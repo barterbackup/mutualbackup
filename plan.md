@@ -34,6 +34,7 @@ them as ADRs and test vectors before promising wire compatibility.
 | Information sectors | Guild-specific encrypted form normally comes from its owner; after owner-disk loss it is reconstructed from the coding group |
 | Private file metadata | Encrypted as user-owned information sectors and protected by the same coding machinery |
 | Parity sectors | Assigned peer or storage-only node, according to the explicit guild layout |
+| Virtual zero extents | Nobody stores payload or earns storage credit; peers synthesize them from the authenticated layout |
 | User revisions | Signed by an identity-authorized revision key and replicated with recoverable guild state |
 | Guild state | Members retain the latest authenticated state/checkpoint and recent signed events; old history is compacted |
 | Coordinator state | Temporary encrypted inputs/staging only; the coordinator is never authoritative |
@@ -61,6 +62,11 @@ vectors for hashes, signatures, encryption, Merkle trees, and RS.
   hashes. Define canonical split/coalesce, tails, padding, sparse ranges, and
   AEAD overhead. Code the exact ciphertext representation and make unchanged
   committed sectors reproducible.
+- **Virtual zero extent:** provisionally model an aligned `Zero(length)` at the
+  exact byte representation consumed by RS, not as encrypted plaintext zeros.
+  Bind its position and length into a new immutable layout/object generation
+  and define canonical, precomputable Merkle roots. Benchmark this protocol
+  feature before v1; a fully unreachable sector should simply be deleted.
 - **Private metadata:** safe relative paths, file/directory/symlink type,
   ordered sector references, logical size, sparse extents, timestamps, and a
   portable attribute subset. Restore symlinks only under an explicit safe
@@ -113,6 +119,15 @@ commit new state, and later re-coalesce compatible survivors. GC removes only
 objects unreachable from all active/retained revisions and layouts after the
 grace period. Remote secure erasure cannot be proved; deletion ends the storage
 obligation and requests best-effort removal.
+
+After replacement protection is committed and the grace period ends, a range
+of an old group may become `Zero` only when all `k` information roles there are
+retired; linear RS then makes every parity role zero there too. Storage may
+punch aligned holes in local packed containers, but must capability-test the
+filesystem, derive logical zeros only from authenticated state, and track
+physical allocation separately. Synthesize zeros in software or compact the
+container when punching is unavailable. Never mutate an object still addressed
+by its old Merkle root.
 
 During outages, keep the old layout while adding temporary protection among
 reachable domains. Remove it when peers return or migrate safely if the outage
@@ -183,8 +198,8 @@ Copied code must retain the older repository's MIT notice.
 ## 7. Delivery phases
 
 1. **ADRs and risk spikes:** identity/membership/threat model, canonical format
-   vectors, Merkle/encryption/RS benchmark, and direct/punch/relay/onion
-   prototype.
+   vectors, Merkle/encryption/RS benchmark, virtual-zero versus split/delete
+   storage benchmark, and direct/punch/relay/onion prototype.
 2. **Offline vertical slice:** ordinary-folder snapshot → encrypted hierarchy
    and metadata → signed revision → RS encode → lose a shard → restore; include
    atomic storage, reference tracking, and crash-point tests.
@@ -208,4 +223,5 @@ encryption regeneration rules; RS matrix/extensible rows and availability-based
 quota, and deletion policy; DHT privacy/bootstrap/TTL and endpoint freshness;
 connection racing/fallback policy; Tor configuration and resource limits;
 relay abuse controls; audit cadence; coordinator failover; and the portable
-restore metadata set.
+restore metadata set; plus zero-extent alignment, Merkle/AEAD semantics, and
+whether it belongs in v1 wire formats or remains a local storage optimization.
