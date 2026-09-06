@@ -20,38 +20,6 @@ repair, GC, and multiple parity volumes remains intentionally omitted.
   capture before materialization and either finalize atomically or reconcile
   all rows and anchor directories on retry/startup.
 
-- [ ] **Make recovery-marker cleanup independent of restored directory
-  permissions and idempotent across crashes.** Restore applies the signed root
-  mode before the ownership marker is created inside that root
-  (`crates/mb-node/src/snapshot.rs:1020-1027,1260-1269`;
-  `crates/mb-node/src/node.rs:830-841`), so a valid `0555` root cannot install
-  or later remove the marker and may also resist retry cleanup. In addition,
-  the job is persisted `Complete`, the marker is durably removed, and only then
-  is signed root metadata restored; a crash in between makes retries skip that
-  restoration forever (`node.rs:765-790,843-866`;
-  `snapshot.rs:1077-1089`). Keep staging under application-controlled modes and
-  model marker removal plus final metadata as an explicit idempotent phase.
-
-- [ ] **Anchor recovered content before exposing it to ordinary writers.** The
-  restore directory is renamed to its user-visible target and the job is
-  persisted `Complete` before `reanchor_recovered_revision` captures it
-  (`crates/mb-node/src/node.rs:765-819,830-847`). The ownership marker proves
-  provenance but does not freeze file contents. A normal program can modify a
-  writable file immediately after publication; the subsequent capture then
-  fails its signed sector check, and every retry reuses the already-modified
-  `Complete` target (`crates/mb-node/src/snapshot.rs:583-607,807-874`). Build
-  and fsync the regeneration anchor from private staging before publication,
-  then switch recipes and expose the target in a recoverable order.
-
-- [ ] **Replace an unavailable saved anchor when reanchoring recovered data.**
-  `reanchor_recovered_revision` unconditionally selects any existing
-  `anchor-manifest` row and captures the restored tree only when the row is
-  absent (`crates/mb-node/src/snapshot.rs:583-607`). If `control.db` survives
-  but its source/anchor filesystem does not, restoration succeeds but every
-  reanchor retry opens the dead locator and can never adopt the newly restored
-  tree (`snapshot.rs:807-874`). Validate the saved anchor first and atomically
-  replace it from the restored target when it is unavailable or inconsistent.
-
 - [ ] **Recover guilds independently instead of comparing their generations.**
   The commit and directory paths can create and retain distinct guilds for the
   same seed, as the design permits, but recovery puts every valid checkpoint

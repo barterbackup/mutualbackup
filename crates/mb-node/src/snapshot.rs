@@ -656,34 +656,49 @@ pub(crate) fn reanchor_recovered_revision(
     }
     let metadata = load_private_metadata(control, keys, guild_id, revision)?;
     let existing = control.get_record("anchor-manifest", revision.value.revision_id.as_bytes())?;
-    let mut pending = None;
-    let manifest = if let Some(bytes) = existing {
-        decode_canonical::<mb_store::StableAnchorManifest>(&bytes)?
-    } else {
-        let anchor = PendingAnchor {
-            manifest: ReflinkAnchor::capture(restored_root)
-                .context("capture recovered source anchor")?,
-            committed: false,
-        };
-        let manifest = anchor.manifest.clone();
-        pending = Some(anchor);
-        manifest
+    let old_manifest = existing
+        .as_deref()
+        .and_then(|bytes| decode_canonical::<mb_store::StableAnchorManifest>(bytes).ok());
+    if let Some(manifest) = old_manifest.as_ref()
+        && let Ok(records) = recovered_anchor_records(keys, guild_id, revision, &metadata, manifest)
+    {
+        control.put_records(&records)?;
+        return Ok(());
+    }
+    let mut anchor = PendingAnchor {
+        manifest: ReflinkAnchor::capture(restored_root)
+            .context("capture recovered source anchor")?,
+        committed: false,
     };
+    let records = recovered_anchor_records(keys, guild_id, revision, &metadata, &anchor.manifest)?;
+    control.put_records(&records)?;
+    anchor.commit();
+    if let Some(old) = old_manifest
+        && old.anchor_id != anchor.manifest.anchor_id
+    {
+        let _ = old.remove();
+    }
+    Ok(())
+}
+
+fn recovered_anchor_records(
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+    metadata: &PrivateMetadata,
+    manifest: &mb_store::StableAnchorManifest,
+) -> Result<Vec<RecordWrite>> {
     if manifest.format_version != 2 {
         bail!("unsupported recovered anchor manifest version");
     }
-    validate_recovered_manifest(&metadata, &manifest)?;
-    let mut recipes = recovered_anchor_recipes(keys, guild_id, revision, &metadata, &manifest)?;
-    recipes.push((
+    validate_recovered_manifest(metadata, manifest)?;
+    let mut records = recovered_anchor_recipes(keys, guild_id, revision, metadata, manifest)?;
+    records.push((
         "anchor-manifest".to_owned(),
         revision.value.revision_id.as_bytes().to_vec(),
-        canonical_bytes(&manifest)?,
+        canonical_bytes(manifest)?,
     ));
-    control.put_records(&recipes)?;
-    if let Some(anchor) = pending.as_mut() {
-        anchor.commit();
-    }
-    Ok(())
+    Ok(records)
 }
 
 fn load_private_metadata(
@@ -912,6 +927,12 @@ pub(crate) fn restore_signed_root_metadata(
         metadata.root_modified_secs,
         metadata.root_modified_nanos,
     )
+}
+
+pub(crate) fn make_restore_root_private(restored_root: &Path) -> Result<()> {
+    set_mode(restored_root, 0o700)?;
+    File::open(restored_root)?.sync_all()?;
+    Ok(())
 }
 
 fn validate_recovered_manifest(
@@ -1243,7 +1264,14 @@ where
     let parent = target.parent().context("restore target has no parent")?;
     fs::create_dir_all(parent)?;
     let staging = parent.join(format!(".mutualbackup-restore-{}", Uuid::new_v4()));
-    build_revision_restore(keys, guild_id, revision, &staging, &mut load_ciphertext)?;
+    build_revision_restore(
+        keys,
+        guild_id,
+        revision,
+        &staging,
+        &mut load_ciphertext,
+        true,
+    )?;
     publish_restore(&staging, target)
 }
 
@@ -1253,6 +1281,7 @@ pub(crate) fn build_revision_restore<F>(
     revision: &SignedRecord<UserRevision>,
     staging: &Path,
     load_ciphertext: &mut F,
+    apply_root_metadata: bool,
 ) -> Result<()>
 where
     F: FnMut(&SectorId) -> Result<Vec<u8>>,
@@ -1278,7 +1307,13 @@ where
     let metadata = decode_private_metadata(&metadata_bytes)?;
 
     create_private_dir(staging)?;
-    let result = restore_entries(staging, &metadata, &encryption_key, load_ciphertext);
+    let result = restore_entries(
+        staging,
+        &metadata,
+        &encryption_key,
+        load_ciphertext,
+        apply_root_metadata,
+    );
     if let Err(error) = result {
         let _ = fs::remove_dir_all(staging);
         return Err(error);
@@ -1394,6 +1429,7 @@ fn restore_entries<F>(
     metadata: &PrivateMetadata,
     encryption_key: &[u8; 32],
     load_ciphertext: &mut F,
+    apply_root_metadata: bool,
 ) -> Result<()>
 where
     F: FnMut(&SectorId) -> Result<Vec<u8>>,
@@ -1517,12 +1553,14 @@ where
             }
         }
     }
-    directory_metadata.push((
-        staging.to_path_buf(),
-        metadata.root_mode,
-        metadata.root_modified_secs,
-        metadata.root_modified_nanos,
-    ));
+    if apply_root_metadata {
+        directory_metadata.push((
+            staging.to_path_buf(),
+            metadata.root_mode,
+            metadata.root_modified_secs,
+            metadata.root_modified_nanos,
+        ));
+    }
     directory_metadata.sort_by_key(|(path, ..)| std::cmp::Reverse(path.components().count()));
     for (path, mode, modified_secs, modified_nanos) in directory_metadata {
         let directory = File::open(&path)?;

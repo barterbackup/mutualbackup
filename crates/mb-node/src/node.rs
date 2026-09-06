@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 use crate::snapshot::{
     build_revision_restore, install_inline_recipe, install_recovered_sector_recipe,
-    install_recovery_marker, native_directory_id, prepare_revision, publish_restore,
-    reanchor_recovered_revision, remove_recovery_marker, render_sector,
+    install_recovery_marker, make_restore_root_private, native_directory_id, prepare_revision,
+    publish_restore, reanchor_recovered_revision, remove_recovery_marker, render_sector,
     restore_signed_root_metadata, verify_recovery_marker,
 };
 
@@ -25,6 +25,7 @@ enum RecoveryJobState {
     Building,
     Ready,
     Complete,
+    Published,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -790,14 +791,20 @@ impl Node {
         let existing = self.control.get_record("recovery-job", checkpoint_hash)?;
         let mut job = match existing {
             Some(bytes) => {
-                let job: RecoveryJob = decode_canonical(&bytes)?;
-                if job.format_version != 2
+                let mut job: RecoveryJob = decode_canonical(&bytes)?;
+                if !matches!(job.format_version, 2 | 3)
                     || job.guild_id != guild_id
                     || job.revision_id != revision.value.revision_id
                     || job.target != target
                     || job.staging.parent() != Some(parent)
                 {
                     anyhow::bail!("recovery job conflicts with durable local state");
+                }
+                if job.format_version == 2 {
+                    if job.state == RecoveryJobState::Complete {
+                        job.state = RecoveryJobState::Published;
+                    }
+                    job.format_version = 3;
                 }
                 job
             }
@@ -806,7 +813,7 @@ impl Node {
                 let mut ownership_marker = [0_u8; 32];
                 rand::thread_rng().fill_bytes(&mut ownership_marker);
                 RecoveryJob {
-                    format_version: 2,
+                    format_version: 3,
                     guild_id,
                     revision_id: revision.value.revision_id,
                     target: target.to_path_buf(),
@@ -820,38 +827,32 @@ impl Node {
         };
 
         if target.exists() {
-            if job.state == RecoveryJobState::Complete {
-                self.finish_recovery_marker(&job, revision, target)?;
-                return reanchor_recovered_revision(
-                    &mut self.control,
-                    &self.keys,
-                    guild_id,
-                    revision,
-                    target,
-                );
-            }
-            if job.state != RecoveryJobState::Ready {
-                anyhow::bail!("existing restore target is not owned by a publishable recovery job");
-            }
             let expected = job
                 .staged_native_id
                 .context("existing restore target is not owned by this recovery job")?;
             if native_directory_id(target)? != expected {
                 anyhow::bail!("existing restore target was created by another actor");
             }
-            verify_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
-            sync_directory(parent)?;
-            job.state = RecoveryJobState::Complete;
-            self.control
-                .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
-            self.finish_recovery_marker(&job, revision, target)?;
-            return reanchor_recovered_revision(
-                &mut self.control,
-                &self.keys,
-                guild_id,
-                revision,
-                target,
-            );
+            match job.state {
+                RecoveryJobState::Complete => return Ok(()),
+                RecoveryJobState::Ready => {
+                    verify_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
+                    sync_directory(parent)?;
+                    job.state = RecoveryJobState::Published;
+                    self.control.put_record(
+                        "recovery-job",
+                        checkpoint_hash,
+                        &canonical_bytes(&job)?,
+                    )?;
+                }
+                RecoveryJobState::Published => {}
+                RecoveryJobState::Building => {
+                    anyhow::bail!(
+                        "existing restore target is not owned by a publishable recovery job"
+                    );
+                }
+            }
+            return self.finish_recovery(&mut job, checkpoint_hash, revision, target);
         }
 
         if job.state == RecoveryJobState::Ready && job.staging.exists() {
@@ -863,20 +864,21 @@ impl Node {
             }
             verify_recovery_marker(&job.staging, &job.marker_name, &job.ownership_marker)?;
             publish_restore(&job.staging, target)?;
-            job.state = RecoveryJobState::Complete;
+            job.state = RecoveryJobState::Published;
             self.control
                 .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
-            self.finish_recovery_marker(&job, revision, target)?;
-            return reanchor_recovered_revision(
-                &mut self.control,
-                &self.keys,
-                guild_id,
-                revision,
-                target,
-            );
+            return self.finish_recovery(&mut job, checkpoint_hash, revision, target);
+        }
+
+        if matches!(
+            job.state,
+            RecoveryJobState::Published | RecoveryJobState::Complete
+        ) {
+            anyhow::bail!("published recovery target disappeared");
         }
 
         if job.staging.exists() {
+            make_restore_root_private(&job.staging)?;
             fs::remove_dir_all(&job.staging)?;
             sync_directory(parent)?;
         }
@@ -890,28 +892,39 @@ impl Node {
             revision,
             &job.staging,
             &mut |sector_id| self.sector(sector_id),
+            false,
         )?;
+        restore_signed_root_metadata(&self.control, &self.keys, guild_id, revision, &job.staging)?;
+        reanchor_recovered_revision(
+            &mut self.control,
+            &self.keys,
+            guild_id,
+            revision,
+            &job.staging,
+        )?;
+        make_restore_root_private(&job.staging)?;
         install_recovery_marker(&job.staging, &job.marker_name, &job.ownership_marker)?;
         job.staged_native_id = Some(native_directory_id(&job.staging)?);
         job.state = RecoveryJobState::Ready;
         self.control
             .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
         publish_restore(&job.staging, target)?;
-        job.state = RecoveryJobState::Complete;
+        job.state = RecoveryJobState::Published;
         self.control
             .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
-        self.finish_recovery_marker(&job, revision, target)?;
-        reanchor_recovered_revision(&mut self.control, &self.keys, guild_id, revision, target)
+        self.finish_recovery(&mut job, checkpoint_hash, revision, target)
     }
 
-    fn finish_recovery_marker(
-        &self,
-        job: &RecoveryJob,
+    fn finish_recovery(
+        &mut self,
+        job: &mut RecoveryJob,
+        checkpoint_hash: &[u8; 32],
         revision: &SignedRecord<UserRevision>,
         target: &Path,
     ) -> Result<()> {
-        let removed = remove_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
-        if removed && !revision.value.metadata_sectors.is_empty() {
+        make_restore_root_private(target)?;
+        remove_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
+        if !revision.value.metadata_sectors.is_empty() {
             restore_signed_root_metadata(
                 &self.control,
                 &self.keys,
@@ -920,6 +933,9 @@ impl Node {
                 target,
             )?;
         }
+        job.state = RecoveryJobState::Complete;
+        self.control
+            .put_record("recovery-job", checkpoint_hash, &canonical_bytes(job)?)?;
         Ok(())
     }
 
