@@ -23,6 +23,13 @@ them as ADRs and test vectors before promising wire compatibility.
   in BarterBackup. Keep revision, mailbox, metadata, and `(user, guild)` data
   keys domain-separated. Treat one live node as the writer for that identity
   in v1; separately certified multi-device identities remain a later ADR.
+- Make **seed-only recovery** a v1 invariant and the acceptance test for the
+  first complete vertical slice. Starting with the seed, an empty data
+  directory, and only generic software bootstrap configuration, a node must
+  derive its identity, find its guild peers without a cached guild ID or peer
+  list, rebuild its authenticated state and keys, retrieve any sufficient set
+  of shards, and restore its data. No indispensable recovery material may live
+  only in `control.db` or the source folder.
 - Assume social trust but verify all data and transitions; tolerate buggy or
   dishonest peers, replay, corruption, crashes, and partitions.
 - Use a fixed test profile first (for example 4 KiB minimum sectors and RS
@@ -36,16 +43,16 @@ them as ADRs and test vectors before promising wire compatibility.
 
 | Item | Who keeps it |
 | --- | --- |
-| Plaintext and recovery seed | Plaintext stays on the owner's selected filesystem, in the working folder or restricted source-anchor area; the seed has offline backup and never enters the DHT |
+| Plaintext and recovery seed | Plaintext stays on the owner's selected filesystem, in the working folder or restricted source-anchor area; the seed has offline backup and never enters the DHT. The seed alone derives the stable identity and recovery-decryption roots |
 | Active source anchor | The owner retains a COW clone/snapshot, a write-protected hard link to the working inode, or a sparse private copy made when that inode is unlocked, until all referencing layouts are retired |
 | Information sectors | Guild-specific encrypted form normally comes from its owner; after owner-disk loss it is reconstructed from the coding group |
 | Private file metadata | Encrypted as user-owned information sectors and protected by the same coding machinery |
 | Parity sectors | Assigned peer or storage-only node; that host stores the exact RS-level bytes as locally SQLCipher-encrypted chunks on a selected volume |
 | Virtual zero extents | Nobody stores payload or earns storage credit; peers synthesize them from the authenticated layout |
 | User revisions | Signed by an identity-authorized revision key and replicated with recoverable guild state |
-| Guild state | Members retain the latest authenticated state/checkpoint and recent signed events; old history is compacted |
+| Guild state | Members retain the latest authenticated state/checkpoint, recent signed events, per-member recovery key envelopes/catalogs, and enough layout/revision metadata to rebuild a lost member; old history is compacted |
 | Coordinator state | Temporary encrypted inputs/staging only; the coordinator is never authoritative |
-| DHT and relay | DHT stores short-lived encrypted endpoint hints, including the stable onion address when available; relay stores no data and forwards opaque encrypted traffic |
+| DHT and relay | DHT stores independently published, short-lived encrypted endpoint and per-member recovery-rendezvous hints, including stable onion addresses; relay stores no data and forwards opaque encrypted traffic |
 
 Proposed simplification: a `UserRevision` describes only that user's logical
 data. Membership, revision heads, coding groups, parity assignments, and
@@ -62,6 +69,12 @@ caches are disposable, and no recovery seed, indispensable key, current
 private metadata, or guild state may exist only in this database. Each guild
 has independent ciphertext, layout, quota, and state even when local scanning
 work is shared.
+
+Define a versioned, checksummed seed format before storing real data. Rotatable
+user/guild keys and historical epochs are kept in encrypted envelopes to a
+seed-derived recovery public key, committed by signed guild state, and
+replicated by peers; recovery must not depend on a salt, counter, key version,
+or manifest found only on the lost machine.
 
 ## 3. Formats to specify first
 
@@ -97,16 +110,30 @@ root authenticated by the signed revision/coding-group state before use.
   compact information-sector forest, suite versions, and signature.
 - **CodingGroup:** stable ID, shard size, versioned RS construction and row IDs,
   `k/m`, canonical ordered roles, sector roots, nodes, and failure domains.
-- **Guild state:** signed membership/revocation events plus authenticated state
-  commits and periodic checkpoints containing explicit current/temporary
-  groups and tombstones. A normal update must not wait for a periodic
-  checkpoint; the checkpoint later compacts committed state.
+- **Guild state:** signed membership/revocation events bind each stable Node ID
+  to its recovery public key. Authenticated commits and periodic checkpoints
+  contain explicit current/temporary groups, tombstones, and the quorum-bound
+  active `(writer epoch, incarnation public key)` for each identity. A normal
+  update must not wait for a periodic checkpoint; the checkpoint later compacts
+  committed state.
+- **Recovery capsule:** a content-addressed, per-member bundle binds the member
+  identity to checkpoint/event-tail heads, private revision-catalog and layout
+  roots, and encrypted envelopes for every required historical key epoch. It is
+  quorum-committed and replicated by peers; it tells a blank node what signed
+  objects to fetch and verify but is not itself a substitute for those objects.
 - **Storage and discovery records:** quota reservation, durable shard receipt,
   retention promise, operation ID, and a signed/encrypted/expiring DHT provider
   record. The provider record carries the peer identity plus current IP/QUIC,
   relay, and onion endpoints. Keep one record per publisher so writers cannot
   overwrite each other, and verify that an onion address matches its identity.
-  Metadata acceptance never counts as proof that bytes are stored.
+  In addition, every guild peer independently refreshes an opaque recovery
+  rendezvous record under a key deterministically derived from the subject's
+  public Node ID. It is encrypted to that member's seed-derived recovery key
+  and contains the publisher's endpoints plus an opaque locator for the
+  subject's replicated recovery capsule/checkpoint, without exposing a guild ID
+  in cleartext. Thus lookup needs no remembered guild ID. Metadata acceptance
+  never counts as proof that bytes are stored, and DHT contents never become
+  authority.
 
 ## 4. Local source snapshots, persistence, and storage volumes
 
@@ -239,12 +266,39 @@ stopped or exclusively locked. Ordinary `sqlite3` cannot decrypt these files,
 but the schema and SQL remain inspectable with compatible SQLCipher tooling.
 Do not provide a plaintext debug-export command.
 
+### Execution and local test model
+
+- Use an **asynchronous shell around a synchronous deterministic core**, not
+  `async` everywhere. Tokio owns network/DHT/Tor RPC, timers, retries,
+  cancellation, watchers, and orchestration. Canonical encoding, signature and
+  Merkle checks, placement, authorization, and guild-state transitions remain
+  ordinary synchronous functions that are easy to test deterministically.
+- Put blocking SQLCipher work behind one bounded worker/actor per database,
+  filesystem calls such as sparse copy/reflink/fsync in a bounded blocking
+  pool, and encryption, hashing, Merkle, and RS work in a bounded CPU pool.
+  Bound queues and buffers to provide backpressure. Never block a Tokio worker
+  or hold a database transaction, incremental-BLOB handle, mutex/state guard,
+  or source transition guard across a network `.await`.
+- Give background tasks explicit ownership, cancellation, and shutdown/join
+  rules. Use one Tokio runtime per process; several simulated nodes may share
+  that runtime but not node state.
+- A local simulated peer is a complete active `Node`, not a directory standing
+  in for one. Each has its own seed/identity, `control.db`, parity databases,
+  guild-log replica, scheduler, protocol workers, and transport endpoint; it
+  gossips/checkpoints state and performs reservation, RS coordination, storage,
+  receipts, audits, repair, and GC. The deterministic in-process harness may
+  replace only transport, time, and failure sources. A local multi-process mode
+  then runs the same binary and protocol over loopback with separate data
+  directories; neither mode may share a database, guild log, peer registry, or
+  hidden source of authority.
+
 ## 5. Protocol and data lifecycle
 
-1. **Join/sync:** exchange an out-of-band guild invite, authorize membership,
-   authenticate the peer identity, negotiate capabilities, then gossip signed
-   events and checkpoints. Current layouts are explicit; never recreate them by
-   rerunning an old placement algorithm.
+1. **Join/sync:** a new membership starts with an out-of-band guild invite and
+   authorization; cold recovery of an existing member follows step 5 and never
+   needs a new invite. Authenticate peer identity, negotiate capabilities, then
+   gossip signed events and checkpoints. Current layouts are explicit; never
+   recreate them by rerunning an old placement algorithm.
 2. **Protect/commit:** apply the root's publication policy, capture and register
    a durable regeneration anchor, then build encrypted sectors and a draft
    revision. Select equal-size sectors from different users, reserve quota, and
@@ -254,17 +308,27 @@ Do not provide a plaintext debug-export command.
    authenticated guild-state commit activating the revision/groups. Old
    protection remains active throughout.
 3. **Transfer/concurrency:** stream immutable objects and ranges with Merkle
-   proofs. Mutations carry an idempotency key and expected state hash; repeats
-   return the previous result, while ambiguous results cause read/refresh rather
-   than blind overwrite.
+   proofs. Mutations also carry the guild-certified writer epoch and a signature
+   by its bound incarnation key, plus an idempotency key and expected state
+   hash. Repeats return the previous result, while ambiguous results cause
+   read/refresh rather than blind overwrite.
 4. **Audit/repair:** use unpredictable range challenges, Merkle verification,
    and RS checks, with occasional full scrubs. Repair, emergency parity, and
    migration reuse the same stage/verify/receipt/commit flow.
-5. **Recover:** seed → identity → deterministic DHT lookup → authenticated guild
-   peers over the best working IP, relay, or onion path → valid current guild
-   state and revision → any `k` valid shards →
-   verify/reconstruct/decrypt → restore into a safe staging tree → rebuild local
-   caches. Recovery mode blocks mutation/publication until explicitly finished.
+5. **Recover:** seed → identity and recovery keys → generic IP and/or Tor
+   bootstrap → deterministic per-identity DHT rendezvous lookup → authenticated
+   guild peers over the best working direct, relay, or onion path → quorum-valid
+   checkpoint and event tail plus key envelopes, private revision catalog, and
+   explicit layouts → any `k` valid shards → verify/reconstruct/decrypt → safe
+   staged restore → rebuild `control.db` and disposable caches. Test this after
+   deleting every owner-local artifact other than the offline seed, including
+   its data directory, source tree, anchors, keyring, endpoint cache, and
+   remembered peer/guild configuration. Recovery begins read-only; it generates
+   a fresh incarnation signing key, and before it can publish or mutate the
+   guild quorum must advance the writer epoch and bind that key. Peers reject
+   older epochs and other keys, fencing an accidentally stale copy even though
+   it still possesses the seed. Two actors that both control the seed can still
+   request a later takeover, so quorum policy remains the final arbiter.
 
 Protocol object lifecycle:
 
@@ -330,6 +394,11 @@ quotas, so cleanup and audits cannot starve forever.
   A recovering node tries ordinary endpoints/relays and falls back to the onion
   address when they fail, or uses Tor immediately when requested. The DHT is
   discovery only, never authority or bulk storage.
+- Peers also publish the encrypted per-member recovery rendezvous under the
+  deterministic key derived from that member's Node ID. Each publisher writes
+  its own expiring record, preventing one peer from erasing all alternatives;
+  the recovered node decrypts candidate records and accepts only pointers that
+  lead to valid signed guild state.
 - Ensure discovery itself has a Tor path: DHT/provider queries must work over
   the common stream abstraction, or records must be mirrored by onion-reachable
   rendezvous nodes. Ship several replaceable IP and onion bootstrap endpoints;
@@ -359,37 +428,43 @@ Copied code must retain the older repository's MIT notice.
 
 ## 8. Delivery phases
 
-1. **ADRs and risk spikes:** identity/membership/threat model, canonical format
-   vectors, Merkle/encryption/RS benchmark, SQLCipher-with-HMAC chunk/range and
-   page-reuse benchmark, virtual-zero versus split/delete storage benchmark,
-   COW/link-freeze admission and mutation-semantics probe, VSS lifecycle spike,
-   multi-volume crash-state prototype, and direct/punch/relay/onion prototype.
-2. **Offline vertical slice:** ordinary-folder snapshot → encrypted hierarchy
-   and metadata → signed revision → RS encode → lose a shard → restore; include
-   per-database atomic storage, cross-database reconciliation, reference
-   tracking, add-root rejection, reflink and guarded link-freeze capture,
-   pre-opened writer/mapping and every content-mutation path, allowed
-   rename/unlink/atomic replacement, sparse anchor detachment, exact permission
-   restoration, hard-link aliases, `ENOSPC`, and crashes at every
-   capture/unlock/publication boundary.
-3. **Five-node simulation:** invite/join, `3+2` groups, signed state commits,
-   coordinator failure, duplicate calls, edits/deletes, corruption, partitions,
-   emergency repair, disk unplug/remount/path change, verified cross-volume
-   migration, full-volume headroom, and GC using `ManualClock` and expanded
-   `netmock`.
+1. **ADRs and risk spikes:** identity/membership/threat and writer-fencing
+   model; seed/recovery-envelope and rendezvous formats; canonical vectors;
+   Merkle/encryption/RS and SQLCipher chunk/range/page-reuse benchmarks;
+   virtual-zero storage benchmark; COW/link-freeze and VSS probes;
+   multi-volume crash-state spike; bounded async/DB/FS/CPU worker skeleton; and
+   direct/punch/relay/onion prototype. These are disposable learning steps, not
+   a substitute for the multi-node acceptance test.
+2. **First working vertical slice:** run five independent active nodes through
+   the real state machines over deterministic in-memory transport; invite/join,
+   capture one ordinary folder with an admitted anchor backend, build owner-
+   encrypted metadata/sectors, form a `3+2` group, store parity through the real
+   databases, exchange receipts, and commit signed guild state. Stop the owner,
+   delete its data directory, source tree, anchors, keyring, endpoint cache, and
+   all node-specific configuration; then create a clean node from only its seed
+   and generic bootstrap configuration. Without the harness injecting a guild
+   ID, peer list, checkpoint, or receipt, discover peers, rebuild state, restore
+   byte-exact data from any three valid shards, and prove an old writer session
+   is fenced. Keep this scenario passing from this milestone onward.
+3. **Lifecycle and failure coverage:** add edits/deletes, every source mutation
+   path, add-root rejection, reflink/link-freeze detachment and exact permission
+   restoration, hard-link aliases, watcher reconciliation, `ENOSPC`, disk
+   unplug/remount/path change, cross-volume migration, full-volume headroom,
+   coordinator failure, duplicate calls, corruption, partitions, emergency
+   repair, GC, and crashes at every capture/unlock/publication boundary using
+   `ManualClock` and expanded `netmock`. Also run the same nodes as isolated
+   local processes to catch accidental shared-state assumptions.
 4. **Real network:** DHT endpoint records, peer exchange, resumable transfers,
    direct QUIC, hole punching, guild relay, and embedded Arti onion service.
    Test automatic fallback, explicit Tor preference/requirement, restart with a
    stable onion identity, and DHT-seeded onion recovery in Docker/network
    namespaces across common and symmetric NAT cases.
-5. **Recovery MVP and hardening:** erase a member's whole local state and
-   restore with only the seed plus any `k` surviving shards. Then fuzz parsers,
-   property-test split/coalesce and any-`k` recovery, test cross-platform
-   metadata, reject damaged SQLCipher pages, bound storage RSS/WAL growth, test
-   volume and source-anchor reconciliation, watcher overflow/rescan, native-ID
-   reuse and cross-volume movement, remount capability changes, incomplete
-   freeze/edit/GC intents, anchor corruption, freed-page reuse, large
-   trees/small edits, and rotation/revocation limits.
+5. **Hardening:** fuzz parsers; property-test split/coalesce and any-`k`/seed-only
+   recovery; test cross-platform metadata and damaged SQLCipher pages; bound
+   queue, buffer, task, RSS, and WAL growth; test volume/source-anchor and
+   watcher reconciliation, native-ID reuse and cross-volume movement, remount
+   capability changes, incomplete freeze/edit/GC intents, anchor corruption,
+   freed-page reuse, large trees/small edits, and rotation/revocation limits.
 
 Before freezing v1, decide the remaining compatibility gates: sector and
 encryption regeneration rules; RS matrix/extensible rows and availability-based
