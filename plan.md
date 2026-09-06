@@ -8,8 +8,15 @@ them as ADRs and test vectors before promising wire compatibility.
 
 - Start a new layered Rust workspace; transplant small proven utilities rather
   than extending BarterBackup's whole-blob core. Keep one user-facing binary.
-- Protect an ordinary folder using scanning and reflink/copy snapshots—no FUSE,
-  custom filesystem, or kernel component.
+- Protect an ordinary folder with two source-anchor backends: COW through a
+  runtime-probed reflink/clone, or guarded link-freeze through a same-filesystem
+  hard link plus user-reversible write protection. Probe the complete lifecycle
+  when a root is added and reject it if neither backend works. Never make an
+  eager full copy merely to protect a file; no FUSE, custom filesystem, or
+  kernel component is required for v1.
+- Use a pinned SQLCipher/SQLite build as the common local storage engine, with
+  per-page HMAC enabled. Keep control state separate from per-volume parity
+  databases so independent local filesystems can be added, drained, or lost.
 - Use one stable seed-derived Ed25519 **peer identity** across direct, relayed,
   and Tor sessions. Use that same key as the Arti Tor v3 hidden-service
   identity, so the Node ID deterministically maps to its `.onion` address, as
@@ -29,11 +36,11 @@ them as ADRs and test vectors before promising wire compatibility.
 
 | Item | Who keeps it |
 | --- | --- |
-| Plaintext and recovery seed | Plaintext stays in the user's selected folder/devices; the seed has offline backup and never enters the DHT |
-| Active source snapshot | The owner retains a reflink or safe copy until all referencing layouts are retired |
+| Plaintext and recovery seed | Plaintext stays on the owner's selected filesystem, in the working folder or restricted source-anchor area; the seed has offline backup and never enters the DHT |
+| Active source anchor | The owner retains a COW clone/snapshot, a write-protected hard link to the working inode, or a sparse private copy made when that inode is unlocked, until all referencing layouts are retired |
 | Information sectors | Guild-specific encrypted form normally comes from its owner; after owner-disk loss it is reconstructed from the coding group |
 | Private file metadata | Encrypted as user-owned information sectors and protected by the same coding machinery |
-| Parity sectors | Assigned peer or storage-only node, according to the explicit guild layout |
+| Parity sectors | Assigned peer or storage-only node; that host stores the exact RS-level bytes as locally SQLCipher-encrypted chunks on a selected volume |
 | Virtual zero extents | Nobody stores payload or earns storage credit; peers synthesize them from the authenticated layout |
 | User revisions | Signed by an identity-authorized revision key and replicated with recoverable guild state |
 | Guild state | Members retain the latest authenticated state/checkpoint and recent signed events; old history is compacted |
@@ -46,9 +53,15 @@ tombstones belong to guild state. Both must be recoverable from peers; a DHT
 record is only a pointer toward them. This avoids the feedback loop in the old
 system where peer inventory changed the owner's content revision.
 
-A local database may cache paths, Merkle nodes, inventories, reachability, and
-jobs, but must be disposable. Each guild has independent ciphertext, layout,
-quota, and state even when local scanning work is shared.
+The local `control.db` keeps the working file catalog, source-root and anchor
+registry, native volume/file IDs and known paths, desired file properties,
+size/change hints, watcher cursors, jobs/outbox, volume registry, inventories,
+reachability, byte-exact signed guild records, and normalized query views.
+Signed records—not reconstructed SQL rows—remain protocol authority. Derived
+caches are disposable, and no recovery seed, indispensable key, current
+private metadata, or guild state may exist only in this database. Each guild
+has independent ciphertext, layout, quota, and state even when local scanning
+work is shared.
 
 ## 3. Formats to specify first
 
@@ -57,11 +70,18 @@ but arbitrary protobuf serialization must not be signed. Every durable record
 carries format and algorithm versions, scope, type, and lengths. Publish golden
 vectors for hashes, signatures, encryption, Merkle trees, and RS.
 
+The protocol byte flow is owner plaintext → owner encryption → RS over the
+encrypted information sectors → Merkle-committed information/parity sectors.
+A storage host then adds transparent local SQLCipher encryption. Peers exchange
+only the exact RS-level bytes, never SQLCipher pages. Protocol encryption need
+not add its own authentication tag if every range is verified against a Merkle
+root authenticated by the signed revision/coding-group state before use.
+
 - **Sector/Merkle object:** power-of-two logical size, encoding and key epoch,
   nonce/salt material, ciphertext hash/root, and domain-separated leaf/parent
   hashes. Define canonical split/coalesce, tails, padding, sparse ranges, and
-  AEAD overhead. Code the exact ciphertext representation and make unchanged
-  committed sectors reproducible.
+  encryption framing. Code the exact ciphertext representation and make
+  unchanged committed sectors reproducible.
 - **Virtual zero extent:** provisionally model an aligned `Zero(length)` at the
   exact byte representation consumed by RS, not as encrypted plaintext zeros.
   Bind its position and length into a new immutable layout/object generation
@@ -70,7 +90,9 @@ vectors for hashes, signatures, encryption, Merkle trees, and RS.
 - **Private metadata:** safe relative paths, file/directory/symlink type,
   ordered sector references, logical size, sparse extents, timestamps, and a
   portable attribute subset. Restore symlinks only under an explicit safe
-  policy that prevents path escape.
+  policy that prevents path escape. Native file IDs, anchor paths, enforcement
+  permissions, and watcher cursors are local catalog state, never portable
+  signed recovery fields.
 - **UserRevision:** owner, monotonic revision, optional parent, metadata root,
   compact information-sector forest, suite versions, and signature.
 - **CodingGroup:** stable ID, shard size, versioned RS construction and row IDs,
@@ -86,17 +108,151 @@ vectors for hashes, signatures, encryption, Merkle trees, and RS.
   overwrite each other, and verify that an onion address matches its identity.
   Metadata acceptance never counts as proof that bytes are stored.
 
-## 4. Protocol and data lifecycle
+## 4. Local source snapshots, persistence, and storage volumes
+
+### Source capture
+
+Each active information-shard role needs a stable **regeneration anchor** that
+reproduces its committed RS-level bytes using the recorded format and key
+parameters. Only file content and length need anchoring: directory structure,
+names, and desired file properties live in authenticated metadata. If an anchor
+is missing, changed, or corrupt, declare that local shard unavailable and
+repair it; never silently encode new bytes under an old root.
+
+- Support two v1 anchor backends. **COW** uses a native per-file reflink/clone,
+  leaving the working inode editable. **Guarded link-freeze** creates a private
+  same-filesystem hard link to the working inode, records its exact original
+  mode/ACL, uses a short platform guard to exclude pre-opened writers and
+  writable mappings, then removes normal write/append/truncate permission. A
+  hard link alone is not a snapshot. The write protection is deliberately
+  user-reversible and defends against ordinary accidental modification, not a
+  malicious process running with the user's authority.
+- When adding a root, run a quick disposable sparse-file probe on every allowed
+  root/filesystem pair: try the native clone API first; if unavailable, test the
+  complete hard-link → guard/freeze → reject in-place mutation → allow
+  rename/unlink/atomic replacement while the anchor survives → sparse detach
+  → exact permission restore/edit cycle. Use only allowlisted platform
+  mechanisms, clean up the probe, and reject the root if neither backend passes;
+  never fall back silently to an eager full copy. Re-probe after a filesystem or
+  mount-identity change, and reject or separately probe nested filesystems.
+- Give each protected root/filesystem pair an app-owned, restricted anchor area
+  on that filesystem, keyed by stable root/volume IDs. Prefer it outside the
+  scanned subtree; otherwise reserve and hard-exclude it from scans/watchers,
+  reject symlink traversal, and prevent recursive protection. Self-identifying
+  anchor names let startup reconcile files with `control.db`.
+- Link-freeze protects the shared file record, not its user-visible directory
+  entry. Renames and unlinks need no copy; an atomic-replace editor naturally
+  creates a new working file ID while the old anchored inode remains intact.
+  Track all known paths per native file ID. If an inode already has unaccounted
+  hard-link aliases, enroll the whole link group explicitly or reject that file
+  rather than unexpectedly changing permissions on unknown paths.
+- For an in-place edit, use the recoverable local sequence
+  `SHARED_FROZEN → COPY_STAGING → PRIVATE_COPY_READY → UNLOCK_PENDING → EDITABLE`.
+  Under the transition guard, copy the anchored inode to an independent
+  temporary anchor while preserving holes, verify it against the committed
+  root, fsync it and the anchor directory, atomically install/register it, and
+  detach the old hard link before restoring the working inode's exact original
+  permissions. Failure or `ENOSPC` leaves the working inode frozen. This local
+  representation change does not create a protocol revision.
+- Store local-only `(stable volume UUID, native file ID)`, all known paths,
+  working and anchor IDs, link count, desired properties, size, modification
+  and change-time hints, last verified root, watcher cursor, and transition
+  state in `control.db`. File IDs can be reused and do not survive cross-volume
+  moves, so confirm associations with the anchor and content root rather than
+  treating IDs or timestamps as authority.
+- Watch roots with inotify or the native Windows/macOS analogue, but treat
+  events only as latency hints. At startup, after watcher overflow, and
+  periodically, enumerate roots and anchor areas; reconcile native IDs and
+  paths, expected protection, missing/orphan anchors, and incomplete edit/GC
+  intents. Same-volume ID movement is a rename; a new ID at a path is a
+  replacement; missing names are deletion candidates; size/time changes mark
+  content dirty and require root verification before use.
+- Support per-root `immediate`, quiet-period, and manual publication policies.
+  Quiet time reduces churn but is not a consistency boundary; live databases
+  and other multi-file applications require native snapshots, quiesce/export
+  hooks, or an explicit warning. A persistent NTFS VSS snapshot is a possible
+  volume-level COW implementation, but enable it only after testing service
+  authorization, publication batching, diff-area headroom, eviction, and
+  missing-snapshot reconciliation.
+- Keep private edit copies sparse and byte-addressable in v1. A compressed or
+  locally encrypted source-object store is a later backend because guild
+  contexts differ and whole-file transforms hurt range access. Keep the
+  abstraction open for independently chunked packing or optional
+  userspace-COW/FUSE later.
+
+### Databases and volumes
+
+- Put `control.db` on stable system storage. It contains local owner metadata,
+  byte-exact signed guild events/checkpoints, derived membership/group/layout
+  views, reservations, object locations, quotas, receipts, durable operations
+  and outbox, endpoint caches, and schema migrations.
+- Put one `parity-<volume-uuid>.db` on each configured local filesystem, even
+  when there is initially only one. It contains immutable parity chunks plus
+  enough self-describing state to reconcile it independently: volume/object and
+  operation IDs, root, generation, exact length, chunk index, lifecycle state,
+  and local accounting. An OS RAID/LVM/ZFS/Btrfs pool appears as one volume;
+  SQLite itself does not stripe one database across filesystems.
+- Identify a volume by a persistent random UUID and authenticated manifest, not
+  by mount path or device name. Never create a fresh database merely because an
+  expected mount is absent, and reject two online copies with the same UUID.
+  Track `online`, `offline`, `draining`, and `failed` states.
+- Give `control.db` and every parity database independent random DEKs wrapped
+  by a node-local storage key held outside those databases. Normal master-key
+  rotation rewraps DEKs; reserve full SQLCipher `rekey` for DEK compromise or
+  cipher migration. Pin the SQLCipher format/settings, retain page HMAC, disable
+  extension loading and file-backed temporary storage, and enable defensive,
+  untrusted-schema, memory-wiping, and resource-limit hardening.
+  The page HMAC protects the local container before SQLite parses it;
+  authenticated Merkle roots independently verify protocol-level sector bytes.
+- Use separate WAL connections/workers for control and each online volume, so
+  an absent disk cannot stop control work and different disks can write in
+  parallel. Do not depend on `ATTACH` or cross-database foreign keys in normal
+  operation; reserve attachment for inspection and controlled migration.
+- Store parity in fixed, bounded, preferably Merkle-aligned BLOB chunks, using
+  `zeroblob`/incremental BLOB I/O where useful. Never retain a write transaction
+  or BLOB handle while awaiting the network: buffer one bounded chunk, write it
+  in a short transaction, and verify the complete object before publication.
+
+WAL does not make a transaction across several database files crash-atomic, so
+publication uses an idempotent, recoverable sequence:
+
+`control reservation → parity STAGED → verify root/length → parity READY → control STORED/RECEIPTED + quota + receipt + outbox → send receipt`
+
+On restart, resume or expire reservations, adopt or collect unreferenced
+`READY` objects, mark references on offline volumes unavailable, and resend
+committed outbox entries. Migrate with copy → verify destination → atomically
+switch the control location → collect the source. A disappeared volume is
+offline rather than deleted; drain a healthy volume before removal. Multiple
+disks in one machine remain one protocol failure domain and must not be counted
+as independent shard hosts.
+
+SQLite reuses deleted BLOB pages from its freelist; do not hole-punch or reflink
+ranges of a live database. Track logical quota separately from file allocation,
+reserve space for control/GC work, and use incremental vacuum, evacuation, or a
+controlled rebuild only when physical space must be returned to the host.
+
+Provide `mutualbackup db-shell`, opening `control.db` by default and accepting
+`--volume <uuid>` for a parity database. It uses the application's exact
+SQLCipher build, settings, and normal key-unwrapping path, never exposes keys in
+arguments/logs, and defaults to query-only; writes require the daemon to be
+stopped or exclusively locked. Ordinary `sqlite3` cannot decrypt these files,
+but the schema and SQL remain inspectable with compatible SQLCipher tooling.
+Do not provide a plaintext debug-export command.
+
+## 5. Protocol and data lifecycle
 
 1. **Join/sync:** exchange an out-of-band guild invite, authorize membership,
    authenticate the peer identity, negotiate capabilities, then gossip signed
    events and checkpoints. Current layouts are explicit; never recreate them by
    rerunning an old placement algorithm.
-2. **Protect/commit:** scan a stable snapshot, build encrypted sectors and a
-   draft revision, select equal-size sectors from different users, reserve
-   quota, and stream them to a temporary coordinator. Destinations durably
-   stage and verify parity, then return signed receipts. An authenticated state
-   commit activates the revision/groups; old protection remains active.
+2. **Protect/commit:** apply the root's publication policy, capture and register
+   a durable regeneration anchor, then build encrypted sectors and a draft
+   revision. Select equal-size sectors from different users, reserve quota, and
+   stream them to a temporary coordinator. Destinations durably stage and
+   verify parity using the local publication sequence above, commit their
+   receipt/outbox before sending the signed receipt, and later observe an
+   authenticated guild-state commit activating the revision/groups. Old
+   protection remains active throughout.
 3. **Transfer/concurrency:** stream immutable objects and ranges with Merkle
    proofs. Mutations carry an idempotency key and expected state hash; repeats
    return the previous result, while ambiguous results cause read/refresh rather
@@ -110,24 +266,30 @@ vectors for hashes, signatures, encryption, Merkle trees, and RS.
    verify/reconstruct/decrypt → restore into a safe staging tree → rebuild local
    caches. Recovery mode blocks mutation/publication until explicitly finished.
 
-Object lifecycle:
+Protocol object lifecycle:
 
 `staged → uploaded → verified/receipted → committed/active → superseded → grace period → GC`
 
-Edits and deletions expand only affected Merkle branches, replace their groups,
-commit new state, and later re-coalesce compatible survivors. GC removes only
-objects unreachable from all active/retained revisions and layouts after the
-grace period. Remote secure erasure cannot be proved; deletion ends the storage
+Content edits and deletions expand only affected Merkle branches, replace their
+groups, commit new state, and later re-coalesce compatible survivors. A
+same-volume rename changes private metadata but reuses unchanged content
+sectors; unlink or atomic replacement of a working name leaves its link-freeze
+anchor intact. GC removes only objects and source anchors unreachable from all
+active/retained revisions and layouts after the grace period and after in-flight
+transitions finish. When collecting the last shared hard-link anchor, journal
+restoration of the desired permissions on any still-visible working inode so a
+crash cannot strand it frozen. Removal is idempotent and crash-reconciled, not
+an immediate reaction to the last apparent reference. Secure physical erasure
+cannot be proved on remote hosts, CoW filesystems, or SSDs; deletion ends the
 obligation and requests best-effort removal.
 
 After replacement protection is committed and the grace period ends, a range
 of an old group may become `Zero` only when all `k` information roles there are
 retired; linear RS then makes every parity role zero there too. Storage may
-punch aligned holes in local packed containers, but must capability-test the
-filesystem, derive logical zeros only from authenticated state, and track
-physical allocation separately. Synthesize zeros in software or compact the
-container when punching is unavailable. Never mutate an object still addressed
-by its old Merkle root.
+omit its payload only from authenticated state and synthesize the exact zeros
+in software. A SQLCipher parity database deletes obsolete chunk rows and reuses
+their pages; it must never be externally hole-punched. Never mutate an object
+still addressed by its old Merkle root.
 
 During outages, keep the old layout while adding temporary protection among
 reachable domains. Remove it when peers return or migrate safely if the outage
@@ -136,7 +298,7 @@ migration; it must not force rewriting old groups. Schedule all work with
 weighted fairness plus aging, bounded concurrency, and per-guild disk/network
 quotas, so cleanup and audits cannot starve forever.
 
-## 5. Networking and hole punching
+## 6. Networking and hole punching
 
 - Hide paths behind a common authenticated stream/session interface keyed by
   the stable Node ID. Maintain a small torrent-like peer-exchange/gossip
@@ -176,7 +338,7 @@ quotas, so cleanup and audits cannot starve forever.
   enough shard holders must be reachable. Onion services avoid inbound NAT
   requirements but still depend on the Tor network being available.
 
-## 6. What to reuse from BarterBackup
+## 7. What to reuse from BarterBackup
 
 | Treatment | Older Rust material |
 | --- | --- |
@@ -195,17 +357,25 @@ rustls callbacks accept TLS handshake signatures without verifying them. Use a
 reviewed authenticated handshake and authorize the identity as a guild member.
 Copied code must retain the older repository's MIT notice.
 
-## 7. Delivery phases
+## 8. Delivery phases
 
 1. **ADRs and risk spikes:** identity/membership/threat model, canonical format
-   vectors, Merkle/encryption/RS benchmark, virtual-zero versus split/delete
-   storage benchmark, and direct/punch/relay/onion prototype.
+   vectors, Merkle/encryption/RS benchmark, SQLCipher-with-HMAC chunk/range and
+   page-reuse benchmark, virtual-zero versus split/delete storage benchmark,
+   COW/link-freeze admission and mutation-semantics probe, VSS lifecycle spike,
+   multi-volume crash-state prototype, and direct/punch/relay/onion prototype.
 2. **Offline vertical slice:** ordinary-folder snapshot → encrypted hierarchy
    and metadata → signed revision → RS encode → lose a shard → restore; include
-   atomic storage, reference tracking, and crash-point tests.
+   per-database atomic storage, cross-database reconciliation, reference
+   tracking, add-root rejection, reflink and guarded link-freeze capture,
+   pre-opened writer/mapping and every content-mutation path, allowed
+   rename/unlink/atomic replacement, sparse anchor detachment, exact permission
+   restoration, hard-link aliases, `ENOSPC`, and crashes at every
+   capture/unlock/publication boundary.
 3. **Five-node simulation:** invite/join, `3+2` groups, signed state commits,
    coordinator failure, duplicate calls, edits/deletes, corruption, partitions,
-   emergency repair, migration, and GC using `ManualClock` and expanded
+   emergency repair, disk unplug/remount/path change, verified cross-volume
+   migration, full-volume headroom, and GC using `ManualClock` and expanded
    `netmock`.
 4. **Real network:** DHT endpoint records, peer exchange, resumable transfers,
    direct QUIC, hole punching, guild relay, and embedded Arti onion service.
@@ -215,7 +385,11 @@ Copied code must retain the older repository's MIT notice.
 5. **Recovery MVP and hardening:** erase a member's whole local state and
    restore with only the seed plus any `k` surviving shards. Then fuzz parsers,
    property-test split/coalesce and any-`k` recovery, test cross-platform
-   metadata, soak large trees/small edits, and add rotation/revocation limits.
+   metadata, reject damaged SQLCipher pages, bound storage RSS/WAL growth, test
+   volume and source-anchor reconciliation, watcher overflow/rescan, native-ID
+   reuse and cross-volume movement, remount capability changes, incomplete
+   freeze/edit/GC intents, anchor corruption, freed-page reuse, large
+   trees/small edits, and rotation/revocation limits.
 
 Before freezing v1, decide the remaining compatibility gates: sector and
 encryption regeneration rules; RS matrix/extensible rows and availability-based
@@ -223,5 +397,10 @@ encryption regeneration rules; RS matrix/extensible rows and availability-based
 quota, and deletion policy; DHT privacy/bootstrap/TTL and endpoint freshness;
 connection racing/fallback policy; Tor configuration and resource limits;
 relay abuse controls; audit cadence; coordinator failover; and the portable
-restore metadata set; plus zero-extent alignment, Merkle/AEAD semantics, and
-whether it belongs in v1 wire formats or remains a local storage optimization.
+restore metadata set; zero-extent alignment and whether virtual zeros belong in
+v1 wire formats or remain a local storage optimization; protocol
+encryption/authenticated-Merkle semantics; physical chunk size; SQLCipher
+profile/base version; schema/volume-manifest versions; COW/link-freeze/VSS
+support matrix, native-file-ID semantics, and source-anchor state machine;
+application-consistent capture; journal/durability/checkpoint policy; and
+storage headroom.
