@@ -1087,6 +1087,10 @@ fn source_identity_name(metadata: &fs::Metadata) -> String {
 
 fn modified_parts(metadata: &fs::Metadata) -> (i64, u32) {
     let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+    system_time_parts(modified)
+}
+
+fn system_time_parts(modified: std::time::SystemTime) -> (i64, u32) {
     match modified.duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => (
             duration.as_secs().min(i64::MAX as u64) as i64,
@@ -1099,7 +1103,10 @@ fn modified_parts(metadata: &fs::Metadata) -> (i64, u32) {
                 (-seconds, 0)
             } else {
                 (
-                    -seconds.saturating_sub(1),
+                    seconds
+                        .checked_add(1)
+                        .and_then(|value| value.checked_neg())
+                        .unwrap_or(i64::MIN),
                     1_000_000_000 - duration.subsec_nanos(),
                 )
             }
@@ -1192,6 +1199,33 @@ mod tests {
         assert!(validate_relative(Path::new("good/file")).is_ok());
         assert!(validate_relative(Path::new("../escape")).is_err());
         assert!(validate_relative(Path::new("/absolute")).is_err());
+    }
+
+    #[test]
+    fn modification_times_are_normalized_across_the_unix_epoch() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        assert_eq!(system_time_parts(UNIX_EPOCH), (0, 0));
+        assert_eq!(
+            system_time_parts(UNIX_EPOCH + Duration::from_nanos(1)),
+            (0, 1)
+        );
+        assert_eq!(
+            system_time_parts(UNIX_EPOCH - Duration::from_nanos(1)),
+            (-1, 999_999_999)
+        );
+        assert_eq!(
+            system_time_parts(UNIX_EPOCH - Duration::from_millis(500)),
+            (-1, 500_000_000)
+        );
+        assert_eq!(
+            system_time_parts(UNIX_EPOCH - Duration::from_secs(1)),
+            (-1, 0)
+        );
+        assert_eq!(
+            system_time_parts(UNIX_EPOCH - Duration::new(1, 1)),
+            (-2, 999_999_999)
+        );
     }
 
     #[test]

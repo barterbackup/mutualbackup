@@ -76,23 +76,6 @@ repair, GC, and multiple parity volumes remains intentionally omitted.
 
 ## P2 — format, privacy, and authorization defects
 
-- [ ] **Compare SQL schemas without rewriting quoted literals.** The exact
-  schema validator removes whitespace and lowercases every character, including
-  string literals (`crates/mb-store/src/database.rs:1168-1201`). It therefore
-  accepts an `operations` constraint containing `'in_progress'` and
-  `'committed'` as equivalent to the required uppercase states, even though all
-  normal inserts then violate that constraint (`database.rs:1072-1079`). It
-  also ignores non-table schema objects such as triggers. Compare parsed schema
-  facts or tokenize SQL while preserving literal contents, and reject
-  unexpected behavior-bearing objects.
-
-- [ ] **Encode pre-epoch modification times correctly.** The fractional
-  pre-1970 branch computes `-(seconds.saturating_sub(1))` instead of
-  `-seconds-1` (`crates/mb-store/src/anchor.rs:895-912`). Thus `-0.5s` is stored
-  as `+0.5s`, and multiple distinct old timestamps collapse to the same value.
-  Produce the normalized signed `(seconds, nanoseconds)` pair with checked
-  arithmetic and add boundary vectors around the Unix epoch.
-
 - [ ] **Do not expose checkpoint generation through the opaque rendezvous
   wrapper.** Guild ID and checkpoint hash are now sealed, but the public
   `slot_generation` is assigned the exact checkpoint generation and recovery

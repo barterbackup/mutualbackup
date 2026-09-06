@@ -1265,22 +1265,25 @@ fn require_exact_tables(
     expected: &[(&str, &str)],
 ) -> Result<(), DatabaseError> {
     let mut statement = connection.prepare(
-        "SELECT name, sql FROM sqlite_schema
-         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        "SELECT type, name, coalesce(sql, '') FROM sqlite_schema
+         WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
     )?;
     let actual = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(1)?,
+                (row.get::<_, String>(0)?, row.get::<_, String>(2)?),
+            ))
         })?
         .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
     if actual.len() != expected.len() {
         return Err(DatabaseError::IncompatibleSchema);
     }
     for (name, sql) in expected {
-        let Some(actual_sql) = actual.get(*name) else {
+        let Some((object_type, actual_sql)) = actual.get(*name) else {
             return Err(DatabaseError::IncompatibleSchema);
         };
-        if normalize_schema_sql(actual_sql) != normalize_schema_sql(sql) {
+        if object_type != "table" || normalize_schema_sql(actual_sql) != normalize_schema_sql(sql) {
             return Err(DatabaseError::IncompatibleSchema);
         }
     }
@@ -1288,11 +1291,50 @@ fn require_exact_tables(
 }
 
 fn normalize_schema_sql(sql: &str) -> String {
-    sql.chars()
+    let mut normalized = String::with_capacity(sql.len());
+    let mut outside = String::new();
+    let mut characters = sql.chars().peekable();
+    let mut quote = None;
+    while let Some(character) = characters.next() {
+        if let Some(end_quote) = quote {
+            normalized.push(character);
+            if character == end_quote {
+                if characters.peek() == Some(&end_quote) && end_quote != ']' {
+                    normalized.push(characters.next().expect("peeked escaped quote"));
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' | '`' => {
+                append_normalized_schema_outside(&mut normalized, &outside);
+                outside.clear();
+                quote = Some(character);
+                normalized.push(character);
+            }
+            '[' => {
+                append_normalized_schema_outside(&mut normalized, &outside);
+                outside.clear();
+                quote = Some(']');
+                normalized.push(character);
+            }
+            character => outside.push(character),
+        }
+    }
+    append_normalized_schema_outside(&mut normalized, &outside);
+    normalized
+}
+
+fn append_normalized_schema_outside(normalized: &mut String, outside: &str) {
+    let outside = outside
+        .chars()
         .filter(|character| !character.is_whitespace() && *character != ';')
         .flat_map(char::to_lowercase)
         .collect::<String>()
-        .replace("ifnotexists", "")
+        .replace("ifnotexists", "");
+    normalized.push_str(&outside);
 }
 
 fn database_has_tables(connection: &Connection) -> Result<bool, DatabaseError> {
@@ -1777,6 +1819,59 @@ mod tests {
                         kind TEXT NOT NULL, record_id BLOB NOT NULL, bytes BLOB NOT NULL
                      ) STRICT;
                      DROP TABLE protocol_records_valid;",
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            ControlStore::open(&path, &keys),
+            Err(DatabaseError::IncompatibleSchema)
+        ));
+    }
+
+    #[test]
+    fn schema_comparison_preserves_check_literal_case() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([18; 32]));
+        drop(ControlStore::open(&path, &keys).unwrap());
+        {
+            let connection =
+                open_encrypted(&path, &keys.database_key(CONTROL_DATABASE_ID)).unwrap();
+            connection
+                .execute_batch(
+                    "ALTER TABLE operations RENAME TO operations_valid;
+                     CREATE TABLE operations (
+                        operation_id BLOB PRIMARY KEY CHECK(length(operation_id) = 16),
+                        kind TEXT NOT NULL,
+                        caller BLOB NOT NULL CHECK(length(caller) = 32),
+                        request_hash BLOB NOT NULL CHECK(length(request_hash) = 32),
+                        state TEXT NOT NULL CHECK(state IN ('in_progress', 'committed')),
+                        body BLOB NOT NULL
+                     ) STRICT;
+                     DROP TABLE operations_valid;",
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            ControlStore::open(&path, &keys),
+            Err(DatabaseError::IncompatibleSchema)
+        ));
+    }
+
+    #[test]
+    fn unexpected_schema_triggers_are_rejected() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([19; 32]));
+        drop(ControlStore::open(&path, &keys).unwrap());
+        {
+            let connection =
+                open_encrypted(&path, &keys.database_key(CONTROL_DATABASE_ID)).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_protocol_records
+                     BEFORE INSERT ON protocol_records
+                     BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
                 )
                 .unwrap();
         }
