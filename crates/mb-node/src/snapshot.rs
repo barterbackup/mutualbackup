@@ -579,6 +579,86 @@ pub(crate) fn publish_restore(staging: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn install_recovery_marker(
+    root: &Path,
+    marker_name: &str,
+    marker: &[u8; 32],
+) -> Result<()> {
+    let path = recovery_marker_path(root, marker_name)?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(marker)?;
+    file.sync_all()?;
+    sync_directory(root)?;
+    Ok(())
+}
+
+pub(crate) fn verify_recovery_marker(
+    root: &Path,
+    marker_name: &str,
+    expected: &[u8; 32],
+) -> Result<()> {
+    let path = recovery_marker_path(root, marker_name)?;
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != 32 {
+        bail!("restore ownership marker is not a safe regular file");
+    }
+    let mut file = open_file_no_follow(&path)?;
+    let mut actual = [0_u8; 32];
+    file.read_exact(&mut actual)?;
+    if actual != *expected {
+        bail!("restore ownership marker does not match the durable recovery job");
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_recovery_marker(
+    root: &Path,
+    marker_name: &str,
+    expected: &[u8; 32],
+) -> Result<()> {
+    let path = recovery_marker_path(root, marker_name)?;
+    if !path.exists() {
+        return Ok(());
+    }
+    verify_recovery_marker(root, marker_name, expected)?;
+    fs::remove_file(path)?;
+    sync_directory(root)?;
+    Ok(())
+}
+
+fn recovery_marker_path(root: &Path, marker_name: &str) -> Result<PathBuf> {
+    let relative = Path::new(marker_name);
+    if !marker_name.starts_with(".mutualbackup-recovery-ownership-")
+        || relative.components().count() != 1
+        || !matches!(relative.components().next(), Some(Component::Normal(_)))
+    {
+        bail!("invalid recovery ownership marker name");
+    }
+    Ok(root.join(relative))
+}
+
+#[cfg(unix)]
+fn open_file_no_follow(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    Ok(OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?)
+}
+
+#[cfg(not(unix))]
+fn open_file_no_follow(path: &Path) -> Result<File> {
+    Ok(File::open(path)?)
+}
+
 #[cfg(unix)]
 pub(crate) fn native_directory_id(path: &Path) -> Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;

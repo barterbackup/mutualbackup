@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 use crate::snapshot::{
     build_revision_restore, install_inline_recipe, install_recovered_sector_recipe,
-    native_directory_id, prepare_revision, publish_restore, render_sector,
+    install_recovery_marker, native_directory_id, prepare_revision, publish_restore,
+    remove_recovery_marker, render_sector, verify_recovery_marker,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -32,6 +33,8 @@ struct RecoveryJob {
     target: PathBuf,
     staging: PathBuf,
     staged_native_id: Option<(u64, u64)>,
+    marker_name: String,
+    ownership_marker: [u8; 32],
     state: RecoveryJobState,
 }
 
@@ -657,7 +660,7 @@ impl Node {
         let mut job = match existing {
             Some(bytes) => {
                 let job: RecoveryJob = decode_canonical(&bytes)?;
-                if job.format_version != 1
+                if job.format_version != 2
                     || job.guild_id != guild_id
                     || job.revision_id != revision.value.revision_id
                     || job.target != target
@@ -667,27 +670,60 @@ impl Node {
                 }
                 job
             }
-            None => RecoveryJob {
-                format_version: 1,
-                guild_id,
-                revision_id: revision.value.revision_id,
-                target: target.to_path_buf(),
-                staging: parent.join(format!(".mutualbackup-restore-{}", Uuid::new_v4())),
-                staged_native_id: None,
-                state: RecoveryJobState::Building,
-            },
+            None => {
+                let marker_id = Uuid::new_v4();
+                let mut ownership_marker = [0_u8; 32];
+                rand::thread_rng().fill_bytes(&mut ownership_marker);
+                RecoveryJob {
+                    format_version: 2,
+                    guild_id,
+                    revision_id: revision.value.revision_id,
+                    target: target.to_path_buf(),
+                    staging: parent.join(format!(".mutualbackup-restore-{}", Uuid::new_v4())),
+                    staged_native_id: None,
+                    marker_name: format!(".mutualbackup-recovery-ownership-{marker_id}"),
+                    ownership_marker,
+                    state: RecoveryJobState::Building,
+                }
+            }
         };
 
         if target.exists() {
+            if job.state == RecoveryJobState::Complete {
+                remove_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
+                return Ok(());
+            }
+            if job.state != RecoveryJobState::Ready {
+                anyhow::bail!("existing restore target is not owned by a publishable recovery job");
+            }
             let expected = job
                 .staged_native_id
                 .context("existing restore target is not owned by this recovery job")?;
             if native_directory_id(target)? != expected {
                 anyhow::bail!("existing restore target was created by another actor");
             }
+            verify_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
+            sync_directory(parent)?;
             job.state = RecoveryJobState::Complete;
             self.control
                 .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
+            remove_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
+            return Ok(());
+        }
+
+        if job.state == RecoveryJobState::Ready && job.staging.exists() {
+            let expected = job
+                .staged_native_id
+                .context("ready recovery job has no staged native identity")?;
+            if native_directory_id(&job.staging)? != expected {
+                anyhow::bail!("ready recovery staging directory changed unexpectedly");
+            }
+            verify_recovery_marker(&job.staging, &job.marker_name, &job.ownership_marker)?;
+            publish_restore(&job.staging, target)?;
+            job.state = RecoveryJobState::Complete;
+            self.control
+                .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
+            remove_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
             return Ok(());
         }
 
@@ -706,6 +742,7 @@ impl Node {
             &job.staging,
             &mut |sector_id| self.sector(sector_id),
         )?;
+        install_recovery_marker(&job.staging, &job.marker_name, &job.ownership_marker)?;
         job.staged_native_id = Some(native_directory_id(&job.staging)?);
         job.state = RecoveryJobState::Ready;
         self.control
@@ -714,6 +751,7 @@ impl Node {
         job.state = RecoveryJobState::Complete;
         self.control
             .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
+        remove_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
         Ok(())
     }
 
@@ -876,5 +914,72 @@ mod tests {
                 .is_err()
         );
         assert!(node.parity(&group.id, 3).is_err());
+    }
+
+    #[test]
+    fn published_restore_requires_its_durable_ownership_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([111; 32]);
+        let mut node = Node::open(temp.path().join("node"), seed.clone()).unwrap();
+        let target = temp.path().join("restored");
+        fs::create_dir(&target).unwrap();
+        let checkpoint_hash = [112; 32];
+        let guild_id = [113; 32];
+        let revision_id = Uuid::from_bytes([114; 16]);
+        let marker_name = format!(
+            ".mutualbackup-recovery-ownership-{}",
+            Uuid::from_bytes([115; 16])
+        );
+        let ownership_marker = [116; 32];
+        let job = RecoveryJob {
+            format_version: 2,
+            guild_id,
+            revision_id,
+            target: target.clone(),
+            staging: temp.path().join("staging"),
+            staged_native_id: Some(native_directory_id(&target).unwrap()),
+            marker_name: marker_name.clone(),
+            ownership_marker,
+            state: RecoveryJobState::Ready,
+        };
+        node.control
+            .put_record(
+                "recovery-job",
+                &checkpoint_hash,
+                &canonical_bytes(&job).unwrap(),
+            )
+            .unwrap();
+        let revision = SignedRecord::sign(
+            b"mutualbackup/user-revision/v1",
+            UserRevision {
+                format_version: 1,
+                guild_id,
+                cipher_profile: mb_core::V1_CIPHER_PROFILE,
+                revision_id,
+                owner: node.keys().node_id(),
+                sequence: 1,
+                parent: None,
+                metadata_sectors: Vec::new(),
+                data_sectors: Vec::new(),
+            },
+            node.keys(),
+        )
+        .unwrap();
+
+        assert!(
+            node.restore_recovered_revision(&checkpoint_hash, guild_id, &revision, &target)
+                .is_err()
+        );
+        install_recovery_marker(&target, &marker_name, &ownership_marker).unwrap();
+        node.restore_recovered_revision(&checkpoint_hash, guild_id, &revision, &target)
+            .unwrap();
+        assert!(!target.join(marker_name).exists());
+        let bytes = node
+            .control
+            .get_record("recovery-job", &checkpoint_hash)
+            .unwrap()
+            .unwrap();
+        let completed: RecoveryJob = decode_canonical(&bytes).unwrap();
+        assert_eq!(completed.state, RecoveryJobState::Complete);
     }
 }
