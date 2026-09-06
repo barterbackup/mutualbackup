@@ -186,6 +186,35 @@ impl Node {
         }
     }
 
+    pub fn configure_failure_domain(&mut self, failure_domain: &str) -> Result<()> {
+        if failure_domain.is_empty() {
+            anyhow::bail!("failure domain must not be empty");
+        }
+        let expected = self.member(failure_domain);
+        if let Some(bytes) = self.control.get_record("node-config", b"member")? {
+            let configured: Member = decode_canonical(&bytes)?;
+            if configured != expected {
+                anyhow::bail!("configured failure domain conflicts with durable node identity");
+            }
+        }
+        for bytes in self.control.checkpoint_head_certificates()? {
+            let checkpoint: QuorumCheckpoint = decode_canonical(&bytes)?;
+            checkpoint.verify()?;
+            let committed = checkpoint
+                .checkpoint
+                .members
+                .iter()
+                .find(|member| member.node_id == self.keys.node_id())
+                .context("committed checkpoint does not contain the local node")?;
+            if committed != &expected {
+                anyhow::bail!("configured failure domain conflicts with committed membership");
+            }
+        }
+        self.control
+            .put_record("node-config", b"member", &canonical_bytes(&expected)?)?;
+        Ok(())
+    }
+
     pub fn begin_coordinator_commit(
         &mut self,
         intent_id: [u8; 16],
@@ -392,6 +421,20 @@ impl Node {
     pub fn sign_checkpoint(&mut self, checkpoint: &GuildCheckpoint) -> Result<MemberSignature> {
         checkpoint.validate()?;
         self.validate_local_member(checkpoint)?;
+        let configured: Member = decode_canonical(
+            &self
+                .control
+                .get_record("node-config", b"member")?
+                .context("node failure domain has not been configured")?,
+        )?;
+        let committed = checkpoint
+            .members
+            .iter()
+            .find(|member| member.node_id == self.keys.node_id())
+            .context("checkpoint does not contain the local node")?;
+        if committed != &configured {
+            anyhow::bail!("checkpoint local membership conflicts with node configuration");
+        }
         self.validate_checkpoint_transition(checkpoint)?;
         self.validate_local_roles(checkpoint)?;
         let hash = checkpoint.hash()?;
@@ -1009,6 +1052,15 @@ mod tests {
         assert!(node.begin_coordinator_commit([1; 16], [3; 32]).is_err());
         let second = node.begin_coordinator_commit([4; 16], [2; 32]).unwrap();
         assert_ne!(second, first);
+    }
+
+    #[test]
+    fn failure_domain_is_a_durable_part_of_local_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut node = Node::open(temp.path(), Seed::from_bytes([89; 32])).unwrap();
+        node.configure_failure_domain("host-a").unwrap();
+        node.configure_failure_domain("host-a").unwrap();
+        assert!(node.configure_failure_domain("host-b").is_err());
     }
 
     #[test]

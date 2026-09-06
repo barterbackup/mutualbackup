@@ -443,7 +443,11 @@ pub async fn serve_node(node: Arc<Mutex<Node>>, config: NodeServerConfig) -> Res
         bail!("invalid node server configuration");
     }
     validate_advertised_endpoint(&config.public_endpoint)?;
-    let reader_config = node.lock().map_err(lock_error)?.reader_config();
+    let reader_config = {
+        let mut node = node.lock().map_err(lock_error)?;
+        node.configure_failure_domain(&config.failure_domain)?;
+        node.reader_config()
+    };
     let service = Arc::new(NodeService {
         writer: node,
         reader_config,

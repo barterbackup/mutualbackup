@@ -120,15 +120,11 @@ impl PrototypeGuild {
         let mut nodes = Vec::new();
         let mut members = Vec::new();
         for (index, seed) in seeds.into_iter().enumerate() {
-            let node = Arc::new(Mutex::new(Node::open(
-                root.join(format!("node-{index}")),
-                seed,
-            )?));
-            members.push(
-                node.lock()
-                    .map_err(lock_error)?
-                    .member(format!("host-{index}")),
-            );
+            let failure_domain = format!("host-{index}");
+            let mut opened = Node::open(root.join(format!("node-{index}")), seed)?;
+            opened.configure_failure_domain(&failure_domain)?;
+            members.push(opened.member(failure_domain));
+            let node = Arc::new(Mutex::new(opened));
             network.register(node.clone())?;
             nodes.push(Some(node));
         }

@@ -198,6 +198,15 @@ impl ControlStore {
         checkpoint_row(&self.connection, "checkpoint_heads", guild_id)
     }
 
+    pub fn checkpoint_head_certificates(&self) -> Result<Vec<Vec<u8>>, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT checkpoint_bytes FROM checkpoint_heads ORDER BY guild_id")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::from)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn stage_recovery_shard(
         &mut self,

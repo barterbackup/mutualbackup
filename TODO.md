@@ -8,17 +8,6 @@ repair, GC, and multiple parity volumes remains intentionally omitted.
 
 ## P0 — protection can be lost or falsely reported
 
-- [ ] **Make each signer attest its own failure-domain claim.** The coordinator
-  supplies the labels that model validation uses, but local checkpoint
-  validation compares only the node and recovery keys
-  (`crates/mb-node/src/node.rs:464-473`). `SignCheckpoint` never compares the
-  local member entry with the server's configured `failure_domain`
-  (`crates/mb-node/src/network.rs:737-744,869-874`). A buggy or malicious
-  coordinator can therefore replace co-located peers' labels with five unique
-  strings and obtain all five signatures for falsely independent storage.
-  Bind the complete local member profile into signing, and reject startup or
-  signing when a configured domain conflicts with committed local membership.
-
 ## P1 — correctness, durability, availability, and resource bounds
 
 - [ ] **Journal source capture and its database records as one recoverable
