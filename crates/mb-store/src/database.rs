@@ -475,30 +475,35 @@ impl ControlStore {
         let generation_i64 = i64::try_from(generation).map_err(|_| DatabaseError::Integrity)?;
         let transaction = self.connection.transaction()?;
         let locked = checkpoint_row(&transaction, "checkpoint_signature_locks", guild_id)?;
-        match locked {
+        let head = checkpoint_row(&transaction, "checkpoint_heads", guild_id)?;
+        match &locked {
             Some((stored_generation, stored_hash, stored_bytes))
-                if stored_generation == generation
-                    && stored_hash == *checkpoint_hash
+                if *stored_generation == generation
+                    && *stored_hash == *checkpoint_hash
                     && stored_bytes == checkpoint_bytes =>
             {
                 transaction.commit()?;
                 return Ok(());
             }
+            Some((locked_generation, locked_hash, _))
+                if !matches!(
+                    &head,
+                    Some((head_generation, head_hash, _))
+                        if (*head_generation == *locked_generation && *head_hash == *locked_hash)
+                            || *head_generation > *locked_generation
+                ) =>
+            {
+                return Err(DatabaseError::Conflict);
+            }
+            _ => {}
+        }
+        match head {
             Some((stored_generation, stored_hash, _))
                 if stored_generation.checked_add(1) == Some(generation)
                     && parent == Some(&stored_hash) => {}
             Some(_) => return Err(DatabaseError::Conflict),
-            None => {
-                let head = checkpoint_row(&transaction, "checkpoint_heads", guild_id)?;
-                match head {
-                    Some((stored_generation, stored_hash, _))
-                        if stored_generation.checked_add(1) == Some(generation)
-                            && parent == Some(&stored_hash) => {}
-                    Some(_) => return Err(DatabaseError::Conflict),
-                    None if generation == 1 && parent.is_none() => {}
-                    None => return Err(DatabaseError::Conflict),
-                }
-            }
+            None if locked.is_none() && generation == 1 && parent.is_none() => {}
+            None => return Err(DatabaseError::Conflict),
         }
         transaction.execute(
             "INSERT INTO checkpoint_signature_locks(
@@ -1340,6 +1345,43 @@ mod tests {
                 .begin_operation(&operation, "other", &caller, &request)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn checkpoint_child_waits_for_parent_finalization() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([13; 32]));
+        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let guild_id = [1; 32];
+        let first_hash = [2; 32];
+        let second_hash = [3; 32];
+        store
+            .lock_checkpoint_signature(&guild_id, 1, None, &first_hash, b"body-1")
+            .unwrap();
+        assert!(matches!(
+            store.lock_checkpoint_signature(
+                &guild_id,
+                2,
+                Some(&first_hash),
+                &second_hash,
+                b"body-2"
+            ),
+            Err(DatabaseError::Conflict)
+        ));
+        store
+            .commit_checkpoint(
+                &guild_id,
+                1,
+                None,
+                &first_hash,
+                b"body-1",
+                b"certificate-1",
+                true,
+            )
+            .unwrap();
+        store
+            .lock_checkpoint_signature(&guild_id, 2, Some(&first_hash), &second_hash, b"body-2")
+            .unwrap();
     }
 
     #[test]

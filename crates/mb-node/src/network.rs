@@ -69,6 +69,8 @@ enum PeerRequest {
         sector_id: SectorId,
     },
     PublishParity {
+        group: Box<CodingGroup>,
+        information: [Vec<u8>; 3],
         object: ParityObject,
     },
     GetParity {
@@ -151,7 +153,7 @@ impl PeerRequest {
             | Self::FinalizeCheckpoint { guild_id, .. }
             | Self::GetCheckpointPage { guild_id, .. }
             | Self::BuildRecoveryRecord { guild_id, .. } => Some(*guild_id),
-            Self::PublishParity { object } => Some(object.guild_id),
+            Self::PublishParity { object, .. } => Some(object.guild_id),
         }
     }
 }
@@ -527,8 +529,12 @@ fn execute_peer_request(
         } => Ok(PeerResponse::Bytes(
             node.sector_for_guild(&guild_id, &sector_id)?,
         )),
-        PeerRequest::PublishParity { object } => {
-            node.publish_parity(&object)?;
+        PeerRequest::PublishParity {
+            group,
+            information,
+            object,
+        } => {
+            node.publish_verified_parity(&group, &information, &object)?;
             Ok(PeerResponse::Ack)
         }
         PeerRequest::GetParity {
@@ -809,12 +815,15 @@ pub async fn commit_source_over_network(
             root: sector_root(&shards[4]),
             bytes: shards[4].clone(),
         };
+        let information = [shards[0].clone(), shards[1].clone(), shards[2].clone()];
         expect_ack(
             peer_call_expected(
                 peers[3].endpoint,
                 peers[3].profile.member.node_id,
                 coordinator_keys,
                 PeerRequest::PublishParity {
+                    group: Box::new(group.clone()),
+                    information: information.clone(),
                     object: parity_a.clone(),
                 },
             )
@@ -826,6 +835,8 @@ pub async fn commit_source_over_network(
                 peers[4].profile.member.node_id,
                 coordinator_keys,
                 PeerRequest::PublishParity {
+                    group: Box::new(group.clone()),
+                    information,
                     object: parity_b.clone(),
                 },
             )

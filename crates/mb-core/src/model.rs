@@ -5,7 +5,10 @@ use uuid::Uuid;
 
 use crate::keys::{KeyMaterial, NodeId, RecoveryPublicKey, signing_payload};
 use crate::recovery::RecoveryLocator;
-use crate::{V1_CIPHER_PROFILE, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE};
+use crate::{
+    V1_CIPHER_PROFILE, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, encode_3_2,
+    sector_root,
+};
 
 pub type SectorId = [u8; 32];
 pub type CodingGroupId = [u8; 32];
@@ -64,6 +67,49 @@ impl CodingGroup {
             self.shard_size,
             &self.roles,
         )
+    }
+
+    /// Verify that one parity shard is the declared Reed--Solomon row for the
+    /// three root-bound information shards in this descriptor.
+    pub fn verify_parity_shard(
+        &self,
+        information: &[Vec<u8>; 3],
+        shard_index: usize,
+        parity: &[u8],
+    ) -> Result<(), ModelError> {
+        validate_group_profile(self)?;
+        let ShardRole::Parity(parity_role) = self
+            .roles
+            .get(shard_index)
+            .ok_or(ModelError::InvalidCodingRelation)?
+        else {
+            return Err(ModelError::InvalidCodingRelation);
+        };
+        if shard_index < V1_RS_DATA_SHARDS as usize
+            || parity_role.row != (shard_index - V1_RS_DATA_SHARDS as usize) as u16
+            || parity.len() != self.shard_size as usize
+            || sector_root(parity) != parity_role.root
+        {
+            return Err(ModelError::InvalidCodingRelation);
+        }
+        for (role, bytes) in self.roles[..V1_RS_DATA_SHARDS as usize]
+            .iter()
+            .zip(information)
+        {
+            let ShardRole::Information(information_role) = role else {
+                return Err(ModelError::InvalidCodingRelation);
+            };
+            if bytes.len() != self.shard_size as usize
+                || sector_root(bytes) != information_role.sector.root
+            {
+                return Err(ModelError::InvalidCodingRelation);
+            }
+        }
+        let encoded = encode_3_2(information.clone())?;
+        if encoded[shard_index].as_slice() != parity {
+            return Err(ModelError::InvalidCodingRelation);
+        }
+        Ok(())
     }
 }
 
@@ -174,7 +220,7 @@ impl GuildCheckpoint {
                 if reference.logical_len == 0
                     || reference.logical_len as usize > V1_SECTOR_SIZE
                     || revision_sectors
-                        .insert(reference.id, reference.clone())
+                        .insert(reference.id, (revision.value.owner, reference.clone()))
                         .is_some()
                 {
                     return Err(ModelError::InvalidCheckpoint);
@@ -268,7 +314,10 @@ impl QuorumCheckpoint {
             )?;
             previous_signer = Some(member_signature.signer);
         }
-        let quorum = self.checkpoint.members.len() / 2 + 1;
+        // The fixed v1 slice relies on each role holder's signature as its
+        // durable-storage and coding-validation attestation. A smaller quorum
+        // could certify a group without either parity holder participating.
+        let quorum = self.checkpoint.members.len();
         if valid_signers.len() < quorum {
             return Err(ModelError::InsufficientQuorum {
                 actual: valid_signers.len(),
@@ -407,23 +456,22 @@ pub enum ModelError {
     InsufficientQuorum { actual: usize, required: usize },
     #[error("coding group assigns more than one shard to failure domain {0}")]
     ReusedFailureDomain(String),
+    #[error("parity shard does not encode the declared information shards")]
+    InvalidCodingRelation,
+    #[error("Reed--Solomon validation failed: {0}")]
+    Coding(#[from] crate::CodingError),
 }
 
 fn validate_group(
     group: &CodingGroup,
     guild_id: [u8; 32],
     failure_domains: &std::collections::BTreeMap<NodeId, &str>,
-    revision_sectors: &std::collections::BTreeMap<SectorId, SectorRef>,
+    revision_sectors: &std::collections::BTreeMap<SectorId, (NodeId, SectorRef)>,
     information_ids: &mut std::collections::BTreeSet<SectorId>,
     covered_revision_sectors: &mut std::collections::BTreeSet<SectorId>,
 ) -> Result<(), ModelError> {
-    if group.format_version != 1
-        || group.guild_id != guild_id
-        || group.data_shards != V1_RS_DATA_SHARDS
-        || group.parity_shards != V1_RS_PARITY_SHARDS
-        || group.shard_size as usize != V1_SECTOR_SIZE
-        || group.calculate_id()? != group.id
-    {
+    validate_group_profile(group)?;
+    if group.guild_id != guild_id {
         return Err(ModelError::InvalidCheckpoint);
     }
     let mut used_domains = std::collections::BTreeSet::new();
@@ -437,8 +485,9 @@ fn validate_group(
                 if !information_ids.insert(information.sector.id) {
                     return Err(ModelError::InvalidCheckpoint);
                 }
-                if let Some(reference) = revision_sectors.get(&information.sector.id) {
-                    if reference != &information.sector
+                if let Some((owner, reference)) = revision_sectors.get(&information.sector.id) {
+                    if *owner != information.owner
+                        || reference != &information.sector
                         || !covered_revision_sectors.insert(information.sector.id)
                     {
                         return Err(ModelError::InvalidCheckpoint);
@@ -464,6 +513,29 @@ fn validate_group(
     }
     if covered_in_group == 0 {
         return Err(ModelError::InvalidCheckpoint);
+    }
+    Ok(())
+}
+
+fn validate_group_profile(group: &CodingGroup) -> Result<(), ModelError> {
+    if group.format_version != 1
+        || group.data_shards != V1_RS_DATA_SHARDS
+        || group.parity_shards != V1_RS_PARITY_SHARDS
+        || group.shard_size as usize != V1_SECTOR_SIZE
+        || group.calculate_id()? != group.id
+    {
+        return Err(ModelError::InvalidCheckpoint);
+    }
+    for (index, role) in group.roles.iter().enumerate() {
+        match role {
+            ShardRole::Information(information)
+                if index < V1_RS_DATA_SHARDS as usize
+                    && information.sector.logical_len as usize <= V1_SECTOR_SIZE => {}
+            ShardRole::Parity(parity)
+                if index >= V1_RS_DATA_SHARDS as usize
+                    && parity.row == (index - V1_RS_DATA_SHARDS as usize) as u16 => {}
+            _ => return Err(ModelError::InvalidCheckpoint),
+        }
     }
     Ok(())
 }
@@ -589,7 +661,9 @@ mod tests {
             checkpoint.verify(),
             Err(ModelError::InsufficientQuorum { .. })
         ));
-        checkpoint.add_signature(&keys[2]).unwrap();
+        for key in keys.iter().skip(2) {
+            checkpoint.add_signature(key).unwrap();
+        }
         checkpoint.verify().unwrap();
 
         let locator = RecoveryLocator {
@@ -602,11 +676,6 @@ mod tests {
             endpoints: vec!["tcp://127.0.0.1:1".to_owned()],
             expires_at_unix_seconds: u64::MAX,
         };
-        assert!(matches!(
-            checkpoint.validate_recovery_authority(&keys[4], &locator, keys[0].node_id()),
-            Err(ModelError::InvalidRecoveryAuthority)
-        ));
-        checkpoint.add_signature(&keys[4]).unwrap();
         checkpoint
             .validate_recovery_authority(&keys[4], &locator, keys[0].node_id())
             .unwrap();
@@ -618,21 +687,108 @@ mod tests {
         for key in keys.iter().take(3) {
             eclipse.add_signature(key).unwrap();
         }
-        eclipse.verify().unwrap();
-        let eclipse_locator = RecoveryLocator {
-            checkpoint_hash: eclipse.hash().unwrap(),
-            checkpoint_generation: u64::MAX,
-            ..locator.clone()
-        };
         assert!(matches!(
-            eclipse.validate_recovery_authority(&keys[4], &eclipse_locator, keys[0].node_id()),
-            Err(ModelError::InvalidRecoveryAuthority)
+            eclipse.verify(),
+            Err(ModelError::InsufficientQuorum { .. })
+        ));
+
+        let mut wrong_owner = checkpoint.checkpoint.clone();
+        let group = &mut wrong_owner.coding_groups[0];
+        let (left, right) = group.roles.split_at_mut(1);
+        let ShardRole::Information(first) = &mut left[0] else {
+            unreachable!();
+        };
+        let ShardRole::Information(second) = &mut right[0] else {
+            unreachable!();
+        };
+        std::mem::swap(&mut first.owner, &mut second.owner);
+        group.id = group.calculate_id().unwrap();
+        assert!(matches!(
+            wrong_owner.validate(),
+            Err(ModelError::InvalidCheckpoint)
         ));
 
         checkpoint.checkpoint.members[4].failure_domain = "host-3".to_owned();
         assert!(matches!(
             checkpoint.verify(),
             Err(ModelError::ReusedFailureDomain(_))
+        ));
+    }
+
+    #[test]
+    fn coding_group_verifies_the_parity_equation() {
+        let keys = (0_u8..5)
+            .map(|value| KeyMaterial::from_seed(&Seed::from_bytes([value + 20; 32])))
+            .collect::<Vec<_>>();
+        let information = [
+            vec![1; V1_SECTOR_SIZE],
+            vec![2; V1_SECTOR_SIZE],
+            vec![3; V1_SECTOR_SIZE],
+        ];
+        let encoded = encode_3_2(information.clone()).unwrap();
+        let roles = [
+            ShardRole::Information(InformationRole {
+                owner: keys[0].node_id(),
+                sector: SectorRef {
+                    id: [1; 32],
+                    root: sector_root(&information[0]),
+                    logical_len: 1,
+                },
+            }),
+            ShardRole::Information(InformationRole {
+                owner: keys[1].node_id(),
+                sector: SectorRef {
+                    id: [2; 32],
+                    root: sector_root(&information[1]),
+                    logical_len: 1,
+                },
+            }),
+            ShardRole::Information(InformationRole {
+                owner: keys[2].node_id(),
+                sector: SectorRef {
+                    id: [3; 32],
+                    root: sector_root(&information[2]),
+                    logical_len: 1,
+                },
+            }),
+            ShardRole::Parity(ParityRole {
+                holder: keys[3].node_id(),
+                row: 0,
+                root: sector_root(&encoded[3]),
+            }),
+            ShardRole::Parity(ParityRole {
+                holder: keys[4].node_id(),
+                row: 1,
+                root: sector_root(&encoded[4]),
+            }),
+        ];
+        let mut group = CodingGroup {
+            id: [0; 32],
+            format_version: 1,
+            guild_id: [9; 32],
+            data_shards: V1_RS_DATA_SHARDS,
+            parity_shards: V1_RS_PARITY_SHARDS,
+            shard_size: V1_SECTOR_SIZE as u32,
+            roles,
+        };
+        group.id = group.calculate_id().unwrap();
+        group
+            .verify_parity_shard(&information, 3, &encoded[3])
+            .unwrap();
+        group
+            .verify_parity_shard(&information, 4, &encoded[4])
+            .unwrap();
+        let mut invalid = encoded[3].clone();
+        invalid[0] ^= 1;
+        let mut invalid_group = group.clone();
+        let ShardRole::Parity(invalid_role) = &mut invalid_group.roles[3] else {
+            unreachable!();
+        };
+        invalid_role.root = sector_root(&invalid);
+        invalid_group.id = invalid_group.calculate_id().unwrap();
+        assert!(matches!(
+            invalid_group.verify_parity_shard(&information, 3, &invalid),
+            Err(ModelError::InvalidCodingRelation)
         ));
     }
 }

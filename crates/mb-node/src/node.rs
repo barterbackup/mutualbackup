@@ -121,8 +121,52 @@ impl Node {
         render_sector(&self.control, &self.keys, sector_id, Some(guild_id))
     }
 
-    pub fn publish_parity(&mut self, object: &ParityObject) -> Result<()> {
+    pub fn publish_verified_parity(
+        &mut self,
+        group: &mb_core::CodingGroup,
+        information: &[Vec<u8>; 3],
+        object: &ParityObject,
+    ) -> Result<()> {
+        self.validate_parity_assignment(group, object)?;
+        group.verify_parity_shard(information, object.shard_index as usize, &object.bytes)?;
+        self.publish_validated_parity(group, object)
+    }
+
+    fn publish_validated_parity(
+        &mut self,
+        group: &mb_core::CodingGroup,
+        object: &ParityObject,
+    ) -> Result<()> {
         self.parity.stage_and_publish(object)?;
+        self.control.put_record(
+            "local-parity-proof",
+            &parity_proof_id(&group.id, object.shard_index),
+            &canonical_bytes(group)?,
+        )?;
+        Ok(())
+    }
+
+    fn validate_parity_assignment(
+        &self,
+        group: &mb_core::CodingGroup,
+        object: &ParityObject,
+    ) -> Result<()> {
+        let ShardRole::Parity(role) = group
+            .roles
+            .get(object.shard_index as usize)
+            .context("parity shard index is out of range")?
+        else {
+            anyhow::bail!("parity object is assigned to an information role");
+        };
+        if group.calculate_id()? != group.id
+            || group.guild_id != object.guild_id
+            || group.format_version != object.format_version
+            || group.id != object.group_id
+            || role.holder != self.keys.node_id()
+            || role.root != object.root
+        {
+            anyhow::bail!("parity object does not match its local coding-group assignment");
+        }
         Ok(())
     }
 
@@ -330,7 +374,8 @@ impl Node {
                     ShardRole::Information(information)
                         if information.owner == self.keys.node_id() =>
                     {
-                        let bytes = self.sector(&information.sector.id)?;
+                        let bytes =
+                            self.sector_for_guild(&checkpoint.guild_id, &information.sector.id)?;
                         if bytes.len() != group.shard_size as usize
                             || sector_root(&bytes) != information.sector.root
                         {
@@ -339,9 +384,17 @@ impl Node {
                     }
                     ShardRole::Parity(parity) if parity.holder == self.keys.node_id() => {
                         let object = self.parity.load_ready(&group.id, index as u8)?;
+                        let proof = self
+                            .control
+                            .get_record(
+                                "local-parity-proof",
+                                &parity_proof_id(&group.id, index as u8),
+                            )?
+                            .context("local parity coding proof is unavailable")?;
                         if object.format_version != group.format_version
                             || object.guild_id != checkpoint.guild_id
                             || object.root != parity.root
+                            || proof != canonical_bytes(group)?
                         {
                             anyhow::bail!("local parity shard is not durable");
                         }
@@ -450,14 +503,16 @@ impl Node {
                             index as u8,
                             &parity.root,
                         )?;
-                        self.publish_parity(&ParityObject {
+                        let object = ParityObject {
                             format_version: group.format_version,
                             guild_id: checkpoint.checkpoint.guild_id,
                             group_id: group.id,
                             shard_index: index as u8,
                             root: parity.root,
                             bytes,
-                        })?;
+                        };
+                        self.validate_parity_assignment(group, &object)?;
+                        self.publish_validated_parity(group, &object)?;
                     }
                     _ => {}
                 }
@@ -609,6 +664,13 @@ impl Node {
     }
 }
 
+fn parity_proof_id(group_id: &[u8; 32], shard_index: u8) -> [u8; 33] {
+    let mut id = [0_u8; 33];
+    id[..32].copy_from_slice(group_id);
+    id[32] = shard_index;
+    id
+}
+
 fn open_data_dir_lock(data_dir: &Path) -> Result<File> {
     use fs2::FileExt;
 
@@ -658,5 +720,82 @@ mod tests {
         assert!(Node::open(temp.path(), Seed::from_bytes([91; 32])).is_err());
         drop(first);
         Node::open(temp.path(), Seed::from_bytes([91; 32])).unwrap();
+    }
+
+    #[test]
+    fn parity_publication_requires_the_declared_rs_equation() {
+        let temp = tempfile::tempdir().unwrap();
+        let identities = (0_u8..5)
+            .map(|value| KeyMaterial::from_seed(&Seed::from_bytes([value + 92; 32])).node_id())
+            .collect::<Vec<_>>();
+        let mut node = Node::open(temp.path(), Seed::from_bytes([95; 32])).unwrap();
+        assert_eq!(node.keys().node_id(), identities[3]);
+        let information = [
+            vec![1; mb_core::V1_SECTOR_SIZE],
+            vec![2; mb_core::V1_SECTOR_SIZE],
+            vec![3; mb_core::V1_SECTOR_SIZE],
+        ];
+        let encoded = mb_core::encode_3_2(information.clone()).unwrap();
+        let mut invalid_parity = encoded[3].clone();
+        invalid_parity[0] ^= 1;
+        let roles = [
+            ShardRole::Information(mb_core::InformationRole {
+                owner: identities[0],
+                sector: SectorRef {
+                    id: [1; 32],
+                    root: sector_root(&information[0]),
+                    logical_len: 1,
+                },
+            }),
+            ShardRole::Information(mb_core::InformationRole {
+                owner: identities[1],
+                sector: SectorRef {
+                    id: [2; 32],
+                    root: sector_root(&information[1]),
+                    logical_len: 1,
+                },
+            }),
+            ShardRole::Information(mb_core::InformationRole {
+                owner: identities[2],
+                sector: SectorRef {
+                    id: [3; 32],
+                    root: sector_root(&information[2]),
+                    logical_len: 1,
+                },
+            }),
+            ShardRole::Parity(mb_core::ParityRole {
+                holder: identities[3],
+                row: 0,
+                root: sector_root(&invalid_parity),
+            }),
+            ShardRole::Parity(mb_core::ParityRole {
+                holder: identities[4],
+                row: 1,
+                root: sector_root(&encoded[4]),
+            }),
+        ];
+        let mut group = mb_core::CodingGroup {
+            id: [0; 32],
+            format_version: 1,
+            guild_id: [7; 32],
+            data_shards: mb_core::V1_RS_DATA_SHARDS,
+            parity_shards: mb_core::V1_RS_PARITY_SHARDS,
+            shard_size: mb_core::V1_SECTOR_SIZE as u32,
+            roles,
+        };
+        group.id = group.calculate_id().unwrap();
+        let object = ParityObject {
+            format_version: 1,
+            guild_id: group.guild_id,
+            group_id: group.id,
+            shard_index: 3,
+            root: sector_root(&invalid_parity),
+            bytes: invalid_parity,
+        };
+        assert!(
+            node.publish_verified_parity(&group, &information, &object)
+                .is_err()
+        );
+        assert!(node.parity(&group.id, 3).is_err());
     }
 }

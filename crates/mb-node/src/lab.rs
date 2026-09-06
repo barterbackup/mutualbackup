@@ -237,14 +237,15 @@ impl PrototypeGuild {
                 root: sector_root(&shards[4]),
                 bytes: shards[4].clone(),
             };
+            let information = [shards[0].clone(), shards[1].clone(), shards[2].clone()];
             self.live_node(role_indices[3])?
                 .lock()
                 .map_err(lock_error)?
-                .publish_parity(&parity_a)?;
+                .publish_verified_parity(&group, &information, &parity_a)?;
             self.live_node(role_indices[4])?
                 .lock()
                 .map_err(lock_error)?
-                .publish_parity(&parity_b)?;
+                .publish_verified_parity(&group, &information, &parity_b)?;
             groups.push(group);
         }
 
