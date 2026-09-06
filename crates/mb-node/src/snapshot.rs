@@ -40,7 +40,7 @@ pub enum PrivateEntry {
         logical_len: u64,
         modified_secs: i64,
         modified_nanos: u32,
-        native_id: NativeFileId,
+        link_group: u64,
         data_extents: Vec<PrivateDataExtent>,
     },
 }
@@ -148,7 +148,8 @@ pub(crate) fn prepare_revision(
     let mut private_entries = Vec::new();
     let mut recipe_records = Vec::with_capacity(256);
     let mut ordinal = 0_u64;
-    let mut prepared_links = BTreeMap::<NativeFileId, Vec<PrivateDataExtent>>::new();
+    let mut prepared_links = BTreeMap::<NativeFileId, (u64, Vec<PrivateDataExtent>)>::new();
+    let mut next_link_group = 0_u64;
 
     for entry in &anchor.manifest.entries {
         match entry {
@@ -220,34 +221,39 @@ pub(crate) fn prepare_revision(
                 native_id,
                 data_extents,
             } => {
-                let private_extents = if let Some(existing) = prepared_links.get(native_id) {
-                    existing.clone()
-                } else {
-                    let locator = anchor.manifest.file_locator(path.clone())?;
-                    let extents = prepare_sparse_file(
-                        control,
-                        &mut recipe_records,
-                        keys,
-                        guild_id,
-                        revision_id,
-                        &mut ordinal,
-                        &locator,
-                        *logical_len,
-                        data_extents,
-                    )?;
-                    for extent in &extents {
-                        data_references.extend(extent.sectors.iter().cloned());
-                    }
-                    prepared_links.insert(*native_id, extents.clone());
-                    extents
-                };
+                let (link_group, private_extents) =
+                    if let Some(existing) = prepared_links.get(native_id) {
+                        existing.clone()
+                    } else {
+                        let locator = anchor.manifest.file_locator(path.clone())?;
+                        let extents = prepare_sparse_file(
+                            control,
+                            &mut recipe_records,
+                            keys,
+                            guild_id,
+                            revision_id,
+                            &mut ordinal,
+                            &locator,
+                            *logical_len,
+                            data_extents,
+                        )?;
+                        for extent in &extents {
+                            data_references.extend(extent.sectors.iter().cloned());
+                        }
+                        let link_group = next_link_group;
+                        next_link_group = next_link_group
+                            .checked_add(1)
+                            .context("too many hard-link groups in one revision")?;
+                        prepared_links.insert(*native_id, (link_group, extents.clone()));
+                        (link_group, extents)
+                    };
                 private_entries.push(PrivateEntry::FileV2 {
                     path: path.clone(),
                     mode: *mode,
                     logical_len: *logical_len,
                     modified_secs: *modified_secs,
                     modified_nanos: *modified_nanos,
-                    native_id: *native_id,
+                    link_group,
                     data_extents: private_extents,
                 });
             }
@@ -570,8 +576,8 @@ fn validate_recovered_manifest(
     if captured.len() != manifest.entries.len() {
         bail!("recovered anchor contains duplicate paths");
     }
-    let mut signed_to_captured = BTreeMap::<NativeFileId, NativeFileId>::new();
-    let mut captured_to_signed = BTreeMap::<NativeFileId, NativeFileId>::new();
+    let mut signed_to_captured = BTreeMap::<u64, NativeFileId>::new();
+    let mut captured_to_signed = BTreeMap::<NativeFileId, u64>::new();
     for entry in &metadata.entries {
         let path = private_entry_path(entry);
         let actual = captured
@@ -619,7 +625,7 @@ fn validate_recovered_manifest(
                     logical_len,
                     modified_secs,
                     modified_nanos,
-                    native_id,
+                    link_group,
                     data_extents,
                     ..
                 },
@@ -645,11 +651,11 @@ fn validate_recovered_manifest(
                     .eq(actual_extents.iter().cloned()) =>
             {
                 if signed_to_captured
-                    .insert(*native_id, *actual_native_id)
+                    .insert(*link_group, *actual_native_id)
                     .is_some_and(|previous| previous != *actual_native_id)
                     || captured_to_signed
-                        .insert(*actual_native_id, *native_id)
-                        .is_some_and(|previous| previous != *native_id)
+                        .insert(*actual_native_id, *link_group)
+                        .is_some_and(|previous| previous != *link_group)
                 {
                     bail!("recovered anchor does not preserve signed hard-link groups");
                 }
@@ -1002,7 +1008,7 @@ where
     F: FnMut(&SectorId) -> Result<Vec<u8>>,
 {
     let mut directory_metadata = Vec::new();
-    let mut restored_links = BTreeMap::<NativeFileId, RestoredLink>::new();
+    let mut restored_links = BTreeMap::<u64, RestoredLink>::new();
     for entry in &metadata.entries {
         match entry {
             PrivateEntry::Directory {
@@ -1048,14 +1054,14 @@ where
                 logical_len,
                 modified_secs,
                 modified_nanos,
-                native_id,
+                link_group,
                 data_extents,
             } => {
                 let destination = safe_join(staging, path)?;
                 if let Some(parent) = destination.parent() {
                     create_private_dir(parent)?;
                 }
-                if let Some(existing) = restored_links.get(native_id) {
+                if let Some(existing) = restored_links.get(link_group) {
                     if existing.mode != *mode
                         || existing.logical_len != *logical_len
                         || existing.modified_secs != *modified_secs
@@ -1082,7 +1088,7 @@ where
                         *modified_nanos,
                     )?;
                     restored_links.insert(
-                        *native_id,
+                        *link_group,
                         RestoredLink {
                             path: destination,
                             mode: *mode,
