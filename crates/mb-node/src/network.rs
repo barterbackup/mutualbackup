@@ -34,6 +34,7 @@ const MAX_DIRECTORY_SUBJECTS: usize = 100_000;
 const MAX_PUBLISHERS_PER_SUBJECT: usize = 64;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(2);
 const BODY_TIMEOUT: Duration = Duration::from_secs(10);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const PEER_REQUEST_DOMAIN: &[u8] = b"mutualbackup/direct-request/v2";
 const PEER_RESPONSE_DOMAIN: &[u8] = b"mutualbackup/direct-response/v2";
 const DIRECTORY_RECORD_DOMAIN: &[u8] = b"mutualbackup/directory-record/v1";
@@ -288,6 +289,19 @@ impl NodeService {
     }
 }
 
+fn directory_records_fit(
+    publishers: &PublisherRecords,
+    candidate: &SignedRecord<PublishedRecoveryRecord>,
+) -> Result<bool> {
+    let mut records = publishers
+        .iter()
+        .filter(|(publisher, _)| **publisher != candidate.value.publisher)
+        .map(|(_, record)| record.clone())
+        .collect::<Vec<_>>();
+    records.push(candidate.clone());
+    Ok(canonical_bytes(&DirectoryResponse::Records(records))?.len() <= MAX_DIRECTORY_FRAME_BYTES)
+}
+
 pub async fn serve_node(node: Arc<Mutex<Node>>, config: NodeServerConfig) -> Result<()> {
     if config.failure_domain.is_empty() || config.max_connections == 0 {
         bail!("invalid node server configuration");
@@ -378,14 +392,27 @@ pub async fn serve_directory(listen: SocketAddr, state: DirectoryState) -> Resul
                                             }
                                             _ => true,
                                         };
-                                        if accepted {
-                                            publishers.insert(record.value.publisher, record);
-                                            DirectoryResponse::Ack
-                                        } else {
+                                        if !accepted {
                                             DirectoryResponse::Error(
                                                 "recovery record would roll back or fork publisher state"
                                                     .to_owned(),
                                             )
+                                        } else {
+                                            match directory_records_fit(publishers, &record) {
+                                                Ok(true) => {
+                                                    publishers
+                                                        .insert(record.value.publisher, record);
+                                                    DirectoryResponse::Ack
+                                                }
+                                                Ok(false) => DirectoryResponse::Error(
+                                                    "recovery records exceed the lookup response limit"
+                                                        .to_owned(),
+                                                ),
+                                                Err(_) => DirectoryResponse::Error(
+                                                    "recovery record is not canonically encodable"
+                                                        .to_owned(),
+                                                ),
+                                            }
                                         }
                                     }
                                 }
@@ -408,7 +435,7 @@ pub async fn serve_directory(listen: SocketAddr, state: DirectoryState) -> Resul
                 Err(error) => DirectoryResponse::Error(error.to_string()),
             };
             if let Err(error) =
-                write_frame_limited(&mut stream, &response, MAX_DIRECTORY_FRAME_BYTES).await
+                write_frame_timed(&mut stream, &response, MAX_DIRECTORY_FRAME_BYTES).await
             {
                 tracing::warn!(%error, "directory response failed");
             }
@@ -428,7 +455,7 @@ async fn handle_peer_connection(
         tokio::task::spawn_blocking(move || process_peer_request(service, &config, signed))
             .await
             .context("peer request worker panicked")??;
-    write_frame_limited(&mut stream, &signed_response, MAX_PEER_FRAME_BYTES).await?;
+    write_frame_timed(&mut stream, &signed_response, MAX_PEER_FRAME_BYTES).await?;
     Ok(())
 }
 
@@ -1217,20 +1244,19 @@ pub async fn recover_over_network(
         .revisions
         .iter()
         .filter(|revision| revision.value.owner == local_node_id)
-        .max_by_key(|revision| revision.value.sequence);
-    let revision = revision.cloned();
+        .max_by_key(|revision| revision.value.sequence)
+        .cloned()
+        .context("the recovered storage-only member has no user revision to restore")?;
     let checkpoint_for_worker = checkpoint.clone();
     let restore_target = restore_target.to_path_buf();
     recovered_node = run_node_blocking(recovered_node, move |node| {
         node.install_recovered_checkpoint(&checkpoint_for_worker)?;
-        if let Some(revision) = revision.as_ref() {
-            node.restore_recovered_revision(
-                &checkpoint_hash,
-                checkpoint_for_worker.checkpoint.guild_id,
-                revision,
-                &restore_target,
-            )?;
-        }
+        node.restore_recovered_revision(
+            &checkpoint_hash,
+            checkpoint_for_worker.checkpoint.guild_id,
+            &revision,
+            &restore_target,
+        )?;
         Ok(())
     })
     .await?;
@@ -1622,6 +1648,16 @@ async fn write_frame_limited<W: AsyncWrite + Unpin, T: Serialize>(
     Ok(())
 }
 
+async fn write_frame_timed<W: AsyncWrite + Unpin, T: Serialize>(
+    writer: &mut W,
+    value: &T,
+    limit: usize,
+) -> Result<()> {
+    tokio::time::timeout(WRITE_TIMEOUT, write_frame_limited(writer, value, limit))
+        .await
+        .context("protocol frame write timed out")?
+}
+
 async fn read_frame_timed<R: AsyncRead + Unpin, T: DeserializeOwned>(
     reader: &mut R,
     limit: usize,
@@ -1813,6 +1849,66 @@ mod tests {
         assert_eq!(records[0].value.checkpoint_generation, 2);
         assert_eq!(records[0].value.checkpoint_hash, [2; 32]);
         task.abort();
+    }
+
+    #[test]
+    fn directory_admission_keeps_every_lookup_frame_encodable() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([63; 32]));
+        let subject = NodeId([64; 32]);
+        let make_record = |ciphertext_len| {
+            SignedRecord::sign(
+                DIRECTORY_RECORD_DOMAIN,
+                PublishedRecoveryRecord {
+                    format_version: 1,
+                    subject,
+                    publisher: keys.node_id(),
+                    guild_id: [65; 32],
+                    checkpoint_hash: [66; 32],
+                    checkpoint_generation: 1,
+                    expires_at_unix_seconds: u64::MAX,
+                    sealed: SealedRecoveryRecord {
+                        format_version: 1,
+                        ephemeral_public_key: [67; 32],
+                        nonce: [68; 24],
+                        ciphertext: vec![69; ciphertext_len],
+                    },
+                },
+                &keys,
+            )
+            .unwrap()
+        };
+        let mut low = 0_usize;
+        let mut high = MAX_DIRECTORY_RECORD_BYTES;
+        while low < high {
+            let midpoint = (low + high).div_ceil(2);
+            if canonical_bytes(&make_record(midpoint)).unwrap().len() <= MAX_DIRECTORY_RECORD_BYTES
+            {
+                low = midpoint;
+            } else {
+                high = midpoint - 1;
+            }
+        }
+        let base = make_record(low);
+        let mut publishers = PublisherRecords::new();
+        for value in 0_u8..63 {
+            let mut record = base.clone();
+            record.signer = NodeId([value; 32]);
+            record.value.publisher = record.signer;
+            assert!(directory_records_fit(&publishers, &record).unwrap());
+            publishers.insert(record.signer, record);
+        }
+        let mut last = base;
+        last.signer = NodeId([255; 32]);
+        last.value.publisher = last.signer;
+        assert!(!directory_records_fit(&publishers, &last).unwrap());
+        assert!(
+            canonical_bytes(&DirectoryResponse::Records(
+                publishers.into_values().collect()
+            ))
+            .unwrap()
+            .len()
+                <= MAX_DIRECTORY_FRAME_BYTES
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

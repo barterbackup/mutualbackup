@@ -159,6 +159,7 @@ impl GuildCheckpoint {
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.format_version != 1
             || self.generation == 0
+            || self.generation > i64::MAX as u64
             || (self.generation == 1) != self.parent.is_none()
             || self.members.len() != 5
             || self.revisions.is_empty()
@@ -765,13 +766,9 @@ mod tests {
         let mut eclipse = checkpoint.clone();
         eclipse.checkpoint.generation = u64::MAX;
         eclipse.checkpoint.parent = Some([99; 32]);
-        eclipse.signatures.clear();
-        for key in keys.iter().take(3) {
-            eclipse.add_signature(key).unwrap();
-        }
         assert!(matches!(
             eclipse.verify(),
-            Err(ModelError::InsufficientQuorum { .. })
+            Err(ModelError::InvalidCheckpoint)
         ));
 
         let mut wrong_owner = checkpoint.checkpoint.clone();
