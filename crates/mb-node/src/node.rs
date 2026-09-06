@@ -15,7 +15,8 @@ use uuid::Uuid;
 use crate::snapshot::{
     build_revision_restore, install_inline_recipe, install_recovered_sector_recipe,
     install_recovery_marker, native_directory_id, prepare_revision, publish_restore,
-    remove_recovery_marker, render_sector, verify_recovery_marker,
+    reanchor_recovered_revision, remove_recovery_marker, render_sector,
+    restore_signed_root_metadata, verify_recovery_marker,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -188,6 +189,11 @@ impl Node {
 
     pub fn sector_for_guild(&self, guild_id: &[u8; 32], sector_id: &SectorId) -> Result<Vec<u8>> {
         render_sector(&self.control, &self.keys, sector_id, Some(guild_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_sector_is_inline(&self, sector_id: &SectorId) -> Result<bool> {
+        crate::snapshot::local_recipe_is_inline(&self.control, sector_id)
     }
 
     pub fn publish_verified_parity(
@@ -690,8 +696,14 @@ impl Node {
 
         if target.exists() {
             if job.state == RecoveryJobState::Complete {
-                remove_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
-                return Ok(());
+                self.finish_recovery_marker(&job, revision, target)?;
+                return reanchor_recovered_revision(
+                    &mut self.control,
+                    &self.keys,
+                    guild_id,
+                    revision,
+                    target,
+                );
             }
             if job.state != RecoveryJobState::Ready {
                 anyhow::bail!("existing restore target is not owned by a publishable recovery job");
@@ -707,8 +719,14 @@ impl Node {
             job.state = RecoveryJobState::Complete;
             self.control
                 .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
-            remove_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
-            return Ok(());
+            self.finish_recovery_marker(&job, revision, target)?;
+            return reanchor_recovered_revision(
+                &mut self.control,
+                &self.keys,
+                guild_id,
+                revision,
+                target,
+            );
         }
 
         if job.state == RecoveryJobState::Ready && job.staging.exists() {
@@ -723,8 +741,14 @@ impl Node {
             job.state = RecoveryJobState::Complete;
             self.control
                 .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
-            remove_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
-            return Ok(());
+            self.finish_recovery_marker(&job, revision, target)?;
+            return reanchor_recovered_revision(
+                &mut self.control,
+                &self.keys,
+                guild_id,
+                revision,
+                target,
+            );
         }
 
         if job.staging.exists() {
@@ -751,7 +775,26 @@ impl Node {
         job.state = RecoveryJobState::Complete;
         self.control
             .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
-        remove_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
+        self.finish_recovery_marker(&job, revision, target)?;
+        reanchor_recovered_revision(&mut self.control, &self.keys, guild_id, revision, target)
+    }
+
+    fn finish_recovery_marker(
+        &self,
+        job: &RecoveryJob,
+        revision: &SignedRecord<UserRevision>,
+        target: &Path,
+    ) -> Result<()> {
+        let removed = remove_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
+        if removed && !revision.value.metadata_sectors.is_empty() {
+            restore_signed_root_metadata(
+                &self.control,
+                &self.keys,
+                job.guild_id,
+                revision,
+                target,
+            )?;
+        }
         Ok(())
     }
 

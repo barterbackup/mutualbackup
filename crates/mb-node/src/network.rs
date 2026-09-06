@@ -1733,6 +1733,20 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(recovered.keys().node_id(), coordinator_keys.node_id());
+        let recovered_checkpoint = recovered.checkpoint(&first_commit.checkpoint_hash).unwrap();
+        let recovered_revision = recovered_checkpoint
+            .checkpoint
+            .revisions
+            .iter()
+            .find(|revision| revision.value.owner == recovered.keys().node_id())
+            .unwrap();
+        assert!(
+            recovered_revision
+                .value
+                .data_sectors
+                .iter()
+                .all(|sector| !recovered.local_sector_is_inline(&sector.id).unwrap())
+        );
         assert_eq!(
             fs::read(restored.join("payload")).unwrap(),
             vec![0x5a; 150_000]
@@ -1766,6 +1780,13 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(
+            recovered_revision
+                .value
+                .data_sectors
+                .iter()
+                .all(|sector| !recovered.local_sector_is_inline(&sector.id).unwrap())
+        );
         assert_eq!(
             fs::read(restored.join("payload")).unwrap(),
             vec![0x5a; 150_000]

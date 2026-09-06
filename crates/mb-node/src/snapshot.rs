@@ -16,6 +16,8 @@ use mb_store::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+type RecordWrite = (String, Vec<u8>, Vec<u8>);
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PrivateEntry {
     Directory {
@@ -324,7 +326,7 @@ pub(crate) fn prepare_revision(
 #[allow(clippy::too_many_arguments)]
 fn prepare_sparse_file(
     control: &mut ControlStore,
-    recipe_records: &mut Vec<(String, Vec<u8>, Vec<u8>)>,
+    recipe_records: &mut Vec<RecordWrite>,
     keys: &KeyMaterial,
     guild_id: [u8; 32],
     revision_id: Uuid,
@@ -400,7 +402,7 @@ fn validate_file_extents(
 
 fn queue_recipe(
     control: &mut ControlStore,
-    records: &mut Vec<(String, Vec<u8>, Vec<u8>)>,
+    records: &mut Vec<RecordWrite>,
     recipe: LocalSectorRecipe,
 ) -> Result<()> {
     records.push((
@@ -453,6 +455,313 @@ pub(crate) fn install_recovered_sector_recipe(
     install_inline_recipe(control, guild_id, reference, plaintext)
 }
 
+pub(crate) fn reanchor_recovered_revision(
+    control: &mut ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+    restored_root: &Path,
+) -> Result<()> {
+    revision.verify(b"mutualbackup/user-revision/v1")?;
+    if revision.signer != keys.node_id()
+        || revision.value.owner != keys.node_id()
+        || revision.value.guild_id != guild_id
+    {
+        bail!("recovered revision does not belong to the local seed and guild");
+    }
+    if revision.value.data_sectors.is_empty() {
+        return Ok(());
+    }
+    let metadata = load_private_metadata(control, keys, guild_id, revision)?;
+    let existing = control.get_record("anchor-manifest", revision.value.revision_id.as_bytes())?;
+    let mut pending = None;
+    let manifest = if let Some(bytes) = existing {
+        decode_canonical::<mb_store::StableAnchorManifest>(&bytes)?
+    } else {
+        let anchor = PendingAnchor {
+            manifest: ReflinkAnchor::capture(restored_root)
+                .context("capture recovered source anchor")?,
+            committed: false,
+        };
+        let manifest = anchor.manifest.clone();
+        pending = Some(anchor);
+        manifest
+    };
+    if manifest.format_version != 2 {
+        bail!("unsupported recovered anchor manifest version");
+    }
+    validate_recovered_manifest(&metadata, &manifest)?;
+    let mut recipes = recovered_anchor_recipes(keys, guild_id, revision, &metadata, &manifest)?;
+    recipes.push((
+        "anchor-manifest".to_owned(),
+        revision.value.revision_id.as_bytes().to_vec(),
+        canonical_bytes(&manifest)?,
+    ));
+    control.put_records(&recipes)?;
+    if let Some(anchor) = pending.as_mut() {
+        anchor.commit();
+    }
+    Ok(())
+}
+
+fn load_private_metadata(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+) -> Result<PrivateMetadata> {
+    let encryption_key = keys.guild_data_key(&guild_id);
+    let mut metadata_bytes = Vec::new();
+    for reference in &revision.value.metadata_sectors {
+        metadata_bytes.extend(decrypt_reference(
+            &encryption_key,
+            reference,
+            &mut |sector_id| render_sector(control, keys, sector_id, Some(&guild_id)),
+        )?);
+    }
+    let metadata: PrivateMetadata = decode_canonical(&metadata_bytes)?;
+    if !matches!(metadata.format_version, 1 | 2) {
+        bail!("unsupported private metadata version");
+    }
+    Ok(metadata)
+}
+
+pub(crate) fn restore_signed_root_metadata(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+    restored_root: &Path,
+) -> Result<()> {
+    let metadata = load_private_metadata(control, keys, guild_id, revision)?;
+    let directory = File::open(restored_root)?;
+    set_metadata_durable(
+        &directory,
+        restored_root,
+        metadata.root_mode,
+        metadata.root_modified_secs,
+        metadata.root_modified_nanos,
+    )
+}
+
+fn validate_recovered_manifest(
+    metadata: &PrivateMetadata,
+    manifest: &mb_store::StableAnchorManifest,
+) -> Result<()> {
+    if metadata.root_mode != manifest.root_mode
+        || metadata.root_modified_secs != manifest.root_modified_secs
+        || metadata.root_modified_nanos != manifest.root_modified_nanos
+        || metadata.entries.len() != manifest.entries.len()
+    {
+        bail!("recovered anchor root does not match signed metadata");
+    }
+    let captured = manifest
+        .entries
+        .iter()
+        .map(|entry| {
+            let path = match entry {
+                CapturedEntry::Directory { path, .. }
+                | CapturedEntry::File { path, .. }
+                | CapturedEntry::FileV2 { path, .. } => path,
+            };
+            (path.as_str(), entry)
+        })
+        .collect::<BTreeMap<_, _>>();
+    if captured.len() != manifest.entries.len() {
+        bail!("recovered anchor contains duplicate paths");
+    }
+    let mut signed_to_captured = BTreeMap::<NativeFileId, NativeFileId>::new();
+    let mut captured_to_signed = BTreeMap::<NativeFileId, NativeFileId>::new();
+    for entry in &metadata.entries {
+        let path = private_entry_path(entry);
+        let actual = captured
+            .get(path)
+            .with_context(|| format!("recovered anchor is missing {path}"))?;
+        match (entry, *actual) {
+            (
+                PrivateEntry::Directory {
+                    mode,
+                    modified_secs,
+                    modified_nanos,
+                    ..
+                },
+                CapturedEntry::Directory {
+                    mode: actual_mode,
+                    modified_secs: actual_secs,
+                    modified_nanos: actual_nanos,
+                    ..
+                },
+            ) if mode == actual_mode
+                && modified_secs == actual_secs
+                && modified_nanos == actual_nanos => {}
+            (
+                PrivateEntry::File {
+                    mode,
+                    logical_len,
+                    modified_secs,
+                    modified_nanos,
+                    ..
+                },
+                CapturedEntry::FileV2 {
+                    mode: actual_mode,
+                    logical_len: actual_len,
+                    modified_secs: actual_secs,
+                    modified_nanos: actual_nanos,
+                    ..
+                },
+            ) if mode == actual_mode
+                && logical_len == actual_len
+                && modified_secs == actual_secs
+                && modified_nanos == actual_nanos => {}
+            (
+                PrivateEntry::FileV2 {
+                    mode,
+                    logical_len,
+                    modified_secs,
+                    modified_nanos,
+                    native_id,
+                    data_extents,
+                    ..
+                },
+                CapturedEntry::FileV2 {
+                    mode: actual_mode,
+                    logical_len: actual_len,
+                    modified_secs: actual_secs,
+                    modified_nanos: actual_nanos,
+                    native_id: actual_native_id,
+                    data_extents: actual_extents,
+                    ..
+                },
+            ) if mode == actual_mode
+                && logical_len == actual_len
+                && modified_secs == actual_secs
+                && modified_nanos == actual_nanos
+                && data_extents
+                    .iter()
+                    .map(|extent| FileExtent {
+                        offset: extent.offset,
+                        logical_len: extent.logical_len,
+                    })
+                    .eq(actual_extents.iter().cloned()) =>
+            {
+                if signed_to_captured
+                    .insert(*native_id, *actual_native_id)
+                    .is_some_and(|previous| previous != *actual_native_id)
+                    || captured_to_signed
+                        .insert(*actual_native_id, *native_id)
+                        .is_some_and(|previous| previous != *native_id)
+                {
+                    bail!("recovered anchor does not preserve signed hard-link groups");
+                }
+            }
+            _ => bail!("recovered anchor entry {path} does not match signed metadata"),
+        }
+    }
+    Ok(())
+}
+
+fn private_entry_path(entry: &PrivateEntry) -> &str {
+    match entry {
+        PrivateEntry::Directory { path, .. }
+        | PrivateEntry::File { path, .. }
+        | PrivateEntry::FileV2 { path, .. } => path,
+    }
+}
+
+fn recovered_anchor_recipes(
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+    metadata: &PrivateMetadata,
+    manifest: &mb_store::StableAnchorManifest,
+) -> Result<Vec<RecordWrite>> {
+    let encryption_key = keys.guild_data_key(&guild_id);
+    let mut by_id = BTreeMap::<SectorId, LocalSectorRecipe>::new();
+    for entry in &metadata.entries {
+        let (path, extents) = match entry {
+            PrivateEntry::Directory { .. } => continue,
+            PrivateEntry::File {
+                path,
+                logical_len,
+                sectors,
+                ..
+            } => (
+                path,
+                vec![PrivateDataExtent {
+                    offset: 0,
+                    logical_len: *logical_len,
+                    sectors: sectors.clone(),
+                }],
+            ),
+            PrivateEntry::FileV2 {
+                path, data_extents, ..
+            } => (path, data_extents.clone()),
+        };
+        let locator = manifest.file_locator(path.clone())?;
+        let mut file = locator.open().context("open recovered anchor file")?;
+        for extent in extents {
+            let mut offset = extent.offset;
+            let mut extent_len = 0_u64;
+            for reference in extent.sectors {
+                file.seek(SeekFrom::Start(offset))?;
+                let mut plaintext = vec![0_u8; reference.logical_len as usize];
+                file.read_exact(&mut plaintext)?;
+                let (actual, _) = encrypted_sector(&encryption_key, reference.id, &plaintext)?;
+                if actual != reference {
+                    bail!("recovered anchor content does not match a signed sector");
+                }
+                let recipe = LocalSectorRecipe {
+                    guild_id,
+                    reference: reference.clone(),
+                    source: LocalPlaintextSource::StableAnchorFile {
+                        locator: locator.clone(),
+                        offset,
+                    },
+                };
+                if by_id
+                    .insert(reference.id, recipe.clone())
+                    .is_some_and(|previous| previous.reference != recipe.reference)
+                {
+                    bail!("one sector ID has conflicting signed references");
+                }
+                offset = offset
+                    .checked_add(reference.logical_len as u64)
+                    .context("signed sector range overflow")?;
+                extent_len = extent_len
+                    .checked_add(reference.logical_len as u64)
+                    .context("signed extent length overflow")?;
+            }
+            if extent_len != extent.logical_len {
+                bail!("signed extent does not match its sector lengths");
+            }
+        }
+    }
+    let expected = revision
+        .value
+        .data_sectors
+        .iter()
+        .map(|reference| (reference.id, reference))
+        .collect::<BTreeMap<_, _>>();
+    if expected.len() != revision.value.data_sectors.len()
+        || expected.len() != by_id.len()
+        || expected.iter().any(|(id, reference)| {
+            by_id.get(id).map(|recipe| &recipe.reference) != Some(*reference)
+        })
+    {
+        bail!("signed data-sector catalog does not match recovered file metadata");
+    }
+    by_id
+        .into_values()
+        .map(|recipe| {
+            Ok((
+                "local-sector".to_owned(),
+                recipe.reference.id.to_vec(),
+                canonical_bytes(&recipe)?,
+            ))
+        })
+        .collect()
+}
+
 pub(crate) fn render_sector(
     control: &ControlStore,
     keys: &KeyMaterial,
@@ -492,6 +801,15 @@ pub(crate) fn render_sector(
         bail!("source anchor no longer matches the committed sector root");
     }
     Ok(ciphertext)
+}
+
+#[cfg(test)]
+pub(crate) fn local_recipe_is_inline(control: &ControlStore, sector_id: &SectorId) -> Result<bool> {
+    let encoded = control
+        .get_record("local-sector", sector_id)?
+        .context("local sector recipe is unavailable")?;
+    let recipe: LocalSectorRecipe = decode_canonical(&encoded)?;
+    Ok(matches!(recipe.source, LocalPlaintextSource::Inline(_)))
 }
 
 pub fn restore_revision(
@@ -623,15 +941,15 @@ pub(crate) fn remove_recovery_marker(
     root: &Path,
     marker_name: &str,
     expected: &[u8; 32],
-) -> Result<()> {
+) -> Result<bool> {
     let path = recovery_marker_path(root, marker_name)?;
     if !path.exists() {
-        return Ok(());
+        return Ok(false);
     }
     verify_recovery_marker(root, marker_name, expected)?;
     fs::remove_file(path)?;
     sync_directory(root)?;
-    Ok(())
+    Ok(true)
 }
 
 fn recovery_marker_path(root: &Path, marker_name: &str) -> Result<PathBuf> {
