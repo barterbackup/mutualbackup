@@ -38,6 +38,7 @@ const PEER_REQUEST_DOMAIN: &[u8] = b"mutualbackup/direct-request/v2";
 const PEER_RESPONSE_DOMAIN: &[u8] = b"mutualbackup/direct-response/v2";
 const DIRECTORY_RECORD_DOMAIN: &[u8] = b"mutualbackup/directory-record/v1";
 const DIRECTORY_ADMISSION_DOMAIN: &[u8] = b"mutualbackup/directory-admission/v1";
+const RECOVERY_POW_ZERO_BYTES: usize = 2;
 
 #[derive(Clone, Debug)]
 pub struct NodeServerConfig {
@@ -267,6 +268,7 @@ struct PublishedRecoveryRecord {
     expires_at_unix_seconds: u64,
     admission: SignedRecord<RecoveryPublisherAdmission>,
     sealed: SealedRecoveryRecord,
+    pow_nonce: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -384,7 +386,54 @@ fn validate_published_recovery_record(
         record.value.publisher,
         record.value.slot,
         record.value.expires_at_unix_seconds,
-    )
+    )?;
+    if !valid_recovery_pow(&record.value)? {
+        bail!("published recovery record has insufficient proof of work");
+    }
+    Ok(())
+}
+
+fn recovery_pow_commitment(record: &PublishedRecoveryRecord) -> Result<[u8; 32]> {
+    let mut hasher = blake3::Hasher::new_derive_key("mutualbackup recovery directory work v1");
+    hasher.update(&canonical_bytes(&(
+        record.format_version,
+        record.subject,
+        record.publisher,
+        record.slot,
+        record.slot_generation,
+        record.expires_at_unix_seconds,
+        &record.admission,
+        &record.sealed,
+    ))?);
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn recovery_pow_digest(commitment: [u8; 32], nonce: u64) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key("mutualbackup recovery directory nonce v1");
+    hasher.update(&commitment);
+    hasher.update(&nonce.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn valid_recovery_pow(record: &PublishedRecoveryRecord) -> Result<bool> {
+    let digest = recovery_pow_digest(recovery_pow_commitment(record)?, record.pow_nonce);
+    Ok(digest[..RECOVERY_POW_ZERO_BYTES]
+        .iter()
+        .all(|byte| *byte == 0))
+}
+
+fn solve_recovery_pow(record: &mut PublishedRecoveryRecord) -> Result<()> {
+    let commitment = recovery_pow_commitment(record)?;
+    for nonce in 0..=u64::MAX {
+        if recovery_pow_digest(commitment, nonce)[..RECOVERY_POW_ZERO_BYTES]
+            .iter()
+            .all(|byte| *byte == 0)
+        {
+            record.pow_nonce = nonce;
+            return Ok(());
+        }
+    }
+    bail!("recovery-directory proof-of-work nonce space was exhausted")
 }
 
 pub async fn serve_node(node: Arc<Mutex<Node>>, config: NodeServerConfig) -> Result<()> {
@@ -885,18 +934,21 @@ fn execute_peer_request(
                 config.public_endpoint.clone(),
                 expires_at_unix_seconds,
             )?;
+            let mut published = PublishedRecoveryRecord {
+                format_version: 2,
+                subject: subject.node_id,
+                publisher,
+                slot,
+                slot_generation: checkpoint_generation,
+                expires_at_unix_seconds,
+                admission: *admission,
+                sealed,
+                pow_nonce: 0,
+            };
+            solve_recovery_pow(&mut published)?;
             Ok(PeerResponse::RecoveryRecord(Box::new(SignedRecord::sign(
                 DIRECTORY_RECORD_DOMAIN,
-                PublishedRecoveryRecord {
-                    format_version: 2,
-                    subject: subject.node_id,
-                    publisher,
-                    slot,
-                    slot_generation: checkpoint_generation,
-                    expires_at_unix_seconds,
-                    admission: *admission,
-                    sealed,
-                },
+                published,
                 node.keys(),
             )?)))
         }
@@ -2096,26 +2148,24 @@ mod tests {
         )
         .unwrap();
         let record = |generation, payload| {
-            SignedRecord::sign(
-                DIRECTORY_RECORD_DOMAIN,
-                PublishedRecoveryRecord {
-                    format_version: 2,
-                    subject,
-                    publisher: publisher_keys.node_id(),
-                    slot,
-                    slot_generation: generation,
-                    expires_at_unix_seconds: u64::MAX,
-                    admission: admission.clone(),
-                    sealed: SealedRecoveryRecord {
-                        format_version: 1,
-                        ephemeral_public_key: [5; 32],
-                        nonce: [6; 24],
-                        ciphertext: vec![payload; 32],
-                    },
+            let mut published = PublishedRecoveryRecord {
+                format_version: 2,
+                subject,
+                publisher: publisher_keys.node_id(),
+                slot,
+                slot_generation: generation,
+                expires_at_unix_seconds: u64::MAX,
+                admission: admission.clone(),
+                sealed: SealedRecoveryRecord {
+                    format_version: 1,
+                    ephemeral_public_key: [5; 32],
+                    nonce: [6; 24],
+                    ciphertext: vec![payload; 32],
                 },
-                &publisher_keys,
-            )
-            .unwrap()
+                pow_nonce: 0,
+            };
+            solve_recovery_pow(&mut published).unwrap();
+            SignedRecord::sign(DIRECTORY_RECORD_DOMAIN, published, &publisher_keys).unwrap()
         };
         directory_publish(address, record(2, 2)).await.unwrap();
         assert!(directory_publish(address, record(1, 1)).await.is_err());
@@ -2151,32 +2201,42 @@ mod tests {
                 admission_keys,
             )
             .unwrap();
-            SignedRecord::sign(
-                DIRECTORY_RECORD_DOMAIN,
-                PublishedRecoveryRecord {
-                    format_version: 2,
-                    subject,
-                    publisher,
-                    slot,
-                    slot_generation: 1,
-                    expires_at_unix_seconds: u64::MAX,
-                    admission,
-                    sealed: SealedRecoveryRecord {
-                        format_version: 1,
-                        ephemeral_public_key: [73; 32],
-                        nonce: [74; 24],
-                        ciphertext: vec![75; 32],
-                    },
+            let mut published = PublishedRecoveryRecord {
+                format_version: 2,
+                subject,
+                publisher,
+                slot,
+                slot_generation: 1,
+                expires_at_unix_seconds: u64::MAX,
+                admission,
+                sealed: SealedRecoveryRecord {
+                    format_version: 1,
+                    ephemeral_public_key: [73; 32],
+                    nonce: [74; 24],
+                    ciphertext: vec![75; 32],
                 },
-                &publisher_keys,
-            )
-            .unwrap()
+                pow_nonce: 0,
+            };
+            solve_recovery_pow(&mut published).unwrap();
+            SignedRecord::sign(DIRECTORY_RECORD_DOMAIN, published, &publisher_keys).unwrap()
         };
         assert!(
             directory_publish(address, make_record([1; 32], &attacker_keys))
                 .await
                 .is_err()
         );
+        let mut insufficient_work = make_record([3; 32], &subject_keys);
+        insufficient_work.value.pow_nonce = 0;
+        while valid_recovery_pow(&insufficient_work.value).unwrap() {
+            insufficient_work.value.pow_nonce += 1;
+        }
+        insufficient_work = SignedRecord::sign(
+            DIRECTORY_RECORD_DOMAIN,
+            insufficient_work.value,
+            &publisher_keys,
+        )
+        .unwrap();
+        assert!(directory_publish(address, insufficient_work).await.is_err());
         directory_publish(address, make_record([1; 32], &subject_keys))
             .await
             .unwrap();
@@ -2210,26 +2270,23 @@ mod tests {
                 &subject_keys,
             )
             .unwrap();
-            SignedRecord::sign(
-                DIRECTORY_RECORD_DOMAIN,
-                PublishedRecoveryRecord {
-                    format_version: 2,
-                    subject,
-                    publisher: keys.node_id(),
-                    slot,
-                    slot_generation: 1,
-                    expires_at_unix_seconds: u64::MAX,
-                    admission,
-                    sealed: SealedRecoveryRecord {
-                        format_version: 1,
-                        ephemeral_public_key: [67; 32],
-                        nonce: [68; 24],
-                        ciphertext: vec![69; ciphertext_len],
-                    },
+            let published = PublishedRecoveryRecord {
+                format_version: 2,
+                subject,
+                publisher: keys.node_id(),
+                slot,
+                slot_generation: 1,
+                expires_at_unix_seconds: u64::MAX,
+                admission,
+                sealed: SealedRecoveryRecord {
+                    format_version: 1,
+                    ephemeral_public_key: [67; 32],
+                    nonce: [68; 24],
+                    ciphertext: vec![69; ciphertext_len],
                 },
-                &keys,
-            )
-            .unwrap()
+                pow_nonce: 0,
+            };
+            SignedRecord::sign(DIRECTORY_RECORD_DOMAIN, published, &keys).unwrap()
         };
         let mut low = 0_usize;
         let mut high = MAX_DIRECTORY_RECORD_BYTES;
