@@ -329,6 +329,7 @@ fn capture_entries(
     )];
     let mut file_versions = Vec::new();
     let mut captured_links = BTreeMap::<NativeFileId, PathBuf>::new();
+    let mut captured_extent_count = 0_usize;
     for entry in WalkDir::new(source_root).follow_links(false) {
         let entry = entry?;
         if entry.path() == source_root {
@@ -388,6 +389,13 @@ fn capture_entries(
             seal_anchor_file(&destination)?;
             let (modified_secs, modified_nanos) = modified_parts(&after);
             let captured_file = File::open(&destination)?;
+            let data_extents = file_data_extents(&captured_file, after.len())?;
+            captured_extent_count = captured_extent_count
+                .checked_add(data_extents.len())
+                .ok_or(AnchorError::CatalogTooLarge)?;
+            if captured_extent_count > MAX_CAPTURE_EXTENTS {
+                return Err(AnchorError::CatalogTooLarge);
+            }
             entries.push(CapturedEntry::FileV2 {
                 path: relative_string,
                 mode: unix_mode(&after),
@@ -395,7 +403,7 @@ fn capture_entries(
                 modified_secs,
                 modified_nanos,
                 native_id,
-                data_extents: file_data_extents(&captured_file, after.len())?,
+                data_extents,
             });
             file_versions.push((relative.to_path_buf(), file, after));
         } else {
