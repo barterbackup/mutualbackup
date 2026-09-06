@@ -9,6 +9,7 @@ use mb_core::{
     canonical_bytes, decode_canonical, seal_recovery_record, sector_root, synthetic_filler_sector,
 };
 use mb_store::{ControlStore, ParityObject, ParityStore};
+use rand::RngCore;
 use uuid::Uuid;
 
 use crate::snapshot::{
@@ -32,6 +33,14 @@ struct RecoveryJob {
     staging: PathBuf,
     staged_native_id: Option<(u64, u64)>,
     state: RecoveryJobState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct CoordinatorCommitJournal {
+    format_version: u16,
+    plan_hash: [u8; 32],
+    guild_id: [u8; 32],
+    checkpoint_hash: Option<[u8; 32]>,
 }
 
 pub type RecoveredShards = BTreeMap<([u8; 32], u8), Vec<u8>>;
@@ -78,6 +87,63 @@ impl Node {
             recovery_public_key: self.keys.recovery_public_key(),
             failure_domain: failure_domain.into(),
         }
+    }
+
+    pub fn begin_coordinator_commit(&mut self, plan_hash: [u8; 32]) -> Result<[u8; 32]> {
+        if let Some(bytes) = self.control.get_record("coordinator-commit", &plan_hash)? {
+            let journal: CoordinatorCommitJournal = decode_canonical(&bytes)?;
+            if journal.format_version != 1 || journal.plan_hash != plan_hash {
+                anyhow::bail!("coordinator commit journal is inconsistent");
+            }
+            return Ok(journal.guild_id);
+        }
+        let mut guild_id = [0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut guild_id);
+        let journal = CoordinatorCommitJournal {
+            format_version: 1,
+            plan_hash,
+            guild_id,
+            checkpoint_hash: None,
+        };
+        self.control.put_record(
+            "coordinator-commit",
+            &plan_hash,
+            &canonical_bytes(&journal)?,
+        )?;
+        Ok(guild_id)
+    }
+
+    pub fn complete_coordinator_commit(
+        &mut self,
+        plan_hash: [u8; 32],
+        guild_id: [u8; 32],
+        checkpoint_hash: [u8; 32],
+    ) -> Result<()> {
+        let bytes = self
+            .control
+            .get_record("coordinator-commit", &plan_hash)?
+            .context("coordinator commit journal is unavailable")?;
+        let mut journal: CoordinatorCommitJournal = decode_canonical(&bytes)?;
+        if journal.format_version != 1
+            || journal.plan_hash != plan_hash
+            || journal.guild_id != guild_id
+            || journal
+                .checkpoint_hash
+                .is_some_and(|stored| stored != checkpoint_hash)
+        {
+            anyhow::bail!("coordinator commit completion conflicts with durable state");
+        }
+        let checkpoint = self.checkpoint(&checkpoint_hash)?;
+        if checkpoint.checkpoint.guild_id != guild_id {
+            anyhow::bail!("coordinator commit checkpoint belongs to another guild");
+        }
+        journal.checkpoint_hash = Some(checkpoint_hash);
+        self.control.put_record(
+            "coordinator-commit",
+            &plan_hash,
+            &canonical_bytes(&journal)?,
+        )?;
+        Ok(())
     }
 
     pub fn prepare_revision(
@@ -528,6 +594,19 @@ impl Node {
             &canonical_bytes(checkpoint)?,
             false,
         )?;
+        if let Some(revision) = checkpoint
+            .checkpoint
+            .revisions
+            .iter()
+            .filter(|revision| revision.value.owner == self.keys.node_id())
+            .max_by_key(|revision| revision.value.sequence)
+        {
+            self.control.put_record(
+                "user-revision-head",
+                &checkpoint.checkpoint.guild_id,
+                &canonical_bytes(revision)?,
+            )?;
+        }
         self.control.clear_recovery_shards(&checkpoint_hash)?;
         Ok(checkpoint_hash)
     }

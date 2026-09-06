@@ -96,6 +96,24 @@ pub(crate) fn prepare_revision(
         }
         return Ok(existing);
     }
+    let parent = match control.get_record("user-revision-head", &guild_id)? {
+        Some(bytes) => {
+            let previous: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
+            previous.verify(b"mutualbackup/user-revision/v1")?;
+            if previous.signer != keys.node_id()
+                || previous.value.owner != keys.node_id()
+                || previous.value.guild_id != guild_id
+                || previous.value.format_version != 1
+                || previous.value.cipher_profile != V1_CIPHER_PROFILE
+                || previous.value.sequence.checked_add(1) != Some(sequence)
+            {
+                bail!("new revision does not extend the durable local revision head");
+            }
+            Some(previous.value.hash()?)
+        }
+        None if sequence == 1 => None,
+        None => bail!("the first local revision must have sequence one"),
+    };
     let mut anchor = PendingAnchor {
         manifest: ReflinkAnchor::capture(source_root).context("capture reflink source anchor")?,
         committed: false,
@@ -208,7 +226,7 @@ pub(crate) fn prepare_revision(
             revision_id,
             owner: keys.node_id(),
             sequence,
-            parent: None,
+            parent,
             metadata_sectors: metadata_references,
             data_sectors: data_references,
         },
@@ -226,6 +244,11 @@ pub(crate) fn prepare_revision(
         (
             "user-revision".to_owned(),
             revision_id.as_bytes().to_vec(),
+            canonical_bytes(&revision)?,
+        ),
+        (
+            "user-revision-head".to_owned(),
+            guild_id.to_vec(),
             canonical_bytes(&revision)?,
         ),
     ];

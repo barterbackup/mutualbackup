@@ -14,7 +14,6 @@ use mb_core::{
     sector_root,
 };
 use mb_store::ParityObject;
-use rand::RngCore;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -54,6 +53,9 @@ struct PeerProfile {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum PeerRequest {
     Profile,
+    BeginCommit {
+        plan_hash: [u8; 32],
+    },
     PrepareSource {
         guild_id: [u8; 32],
         source: String,
@@ -107,6 +109,11 @@ enum PeerRequest {
         checkpoint_generation: u64,
         expires_at_unix_seconds: u64,
     },
+    CompleteCommit {
+        plan_hash: [u8; 32],
+        guild_id: [u8; 32],
+        checkpoint_hash: [u8; 32],
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -131,6 +138,7 @@ impl PeerRequest {
             | Self::GetSector { .. }
             | Self::GetParity { .. }
             | Self::GetCheckpointPage { .. } => None,
+            Self::BeginCommit { .. } => Some("begin-commit"),
             Self::PrepareSource { .. } => Some("prepare-source"),
             Self::EnsureFiller { .. } => Some("ensure-filler"),
             Self::PublishParity { .. } => Some("publish-parity"),
@@ -138,12 +146,13 @@ impl PeerRequest {
             Self::SignCheckpoint { .. } => Some("sign-checkpoint"),
             Self::FinalizeCheckpoint { .. } => Some("finalize-checkpoint"),
             Self::BuildRecoveryRecord { .. } => Some("build-recovery-record"),
+            Self::CompleteCommit { .. } => Some("complete-commit"),
         }
     }
 
     fn guild_scope(&self) -> Option<[u8; 32]> {
         match self {
-            Self::Profile => None,
+            Self::Profile | Self::BeginCommit { .. } => None,
             Self::PrepareSource { guild_id, .. }
             | Self::EnsureFiller { guild_id, .. }
             | Self::GetSector { guild_id, .. }
@@ -152,7 +161,8 @@ impl PeerRequest {
             | Self::SignCheckpoint { guild_id, .. }
             | Self::FinalizeCheckpoint { guild_id, .. }
             | Self::GetCheckpointPage { guild_id, .. }
-            | Self::BuildRecoveryRecord { guild_id, .. } => Some(*guild_id),
+            | Self::BuildRecoveryRecord { guild_id, .. }
+            | Self::CompleteCommit { guild_id, .. } => Some(*guild_id),
             Self::PublishParity { object, .. } => Some(object.guild_id),
         }
     }
@@ -173,6 +183,9 @@ struct PeerRequestEnvelope {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum PeerResponse {
     Profile(PeerProfile),
+    CommitStarted {
+        guild_id: [u8; 32],
+    },
     Prepared(SignedRecord<UserRevision>),
     Filler {
         reference: SectorRef,
@@ -393,8 +406,14 @@ fn process_peer_request(
         if mutation_kind.is_some() && caller != config.trusted_coordinator {
             bail!("caller is not the configured guild coordinator");
         }
-        if matches!(&request, PeerRequest::PrepareSource { .. }) && caller != local_node_id {
-            bail!("only the source node itself may request source capture");
+        if matches!(
+            &request,
+            PeerRequest::BeginCommit { .. }
+                | PeerRequest::PrepareSource { .. }
+                | PeerRequest::CompleteCommit { .. }
+        ) && caller != local_node_id
+        {
+            bail!("only the source node itself may manage its coordinator commit");
         }
         if mutation_kind.is_none()
             && !matches!(&request, PeerRequest::Profile)
@@ -505,6 +524,9 @@ fn execute_peer_request(
             member: node.member(config.failure_domain.clone()),
             endpoint: config.public_endpoint.clone(),
         })),
+        PeerRequest::BeginCommit { plan_hash } => Ok(PeerResponse::CommitStarted {
+            guild_id: node.begin_coordinator_commit(plan_hash)?,
+        }),
         PeerRequest::PrepareSource {
             guild_id,
             source,
@@ -636,6 +658,14 @@ fn execute_peer_request(
                 node.keys(),
             )?))
         }
+        PeerRequest::CompleteCommit {
+            plan_hash,
+            guild_id,
+            checkpoint_hash,
+        } => {
+            node.complete_coordinator_commit(plan_hash, guild_id, checkpoint_hash)?;
+            Ok(PeerResponse::Ack)
+        }
     }
 }
 
@@ -702,12 +732,31 @@ pub async fn commit_source_over_network(
     peers.swap(0, owner_position);
     peers[1..].sort_by_key(|peer| peer.profile.member.node_id);
 
-    let mut guild_id = [0_u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut guild_id);
     let source = source
         .to_str()
         .context("source path is not valid UTF-8")?
         .to_owned();
+    let plan_peers = peers
+        .iter()
+        .map(|peer| peer.profile.clone())
+        .collect::<Vec<_>>();
+    let mut plan_hasher = blake3::Hasher::new_derive_key("mutualbackup coordinator commit v1");
+    plan_hasher.update(&canonical_bytes(&(
+        source.as_str(),
+        directory.to_string(),
+        plan_peers,
+    ))?);
+    let plan_hash = *plan_hasher.finalize().as_bytes();
+    let started = peer_call_expected(
+        peers[0].endpoint,
+        peers[0].profile.member.node_id,
+        coordinator_keys,
+        PeerRequest::BeginCommit { plan_hash },
+    )
+    .await?;
+    let PeerResponse::CommitStarted { guild_id } = started else {
+        bail!("owner returned the wrong response to commit initialization");
+    };
     let prepared = peer_call_expected(
         peers[0].endpoint,
         peers[0].profile.member.node_id,
@@ -950,6 +999,19 @@ pub async fn commit_source_over_network(
             directory_publish(directory, record).await?;
         }
     }
+    expect_ack(
+        peer_call_expected(
+            peers[0].endpoint,
+            peers[0].profile.member.node_id,
+            coordinator_keys,
+            PeerRequest::CompleteCommit {
+                plan_hash,
+                guild_id,
+                checkpoint_hash,
+            },
+        )
+        .await?,
+    )?;
     Ok(NetworkCommitResult {
         guild_id,
         checkpoint_hash,
@@ -1626,7 +1688,15 @@ mod tests {
             peer_tasks.push(task);
         }
 
-        commit_source_over_network(
+        let first_commit = commit_source_over_network(
+            &coordinator_keys,
+            &source,
+            directory_address,
+            peer_addresses.clone(),
+        )
+        .await
+        .unwrap();
+        let retried_commit = commit_source_over_network(
             &coordinator_keys,
             &source,
             directory_address,
@@ -1634,6 +1704,8 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(first_commit.guild_id, retried_commit.guild_id);
+        assert_eq!(first_commit.checkpoint_hash, retried_commit.checkpoint_hash);
         peer_tasks.remove(0).abort();
         tokio::task::yield_now().await;
         fs::remove_dir_all(root.join("node-0")).unwrap();

@@ -191,6 +191,7 @@ impl GuildCheckpoint {
         let mut revision_ids = std::collections::BTreeSet::new();
         let mut revision_order = None;
         let mut revision_sectors = std::collections::BTreeMap::new();
+        let mut revision_heads = std::collections::BTreeMap::<NodeId, (u64, [u8; 32])>::new();
         for revision in &self.revisions {
             revision.verify(b"mutualbackup/user-revision/v1")?;
             let order = (
@@ -205,11 +206,17 @@ impl GuildCheckpoint {
                 || revision.value.guild_id != self.guild_id
                 || revision.value.cipher_profile != V1_CIPHER_PROFILE
                 || revision.value.sequence == 0
-                || (revision.value.sequence == 1) != revision.value.parent.is_none()
                 || revision.value.metadata_sectors.is_empty()
                 || !revision_ids.insert(revision.value.revision_id)
             {
                 return Err(ModelError::InvalidCheckpoint);
+            }
+            match revision_heads.get(&revision.value.owner) {
+                Some((previous_sequence, previous_hash))
+                    if previous_sequence.checked_add(1) == Some(revision.value.sequence)
+                        && revision.value.parent == Some(*previous_hash) => {}
+                None if revision.value.sequence == 1 && revision.value.parent.is_none() => {}
+                _ => return Err(ModelError::InvalidCheckpoint),
             }
             for reference in revision
                 .value
@@ -226,6 +233,10 @@ impl GuildCheckpoint {
                     return Err(ModelError::InvalidCheckpoint);
                 }
             }
+            revision_heads.insert(
+                revision.value.owner,
+                (revision.value.sequence, revision.value.hash()?),
+            );
             revision_order = Some(order);
         }
 
@@ -395,6 +406,15 @@ pub struct UserRevision {
     pub parent: Option<[u8; 32]>,
     pub metadata_sectors: Vec<SectorRef>,
     pub data_sectors: Vec<SectorRef>,
+}
+
+impl UserRevision {
+    /// Stable identity used by the next revision's `parent` field.
+    pub fn hash(&self) -> Result<[u8; 32], ModelError> {
+        let mut hasher = blake3::Hasher::new_derive_key("mutualbackup user revision body v1");
+        hasher.update(&canonical_bytes(self)?);
+        Ok(*hasher.finalize().as_bytes())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -679,6 +699,68 @@ mod tests {
         checkpoint
             .validate_recovery_authority(&keys[4], &locator, keys[0].node_id())
             .unwrap();
+
+        let mut chained = checkpoint.checkpoint.clone();
+        let previous = chained.revisions[0].value.hash().unwrap();
+        let next_target = SectorRef {
+            id: [10; 32],
+            root: [11; 32],
+            logical_len: 1,
+        };
+        chained.revisions.push(
+            SignedRecord::sign(
+                b"mutualbackup/user-revision/v1",
+                UserRevision {
+                    format_version: 1,
+                    guild_id,
+                    cipher_profile: V1_CIPHER_PROFILE,
+                    revision_id: Uuid::from_u128(2),
+                    owner: keys[0].node_id(),
+                    sequence: 2,
+                    parent: Some(previous),
+                    metadata_sectors: vec![next_target.clone()],
+                    data_sectors: Vec::new(),
+                },
+                &keys[0],
+            )
+            .unwrap(),
+        );
+        let mut next_group = chained.coding_groups[0].clone();
+        let ShardRole::Information(next_information) = &mut next_group.roles[0] else {
+            unreachable!();
+        };
+        next_information.sector = next_target;
+        let ShardRole::Information(next_helper_a) = &mut next_group.roles[1] else {
+            unreachable!();
+        };
+        next_helper_a.sector.id = [12; 32];
+        next_helper_a.sector.root = [13; 32];
+        let ShardRole::Information(next_helper_b) = &mut next_group.roles[2] else {
+            unreachable!();
+        };
+        next_helper_b.sector.id = [14; 32];
+        next_helper_b.sector.root = [15; 32];
+        let ShardRole::Parity(next_parity_a) = &mut next_group.roles[3] else {
+            unreachable!();
+        };
+        next_parity_a.root = [16; 32];
+        let ShardRole::Parity(next_parity_b) = &mut next_group.roles[4] else {
+            unreachable!();
+        };
+        next_parity_b.root = [17; 32];
+        next_group.id = next_group.calculate_id().unwrap();
+        chained.coding_groups.push(next_group);
+        chained.coding_groups.sort_by_key(|group| group.id);
+        chained.validate().unwrap();
+        let mut invalid_revision = chained.revisions[1].value.clone();
+        invalid_revision.parent = Some([99; 32]);
+        chained.revisions[1] =
+            SignedRecord::sign(b"mutualbackup/user-revision/v1", invalid_revision, &keys[0])
+                .unwrap();
+        assert!(matches!(
+            chained.validate(),
+            Err(ModelError::InvalidCheckpoint)
+        ));
 
         let mut eclipse = checkpoint.clone();
         eclipse.checkpoint.generation = u64::MAX;
