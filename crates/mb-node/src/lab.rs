@@ -516,11 +516,10 @@ mod tests {
     /// Run with MUTUALBACKUP_REFLINK_TEST_ROOT pointing at a disposable Btrfs
     /// or XFS directory. The GCP runner supplies that directory explicitly.
     #[test]
+    #[ignore = "requires an explicitly provisioned reflink test filesystem"]
     fn seed_only_recovery_over_five_active_nodes() {
-        let Some(test_root) = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") else {
-            eprintln!("skipped: MUTUALBACKUP_REFLINK_TEST_ROOT is not set");
-            return;
-        };
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT");
         let root = PathBuf::from(test_root).join(format!("run-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let source = root.join("source");
@@ -576,6 +575,23 @@ mod tests {
             .collect::<Vec<_>>();
         let mut guild = PrototypeGuild::create(&root.join("nodes"), seeds).unwrap();
         let checkpoint = guild.commit_source(0, &source).unwrap();
+        let mut fork = checkpoint.checkpoint.clone();
+        let group = &mut fork.coding_groups[0];
+        let ShardRole::Parity(parity) = &mut group.roles[3] else {
+            unreachable!();
+        };
+        parity.root[0] ^= 1;
+        group.id = group.calculate_id().unwrap();
+        fork.coding_groups.sort_by_key(|group| group.id);
+        assert!(
+            guild.nodes[0]
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .sign_checkpoint(&fork)
+                .is_err()
+        );
         fs::remove_dir_all(&source).unwrap();
 
         for index in 0..5 {

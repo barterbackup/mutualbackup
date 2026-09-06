@@ -14,10 +14,11 @@
         cargoLock.lockFile = ./Cargo.lock;
         cargoBuildFlags = [ "-p" "mutualbackup" ];
         nativeBuildInputs = with pkgs; [ perl pkg-config ];
-        doCheck = false;
+        doCheck = true;
       };
     in {
       packages.${system}.default = staticBinary;
+      checks.${system}.default = staticBinary;
 
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [

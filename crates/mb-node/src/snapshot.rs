@@ -56,6 +56,25 @@ enum LocalPlaintextSource {
     Inline(Vec<u8>),
 }
 
+struct PendingAnchor {
+    manifest: mb_store::AnchorManifest,
+    committed: bool,
+}
+
+impl PendingAnchor {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PendingAnchor {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.manifest.remove();
+        }
+    }
+}
+
 pub(crate) fn prepare_revision(
     control: &mut ControlStore,
     keys: &KeyMaterial,
@@ -77,14 +96,17 @@ pub(crate) fn prepare_revision(
         }
         return Ok(existing);
     }
-    let anchor = ReflinkAnchor::capture(source_root).context("capture reflink source anchor")?;
+    let mut anchor = PendingAnchor {
+        manifest: ReflinkAnchor::capture(source_root).context("capture reflink source anchor")?,
+        committed: false,
+    };
     let encryption_key = keys.guild_data_key(&guild_id);
     let mut data_references = Vec::new();
     let mut private_entries = Vec::new();
     let mut recipe_records = Vec::with_capacity(256);
     let mut ordinal = 0_u64;
 
-    for entry in &anchor.entries {
+    for entry in &anchor.manifest.entries {
         match entry {
             CapturedEntry::Directory {
                 path,
@@ -106,7 +128,7 @@ pub(crate) fn prepare_revision(
                 modified_secs,
                 modified_nanos,
             } => {
-                let locator = anchor.file_locator(path.clone())?;
+                let locator = anchor.manifest.file_locator(path.clone())?;
                 let mut file = locator.open().context("open captured anchor file")?;
                 let mut remaining = *logical_len;
                 let mut offset = 0_u64;
@@ -150,9 +172,9 @@ pub(crate) fn prepare_revision(
 
     let metadata = PrivateMetadata {
         format_version: 1,
-        root_mode: anchor.root_mode,
-        root_modified_secs: anchor.root_modified_secs,
-        root_modified_nanos: anchor.root_modified_nanos,
+        root_mode: anchor.manifest.root_mode,
+        root_modified_secs: anchor.manifest.root_modified_secs,
+        root_modified_nanos: anchor.manifest.root_modified_nanos,
         entries: private_entries,
     };
     let metadata_bytes = canonical_bytes(&metadata)?;
@@ -199,7 +221,7 @@ pub(crate) fn prepare_revision(
         (
             "anchor-manifest".to_owned(),
             revision_id.as_bytes().to_vec(),
-            canonical_bytes(&anchor)?,
+            canonical_bytes(&anchor.manifest)?,
         ),
         (
             "user-revision".to_owned(),
@@ -208,6 +230,7 @@ pub(crate) fn prepare_revision(
         ),
     ];
     control.put_records(&records)?;
+    anchor.commit();
     Ok(revision)
 }
 

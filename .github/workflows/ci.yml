@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: clippy,rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --all-targets --locked
+
+  reflink-acceptance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - name: Provision disposable Btrfs filesystem
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs
+          truncate -s 2G /tmp/mutualbackup-ci.btrfs
+          sudo mkfs.btrfs -q -f /tmp/mutualbackup-ci.btrfs
+          sudo mkdir -p /mnt/mutualbackup-ci
+          sudo mount -o loop /tmp/mutualbackup-ci.btrfs /mnt/mutualbackup-ci
+          sudo chown "$USER":"$USER" /mnt/mutualbackup-ci
+      - name: Run mandatory reflink acceptance suite
+        env:
+          MUTUALBACKUP_REFLINK_TEST_ROOT: /mnt/mutualbackup-ci
+        run: bash scripts/reflink-acceptance.sh

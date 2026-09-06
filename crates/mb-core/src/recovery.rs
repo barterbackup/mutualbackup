@@ -149,4 +149,20 @@ mod tests {
         tampered.ciphertext[0] ^= 1;
         assert!(open_recovery_record(&recipient, &tampered).is_err());
     }
+
+    #[test]
+    fn rejects_non_contributory_x25519_inputs() {
+        let recipient = KeyMaterial::from_seed(&Seed::from_bytes([8; 32]));
+        assert!(seal_recovery_record(RecoveryPublicKey([0; 32]), b"payload").is_err());
+        let invalid = SealedRecoveryRecord {
+            format_version: 1,
+            ephemeral_public_key: [0; 32],
+            nonce: [0; 24],
+            ciphertext: vec![0; 16],
+        };
+        assert!(matches!(
+            open_recovery_record(&recipient, &invalid),
+            Err(RecoveryCryptoError::Authentication)
+        ));
+    }
 }

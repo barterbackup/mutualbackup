@@ -101,6 +101,18 @@ impl AnchorManifest {
             relative_path,
         })
     }
+
+    pub fn remove(&self) -> Result<(), AnchorError> {
+        validate_anchor_area(&self.area)?;
+        let anchor_root = self.area.path_hint.join(self.anchor_id.to_string());
+        let metadata = fs::symlink_metadata(&anchor_root)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(AnchorError::AnchorAreaCollision(anchor_root));
+        }
+        fs::remove_dir_all(anchor_root)?;
+        sync_directory(&self.area.path_hint)?;
+        Ok(())
+    }
 }
 
 pub struct ReflinkAnchor;
@@ -135,7 +147,11 @@ impl ReflinkAnchor {
         };
         sync_tree_bottom_up(&staging)?;
         rename_no_replace(&staging, &anchor_root)?;
-        sync_directory(&area.path_hint)?;
+        if let Err(error) = sync_directory(&area.path_hint) {
+            let _ = fs::remove_dir_all(&anchor_root);
+            let _ = sync_directory(&area.path_hint);
+            return Err(error.into());
+        }
         let (root_modified_secs, root_modified_nanos) = modified_parts(&root_metadata);
         Ok(AnchorManifest {
             format_version: 1,

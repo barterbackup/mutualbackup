@@ -480,6 +480,13 @@ mod tests {
         record.verify(b"test/member/v1").unwrap();
         record.value = 42;
         assert!(record.verify(b"test/member/v1").is_err());
+
+        let weak = SignedRecord {
+            signer: NodeId([0; 32]),
+            value: 1_u8,
+            signature: vec![0; 64],
+        };
+        assert!(weak.verify(b"test/member/v1").is_err());
     }
 
     #[test]
@@ -603,6 +610,24 @@ mod tests {
         checkpoint
             .validate_recovery_authority(&keys[4], &locator, keys[0].node_id())
             .unwrap();
+
+        let mut eclipse = checkpoint.clone();
+        eclipse.checkpoint.generation = u64::MAX;
+        eclipse.checkpoint.parent = Some([99; 32]);
+        eclipse.signatures.clear();
+        for key in keys.iter().take(3) {
+            eclipse.add_signature(key).unwrap();
+        }
+        eclipse.verify().unwrap();
+        let eclipse_locator = RecoveryLocator {
+            checkpoint_hash: eclipse.hash().unwrap(),
+            checkpoint_generation: u64::MAX,
+            ..locator.clone()
+        };
+        assert!(matches!(
+            eclipse.validate_recovery_authority(&keys[4], &eclipse_locator, keys[0].node_id()),
+            Err(ModelError::InvalidRecoveryAuthority)
+        ));
 
         checkpoint.checkpoint.members[4].failure_domain = "host-3".to_owned();
         assert!(matches!(

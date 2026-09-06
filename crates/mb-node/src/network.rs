@@ -1572,11 +1572,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires an explicitly provisioned reflink test filesystem"]
     async fn signed_network_commit_and_seed_recovery() {
-        let Some(test_root) = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") else {
-            eprintln!("skipped: MUTUALBACKUP_REFLINK_TEST_ROOT is not set");
-            return;
-        };
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT");
         let root = PathBuf::from(test_root).join(format!("network-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let source = root.join("source");

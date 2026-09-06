@@ -790,6 +790,7 @@ impl ParityStore {
 
 fn initialize_or_validate_control(connection: &mut Connection) -> Result<(), DatabaseError> {
     if database_has_tables(connection)? {
+        migrate_control(connection)?;
         validate_database_identity(connection, b"control", None)?;
         require_tables(
             connection,
@@ -874,6 +875,7 @@ fn initialize_or_validate_parity(
     volume_id: &[u8; 16],
 ) -> Result<(), DatabaseError> {
     if database_has_tables(connection)? {
+        migrate_parity(connection, volume_id)?;
         validate_database_identity(connection, b"parity", Some(volume_id))?;
         require_tables(connection, &["meta", "parity_objects"])?;
         return Ok(());
@@ -910,6 +912,218 @@ fn initialize_or_validate_parity(
     )?;
     transaction.commit()?;
     Ok(())
+}
+
+fn migrate_control(connection: &mut Connection) -> Result<(), DatabaseError> {
+    if !table_exists(connection, "meta")? {
+        return Err(DatabaseError::IncompatibleSchema);
+    }
+    let version = stored_schema_version(connection)?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    if version == 0 || version > SCHEMA_VERSION {
+        return Err(DatabaseError::IncompatibleSchema);
+    }
+    if version >= 2 && meta_value(connection, "database_kind")?.as_deref() != Some(b"control") {
+        return Err(DatabaseError::IncompatibleSchema);
+    }
+    if !table_exists(connection, "protocol_records")? || !table_exists(connection, "operations")? {
+        return Err(DatabaseError::IncompatibleSchema);
+    }
+    let operation_columns = table_columns(connection, "operations")?;
+    let expected_operations = if version == 1 {
+        ["operation_id", "kind", "state", "body"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        [
+            "operation_id",
+            "kind",
+            "caller",
+            "request_hash",
+            "state",
+            "body",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    };
+    if operation_columns != expected_operations {
+        return Err(DatabaseError::IncompatibleSchema);
+    }
+
+    let transaction = connection.transaction()?;
+    if version <= 2 {
+        transaction.execute_batch(
+            "ALTER TABLE operations RENAME TO operations_before_v3;
+             CREATE TABLE operations (
+                operation_id BLOB PRIMARY KEY CHECK(length(operation_id) = 16),
+                kind TEXT NOT NULL,
+                caller BLOB NOT NULL CHECK(length(caller) = 32),
+                request_hash BLOB NOT NULL CHECK(length(request_hash) = 32),
+                state TEXT NOT NULL CHECK(state IN ('IN_PROGRESS', 'COMMITTED')),
+                body BLOB NOT NULL
+             ) STRICT;",
+        )?;
+        if version == 2 {
+            transaction.execute_batch(
+                "INSERT INTO operations(operation_id, kind, caller, request_hash, state, body)
+                 SELECT operation_id, kind, caller, request_hash, 'COMMITTED', body
+                 FROM operations_before_v3
+                 WHERE length(operation_id) = 16
+                   AND length(caller) = 32
+                   AND length(request_hash) = 32
+                   AND state = 'COMMITTED';",
+            )?;
+        }
+        transaction.execute_batch("DROP TABLE operations_before_v3;")?;
+    }
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS checkpoint_signature_locks (
+            guild_id BLOB PRIMARY KEY CHECK(length(guild_id) = 32),
+            generation INTEGER NOT NULL CHECK(generation > 0),
+            checkpoint_hash BLOB NOT NULL CHECK(length(checkpoint_hash) = 32),
+            checkpoint_bytes BLOB NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS checkpoint_heads (
+            guild_id BLOB PRIMARY KEY CHECK(length(guild_id) = 32),
+            generation INTEGER NOT NULL CHECK(generation > 0),
+            checkpoint_hash BLOB NOT NULL CHECK(length(checkpoint_hash) = 32),
+            checkpoint_bytes BLOB NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS recovery_shards (
+            checkpoint_hash BLOB NOT NULL CHECK(length(checkpoint_hash) = 32),
+            guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
+            group_id BLOB NOT NULL CHECK(length(group_id) = 32),
+            shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 0 AND 4),
+            root BLOB NOT NULL CHECK(length(root) = 32),
+            bytes BLOB NOT NULL CHECK(length(bytes) = 65536),
+            PRIMARY KEY(checkpoint_hash, group_id, shard_index)
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS checkpoint_pages (
+            object_kind TEXT NOT NULL CHECK(object_kind IN ('body', 'certificate')),
+            guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
+            object_id BLOB NOT NULL CHECK(length(object_id) = 32),
+            page_index INTEGER NOT NULL CHECK(page_index >= 0),
+            total_pages INTEGER NOT NULL CHECK(total_pages BETWEEN 1 AND 512),
+            page_hash BLOB NOT NULL CHECK(length(page_hash) = 32),
+            bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 524288),
+            PRIMARY KEY(object_kind, object_id, page_index)
+         ) STRICT;",
+    )?;
+    transaction.execute(
+        "INSERT INTO meta(key, value) VALUES ('database_kind', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [b"control".as_slice()],
+    )?;
+    transaction.execute(
+        "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [SCHEMA_VERSION.to_be_bytes().as_slice()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_parity(connection: &mut Connection, volume_id: &[u8; 16]) -> Result<(), DatabaseError> {
+    if !table_exists(connection, "meta")? {
+        if !table_exists(connection, "parity_objects")? {
+            return Err(DatabaseError::IncompatibleSchema);
+        }
+        let expected = [
+            "group_id",
+            "shard_index",
+            "root",
+            "byte_length",
+            "state",
+            "bytes",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        if table_columns(connection, "parity_objects")? != expected {
+            return Err(DatabaseError::IncompatibleSchema);
+        }
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "ALTER TABLE parity_objects RENAME TO parity_objects_v1_unassigned;
+             CREATE TABLE parity_objects (
+                format_version INTEGER NOT NULL CHECK(format_version = 1),
+                guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
+                group_id BLOB NOT NULL CHECK(length(group_id) = 32),
+                shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 3 AND 4),
+                root BLOB NOT NULL CHECK(length(root) = 32),
+                byte_length INTEGER NOT NULL CHECK(byte_length = 65536),
+                state TEXT NOT NULL CHECK(state IN ('STAGED', 'READY')),
+                bytes BLOB NOT NULL,
+                PRIMARY KEY(group_id, shard_index)
+             ) STRICT;
+             CREATE TABLE meta (
+                key TEXT PRIMARY KEY,
+                value BLOB NOT NULL
+             ) STRICT;",
+        )?;
+        transaction.execute(
+            "INSERT INTO meta(key, value) VALUES ('database_kind', ?1)",
+            [b"parity".as_slice()],
+        )?;
+        transaction.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
+            [SCHEMA_VERSION.to_be_bytes().as_slice()],
+        )?;
+        transaction.execute(
+            "INSERT INTO meta(key, value) VALUES ('volume_id', ?1)",
+            [volume_id.as_slice()],
+        )?;
+        transaction.commit()?;
+        return Ok(());
+    }
+    let version = stored_schema_version(connection)?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    if !(2..=SCHEMA_VERSION).contains(&version)
+        || meta_value(connection, "database_kind")?.as_deref() != Some(b"parity")
+        || meta_value(connection, "volume_id")?.as_deref() != Some(volume_id.as_slice())
+    {
+        return Err(DatabaseError::IncompatibleSchema);
+    }
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+        [SCHEMA_VERSION.to_be_bytes().as_slice()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn stored_schema_version(connection: &Connection) -> Result<u32, DatabaseError> {
+    let bytes =
+        meta_value(connection, "schema_version")?.ok_or(DatabaseError::IncompatibleSchema)?;
+    let bytes: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| DatabaseError::IncompatibleSchema)?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn table_exists(connection: &Connection, name: &str) -> Result<bool, DatabaseError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+        [name],
+        |row| row.get(0),
+    )?)
+}
+
+fn table_columns(
+    connection: &Connection,
+    table: &'static str,
+) -> Result<std::collections::BTreeSet<String>, DatabaseError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    Ok(statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?)
 }
 
 fn database_has_tables(connection: &Connection) -> Result<bool, DatabaseError> {
@@ -1126,6 +1340,91 @@ mod tests {
                 .begin_operation(&operation, "other", &caller, &request)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn known_control_schema_migrates_transactionally() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([14; 32]));
+        {
+            let connection =
+                open_encrypted(&path, &keys.database_key(CONTROL_DATABASE_ID)).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE meta(key TEXT PRIMARY KEY, value BLOB NOT NULL) STRICT;
+                     CREATE TABLE protocol_records(
+                        kind TEXT NOT NULL, record_id BLOB NOT NULL, bytes BLOB NOT NULL,
+                        PRIMARY KEY(kind, record_id)
+                     ) STRICT;
+                     CREATE TABLE operations(
+                        operation_id BLOB PRIMARY KEY, kind TEXT NOT NULL,
+                        state TEXT NOT NULL, body BLOB NOT NULL
+                     ) STRICT;",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
+                    [1_u32.to_be_bytes().as_slice()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO protocol_records(kind, record_id, bytes) VALUES ('test', x'01', x'02')",
+                    [],
+                )
+                .unwrap();
+        }
+        let mut store = ControlStore::open(&path, &keys).unwrap();
+        assert_eq!(store.get_record("test", &[1]).unwrap().unwrap(), vec![2]);
+        assert!(
+            store
+                .begin_operation(&[1; 16], "test", &[2; 32], &[3; 32])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unknown_newer_schema_is_rejected() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([15; 32]));
+        {
+            let connection =
+                open_encrypted(&path, &keys.database_key(CONTROL_DATABASE_ID)).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE meta(key TEXT PRIMARY KEY, value BLOB NOT NULL) STRICT;
+                     CREATE TABLE protocol_records(
+                        kind TEXT NOT NULL, record_id BLOB NOT NULL, bytes BLOB NOT NULL,
+                        PRIMARY KEY(kind, record_id)
+                     ) STRICT;
+                     CREATE TABLE operations(
+                        operation_id BLOB PRIMARY KEY, kind TEXT NOT NULL,
+                        caller BLOB NOT NULL, request_hash BLOB NOT NULL,
+                        state TEXT NOT NULL, body BLOB NOT NULL
+                     ) STRICT;",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO meta(key, value) VALUES ('database_kind', ?1)",
+                    [b"control".as_slice()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
+                    [(SCHEMA_VERSION + 1).to_be_bytes().as_slice()],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            ControlStore::open(&path, &keys),
+            Err(DatabaseError::IncompatibleSchema)
+        ));
     }
 
     #[test]
