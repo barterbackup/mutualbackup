@@ -1333,6 +1333,38 @@ pub async fn recover_over_network(
     restore_target: &Path,
     directory: SocketAddr,
 ) -> Result<Node> {
+    let (mut recovered_node, checkpoint) =
+        recover_member_over_network(seed, data_dir, directory).await?;
+    let local_node_id = recovered_node.keys().node_id();
+    let checkpoint_hash = checkpoint.hash()?;
+    let revision = checkpoint
+        .checkpoint
+        .revisions
+        .iter()
+        .filter(|revision| revision.value.owner == local_node_id)
+        .max_by_key(|revision| revision.value.sequence)
+        .cloned()
+        .context("the recovered storage-only member has no user revision to restore")?;
+    let checkpoint_for_worker = checkpoint.clone();
+    let restore_target = restore_target.to_path_buf();
+    recovered_node = run_node_blocking(recovered_node, move |node| {
+        node.restore_recovered_revision(
+            &checkpoint_hash,
+            checkpoint_for_worker.checkpoint.guild_id,
+            &revision,
+            &restore_target,
+        )?;
+        Ok(())
+    })
+    .await?;
+    Ok(recovered_node)
+}
+
+async fn recover_member_over_network(
+    seed: Seed,
+    data_dir: &Path,
+    directory: SocketAddr,
+) -> Result<(Node, QuorumCheckpoint)> {
     let data_dir = data_dir.to_path_buf();
     let mut recovered_node = tokio::task::spawn_blocking(move || Node::open(data_dir, seed))
         .await
@@ -1416,28 +1448,13 @@ pub async fn recover_over_network(
         .collect::<BTreeMap<_, _>>();
     recovered_node =
         recover_network_local_shards(recovered_node, &checkpoint, &peer_endpoints).await?;
-    let revision = checkpoint
-        .checkpoint
-        .revisions
-        .iter()
-        .filter(|revision| revision.value.owner == local_node_id)
-        .max_by_key(|revision| revision.value.sequence)
-        .cloned()
-        .context("the recovered storage-only member has no user revision to restore")?;
     let checkpoint_for_worker = checkpoint.clone();
-    let restore_target = restore_target.to_path_buf();
     recovered_node = run_node_blocking(recovered_node, move |node| {
         node.install_recovered_checkpoint(&checkpoint_for_worker)?;
-        node.restore_recovered_revision(
-            &checkpoint_hash,
-            checkpoint_for_worker.checkpoint.guild_id,
-            &revision,
-            &restore_target,
-        )?;
         Ok(())
     })
     .await?;
-    Ok(recovered_node)
+    Ok((recovered_node, checkpoint))
 }
 
 async fn recover_network_local_shards(
@@ -2317,15 +2334,18 @@ mod tests {
             &coordinator_keys,
             &source,
             directory_address,
-            peer_addresses,
+            peer_addresses.clone(),
         )
         .await
         .unwrap();
         assert_eq!(first_commit.guild_id, retried_commit.guild_id);
         assert_eq!(first_commit.checkpoint_hash, retried_commit.checkpoint_hash);
-        peer_tasks.remove(0).abort();
-        tokio::task::yield_now().await;
+        peer_tasks[0].abort();
+        peer_tasks[1].abort();
+        let _ = (&mut peer_tasks[0]).await;
+        let _ = (&mut peer_tasks[1]).await;
         fs::remove_dir_all(root.join("node-0")).unwrap();
+        fs::remove_dir_all(root.join("node-1")).unwrap();
         fs::remove_dir_all(&source).unwrap();
 
         let restored = root.join("restored");
@@ -2397,11 +2417,76 @@ mod tests {
             vec![0x5a; 150_000]
         );
 
-        for task in peer_tasks {
-            task.abort();
-        }
+        let recovered_zero_task = tokio::spawn(serve_node(
+            Arc::new(Mutex::new(recovered)),
+            NodeServerConfig {
+                listen: peer_addresses[0],
+                public_endpoint: format!("tcp://{}", peer_addresses[0]),
+                failure_domain: "host-0".to_owned(),
+                trusted_coordinator: coordinator_keys.node_id(),
+                max_connections: 8,
+            },
+        ));
+        wait_until_listening(peer_addresses[0]).await;
+
+        peer_tasks[2].abort();
+        let _ = (&mut peer_tasks[2]).await;
+        fs::remove_dir_all(root.join("node-2")).unwrap();
+        let (recovered_one, recovered_one_checkpoint) = recover_member_over_network(
+            Seed::from_bytes([101; 32]),
+            &root.join("recovered-node-1"),
+            directory_address,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered_one.keys().node_id(),
+            KeyMaterial::from_seed(&Seed::from_bytes([101; 32])).node_id()
+        );
+        assert_eq!(
+            recovered_one_checkpoint.hash().unwrap(),
+            first_commit.checkpoint_hash
+        );
+        let recovered_one_task = tokio::spawn(serve_node(
+            Arc::new(Mutex::new(recovered_one)),
+            NodeServerConfig {
+                listen: peer_addresses[1],
+                public_endpoint: format!("tcp://{}", peer_addresses[1]),
+                failure_domain: "host-1".to_owned(),
+                trusted_coordinator: coordinator_keys.node_id(),
+                max_connections: 8,
+            },
+        ));
+        wait_until_listening(peer_addresses[1]).await;
+
+        peer_tasks[3].abort();
+        let _ = (&mut peer_tasks[3]).await;
+        fs::remove_dir_all(root.join("node-3")).unwrap();
+        let (recovered_two, recovered_two_checkpoint) = recover_member_over_network(
+            Seed::from_bytes([102; 32]),
+            &root.join("recovered-node-2"),
+            directory_address,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered_two.keys().node_id(),
+            KeyMaterial::from_seed(&Seed::from_bytes([102; 32])).node_id()
+        );
+        assert_eq!(
+            recovered_two_checkpoint.hash().unwrap(),
+            first_commit.checkpoint_hash
+        );
+
+        peer_tasks[4].abort();
+        let _ = (&mut peer_tasks[4]).await;
+        recovered_zero_task.abort();
+        let _ = recovered_zero_task.await;
+        recovered_one_task.abort();
+        let _ = recovered_one_task.await;
         directory_task.abort();
-        drop(recovered);
+        let _ = directory_task.await;
+        drop(recovered_two);
         fs::remove_dir_all(&root).unwrap();
     }
 }
