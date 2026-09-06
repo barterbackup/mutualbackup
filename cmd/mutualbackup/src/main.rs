@@ -82,6 +82,32 @@ enum Command {
     },
     /// Inspect a durable backup job by revision ID.
     BackupStatus { revision_id: Uuid },
+    /// Create a blank recovery-mode daemon configuration around an existing seed.
+    RecoverInit {
+        #[arg(long)]
+        seed_file: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024_u64)]
+        parity_budget_bytes: u64,
+        #[arg(long = "listen")]
+        p2p_listen_addresses: Vec<String>,
+        #[arg(long = "external-address")]
+        p2p_external_addresses: Vec<String>,
+        #[arg(long = "bootstrap", required = true)]
+        p2p_bootstrap_addresses: Vec<String>,
+        #[arg(long = "relay")]
+        p2p_relay_addresses: Vec<String>,
+    },
+    /// Restore this seed's latest revision through the recovery-mode daemon.
+    Restore { target: PathBuf },
+    /// List or restore committed snapshots owned by this node.
+    Snapshot {
+        #[command(subcommand)]
+        command: SnapshotCommand,
+    },
     /// Run a real five-node, SQLCipher-backed, seed-only recovery demonstration.
     DemoSeedRecovery {
         /// Existing directory on a reflink-capable filesystem. The command
@@ -182,6 +208,16 @@ enum GuildCommand {
     Status,
 }
 
+#[derive(Debug, Subcommand)]
+enum SnapshotCommand {
+    List,
+    Restore {
+        target: PathBuf,
+        #[arg(long)]
+        revision: Option<Uuid>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -217,6 +253,7 @@ async fn main() -> Result<()> {
                     control_socket: control_socket.clone(),
                     failure_domain: failure_domain
                         .context("--failure-domain is required when --config is used")?,
+                    recovery_mode: false,
                     parity_budget_bytes,
                     p2p_listen_addresses: if p2p_listen_addresses.is_empty() {
                         default_p2p_listen_addresses()
@@ -247,6 +284,8 @@ async fn main() -> Result<()> {
             println!("node id:       {}", status.node_id);
             println!("data dir:      {}", status.data_dir.display());
             println!("checkpoints:   {}", status.checkpoint_count);
+            println!("recovery ready: {}", status.seed_recovery_ready);
+            println!("root dirty:     {}", status.root_dirty);
             match status.protected_root {
                 Some(root) => println!("protected root: {}", root.path.display()),
                 None => println!("protected root: (not configured)"),
@@ -320,6 +359,95 @@ async fn main() -> Result<()> {
             };
             print_backup_job(&job);
         }
+        Command::RecoverInit {
+            seed_file,
+            config,
+            data_dir,
+            parity_budget_bytes,
+            p2p_listen_addresses,
+            p2p_external_addresses,
+            p2p_bootstrap_addresses,
+            p2p_relay_addresses,
+        } => {
+            read_seed(&seed_file).context("cannot use the supplied recovery seed")?;
+            let control_socket = cli
+                .socket
+                .as_ref()
+                .context("--socket is required for recover-init")?;
+            write_config(
+                &config,
+                &DaemonConfig {
+                    format_version: 1,
+                    data_dir,
+                    seed_file,
+                    control_socket: control_socket.clone(),
+                    failure_domain: String::new(),
+                    recovery_mode: true,
+                    parity_budget_bytes,
+                    p2p_listen_addresses: if p2p_listen_addresses.is_empty() {
+                        default_p2p_listen_addresses()
+                    } else {
+                        p2p_listen_addresses
+                    },
+                    p2p_external_addresses,
+                    p2p_bootstrap_addresses,
+                    p2p_relay_addresses,
+                    enable_relay_server: false,
+                },
+            )?;
+            println!("recovery daemon config written to: {}", config.display());
+        }
+        Command::Restore { target } => {
+            let response = local_control_call(
+                required_socket(&cli.socket)?,
+                &LocalRequest::Recover {
+                    target: target.clone(),
+                },
+            )
+            .await?;
+            let LocalResponse::Recovered(result) = response else {
+                bail!("daemon returned the wrong response to restore request");
+            };
+            println!("restore succeeded: {}", target.display());
+            println!("guild id:    {}", hex::encode(result.guild_id));
+            println!("checkpoint:  {}", hex::encode(result.checkpoint_hash));
+            println!("generation:  {}", result.generation);
+            println!("revision:    {}", result.revision_id);
+        }
+        Command::Snapshot { command } => match command {
+            SnapshotCommand::List => {
+                let response =
+                    local_control_call(required_socket(&cli.socket)?, &LocalRequest::SnapshotList)
+                        .await?;
+                let LocalResponse::Snapshots(snapshots) = response else {
+                    bail!("daemon returned the wrong response to snapshot list");
+                };
+                for snapshot in snapshots {
+                    println!(
+                        "{} sequence={} checkpoint-generation={}",
+                        snapshot.revision_id, snapshot.sequence, snapshot.checkpoint_generation
+                    );
+                }
+            }
+            SnapshotCommand::Restore { target, revision } => {
+                let response = local_control_call(
+                    required_socket(&cli.socket)?,
+                    &LocalRequest::SnapshotRestore {
+                        revision_id: revision,
+                        target: target.clone(),
+                    },
+                )
+                .await?;
+                let LocalResponse::SnapshotRestored(snapshot) = response else {
+                    bail!("daemon returned the wrong response to snapshot restore");
+                };
+                println!(
+                    "restored revision {} to {}",
+                    snapshot.revision_id,
+                    target.display()
+                );
+            }
+        },
         Command::DemoSeedRecovery { work_dir } => demo_seed_recovery(work_dir)?,
         Command::ServeDirectory { listen } => {
             println!("recovery directory listening on {listen}");

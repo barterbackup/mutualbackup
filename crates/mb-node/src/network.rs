@@ -29,8 +29,9 @@ use crate::{
 
 mod p2p;
 pub use p2p::{
-    DhtRecord, P2pClient, P2pConfig, P2pEventLoop, P2pPeerProfile, P2pStatus, build_p2p,
-    run_coordinator_jobs,
+    DhtRecord, DhtRecoveryResult, P2pClient, P2pConfig, P2pEventLoop, P2pPeerProfile, P2pStatus,
+    build_p2p, endpoint_record_key, recover_from_dht, recovery_bundle_key, recovery_mailbox_key,
+    run_coordinator_jobs, run_dht_publications,
 };
 
 const MAX_PEER_FRAME_BYTES: usize = 600 * 1024;
@@ -86,6 +87,9 @@ enum PeerRequest {
     BackupStatus {
         guild_id: [u8; 32],
         revision_id: Uuid,
+    },
+    GetGuildGenesis {
+        guild_id: [u8; 32],
     },
     BeginCommit {
         intent_id: [u8; 16],
@@ -190,6 +194,7 @@ impl PeerRequest {
                 | Self::GetPreparedRevisionPage { .. }
                 | Self::GetCheckpointPage { .. }
                 | Self::BackupStatus { .. }
+                | Self::GetGuildGenesis { .. }
         )
     }
 
@@ -201,6 +206,7 @@ impl PeerRequest {
             | Self::GetPreparedRevisionPage { .. }
             | Self::GetCheckpointPage { .. }
             | Self::BackupStatus { .. } => None,
+            Self::GetGuildGenesis { .. } => None,
             Self::BeginCommit { .. } => Some("begin-commit"),
             Self::JoinGuild { .. } => Some("join-guild"),
             Self::ProposeGuildGenesis { .. } => Some("propose-guild-genesis"),
@@ -238,6 +244,7 @@ impl PeerRequest {
             | Self::AuthorizeRecoveryPublisher { guild_id, .. }
             | Self::CompleteCommit { guild_id, .. }
             | Self::BackupStatus { guild_id, .. } => Some(*guild_id),
+            Self::GetGuildGenesis { guild_id } => Some(*guild_id),
             Self::PublishParity { object, .. } => Some(object.guild_id),
         }
     }
@@ -280,6 +287,7 @@ enum PeerResponse {
     GuildGenesisSignature(MemberSignature),
     BackupJob(BackupJob),
     StorageAcknowledgement(SignedRecord<StorageAcknowledgement>),
+    GuildGenesis(Box<QuorumGuildGenesis>),
     CheckpointPage {
         total_pages: u32,
         page_hash: [u8; 32],
@@ -938,11 +946,7 @@ fn execute_read_request(
 ) -> Result<PeerResponse> {
     match request {
         PeerRequest::Profile => Ok(PeerResponse::Profile(PeerProfile {
-            member: Member {
-                node_id: node.keys().node_id(),
-                recovery_public_key: node.keys().recovery_public_key(),
-                failure_domain: config.failure_domain.clone(),
-            },
+            member: node.advertised_member(&config.failure_domain)?,
             endpoint: config.public_endpoint.clone(),
         })),
         PeerRequest::GetSector {
@@ -992,6 +996,9 @@ fn execute_read_request(
         } => Ok(PeerResponse::BackupJob(
             node.backup_job(guild_id, revision_id)?,
         )),
+        PeerRequest::GetGuildGenesis { guild_id } => Ok(PeerResponse::GuildGenesis(Box::new(
+            node.installed_guild_certificate(guild_id)?,
+        ))),
         _ => bail!("mutation was sent to a read-only node worker"),
     }
 }
@@ -1005,7 +1012,7 @@ fn execute_peer_request(
 ) -> Result<PeerResponse> {
     match request {
         PeerRequest::Profile => Ok(PeerResponse::Profile(PeerProfile {
-            member: node.member(config.failure_domain.clone()),
+            member: node.advertised_member(&config.failure_domain)?,
             endpoint: config.public_endpoint.clone(),
         })),
         PeerRequest::JoinGuild { invite, peer } => {
@@ -1130,6 +1137,9 @@ fn execute_peer_request(
         }
         PeerRequest::BackupStatus { .. } => {
             bail!("backup status read was sent to a mutation worker")
+        }
+        PeerRequest::GetGuildGenesis { .. } => {
+            bail!("guild genesis read was sent to a mutation worker")
         }
         PeerRequest::BuildRecoveryRecord {
             publication_id: _,

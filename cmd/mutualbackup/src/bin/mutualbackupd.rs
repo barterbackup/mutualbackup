@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use clap::Parser;
 use libp2p::Multiaddr;
-use mb_node::{Node, P2pConfig, build_p2p, run_coordinator_jobs, serve_local_control};
+use mb_node::{
+    Node, P2pConfig, build_p2p, run_coordinator_jobs, run_dht_publications, run_root_watcher,
+    serve_local_control,
+};
 use mutualbackup::{read_config, read_seed};
 use tracing_subscriber::EnvFilter;
 
@@ -23,7 +26,9 @@ async fn main() -> Result<()> {
         .ok();
     let config = read_config(&Cli::parse().config)?;
     let mut node = Node::open(&config.data_dir, read_seed(&config.seed_file)?)?;
-    node.configure_failure_domain(&config.failure_domain)?;
+    if !config.recovery_mode {
+        node.configure_failure_domain(&config.failure_domain)?;
+    }
     node.configure_parity_budget(config.parity_budget_bytes)?;
     let node_id = node.keys().node_id();
     let node = Arc::new(Mutex::new(node));
@@ -40,6 +45,7 @@ async fn main() -> Result<()> {
             .cloned()
             .expect("validated config has a listen address"),
         failure_domain: config.failure_domain.clone(),
+        configure_failure_domain: !config.recovery_mode,
         trusted_coordinator: node_id,
         max_connections: 32,
     };
@@ -50,7 +56,9 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         result = serve_local_control(node.clone(), p2p_client.clone(), &config.control_socket) => result,
-        result = run_coordinator_jobs(node, p2p_client) => result,
+        result = run_coordinator_jobs(node.clone(), p2p_client.clone()) => result,
+        result = run_dht_publications(node.clone(), p2p_client.clone()) => result,
+        result = run_root_watcher(node.clone()) => result,
         result = p2p_event_loop.run() => result,
         result = tokio::signal::ctrl_c() => {
             result?;

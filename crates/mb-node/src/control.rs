@@ -15,7 +15,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
 
-use crate::{BackupJob, BackupJobState, GuildSummary, Node, P2pClient};
+use crate::{
+    BackupJob, BackupJobState, DhtRecoveryResult, GuildSummary, Node, P2pClient, SnapshotInfo,
+    recover_from_dht,
+};
 
 const MAX_LOCAL_FRAME_BYTES: usize = 1024 * 1024;
 
@@ -34,19 +37,37 @@ pub struct NodeStatus {
     pub data_dir: PathBuf,
     pub protected_root: Option<ProtectedRoot>,
     pub checkpoint_count: u64,
+    pub seed_recovery_ready: bool,
+    pub root_dirty: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum LocalRequest {
     Status,
-    AddRoot { path: PathBuf },
+    AddRoot {
+        path: PathBuf,
+    },
     GuildStatus,
     GuildCreate,
     GuildInvite,
-    GuildJoin { token: String },
+    GuildJoin {
+        token: String,
+    },
     GuildFinalize,
-    Backup { wait: bool },
-    BackupStatus { revision_id: Uuid },
+    Backup {
+        wait: bool,
+    },
+    BackupStatus {
+        revision_id: Uuid,
+    },
+    Recover {
+        target: PathBuf,
+    },
+    SnapshotList,
+    SnapshotRestore {
+        revision_id: Option<Uuid>,
+        target: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -59,6 +80,9 @@ pub enum LocalResponse {
         expires_at_unix_seconds: u64,
     },
     BackupJob(BackupJob),
+    Recovered(DhtRecoveryResult),
+    Snapshots(Vec<SnapshotInfo>),
+    SnapshotRestored(SnapshotInfo),
     Error(String),
 }
 
@@ -338,6 +362,26 @@ async fn handle_request(
             )
             .await?;
             Ok(LocalResponse::BackupJob(job))
+        }
+        LocalRequest::Recover { target } => {
+            let result = recover_from_dht(node, &p2p, &target).await?;
+            Ok(LocalResponse::Recovered(result))
+        }
+        LocalRequest::SnapshotList => {
+            blocking_node(node, |node| {
+                node.list_snapshots().map(LocalResponse::Snapshots)
+            })
+            .await
+        }
+        LocalRequest::SnapshotRestore {
+            revision_id,
+            target,
+        } => {
+            blocking_node(node, move |node| {
+                node.restore_snapshot(revision_id, &target)
+                    .map(LocalResponse::SnapshotRestored)
+            })
+            .await
         }
     }
 }

@@ -16,6 +16,7 @@ libc.workspace = true
 libp2p.workspace = true
 mb-core = { path = "../mb-core" }
 mb-store = { path = "../mb-store" }
+notify.workspace = true
 postcard.workspace = true
 rand.workspace = true
 serde.workspace = true

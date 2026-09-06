@@ -4,7 +4,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::keys::{KeyMaterial, NodeId, RecoveryPublicKey, signing_payload};
-use crate::recovery::RecoveryLocator;
+use crate::recovery::{RecoveryLocator, SealedRecoveryRecord};
 use crate::{
     V1_CIPHER_PROFILE, V1_MAX_CODING_GROUPS, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS,
     V1_SECTOR_SIZE, encode_3_2, sector_root,
@@ -54,6 +54,25 @@ pub struct StorageAcknowledgement {
     pub row: u16,
     pub root: [u8; 32],
     pub holder: NodeId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EndpointRecord {
+    pub format_version: u16,
+    pub publisher: NodeId,
+    pub sequence: u64,
+    pub expires_at_unix_seconds: u64,
+    pub endpoints: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryBundle {
+    pub format_version: u16,
+    pub subject: NodeId,
+    pub publisher: NodeId,
+    pub sequence: u64,
+    pub expires_at_unix_seconds: u64,
+    pub sealed: SealedRecoveryRecord,
 }
 
 impl StorageAcknowledgement {
@@ -524,7 +543,7 @@ impl QuorumCheckpoint {
             || locator.guild_id != self.checkpoint.guild_id
             || locator.checkpoint_generation != self.checkpoint.generation
             || locator.checkpoint_hash != self.hash()?
-            || locator.expires_at_unix_seconds != u64::MAX
+            || locator.expires_at_unix_seconds == 0
             || locator.endpoints.is_empty()
             || locator.endpoints.len() > 8
             || locator

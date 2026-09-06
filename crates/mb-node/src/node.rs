@@ -6,11 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use mb_core::{
-    GuildCheckpoint, GuildGenesis, GuildInvite, KeyMaterial, Member, MemberSignature, NodeId,
-    QuorumCheckpoint, QuorumGuildGenesis, RecoveryLocator, SectorId, SectorRef, Seed, ShardRole,
-    SignedRecord, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
-    V1_MAX_CATALOG_PAGES, canonical_bytes, decode_canonical, seal_recovery_record, sector_root,
-    synthetic_filler_sector,
+    EndpointRecord, GuildCheckpoint, GuildGenesis, GuildInvite, KeyMaterial, Member,
+    MemberSignature, NodeId, QuorumCheckpoint, QuorumGuildGenesis, RecoveryBundle, RecoveryLocator,
+    SectorId, SectorRef, Seed, ShardRole, SignedRecord, StorageAcknowledgement, UserRevision,
+    V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_PAGES, canonical_bytes, decode_canonical,
+    seal_recovery_record, sector_root, synthetic_filler_sector,
 };
 use mb_store::{ControlStore, ParityObject, ParityStore, probe_reflink};
 use rand::RngCore;
@@ -21,7 +21,8 @@ use crate::snapshot::{
     build_revision_restore, install_inline_recipe, install_recovered_sector_recipe,
     install_recovery_marker, make_restore_root_private, native_directory_id, prepare_revision,
     publish_restore, reanchor_recovered_revision, reconcile_pending_captures,
-    remove_recovery_marker, render_sector, restore_signed_root_metadata, verify_recovery_marker,
+    remove_recovery_marker, render_sector, restore_revision_from_source,
+    restore_signed_root_metadata, verify_recovery_marker,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -105,6 +106,29 @@ pub struct BackupJob {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct DhtPublicationSet {
+    pub checkpoint_hash: [u8; 32],
+    pub endpoint: SignedRecord<EndpointRecord>,
+    pub recovery: Vec<SignedRecord<RecoveryBundle>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct DhtPublicationState {
+    format_version: u16,
+    checkpoint_hash: [u8; 32],
+    endpoints: Vec<String>,
+    expires_at_unix_seconds: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotInfo {
+    pub revision_id: Uuid,
+    pub sequence: u64,
+    pub checkpoint_generation: u64,
+    pub checkpoint_hash: [u8; 32],
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct GuildDraft {
     format_version: u16,
@@ -135,6 +159,13 @@ struct InstalledGuild {
     format_version: u16,
     certificate: QuorumGuildGenesis,
     peers: Vec<GuildPeer>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct RootDirtyState {
+    format_version: u16,
+    dirty: bool,
+    reason: String,
 }
 
 pub type RecoveredShards = BTreeMap<([u8; 32], u8), Vec<u8>>;
@@ -177,8 +208,15 @@ impl NodeReaderConfig {
 }
 
 impl NodeReader {
-    pub(crate) fn keys(&self) -> &KeyMaterial {
-        &self.keys
+    pub(crate) fn advertised_member(&self, fallback_failure_domain: &str) -> Result<Member> {
+        if let Some(bytes) = self.control.get_record("node-config", b"member")? {
+            return decode_canonical(&bytes).map_err(Into::into);
+        }
+        Ok(Member {
+            node_id: self.keys.node_id(),
+            recovery_public_key: self.keys.recovery_public_key(),
+            failure_domain: fallback_failure_domain.to_owned(),
+        })
     }
 
     pub(crate) fn authorize_member(&self, guild_id: &[u8; 32], caller: NodeId) -> Result<()> {
@@ -187,6 +225,23 @@ impl NodeReader {
 
     pub(crate) fn backup_job(&self, guild_id: [u8; 32], revision_id: Uuid) -> Result<BackupJob> {
         backup_job(&self.control, guild_id, revision_id)
+    }
+
+    pub(crate) fn installed_guild_certificate(
+        &self,
+        guild_id: [u8; 32],
+    ) -> Result<QuorumGuildGenesis> {
+        let installed: InstalledGuild = decode_canonical(
+            &self
+                .control
+                .get_record("guild-installed", b"primary")?
+                .context("this node has no installed guild")?,
+        )?;
+        installed.certificate.verify()?;
+        if installed.certificate.genesis.guild_id != guild_id {
+            anyhow::bail!("requested guild differs from installed guild");
+        }
+        Ok(installed.certificate)
     }
 
     pub(crate) fn sector_for_guild(
@@ -283,6 +338,8 @@ impl Node {
             data_dir: self.data_dir.clone(),
             protected_root: self.protected_root()?,
             checkpoint_count: self.control.checkpoint_head_certificates()?.len() as u64,
+            seed_recovery_ready: self.seed_recovery_ready()?,
+            root_dirty: self.root_dirty()?,
         })
     }
 
@@ -332,7 +389,34 @@ impl Node {
         };
         self.control
             .put_record("node-config", b"protected-root", &canonical_bytes(&root)?)?;
+        self.mark_root_dirty("protected root has not been backed up")?;
         Ok(root)
+    }
+
+    pub fn mark_root_dirty(&mut self, reason: &str) -> Result<()> {
+        let mut reason = reason.to_owned();
+        reason.truncate(512);
+        self.control.put_record(
+            "node-state",
+            b"root-dirty",
+            &canonical_bytes(&RootDirtyState {
+                format_version: 1,
+                dirty: true,
+                reason,
+            })?,
+        )?;
+        Ok(())
+    }
+
+    pub fn root_dirty(&self) -> Result<bool> {
+        let Some(bytes) = self.control.get_record("node-state", b"root-dirty")? else {
+            return Ok(self.protected_root()?.is_some());
+        };
+        let state: RootDirtyState = decode_canonical(&bytes)?;
+        if state.format_version != 1 {
+            anyhow::bail!("unsupported root dirty-state version");
+        }
+        Ok(state.dirty)
     }
 
     pub(crate) fn reader_config(&self) -> NodeReaderConfig {
@@ -352,6 +436,13 @@ impl Node {
             recovery_public_key: self.keys.recovery_public_key(),
             failure_domain: failure_domain.into(),
         }
+    }
+
+    pub fn advertised_member(&self, fallback_failure_domain: &str) -> Result<Member> {
+        if let Some(bytes) = self.control.get_record("node-config", b"member")? {
+            return decode_canonical(&bytes).map_err(Into::into);
+        }
+        Ok(self.member(fallback_failure_domain))
     }
 
     pub fn configure_failure_domain(&mut self, failure_domain: &str) -> Result<()> {
@@ -676,6 +767,85 @@ impl Node {
         }
         self.control
             .put_record("guild-installed", b"primary", &canonical_bytes(&installed)?)?;
+        Ok(())
+    }
+
+    pub fn adopt_recovered_guild(
+        &mut self,
+        certificate: QuorumGuildGenesis,
+        mut peers: Vec<GuildPeer>,
+    ) -> Result<()> {
+        certificate.verify()?;
+        let local_member = certificate
+            .genesis
+            .members
+            .iter()
+            .find(|member| member.node_id == self.keys.node_id())
+            .context("recovered guild does not contain this seed identity")?
+            .clone();
+        if local_member.recovery_public_key != self.keys.recovery_public_key() {
+            anyhow::bail!("recovered guild has the wrong recovery key for this seed");
+        }
+        let local_signature = certificate
+            .signatures
+            .iter()
+            .find(|signature| signature.signer == self.keys.node_id())
+            .cloned()
+            .context("recovered guild certificate omits this seed's signature")?;
+        peers.sort_by_key(|peer| peer.member.node_id);
+        if peers.len() != 5
+            || peers
+                .iter()
+                .map(|peer| &peer.member)
+                .ne(certificate.genesis.members.iter())
+        {
+            anyhow::bail!("recovered endpoint roster does not match guild membership");
+        }
+        for peer in &peers {
+            if !peer.endpoints.is_empty() {
+                validate_endpoint_set(peer.member.node_id, &peer.endpoints)?;
+            }
+        }
+        let lock = GenesisSignatureLock {
+            format_version: 1,
+            genesis_hash: certificate.hash()?,
+            genesis: certificate.genesis.clone(),
+            signature: local_signature,
+        };
+        let installed = InstalledGuild {
+            format_version: 1,
+            certificate,
+            peers,
+        };
+        if let Some(existing) = self.installed_guild()? {
+            if existing == installed {
+                return Ok(());
+            }
+            anyhow::bail!("this node already has different guild state");
+        }
+        if let Some(bytes) = self.control.get_record("node-config", b"member")? {
+            let configured: Member = decode_canonical(&bytes)?;
+            if configured != local_member {
+                anyhow::bail!("configured member conflicts with recovered guild membership");
+            }
+        }
+        self.control.put_records(&[
+            (
+                "node-config".to_owned(),
+                b"member".to_vec(),
+                canonical_bytes(&local_member)?,
+            ),
+            (
+                "guild-genesis-signature-lock".to_owned(),
+                b"primary".to_vec(),
+                canonical_bytes(&lock)?,
+            ),
+            (
+                "guild-installed".to_owned(),
+                b"primary".to_vec(),
+                canonical_bytes(&installed)?,
+            ),
+        ])?;
         Ok(())
     }
 
@@ -1220,6 +1390,7 @@ impl Node {
             &certificate,
             true,
         )?;
+        self.clear_root_dirty_if_committed(checkpoint)?;
         Ok(hash)
     }
 
@@ -1435,6 +1606,28 @@ impl Node {
         Ok(())
     }
 
+    fn clear_root_dirty_if_committed(&mut self, checkpoint: &QuorumCheckpoint) -> Result<()> {
+        let Some(bytes) = self
+            .control
+            .get_record("user-revision-head", &checkpoint.checkpoint.guild_id)?
+        else {
+            return Ok(());
+        };
+        let local_head: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
+        if checkpoint.checkpoint.revisions.contains(&local_head) {
+            self.control.put_record(
+                "node-state",
+                b"root-dirty",
+                &canonical_bytes(&RootDirtyState {
+                    format_version: 1,
+                    dirty: false,
+                    reason: "latest local revision is committed".to_owned(),
+                })?,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn recovery_record(
         &self,
         subject: &Member,
@@ -1444,6 +1637,25 @@ impl Node {
         endpoint: String,
         expires_at_unix_seconds: u64,
     ) -> Result<mb_core::SealedRecoveryRecord> {
+        self.recovery_record_for_endpoints(
+            subject,
+            guild_id,
+            checkpoint_hash,
+            checkpoint_generation,
+            vec![endpoint],
+            expires_at_unix_seconds,
+        )
+    }
+
+    pub fn recovery_record_for_endpoints(
+        &self,
+        subject: &Member,
+        guild_id: [u8; 32],
+        checkpoint_hash: [u8; 32],
+        checkpoint_generation: u64,
+        endpoints: Vec<String>,
+        expires_at_unix_seconds: u64,
+    ) -> Result<mb_core::SealedRecoveryRecord> {
         let locator = RecoveryLocator {
             format_version: 1,
             subject: subject.node_id,
@@ -1451,7 +1663,7 @@ impl Node {
             guild_id,
             checkpoint_hash,
             checkpoint_generation,
-            endpoints: vec![endpoint],
+            endpoints,
             expires_at_unix_seconds,
         };
         let signed = SignedRecord::sign(b"mutualbackup/recovery-locator/v1", locator, &self.keys)?;
@@ -1459,6 +1671,222 @@ impl Node {
             subject.recovery_public_key,
             &canonical_bytes(&signed)?,
         )?)
+    }
+
+    pub fn build_dht_publications(
+        &mut self,
+        endpoints: Vec<String>,
+        expires_at_unix_seconds: u64,
+    ) -> Result<Option<DhtPublicationSet>> {
+        let Some(installed) = self.installed_guild()? else {
+            return Ok(None);
+        };
+        let guild_id = installed.certificate.genesis.guild_id;
+        let Some(checkpoint) = self.current_checkpoint(guild_id)? else {
+            return Ok(None);
+        };
+        checkpoint.verify()?;
+        let checkpoint_hash = checkpoint.hash()?;
+        let local_id = self.keys.node_id();
+        validate_endpoint_set(local_id, &endpoints)?;
+        if expires_at_unix_seconds <= unix_seconds() {
+            anyhow::bail!("DHT publication expiry must be in the future");
+        }
+        if let Some(bytes) = self.control.get_record("dht-publication", b"primary")? {
+            let state: DhtPublicationState = decode_canonical(&bytes)?;
+            if state.format_version == 1
+                && state.checkpoint_hash == checkpoint_hash
+                && state.endpoints == endpoints
+                && state.expires_at_unix_seconds.saturating_add(5 * 60) >= expires_at_unix_seconds
+            {
+                let endpoint = self
+                    .control
+                    .get_record("dht-endpoint", b"primary")?
+                    .context("DHT publication state has no endpoint record")?;
+                let endpoint: SignedRecord<EndpointRecord> = decode_canonical(&endpoint)?;
+                let mut recovery = Vec::new();
+                for subject in installed
+                    .certificate
+                    .genesis
+                    .members
+                    .iter()
+                    .filter(|member| member.node_id != local_id)
+                {
+                    let bundle = self
+                        .control
+                        .get_record("dht-recovery-bundle", &subject.node_id.0)?
+                        .context("DHT publication state has no recovery bundle")?;
+                    recovery.push(decode_canonical(&bundle)?);
+                }
+                return Ok(Some(DhtPublicationSet {
+                    checkpoint_hash,
+                    endpoint,
+                    recovery,
+                }));
+            }
+        }
+        let endpoint_slot = publication_slot(b"endpoint", local_id, local_id, guild_id);
+        let endpoint = SignedRecord::sign(
+            b"mutualbackup/endpoint-record/v1",
+            EndpointRecord {
+                format_version: 1,
+                publisher: local_id,
+                sequence: self.next_recovery_publication_sequence(&endpoint_slot, 1)?,
+                expires_at_unix_seconds,
+                endpoints: endpoints.clone(),
+            },
+            &self.keys,
+        )?;
+        self.control
+            .put_record("dht-endpoint", b"primary", &canonical_bytes(&endpoint)?)?;
+        let mut recovery = Vec::new();
+        for subject in installed
+            .certificate
+            .genesis
+            .members
+            .iter()
+            .filter(|member| member.node_id != local_id)
+        {
+            let slot = publication_slot(b"recovery", subject.node_id, local_id, guild_id);
+            let sequence = self.next_recovery_publication_sequence(&slot, 1)?;
+            let sealed = self.recovery_record_for_endpoints(
+                subject,
+                guild_id,
+                checkpoint_hash,
+                checkpoint.checkpoint.generation,
+                endpoints.clone(),
+                expires_at_unix_seconds,
+            )?;
+            let bundle = SignedRecord::sign(
+                b"mutualbackup/recovery-bundle/v1",
+                RecoveryBundle {
+                    format_version: 1,
+                    subject: subject.node_id,
+                    publisher: local_id,
+                    sequence,
+                    expires_at_unix_seconds,
+                    sealed,
+                },
+                &self.keys,
+            )?;
+            self.control.put_record(
+                "dht-recovery-bundle",
+                &subject.node_id.0,
+                &canonical_bytes(&bundle)?,
+            )?;
+            recovery.push(bundle);
+        }
+        self.control.put_record(
+            "dht-publication",
+            b"primary",
+            &canonical_bytes(&DhtPublicationState {
+                format_version: 1,
+                checkpoint_hash,
+                endpoints,
+                expires_at_unix_seconds,
+            })?,
+        )?;
+        Ok(Some(DhtPublicationSet {
+            checkpoint_hash,
+            endpoint,
+            recovery,
+        }))
+    }
+
+    pub fn mark_seed_recovery_ready(&mut self, checkpoint_hash: [u8; 32]) -> Result<()> {
+        let checkpoint = self.checkpoint(&checkpoint_hash)?;
+        if checkpoint.checkpoint.guild_id
+            != self
+                .installed_guild()?
+                .context("this node has no active guild")?
+                .certificate
+                .genesis
+                .guild_id
+        {
+            anyhow::bail!("recovery readiness checkpoint belongs to another guild");
+        }
+        self.control.put_record(
+            "seed-recovery-ready",
+            b"primary",
+            &canonical_bytes(&checkpoint_hash)?,
+        )?;
+        Ok(())
+    }
+
+    pub fn seed_recovery_ready(&self) -> Result<bool> {
+        let Some(bytes) = self.control.get_record("seed-recovery-ready", b"primary")? else {
+            return Ok(false);
+        };
+        let ready: [u8; 32] = decode_canonical(&bytes)?;
+        let Some(installed) = self.installed_guild()? else {
+            return Ok(false);
+        };
+        Ok(self
+            .current_checkpoint(installed.certificate.genesis.guild_id)?
+            .is_some_and(|checkpoint| checkpoint.hash().ok() == Some(ready)))
+    }
+
+    pub fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>> {
+        let installed = self
+            .installed_guild()?
+            .context("this node has no active guild")?;
+        let checkpoint = self
+            .current_checkpoint(installed.certificate.genesis.guild_id)?
+            .context("guild has no committed snapshots")?;
+        checkpoint.verify()?;
+        let checkpoint_hash = checkpoint.hash()?;
+        Ok(checkpoint
+            .checkpoint
+            .revisions
+            .iter()
+            .filter(|revision| revision.value.owner == self.keys.node_id())
+            .map(|revision| SnapshotInfo {
+                revision_id: revision.value.revision_id,
+                sequence: revision.value.sequence,
+                checkpoint_generation: checkpoint.checkpoint.generation,
+                checkpoint_hash,
+            })
+            .collect())
+    }
+
+    pub fn restore_snapshot(
+        &self,
+        revision_id: Option<Uuid>,
+        target: &Path,
+    ) -> Result<SnapshotInfo> {
+        if target.exists() {
+            anyhow::bail!("restore target must not already exist");
+        }
+        let installed = self
+            .installed_guild()?
+            .context("this node has no active guild")?;
+        let guild_id = installed.certificate.genesis.guild_id;
+        let checkpoint = self
+            .current_checkpoint(guild_id)?
+            .context("guild has no committed snapshots")?;
+        checkpoint.verify()?;
+        let revision = match revision_id {
+            Some(revision_id) => checkpoint.checkpoint.revisions.iter().find(|revision| {
+                revision.value.owner == self.keys.node_id()
+                    && revision.value.revision_id == revision_id
+            }),
+            None => checkpoint
+                .checkpoint
+                .revisions
+                .iter()
+                .filter(|revision| revision.value.owner == self.keys.node_id())
+                .max_by_key(|revision| revision.value.sequence),
+        }
+        .context("requested snapshot is unavailable for this node")?;
+        restore_revision_from_source(&self.keys, guild_id, revision, target, |sector_id| {
+            self.sector_for_guild(&guild_id, sector_id)
+        })?;
+        Ok(SnapshotInfo {
+            revision_id: revision.value.revision_id,
+            sequence: revision.value.sequence,
+            checkpoint_generation: checkpoint.checkpoint.generation,
+            checkpoint_hash: checkpoint.hash()?,
+        })
     }
 
     pub fn next_recovery_publication_sequence(
@@ -1963,6 +2391,20 @@ fn parity_operation_id(group_id: &[u8; 32], shard_index: u8) -> [u8; 16] {
         id[0] = 1;
     }
     id
+}
+
+fn publication_slot(
+    kind: &[u8],
+    subject: NodeId,
+    publisher: NodeId,
+    guild_id: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key("mutualbackup dht publication slot v1");
+    hasher.update(kind);
+    hasher.update(&subject.0);
+    hasher.update(&publisher.0);
+    hasher.update(&guild_id);
+    *hasher.finalize().as_bytes()
 }
 
 fn open_data_dir_lock(data_dir: &Path) -> Result<File> {

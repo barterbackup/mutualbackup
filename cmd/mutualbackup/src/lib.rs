@@ -15,6 +15,8 @@ pub struct DaemonConfig {
     pub seed_file: PathBuf,
     pub control_socket: PathBuf,
     pub failure_domain: String,
+    #[serde(default)]
+    pub recovery_mode: bool,
     pub parity_budget_bytes: u64,
     #[serde(default = "default_p2p_listen_addresses")]
     pub p2p_listen_addresses: Vec<String>,
@@ -33,7 +35,9 @@ impl DaemonConfig {
         if self.format_version != 1 {
             bail!("unsupported daemon config format version");
         }
-        if self.failure_domain.is_empty() || self.failure_domain.len() > 256 {
+        if (!self.recovery_mode && self.failure_domain.is_empty())
+            || self.failure_domain.len() > 256
+        {
             bail!("failure_domain must contain 1 to 256 bytes");
         }
         if self.parity_budget_bytes == 0 {
@@ -152,6 +156,7 @@ mod tests {
                 seed_file: PathBuf::from("node.seed"),
                 control_socket: PathBuf::from("run/control.sock"),
                 failure_domain: "disk-a".into(),
+                recovery_mode: false,
                 parity_budget_bytes: 1024,
                 p2p_listen_addresses: default_p2p_listen_addresses(),
                 p2p_external_addresses: Vec::new(),
