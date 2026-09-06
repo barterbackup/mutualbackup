@@ -8,8 +8,10 @@ mod snapshot;
 pub use lab::{MemoryDirectory, MemoryNetwork, PrototypeGuild};
 pub use mb_core::{KeyMaterial, NodeId, Seed};
 pub use network::{
-    DirectoryState, NetworkCommitResult, NodeServerConfig, commit_source_over_network,
-    commit_source_over_network_with_intent, recover_over_network, serve_directory, serve_node,
+    DirectoryState, NetworkCommitResult, NetworkMemberRecovery, NodeServerConfig,
+    commit_source_over_network, commit_source_over_network_with_intent, recover_guild_over_network,
+    recover_member_and_republish_over_network, recover_member_over_network, recover_over_network,
+    serve_directory, serve_node,
 };
 pub use node::{Node, RecoveredShards};
 pub use snapshot::{

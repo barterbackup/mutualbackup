@@ -28,8 +28,11 @@ use crate::{
 
 const MAX_PEER_FRAME_BYTES: usize = 600 * 1024;
 const MAX_DIRECTORY_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DIRECTORY_REQUEST_BYTES: usize = 72 * 1024;
 const MAX_DIRECTORY_RECORD_BYTES: usize = 64 * 1024;
-const MAX_DIRECTORY_SUBJECTS: usize = 100_000;
+const MAX_DIRECTORY_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DIRECTORY_PUBLISHES_PER_MINUTE: u32 = 512;
+const MAX_DIRECTORY_WORKING_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RECOVERY_SLOTS_PER_SUBJECT: usize = 64;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(2);
 const BODY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -39,6 +42,7 @@ const PEER_RESPONSE_DOMAIN: &[u8] = b"mutualbackup/direct-response/v2";
 const DIRECTORY_RECORD_DOMAIN: &[u8] = b"mutualbackup/directory-record/v1";
 const DIRECTORY_ADMISSION_DOMAIN: &[u8] = b"mutualbackup/directory-admission/v1";
 const RECOVERY_POW_ZERO_BYTES: usize = 2;
+const RECOVERY_READ_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct NodeServerConfig {
@@ -114,6 +118,7 @@ enum PeerRequest {
         page_index: u32,
     },
     BuildRecoveryRecord {
+        publication_id: [u8; 16],
         subject: Member,
         guild_id: [u8; 32],
         checkpoint_hash: [u8; 32],
@@ -266,7 +271,7 @@ struct PublishedRecoveryRecord {
     subject: NodeId,
     publisher: NodeId,
     slot: [u8; 32],
-    slot_generation: u64,
+    slot_sequence: u64,
     expires_at_unix_seconds: u64,
     admission: SignedRecord<RecoveryPublisherAdmission>,
     sealed: SealedRecoveryRecord,
@@ -296,12 +301,26 @@ enum DirectoryResponse {
 }
 
 type RecoverySlotKey = ([u8; 32], NodeId);
-type PublisherRecords = BTreeMap<RecoverySlotKey, SignedRecord<PublishedRecoveryRecord>>;
+struct StoredRecoveryRecord {
+    record: SignedRecord<PublishedRecoveryRecord>,
+    byte_len: usize,
+    admission_order: u64,
+}
+type PublisherRecords = BTreeMap<RecoverySlotKey, StoredRecoveryRecord>;
 type RecoveryDirectoryRecords = BTreeMap<NodeId, PublisherRecords>;
+
+#[derive(Default)]
+struct RecoveryDirectoryState {
+    records: RecoveryDirectoryRecords,
+    total_bytes: usize,
+    next_admission_order: u64,
+    rate_window_started: u64,
+    rate_window_publishes: u32,
+}
 
 #[derive(Clone, Default)]
 pub struct DirectoryState {
-    records: Arc<Mutex<RecoveryDirectoryRecords>>,
+    inner: Arc<Mutex<RecoveryDirectoryState>>,
 }
 
 struct NodeService {
@@ -337,10 +356,130 @@ fn directory_records_fit(
     let mut records = publishers
         .iter()
         .filter(|(key, _)| **key != candidate_key)
-        .map(|(_, record)| record.clone())
+        .map(|(_, stored)| stored.record.clone())
         .collect::<Vec<_>>();
     records.push(candidate.clone());
     Ok(canonical_bytes(&DirectoryResponse::Records(records))?.len() <= MAX_DIRECTORY_FRAME_BYTES)
+}
+
+impl RecoveryDirectoryState {
+    fn publish(&mut self, record: SignedRecord<PublishedRecoveryRecord>) -> Result<()> {
+        let now = unix_seconds();
+        if now.saturating_sub(self.rate_window_started) >= 60 {
+            self.rate_window_started = now;
+            self.rate_window_publishes = 0;
+        }
+        if self.rate_window_publishes >= MAX_DIRECTORY_PUBLISHES_PER_MINUTE {
+            bail!("recovery directory publish rate limit reached");
+        }
+        self.rate_window_publishes += 1;
+
+        let subject = record.value.subject;
+        let slot_key = (record.value.slot, record.value.publisher);
+        if let Some(current) = self
+            .records
+            .get(&subject)
+            .and_then(|publishers| publishers.get(&slot_key))
+        {
+            if current.record.value.slot_sequence > record.value.slot_sequence {
+                bail!("recovery record would roll back publisher state");
+            }
+            if current.record.value.slot_sequence == record.value.slot_sequence {
+                if current.record == record {
+                    return Ok(());
+                }
+                bail!("recovery record would fork publisher state");
+            }
+        }
+
+        let byte_len = canonical_bytes(&record)?.len();
+        if byte_len > MAX_DIRECTORY_RECORD_BYTES {
+            bail!("recovery record exceeds its byte limit");
+        }
+        let replaced_len = self
+            .records
+            .get(&subject)
+            .and_then(|publishers| publishers.get(&slot_key))
+            .map_or(0, |stored| stored.byte_len);
+        while self
+            .total_bytes
+            .saturating_sub(replaced_len)
+            .saturating_add(byte_len)
+            > MAX_DIRECTORY_TOTAL_BYTES
+        {
+            self.evict_oldest(Some((subject, slot_key)))?;
+        }
+        let publishers = self.records.entry(subject).or_default();
+        if !publishers.contains_key(&slot_key) && publishers.len() >= MAX_RECOVERY_SLOTS_PER_SUBJECT
+        {
+            bail!("recovery slot limit reached");
+        }
+        if !directory_records_fit(publishers, &record)? {
+            bail!("recovery records exceed the lookup response limit");
+        }
+        self.next_admission_order = self
+            .next_admission_order
+            .checked_add(1)
+            .context("recovery directory admission order exhausted")?;
+        if let Some(previous) = publishers.insert(
+            slot_key,
+            StoredRecoveryRecord {
+                record,
+                byte_len,
+                admission_order: self.next_admission_order,
+            },
+        ) {
+            self.total_bytes = self.total_bytes.saturating_sub(previous.byte_len);
+        }
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(byte_len)
+            .context("recovery directory byte accounting overflow")?;
+        Ok(())
+    }
+
+    fn evict_oldest(&mut self, protected: Option<(NodeId, RecoverySlotKey)>) -> Result<()> {
+        let victim = self
+            .records
+            .iter()
+            .flat_map(|(subject, publishers)| {
+                publishers.iter().filter_map(move |(key, stored)| {
+                    if protected == Some((*subject, *key)) {
+                        None
+                    } else {
+                        Some((stored.admission_order, *subject, *key))
+                    }
+                })
+            })
+            .min();
+        let Some((_, subject, key)) = victim else {
+            bail!("recovery directory global byte limit reached");
+        };
+        let publishers = self
+            .records
+            .get_mut(&subject)
+            .context("recovery directory eviction subject disappeared")?;
+        let removed = publishers
+            .remove(&key)
+            .context("recovery directory eviction record disappeared")?;
+        self.total_bytes = self.total_bytes.saturating_sub(removed.byte_len);
+        if publishers.is_empty() {
+            self.records.remove(&subject);
+        }
+        Ok(())
+    }
+
+    fn lookup(&self, subject: NodeId) -> Vec<SignedRecord<PublishedRecoveryRecord>> {
+        self.records
+            .get(&subject)
+            .map(|entries| {
+                entries
+                    .values()
+                    .map(|stored| stored.record.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 fn recovery_slot(subject: NodeId, publisher: NodeId, guild_id: [u8; 32]) -> [u8; 32] {
@@ -377,7 +516,7 @@ fn validate_published_recovery_record(
 ) -> Result<()> {
     record.verify(DIRECTORY_RECORD_DOMAIN)?;
     if record.signer != record.value.publisher
-        || record.value.format_version != 2
+        || record.value.format_version != 3
         || record.value.expires_at_unix_seconds != u64::MAX
     {
         bail!("invalid published recovery record");
@@ -402,7 +541,7 @@ fn recovery_pow_commitment(record: &PublishedRecoveryRecord) -> Result<[u8; 32]>
         record.subject,
         record.publisher,
         record.slot,
-        record.slot_generation,
+        record.slot_sequence,
         record.expires_at_unix_seconds,
         &record.admission,
         &record.sealed,
@@ -473,15 +612,26 @@ pub async fn serve_node(node: Arc<Mutex<Node>>, config: NodeServerConfig) -> Res
 pub async fn serve_directory(listen: SocketAddr, state: DirectoryState) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
     let permits = Arc::new(Semaphore::new(128));
+    let working_bytes = Arc::new(Semaphore::new(MAX_DIRECTORY_WORKING_BYTES));
     loop {
         let (mut stream, _) = listener.accept().await?;
         let permit = permits.clone().acquire_owned().await?;
         let state = state.clone();
+        let working_bytes = working_bytes.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let Ok(inbound_permit) = working_bytes
+                .clone()
+                .acquire_many_owned(MAX_DIRECTORY_REQUEST_BYTES as u32)
+                .await
+            else {
+                return;
+            };
+            let mut inbound_permit = Some(inbound_permit);
+            let mut response_permit = None;
             let response = match read_frame_timed::<_, DirectoryRequest>(
                 &mut stream,
-                MAX_DIRECTORY_FRAME_BYTES,
+                MAX_DIRECTORY_REQUEST_BYTES,
             )
             .await
             {
@@ -493,87 +643,47 @@ pub async fn serve_directory(listen: SocketAddr, state: DirectoryState) -> Resul
                     {
                         DirectoryResponse::Error("invalid recovery record or admission".to_owned())
                     } else {
-                        match state.records.lock() {
-                            Ok(mut records) => {
-                                if !records.contains_key(&record.value.subject)
-                                    && records.len() >= MAX_DIRECTORY_SUBJECTS
-                                {
-                                    DirectoryResponse::Error(
-                                        "recovery directory subject limit reached".to_owned(),
-                                    )
-                                } else {
-                                    let publishers =
-                                        records.entry(record.value.subject).or_default();
-                                    let slot_key = (record.value.slot, record.value.publisher);
-                                    if !publishers.contains_key(&slot_key)
-                                        && publishers.len() >= MAX_RECOVERY_SLOTS_PER_SUBJECT
-                                    {
-                                        DirectoryResponse::Error(
-                                            "recovery slot limit reached".to_owned(),
-                                        )
-                                    } else {
-                                        let accepted = match publishers.get(&slot_key) {
-                                            Some(current)
-                                                if current.value.slot_generation
-                                                    > record.value.slot_generation =>
-                                            {
-                                                false
-                                            }
-                                            Some(current)
-                                                if current.value.slot_generation
-                                                    == record.value.slot_generation
-                                                    && current != &record =>
-                                            {
-                                                false
-                                            }
-                                            _ => true,
-                                        };
-                                        if !accepted {
-                                            DirectoryResponse::Error(
-                                                "recovery record would roll back or fork publisher state"
-                                                    .to_owned(),
-                                            )
-                                        } else {
-                                            match directory_records_fit(publishers, &record) {
-                                                Ok(true) => {
-                                                    publishers.insert(slot_key, record);
-                                                    DirectoryResponse::Ack
-                                                }
-                                                Ok(false) => DirectoryResponse::Error(
-                                                    "recovery records exceed the lookup response limit"
-                                                        .to_owned(),
-                                                ),
-                                                Err(_) => DirectoryResponse::Error(
-                                                    "recovery record is not canonically encodable"
-                                                        .to_owned(),
-                                                ),
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                        match state.inner.lock() {
+                            Ok(mut state) => match state.publish(record) {
+                                Ok(()) => DirectoryResponse::Ack,
+                                Err(error) => DirectoryResponse::Error(error.to_string()),
+                            },
                             Err(_) => {
                                 DirectoryResponse::Error("directory lock poisoned".to_owned())
                             }
                         }
                     }
                 }
-                Ok(DirectoryRequest::Lookup { subject }) => match state.records.lock() {
-                    Ok(records) => DirectoryResponse::Records(
-                        records
-                            .get(&subject)
-                            .map(|entries| entries.values().cloned().collect())
-                            .unwrap_or_default(),
-                    ),
-                    Err(_) => DirectoryResponse::Error("directory lock poisoned".to_owned()),
-                },
+                Ok(DirectoryRequest::Lookup { subject }) => {
+                    drop(inbound_permit.take());
+                    match working_bytes
+                        .clone()
+                        .acquire_many_owned((2 * MAX_DIRECTORY_FRAME_BYTES) as u32)
+                        .await
+                    {
+                        Ok(permit) => {
+                            response_permit = Some(permit);
+                            match state.inner.lock() {
+                                Ok(state) => DirectoryResponse::Records(state.lookup(subject)),
+                                Err(_) => {
+                                    DirectoryResponse::Error("directory lock poisoned".to_owned())
+                                }
+                            }
+                        }
+                        Err(_) => DirectoryResponse::Error(
+                            "directory working-memory limiter closed".to_owned(),
+                        ),
+                    }
+                }
                 Err(error) => DirectoryResponse::Error(error.to_string()),
             };
+            drop(inbound_permit);
             if let Err(error) =
                 write_frame_timed(&mut stream, &response, MAX_DIRECTORY_FRAME_BYTES).await
             {
                 tracing::warn!(%error, "directory response failed");
             }
+            drop(response_permit);
         });
     }
 }
@@ -636,7 +746,14 @@ fn process_peer_request(
         let mutation_kind = request.mutation_kind();
         let mut node_guard = service.writer.lock().map_err(lock_error)?;
         let local_node_id = node_guard.keys().node_id();
-        if mutation_kind.is_some() && caller != config.trusted_coordinator {
+        let self_authorized_admission = matches!(
+            &request,
+            PeerRequest::AuthorizeRecoveryPublisher { publisher, .. } if *publisher == caller
+        );
+        if mutation_kind.is_some()
+            && caller != config.trusted_coordinator
+            && !self_authorized_admission
+        {
             bail!("caller is not the configured guild coordinator");
         }
         if matches!(
@@ -912,6 +1029,7 @@ fn execute_peer_request(
             bail!("revision-page read was sent to a mutation worker")
         }
         PeerRequest::BuildRecoveryRecord {
+            publication_id: _,
             subject,
             guild_id,
             checkpoint_hash,
@@ -950,12 +1068,13 @@ fn execute_peer_request(
                 config.public_endpoint.clone(),
                 expires_at_unix_seconds,
             )?;
+            let slot_sequence = node.next_recovery_publication_sequence(&slot, 1)?;
             let mut published = PublishedRecoveryRecord {
-                format_version: 2,
+                format_version: 3,
                 subject: subject.node_id,
                 publisher,
                 slot,
-                slot_generation: checkpoint_generation,
+                slot_sequence,
                 expires_at_unix_seconds,
                 admission: *admission,
                 sealed,
@@ -1014,6 +1133,16 @@ pub struct NetworkCommitResult {
     pub checkpoint_hash: [u8; 32],
     pub owner: NodeId,
     pub coding_groups: usize,
+}
+
+pub struct NetworkMemberRecovery {
+    pub node: Node,
+    pub checkpoints: Vec<QuorumCheckpoint>,
+}
+
+struct RecoveredGuild {
+    checkpoint: QuorumCheckpoint,
+    peer_endpoints: BTreeMap<NodeId, SocketAddr>,
 }
 
 pub async fn commit_source_over_network(
@@ -1380,6 +1509,7 @@ pub async fn commit_source_over_network_with_intent(
                 peer.profile.member.node_id,
                 coordinator_keys,
                 PeerRequest::BuildRecoveryRecord {
+                    publication_id: *Uuid::new_v4().as_bytes(),
                     subject: subject.clone(),
                     guild_id,
                     checkpoint_hash,
@@ -1423,21 +1553,59 @@ pub async fn recover_over_network(
     restore_target: &Path,
     directory: SocketAddr,
 ) -> Result<Node> {
-    let (mut recovered_node, checkpoint) =
-        recover_member_over_network(seed, data_dir, directory).await?;
-    let local_node_id = recovered_node.keys().node_id();
+    recover_selected_guild_over_network(seed, data_dir, restore_target, directory, None).await
+}
+
+pub async fn recover_guild_over_network(
+    seed: Seed,
+    data_dir: &Path,
+    restore_target: &Path,
+    directory: SocketAddr,
+    guild_id: [u8; 32],
+) -> Result<Node> {
+    recover_selected_guild_over_network(seed, data_dir, restore_target, directory, Some(guild_id))
+        .await
+}
+
+async fn recover_selected_guild_over_network(
+    seed: Seed,
+    data_dir: &Path,
+    restore_target: &Path,
+    directory: SocketAddr,
+    selected_guild: Option<[u8; 32]>,
+) -> Result<Node> {
+    let NetworkMemberRecovery {
+        mut node,
+        checkpoints,
+    } = recover_member_over_network(seed, data_dir, directory).await?;
+    let local_node_id = node.keys().node_id();
+    let mut owned = checkpoints
+        .into_iter()
+        .filter_map(|checkpoint| {
+            let revision = checkpoint
+                .checkpoint
+                .revisions
+                .iter()
+                .filter(|revision| revision.value.owner == local_node_id)
+                .max_by_key(|revision| revision.value.sequence)
+                .cloned()?;
+            Some((checkpoint, revision))
+        })
+        .filter(|(checkpoint, _)| {
+            selected_guild.is_none_or(|guild_id| checkpoint.checkpoint.guild_id == guild_id)
+        })
+        .collect::<Vec<_>>();
+    if owned.len() != 1 {
+        bail!(
+            "recovery found {} owned guilds; select exactly one guild for this restore target",
+            owned.len()
+        );
+    }
+    let (checkpoint, revision) = owned.pop().expect("checked one owned guild");
     let checkpoint_hash = checkpoint.hash()?;
-    let revision = checkpoint
-        .checkpoint
-        .revisions
-        .iter()
-        .filter(|revision| revision.value.owner == local_node_id)
-        .max_by_key(|revision| revision.value.sequence)
-        .cloned()
-        .context("the recovered storage-only member has no user revision to restore")?;
     let checkpoint_for_worker = checkpoint.clone();
     let restore_target = restore_target.to_path_buf();
-    recovered_node = run_node_blocking(recovered_node, move |node| {
+    node = run_node_blocking(node, move |node| {
         node.restore_recovered_revision(
             &checkpoint_hash,
             checkpoint_for_worker.checkpoint.guild_id,
@@ -1447,14 +1615,112 @@ pub async fn recover_over_network(
         Ok(())
     })
     .await?;
-    Ok(recovered_node)
+    Ok(node)
 }
 
-async fn recover_member_over_network(
+pub async fn recover_member_over_network(
     seed: Seed,
     data_dir: &Path,
     directory: SocketAddr,
-) -> Result<(Node, QuorumCheckpoint)> {
+) -> Result<NetworkMemberRecovery> {
+    let (node, guilds) = recover_member_state(seed, data_dir, directory).await?;
+    Ok(NetworkMemberRecovery {
+        node,
+        checkpoints: guilds.into_iter().map(|guild| guild.checkpoint).collect(),
+    })
+}
+
+pub async fn recover_member_and_republish_over_network(
+    seed: Seed,
+    data_dir: &Path,
+    directory: SocketAddr,
+    public_endpoint: String,
+) -> Result<NetworkMemberRecovery> {
+    validate_advertised_endpoint(&public_endpoint)?;
+    let (mut node, guilds) = recover_member_state(seed, data_dir, directory).await?;
+    let local_node = node.keys().node_id();
+    for guild in &guilds {
+        let checkpoint_hash = guild.checkpoint.hash()?;
+        for subject in &guild.checkpoint.checkpoint.members {
+            if subject.node_id == local_node {
+                continue;
+            }
+            let Some(endpoint) = guild.peer_endpoints.get(&subject.node_id) else {
+                continue;
+            };
+            let response = peer_call_expected(
+                *endpoint,
+                subject.node_id,
+                node.keys(),
+                PeerRequest::AuthorizeRecoveryPublisher {
+                    guild_id: guild.checkpoint.checkpoint.guild_id,
+                    publisher: local_node,
+                    expires_at_unix_seconds: u64::MAX,
+                },
+            )
+            .await?;
+            let PeerResponse::RecoveryAdmission(admission) = response else {
+                bail!("peer returned the wrong recovery-admission response");
+            };
+            let slot = recovery_slot(
+                subject.node_id,
+                local_node,
+                guild.checkpoint.checkpoint.guild_id,
+            );
+            validate_recovery_admission(&admission, subject.node_id, local_node, slot, u64::MAX)?;
+            let minimum_sequence = directory_lookup(directory, subject.node_id)
+                .await?
+                .into_iter()
+                .filter(|record| {
+                    record.value.publisher == local_node
+                        && record.value.slot == slot
+                        && validate_published_recovery_record(record).is_ok()
+                })
+                .map(|record| record.value.slot_sequence)
+                .max()
+                .map(|sequence| {
+                    sequence
+                        .checked_add(1)
+                        .context("directory publication sequence exhausted")
+                })
+                .transpose()?
+                .unwrap_or(1);
+            let sealed = node.recovery_record(
+                subject,
+                guild.checkpoint.checkpoint.guild_id,
+                checkpoint_hash,
+                guild.checkpoint.checkpoint.generation,
+                public_endpoint.clone(),
+                u64::MAX,
+            )?;
+            let slot_sequence = node.next_recovery_publication_sequence(&slot, minimum_sequence)?;
+            let mut published = PublishedRecoveryRecord {
+                format_version: 3,
+                subject: subject.node_id,
+                publisher: local_node,
+                slot,
+                slot_sequence,
+                expires_at_unix_seconds: u64::MAX,
+                admission,
+                sealed,
+                pow_nonce: 0,
+            };
+            solve_recovery_pow(&mut published)?;
+            let signed = SignedRecord::sign(DIRECTORY_RECORD_DOMAIN, published, node.keys())?;
+            directory_publish(directory, signed).await?;
+        }
+    }
+    Ok(NetworkMemberRecovery {
+        node,
+        checkpoints: guilds.into_iter().map(|guild| guild.checkpoint).collect(),
+    })
+}
+
+async fn recover_member_state(
+    seed: Seed,
+    data_dir: &Path,
+    directory: SocketAddr,
+) -> Result<(Node, Vec<RecoveredGuild>)> {
     let data_dir = data_dir.to_path_buf();
     let mut recovered_node = tokio::task::spawn_blocking(move || Node::open(data_dir, seed))
         .await
@@ -1487,7 +1753,7 @@ async fn recover_member_over_network(
                 published.value.publisher,
                 signed.value.guild_id,
             ) != published.value.slot
-            || signed.value.checkpoint_generation != published.value.slot_generation
+            || published.value.slot_sequence == 0
             || signed.value.expires_at_unix_seconds != published.value.expires_at_unix_seconds
         {
             continue;
@@ -1524,27 +1790,60 @@ async fn recover_member_over_network(
         }
         candidates.push((response, signed.value.publisher, endpoint));
     }
-    let checkpoint = candidates
-        .iter()
-        .map(|(checkpoint, _, _)| checkpoint)
-        .max_by_key(|candidate| candidate.checkpoint.generation)
-        .cloned()
-        .context("no reachable recovery locator led to a valid quorum checkpoint")?;
-    let checkpoint_hash = checkpoint.hash()?;
-    let peer_endpoints = candidates
-        .into_iter()
-        .filter(|(candidate, _, _)| candidate.hash().ok() == Some(checkpoint_hash))
-        .map(|(_, publisher, endpoint)| (publisher, endpoint))
-        .collect::<BTreeMap<_, _>>();
-    recovered_node =
-        recover_network_local_shards(recovered_node, &checkpoint, &peer_endpoints).await?;
-    let checkpoint_for_worker = checkpoint.clone();
-    recovered_node = run_node_blocking(recovered_node, move |node| {
-        node.install_recovered_checkpoint(&checkpoint_for_worker)?;
-        Ok(())
-    })
-    .await?;
-    Ok((recovered_node, checkpoint))
+    let mut candidates_by_guild = BTreeMap::<[u8; 32], Vec<_>>::new();
+    for candidate in candidates {
+        candidates_by_guild
+            .entry(candidate.0.checkpoint.guild_id)
+            .or_default()
+            .push(candidate);
+    }
+    if candidates_by_guild.is_empty() {
+        bail!("no reachable recovery locator led to a valid quorum checkpoint");
+    }
+
+    let mut recovered_guilds = Vec::with_capacity(candidates_by_guild.len());
+    for (guild_id, guild_candidates) in candidates_by_guild {
+        let generation = guild_candidates
+            .iter()
+            .map(|(checkpoint, _, _)| checkpoint.checkpoint.generation)
+            .max()
+            .context("recovery guild has no checkpoint candidates")?;
+        let mut head_hashes = guild_candidates
+            .iter()
+            .filter(|(checkpoint, _, _)| checkpoint.checkpoint.generation == generation)
+            .map(|(checkpoint, _, _)| Ok::<_, anyhow::Error>(checkpoint.hash()?))
+            .collect::<Result<BTreeSet<_>>>()?;
+        if head_hashes.len() != 1 {
+            bail!("recovery directory contains conflicting heads for one guild");
+        }
+        let checkpoint_hash = head_hashes.pop_first().expect("checked one guild head");
+        let checkpoint = guild_candidates
+            .iter()
+            .find(|(checkpoint, _, _)| checkpoint.hash().ok() == Some(checkpoint_hash))
+            .map(|(checkpoint, _, _)| checkpoint.clone())
+            .context("selected guild head disappeared")?;
+        if checkpoint.checkpoint.guild_id != guild_id {
+            bail!("recovery guild candidate changed identity");
+        }
+        let peer_endpoints = guild_candidates
+            .into_iter()
+            .filter(|(candidate, _, _)| candidate.hash().ok() == Some(checkpoint_hash))
+            .map(|(_, publisher, endpoint)| (publisher, endpoint))
+            .collect::<BTreeMap<_, _>>();
+        recovered_node =
+            recover_network_local_shards(recovered_node, &checkpoint, &peer_endpoints).await?;
+        let checkpoint_for_worker = checkpoint.clone();
+        recovered_node = run_node_blocking(recovered_node, move |node| {
+            node.install_recovered_checkpoint(&checkpoint_for_worker)?;
+            Ok(())
+        })
+        .await?;
+        recovered_guilds.push(RecoveredGuild {
+            checkpoint,
+            peer_endpoints,
+        });
+    }
+    Ok((recovered_node, recovered_guilds))
 }
 
 async fn recover_network_local_shards(
@@ -1554,7 +1853,6 @@ async fn recover_network_local_shards(
 ) -> Result<Node> {
     let recovering = recovered_node.keys().node_id();
     let checkpoint_hash = checkpoint.hash()?;
-    let mut unhealthy = BTreeSet::new();
     for group in &checkpoint.checkpoint.coding_groups {
         let target = group
             .roles
@@ -1600,37 +1898,47 @@ async fn recover_network_local_shards(
             let Some(endpoint) = peer_endpoints.get(&holder) else {
                 continue;
             };
-            if unhealthy.contains(&holder) {
-                continue;
-            }
             let signed_request = make_peer_request(recovered_node.keys(), Some(holder), request)?;
             attempts.push(async move {
+                let mut last_transport_error = None;
+                for _ in 0..RECOVERY_READ_ATTEMPTS {
+                    match send_peer_request(*endpoint, recovering, &signed_request).await {
+                        Ok((signer, response)) if signer == holder => {
+                            return (holder, index, root, Ok(response));
+                        }
+                        Ok(_) => {
+                            return (
+                                holder,
+                                index,
+                                root,
+                                Err(anyhow::anyhow!(
+                                    "authenticated response came from an unexpected identity"
+                                )),
+                            );
+                        }
+                        Err(error) => last_transport_error = Some(error),
+                    }
+                }
                 (
                     holder,
                     index,
                     root,
-                    async {
-                        let (signer, response) =
-                            send_peer_request(*endpoint, recovering, &signed_request).await?;
-                        if signer != holder {
-                            bail!("peer response was signed by an unexpected identity");
-                        }
-                        Ok(response)
-                    }
-                    .await,
+                    Err(last_transport_error
+                        .unwrap_or_else(|| anyhow::anyhow!("recovery read was not attempted"))),
                 )
             });
         }
-        while let Some((holder, index, root, response)) = attempts.next().await {
+        while let Some((_holder, index, root, response)) = attempts.next().await {
             match response {
                 Ok(PeerResponse::Bytes(bytes))
                     if bytes.len() == group.shard_size as usize && sector_root(&bytes) == root =>
                 {
                     shards[index] = Some(bytes);
                 }
-                _ => {
-                    unhealthy.insert(holder);
-                }
+                // An authenticated malformed response is corrupt data for
+                // this shard; transport failures have already exhausted their
+                // bounded retry budget. Neither poisons later coding groups.
+                _ => {}
             }
             if shards.iter().filter(|shard| shard.is_some()).count() == 3 {
                 break;
@@ -2187,11 +2495,11 @@ mod tests {
         .unwrap();
         let record = |generation, payload| {
             let mut published = PublishedRecoveryRecord {
-                format_version: 2,
+                format_version: 3,
                 subject,
                 publisher: publisher_keys.node_id(),
                 slot,
-                slot_generation: generation,
+                slot_sequence: generation,
                 expires_at_unix_seconds: u64::MAX,
                 admission: admission.clone(),
                 sealed: SealedRecoveryRecord {
@@ -2210,7 +2518,7 @@ mod tests {
         assert!(directory_publish(address, record(2, 3)).await.is_err());
         let records = directory_lookup(address, subject).await.unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].value.slot_generation, 2);
+        assert_eq!(records[0].value.slot_sequence, 2);
         assert_eq!(records[0].value.sealed.ciphertext, vec![2; 32]);
         task.abort();
     }
@@ -2240,11 +2548,11 @@ mod tests {
             )
             .unwrap();
             let mut published = PublishedRecoveryRecord {
-                format_version: 2,
+                format_version: 3,
                 subject,
                 publisher,
                 slot,
-                slot_generation: 1,
+                slot_sequence: 1,
                 expires_at_unix_seconds: u64::MAX,
                 admission,
                 sealed: SealedRecoveryRecord {
@@ -2309,11 +2617,11 @@ mod tests {
             )
             .unwrap();
             let published = PublishedRecoveryRecord {
-                format_version: 2,
+                format_version: 3,
                 subject,
                 publisher: keys.node_id(),
                 slot,
-                slot_generation: 1,
+                slot_sequence: 1,
                 expires_at_unix_seconds: u64::MAX,
                 admission,
                 sealed: SealedRecoveryRecord {
@@ -2345,7 +2653,14 @@ mod tests {
             record.value.publisher = record.signer;
             record.value.slot = [value; 32];
             assert!(directory_records_fit(&publishers, &record).unwrap());
-            publishers.insert((record.value.slot, record.signer), record);
+            publishers.insert(
+                (record.value.slot, record.signer),
+                StoredRecoveryRecord {
+                    byte_len: canonical_bytes(&record).unwrap().len(),
+                    admission_order: u64::from(value) + 1,
+                    record,
+                },
+            );
         }
         let mut last = base;
         last.signer = NodeId([255; 32]);
@@ -2354,7 +2669,10 @@ mod tests {
         assert!(!directory_records_fit(&publishers, &last).unwrap());
         assert!(
             canonical_bytes(&DirectoryResponse::Records(
-                publishers.into_values().collect()
+                publishers
+                    .into_values()
+                    .map(|stored| stored.record)
+                    .collect()
             ))
             .unwrap()
             .len()
@@ -2530,15 +2848,16 @@ mod tests {
         peer_tasks[2].abort();
         let _ = (&mut peer_tasks[2]).await;
         fs::remove_dir_all(root.join("node-2")).unwrap();
-        let (recovered_one, recovered_one_checkpoint) = recover_member_over_network(
+        let recovered_one = recover_member_over_network(
             Seed::from_bytes([101; 32]),
             &root.join("recovered-node-1"),
             directory_address,
         )
         .await
         .unwrap();
+        let recovered_one_checkpoint = &recovered_one.checkpoints[0];
         assert_eq!(
-            recovered_one.keys().node_id(),
+            recovered_one.node.keys().node_id(),
             KeyMaterial::from_seed(&Seed::from_bytes([101; 32])).node_id()
         );
         assert_eq!(
@@ -2546,7 +2865,7 @@ mod tests {
             first_commit.checkpoint_hash
         );
         let recovered_one_task = tokio::spawn(serve_node(
-            Arc::new(Mutex::new(recovered_one)),
+            Arc::new(Mutex::new(recovered_one.node)),
             NodeServerConfig {
                 listen: peer_addresses[1],
                 public_endpoint: format!("tcp://{}", peer_addresses[1]),
@@ -2560,15 +2879,16 @@ mod tests {
         peer_tasks[3].abort();
         let _ = (&mut peer_tasks[3]).await;
         fs::remove_dir_all(root.join("node-3")).unwrap();
-        let (recovered_two, recovered_two_checkpoint) = recover_member_over_network(
+        let recovered_two = recover_member_over_network(
             Seed::from_bytes([102; 32]),
             &root.join("recovered-node-2"),
             directory_address,
         )
         .await
         .unwrap();
+        let recovered_two_checkpoint = &recovered_two.checkpoints[0];
         assert_eq!(
-            recovered_two.keys().node_id(),
+            recovered_two.node.keys().node_id(),
             KeyMaterial::from_seed(&Seed::from_bytes([102; 32])).node_id()
         );
         assert_eq!(

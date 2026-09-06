@@ -10,7 +10,8 @@ use clap::{Parser, Subcommand};
 use mb_core::{KeyMaterial, NodeId, Seed};
 use mb_node::{
     DirectoryState, Node, NodeServerConfig, PrototypeGuild, commit_source_over_network_with_intent,
-    recover_over_network, serve_directory, serve_node,
+    recover_guild_over_network, recover_member_and_republish_over_network, recover_over_network,
+    serve_directory, serve_node,
 };
 use mb_store::probe_reflink;
 use tracing_subscriber::EnvFilter;
@@ -94,6 +95,26 @@ enum Command {
         restore: PathBuf,
         #[arg(long)]
         directory: SocketAddr,
+        /// Required when this seed owns revisions in more than one guild.
+        #[arg(long)]
+        guild_id: Option<String>,
+    },
+    /// Rebuild a storage member, republish its new endpoint, and serve it.
+    RecoverMember {
+        #[arg(long)]
+        seed_file: PathBuf,
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        directory: SocketAddr,
+        #[arg(long)]
+        listen: SocketAddr,
+        #[arg(long)]
+        public_endpoint: String,
+        #[arg(long)]
+        failure_domain: String,
+        #[arg(long)]
+        trusted_coordinator: NodeId,
     },
 }
 
@@ -172,16 +193,61 @@ async fn main() -> Result<()> {
             data_dir,
             restore,
             directory,
+            guild_id,
         } => {
             if restore.exists() {
                 bail!("--restore must not already exist");
             }
             let seed = read_seed(&seed_file)?;
-            let node = recover_over_network(seed, &data_dir, &restore, directory).await?;
+            let node = match guild_id {
+                Some(guild_id) => {
+                    recover_guild_over_network(
+                        seed,
+                        &data_dir,
+                        &restore,
+                        directory,
+                        parse_hex_32(&guild_id)?,
+                    )
+                    .await?
+                }
+                None => recover_over_network(seed, &data_dir, &restore, directory).await?,
+            };
             println!("seed-only recovery succeeded");
             println!("node id:            {}", node.keys().node_id());
             println!("rebuilt state:      {}", data_dir.display());
             println!("restored directory: {}", restore.display());
+        }
+        Command::RecoverMember {
+            seed_file,
+            data_dir,
+            directory,
+            listen,
+            public_endpoint,
+            failure_domain,
+            trusted_coordinator,
+        } => {
+            let recovered = recover_member_and_republish_over_network(
+                read_seed(&seed_file)?,
+                &data_dir,
+                directory,
+                public_endpoint.clone(),
+            )
+            .await?;
+            println!(
+                "storage member recovered for {} guild(s); serving on {listen}",
+                recovered.checkpoints.len()
+            );
+            serve_node(
+                Arc::new(Mutex::new(recovered.node)),
+                NodeServerConfig {
+                    listen,
+                    public_endpoint,
+                    failure_domain,
+                    trusted_coordinator,
+                    max_connections: 32,
+                },
+            )
+            .await?;
         }
     }
     Ok(())
@@ -224,6 +290,13 @@ fn read_seed(path: &PathBuf) -> Result<Seed> {
     let encoded = fs::read_to_string(path)
         .with_context(|| format!("cannot read seed file {}", path.display()))?;
     Seed::from_str(encoded.trim()).context("invalid recovery seed file")
+}
+
+fn parse_hex_32(value: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(value).context("guild ID must be hexadecimal")?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("guild ID must contain exactly 32 bytes"))
 }
 
 fn sync_directory(path: &Path) -> Result<()> {

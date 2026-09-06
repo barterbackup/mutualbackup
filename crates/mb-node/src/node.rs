@@ -661,6 +661,32 @@ impl Node {
         )?)
     }
 
+    pub fn next_recovery_publication_sequence(
+        &mut self,
+        slot: &[u8; 32],
+        minimum: u64,
+    ) -> Result<u64> {
+        if minimum == 0 {
+            anyhow::bail!("recovery publication sequence must be positive");
+        }
+        let current = self
+            .control
+            .get_record("recovery-publication-sequence", slot)?
+            .map(|bytes| decode_canonical::<u64>(&bytes))
+            .transpose()?
+            .unwrap_or(0);
+        let next = current
+            .checked_add(1)
+            .context("recovery publication sequence exhausted")?
+            .max(minimum);
+        self.control.put_record(
+            "recovery-publication-sequence",
+            slot,
+            &canonical_bytes(&next)?,
+        )?;
+        Ok(next)
+    }
+
     pub fn checkpoint(&self, hash: &[u8; 32]) -> Result<QuorumCheckpoint> {
         let bytes = self
             .control
@@ -1131,6 +1157,30 @@ mod tests {
             reader
                 .prepared_revision_page(&[85; 32], revision_id, 0)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn recovery_publication_sequence_is_durable_and_not_a_checkpoint_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([84; 32]);
+        let slot = [83; 32];
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        assert_eq!(
+            node.next_recovery_publication_sequence(&slot, 1).unwrap(),
+            1
+        );
+        assert_eq!(
+            node.next_recovery_publication_sequence(&slot, 1).unwrap(),
+            2
+        );
+        drop(node);
+        let mut reopened = Node::open(temp.path(), seed).unwrap();
+        assert_eq!(
+            reopened
+                .next_recovery_publication_sequence(&slot, 9)
+                .unwrap(),
+            9
         );
     }
 
