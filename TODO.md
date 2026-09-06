@@ -1,14 +1,13 @@
 # Source-review TODO
 
-Source-only review of `9a31da9` plus the current working tree. Nothing was
-built or executed for this review. This is not the roadmap: Tor, DHT
-replacement, hole punching, link-freeze, watchers, repair, GC, and multiple
-volumes are intentionally omitted. Every item below is a defect in behavior or
-state already implemented.
+Source-only review of `9a31da9` plus the working tree that followed it. Every
+defect found in that review is now resolved and checked below. The descriptions
+and source locations record the state at review time; they are not claims about
+the current implementation.
 
 ## P0 — protection can be falsely certified or checkpoint progress can wedge
 
-- [ ] **Prove the Reed--Solomon relation before signing a checkpoint.**
+- [x] **Prove the Reed--Solomon relation before signing a checkpoint.**
   `GuildCheckpoint::validate` commits to five roots but never proves that the
   two parity shards encode the three declared information shards
   (`crates/mb-core/src/model.rs:412-468`). A parity holder merely checks that
@@ -21,7 +20,7 @@ state already implemented.
   authenticated information shards (or add an equally strong coding proof),
   and add a corrupt-but-self-consistent parity regression test.
 
-- [ ] **Bind every revision sector to its signed owner in coding-group
+- [x] **Bind every revision sector to its signed owner in coding-group
   validation.** Revision coverage is indexed only as `SectorId -> SectorRef`;
   when a matching reference appears in a group, the validator does not require
   `InformationRole.owner` to equal the revision owner
@@ -32,7 +31,7 @@ state already implemented.
   for that sector. Carry `(owner, reference)` through validation and require an
   exact one-to-one owner-preserving assignment.
 
-- [ ] **Do not overwrite an uncommitted signature lock with its child.** A node
+- [x] **Do not overwrite an uncommitted signature lock with its child.** A node
   may sign generation `N+1` using its generation-`N` lock even when `N` is not
   yet the committed head (`crates/mb-node/src/node.rs:274-323`). The database
   then replaces the sole lock row with `N+1`
@@ -44,7 +43,7 @@ state already implemented.
 
 ## P1 — correctness, durability, availability, and bounded operation
 
-- [ ] **Validate revision lineage instead of trusting sequence labels.** The
+- [x] **Validate revision lineage instead of trusting sequence labels.** The
   model only checks that sequence 1 has no parent and later sequences have some
   parent; it permits gaps, duplicate `(owner, sequence)` values, and arbitrary
   parent hashes (`crates/mb-core/src/model.rs:145-184`). Recovery then chooses
@@ -54,7 +53,7 @@ state already implemented.
   require each owner's head to extend its exact predecessor, reject forks and
   duplicate sequences, and select only the authenticated head.
 
-- [ ] **Journal the coordinator's whole commit, not only individual peer
+- [x] **Journal the coordinator's whole commit, not only individual peer
   calls.** Every invocation chooses a fresh random guild ID and retains no
   durable coordinator state (`crates/mb-node/src/network.rs:650-700`). Failure
   after source capture, parity publication, signature locking, checkpoint
@@ -64,7 +63,7 @@ state already implemented.
   phase before the first side effect, then resume or explicitly abort that same
   operation.
 
-- [ ] **Finish the bounded-state design; paging currently changes only the
+- [x] **Finish the bounded-state design; paging currently changes only the
   wire envelope.** `PrepareSource` still returns the complete revision in one
   600 KiB frame, imposing a backup-size ceiling in the hundreds of MiB
   (`crates/mb-node/src/network.rs:28,171-188,705-725`). Preparation constructs
@@ -77,7 +76,7 @@ state already implemented.
   end-to-end memory budget rather than a 256 MiB object cap with several live
   copies.
 
-- [ ] **Keep synchronous filesystem/SQLCipher work off Tokio workers and split
+- [x] **Keep synchronous filesystem/SQLCipher work off Tokio workers and split
   the global node lock.** Server requests run in `spawn_blocking`, but hold one
   `Mutex<Node>` across an entire capture or store operation, so one long
   capture serializes all reads and parks other blocking-pool jobs
@@ -88,7 +87,7 @@ state already implemented.
   short ownership scopes; do not make the whole node one blocking critical
   section.
 
-- [ ] **Do not leave recovered owner data permanently embedded in
+- [x] **Do not leave recovered owner data permanently embedded in
   `control.db`.** Recovery decrypts every information sector and installs it as
   an inline plaintext recipe (`crates/mb-node/src/node.rs:424-465`,
   `crates/mb-node/src/snapshot.rs:269-290`). Restore writes a second copy to the
@@ -98,7 +97,7 @@ state already implemented.
   restored anchor, atomically switch recipes to it, and retire recovery payload
   rows only after the switch is durable.
 
-- [ ] **Make anchor IDs locatable and make capture cleanup complete.**
+- [x] **Make anchor IDs locatable and make capture cleanup complete.**
   `AnchorAreaLocator` has an ID, but opening an anchor only validates and uses
   its absolute `path_hint`; renaming a parent makes every committed recipe
   unavailable even though the anchor moved intact
@@ -109,7 +108,7 @@ state already implemented.
   state, guard the complete capture with cleanup/reconciliation state, and
   propagate every sync-walk error.
 
-- [ ] **Preserve filesystem semantics that the current capture accepts.**
+- [x] **Preserve filesystem semantics that the current capture accepts.**
   Regular hard-linked aliases are captured as unrelated files because no
   native identity/link relation is recorded; recovery always creates a new
   inode per path (`crates/mb-store/src/anchor.rs:226-301`,
@@ -119,7 +118,7 @@ state already implemented.
   preserve link groups and hole maps in signed private metadata or reject such
   inputs explicitly; do not silently report a faithful restore.
 
-- [ ] **Retry directory durability before adopting a published restore.** If
+- [x] **Retry directory durability before adopting a published restore.** If
   `rename_no_replace` succeeds but the parent-directory fsync fails,
   `publish_restore` returns an error while the job remains `Ready`
   (`crates/mb-node/src/snapshot.rs:404-408`,
@@ -129,7 +128,7 @@ state already implemented.
   adoption to a stronger persisted marker/manifest so inode reuse cannot make
   an unrelated directory look owned by the job.
 
-- [ ] **Do not bless unknown or malformed database layouts during migration.**
+- [x] **Do not bless unknown or malformed database layouts during migration.**
   Versions 3 and 4 are upgraded largely by `CREATE TABLE IF NOT EXISTS` plus a
   version bump; current-version validation checks table names, not their
   columns, constraints, or indexes (`crates/mb-store/src/database.rs:917-1027,1168-1179`).
@@ -140,7 +139,7 @@ state already implemented.
   exactly; reject undefined layouts, and require explicit reconciliation when
   legacy parity cannot be assigned safely.
 
-- [ ] **Close the remaining server and directory resource-exhaustion paths.**
+- [x] **Close the remaining server and directory resource-exhaustion paths.**
   Reads have deadlines, but server response writes do not; clients that stop
   reading can retain all node/directory permits indefinitely
   (`crates/mb-node/src/network.rs:238-371,1406-1418`). Directory admission also
@@ -150,7 +149,7 @@ state already implemented.
   and make admission limits prove that every accepted lookup result is
   returnable within its frame and memory budgets.
 
-- [ ] **Prevent trivial Sybil saturation of recovery rendezvous slots.** The
+- [x] **Prevent trivial Sybil saturation of recovery rendezvous slots.** The
   directory accepts any self-signed key as a publisher for any subject before
   the encrypted inner record can prove guild membership. An attacker can fill
   the first 64 publisher slots for a known Node ID (or all 100,000 subject
@@ -162,7 +161,7 @@ state already implemented.
 
 ## P2 — format, interface, and verification defects
 
-- [ ] **Do not expose or conflate guild recovery records in the directory
+- [x] **Do not expose or conflate guild recovery records in the directory
   schema.** `PublishedRecoveryRecord` leaves guild ID, checkpoint hash, and
   generation in cleartext, contrary to the opaque rendezvous design
   (`crates/mb-node/src/network.rs:205-215`). Records are keyed only by
@@ -171,7 +170,7 @@ state already implemented.
   a privacy-preserving, independently versioned slot/anti-rollback key that can
   represent every guild without revealing the decrypted locator fields.
 
-- [ ] **Align protocol integer ranges with persistence.** Checkpoint validation
+- [x] **Align protocol integer ranges with persistence.** Checkpoint validation
   accepts every nonzero `u64` generation, while signature locking and commit
   convert it to SQLite `i64` and reject values above `i64::MAX`
   (`crates/mb-core/src/model.rs:113-123`,
@@ -179,7 +178,7 @@ state already implemented.
   can therefore be impossible to persist. Constrain the wire model or store the
   full unsigned representation consistently.
 
-- [ ] **Make `recover --restore` truthful for members without a user
+- [x] **Make `recover --restore` truthful for members without a user
   revision.** Recovery intentionally rebuilds parity/helper roles too, but if
   the seed owns no revision it returns success without creating the requested
   target (`crates/mb-node/src/network.rs:1034-1050`). The CLI nevertheless
@@ -187,7 +186,7 @@ state already implemented.
   Make restoration optional for storage-only recovery, or fail an explicitly
   requested restore when there is no recoverable user revision.
 
-- [ ] **Make the mandatory acceptance coverage exercise the claimed failure
+- [x] **Make the mandatory acceptance coverage exercise the claimed failure
   boundary.** The network acceptance test removes only the recovered owner, so
   four remote shards remain, and it exercises only the owner role
   (`crates/mb-node/src/network.rs:1574-1665`). The in-memory all-role test also

@@ -78,11 +78,10 @@ nix build
 `result/bin/mutualbackup`. The prebuilt file under `dist/` is produced by this
 same expression.
 
-Run `bash scripts/reflink-acceptance.sh` for the required reflink and
-end-to-end network loss/recovery coverage. The script provisions its own Btrfs
-test image when `MUTUALBACKUP_REFLINK_TEST_ROOT` is unset; setting that variable
-instead points it at an existing reflink-capable test directory. The ordinary
-workspace test command intentionally leaves these destructive tests ignored.
+Set `MUTUALBACKUP_REFLINK_TEST_ROOT` to a disposable reflink-capable directory,
+then run `bash scripts/reflink-acceptance.sh` for the required reflink and
+end-to-end network loss/recovery coverage. The ordinary workspace test command
+intentionally leaves these destructive tests ignored.
 
 The SQLCipher tests verify an encrypted header, reject a wrong key through page
 HMAC failure, run `cipher_integrity_check`, and reject parity whose committed
