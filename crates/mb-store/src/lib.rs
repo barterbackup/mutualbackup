@@ -8,8 +8,8 @@ mod anchor;
 mod database;
 
 pub use anchor::{
-    AnchorAreaLocator, AnchorError, AnchorFileLocator, AnchorManifest, CapturedEntry,
-    ReflinkAnchor, probe_reflink,
+    AnchorAreaLocator, AnchorError, AnchorFileLocator, AnchorManifest, CapturedEntry, FileExtent,
+    NativeFileId, ReflinkAnchor, probe_reflink,
 };
 pub use database::{CheckpointRow, ControlStore, DatabaseError, ParityObject, ParityStore};
 

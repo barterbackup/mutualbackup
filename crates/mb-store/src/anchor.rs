@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -53,6 +54,27 @@ pub enum CapturedEntry {
         modified_secs: i64,
         modified_nanos: u32,
     },
+    FileV2 {
+        path: String,
+        mode: u32,
+        logical_len: u64,
+        modified_secs: i64,
+        modified_nanos: u32,
+        native_id: NativeFileId,
+        data_extents: Vec<FileExtent>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct NativeFileId {
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileExtent {
+    pub offset: u64,
+    pub logical_len: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -137,16 +159,20 @@ impl ReflinkAnchor {
         let anchor_root = area.path_hint.join(anchor_id.to_string());
         create_private_dir_new(&staging)?;
 
-        let capture_result = capture_entries(&source_root, &root_file, &root_metadata, &staging);
+        let capture_result = (|| {
+            let entries = capture_entries(&source_root, &root_file, &root_metadata, &staging)?;
+            sync_tree_bottom_up(&staging)?;
+            rename_no_replace(&staging, &anchor_root)?;
+            Ok::<_, AnchorError>(entries)
+        })();
         let entries = match capture_result {
             Ok(entries) => entries,
             Err(error) => {
                 let _ = fs::remove_dir_all(&staging);
+                let _ = sync_directory(&area.path_hint);
                 return Err(error);
             }
         };
-        sync_tree_bottom_up(&staging)?;
-        rename_no_replace(&staging, &anchor_root)?;
         if let Err(error) = sync_directory(&area.path_hint) {
             let _ = fs::remove_dir_all(&anchor_root);
             let _ = sync_directory(&area.path_hint);
@@ -154,7 +180,7 @@ impl ReflinkAnchor {
         }
         let (root_modified_secs, root_modified_nanos) = modified_parts(&root_metadata);
         Ok(AnchorManifest {
-            format_version: 1,
+            format_version: 2,
             anchor_id,
             source_root_hint: source_root,
             area,
@@ -235,6 +261,8 @@ fn capture_entries(
         root_file.try_clone()?,
         root_metadata.clone(),
     )];
+    let mut file_versions = Vec::new();
+    let mut captured_links = BTreeMap::<NativeFileId, PathBuf>::new();
     for entry in WalkDir::new(source_root).follow_links(false) {
         let entry = entry?;
         if entry.path() == source_root {
@@ -269,7 +297,13 @@ fn capture_entries(
             if let Some(parent) = destination.parent() {
                 create_private_dir(parent)?;
             }
-            reflink_open_file(&file, &destination).map_err(AnchorError::ReflinkUnavailable)?;
+            let native_id = native_file_id(&before);
+            if let Some(first_destination) = captured_links.get(&native_id) {
+                fs::hard_link(first_destination, &destination)?;
+            } else {
+                reflink_open_file(&file, &destination).map_err(AnchorError::ReflinkUnavailable)?;
+                captured_links.insert(native_id, destination.clone());
+            }
             let after = file.metadata()?;
             let captured = fs::symlink_metadata(&destination)?;
             if !same_capture_version(&before, &after)
@@ -281,19 +315,28 @@ fn capture_entries(
             }
             seal_anchor_file(&destination)?;
             let (modified_secs, modified_nanos) = modified_parts(&after);
-            entries.push(CapturedEntry::File {
+            let captured_file = File::open(&destination)?;
+            entries.push(CapturedEntry::FileV2 {
                 path: relative_string,
                 mode: unix_mode(&after),
                 logical_len: after.len(),
                 modified_secs,
                 modified_nanos,
+                native_id,
+                data_extents: file_data_extents(&captured_file, after.len())?,
             });
+            file_versions.push((relative.to_path_buf(), file, after));
         } else {
             return Err(AnchorError::UnsupportedObject(relative.to_path_buf()));
         }
     }
     for (relative, directory, before) in directory_versions {
         if !same_capture_version(&before, &directory.metadata()?) {
+            return Err(AnchorError::SourceChanged(relative));
+        }
+    }
+    for (relative, file, before) in file_versions {
+        if !same_capture_version(&before, &file.metadata()?) {
             return Err(AnchorError::SourceChanged(relative));
         }
     }
@@ -384,8 +427,79 @@ fn read_area_marker(area: &Path) -> Result<Uuid, AnchorError> {
 
 fn entry_path(entry: &CapturedEntry) -> &str {
     match entry {
-        CapturedEntry::Directory { path, .. } | CapturedEntry::File { path, .. } => path,
+        CapturedEntry::Directory { path, .. }
+        | CapturedEntry::File { path, .. }
+        | CapturedEntry::FileV2 { path, .. } => path,
     }
+}
+
+#[cfg(unix)]
+fn native_file_id(metadata: &fs::Metadata) -> NativeFileId {
+    use std::os::unix::fs::MetadataExt;
+    NativeFileId {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn native_file_id(_metadata: &fs::Metadata) -> NativeFileId {
+    NativeFileId {
+        device: 0,
+        inode: 0,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn file_data_extents(file: &File, logical_len: u64) -> Result<Vec<FileExtent>, AnchorError> {
+    use std::os::fd::AsRawFd;
+
+    let mut extents = Vec::new();
+    let mut cursor = 0_u64;
+    while cursor < logical_len {
+        let data = unsafe { libc::lseek(file.as_raw_fd(), cursor as libc::off_t, libc::SEEK_DATA) };
+        if data < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            return Err(error.into());
+        }
+        let data = data as u64;
+        if data >= logical_len {
+            break;
+        }
+        let hole = unsafe { libc::lseek(file.as_raw_fd(), data as libc::off_t, libc::SEEK_HOLE) };
+        let hole = if hole < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                logical_len
+            } else {
+                return Err(error.into());
+            }
+        } else {
+            (hole as u64).min(logical_len)
+        };
+        if hole <= data {
+            return Err(
+                std::io::Error::other("filesystem returned an invalid sparse extent").into(),
+            );
+        }
+        extents.push(FileExtent {
+            offset: data,
+            logical_len: hole - data,
+        });
+        cursor = hole;
+    }
+    Ok(extents)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn file_data_extents(_file: &File, _logical_len: u64) -> Result<Vec<FileExtent>, AnchorError> {
+    Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "sparse extent discovery is currently implemented only on Linux",
+    )))
 }
 
 fn validate_relative(path: &Path) -> Result<(), AnchorError> {
@@ -651,11 +765,12 @@ fn seal_anchor_file(path: &Path) -> Result<(), std::io::Error> {
     File::open(path)?.sync_all()
 }
 
-fn sync_tree_bottom_up(root: &Path) -> Result<(), std::io::Error> {
+fn sync_tree_bottom_up(root: &Path) -> Result<(), AnchorError> {
     let mut directories = WalkDir::new(root)
         .min_depth(0)
         .into_iter()
-        .filter_map(Result::ok)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .filter(|entry| entry.file_type().is_dir())
         .map(|entry| entry.into_path())
         .collect::<Vec<_>>();

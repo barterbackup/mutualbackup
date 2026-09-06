@@ -1539,6 +1539,7 @@ fn lock_error<T>(_: std::sync::PoisonError<T>) -> anyhow::Error {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::PathBuf;
 
     fn free_address() -> SocketAddr {
@@ -1654,6 +1655,17 @@ mod tests {
         let source = root.join("source");
         fs::create_dir(&source).unwrap();
         fs::write(source.join("payload"), vec![0x5a; 150_000]).unwrap();
+        fs::hard_link(source.join("payload"), source.join("payload-alias")).unwrap();
+        let mut sparse = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(source.join("sparse"))
+            .unwrap();
+        sparse.set_len(128 * 1024 * 1024).unwrap();
+        sparse.seek(SeekFrom::Start(64 * 1024 * 1024)).unwrap();
+        sparse.write_all(b"allocated island").unwrap();
+        sparse.sync_all().unwrap();
 
         let coordinator_seed = Seed::from_bytes([100; 32]);
         let coordinator_keys = KeyMaterial::from_seed(&coordinator_seed);
@@ -1725,6 +1737,26 @@ mod tests {
             fs::read(restored.join("payload")).unwrap(),
             vec![0x5a; 150_000]
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let payload = fs::metadata(restored.join("payload")).unwrap();
+            let alias = fs::metadata(restored.join("payload-alias")).unwrap();
+            assert_eq!(payload.ino(), alias.ino());
+            assert_eq!(payload.nlink(), 2);
+
+            let sparse_metadata = fs::metadata(restored.join("sparse")).unwrap();
+            assert_eq!(sparse_metadata.len(), 128 * 1024 * 1024);
+            assert!(sparse_metadata.blocks() * 512 < sparse_metadata.len() / 4);
+            let mut restored_sparse = fs::File::open(restored.join("sparse")).unwrap();
+            restored_sparse
+                .seek(SeekFrom::Start(64 * 1024 * 1024))
+                .unwrap();
+            let mut island = [0_u8; 16];
+            restored_sparse.read_exact(&mut island).unwrap();
+            assert_eq!(&island, b"allocated island");
+        }
         drop(recovered);
         let recovered = recover_over_network(
             Seed::from_bytes([100; 32]),

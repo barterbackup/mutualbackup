@@ -9,7 +9,9 @@ use mb_core::{
     V1_SECTOR_SIZE, canonical_bytes, crypt_sector, decode_canonical, encrypted_sector,
     make_sector_id, sector_root,
 };
-use mb_store::{AnchorFileLocator, CapturedEntry, ControlStore, ReflinkAnchor};
+use mb_store::{
+    AnchorFileLocator, CapturedEntry, ControlStore, FileExtent, NativeFileId, ReflinkAnchor,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -29,6 +31,22 @@ pub enum PrivateEntry {
         modified_nanos: u32,
         sectors: Vec<SectorRef>,
     },
+    FileV2 {
+        path: String,
+        mode: u32,
+        logical_len: u64,
+        modified_secs: i64,
+        modified_nanos: u32,
+        native_id: NativeFileId,
+        data_extents: Vec<PrivateDataExtent>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PrivateDataExtent {
+    pub offset: u64,
+    pub logical_len: u64,
+    pub sectors: Vec<SectorRef>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -123,6 +141,7 @@ pub(crate) fn prepare_revision(
     let mut private_entries = Vec::new();
     let mut recipe_records = Vec::with_capacity(256);
     let mut ordinal = 0_u64;
+    let mut prepared_links = BTreeMap::<NativeFileId, Vec<PrivateDataExtent>>::new();
 
     for entry in &anchor.manifest.entries {
         match entry {
@@ -185,11 +204,51 @@ pub(crate) fn prepare_revision(
                     sectors: file_references,
                 });
             }
+            CapturedEntry::FileV2 {
+                path,
+                mode,
+                logical_len,
+                modified_secs,
+                modified_nanos,
+                native_id,
+                data_extents,
+            } => {
+                let private_extents = if let Some(existing) = prepared_links.get(native_id) {
+                    existing.clone()
+                } else {
+                    let locator = anchor.manifest.file_locator(path.clone())?;
+                    let extents = prepare_sparse_file(
+                        control,
+                        &mut recipe_records,
+                        keys,
+                        guild_id,
+                        revision_id,
+                        &mut ordinal,
+                        &locator,
+                        *logical_len,
+                        data_extents,
+                    )?;
+                    for extent in &extents {
+                        data_references.extend(extent.sectors.iter().cloned());
+                    }
+                    prepared_links.insert(*native_id, extents.clone());
+                    extents
+                };
+                private_entries.push(PrivateEntry::FileV2 {
+                    path: path.clone(),
+                    mode: *mode,
+                    logical_len: *logical_len,
+                    modified_secs: *modified_secs,
+                    modified_nanos: *modified_nanos,
+                    native_id: *native_id,
+                    data_extents: private_extents,
+                });
+            }
         }
     }
 
     let metadata = PrivateMetadata {
-        format_version: 1,
+        format_version: 2,
         root_mode: anchor.manifest.root_mode,
         root_modified_secs: anchor.manifest.root_modified_secs,
         root_modified_nanos: anchor.manifest.root_modified_nanos,
@@ -255,6 +314,83 @@ pub(crate) fn prepare_revision(
     control.put_records(&records)?;
     anchor.commit();
     Ok(revision)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_sparse_file(
+    control: &mut ControlStore,
+    recipe_records: &mut Vec<(String, Vec<u8>, Vec<u8>)>,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    ordinal: &mut u64,
+    locator: &AnchorFileLocator,
+    logical_len: u64,
+    extents: &[FileExtent],
+) -> Result<Vec<PrivateDataExtent>> {
+    validate_file_extents(
+        logical_len,
+        extents
+            .iter()
+            .map(|extent| (extent.offset, extent.logical_len)),
+    )?;
+    let encryption_key = keys.guild_data_key(&guild_id);
+    let mut file = locator.open().context("open captured anchor file")?;
+    let mut result = Vec::with_capacity(extents.len());
+    for extent in extents {
+        file.seek(SeekFrom::Start(extent.offset))?;
+        let mut remaining = extent.logical_len;
+        let mut offset = extent.offset;
+        let mut sectors = Vec::new();
+        while remaining > 0 {
+            let logical_len = remaining.min(V1_SECTOR_SIZE as u64) as usize;
+            let mut plaintext = vec![0_u8; logical_len];
+            file.read_exact(&mut plaintext)?;
+            let id = make_sector_id(keys.node_id(), revision_id, SectorPurpose::Data, *ordinal);
+            *ordinal = ordinal
+                .checked_add(1)
+                .context("too many sectors in one revision")?;
+            let (reference, _) = encrypted_sector(&encryption_key, id, &plaintext)?;
+            sectors.push(reference.clone());
+            queue_recipe(
+                control,
+                recipe_records,
+                LocalSectorRecipe {
+                    guild_id,
+                    reference,
+                    source: LocalPlaintextSource::AnchorFile {
+                        locator: locator.clone(),
+                        offset,
+                    },
+                },
+            )?;
+            offset += logical_len as u64;
+            remaining -= logical_len as u64;
+        }
+        result.push(PrivateDataExtent {
+            offset: extent.offset,
+            logical_len: extent.logical_len,
+            sectors,
+        });
+    }
+    Ok(result)
+}
+
+fn validate_file_extents(
+    logical_len: u64,
+    extents: impl IntoIterator<Item = (u64, u64)>,
+) -> Result<()> {
+    let mut previous_end = 0_u64;
+    for (offset, extent_len) in extents {
+        let end = offset
+            .checked_add(extent_len)
+            .context("file extent overflows its signed range")?;
+        if extent_len == 0 || offset < previous_end || end > logical_len {
+            bail!("invalid or overlapping file extent");
+        }
+        previous_end = end;
+    }
+    Ok(())
 }
 
 fn queue_recipe(
@@ -410,7 +546,7 @@ where
         )?);
     }
     let metadata: PrivateMetadata = decode_canonical(&metadata_bytes)?;
-    if metadata.format_version != 1 {
+    if !matches!(metadata.format_version, 1 | 2) {
         bail!("unsupported private metadata version");
     }
 
@@ -456,6 +592,7 @@ where
     F: FnMut(&SectorId) -> Result<Vec<u8>>,
 {
     let mut directory_metadata = Vec::new();
+    let mut restored_links = BTreeMap::<NativeFileId, RestoredLink>::new();
     for entry in &metadata.entries {
         match entry {
             PrivateEntry::Directory {
@@ -495,6 +632,58 @@ where
                 }
                 set_metadata_durable(&file, &destination, *mode, *modified_secs, *modified_nanos)?;
             }
+            PrivateEntry::FileV2 {
+                path,
+                mode,
+                logical_len,
+                modified_secs,
+                modified_nanos,
+                native_id,
+                data_extents,
+            } => {
+                let destination = safe_join(staging, path)?;
+                if let Some(parent) = destination.parent() {
+                    create_private_dir(parent)?;
+                }
+                if let Some(existing) = restored_links.get(native_id) {
+                    if existing.mode != *mode
+                        || existing.logical_len != *logical_len
+                        || existing.modified_secs != *modified_secs
+                        || existing.modified_nanos != *modified_nanos
+                        || existing.data_extents != *data_extents
+                    {
+                        bail!("hard-linked aliases have inconsistent signed metadata");
+                    }
+                    fs::hard_link(&existing.path, &destination)?;
+                } else {
+                    restore_sparse_file(
+                        &destination,
+                        *logical_len,
+                        data_extents,
+                        encryption_key,
+                        load_ciphertext,
+                    )?;
+                    let file = File::open(&destination)?;
+                    set_metadata_durable(
+                        &file,
+                        &destination,
+                        *mode,
+                        *modified_secs,
+                        *modified_nanos,
+                    )?;
+                    restored_links.insert(
+                        *native_id,
+                        RestoredLink {
+                            path: destination,
+                            mode: *mode,
+                            logical_len: *logical_len,
+                            modified_secs: *modified_secs,
+                            modified_nanos: *modified_nanos,
+                            data_extents: data_extents.clone(),
+                        },
+                    );
+                }
+            }
         }
     }
     directory_metadata.push((
@@ -508,6 +697,54 @@ where
         let directory = File::open(&path)?;
         set_metadata_durable(&directory, &path, mode, modified_secs, modified_nanos)?;
     }
+    Ok(())
+}
+
+struct RestoredLink {
+    path: PathBuf,
+    mode: u32,
+    logical_len: u64,
+    modified_secs: i64,
+    modified_nanos: u32,
+    data_extents: Vec<PrivateDataExtent>,
+}
+
+fn restore_sparse_file<F>(
+    destination: &Path,
+    logical_len: u64,
+    data_extents: &[PrivateDataExtent],
+    encryption_key: &[u8; 32],
+    load_ciphertext: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&SectorId) -> Result<Vec<u8>>,
+{
+    validate_file_extents(
+        logical_len,
+        data_extents
+            .iter()
+            .map(|extent| (extent.offset, extent.logical_len)),
+    )?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)?;
+    file.set_len(logical_len)?;
+    for extent in data_extents {
+        file.seek(SeekFrom::Start(extent.offset))?;
+        let mut written = 0_u64;
+        for reference in &extent.sectors {
+            let plaintext = decrypt_reference(encryption_key, reference, load_ciphertext)?;
+            file.write_all(&plaintext)?;
+            written = written
+                .checked_add(plaintext.len() as u64)
+                .context("restored extent length overflow")?;
+        }
+        if written != extent.logical_len {
+            bail!("restored extent length does not match signed metadata");
+        }
+    }
+    file.sync_all()?;
     Ok(())
 }
 
