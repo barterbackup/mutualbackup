@@ -12,7 +12,7 @@ use mb_core::{
 };
 use mb_store::ParityObject;
 
-use crate::{Node, restore_revision};
+use crate::{Node, RecoveredShards, restore_revision};
 
 type SharedNode = Arc<Mutex<Node>>;
 
@@ -157,7 +157,7 @@ impl PrototypeGuild {
             owner
                 .lock()
                 .map_err(lock_error)?
-                .prepare_revision(self.guild_id, source, 1)?;
+                .prepare_revision(self.guild_id, source, 1, None)?;
         let mut target_sectors = revision.value.metadata_sectors.clone();
         target_sectors.extend(revision.value.data_sectors.clone());
         let mut groups = Vec::with_capacity(target_sectors.len());
@@ -413,7 +413,7 @@ fn recover_local_shards(
     recovering: NodeId,
     checkpoint: &QuorumCheckpoint,
     network: &MemoryNetwork,
-) -> Result<BTreeMap<([u8; 32], u8), Vec<u8>>> {
+) -> Result<RecoveredShards> {
     let mut recovered = BTreeMap::new();
     for group in &checkpoint.checkpoint.coding_groups {
         let target = group
@@ -479,7 +479,7 @@ fn recover_local_shards(
 fn local_revision_ciphertexts(
     revision: &SignedRecord<UserRevision>,
     checkpoint: &QuorumCheckpoint,
-    recovered_shards: &BTreeMap<([u8; 32], u8), Vec<u8>>,
+    recovered_shards: &RecoveredShards,
 ) -> Result<BTreeMap<SectorId, Vec<u8>>> {
     let wanted = revision
         .value

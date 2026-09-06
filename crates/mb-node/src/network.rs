@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -21,11 +21,17 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::{Node, restore_revision};
+use crate::{Node, RecoveredShards, restore_revision};
 
-const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
-const PEER_REQUEST_DOMAIN: &[u8] = b"mutualbackup/direct-request/v1";
-const PEER_RESPONSE_DOMAIN: &[u8] = b"mutualbackup/direct-response/v1";
+const MAX_PEER_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DIRECTORY_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DIRECTORY_RECORD_BYTES: usize = 64 * 1024;
+const MAX_DIRECTORY_SUBJECTS: usize = 100_000;
+const MAX_PUBLISHERS_PER_SUBJECT: usize = 64;
+const HEADER_TIMEOUT: Duration = Duration::from_secs(2);
+const BODY_TIMEOUT: Duration = Duration::from_secs(10);
+const PEER_REQUEST_DOMAIN: &[u8] = b"mutualbackup/direct-request/v2";
+const PEER_RESPONSE_DOMAIN: &[u8] = b"mutualbackup/direct-response/v2";
 const DIRECTORY_RECORD_DOMAIN: &[u8] = b"mutualbackup/directory-record/v1";
 
 #[derive(Clone, Debug)]
@@ -57,12 +63,14 @@ enum PeerRequest {
         ordinal: u64,
     },
     GetSector {
+        guild_id: [u8; 32],
         sector_id: SectorId,
     },
     PublishParity {
         object: ParityObject,
     },
     GetParity {
+        guild_id: [u8; 32],
         group_id: [u8; 32],
         shard_index: u8,
     },
@@ -73,6 +81,7 @@ enum PeerRequest {
         checkpoint: QuorumCheckpoint,
     },
     GetCheckpoint {
+        guild_id: [u8; 32],
         hash: [u8; 32],
     },
     BuildRecoveryRecord {
@@ -99,11 +108,32 @@ impl PeerRequest {
             Self::BuildRecoveryRecord { .. } => Some("build-recovery-record"),
         }
     }
+
+    fn guild_scope(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Profile => None,
+            Self::PrepareSource { guild_id, .. }
+            | Self::EnsureFiller { guild_id, .. }
+            | Self::GetSector { guild_id, .. }
+            | Self::GetParity { guild_id, .. }
+            | Self::GetCheckpoint { guild_id, .. }
+            | Self::BuildRecoveryRecord { guild_id, .. } => Some(*guild_id),
+            Self::PublishParity { object } => Some(object.guild_id),
+            Self::SignCheckpoint { checkpoint } => Some(checkpoint.guild_id),
+            Self::StoreCheckpoint { checkpoint } => Some(checkpoint.checkpoint.guild_id),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PeerRequestEnvelope {
+    format_version: u16,
     request_id: [u8; 16],
+    caller: NodeId,
+    recipient: Option<NodeId>,
+    guild_scope: Option<[u8; 32]>,
+    issued_at_unix_seconds: u64,
+    expires_at_unix_seconds: u64,
     request: PeerRequest,
 }
 
@@ -124,7 +154,10 @@ enum PeerResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PeerResponseEnvelope {
+    format_version: u16,
     request_id: [u8; 16],
+    recipient: NodeId,
+    request_hash: [u8; 32],
     result: std::result::Result<PeerResponse, String>,
 }
 
@@ -148,7 +181,7 @@ struct PublishedRecoveryRecord {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum DirectoryRequest {
-    Publish(SignedRecord<PublishedRecoveryRecord>),
+    Publish(Box<SignedRecord<PublishedRecoveryRecord>>),
     Lookup { subject: NodeId },
 }
 
@@ -171,6 +204,7 @@ pub async fn serve_node(node: Arc<Mutex<Node>>, config: NodeServerConfig) -> Res
     if config.failure_domain.is_empty() || config.max_connections == 0 {
         bail!("invalid node server configuration");
     }
+    validate_advertised_endpoint(&config.public_endpoint)?;
     let listener = TcpListener::bind(config.listen).await?;
     let permits = Arc::new(Semaphore::new(config.max_connections));
     loop {
@@ -196,43 +230,69 @@ pub async fn serve_directory(listen: SocketAddr, state: DirectoryState) -> Resul
         let state = state.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let response = match read_frame::<_, DirectoryRequest>(&mut stream).await {
+            let response = match read_frame_timed::<_, DirectoryRequest>(
+                &mut stream,
+                MAX_DIRECTORY_FRAME_BYTES,
+            )
+            .await
+            {
                 Ok(DirectoryRequest::Publish(record)) => {
+                    let record = *record;
                     if record.verify(DIRECTORY_RECORD_DOMAIN).is_err()
                         || record.signer != record.value.publisher
                         || record.value.format_version != 1
                         || record.value.expires_at_unix_seconds != u64::MAX
+                        || canonical_bytes(&record)
+                            .map_or(true, |bytes| bytes.len() > MAX_DIRECTORY_RECORD_BYTES)
                     {
                         DirectoryResponse::Error("invalid publisher signature".to_owned())
                     } else {
                         match state.records.lock() {
                             Ok(mut records) => {
-                                let publishers = records.entry(record.value.subject).or_default();
-                                let accepted = match publishers.get(&record.value.publisher) {
-                                    Some(current)
-                                        if current.value.checkpoint_generation
-                                            > record.value.checkpoint_generation =>
-                                    {
-                                        false
-                                    }
-                                    Some(current)
-                                        if current.value.checkpoint_generation
-                                            == record.value.checkpoint_generation
-                                            && current.value.checkpoint_hash
-                                                != record.value.checkpoint_hash =>
-                                    {
-                                        false
-                                    }
-                                    _ => true,
-                                };
-                                if accepted {
-                                    publishers.insert(record.value.publisher, record);
-                                    DirectoryResponse::Ack
-                                } else {
+                                if !records.contains_key(&record.value.subject)
+                                    && records.len() >= MAX_DIRECTORY_SUBJECTS
+                                {
                                     DirectoryResponse::Error(
-                                        "recovery record would roll back or fork publisher state"
-                                            .to_owned(),
+                                        "recovery directory subject limit reached".to_owned(),
                                     )
+                                } else {
+                                    let publishers =
+                                        records.entry(record.value.subject).or_default();
+                                    if !publishers.contains_key(&record.value.publisher)
+                                        && publishers.len() >= MAX_PUBLISHERS_PER_SUBJECT
+                                    {
+                                        DirectoryResponse::Error(
+                                            "recovery publisher limit reached".to_owned(),
+                                        )
+                                    } else {
+                                        let accepted = match publishers.get(&record.value.publisher)
+                                        {
+                                            Some(current)
+                                                if current.value.checkpoint_generation
+                                                    > record.value.checkpoint_generation =>
+                                            {
+                                                false
+                                            }
+                                            Some(current)
+                                                if current.value.checkpoint_generation
+                                                    == record.value.checkpoint_generation
+                                                    && current.value.checkpoint_hash
+                                                        != record.value.checkpoint_hash =>
+                                            {
+                                                false
+                                            }
+                                            _ => true,
+                                        };
+                                        if accepted {
+                                            publishers.insert(record.value.publisher, record);
+                                            DirectoryResponse::Ack
+                                        } else {
+                                            DirectoryResponse::Error(
+                                                "recovery record would roll back or fork publisher state"
+                                                    .to_owned(),
+                                            )
+                                        }
+                                    }
                                 }
                             }
                             Err(_) => {
@@ -252,7 +312,11 @@ pub async fn serve_directory(listen: SocketAddr, state: DirectoryState) -> Resul
                 },
                 Err(error) => DirectoryResponse::Error(error.to_string()),
             };
-            let _ = write_frame(&mut stream, &response).await;
+            if let Err(error) =
+                write_frame_limited(&mut stream, &response, MAX_DIRECTORY_FRAME_BYTES).await
+            {
+                tracing::warn!(%error, "directory response failed");
+            }
         });
     }
 }
@@ -262,45 +326,32 @@ async fn handle_peer_connection(
     node: Arc<Mutex<Node>>,
     config: NodeServerConfig,
 ) -> Result<()> {
-    let signed = read_frame::<_, SignedRecord<PeerRequestEnvelope>>(&mut stream).await?;
-    let request_id = signed.value.request_id;
-    let result = tokio::task::spawn_blocking(move || process_peer_request(node, &config, signed))
-        .await
-        .context("peer request worker panicked")?;
-    let signed_response = {
-        let node = result.node.lock().map_err(lock_error)?;
-        SignedRecord::sign(
-            PEER_RESPONSE_DOMAIN,
-            PeerResponseEnvelope {
-                request_id,
-                result: result.response.map_err(|error| format!("{error:#}")),
-            },
-            node.keys(),
-        )?
-    };
-    write_frame(&mut stream, &signed_response).await?;
+    let signed =
+        read_frame_timed::<_, SignedRecord<PeerRequestEnvelope>>(&mut stream, MAX_PEER_FRAME_BYTES)
+            .await?;
+    let signed_response =
+        tokio::task::spawn_blocking(move || process_peer_request(node, &config, signed))
+            .await
+            .context("peer request worker panicked")??;
+    write_frame_limited(&mut stream, &signed_response, MAX_PEER_FRAME_BYTES).await?;
     Ok(())
-}
-
-struct ProcessedRequest {
-    node: Arc<Mutex<Node>>,
-    response: Result<PeerResponse>,
 }
 
 fn process_peer_request(
     node: Arc<Mutex<Node>>,
     config: &NodeServerConfig,
     signed: SignedRecord<PeerRequestEnvelope>,
-) -> ProcessedRequest {
+) -> Result<SignedRecord<PeerResponseEnvelope>> {
+    let request_id = signed.value.request_id;
+    let caller = signed.signer;
+    let wire_request_hash = *blake3::hash(&canonical_bytes(&signed.value)?).as_bytes();
+    let operation_hash = peer_operation_hash(&signed.value)?;
+    let mut node_guard = node.lock().map_err(lock_error)?;
     let response = (|| {
         signed.verify(PEER_REQUEST_DOMAIN)?;
-        let caller = signed.signer;
-        let request_id = signed.value.request_id;
+        validate_request_envelope(&signed.value, caller, node_guard.keys().node_id())?;
         let request = signed.value.request;
-        let request_bytes = canonical_bytes(&request)?;
-        let request_hash = *blake3::hash(&request_bytes).as_bytes();
         let mutation_kind = request.mutation_kind();
-        let mut node_guard = node.lock().map_err(lock_error)?;
         let local_node_id = node_guard.keys().node_id();
         if mutation_kind.is_some() && caller != config.trusted_coordinator {
             bail!("caller is not the configured guild coordinator");
@@ -308,36 +359,108 @@ fn process_peer_request(
         if matches!(&request, PeerRequest::PrepareSource { .. }) && caller != local_node_id {
             bail!("only the source node itself may request source capture");
         }
+        if mutation_kind.is_none()
+            && !matches!(&request, PeerRequest::Profile)
+            && !(matches!(&request, PeerRequest::GetSector { .. })
+                && caller == config.trusted_coordinator)
+        {
+            node_guard.authorize_member(
+                &request
+                    .guild_scope()
+                    .context("guild-scoped request has no scope")?,
+                caller,
+            )?;
+        }
         if let Some(kind) = mutation_kind {
             if let Some(cached_bytes) =
-                node_guard.cached_operation(&request_id, kind, caller, &request_hash)?
+                node_guard.cached_operation(&request_id, kind, caller, &operation_hash)?
             {
                 let cached: CachedOperation = decode_canonical(&cached_bytes)?;
+                if cached.request_hash != operation_hash {
+                    bail!("cached operation hash is inconsistent");
+                }
                 return Ok(cached.response);
             }
-            let response = execute_peer_request(&mut node_guard, config, request)?;
+            let response = execute_peer_request(&mut node_guard, config, request_id, request)?;
             let cached = CachedOperation {
-                request_hash,
+                request_hash: operation_hash,
                 response: response.clone(),
             };
             node_guard.commit_operation(
                 &request_id,
                 kind,
                 caller,
-                &request_hash,
+                &operation_hash,
                 &canonical_bytes(&cached)?,
             )?;
             Ok(response)
         } else {
-            execute_peer_request(&mut node_guard, config, request)
+            execute_peer_request(&mut node_guard, config, request_id, request)
         }
     })();
-    ProcessedRequest { node, response }
+    let error = response.map_err(|error| {
+        let mut message = format!("{error:#}");
+        message.truncate(4096);
+        message
+    });
+    Ok(SignedRecord::sign(
+        PEER_RESPONSE_DOMAIN,
+        PeerResponseEnvelope {
+            format_version: 1,
+            request_id,
+            recipient: caller,
+            request_hash: wire_request_hash,
+            result: error,
+        },
+        node_guard.keys(),
+    )?)
+}
+
+fn validate_request_envelope(
+    envelope: &PeerRequestEnvelope,
+    signer: NodeId,
+    local_node: NodeId,
+) -> Result<()> {
+    let now = unix_seconds();
+    if envelope.format_version != 1
+        || envelope.caller != signer
+        || envelope.guild_scope != envelope.request.guild_scope()
+        || envelope.expires_at_unix_seconds < envelope.issued_at_unix_seconds
+        || envelope.expires_at_unix_seconds - envelope.issued_at_unix_seconds > 120
+        || envelope.expires_at_unix_seconds < now
+        || envelope.issued_at_unix_seconds > now.saturating_add(30)
+    {
+        bail!("invalid request protocol or freshness context");
+    }
+    match &envelope.request {
+        PeerRequest::Profile if envelope.recipient.is_none() => {}
+        PeerRequest::Profile => bail!("profile request must not claim a recipient"),
+        _ if envelope.recipient == Some(local_node) => {}
+        _ => bail!("request is not addressed to this node"),
+    }
+    if let PeerRequest::PrepareSource { ref source, .. } = envelope.request
+        && source.len() > 4096
+    {
+        bail!("source path exceeds the protocol limit");
+    }
+    Ok(())
+}
+
+fn peer_operation_hash(envelope: &PeerRequestEnvelope) -> Result<[u8; 32]> {
+    Ok(*blake3::hash(&canonical_bytes(&(
+        envelope.format_version,
+        envelope.caller,
+        envelope.recipient,
+        envelope.guild_scope,
+        &envelope.request,
+    ))?)
+    .as_bytes())
 }
 
 fn execute_peer_request(
     node: &mut Node,
     config: &NodeServerConfig,
+    request_id: [u8; 16],
     request: PeerRequest,
 ) -> Result<PeerResponse> {
     match request {
@@ -353,6 +476,7 @@ fn execute_peer_request(
             guild_id,
             Path::new(&source),
             sequence,
+            Some(request_id),
         )?)),
         PeerRequest::EnsureFiller {
             guild_id,
@@ -362,15 +486,25 @@ fn execute_peer_request(
             let (reference, bytes) = node.ensure_filler(guild_id, revision_id, ordinal)?;
             Ok(PeerResponse::Filler { reference, bytes })
         }
-        PeerRequest::GetSector { sector_id } => Ok(PeerResponse::Bytes(node.sector(&sector_id)?)),
+        PeerRequest::GetSector {
+            guild_id,
+            sector_id,
+        } => Ok(PeerResponse::Bytes(
+            node.sector_for_guild(&guild_id, &sector_id)?,
+        )),
         PeerRequest::PublishParity { object } => {
             node.publish_parity(&object)?;
             Ok(PeerResponse::Ack)
         }
         PeerRequest::GetParity {
+            guild_id,
             group_id,
             shard_index,
-        } => Ok(PeerResponse::Bytes(node.parity(&group_id, shard_index)?)),
+        } => Ok(PeerResponse::Bytes(node.parity_for_guild(
+            &guild_id,
+            &group_id,
+            shard_index,
+        )?)),
         PeerRequest::SignCheckpoint { checkpoint } => Ok(PeerResponse::CheckpointSignature(
             node.sign_checkpoint(&checkpoint)?,
         )),
@@ -378,8 +512,12 @@ fn execute_peer_request(
             node.store_checkpoint(&checkpoint)?;
             Ok(PeerResponse::Ack)
         }
-        PeerRequest::GetCheckpoint { hash } => {
-            Ok(PeerResponse::Checkpoint(node.checkpoint(&hash)?))
+        PeerRequest::GetCheckpoint { guild_id, hash } => {
+            let checkpoint = node.checkpoint(&hash)?;
+            if checkpoint.checkpoint.guild_id != guild_id {
+                bail!("checkpoint does not belong to the requested guild");
+            }
+            Ok(PeerResponse::Checkpoint(checkpoint))
         }
         PeerRequest::BuildRecoveryRecord {
             subject,
@@ -471,6 +609,19 @@ pub async fn commit_source_over_network(
     }) {
         bail!("peer identities and physical failure domains must be unique");
     }
+    for peer in &peers {
+        let advertised = validate_advertised_endpoint(&peer.profile.endpoint)?;
+        let (signer, response) =
+            peer_call(advertised, coordinator_keys, PeerRequest::Profile).await?;
+        let PeerResponse::Profile(advertised_profile) = response else {
+            bail!("advertised peer returned the wrong profile response");
+        };
+        if signer != peer.profile.member.node_id
+            || advertised_profile.member.node_id != peer.profile.member.node_id
+        {
+            bail!("advertised endpoint does not authenticate as the expected node");
+        }
+    }
     let owner_position = peers
         .iter()
         .position(|peer| peer.profile.member.node_id == coordinator_keys.node_id())
@@ -512,6 +663,7 @@ pub async fn commit_source_over_network(
             peers[0].profile.member.node_id,
             coordinator_keys,
             PeerRequest::GetSector {
+                guild_id,
                 sector_id: target_reference.id,
             },
         )
@@ -754,6 +906,7 @@ pub async fn recover_over_network(
             signed.value.publisher,
             recovered_node.keys(),
             PeerRequest::GetCheckpoint {
+                guild_id: signed.value.guild_id,
                 hash: signed.value.checkpoint_hash,
             },
         )
@@ -818,7 +971,7 @@ async fn recover_network_local_shards(
     keys: &KeyMaterial,
     checkpoint: &QuorumCheckpoint,
     peer_endpoints: &BTreeMap<NodeId, SocketAddr>,
-) -> Result<BTreeMap<([u8; 32], u8), Vec<u8>>> {
+) -> Result<RecoveredShards> {
     let mut recovered = BTreeMap::new();
     let mut unhealthy = BTreeSet::new();
     for group in &checkpoint.checkpoint.coding_groups {
@@ -849,6 +1002,7 @@ async fn recover_network_local_shards(
                     information.owner,
                     information.sector.root,
                     PeerRequest::GetSector {
+                        guild_id: checkpoint.checkpoint.guild_id,
                         sector_id: information.sector.id,
                     },
                 ),
@@ -856,6 +1010,7 @@ async fn recover_network_local_shards(
                     parity.holder,
                     parity.root,
                     PeerRequest::GetParity {
+                        guild_id: checkpoint.checkpoint.guild_id,
                         group_id: group.id,
                         shard_index: index as u8,
                     },
@@ -909,7 +1064,7 @@ async fn recover_network_local_shards(
 fn local_revision_ciphertexts(
     revision: &SignedRecord<UserRevision>,
     checkpoint: &QuorumCheckpoint,
-    recovered_shards: &BTreeMap<([u8; 32], u8), Vec<u8>>,
+    recovered_shards: &RecoveredShards,
 ) -> Result<BTreeMap<SectorId, Vec<u8>>> {
     let wanted = revision
         .value
@@ -969,22 +1124,60 @@ async fn peer_call(
     keys: &KeyMaterial,
     request: PeerRequest,
 ) -> Result<(NodeId, PeerResponse)> {
-    let request_id = *Uuid::new_v4().as_bytes();
-    let signed_request = SignedRecord::sign(
+    let signed_request = make_peer_request(keys, None, request)?;
+    send_peer_request(endpoint, keys, &signed_request).await
+}
+
+fn make_peer_request(
+    keys: &KeyMaterial,
+    recipient: Option<NodeId>,
+    request: PeerRequest,
+) -> Result<SignedRecord<PeerRequestEnvelope>> {
+    let issued_at_unix_seconds = unix_seconds();
+    let guild_scope = request.guild_scope();
+    let request_id = if request.mutation_kind().is_some() {
+        let bytes = canonical_bytes(&(1_u16, keys.node_id(), recipient, guild_scope, &request))?;
+        let mut id = [0_u8; 16];
+        id.copy_from_slice(&blake3::hash(&bytes).as_bytes()[..16]);
+        id
+    } else {
+        *Uuid::new_v4().as_bytes()
+    };
+    Ok(SignedRecord::sign(
         PEER_REQUEST_DOMAIN,
         PeerRequestEnvelope {
+            format_version: 1,
             request_id,
+            caller: keys.node_id(),
+            recipient,
+            guild_scope,
+            issued_at_unix_seconds,
+            expires_at_unix_seconds: issued_at_unix_seconds.saturating_add(60),
             request,
         },
         keys,
-    )?;
+    )?)
+}
+
+async fn send_peer_request(
+    endpoint: SocketAddr,
+    keys: &KeyMaterial,
+    signed_request: &SignedRecord<PeerRequestEnvelope>,
+) -> Result<(NodeId, PeerResponse)> {
+    let request_hash = *blake3::hash(&canonical_bytes(&signed_request.value)?).as_bytes();
+    let request_id = signed_request.value.request_id;
     let call = async {
         let mut stream = TcpStream::connect(endpoint).await?;
-        write_frame(&mut stream, &signed_request).await?;
-        let response: SignedRecord<PeerResponseEnvelope> = read_frame(&mut stream).await?;
+        write_frame_limited(&mut stream, signed_request, MAX_PEER_FRAME_BYTES).await?;
+        let response: SignedRecord<PeerResponseEnvelope> =
+            read_frame_timed(&mut stream, MAX_PEER_FRAME_BYTES).await?;
         response.verify(PEER_RESPONSE_DOMAIN)?;
-        if response.value.request_id != request_id {
-            bail!("peer response request ID mismatch");
+        if response.value.format_version != 1
+            || response.value.request_id != request_id
+            || response.value.recipient != keys.node_id()
+            || response.value.request_hash != request_hash
+        {
+            bail!("peer response context mismatch");
         }
         let body = response.value.result.map_err(anyhow::Error::msg)?;
         Ok((response.signer, body))
@@ -1000,11 +1193,16 @@ async fn peer_call_expected(
     keys: &KeyMaterial,
     request: PeerRequest,
 ) -> Result<PeerResponse> {
-    let (signer, response) = peer_call(endpoint, keys, request).await?;
-    if signer != expected_signer {
-        bail!("peer response was signed by an unexpected identity");
+    let signed_request = make_peer_request(keys, Some(expected_signer), request)?;
+    let mut last_error = None;
+    for _ in 0..2 {
+        match send_peer_request(endpoint, keys, &signed_request).await {
+            Ok((signer, response)) if signer == expected_signer => return Ok(response),
+            Ok(_) => last_error = Some(anyhow::anyhow!("unexpected peer response identity")),
+            Err(error) => last_error = Some(error),
+        }
     }
-    Ok(response)
+    Err(last_error.context("peer request was not attempted")?)
 }
 
 fn expect_ack(response: PeerResponse) -> Result<()> {
@@ -1019,7 +1217,7 @@ async fn directory_publish(
     endpoint: SocketAddr,
     record: SignedRecord<PublishedRecoveryRecord>,
 ) -> Result<()> {
-    match directory_call(endpoint, DirectoryRequest::Publish(record)).await? {
+    match directory_call(endpoint, DirectoryRequest::Publish(Box::new(record))).await? {
         DirectoryResponse::Ack => Ok(()),
         DirectoryResponse::Error(error) => bail!(error),
         DirectoryResponse::Records(_) => bail!("directory returned records to publish request"),
@@ -1043,16 +1241,20 @@ async fn directory_call(
 ) -> Result<DirectoryResponse> {
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut stream = TcpStream::connect(endpoint).await?;
-        write_frame(&mut stream, &request).await?;
-        read_frame(&mut stream).await
+        write_frame_limited(&mut stream, &request, MAX_DIRECTORY_FRAME_BYTES).await?;
+        read_frame_timed(&mut stream, MAX_DIRECTORY_FRAME_BYTES).await
     })
     .await
     .context("directory request timed out")?
 }
 
-async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(writer: &mut W, value: &T) -> Result<()> {
+async fn write_frame_limited<W: AsyncWrite + Unpin, T: Serialize>(
+    writer: &mut W,
+    value: &T,
+    limit: usize,
+) -> Result<()> {
     let bytes = canonical_bytes(value)?;
-    if bytes.len() > MAX_FRAME_BYTES {
+    if bytes.len() > limit {
         bail!("outgoing protocol frame exceeds the fixed limit");
     }
     writer.write_u32(bytes.len() as u32).await?;
@@ -1061,13 +1263,20 @@ async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(writer: &mut W, value:
     Ok(())
 }
 
-async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(reader: &mut R) -> Result<T> {
-    let length = reader.read_u32().await? as usize;
-    if length == 0 || length > MAX_FRAME_BYTES {
+async fn read_frame_timed<R: AsyncRead + Unpin, T: DeserializeOwned>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<T> {
+    let length = tokio::time::timeout(HEADER_TIMEOUT, reader.read_u32())
+        .await
+        .context("protocol frame header timed out")?? as usize;
+    if length == 0 || length > limit {
         bail!("incoming protocol frame has an invalid length");
     }
     let mut bytes = vec![0_u8; length];
-    reader.read_exact(&mut bytes).await?;
+    tokio::time::timeout(BODY_TIMEOUT, reader.read_exact(&mut bytes))
+        .await
+        .context("protocol frame body timed out")??;
     Ok(decode_canonical(&bytes)?)
 }
 
@@ -1079,6 +1288,21 @@ fn parse_tcp_endpoint(endpoint: &str) -> Result<SocketAddr> {
         .context("invalid direct TCP endpoint")
 }
 
+fn validate_advertised_endpoint(endpoint: &str) -> Result<SocketAddr> {
+    let address = parse_tcp_endpoint(endpoint)?;
+    if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
+        bail!("advertised endpoint is not remotely usable");
+    }
+    Ok(address)
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn lock_error<T>(_: std::sync::PoisonError<T>) -> anyhow::Error {
     anyhow::anyhow!("node state lock was poisoned")
 }
@@ -1086,6 +1310,23 @@ fn lock_error<T>(_: std::sync::PoisonError<T>) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn free_address() -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    async fn wait_until_listening(address: SocketAddr) {
+        for _ in 0..100 {
+            if TcpStream::connect(address).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("server did not start listening");
+    }
 
     #[test]
     fn endpoint_parser_is_strict() {
@@ -1094,5 +1335,165 @@ mod tests {
             "127.0.0.1:1234".parse().unwrap()
         );
         assert!(parse_tcp_endpoint("http://127.0.0.1:1234").is_err());
+        assert!(validate_advertised_endpoint("tcp://0.0.0.0:1234").is_err());
+        assert!(validate_advertised_endpoint("tcp://127.0.0.1:0").is_err());
+    }
+
+    #[test]
+    fn signed_request_context_is_destination_bound_and_fresh() {
+        let caller = KeyMaterial::from_seed(&Seed::from_bytes([51; 32]));
+        let recipient = KeyMaterial::from_seed(&Seed::from_bytes([52; 32])).node_id();
+        let guild_id = [7; 32];
+        let request = PeerRequest::EnsureFiller {
+            guild_id,
+            revision_id: Uuid::from_bytes([8; 16]),
+            ordinal: 9,
+        };
+        let first = make_peer_request(&caller, Some(recipient), request.clone()).unwrap();
+        let second = make_peer_request(&caller, Some(recipient), request).unwrap();
+        assert_eq!(first.value.request_id, second.value.request_id);
+        validate_request_envelope(&first.value, caller.node_id(), recipient).unwrap();
+        assert!(
+            validate_request_envelope(
+                &first.value,
+                caller.node_id(),
+                KeyMaterial::from_seed(&Seed::from_bytes([53; 32])).node_id(),
+            )
+            .is_err()
+        );
+        let mut stale = first.value;
+        stale.issued_at_unix_seconds = 1;
+        stale.expires_at_unix_seconds = 2;
+        assert!(validate_request_envelope(&stale, caller.node_id(), recipient).is_err());
+    }
+
+    #[tokio::test]
+    async fn directory_rejects_signed_rollback() {
+        let address = free_address();
+        let task = tokio::spawn(serve_directory(address, DirectoryState::default()));
+        wait_until_listening(address).await;
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([61; 32]));
+        let subject = KeyMaterial::from_seed(&Seed::from_bytes([62; 32])).node_id();
+        let record = |generation, hash| {
+            SignedRecord::sign(
+                DIRECTORY_RECORD_DOMAIN,
+                PublishedRecoveryRecord {
+                    format_version: 1,
+                    subject,
+                    publisher: keys.node_id(),
+                    guild_id: [4; 32],
+                    checkpoint_hash: hash,
+                    checkpoint_generation: generation,
+                    expires_at_unix_seconds: u64::MAX,
+                    sealed: SealedRecoveryRecord {
+                        format_version: 1,
+                        ephemeral_public_key: [5; 32],
+                        nonce: [6; 24],
+                        ciphertext: vec![7; 32],
+                    },
+                },
+                &keys,
+            )
+            .unwrap()
+        };
+        directory_publish(address, record(2, [2; 32]))
+            .await
+            .unwrap();
+        assert!(
+            directory_publish(address, record(1, [1; 32]))
+                .await
+                .is_err()
+        );
+        assert!(
+            directory_publish(address, record(2, [3; 32]))
+                .await
+                .is_err()
+        );
+        let records = directory_lookup(address, subject).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].value.checkpoint_generation, 2);
+        assert_eq!(records[0].value.checkpoint_hash, [2; 32]);
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn signed_network_commit_and_seed_recovery() {
+        let Some(test_root) = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") else {
+            eprintln!("skipped: MUTUALBACKUP_REFLINK_TEST_ROOT is not set");
+            return;
+        };
+        let root = PathBuf::from(test_root).join(format!("network-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("payload"), vec![0x5a; 150_000]).unwrap();
+
+        let coordinator_seed = Seed::from_bytes([100; 32]);
+        let coordinator_keys = KeyMaterial::from_seed(&coordinator_seed);
+        let directory_address = free_address();
+        let directory_task = tokio::spawn(serve_directory(
+            directory_address,
+            DirectoryState::default(),
+        ));
+        wait_until_listening(directory_address).await;
+
+        let mut peer_addresses = Vec::new();
+        let mut peer_tasks = Vec::new();
+        for index in 0_u8..5 {
+            let address = free_address();
+            let node = Node::open(
+                root.join(format!("node-{index}")),
+                Seed::from_bytes([100 + index; 32]),
+            )
+            .unwrap();
+            let task = tokio::spawn(serve_node(
+                Arc::new(Mutex::new(node)),
+                NodeServerConfig {
+                    listen: address,
+                    public_endpoint: format!("tcp://{address}"),
+                    failure_domain: format!("host-{index}"),
+                    trusted_coordinator: coordinator_keys.node_id(),
+                    max_connections: 8,
+                },
+            ));
+            wait_until_listening(address).await;
+            peer_addresses.push(address);
+            peer_tasks.push(task);
+        }
+
+        commit_source_over_network(
+            &coordinator_keys,
+            &source,
+            directory_address,
+            peer_addresses,
+        )
+        .await
+        .unwrap();
+        peer_tasks.remove(0).abort();
+        tokio::task::yield_now().await;
+        fs::remove_dir_all(root.join("node-0")).unwrap();
+        fs::remove_dir_all(&source).unwrap();
+
+        let restored = root.join("restored");
+        let recovered = recover_over_network(
+            Seed::from_bytes([100; 32]),
+            &root.join("recovered-node"),
+            &restored,
+            directory_address,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.keys().node_id(), coordinator_keys.node_id());
+        assert_eq!(
+            fs::read(restored.join("payload")).unwrap(),
+            vec![0x5a; 150_000]
+        );
+
+        for task in peer_tasks {
+            task.abort();
+        }
+        directory_task.abort();
+        drop(recovered);
+        fs::remove_dir_all(&root).unwrap();
     }
 }

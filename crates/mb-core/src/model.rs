@@ -114,8 +114,11 @@ impl GuildCheckpoint {
         if self.format_version != 1
             || self.generation == 0
             || (self.generation == 1) != self.parent.is_none()
-            || self.members.len() < 3
+            || self.members.len() != 5
             || self.revisions.is_empty()
+            || self.revisions.len() > 4096
+            || self.coding_groups.is_empty()
+            || self.coding_groups.len() > 1_000_000
         {
             return Err(ModelError::InvalidCheckpoint);
         }
@@ -306,6 +309,12 @@ impl QuorumCheckpoint {
             || locator.checkpoint_generation != self.checkpoint.generation
             || locator.checkpoint_hash != self.hash()?
             || locator.expires_at_unix_seconds != u64::MAX
+            || locator.endpoints.is_empty()
+            || locator.endpoints.len() > 8
+            || locator
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.len() > 512)
             || member.recovery_public_key != keys.recovery_public_key()
             || !self
                 .checkpoint

@@ -62,9 +62,22 @@ pub(crate) fn prepare_revision(
     guild_id: [u8; 32],
     source_root: &Path,
     sequence: u64,
+    revision_id: Option<Uuid>,
 ) -> Result<SignedRecord<UserRevision>> {
+    let revision_id = revision_id.unwrap_or_else(Uuid::new_v4);
+    if let Some(bytes) = control.get_record("user-revision", revision_id.as_bytes())? {
+        let existing: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
+        existing.verify(b"mutualbackup/user-revision/v1")?;
+        if existing.value.revision_id != revision_id
+            || existing.value.owner != keys.node_id()
+            || existing.value.guild_id != guild_id
+            || existing.value.sequence != sequence
+        {
+            bail!("persisted revision does not match the retried operation");
+        }
+        return Ok(existing);
+    }
     let anchor = ReflinkAnchor::capture(source_root).context("capture reflink source anchor")?;
-    let revision_id = Uuid::new_v4();
     let encryption_key = keys.guild_data_key(&guild_id);
     let mut data_references = Vec::new();
     let mut private_entries = Vec::new();
@@ -237,11 +250,15 @@ pub(crate) fn render_sector(
     control: &ControlStore,
     keys: &KeyMaterial,
     sector_id: &SectorId,
+    expected_guild: Option<&[u8; 32]>,
 ) -> Result<Vec<u8>> {
     let encoded = control
         .get_record("local-sector", sector_id)?
         .context("local sector recipe is unavailable")?;
     let recipe: LocalSectorRecipe = decode_canonical(&encoded)?;
+    if expected_guild.is_some_and(|guild_id| recipe.guild_id != *guild_id) {
+        bail!("local sector does not belong to the requested guild");
+    }
     let plaintext = match &recipe.source {
         LocalPlaintextSource::AnchorFile { locator, offset } => {
             let mut file = locator.open().context("open source anchor")?;

@@ -8,6 +8,7 @@ use thiserror::Error;
 use crate::SCHEMA_VERSION;
 
 const CONTROL_DATABASE_ID: &[u8] = b"control.db";
+pub type CheckpointRow = (u64, [u8; 32], Vec<u8>);
 
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -109,71 +110,88 @@ impl ControlStore {
         let transaction = self.connection.transaction()?;
         let existing = transaction
             .query_row(
-                "SELECT kind, caller, request_hash, body FROM operations
-                 WHERE operation_id = ?1 AND state = 'COMMITTED'",
+                "SELECT kind, caller, request_hash, state, body FROM operations
+                 WHERE operation_id = ?1",
                 [operation_id.as_slice()],
                 operation_row,
             )
             .optional()?;
         if let Some(existing) = existing {
-            if !existing.matches(kind, caller, request_hash, body) {
+            if !existing.matches_request(kind, caller, request_hash)
+                || (existing.state == "COMMITTED" && existing.body != body)
+            {
                 return Err(DatabaseError::Conflict);
+            }
+            if existing.state == "IN_PROGRESS" {
+                transaction.execute(
+                    "UPDATE operations SET state = 'COMMITTED', body = ?2
+                     WHERE operation_id = ?1 AND state = 'IN_PROGRESS'",
+                    params![operation_id.as_slice(), body],
+                )?;
             }
             transaction.commit()?;
             return Ok(());
         }
-        transaction.execute(
-            "INSERT INTO operations(
-                operation_id, kind, caller, request_hash, state, body
-             ) VALUES (?1, ?2, ?3, ?4, 'COMMITTED', ?5)",
-            params![
-                operation_id.as_slice(),
-                kind,
-                caller.as_slice(),
-                request_hash.as_slice(),
-                body,
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(())
+        Err(DatabaseError::Conflict)
     }
 
-    pub fn operation_result(
-        &self,
+    pub fn begin_operation(
+        &mut self,
         operation_id: &[u8; 16],
         kind: &str,
         caller: &[u8; 32],
         request_hash: &[u8; 32],
     ) -> Result<Option<Vec<u8>>, DatabaseError> {
-        let existing = self
-            .connection
+        let transaction = self.connection.transaction()?;
+        let existing = transaction
             .query_row(
-                "SELECT kind, caller, request_hash, body FROM operations
-                 WHERE operation_id = ?1 AND state = 'COMMITTED'",
+                "SELECT kind, caller, request_hash, state, body FROM operations
+                 WHERE operation_id = ?1",
                 [operation_id.as_slice()],
                 operation_row,
             )
             .optional()?;
-        match existing {
+        let result = match existing {
             Some(existing) if existing.matches_request(kind, caller, request_hash) => {
-                Ok(Some(existing.body))
+                if existing.state == "COMMITTED" {
+                    Some(existing.body)
+                } else if existing.state == "IN_PROGRESS" {
+                    None
+                } else {
+                    return Err(DatabaseError::Integrity);
+                }
             }
-            Some(_) => Err(DatabaseError::Conflict),
-            None => Ok(None),
-        }
+            Some(_) => return Err(DatabaseError::Conflict),
+            None => {
+                transaction.execute(
+                    "INSERT INTO operations(
+                        operation_id, kind, caller, request_hash, state, body
+                     ) VALUES (?1, ?2, ?3, ?4, 'IN_PROGRESS', x'')",
+                    params![
+                        operation_id.as_slice(),
+                        kind,
+                        caller.as_slice(),
+                        request_hash.as_slice(),
+                    ],
+                )?;
+                None
+            }
+        };
+        transaction.commit()?;
+        Ok(result)
     }
 
     pub fn locked_checkpoint(
         &self,
         guild_id: &[u8; 32],
-    ) -> Result<Option<(u64, [u8; 32], Vec<u8>)>, DatabaseError> {
+    ) -> Result<Option<CheckpointRow>, DatabaseError> {
         checkpoint_row(&self.connection, "checkpoint_signature_locks", guild_id)
     }
 
     pub fn checkpoint_head(
         &self,
         guild_id: &[u8; 32],
-    ) -> Result<Option<(u64, [u8; 32], Vec<u8>)>, DatabaseError> {
+    ) -> Result<Option<CheckpointRow>, DatabaseError> {
         checkpoint_row(&self.connection, "checkpoint_heads", guild_id)
     }
 
@@ -309,6 +327,7 @@ struct OperationRow {
     kind: String,
     caller: Vec<u8>,
     request_hash: Vec<u8>,
+    state: String,
     body: Vec<u8>,
 }
 
@@ -318,10 +337,6 @@ impl OperationRow {
             && self.caller.as_slice() == caller
             && self.request_hash.as_slice() == request_hash
     }
-
-    fn matches(&self, kind: &str, caller: &[u8; 32], request_hash: &[u8; 32], body: &[u8]) -> bool {
-        self.matches_request(kind, caller, request_hash) && self.body == body
-    }
 }
 
 fn operation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
@@ -329,7 +344,8 @@ fn operation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
         kind: row.get(0)?,
         caller: row.get(1)?,
         request_hash: row.get(2)?,
-        body: row.get(3)?,
+        state: row.get(3)?,
+        body: row.get(4)?,
     })
 }
 
@@ -535,7 +551,7 @@ fn initialize_or_validate_control(connection: &mut Connection) -> Result<(), Dat
             kind TEXT NOT NULL,
             caller BLOB NOT NULL CHECK(length(caller) = 32),
             request_hash BLOB NOT NULL CHECK(length(request_hash) = 32),
-            state TEXT NOT NULL CHECK(state = 'COMMITTED'),
+            state TEXT NOT NULL CHECK(state IN ('IN_PROGRESS', 'COMMITTED')),
             body BLOB NOT NULL
          ) STRICT;
          CREATE TABLE checkpoint_signature_locks (
@@ -662,7 +678,7 @@ fn checkpoint_row(
     connection: &Connection,
     table: &'static str,
     guild_id: &[u8; 32],
-) -> Result<Option<(u64, [u8; 32], Vec<u8>)>, DatabaseError> {
+) -> Result<Option<CheckpointRow>, DatabaseError> {
     let sql = format!(
         "SELECT generation, checkpoint_hash, checkpoint_bytes FROM {table} WHERE guild_id = ?1"
     );
@@ -783,6 +799,43 @@ mod tests {
         assert!(store.get_record("test", b"id").unwrap().is_some());
         let wrong = KeyMaterial::from_seed(&Seed::from_bytes([2; 32]));
         assert!(ControlStore::open(&path, &wrong).is_err());
+    }
+
+    #[test]
+    fn operation_identity_is_durable_and_bound_to_request() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([3; 32]));
+        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let operation = [1; 16];
+        let caller = [2; 32];
+        let request = [3; 32];
+        assert_eq!(
+            store
+                .begin_operation(&operation, "write", &caller, &request)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .begin_operation(&operation, "write", &caller, &request)
+                .unwrap(),
+            None
+        );
+        store
+            .put_operation_result(&operation, "write", &caller, &request, b"result")
+            .unwrap();
+        assert_eq!(
+            store
+                .begin_operation(&operation, "write", &caller, &request)
+                .unwrap()
+                .unwrap(),
+            b"result"
+        );
+        assert!(
+            store
+                .begin_operation(&operation, "other", &caller, &request)
+                .is_err()
+        );
     }
 
     #[test]

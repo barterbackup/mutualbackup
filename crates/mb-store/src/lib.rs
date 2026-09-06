@@ -11,6 +11,6 @@ pub use anchor::{
     AnchorAreaLocator, AnchorError, AnchorFileLocator, AnchorManifest, CapturedEntry,
     ReflinkAnchor, probe_reflink,
 };
-pub use database::{ControlStore, DatabaseError, ParityObject, ParityStore};
+pub use database::{CheckpointRow, ControlStore, DatabaseError, ParityObject, ParityStore};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;

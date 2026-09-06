@@ -15,6 +15,8 @@ use crate::snapshot::{
     install_inline_recipe, install_recovered_sector_recipe, prepare_revision, render_sector,
 };
 
+pub type RecoveredShards = BTreeMap<([u8; 32], u8), Vec<u8>>;
+
 pub struct Node {
     data_dir: PathBuf,
     _data_dir_lock: File,
@@ -64,6 +66,7 @@ impl Node {
         guild_id: [u8; 32],
         source_root: &Path,
         sequence: u64,
+        operation_id: Option<[u8; 16]>,
     ) -> Result<SignedRecord<UserRevision>> {
         prepare_revision(
             &mut self.control,
@@ -71,6 +74,7 @@ impl Node {
             guild_id,
             source_root,
             sequence,
+            operation_id.map(Uuid::from_bytes),
         )
     }
 
@@ -91,7 +95,11 @@ impl Node {
     }
 
     pub fn sector(&self, sector_id: &SectorId) -> Result<Vec<u8>> {
-        render_sector(&self.control, &self.keys, sector_id)
+        render_sector(&self.control, &self.keys, sector_id, None)
+    }
+
+    pub fn sector_for_guild(&self, guild_id: &[u8; 32], sector_id: &SectorId) -> Result<Vec<u8>> {
+        render_sector(&self.control, &self.keys, sector_id, Some(guild_id))
     }
 
     pub fn publish_parity(&mut self, object: &ParityObject) -> Result<()> {
@@ -101,6 +109,19 @@ impl Node {
 
     pub fn parity(&self, group_id: &[u8; 32], shard_index: u8) -> Result<Vec<u8>> {
         Ok(self.parity.load_ready(group_id, shard_index)?.bytes)
+    }
+
+    pub fn parity_for_guild(
+        &self,
+        guild_id: &[u8; 32],
+        group_id: &[u8; 32],
+        shard_index: u8,
+    ) -> Result<Vec<u8>> {
+        let object = self.parity.load_ready(group_id, shard_index)?;
+        if object.guild_id != *guild_id {
+            anyhow::bail!("parity object does not belong to the requested guild");
+        }
+        Ok(object.bytes)
     }
 
     pub fn store_checkpoint(&mut self, checkpoint: &QuorumCheckpoint) -> Result<[u8; 32]> {
@@ -274,10 +295,29 @@ impl Node {
         Ok(checkpoint)
     }
 
+    pub fn authorize_member(&self, guild_id: &[u8; 32], caller: NodeId) -> Result<()> {
+        let (_, _, bytes) = self
+            .control
+            .checkpoint_head(guild_id)?
+            .context("guild has no locally committed checkpoint")?;
+        let checkpoint: QuorumCheckpoint = decode_canonical(&bytes)?;
+        checkpoint.verify()?;
+        if checkpoint.checkpoint.guild_id != *guild_id
+            || !checkpoint
+                .checkpoint
+                .members
+                .iter()
+                .any(|member| member.node_id == caller)
+        {
+            anyhow::bail!("caller is not an authorized guild member");
+        }
+        Ok(())
+    }
+
     pub fn install_recovered_checkpoint(
         &mut self,
         checkpoint: &QuorumCheckpoint,
-        recovered_shards: &BTreeMap<([u8; 32], u8), Vec<u8>>,
+        recovered_shards: &RecoveredShards,
     ) -> Result<[u8; 32]> {
         checkpoint.verify()?;
         self.validate_local_member(&checkpoint.checkpoint)?;
@@ -340,7 +380,7 @@ impl Node {
     }
 
     pub fn cached_operation(
-        &self,
+        &mut self,
         operation_id: &[u8; 16],
         kind: &str,
         caller: NodeId,
@@ -348,7 +388,7 @@ impl Node {
     ) -> Result<Option<Vec<u8>>> {
         Ok(self
             .control
-            .operation_result(operation_id, kind, &caller.0, request_hash)?)
+            .begin_operation(operation_id, kind, &caller.0, request_hash)?)
     }
 
     pub fn commit_operation(
@@ -371,6 +411,7 @@ fn open_data_dir_lock(data_dir: &Path) -> Result<File> {
     let path = data_dir.join(".node.lock");
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&path)?;
