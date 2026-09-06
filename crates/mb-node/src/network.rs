@@ -31,13 +31,14 @@ const MAX_PEER_FRAME_BYTES: usize = 600 * 1024;
 const MAX_DIRECTORY_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DIRECTORY_RECORD_BYTES: usize = 64 * 1024;
 const MAX_DIRECTORY_SUBJECTS: usize = 100_000;
-const MAX_PUBLISHERS_PER_SUBJECT: usize = 64;
+const MAX_RECOVERY_SLOTS_PER_SUBJECT: usize = 64;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(2);
 const BODY_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const PEER_REQUEST_DOMAIN: &[u8] = b"mutualbackup/direct-request/v2";
 const PEER_RESPONSE_DOMAIN: &[u8] = b"mutualbackup/direct-response/v2";
 const DIRECTORY_RECORD_DOMAIN: &[u8] = b"mutualbackup/directory-record/v1";
+const DIRECTORY_ADMISSION_DOMAIN: &[u8] = b"mutualbackup/directory-admission/v1";
 
 #[derive(Clone, Debug)]
 pub struct NodeServerConfig {
@@ -112,6 +113,12 @@ enum PeerRequest {
         checkpoint_hash: [u8; 32],
         checkpoint_generation: u64,
         expires_at_unix_seconds: u64,
+        admission: Box<SignedRecord<RecoveryPublisherAdmission>>,
+    },
+    AuthorizeRecoveryPublisher {
+        guild_id: [u8; 32],
+        publisher: NodeId,
+        expires_at_unix_seconds: u64,
     },
     CompleteCommit {
         plan_hash: [u8; 32],
@@ -160,6 +167,7 @@ impl PeerRequest {
             Self::SignCheckpoint { .. } => Some("sign-checkpoint"),
             Self::FinalizeCheckpoint { .. } => Some("finalize-checkpoint"),
             Self::BuildRecoveryRecord { .. } => Some("build-recovery-record"),
+            Self::AuthorizeRecoveryPublisher { .. } => Some("authorize-recovery-publisher"),
             Self::CompleteCommit { .. } => Some("complete-commit"),
         }
     }
@@ -176,6 +184,7 @@ impl PeerRequest {
             | Self::FinalizeCheckpoint { guild_id, .. }
             | Self::GetCheckpointPage { guild_id, .. }
             | Self::BuildRecoveryRecord { guild_id, .. }
+            | Self::AuthorizeRecoveryPublisher { guild_id, .. }
             | Self::CompleteCommit { guild_id, .. } => Some(*guild_id),
             Self::PublishParity { object, .. } => Some(object.guild_id),
         }
@@ -213,6 +222,7 @@ enum PeerResponse {
         bytes: Vec<u8>,
     },
     RecoveryRecord(SignedRecord<PublishedRecoveryRecord>),
+    RecoveryAdmission(SignedRecord<RecoveryPublisherAdmission>),
     Ack,
 }
 
@@ -231,16 +241,25 @@ struct CachedOperation {
     response: PeerResponse,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct PublishedRecoveryRecord {
     format_version: u16,
     subject: NodeId,
     publisher: NodeId,
-    guild_id: [u8; 32],
-    checkpoint_hash: [u8; 32],
-    checkpoint_generation: u64,
+    slot: [u8; 32],
+    slot_generation: u64,
     expires_at_unix_seconds: u64,
+    admission: SignedRecord<RecoveryPublisherAdmission>,
     sealed: SealedRecoveryRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct RecoveryPublisherAdmission {
+    format_version: u16,
+    subject: NodeId,
+    publisher: NodeId,
+    slot: [u8; 32],
+    expires_at_unix_seconds: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -256,7 +275,8 @@ enum DirectoryResponse {
     Error(String),
 }
 
-type PublisherRecords = BTreeMap<NodeId, SignedRecord<PublishedRecoveryRecord>>;
+type RecoverySlotKey = ([u8; 32], NodeId);
+type PublisherRecords = BTreeMap<RecoverySlotKey, SignedRecord<PublishedRecoveryRecord>>;
 type RecoveryDirectoryRecords = BTreeMap<NodeId, PublisherRecords>;
 
 #[derive(Clone, Default)]
@@ -293,13 +313,62 @@ fn directory_records_fit(
     publishers: &PublisherRecords,
     candidate: &SignedRecord<PublishedRecoveryRecord>,
 ) -> Result<bool> {
+    let candidate_key = (candidate.value.slot, candidate.value.publisher);
     let mut records = publishers
         .iter()
-        .filter(|(publisher, _)| **publisher != candidate.value.publisher)
+        .filter(|(key, _)| **key != candidate_key)
         .map(|(_, record)| record.clone())
         .collect::<Vec<_>>();
     records.push(candidate.clone());
     Ok(canonical_bytes(&DirectoryResponse::Records(records))?.len() <= MAX_DIRECTORY_FRAME_BYTES)
+}
+
+fn recovery_slot(subject: NodeId, publisher: NodeId, guild_id: [u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key("mutualbackup recovery directory slot v1");
+    hasher.update(&subject.0);
+    hasher.update(&publisher.0);
+    hasher.update(&guild_id);
+    *hasher.finalize().as_bytes()
+}
+
+fn validate_recovery_admission(
+    admission: &SignedRecord<RecoveryPublisherAdmission>,
+    subject: NodeId,
+    publisher: NodeId,
+    slot: [u8; 32],
+    expires_at_unix_seconds: u64,
+) -> Result<()> {
+    admission.verify(DIRECTORY_ADMISSION_DOMAIN)?;
+    if admission.signer != subject
+        || admission.value.format_version != 1
+        || admission.value.subject != subject
+        || admission.value.publisher != publisher
+        || admission.value.slot != slot
+        || admission.value.expires_at_unix_seconds != expires_at_unix_seconds
+        || expires_at_unix_seconds != u64::MAX
+    {
+        bail!("invalid recovery-directory admission");
+    }
+    Ok(())
+}
+
+fn validate_published_recovery_record(
+    record: &SignedRecord<PublishedRecoveryRecord>,
+) -> Result<()> {
+    record.verify(DIRECTORY_RECORD_DOMAIN)?;
+    if record.signer != record.value.publisher
+        || record.value.format_version != 2
+        || record.value.expires_at_unix_seconds != u64::MAX
+    {
+        bail!("invalid published recovery record");
+    }
+    validate_recovery_admission(
+        &record.value.admission,
+        record.value.subject,
+        record.value.publisher,
+        record.value.slot,
+        record.value.expires_at_unix_seconds,
+    )
 }
 
 pub async fn serve_node(node: Arc<Mutex<Node>>, config: NodeServerConfig) -> Result<()> {
@@ -347,14 +416,11 @@ pub async fn serve_directory(listen: SocketAddr, state: DirectoryState) -> Resul
             {
                 Ok(DirectoryRequest::Publish(record)) => {
                     let record = *record;
-                    if record.verify(DIRECTORY_RECORD_DOMAIN).is_err()
-                        || record.signer != record.value.publisher
-                        || record.value.format_version != 1
-                        || record.value.expires_at_unix_seconds != u64::MAX
+                    if validate_published_recovery_record(&record).is_err()
                         || canonical_bytes(&record)
                             .map_or(true, |bytes| bytes.len() > MAX_DIRECTORY_RECORD_BYTES)
                     {
-                        DirectoryResponse::Error("invalid publisher signature".to_owned())
+                        DirectoryResponse::Error("invalid recovery record or admission".to_owned())
                     } else {
                         match state.records.lock() {
                             Ok(mut records) => {
@@ -367,26 +433,25 @@ pub async fn serve_directory(listen: SocketAddr, state: DirectoryState) -> Resul
                                 } else {
                                     let publishers =
                                         records.entry(record.value.subject).or_default();
-                                    if !publishers.contains_key(&record.value.publisher)
-                                        && publishers.len() >= MAX_PUBLISHERS_PER_SUBJECT
+                                    let slot_key = (record.value.slot, record.value.publisher);
+                                    if !publishers.contains_key(&slot_key)
+                                        && publishers.len() >= MAX_RECOVERY_SLOTS_PER_SUBJECT
                                     {
                                         DirectoryResponse::Error(
-                                            "recovery publisher limit reached".to_owned(),
+                                            "recovery slot limit reached".to_owned(),
                                         )
                                     } else {
-                                        let accepted = match publishers.get(&record.value.publisher)
-                                        {
+                                        let accepted = match publishers.get(&slot_key) {
                                             Some(current)
-                                                if current.value.checkpoint_generation
-                                                    > record.value.checkpoint_generation =>
+                                                if current.value.slot_generation
+                                                    > record.value.slot_generation =>
                                             {
                                                 false
                                             }
                                             Some(current)
-                                                if current.value.checkpoint_generation
-                                                    == record.value.checkpoint_generation
-                                                    && current.value.checkpoint_hash
-                                                        != record.value.checkpoint_hash =>
+                                                if current.value.slot_generation
+                                                    == record.value.slot_generation
+                                                    && current != &record =>
                                             {
                                                 false
                                             }
@@ -400,8 +465,7 @@ pub async fn serve_directory(listen: SocketAddr, state: DirectoryState) -> Resul
                                         } else {
                                             match directory_records_fit(publishers, &record) {
                                                 Ok(true) => {
-                                                    publishers
-                                                        .insert(record.value.publisher, record);
+                                                    publishers.insert(slot_key, record);
                                                     DirectoryResponse::Ack
                                                 }
                                                 Ok(false) => DirectoryResponse::Error(
@@ -750,6 +814,7 @@ fn execute_peer_request(
             checkpoint_hash,
             checkpoint_generation,
             expires_at_unix_seconds,
+            admission,
         } => {
             if expires_at_unix_seconds != u64::MAX {
                 bail!("prototype recovery records must not expire");
@@ -765,6 +830,15 @@ fn execute_peer_request(
             {
                 bail!("recovery locator does not match the stored checkpoint");
             }
+            let publisher = node.keys().node_id();
+            let slot = recovery_slot(subject.node_id, publisher, guild_id);
+            validate_recovery_admission(
+                &admission,
+                subject.node_id,
+                publisher,
+                slot,
+                expires_at_unix_seconds,
+            )?;
             let sealed = node.recovery_record(
                 &subject,
                 guild_id,
@@ -776,14 +850,36 @@ fn execute_peer_request(
             Ok(PeerResponse::RecoveryRecord(SignedRecord::sign(
                 DIRECTORY_RECORD_DOMAIN,
                 PublishedRecoveryRecord {
-                    format_version: 1,
+                    format_version: 2,
                     subject: subject.node_id,
-                    publisher: node.keys().node_id(),
-                    guild_id,
-                    checkpoint_hash,
-                    checkpoint_generation,
+                    publisher,
+                    slot,
+                    slot_generation: checkpoint_generation,
                     expires_at_unix_seconds,
+                    admission: *admission,
                     sealed,
+                },
+                node.keys(),
+            )?))
+        }
+        PeerRequest::AuthorizeRecoveryPublisher {
+            guild_id,
+            publisher,
+            expires_at_unix_seconds,
+        } => {
+            if expires_at_unix_seconds != u64::MAX {
+                bail!("prototype recovery admissions must not expire");
+            }
+            node.authorize_member(&guild_id, publisher)?;
+            let subject = node.keys().node_id();
+            Ok(PeerResponse::RecoveryAdmission(SignedRecord::sign(
+                DIRECTORY_ADMISSION_DOMAIN,
+                RecoveryPublisherAdmission {
+                    format_version: 1,
+                    subject,
+                    publisher,
+                    slot: recovery_slot(subject, publisher, guild_id),
+                    expires_at_unix_seconds,
                 },
                 node.keys(),
             )?))
@@ -1106,10 +1202,35 @@ pub async fn commit_source_over_network(
     }
 
     for subject in &checkpoint.checkpoint.members {
+        let subject_peer = peers
+            .iter()
+            .find(|peer| peer.profile.member.node_id == subject.node_id)
+            .context("checkpoint subject has no connected peer")?;
         for peer in &peers {
             if peer.profile.member.node_id == subject.node_id {
                 continue;
             }
+            let admission_response = peer_call_expected(
+                subject_peer.endpoint,
+                subject.node_id,
+                coordinator_keys,
+                PeerRequest::AuthorizeRecoveryPublisher {
+                    guild_id,
+                    publisher: peer.profile.member.node_id,
+                    expires_at_unix_seconds: u64::MAX,
+                },
+            )
+            .await?;
+            let PeerResponse::RecoveryAdmission(admission) = admission_response else {
+                bail!("peer returned the wrong recovery-admission response");
+            };
+            validate_recovery_admission(
+                &admission,
+                subject.node_id,
+                peer.profile.member.node_id,
+                recovery_slot(subject.node_id, peer.profile.member.node_id, guild_id),
+                u64::MAX,
+            )?;
             let response = peer_call_expected(
                 peer.endpoint,
                 peer.profile.member.node_id,
@@ -1120,6 +1241,7 @@ pub async fn commit_source_over_network(
                     checkpoint_hash,
                     checkpoint_generation: checkpoint.checkpoint.generation,
                     expires_at_unix_seconds: u64::MAX,
+                    admission: Box::new(admission),
                 },
             )
             .await?;
@@ -1164,11 +1286,8 @@ pub async fn recover_over_network(
     let sealed_records = directory_lookup(directory, local_node_id).await?;
     let mut candidates = Vec::new();
     for published in sealed_records {
-        if published.verify(DIRECTORY_RECORD_DOMAIN).is_err()
-            || published.signer != published.value.publisher
+        if validate_published_recovery_record(&published).is_err()
             || published.value.subject != local_node_id
-            || published.value.format_version != 1
-            || published.value.expires_at_unix_seconds != u64::MAX
         {
             continue;
         }
@@ -1186,9 +1305,12 @@ pub async fn recover_over_network(
             || signed.value.format_version != 1
             || signed.value.expires_at_unix_seconds != u64::MAX
             || signed.value.publisher != published.value.publisher
-            || signed.value.guild_id != published.value.guild_id
-            || signed.value.checkpoint_hash != published.value.checkpoint_hash
-            || signed.value.checkpoint_generation != published.value.checkpoint_generation
+            || recovery_slot(
+                local_node_id,
+                published.value.publisher,
+                signed.value.guild_id,
+            ) != published.value.slot
+            || signed.value.checkpoint_generation != published.value.slot_generation
             || signed.value.expires_at_unix_seconds != published.value.expires_at_unix_seconds
         {
             continue;
@@ -1807,65 +1929,148 @@ mod tests {
         let address = free_address();
         let task = tokio::spawn(serve_directory(address, DirectoryState::default()));
         wait_until_listening(address).await;
-        let keys = KeyMaterial::from_seed(&Seed::from_bytes([61; 32]));
-        let subject = KeyMaterial::from_seed(&Seed::from_bytes([62; 32])).node_id();
-        let record = |generation, hash| {
+        let publisher_keys = KeyMaterial::from_seed(&Seed::from_bytes([61; 32]));
+        let subject_keys = KeyMaterial::from_seed(&Seed::from_bytes([62; 32]));
+        let subject = subject_keys.node_id();
+        let guild_id = [4; 32];
+        let slot = recovery_slot(subject, publisher_keys.node_id(), guild_id);
+        let admission = SignedRecord::sign(
+            DIRECTORY_ADMISSION_DOMAIN,
+            RecoveryPublisherAdmission {
+                format_version: 1,
+                subject,
+                publisher: publisher_keys.node_id(),
+                slot,
+                expires_at_unix_seconds: u64::MAX,
+            },
+            &subject_keys,
+        )
+        .unwrap();
+        let record = |generation, payload| {
             SignedRecord::sign(
                 DIRECTORY_RECORD_DOMAIN,
                 PublishedRecoveryRecord {
-                    format_version: 1,
+                    format_version: 2,
                     subject,
-                    publisher: keys.node_id(),
-                    guild_id: [4; 32],
-                    checkpoint_hash: hash,
-                    checkpoint_generation: generation,
+                    publisher: publisher_keys.node_id(),
+                    slot,
+                    slot_generation: generation,
                     expires_at_unix_seconds: u64::MAX,
+                    admission: admission.clone(),
                     sealed: SealedRecoveryRecord {
                         format_version: 1,
                         ephemeral_public_key: [5; 32],
                         nonce: [6; 24],
-                        ciphertext: vec![7; 32],
+                        ciphertext: vec![payload; 32],
                     },
                 },
-                &keys,
+                &publisher_keys,
             )
             .unwrap()
         };
-        directory_publish(address, record(2, [2; 32]))
-            .await
-            .unwrap();
-        assert!(
-            directory_publish(address, record(1, [1; 32]))
-                .await
-                .is_err()
-        );
-        assert!(
-            directory_publish(address, record(2, [3; 32]))
-                .await
-                .is_err()
-        );
+        directory_publish(address, record(2, 2)).await.unwrap();
+        assert!(directory_publish(address, record(1, 1)).await.is_err());
+        assert!(directory_publish(address, record(2, 3)).await.is_err());
         let records = directory_lookup(address, subject).await.unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].value.checkpoint_generation, 2);
-        assert_eq!(records[0].value.checkpoint_hash, [2; 32]);
+        assert_eq!(records[0].value.slot_generation, 2);
+        assert_eq!(records[0].value.sealed.ciphertext, vec![2; 32]);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn directory_requires_subject_admission_and_separates_guild_slots() {
+        let address = free_address();
+        let task = tokio::spawn(serve_directory(address, DirectoryState::default()));
+        wait_until_listening(address).await;
+        let publisher_keys = KeyMaterial::from_seed(&Seed::from_bytes([70; 32]));
+        let subject_keys = KeyMaterial::from_seed(&Seed::from_bytes([71; 32]));
+        let attacker_keys = KeyMaterial::from_seed(&Seed::from_bytes([72; 32]));
+        let make_record = |guild_id: [u8; 32], admission_keys: &KeyMaterial| {
+            let subject = subject_keys.node_id();
+            let publisher = publisher_keys.node_id();
+            let slot = recovery_slot(subject, publisher, guild_id);
+            let admission = SignedRecord::sign(
+                DIRECTORY_ADMISSION_DOMAIN,
+                RecoveryPublisherAdmission {
+                    format_version: 1,
+                    subject,
+                    publisher,
+                    slot,
+                    expires_at_unix_seconds: u64::MAX,
+                },
+                admission_keys,
+            )
+            .unwrap();
+            SignedRecord::sign(
+                DIRECTORY_RECORD_DOMAIN,
+                PublishedRecoveryRecord {
+                    format_version: 2,
+                    subject,
+                    publisher,
+                    slot,
+                    slot_generation: 1,
+                    expires_at_unix_seconds: u64::MAX,
+                    admission,
+                    sealed: SealedRecoveryRecord {
+                        format_version: 1,
+                        ephemeral_public_key: [73; 32],
+                        nonce: [74; 24],
+                        ciphertext: vec![75; 32],
+                    },
+                },
+                &publisher_keys,
+            )
+            .unwrap()
+        };
+        assert!(
+            directory_publish(address, make_record([1; 32], &attacker_keys))
+                .await
+                .is_err()
+        );
+        directory_publish(address, make_record([1; 32], &subject_keys))
+            .await
+            .unwrap();
+        directory_publish(address, make_record([2; 32], &subject_keys))
+            .await
+            .unwrap();
+        let records = directory_lookup(address, subject_keys.node_id())
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_ne!(records[0].value.slot, records[1].value.slot);
         task.abort();
     }
 
     #[test]
     fn directory_admission_keeps_every_lookup_frame_encodable() {
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([63; 32]));
-        let subject = NodeId([64; 32]);
+        let subject_keys = KeyMaterial::from_seed(&Seed::from_bytes([64; 32]));
+        let subject = subject_keys.node_id();
         let make_record = |ciphertext_len| {
-            SignedRecord::sign(
-                DIRECTORY_RECORD_DOMAIN,
-                PublishedRecoveryRecord {
+            let slot = recovery_slot(subject, keys.node_id(), [65; 32]);
+            let admission = SignedRecord::sign(
+                DIRECTORY_ADMISSION_DOMAIN,
+                RecoveryPublisherAdmission {
                     format_version: 1,
                     subject,
                     publisher: keys.node_id(),
-                    guild_id: [65; 32],
-                    checkpoint_hash: [66; 32],
-                    checkpoint_generation: 1,
+                    slot,
                     expires_at_unix_seconds: u64::MAX,
+                },
+                &subject_keys,
+            )
+            .unwrap();
+            SignedRecord::sign(
+                DIRECTORY_RECORD_DOMAIN,
+                PublishedRecoveryRecord {
+                    format_version: 2,
+                    subject,
+                    publisher: keys.node_id(),
+                    slot,
+                    slot_generation: 1,
+                    expires_at_unix_seconds: u64::MAX,
+                    admission,
                     sealed: SealedRecoveryRecord {
                         format_version: 1,
                         ephemeral_public_key: [67; 32],
@@ -1894,12 +2099,14 @@ mod tests {
             let mut record = base.clone();
             record.signer = NodeId([value; 32]);
             record.value.publisher = record.signer;
+            record.value.slot = [value; 32];
             assert!(directory_records_fit(&publishers, &record).unwrap());
-            publishers.insert(record.signer, record);
+            publishers.insert((record.value.slot, record.signer), record);
         }
         let mut last = base;
         last.signer = NodeId([255; 32]);
         last.value.publisher = last.signer;
+        last.value.slot = [255; 32];
         assert!(!directory_records_fit(&publishers, &last).unwrap());
         assert!(
             canonical_bytes(&DirectoryResponse::Records(
