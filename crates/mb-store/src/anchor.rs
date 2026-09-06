@@ -90,6 +90,29 @@ pub struct AnchorFileLocator {
     pub relative_path: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StableAnchorAreaLocator {
+    pub area_id: Uuid,
+    pub path_hint: PathBuf,
+    pub volume_device: u64,
+    pub volume_root_hint: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StableAnchorFileLocator {
+    pub area: StableAnchorAreaLocator,
+    pub anchor_id: Uuid,
+    pub relative_path: String,
+}
+
+impl StableAnchorFileLocator {
+    pub fn open(&self) -> Result<File, AnchorError> {
+        validate_relative(Path::new(&self.relative_path))?;
+        let area = resolve_anchor_area(&self.area)?;
+        open_anchor_beneath(&area, self.anchor_id, Path::new(&self.relative_path))
+    }
+}
+
 impl AnchorFileLocator {
     pub fn open(&self) -> Result<File, AnchorError> {
         validate_relative(Path::new(&self.relative_path))?;
@@ -112,6 +135,44 @@ pub struct AnchorManifest {
     pub root_modified_secs: i64,
     pub root_modified_nanos: u32,
     pub entries: Vec<CapturedEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StableAnchorManifest {
+    pub format_version: u16,
+    pub anchor_id: Uuid,
+    pub source_root_hint: PathBuf,
+    pub area: StableAnchorAreaLocator,
+    pub root_mode: u32,
+    pub root_modified_secs: i64,
+    pub root_modified_nanos: u32,
+    pub entries: Vec<CapturedEntry>,
+}
+
+impl StableAnchorManifest {
+    pub fn file_locator(
+        &self,
+        relative_path: String,
+    ) -> Result<StableAnchorFileLocator, AnchorError> {
+        validate_relative(Path::new(&relative_path))?;
+        Ok(StableAnchorFileLocator {
+            area: self.area.clone(),
+            anchor_id: self.anchor_id,
+            relative_path,
+        })
+    }
+
+    pub fn remove(&self) -> Result<(), AnchorError> {
+        let area = resolve_anchor_area(&self.area)?;
+        let anchor_root = area.join(self.anchor_id.to_string());
+        let metadata = fs::symlink_metadata(&anchor_root)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(AnchorError::AnchorAreaCollision(anchor_root));
+        }
+        fs::remove_dir_all(anchor_root)?;
+        sync_directory(&area)?;
+        Ok(())
+    }
 }
 
 impl AnchorManifest {
@@ -140,7 +201,7 @@ impl AnchorManifest {
 pub struct ReflinkAnchor;
 
 impl ReflinkAnchor {
-    pub fn capture(source_root: impl AsRef<Path>) -> Result<AnchorManifest, AnchorError> {
+    pub fn capture(source_root: impl AsRef<Path>) -> Result<StableAnchorManifest, AnchorError> {
         let source_root = source_root
             .as_ref()
             .canonicalize()
@@ -179,7 +240,7 @@ impl ReflinkAnchor {
             return Err(error.into());
         }
         let (root_modified_secs, root_modified_nanos) = modified_parts(&root_metadata);
-        Ok(AnchorManifest {
+        Ok(StableAnchorManifest {
             format_version: 2,
             anchor_id,
             source_root_hint: source_root,
@@ -347,10 +408,11 @@ fn capture_entries(
 fn ensure_anchor_area(
     source_root: &Path,
     root_metadata: &fs::Metadata,
-) -> Result<AnchorAreaLocator, AnchorError> {
+) -> Result<StableAnchorAreaLocator, AnchorError> {
     let parent = source_root
         .parent()
         .ok_or(AnchorError::NoExternalAnchorLocation)?;
+    let (volume_device, volume_root_hint) = volume_root(source_root, root_metadata)?;
     let area_path = parent.join(format!(
         "{AREA_PREFIX}-{}",
         source_identity_name(root_metadata)
@@ -370,23 +432,130 @@ fn ensure_anchor_area(
             seal_anchor_file(&marker_path)?;
             sync_directory(&area_path)?;
             sync_directory(parent)?;
-            Ok(AnchorAreaLocator {
+            Ok(StableAnchorAreaLocator {
                 area_id,
                 path_hint: area_path,
+                volume_device,
+                volume_root_hint,
             })
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let area_id = read_area_marker(&area_path)
                 .map_err(|_| AnchorError::AnchorAreaCollision(area_path.clone()))?;
-            let locator = AnchorAreaLocator {
+            let locator = StableAnchorAreaLocator {
                 area_id,
                 path_hint: area_path,
+                volume_device,
+                volume_root_hint,
             };
-            validate_anchor_area(&locator)?;
+            validate_stable_anchor_area(&locator.path_hint, locator.area_id)?;
             Ok(locator)
         }
         Err(error) => Err(error.into()),
     }
+}
+
+#[cfg(unix)]
+fn volume_root(
+    source_root: &Path,
+    root_metadata: &fs::Metadata,
+) -> Result<(u64, PathBuf), AnchorError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let device = root_metadata.dev();
+    let mut current = source_root.to_path_buf();
+    while let Some(parent) = current.parent() {
+        let metadata = fs::symlink_metadata(parent)?;
+        if metadata.dev() != device {
+            break;
+        }
+        current = parent.to_path_buf();
+    }
+    Ok((device, current))
+}
+
+#[cfg(not(unix))]
+fn volume_root(
+    _source_root: &Path,
+    _root_metadata: &fs::Metadata,
+) -> Result<(u64, PathBuf), AnchorError> {
+    Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "stable volume discovery is currently implemented only on Unix",
+    )))
+}
+
+fn validate_stable_anchor_area(path: &Path, expected_id: Uuid) -> Result<(), AnchorError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| AnchorError::AnchorAreaCollision(path.to_path_buf()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(AnchorError::AnchorAreaCollision(path.to_path_buf()));
+    }
+    let actual =
+        read_area_marker(path).map_err(|_| AnchorError::AnchorAreaCollision(path.to_path_buf()))?;
+    if actual != expected_id {
+        return Err(AnchorError::AnchorAreaCollision(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn resolve_anchor_area(area: &StableAnchorAreaLocator) -> Result<PathBuf, AnchorError> {
+    if validate_stable_anchor_area(&area.path_hint, area.area_id).is_ok() {
+        return Ok(area.path_hint.clone());
+    }
+    validate_volume_root(area)?;
+    let mut resolved = None;
+    let walker = WalkDir::new(&area.volume_root_hint)
+        .follow_links(false)
+        .same_file_system(true)
+        .into_iter();
+    for result in walker {
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(error)
+                if error
+                    .io_error()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !entry.file_type().is_dir()
+            || !entry.file_name().to_string_lossy().starts_with(AREA_PREFIX)
+            || read_area_marker(entry.path()).ok() != Some(area.area_id)
+        {
+            continue;
+        }
+        if resolved.replace(entry.path().to_path_buf()).is_some() {
+            return Err(AnchorError::AnchorAreaCollision(entry.path().to_path_buf()));
+        }
+    }
+    resolved.ok_or_else(|| AnchorError::AnchorAreaCollision(area.path_hint.clone()))
+}
+
+#[cfg(unix)]
+fn validate_volume_root(area: &StableAnchorAreaLocator) -> Result<(), AnchorError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(&area.volume_root_hint)
+        .map_err(|_| AnchorError::AnchorAreaCollision(area.volume_root_hint.clone()))?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.dev() != area.volume_device
+    {
+        return Err(AnchorError::AnchorAreaCollision(
+            area.volume_root_hint.clone(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_volume_root(area: &StableAnchorAreaLocator) -> Result<(), AnchorError> {
+    Err(AnchorError::AnchorAreaCollision(
+        area.volume_root_hint.clone(),
+    ))
 }
 
 fn validate_anchor_area(area: &AnchorAreaLocator) -> Result<(), AnchorError> {
@@ -808,5 +977,33 @@ mod tests {
         assert!(validate_relative(Path::new("good/file")).is_ok());
         assert!(validate_relative(Path::new("../escape")).is_err());
         assert!(validate_relative(Path::new("/absolute")).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned reflink test filesystem"]
+    fn stable_locator_survives_parent_rename() {
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT");
+        let root = PathBuf::from(test_root).join(format!("anchor-move-{}", Uuid::new_v4()));
+        let original_parent = root.join("original");
+        let moved_parent = root.join("moved");
+        let source = original_parent.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("payload"), b"stable anchor").unwrap();
+
+        let manifest = ReflinkAnchor::capture(&source).unwrap();
+        let locator = manifest.file_locator("payload".to_owned()).unwrap();
+        fs::rename(&original_parent, &moved_parent).unwrap();
+        sync_directory(&root).unwrap();
+
+        let mut payload = String::new();
+        locator
+            .open()
+            .unwrap()
+            .read_to_string(&mut payload)
+            .unwrap();
+        assert_eq!(payload, "stable anchor");
+        manifest.remove().unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -11,6 +11,7 @@ use mb_core::{
 };
 use mb_store::{
     AnchorFileLocator, CapturedEntry, ControlStore, FileExtent, NativeFileId, ReflinkAnchor,
+    StableAnchorFileLocator,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -72,10 +73,14 @@ enum LocalPlaintextSource {
         offset: u64,
     },
     Inline(Vec<u8>),
+    StableAnchorFile {
+        locator: StableAnchorFileLocator,
+        offset: u64,
+    },
 }
 
 struct PendingAnchor {
-    manifest: mb_store::AnchorManifest,
+    manifest: mb_store::StableAnchorManifest,
     committed: bool,
 }
 
@@ -186,7 +191,7 @@ pub(crate) fn prepare_revision(
                         LocalSectorRecipe {
                             guild_id,
                             reference,
-                            source: LocalPlaintextSource::AnchorFile {
+                            source: LocalPlaintextSource::StableAnchorFile {
                                 locator: locator.clone(),
                                 offset,
                             },
@@ -324,7 +329,7 @@ fn prepare_sparse_file(
     guild_id: [u8; 32],
     revision_id: Uuid,
     ordinal: &mut u64,
-    locator: &AnchorFileLocator,
+    locator: &StableAnchorFileLocator,
     logical_len: u64,
     extents: &[FileExtent],
 ) -> Result<Vec<PrivateDataExtent>> {
@@ -358,7 +363,7 @@ fn prepare_sparse_file(
                 LocalSectorRecipe {
                     guild_id,
                     reference,
-                    source: LocalPlaintextSource::AnchorFile {
+                    source: LocalPlaintextSource::StableAnchorFile {
                         locator: locator.clone(),
                         offset,
                     },
@@ -464,6 +469,13 @@ pub(crate) fn render_sector(
     let plaintext = match &recipe.source {
         LocalPlaintextSource::AnchorFile { locator, offset } => {
             let mut file = locator.open().context("open source anchor")?;
+            file.seek(SeekFrom::Start(*offset))?;
+            let mut plaintext = vec![0_u8; recipe.reference.logical_len as usize];
+            file.read_exact(&mut plaintext)?;
+            plaintext
+        }
+        LocalPlaintextSource::StableAnchorFile { locator, offset } => {
+            let mut file = locator.open().context("open stable source anchor")?;
             file.seek(SeekFrom::Start(*offset))?;
             let mut plaintext = vec![0_u8; recipe.reference.logical_len as usize];
             file.read_exact(&mut plaintext)?;
