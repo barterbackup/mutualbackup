@@ -16,9 +16,12 @@ pub use network::{
     P2pClient, P2pConfig, P2pEventLoop, P2pPeerProfile, P2pStatus, build_p2p,
     commit_source_over_network, commit_source_over_network_with_intent, recover_guild_over_network,
     recover_member_and_republish_over_network, recover_member_over_network, recover_over_network,
-    serve_directory, serve_node,
+    run_coordinator_jobs, serve_directory, serve_node,
 };
-pub use node::{GuildPeer, GuildPhase, GuildSummary, Node, RecoveredShards};
+pub use node::{
+    BackupDescriptor, BackupJob, BackupJobState, GuildPeer, GuildPhase, GuildSummary, Node,
+    RecoveredShards,
+};
 pub use snapshot::{
     PrivateDataExtent, PrivateEntry, PrivateMetadata, restore_revision,
     restore_revision_from_source,

@@ -9,10 +9,11 @@ use futures::{StreamExt, stream::FuturesUnordered};
 use mb_core::{
     CodingGroup, GuildCheckpoint, GuildGenesis, GuildInvite, InformationRole, KeyMaterial, Member,
     MemberSignature, NodeId, ParityRole, QuorumCheckpoint, QuorumGuildGenesis, RecoveryLocator,
-    SealedRecoveryRecord, SectorId, SectorRef, Seed, ShardRole, SignedRecord, UserRevision,
-    V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS,
-    V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, canonical_bytes, decode_canonical,
-    encode_3_2, open_recovery_record, reconstruct_3_2, sector_root,
+    SealedRecoveryRecord, SectorId, SectorRef, Seed, ShardRole, SignedRecord,
+    StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES,
+    V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS,
+    V1_SECTOR_SIZE, canonical_bytes, decode_canonical, encode_3_2, open_recovery_record,
+    reconstruct_3_2, sector_root,
 };
 use mb_store::ParityObject;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -22,13 +23,14 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::{
-    GuildPeer, Node,
+    BackupDescriptor, BackupJob, GuildPeer, Node,
     node::{NodeReader, NodeReaderConfig},
 };
 
 mod p2p;
 pub use p2p::{
     DhtRecord, P2pClient, P2pConfig, P2pEventLoop, P2pPeerProfile, P2pStatus, build_p2p,
+    run_coordinator_jobs,
 };
 
 const MAX_PEER_FRAME_BYTES: usize = 600 * 1024;
@@ -78,6 +80,13 @@ enum PeerRequest {
         certificate: Box<QuorumGuildGenesis>,
         peers: Vec<GuildPeer>,
     },
+    SubmitBackup {
+        descriptor: BackupDescriptor,
+    },
+    BackupStatus {
+        guild_id: [u8; 32],
+        revision_id: Uuid,
+    },
     BeginCommit {
         intent_id: [u8; 16],
         plan_hash: [u8; 32],
@@ -102,6 +111,7 @@ enum PeerRequest {
         sector_id: SectorId,
     },
     PublishParity {
+        operation_id: [u8; 16],
         group: Box<CodingGroup>,
         information: [Vec<u8>; 3],
         object: ParityObject,
@@ -156,7 +166,7 @@ enum PeerRequest {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-enum CheckpointObjectKind {
+pub(crate) enum CheckpointObjectKind {
     Body,
     Certificate,
 }
@@ -179,6 +189,7 @@ impl PeerRequest {
                 | Self::GetParity { .. }
                 | Self::GetPreparedRevisionPage { .. }
                 | Self::GetCheckpointPage { .. }
+                | Self::BackupStatus { .. }
         )
     }
 
@@ -188,11 +199,13 @@ impl PeerRequest {
             | Self::GetSector { .. }
             | Self::GetParity { .. }
             | Self::GetPreparedRevisionPage { .. }
-            | Self::GetCheckpointPage { .. } => None,
+            | Self::GetCheckpointPage { .. }
+            | Self::BackupStatus { .. } => None,
             Self::BeginCommit { .. } => Some("begin-commit"),
             Self::JoinGuild { .. } => Some("join-guild"),
             Self::ProposeGuildGenesis { .. } => Some("propose-guild-genesis"),
             Self::InstallGuildGenesis { .. } => Some("install-guild-genesis"),
+            Self::SubmitBackup { .. } => Some("submit-backup"),
             Self::PrepareSource { .. } => Some("prepare-source"),
             Self::EnsureFiller { .. } => Some("ensure-filler"),
             Self::PublishParity { .. } => Some("publish-parity"),
@@ -211,6 +224,7 @@ impl PeerRequest {
             Self::JoinGuild { invite, .. } => Some(invite.value.guild_id),
             Self::ProposeGuildGenesis { genesis } => Some(genesis.guild_id),
             Self::InstallGuildGenesis { certificate, .. } => Some(certificate.genesis.guild_id),
+            Self::SubmitBackup { descriptor } => Some(descriptor.guild_id),
             Self::PrepareSource { guild_id, .. }
             | Self::GetPreparedRevisionPage { guild_id, .. }
             | Self::EnsureFiller { guild_id, .. }
@@ -222,7 +236,8 @@ impl PeerRequest {
             | Self::GetCheckpointPage { guild_id, .. }
             | Self::BuildRecoveryRecord { guild_id, .. }
             | Self::AuthorizeRecoveryPublisher { guild_id, .. }
-            | Self::CompleteCommit { guild_id, .. } => Some(*guild_id),
+            | Self::CompleteCommit { guild_id, .. }
+            | Self::BackupStatus { guild_id, .. } => Some(*guild_id),
             Self::PublishParity { object, .. } => Some(object.guild_id),
         }
     }
@@ -263,6 +278,8 @@ enum PeerResponse {
     Bytes(Vec<u8>),
     CheckpointSignature(MemberSignature),
     GuildGenesisSignature(MemberSignature),
+    BackupJob(BackupJob),
+    StorageAcknowledgement(SignedRecord<StorageAcknowledgement>),
     CheckpointPage {
         total_pages: u32,
         page_hash: [u8; 32],
@@ -511,6 +528,18 @@ fn recovery_slot(subject: NodeId, publisher: NodeId, guild_id: [u8; 32]) -> [u8;
     hasher.update(&publisher.0);
     hasher.update(&guild_id);
     *hasher.finalize().as_bytes()
+}
+
+pub(super) fn storage_operation_id(group_id: &[u8; 32], shard_index: u8) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new_derive_key("mutualbackup parity operation v1");
+    hasher.update(group_id);
+    hasher.update(&[shard_index]);
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    if id == [0; 16] {
+        id[0] = 1;
+    }
+    id
 }
 
 fn validate_recovery_admission(
@@ -781,10 +810,22 @@ fn process_peer_request(
             }
             _ => false,
         };
+        let certified_coordinator = request
+            .guild_scope()
+            .map(|guild_id| node_guard.guild_coordinator(&guild_id))
+            .transpose()?
+            .flatten()
+            == Some(caller);
+        let member_submission = matches!(&request, PeerRequest::SubmitBackup { .. })
+            && request
+                .guild_scope()
+                .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
         if mutation_kind.is_some()
             && caller != config.trusted_coordinator
+            && !certified_coordinator
             && !self_authorized_admission
             && !guild_onboarding
+            && !member_submission
         {
             bail!("caller is not the configured guild coordinator");
         }
@@ -802,7 +843,7 @@ fn process_peer_request(
                 // Filler bytes are deterministic and installation is
                 // idempotent. Recompute them instead of retaining a 64 KiB
                 // response for every coding group in the operation journal.
-                return execute_peer_request(&mut node_guard, config, request_id, request);
+                return execute_peer_request(&mut node_guard, config, request_id, caller, request);
             }
             if let Some(cached_bytes) =
                 node_guard.cached_operation(&request_id, kind, caller, &operation_hash)?
@@ -813,7 +854,8 @@ fn process_peer_request(
                 }
                 return Ok(cached.response);
             }
-            let response = execute_peer_request(&mut node_guard, config, request_id, request)?;
+            let response =
+                execute_peer_request(&mut node_guard, config, request_id, caller, request)?;
             let cached = CachedOperation {
                 request_hash: operation_hash,
                 response: response.clone(),
@@ -944,6 +986,12 @@ fn execute_read_request(
                 bytes,
             })
         }
+        PeerRequest::BackupStatus {
+            guild_id,
+            revision_id,
+        } => Ok(PeerResponse::BackupJob(
+            node.backup_job(guild_id, revision_id)?,
+        )),
         _ => bail!("mutation was sent to a read-only node worker"),
     }
 }
@@ -952,6 +1000,7 @@ fn execute_peer_request(
     node: &mut Node,
     config: &NodeServerConfig,
     request_id: [u8; 16],
+    caller: NodeId,
     request: PeerRequest,
 ) -> Result<PeerResponse> {
     match request {
@@ -960,7 +1009,7 @@ fn execute_peer_request(
             endpoint: config.public_endpoint.clone(),
         })),
         PeerRequest::JoinGuild { invite, peer } => {
-            node.accept_guild_join(peer.member.node_id, &invite, peer)?;
+            node.accept_guild_join(caller, &invite, peer)?;
             Ok(PeerResponse::Ack)
         }
         PeerRequest::ProposeGuildGenesis { genesis } => Ok(PeerResponse::GuildGenesisSignature(
@@ -970,6 +1019,9 @@ fn execute_peer_request(
             node.install_guild_genesis(*certificate, peers)?;
             Ok(PeerResponse::Ack)
         }
+        PeerRequest::SubmitBackup { descriptor } => Ok(PeerResponse::BackupJob(
+            node.enqueue_backup(caller, descriptor)?,
+        )),
         PeerRequest::BeginCommit {
             intent_id,
             plan_hash,
@@ -1006,13 +1058,18 @@ fn execute_peer_request(
             node.sector_for_guild(&guild_id, &sector_id)?,
         )),
         PeerRequest::PublishParity {
+            operation_id,
             group,
             information,
             object,
-        } => {
-            node.publish_verified_parity(&group, &information, &object)?;
-            Ok(PeerResponse::Ack)
-        }
+        } => Ok(PeerResponse::StorageAcknowledgement(
+            node.publish_verified_parity_with_operation(
+                &operation_id,
+                &group,
+                &information,
+                &object,
+            )?,
+        )),
         PeerRequest::GetParity {
             guild_id,
             group_id,
@@ -1070,6 +1127,9 @@ fn execute_peer_request(
         }
         PeerRequest::GetPreparedRevisionPage { .. } => {
             bail!("revision-page read was sent to a mutation worker")
+        }
+        PeerRequest::BackupStatus { .. } => {
+            bail!("backup status read was sent to a mutation worker")
         }
         PeerRequest::BuildRecoveryRecord {
             publication_id: _,
@@ -1407,31 +1467,37 @@ pub async fn commit_source_over_network_with_intent(
             bytes: shards[4].clone(),
         };
         let information = [shards[0].clone(), shards[1].clone(), shards[2].clone()];
-        expect_ack(
+        expect_storage_ack(
             peer_call_expected(
                 peers[3].endpoint,
                 peers[3].profile.member.node_id,
                 coordinator_keys,
                 PeerRequest::PublishParity {
+                    operation_id: storage_operation_id(&group.id, parity_a.shard_index),
                     group: Box::new(group.clone()),
                     information: information.clone(),
                     object: parity_a.clone(),
                 },
             )
             .await?,
+            peers[3].profile.member.node_id,
+            &parity_a,
         )?;
-        expect_ack(
+        expect_storage_ack(
             peer_call_expected(
                 peers[4].endpoint,
                 peers[4].profile.member.node_id,
                 coordinator_keys,
                 PeerRequest::PublishParity {
+                    operation_id: storage_operation_id(&group.id, parity_b.shard_index),
                     group: Box::new(group.clone()),
                     information,
                     object: parity_b.clone(),
                 },
             )
             .await?,
+            peers[4].profile.member.node_id,
+            &parity_b,
         )?;
         groups.push(group);
     }
@@ -1446,6 +1512,7 @@ pub async fn commit_source_over_network_with_intent(
     let checkpoint_body = GuildCheckpoint {
         format_version: 1,
         guild_id,
+        genesis_hash: *blake3::hash(&canonical_bytes(&checkpoint_members)?).as_bytes(),
         generation: 1,
         parent: None,
         members: checkpoint_members,
@@ -2300,6 +2367,26 @@ fn expect_ack(response: PeerResponse) -> Result<()> {
     } else {
         bail!("peer returned the wrong acknowledgement response")
     }
+}
+
+fn expect_storage_ack(response: PeerResponse, holder: NodeId, object: &ParityObject) -> Result<()> {
+    let PeerResponse::StorageAcknowledgement(acknowledgement) = response else {
+        bail!("peer returned the wrong storage acknowledgement response");
+    };
+    acknowledgement.verify(b"mutualbackup/storage-acknowledgement/v1")?;
+    acknowledgement.value.validate()?;
+    if acknowledgement.signer != holder
+        || acknowledgement.value.holder != holder
+        || acknowledgement.value.operation_id
+            != storage_operation_id(&object.group_id, object.shard_index)
+        || acknowledgement.value.guild_id != object.guild_id
+        || acknowledgement.value.group_id != object.group_id
+        || acknowledgement.value.shard_index != object.shard_index
+        || acknowledgement.value.root != object.root
+    {
+        bail!("peer storage acknowledgement does not match the parity object");
+    }
+    Ok(())
 }
 
 async fn directory_publish(

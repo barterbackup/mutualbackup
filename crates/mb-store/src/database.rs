@@ -28,6 +28,8 @@ pub enum DatabaseError {
     Integrity,
     #[error("object is not ready")]
     NotReady,
+    #[error("parity storage budget is exhausted")]
+    CapacityExceeded,
     #[error("immutable database state conflicts with the requested write")]
     Conflict,
     #[error("database kind or schema version is incompatible")]
@@ -761,10 +763,20 @@ impl ParityStore {
     }
 
     pub fn stage_and_publish(&mut self, object: &ParityObject) -> Result<(), DatabaseError> {
+        self.stage_and_publish_ack(object, &[], u64::MAX)
+    }
+
+    pub fn stage_and_publish_ack(
+        &mut self,
+        object: &ParityObject,
+        acknowledgement: &[u8],
+        budget_bytes: u64,
+    ) -> Result<(), DatabaseError> {
         if object.format_version != 1
             || object.bytes.len() != V1_SECTOR_SIZE
             || !(3..=4).contains(&object.shard_index)
             || sector_root(&object.bytes) != object.root
+            || acknowledgement.len() > 4096
         {
             return Err(DatabaseError::Integrity);
         }
@@ -772,7 +784,7 @@ impl ParityStore {
         let transaction = self.connection.transaction()?;
         let existing = transaction
             .query_row(
-                "SELECT format_version, guild_id, root, byte_length, state, bytes
+                "SELECT format_version, guild_id, root, byte_length, state, bytes, acknowledgement
                  FROM parity_objects WHERE group_id = ?1 AND shard_index = ?2",
                 params![object.group_id.as_slice(), object.shard_index],
                 |row| {
@@ -783,16 +795,20 @@ impl ParityStore {
                         row.get::<_, i64>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
                     ))
                 },
             )
             .optional()?;
-        if let Some((format_version, guild_id, root, byte_length, state, bytes)) = existing {
+        if let Some((format_version, guild_id, root, byte_length, state, bytes, stored_ack)) =
+            existing
+        {
             if format_version != i64::from(object.format_version)
                 || guild_id.as_slice() != object.guild_id
                 || root.as_slice() != object.root
                 || byte_length != object.bytes.len() as i64
                 || bytes != object.bytes
+                || stored_ack != acknowledgement
             {
                 return Err(DatabaseError::Conflict);
             }
@@ -809,11 +825,24 @@ impl ParityStore {
             return Ok(());
         }
 
+        let used: i64 = transaction.query_row(
+            "SELECT coalesce(sum(byte_length), 0) FROM parity_objects",
+            [],
+            |row| row.get(0),
+        )?;
+        let required = u64::try_from(used)
+            .map_err(|_| DatabaseError::Integrity)?
+            .checked_add(object.bytes.len() as u64)
+            .ok_or(DatabaseError::CapacityExceeded)?;
+        if required > budget_bytes {
+            return Err(DatabaseError::CapacityExceeded);
+        }
+
         transaction.execute(
             "INSERT INTO parity_objects(
                 format_version, guild_id, group_id, shard_index, root,
-                byte_length, state, bytes
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'STAGED', ?7)",
+                byte_length, state, bytes, acknowledgement
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'STAGED', ?7, ?8)",
             params![
                 object.format_version,
                 object.guild_id.as_slice(),
@@ -822,6 +851,7 @@ impl ParityStore {
                 object.root.as_slice(),
                 object.bytes.len() as i64,
                 object.bytes.as_slice(),
+                acknowledgement,
             ],
         )?;
         let stored: (Vec<u8>, i64, Vec<u8>) = transaction.query_row(
@@ -843,6 +873,27 @@ impl ParityStore {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn load_acknowledgement(
+        &self,
+        group_id: &[u8; 32],
+        shard_index: u8,
+    ) -> Result<Vec<u8>, DatabaseError> {
+        let bytes = self
+            .connection
+            .query_row(
+                "SELECT acknowledgement FROM parity_objects
+                 WHERE group_id = ?1 AND shard_index = ?2 AND state = 'READY'",
+                params![group_id.as_slice(), shard_index],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .ok_or(DatabaseError::NotReady)?;
+        if bytes.is_empty() || bytes.len() > 4096 {
+            return Err(DatabaseError::Integrity);
+        }
+        Ok(bytes)
     }
 
     pub fn load_ready(
@@ -990,6 +1041,7 @@ fn initialize_or_validate_parity(
             byte_length INTEGER NOT NULL CHECK(byte_length = 65536),
             state TEXT NOT NULL CHECK(state IN ('STAGED', 'READY')),
             bytes BLOB NOT NULL,
+            acknowledgement BLOB NOT NULL DEFAULT x'',
             PRIMARY KEY(group_id, shard_index)
          ) STRICT;",
     )?;
@@ -1017,7 +1069,7 @@ fn migrate_control(connection: &mut Connection) -> Result<(), DatabaseError> {
     if version == SCHEMA_VERSION {
         return validate_control_schema(connection, version);
     }
-    if !matches!(version, 1..=3) {
+    if !matches!(version, 1..=3 | 5) {
         return Err(DatabaseError::IncompatibleSchema);
     }
     if version >= 2 && meta_value(connection, "database_kind")?.as_deref() != Some(b"control") {
@@ -1106,14 +1158,24 @@ fn migrate_parity(connection: &mut Connection, volume_id: &[u8; 16]) -> Result<(
     if version == SCHEMA_VERSION {
         return validate_parity_schema(connection);
     }
-    if !matches!(version, 2..=3)
+    if !matches!(version, 2..=3 | 5)
         || meta_value(connection, "database_kind")?.as_deref() != Some(b"parity")
         || meta_value(connection, "volume_id")?.as_deref() != Some(volume_id.as_slice())
     {
         return Err(DatabaseError::IncompatibleSchema);
     }
-    validate_parity_schema(connection)?;
+    require_exact_tables(
+        connection,
+        &[
+            ("meta", META_SCHEMA),
+            ("parity_objects", PARITY_OBJECTS_BEFORE_V6_SCHEMA),
+        ],
+    )?;
     let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "ALTER TABLE parity_objects
+         ADD COLUMN acknowledgement BLOB NOT NULL DEFAULT x'';",
+    )?;
     transaction.execute(
         "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
         [SCHEMA_VERSION.to_be_bytes().as_slice()],
@@ -1211,6 +1273,19 @@ const PARITY_OBJECTS_SCHEMA: &str = "CREATE TABLE parity_objects (
     byte_length INTEGER NOT NULL CHECK(byte_length = 65536),
     state TEXT NOT NULL CHECK(state IN ('STAGED', 'READY')),
     bytes BLOB NOT NULL,
+    acknowledgement BLOB NOT NULL DEFAULT x'',
+    PRIMARY KEY(group_id, shard_index)
+) STRICT";
+
+const PARITY_OBJECTS_BEFORE_V6_SCHEMA: &str = "CREATE TABLE parity_objects (
+    format_version INTEGER NOT NULL CHECK(format_version = 1),
+    guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
+    group_id BLOB NOT NULL CHECK(length(group_id) = 32),
+    shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 3 AND 4),
+    root BLOB NOT NULL CHECK(length(root) = 32),
+    byte_length INTEGER NOT NULL CHECK(byte_length = 65536),
+    state TEXT NOT NULL CHECK(state IN ('STAGED', 'READY')),
+    bytes BLOB NOT NULL,
     PRIMARY KEY(group_id, shard_index)
 ) STRICT";
 
@@ -1235,7 +1310,7 @@ fn validate_control_schema(connection: &Connection, version: u32) -> Result<(), 
             ("checkpoint_signature_locks", CHECKPOINT_LOCKS_SCHEMA),
             ("checkpoint_heads", CHECKPOINT_HEADS_SCHEMA),
         ],
-        SCHEMA_VERSION => vec![
+        5 | SCHEMA_VERSION => vec![
             ("meta", META_SCHEMA),
             ("protocol_records", PROTOCOL_RECORDS_SCHEMA),
             ("operations", OPERATIONS_SCHEMA),
@@ -1951,7 +2026,9 @@ mod tests {
         {
             let connection = open_encrypted(&path, &keys.database_key(&database_id)).unwrap();
             connection.execute_batch(META_SCHEMA).unwrap();
-            connection.execute_batch(PARITY_OBJECTS_SCHEMA).unwrap();
+            connection
+                .execute_batch(PARITY_OBJECTS_BEFORE_V6_SCHEMA)
+                .unwrap();
             connection
                 .execute(
                     "INSERT INTO meta(key, value) VALUES ('database_kind', ?1)",
@@ -2016,6 +2093,43 @@ mod tests {
         replacement.root = sector_root(&replacement.bytes);
         assert!(matches!(
             store.stage_and_publish(&replacement),
+            Err(DatabaseError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn parity_budget_and_acknowledgement_commit_atomically() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([31; 32]));
+        let mut store = ParityStore::open(temp.path().join("parity.db"), &[32; 16], &keys).unwrap();
+        let bytes = vec![33; V1_SECTOR_SIZE];
+        let object = ParityObject {
+            format_version: 1,
+            guild_id: [34; 32],
+            group_id: [35; 32],
+            shard_index: 3,
+            root: sector_root(&bytes),
+            bytes,
+        };
+        assert!(matches!(
+            store.stage_and_publish_ack(&object, b"signed-ack", V1_SECTOR_SIZE as u64 - 1),
+            Err(DatabaseError::CapacityExceeded)
+        ));
+        assert!(matches!(
+            store.load_ready(&object.group_id, object.shard_index),
+            Err(DatabaseError::NotReady)
+        ));
+        store
+            .stage_and_publish_ack(&object, b"signed-ack", V1_SECTOR_SIZE as u64)
+            .unwrap();
+        assert_eq!(
+            store
+                .load_acknowledgement(&object.group_id, object.shard_index)
+                .unwrap(),
+            b"signed-ack"
+        );
+        assert!(matches!(
+            store.stage_and_publish_ack(&object, b"other-ack", V1_SECTOR_SIZE as u64),
             Err(DatabaseError::Conflict)
         ));
     }

@@ -8,8 +8,9 @@ use anyhow::{Context, Result};
 use mb_core::{
     GuildCheckpoint, GuildGenesis, GuildInvite, KeyMaterial, Member, MemberSignature, NodeId,
     QuorumCheckpoint, QuorumGuildGenesis, RecoveryLocator, SectorId, SectorRef, Seed, ShardRole,
-    SignedRecord, UserRevision, canonical_bytes, decode_canonical, seal_recovery_record,
-    sector_root, synthetic_filler_sector,
+    SignedRecord, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
+    V1_MAX_CATALOG_PAGES, canonical_bytes, decode_canonical, seal_recovery_record, sector_root,
+    synthetic_filler_sector,
 };
 use mb_store::{ControlStore, ParityObject, ParityStore, probe_reflink};
 use rand::RngCore;
@@ -78,6 +79,33 @@ pub struct GuildSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BackupDescriptor {
+    pub format_version: u16,
+    pub guild_id: [u8; 32],
+    pub owner: NodeId,
+    pub revision_id: Uuid,
+    pub total_pages: u32,
+    pub object_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum BackupJobState {
+    Pending,
+    Running,
+    Committed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BackupJob {
+    pub format_version: u16,
+    pub descriptor: BackupDescriptor,
+    pub state: BackupJobState,
+    pub checkpoint_hash: Option<[u8; 32]>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct GuildDraft {
     format_version: u16,
     guild_id: [u8; 32],
@@ -117,6 +145,7 @@ pub struct Node {
     keys: Arc<KeyMaterial>,
     control: ControlStore,
     parity: ParityStore,
+    parity_budget_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -154,6 +183,10 @@ impl NodeReader {
 
     pub(crate) fn authorize_member(&self, guild_id: &[u8; 32], caller: NodeId) -> Result<()> {
         authorize_member(&self.control, guild_id, caller)
+    }
+
+    pub(crate) fn backup_job(&self, guild_id: [u8; 32], revision_id: Uuid) -> Result<BackupJob> {
+        backup_job(&self.control, guild_id, revision_id)
     }
 
     pub(crate) fn sector_for_guild(
@@ -231,6 +264,7 @@ impl Node {
             keys,
             control,
             parity,
+            parity_budget_bytes: u64::MAX,
         })
     }
 
@@ -346,6 +380,14 @@ impl Node {
         }
         self.control
             .put_record("node-config", b"member", &canonical_bytes(&expected)?)?;
+        Ok(())
+    }
+
+    pub fn configure_parity_budget(&mut self, budget_bytes: u64) -> Result<()> {
+        if budget_bytes == 0 {
+            anyhow::bail!("parity storage budget must be greater than zero");
+        }
+        self.parity_budget_bytes = budget_bytes;
         Ok(())
     }
 
@@ -672,6 +714,230 @@ impl Node {
         Ok(self.installed_guild()?.map(|guild| guild.certificate))
     }
 
+    pub fn guild_coordinator(&self, guild_id: &[u8; 32]) -> Result<Option<NodeId>> {
+        guild_coordinator(&self.control, guild_id)
+    }
+
+    pub fn prepare_protected_backup(&mut self) -> Result<BackupDescriptor> {
+        let installed = self
+            .installed_guild()?
+            .context("this node has no active guild")?;
+        let guild_id = installed.certificate.genesis.guild_id;
+        let root = self
+            .protected_root()?
+            .context("this node has no protected root")?;
+        let local_head = self
+            .control
+            .get_record("user-revision-head", &guild_id)?
+            .map(|bytes| decode_canonical::<SignedRecord<UserRevision>>(&bytes))
+            .transpose()?;
+        let committed_sequence = self
+            .control
+            .checkpoint_head(&guild_id)?
+            .map(|(_, _, bytes)| decode_canonical::<QuorumCheckpoint>(&bytes))
+            .transpose()?
+            .and_then(|checkpoint| {
+                checkpoint
+                    .checkpoint
+                    .revisions
+                    .into_iter()
+                    .filter(|revision| revision.value.owner == self.keys.node_id())
+                    .map(|revision| revision.value.sequence)
+                    .max()
+            })
+            .unwrap_or(0);
+        let sequence = match &local_head {
+            Some(revision)
+                if revision.value.sequence.checked_sub(1) == Some(committed_sequence) =>
+            {
+                revision.value.sequence
+            }
+            Some(revision) if revision.value.sequence == committed_sequence => committed_sequence
+                .checked_add(1)
+                .context("revision sequence exhausted")?,
+            None if committed_sequence == 0 => 1,
+            _ => anyhow::bail!("local revision head is inconsistent with the guild checkpoint"),
+        };
+        let revision_id = local_head
+            .filter(|revision| revision.value.sequence == sequence)
+            .map(|revision| revision.value.revision_id)
+            .unwrap_or_else(|| deterministic_revision_id(guild_id, self.keys.node_id(), sequence));
+        let revision = self.prepare_revision(
+            guild_id,
+            &root.path,
+            sequence,
+            Some(*revision_id.as_bytes()),
+        )?;
+        let bytes = canonical_bytes(&revision)?;
+        let total_pages = bytes.len().div_ceil(V1_CATALOG_PAGE_BYTES);
+        if total_pages == 0 || total_pages > V1_MAX_CATALOG_PAGES as usize {
+            anyhow::bail!("prepared revision exceeds the catalog paging limit");
+        }
+        Ok(BackupDescriptor {
+            format_version: 1,
+            guild_id,
+            owner: self.keys.node_id(),
+            revision_id,
+            total_pages: total_pages as u32,
+            object_hash: *blake3::hash(&bytes).as_bytes(),
+        })
+    }
+
+    pub fn enqueue_backup(
+        &mut self,
+        caller: NodeId,
+        descriptor: BackupDescriptor,
+    ) -> Result<BackupJob> {
+        validate_backup_descriptor(&descriptor)?;
+        let installed = self
+            .installed_guild()?
+            .context("this node has no active guild")?;
+        if installed.certificate.genesis.coordinator != self.keys.node_id()
+            || installed.certificate.genesis.guild_id != descriptor.guild_id
+            || descriptor.owner != caller
+            || !installed
+                .certificate
+                .genesis
+                .members
+                .iter()
+                .any(|member| member.node_id == caller)
+        {
+            anyhow::bail!("backup submission is not authorized for this coordinator");
+        }
+        if let Some(bytes) = self
+            .control
+            .get_record("backup-job", descriptor.revision_id.as_bytes())?
+        {
+            let mut existing: BackupJob = decode_canonical(&bytes)?;
+            if existing.descriptor != descriptor {
+                anyhow::bail!("backup job identity conflicts with a prior submission");
+            }
+            if existing.state == BackupJobState::Failed {
+                existing.state = BackupJobState::Pending;
+                existing.error = None;
+                self.put_backup_job(&existing)?;
+            }
+            return Ok(existing);
+        }
+        let job = BackupJob {
+            format_version: 1,
+            descriptor,
+            state: BackupJobState::Pending,
+            checkpoint_hash: None,
+            error: None,
+        };
+        self.put_backup_job(&job)?;
+        Ok(job)
+    }
+
+    pub fn backup_job(&self, guild_id: [u8; 32], revision_id: Uuid) -> Result<BackupJob> {
+        backup_job(&self.control, guild_id, revision_id)
+    }
+
+    pub fn claim_backup_job(&mut self) -> Result<Option<BackupJob>> {
+        let Some(installed) = self.installed_guild()? else {
+            return Ok(None);
+        };
+        if installed.certificate.genesis.coordinator != self.keys.node_id() {
+            return Ok(None);
+        }
+        for (_, bytes) in self.control.records("backup-job")? {
+            let mut job: BackupJob = decode_canonical(&bytes)?;
+            if matches!(job.state, BackupJobState::Pending | BackupJobState::Running) {
+                job.state = BackupJobState::Running;
+                job.error = None;
+                self.put_backup_job(&job)?;
+                return Ok(Some(job));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn complete_backup_job(
+        &mut self,
+        descriptor: &BackupDescriptor,
+        checkpoint_hash: [u8; 32],
+    ) -> Result<()> {
+        let mut job = self.backup_job(descriptor.guild_id, descriptor.revision_id)?;
+        if job.descriptor != *descriptor {
+            anyhow::bail!("backup completion conflicts with the durable job");
+        }
+        job.state = BackupJobState::Committed;
+        job.checkpoint_hash = Some(checkpoint_hash);
+        job.error = None;
+        self.put_backup_job(&job)
+    }
+
+    pub fn fail_backup_job(&mut self, descriptor: &BackupDescriptor, error: &str) -> Result<()> {
+        let mut job = self.backup_job(descriptor.guild_id, descriptor.revision_id)?;
+        if job.descriptor != *descriptor {
+            anyhow::bail!("backup failure conflicts with the durable job");
+        }
+        let mut error = error.to_owned();
+        error.truncate(4096);
+        job.state = BackupJobState::Failed;
+        job.error = Some(error);
+        self.put_backup_job(&job)
+    }
+
+    pub fn retry_failed_backup_job(&mut self, descriptor: &BackupDescriptor) -> Result<BackupJob> {
+        let mut job = self.backup_job(descriptor.guild_id, descriptor.revision_id)?;
+        if job.descriptor != *descriptor {
+            anyhow::bail!("backup retry conflicts with the durable job");
+        }
+        if job.state == BackupJobState::Failed {
+            job.state = BackupJobState::Pending;
+            job.error = None;
+            self.put_backup_job(&job)?;
+        }
+        Ok(job)
+    }
+
+    pub fn current_checkpoint(&self, guild_id: [u8; 32]) -> Result<Option<QuorumCheckpoint>> {
+        self.control
+            .checkpoint_head(&guild_id)?
+            .map(|(_, _, bytes)| decode_canonical(&bytes).map_err(Into::into))
+            .transpose()
+    }
+
+    pub(crate) fn prepared_revision_bytes(
+        &self,
+        guild_id: [u8; 32],
+        revision_id: Uuid,
+    ) -> Result<Vec<u8>> {
+        let bytes = self
+            .control
+            .get_record("user-revision", revision_id.as_bytes())?
+            .context("prepared revision is unavailable")?;
+        let revision: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
+        revision.verify(b"mutualbackup/user-revision/v1")?;
+        if revision.value.guild_id != guild_id || revision.value.revision_id != revision_id {
+            anyhow::bail!("prepared revision has the wrong guild or revision identity");
+        }
+        Ok(bytes)
+    }
+
+    pub fn defer_backup_job(&mut self, descriptor: &BackupDescriptor, error: &str) -> Result<()> {
+        let mut job = self.backup_job(descriptor.guild_id, descriptor.revision_id)?;
+        if job.descriptor != *descriptor {
+            anyhow::bail!("backup retry conflicts with the durable job");
+        }
+        let mut error = error.to_owned();
+        error.truncate(4096);
+        job.state = BackupJobState::Pending;
+        job.error = Some(error);
+        self.put_backup_job(&job)
+    }
+
+    fn put_backup_job(&self, job: &BackupJob) -> Result<()> {
+        self.control.put_record(
+            "backup-job",
+            job.descriptor.revision_id.as_bytes(),
+            &canonical_bytes(job)?,
+        )?;
+        Ok(())
+    }
+
     fn configured_member(&self) -> Result<Member> {
         decode_canonical(
             &self
@@ -834,10 +1100,51 @@ impl Node {
         group: &mb_core::CodingGroup,
         information: &[Vec<u8>; 3],
         object: &ParityObject,
-    ) -> Result<()> {
+    ) -> Result<SignedRecord<StorageAcknowledgement>> {
+        self.publish_verified_parity_with_operation(
+            &parity_operation_id(&group.id, object.shard_index),
+            group,
+            information,
+            object,
+        )
+    }
+
+    pub fn publish_verified_parity_with_operation(
+        &mut self,
+        operation_id: &[u8; 16],
+        group: &mb_core::CodingGroup,
+        information: &[Vec<u8>; 3],
+        object: &ParityObject,
+    ) -> Result<SignedRecord<StorageAcknowledgement>> {
         self.validate_parity_assignment(group, object)?;
         group.verify_parity_shard(information, object.shard_index as usize, &object.bytes)?;
-        self.publish_validated_parity(group, object)
+        let acknowledgement = StorageAcknowledgement {
+            format_version: 1,
+            operation_id: *operation_id,
+            guild_id: object.guild_id,
+            group_id: object.group_id,
+            shard_index: object.shard_index,
+            row: u16::from(object.shard_index - 3),
+            root: object.root,
+            holder: self.keys.node_id(),
+        };
+        acknowledgement.validate()?;
+        let acknowledgement = SignedRecord::sign(
+            b"mutualbackup/storage-acknowledgement/v1",
+            acknowledgement,
+            &self.keys,
+        )?;
+        self.parity.stage_and_publish_ack(
+            object,
+            &canonical_bytes(&acknowledgement)?,
+            self.parity_budget_bytes,
+        )?;
+        self.control.put_record(
+            "local-parity-proof",
+            &parity_proof_id(&group.id, object.shard_index),
+            &canonical_bytes(group)?,
+        )?;
+        Ok(acknowledgement)
     }
 
     fn publish_validated_parity(
@@ -1018,6 +1325,14 @@ impl Node {
     }
 
     fn validate_local_member(&self, checkpoint: &GuildCheckpoint) -> Result<()> {
+        if let Some(installed) = self.installed_guild()? {
+            if checkpoint.guild_id != installed.certificate.genesis.guild_id
+                || checkpoint.genesis_hash != installed.certificate.hash()?
+                || checkpoint.members != installed.certificate.genesis.members
+            {
+                anyhow::bail!("checkpoint is not bound to the installed guild genesis");
+            }
+        }
         let member = checkpoint
             .members
             .iter()
@@ -1531,6 +1846,30 @@ fn authorize_member(control: &ControlStore, guild_id: &[u8; 32], caller: NodeId)
     Ok(())
 }
 
+fn guild_coordinator(control: &ControlStore, guild_id: &[u8; 32]) -> Result<Option<NodeId>> {
+    let Some(bytes) = control.get_record("guild-installed", b"primary")? else {
+        return Ok(None);
+    };
+    let installed: InstalledGuild = decode_canonical(&bytes)?;
+    installed.certificate.verify()?;
+    if installed.certificate.genesis.guild_id != *guild_id {
+        anyhow::bail!("requested guild differs from installed guild");
+    }
+    Ok(Some(installed.certificate.genesis.coordinator))
+}
+
+fn backup_job(control: &ControlStore, guild_id: [u8; 32], revision_id: Uuid) -> Result<BackupJob> {
+    let job: BackupJob = decode_canonical(
+        &control
+            .get_record("backup-job", revision_id.as_bytes())?
+            .context("backup job is unavailable")?,
+    )?;
+    if job.format_version != 1 || job.descriptor.guild_id != guild_id {
+        anyhow::bail!("backup job belongs to another guild");
+    }
+    Ok(job)
+}
+
 fn summary_from_draft(draft: &GuildDraft) -> GuildSummary {
     GuildSummary {
         format_version: 1,
@@ -1570,6 +1909,28 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
+fn deterministic_revision_id(guild_id: [u8; 32], owner: NodeId, sequence: u64) -> Uuid {
+    let mut hasher = blake3::Hasher::new_derive_key("mutualbackup revision operation v1");
+    hasher.update(&guild_id);
+    hasher.update(&owner.0);
+    hasher.update(&sequence.to_le_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+fn validate_backup_descriptor(descriptor: &BackupDescriptor) -> Result<()> {
+    if descriptor.format_version != 1
+        || descriptor.guild_id == [0; 32]
+        || descriptor.total_pages == 0
+        || descriptor.total_pages > V1_MAX_CATALOG_PAGES
+        || descriptor.object_hash == [0; 32]
+    {
+        anyhow::bail!("invalid backup descriptor");
+    }
+    Ok(())
+}
+
 fn checkpoint_page(
     control: &ControlStore,
     guild_id: &[u8; 32],
@@ -1589,6 +1950,18 @@ fn parity_proof_id(group_id: &[u8; 32], shard_index: u8) -> [u8; 33] {
     let mut id = [0_u8; 33];
     id[..32].copy_from_slice(group_id);
     id[32] = shard_index;
+    id
+}
+
+fn parity_operation_id(group_id: &[u8; 32], shard_index: u8) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new_derive_key("mutualbackup parity operation v1");
+    hasher.update(group_id);
+    hasher.update(&[shard_index]);
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    if id == [0; 16] {
+        id[0] = 1;
+    }
     id
 }
 

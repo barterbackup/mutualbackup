@@ -45,6 +45,34 @@ pub struct GuildInvite {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StorageAcknowledgement {
+    pub format_version: u16,
+    pub operation_id: [u8; 16],
+    pub guild_id: [u8; 32],
+    pub group_id: CodingGroupId,
+    pub shard_index: u8,
+    pub row: u16,
+    pub root: [u8; 32],
+    pub holder: NodeId,
+}
+
+impl StorageAcknowledgement {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.format_version != 1
+            || self.operation_id == [0; 16]
+            || self.guild_id == [0; 32]
+            || self.group_id == [0; 32]
+            || !(3..=4).contains(&self.shard_index)
+            || self.row != u16::from(self.shard_index - 3)
+            || self.root == [0; 32]
+        {
+            return Err(ModelError::InvalidStorageAcknowledgement);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SectorRef {
     pub id: SectorId,
     pub root: [u8; 32],
@@ -160,6 +188,7 @@ pub fn coding_group_id(
 pub struct GuildCheckpoint {
     pub format_version: u16,
     pub guild_id: [u8; 32],
+    pub genesis_hash: [u8; 32],
     pub generation: u64,
     pub parent: Option<[u8; 32]>,
     pub members: Vec<Member>,
@@ -182,6 +211,7 @@ pub struct QuorumCheckpoint {
 impl GuildCheckpoint {
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.format_version != 1
+            || self.genesis_hash == [0; 32]
             || self.generation == 0
             || self.generation > i64::MAX as u64
             || (self.generation == 1) != self.parent.is_none()
@@ -596,6 +626,8 @@ pub enum ModelError {
     InvalidGenesis,
     #[error("invalid guild invite")]
     InvalidInvite,
+    #[error("invalid parity storage acknowledgement")]
+    InvalidStorageAcknowledgement,
     #[error("weak Ed25519 public key is not accepted")]
     WeakPublicKey,
     #[error("checkpoint is not authorized by the recovering seed")]
@@ -883,6 +915,7 @@ mod tests {
             checkpoint: GuildCheckpoint {
                 format_version: 1,
                 guild_id,
+                genesis_hash: [10; 32],
                 generation: 1,
                 parent: None,
                 members,

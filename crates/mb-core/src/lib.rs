@@ -19,8 +19,8 @@ pub use keys::{KeyIdentityError, KeyMaterial, NodeId, RecoveryPublicKey, Seed, S
 pub use model::{
     CodingGroup, CodingGroupId, GuildCheckpoint, GuildGenesis, GuildInvite, InformationRole,
     Member, MemberSignature, ModelError, ParityRole, QuorumCheckpoint, QuorumGuildGenesis,
-    SectorId, SectorRef, ShardRole, SignedRecord, UserRevision, canonical_bytes, coding_group_id,
-    decode_canonical,
+    SectorId, SectorRef, ShardRole, SignedRecord, StorageAcknowledgement, UserRevision,
+    canonical_bytes, coding_group_id, decode_canonical,
 };
 pub use recovery::{
     RecoveryCryptoError, RecoveryLocator, SealedRecoveryRecord, open_recovery_record,

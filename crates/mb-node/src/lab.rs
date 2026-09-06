@@ -253,6 +253,7 @@ impl PrototypeGuild {
             checkpoint: GuildCheckpoint {
                 format_version: 1,
                 guild_id: self.guild_id,
+                genesis_hash: *blake3::hash(&canonical_bytes(&self.members)?).as_bytes(),
                 generation: 1,
                 parent: None,
                 members: checkpoint_members,

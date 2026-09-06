@@ -74,6 +74,14 @@ enum Command {
         #[command(subcommand)]
         command: GuildCommand,
     },
+    /// Capture the registered root and submit a durable guild backup job.
+    Backup {
+        /// Wait until the checkpoint is committed.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Inspect a durable backup job by revision ID.
+    BackupStatus { revision_id: Uuid },
     /// Run a real five-node, SQLCipher-backed, seed-only recovery demonstration.
     DemoSeedRecovery {
         /// Existing directory on a reflink-capable filesystem. The command
@@ -290,6 +298,28 @@ async fn main() -> Result<()> {
                 _ => bail!("daemon returned the wrong response to guild request"),
             }
         }
+        Command::Backup { wait } => {
+            let response = local_control_call(
+                required_socket(&cli.socket)?,
+                &LocalRequest::Backup { wait },
+            )
+            .await?;
+            let LocalResponse::BackupJob(job) = response else {
+                bail!("daemon returned the wrong response to backup request");
+            };
+            print_backup_job(&job);
+        }
+        Command::BackupStatus { revision_id } => {
+            let response = local_control_call(
+                required_socket(&cli.socket)?,
+                &LocalRequest::BackupStatus { revision_id },
+            )
+            .await?;
+            let LocalResponse::BackupJob(job) = response else {
+                bail!("daemon returned the wrong response to backup-status request");
+            };
+            print_backup_job(&job);
+        }
         Command::DemoSeedRecovery { work_dir } => demo_seed_recovery(work_dir)?,
         Command::ServeDirectory { listen } => {
             println!("recovery directory listening on {listen}");
@@ -486,6 +516,17 @@ fn print_identity(seed: &Seed, expose_seed: bool) {
         "recovery key:   {}",
         hex::encode(keys.recovery_public_key().0)
     );
+}
+
+fn print_backup_job(job: &mb_node::BackupJob) {
+    println!("revision:   {}", job.descriptor.revision_id);
+    println!("state:      {:?}", job.state);
+    if let Some(hash) = job.checkpoint_hash {
+        println!("checkpoint: {}", hex::encode(hash));
+    }
+    if let Some(error) = &job.error {
+        println!("last error: {error}");
+    }
 }
 
 #[cfg(test)]

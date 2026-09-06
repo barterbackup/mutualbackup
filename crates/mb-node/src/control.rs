@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
 
-use crate::{GuildSummary, Node, P2pClient};
+use crate::{BackupJob, BackupJobState, GuildSummary, Node, P2pClient};
 
 const MAX_LOCAL_FRAME_BYTES: usize = 1024 * 1024;
 
@@ -45,6 +45,8 @@ pub enum LocalRequest {
     GuildInvite,
     GuildJoin { token: String },
     GuildFinalize,
+    Backup { wait: bool },
+    BackupStatus { revision_id: Uuid },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,6 +58,7 @@ pub enum LocalResponse {
         token: String,
         expires_at_unix_seconds: u64,
     },
+    BackupJob(BackupJob),
     Error(String),
 }
 
@@ -264,6 +267,93 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::Backup { wait } => {
+            let (descriptor, guild, local_id) = blocking_node(node.clone(), |node| {
+                let descriptor = node.prepare_protected_backup()?;
+                let guild = node
+                    .guild_summary()?
+                    .context("this node has no active guild")?;
+                Ok((descriptor, guild, node.keys().node_id()))
+            })
+            .await?;
+            let coordinator = guild
+                .peers
+                .iter()
+                .find(|peer| peer.member.node_id == guild.coordinator)
+                .context("guild endpoint roster omits the coordinator")?;
+            let mut job = if guild.coordinator == local_id {
+                let descriptor = descriptor.clone();
+                blocking_node(node.clone(), move |node| {
+                    node.enqueue_backup(local_id, descriptor)
+                })
+                .await?
+            } else {
+                add_peer_endpoints(&p2p, guild.coordinator, &coordinator.endpoints).await?;
+                p2p.submit_backup(guild.coordinator, descriptor.clone())
+                    .await?
+            };
+            while wait
+                && !matches!(
+                    job.state,
+                    BackupJobState::Committed | BackupJobState::Failed
+                )
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                job = query_backup_job(
+                    node.clone(),
+                    &p2p,
+                    local_id,
+                    guild.coordinator,
+                    descriptor.guild_id,
+                    descriptor.revision_id,
+                )
+                .await?;
+            }
+            Ok(LocalResponse::BackupJob(job))
+        }
+        LocalRequest::BackupStatus { revision_id } => {
+            let (guild, local_id) = blocking_node(node.clone(), |node| {
+                Ok((
+                    node.guild_summary()?
+                        .context("this node has no active guild")?,
+                    node.keys().node_id(),
+                ))
+            })
+            .await?;
+            let coordinator = guild
+                .peers
+                .iter()
+                .find(|peer| peer.member.node_id == guild.coordinator)
+                .context("guild endpoint roster omits the coordinator")?;
+            if guild.coordinator != local_id {
+                add_peer_endpoints(&p2p, guild.coordinator, &coordinator.endpoints).await?;
+            }
+            let job = query_backup_job(
+                node,
+                &p2p,
+                local_id,
+                guild.coordinator,
+                guild.guild_id,
+                revision_id,
+            )
+            .await?;
+            Ok(LocalResponse::BackupJob(job))
+        }
+    }
+}
+
+async fn query_backup_job(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    local_id: NodeId,
+    coordinator: NodeId,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+) -> Result<BackupJob> {
+    if coordinator == local_id {
+        blocking_node(node, move |node| node.backup_job(guild_id, revision_id)).await
+    } else {
+        p2p.backup_status(coordinator, guild_id, revision_id).await
     }
 }
 

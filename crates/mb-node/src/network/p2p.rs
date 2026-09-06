@@ -15,14 +15,20 @@ use libp2p::{
 use tokio::sync::{mpsc, oneshot};
 
 use mb_core::{
-    GuildGenesis, GuildInvite, Member, MemberSignature, NodeId, QuorumGuildGenesis, SignedRecord,
-    canonical_bytes,
+    CodingGroup, GuildCheckpoint, GuildGenesis, GuildInvite, InformationRole, Member,
+    MemberSignature, NodeId, ParityRole, QuorumCheckpoint, QuorumGuildGenesis, SectorId, SectorRef,
+    ShardRole, SignedRecord, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
+    V1_MAX_CATALOG_BYTES, V1_MAX_CODING_GROUPS, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS,
+    V1_SECTOR_SIZE, canonical_bytes, decode_canonical, encode_3_2, sector_root,
 };
+use mb_store::ParityObject;
+use uuid::Uuid;
 
 use super::{
-    GuildPeer, Node, NodeServerConfig, NodeService, PEER_RESPONSE_DOMAIN, PeerRequest,
-    PeerRequestEnvelope, PeerResponse, PeerResponseEnvelope, make_peer_request,
-    process_peer_request,
+    BackupDescriptor, BackupJob, CheckpointObjectKind, GuildPeer, Node, NodeServerConfig,
+    NodeService, PEER_RESPONSE_DOMAIN, PeerRequest, PeerRequestEnvelope, PeerResponse,
+    PeerResponseEnvelope, checked_catalog_page_count, make_peer_request, process_peer_request,
+    storage_operation_id,
 };
 
 const P2P_PROTOCOL: StreamProtocol = StreamProtocol::new("/mutualbackup/peer/1");
@@ -372,6 +378,217 @@ impl P2pClient {
             .await?;
         if !matches!(response, PeerResponse::Ack) {
             bail!("peer returned the wrong response to guild genesis installation");
+        }
+        Ok(())
+    }
+
+    pub async fn submit_backup(
+        &self,
+        coordinator: NodeId,
+        descriptor: BackupDescriptor,
+    ) -> Result<BackupJob> {
+        let response = self
+            .call(coordinator, PeerRequest::SubmitBackup { descriptor })
+            .await?;
+        let PeerResponse::BackupJob(job) = response else {
+            bail!("peer returned the wrong response to backup submission");
+        };
+        Ok(job)
+    }
+
+    pub async fn backup_status(
+        &self,
+        coordinator: NodeId,
+        guild_id: [u8; 32],
+        revision_id: Uuid,
+    ) -> Result<BackupJob> {
+        let response = self
+            .call(
+                coordinator,
+                PeerRequest::BackupStatus {
+                    guild_id,
+                    revision_id,
+                },
+            )
+            .await?;
+        let PeerResponse::BackupJob(job) = response else {
+            bail!("peer returned the wrong response to backup status request");
+        };
+        Ok(job)
+    }
+
+    pub(crate) async fn prepared_revision_page(
+        &self,
+        owner: NodeId,
+        guild_id: [u8; 32],
+        revision_id: Uuid,
+        page_index: u32,
+    ) -> Result<(u32, [u8; 32], Vec<u8>)> {
+        let response = self
+            .call(
+                owner,
+                PeerRequest::GetPreparedRevisionPage {
+                    guild_id,
+                    revision_id,
+                    page_index,
+                },
+            )
+            .await?;
+        let PeerResponse::PreparedRevisionPage {
+            total_pages,
+            page_hash,
+            bytes,
+        } = response
+        else {
+            bail!("peer returned the wrong prepared revision page response");
+        };
+        Ok((total_pages, page_hash, bytes))
+    }
+
+    pub(crate) async fn sector(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        sector_id: SectorId,
+    ) -> Result<Vec<u8>> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::GetSector {
+                    guild_id,
+                    sector_id,
+                },
+            )
+            .await?;
+        let PeerResponse::Bytes(bytes) = response else {
+            bail!("peer returned the wrong sector response");
+        };
+        Ok(bytes)
+    }
+
+    pub(crate) async fn ensure_filler(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        revision_id: Uuid,
+        ordinal: u64,
+    ) -> Result<(SectorRef, Vec<u8>)> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::EnsureFiller {
+                    guild_id,
+                    revision_id,
+                    ordinal,
+                },
+            )
+            .await?;
+        let PeerResponse::Filler { reference, bytes } = response else {
+            bail!("peer returned the wrong filler response");
+        };
+        Ok((reference, bytes))
+    }
+
+    pub(crate) async fn publish_parity(
+        &self,
+        peer: NodeId,
+        group: CodingGroup,
+        information: [Vec<u8>; 3],
+        object: ParityObject,
+    ) -> Result<SignedRecord<StorageAcknowledgement>> {
+        let operation_id = storage_operation_id(&group.id, object.shard_index);
+        let response = self
+            .call(
+                peer,
+                PeerRequest::PublishParity {
+                    operation_id,
+                    group: Box::new(group),
+                    information,
+                    object,
+                },
+            )
+            .await?;
+        let PeerResponse::StorageAcknowledgement(acknowledgement) = response else {
+            bail!("peer returned the wrong parity publication response");
+        };
+        acknowledgement.verify(b"mutualbackup/storage-acknowledgement/v1")?;
+        acknowledgement.value.validate()?;
+        if acknowledgement.value.operation_id != operation_id {
+            bail!("parity acknowledgement has the wrong operation identity");
+        }
+        Ok(acknowledgement)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn put_checkpoint_page(
+        &self,
+        peer: NodeId,
+        object_kind: CheckpointObjectKind,
+        guild_id: [u8; 32],
+        checkpoint_hash: [u8; 32],
+        page_index: u32,
+        total_pages: u32,
+        page_hash: [u8; 32],
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::PutCheckpointPage {
+                    object_kind,
+                    guild_id,
+                    checkpoint_hash,
+                    page_index,
+                    total_pages,
+                    page_hash,
+                    bytes,
+                },
+            )
+            .await?;
+        if !matches!(response, PeerResponse::Ack) {
+            bail!("peer returned the wrong checkpoint page response");
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn sign_checkpoint(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        checkpoint_hash: [u8; 32],
+    ) -> Result<MemberSignature> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::SignCheckpoint {
+                    guild_id,
+                    checkpoint_hash,
+                },
+            )
+            .await?;
+        let PeerResponse::CheckpointSignature(signature) = response else {
+            bail!("peer returned the wrong checkpoint signature response");
+        };
+        Ok(signature)
+    }
+
+    pub(crate) async fn finalize_checkpoint(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        checkpoint_hash: [u8; 32],
+    ) -> Result<()> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::FinalizeCheckpoint {
+                    guild_id,
+                    checkpoint_hash,
+                },
+            )
+            .await?;
+        if !matches!(response, PeerResponse::Ack) {
+            bail!("peer returned the wrong checkpoint finalization response");
         }
         Ok(())
     }
@@ -791,6 +1008,470 @@ impl P2pEventLoop {
     }
 }
 
+pub async fn run_coordinator_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {
+    loop {
+        let job = node_blocking(node.clone(), |node| node.claim_backup_job()).await?;
+        let Some(job) = job else {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        };
+        match commit_backup_job(node.clone(), &p2p, &job).await {
+            Ok(checkpoint_hash) => {
+                let descriptor = job.descriptor.clone();
+                node_blocking(node.clone(), move |node| {
+                    node.complete_backup_job(&descriptor, checkpoint_hash)
+                })
+                .await?;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    revision = %job.descriptor.revision_id,
+                    %error,
+                    "coordinator backup attempt deferred"
+                );
+                let descriptor = job.descriptor.clone();
+                let message = format!("{error:#}");
+                node_blocking(node.clone(), move |node| {
+                    node.defer_backup_job(&descriptor, &message)
+                })
+                .await?;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+async fn commit_backup_job(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    job: &BackupJob,
+) -> Result<[u8; 32]> {
+    let guild_id = job.descriptor.guild_id;
+    let (certificate, mut peers, local_id, previous) = node_blocking(node.clone(), move |node| {
+        let certificate = node
+            .installed_guild_certificate()?
+            .context("coordinator has no installed guild genesis")?;
+        let summary = node
+            .guild_summary()?
+            .context("coordinator has no guild endpoint roster")?;
+        let previous = node.current_checkpoint(guild_id)?;
+        Ok((certificate, summary.peers, node.keys().node_id(), previous))
+    })
+    .await?;
+    certificate.verify()?;
+    if certificate.genesis.guild_id != guild_id
+        || certificate.genesis.coordinator != local_id
+        || job.descriptor.owner == local_id
+            && !peers.iter().any(|peer| peer.member.node_id == local_id)
+    {
+        bail!("backup job does not belong to this certified coordinator");
+    }
+    if let Some(checkpoint) = &previous
+        && checkpoint.checkpoint.revisions.iter().any(|revision| {
+            revision.value.revision_id == job.descriptor.revision_id
+                && revision.value.owner == job.descriptor.owner
+        })
+    {
+        return checkpoint.hash().map_err(Into::into);
+    }
+    let owner_position = peers
+        .iter()
+        .position(|peer| peer.member.node_id == job.descriptor.owner)
+        .context("backup owner is not a guild member")?;
+    let owner = peers.remove(owner_position);
+    peers.sort_by_key(|peer| peer.member.node_id);
+    peers.insert(0, owner);
+    if peers.len() != 5 {
+        bail!("prototype backup requires exactly five guild peers");
+    }
+    for peer in peers.iter().filter(|peer| peer.member.node_id != local_id) {
+        for endpoint in &peer.endpoints {
+            p2p.add_peer_address(peer.member.node_id, endpoint.parse()?)
+                .await?;
+        }
+    }
+
+    let revision = fetch_p2p_revision(node.clone(), p2p, local_id, &job.descriptor).await?;
+    revision.verify(b"mutualbackup/user-revision/v1")?;
+    if revision.signer != job.descriptor.owner
+        || revision.value.owner != job.descriptor.owner
+        || revision.value.guild_id != guild_id
+        || revision.value.revision_id != job.descriptor.revision_id
+    {
+        bail!("prepared revision does not match its backup submission");
+    }
+    let mut target_sectors = revision.value.metadata_sectors.clone();
+    target_sectors.extend(revision.value.data_sectors.clone());
+    if target_sectors.is_empty() || target_sectors.len() > V1_MAX_CODING_GROUPS {
+        bail!("prepared revision exceeds the bounded coding catalog");
+    }
+
+    let mut new_groups = Vec::with_capacity(target_sectors.len());
+    for (ordinal, target) in target_sectors.iter().enumerate() {
+        let owner_bytes = load_p2p_sector(
+            node.clone(),
+            p2p,
+            local_id,
+            peers[0].member.node_id,
+            guild_id,
+            target.id,
+        )
+        .await?;
+        if owner_bytes.len() != V1_SECTOR_SIZE || sector_root(&owner_bytes) != target.root {
+            bail!("owner sector failed its committed root or fixed size");
+        }
+        let helper_a = ensure_p2p_filler(
+            node.clone(),
+            p2p,
+            local_id,
+            peers[1].member.node_id,
+            guild_id,
+            revision.value.revision_id,
+            ordinal as u64 * 2,
+        )
+        .await?;
+        let helper_b = ensure_p2p_filler(
+            node.clone(),
+            p2p,
+            local_id,
+            peers[2].member.node_id,
+            guild_id,
+            revision.value.revision_id,
+            ordinal as u64 * 2 + 1,
+        )
+        .await?;
+        let shards = encode_3_2([owner_bytes, helper_a.1, helper_b.1])?;
+        let roles = [
+            ShardRole::Information(InformationRole {
+                owner: peers[0].member.node_id,
+                sector: target.clone(),
+            }),
+            ShardRole::Information(InformationRole {
+                owner: peers[1].member.node_id,
+                sector: helper_a.0,
+            }),
+            ShardRole::Information(InformationRole {
+                owner: peers[2].member.node_id,
+                sector: helper_b.0,
+            }),
+            ShardRole::Parity(ParityRole {
+                holder: peers[3].member.node_id,
+                row: 0,
+                root: sector_root(&shards[3]),
+            }),
+            ShardRole::Parity(ParityRole {
+                holder: peers[4].member.node_id,
+                row: 1,
+                root: sector_root(&shards[4]),
+            }),
+        ];
+        let mut group = CodingGroup {
+            id: [0; 32],
+            format_version: 1,
+            guild_id,
+            data_shards: V1_RS_DATA_SHARDS,
+            parity_shards: V1_RS_PARITY_SHARDS,
+            shard_size: V1_SECTOR_SIZE as u32,
+            roles,
+        };
+        group.id = group.calculate_id()?;
+        let information = [shards[0].clone(), shards[1].clone(), shards[2].clone()];
+        for (position, shard_index) in [(3_usize, 3_u8), (4, 4)] {
+            let object = ParityObject {
+                format_version: 1,
+                guild_id,
+                group_id: group.id,
+                shard_index,
+                root: sector_root(&shards[position]),
+                bytes: shards[position].clone(),
+            };
+            publish_p2p_parity(
+                node.clone(),
+                p2p,
+                local_id,
+                peers[position].member.node_id,
+                group.clone(),
+                information.clone(),
+                object,
+            )
+            .await?;
+        }
+        new_groups.push(group);
+    }
+
+    let (generation, parent, mut revisions, mut coding_groups) = match previous {
+        Some(previous) => {
+            previous.verify()?;
+            (
+                previous
+                    .checkpoint
+                    .generation
+                    .checked_add(1)
+                    .context("checkpoint generation exhausted")?,
+                Some(previous.hash()?),
+                previous.checkpoint.revisions,
+                previous.checkpoint.coding_groups,
+            )
+        }
+        None => (1, None, Vec::new(), Vec::new()),
+    };
+    revisions.push(revision);
+    revisions.sort_by_key(|revision| {
+        (
+            revision.value.owner,
+            revision.value.sequence,
+            revision.value.revision_id,
+        )
+    });
+    coding_groups.extend(new_groups);
+    coding_groups.sort_by_key(|group| group.id);
+    let checkpoint = GuildCheckpoint {
+        format_version: 1,
+        guild_id,
+        genesis_hash: certificate.hash()?,
+        generation,
+        parent,
+        members: certificate.genesis.members.clone(),
+        revisions,
+        coding_groups,
+    };
+    checkpoint.validate()?;
+    let checkpoint_hash = checkpoint.hash()?;
+    let body = canonical_bytes(&checkpoint)?;
+    publish_p2p_checkpoint_object(
+        node.clone(),
+        p2p,
+        local_id,
+        &peers,
+        CheckpointObjectKind::Body,
+        guild_id,
+        checkpoint_hash,
+        &body,
+    )
+    .await?;
+    let mut signatures = Vec::with_capacity(5);
+    for peer in &peers {
+        let signer = peer.member.node_id;
+        let signature = if signer == local_id {
+            let checkpoint = checkpoint.clone();
+            node_blocking(node.clone(), move |node| node.sign_checkpoint(&checkpoint)).await?
+        } else {
+            p2p.sign_checkpoint(signer, guild_id, checkpoint_hash)
+                .await?
+        };
+        signatures.push(signature);
+    }
+    signatures.sort_by_key(|signature| signature.signer);
+    let quorum = QuorumCheckpoint {
+        checkpoint,
+        signatures,
+    };
+    quorum.verify()?;
+    let certificate_bytes = canonical_bytes(&quorum)?;
+    publish_p2p_checkpoint_object(
+        node.clone(),
+        p2p,
+        local_id,
+        &peers,
+        CheckpointObjectKind::Certificate,
+        guild_id,
+        checkpoint_hash,
+        &certificate_bytes,
+    )
+    .await?;
+    for peer in peers.iter().filter(|peer| peer.member.node_id != local_id) {
+        p2p.finalize_checkpoint(peer.member.node_id, guild_id, checkpoint_hash)
+            .await?;
+    }
+    node_blocking(node, move |node| {
+        node.finalize_staged_checkpoint(&guild_id, &checkpoint_hash)?;
+        Ok(())
+    })
+    .await?;
+    Ok(checkpoint_hash)
+}
+
+async fn fetch_p2p_revision(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    local_id: NodeId,
+    descriptor: &BackupDescriptor,
+) -> Result<SignedRecord<UserRevision>> {
+    if descriptor.owner == local_id {
+        let guild_id = descriptor.guild_id;
+        let revision_id = descriptor.revision_id;
+        let bytes = node_blocking(node, move |node| {
+            node.prepared_revision_bytes(guild_id, revision_id)
+        })
+        .await?;
+        if blake3::hash(&bytes).as_bytes() != &descriptor.object_hash {
+            bail!("local prepared revision hash differs from its submission");
+        }
+        return decode_canonical(&bytes).map_err(Into::into);
+    }
+    let mut bytes = Vec::new();
+    for page_index in 0..descriptor.total_pages {
+        let (total_pages, page_hash, page) = p2p
+            .prepared_revision_page(
+                descriptor.owner,
+                descriptor.guild_id,
+                descriptor.revision_id,
+                page_index,
+            )
+            .await?;
+        if total_pages != descriptor.total_pages
+            || page_hash != *blake3::hash(&page).as_bytes()
+            || page.len() > V1_CATALOG_PAGE_BYTES
+            || bytes.len().saturating_add(page.len()) > V1_MAX_CATALOG_BYTES
+        {
+            bail!("prepared revision page failed bounds or hash validation");
+        }
+        bytes.extend_from_slice(&page);
+    }
+    if blake3::hash(&bytes).as_bytes() != &descriptor.object_hash {
+        bail!("assembled prepared revision hash differs from its submission");
+    }
+    decode_canonical(&bytes).map_err(Into::into)
+}
+
+async fn load_p2p_sector(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    local_id: NodeId,
+    peer: NodeId,
+    guild_id: [u8; 32],
+    sector_id: SectorId,
+) -> Result<Vec<u8>> {
+    if peer == local_id {
+        node_blocking(node, move |node| {
+            node.sector_for_guild(&guild_id, &sector_id)
+        })
+        .await
+    } else {
+        p2p.sector(peer, guild_id, sector_id).await
+    }
+}
+
+async fn ensure_p2p_filler(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    local_id: NodeId,
+    peer: NodeId,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    ordinal: u64,
+) -> Result<(SectorRef, Vec<u8>)> {
+    if peer == local_id {
+        node_blocking(node, move |node| {
+            node.ensure_filler(guild_id, revision_id, ordinal)
+        })
+        .await
+    } else {
+        p2p.ensure_filler(peer, guild_id, revision_id, ordinal)
+            .await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_p2p_parity(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    local_id: NodeId,
+    peer: NodeId,
+    group: CodingGroup,
+    information: [Vec<u8>; 3],
+    object: ParityObject,
+) -> Result<()> {
+    let group_id = group.id;
+    let guild_id = group.guild_id;
+    let shard_index = object.shard_index;
+    let root = object.root;
+    let acknowledgement = if peer == local_id {
+        node_blocking(node, move |node| {
+            node.publish_verified_parity(&group, &information, &object)
+        })
+        .await?
+    } else {
+        p2p.publish_parity(peer, group, information, object).await?
+    };
+    acknowledgement.verify(b"mutualbackup/storage-acknowledgement/v1")?;
+    if acknowledgement.signer != peer
+        || acknowledgement.value.holder != peer
+        || acknowledgement.value.operation_id != storage_operation_id(&group_id, shard_index)
+        || acknowledgement.value.guild_id != guild_id
+        || acknowledgement.value.group_id != group_id
+        || acknowledgement.value.shard_index != shard_index
+        || acknowledgement.value.root != root
+    {
+        bail!("parity holder returned an acknowledgement for another object");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_p2p_checkpoint_object(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    local_id: NodeId,
+    peers: &[GuildPeer],
+    object_kind: CheckpointObjectKind,
+    guild_id: [u8; 32],
+    checkpoint_hash: [u8; 32],
+    bytes: &[u8],
+) -> Result<()> {
+    let total_pages = checked_catalog_page_count(bytes.len())?;
+    for (page_index, page) in bytes.chunks(V1_CATALOG_PAGE_BYTES).enumerate() {
+        let page = page.to_vec();
+        let page_hash = *blake3::hash(&page).as_bytes();
+        for peer in peers {
+            let peer_id = peer.member.node_id;
+            if peer_id == local_id {
+                let page = page.clone();
+                node_blocking(node.clone(), move |node| {
+                    node.stage_checkpoint_page(
+                        object_kind.as_str(),
+                        &guild_id,
+                        &checkpoint_hash,
+                        page_index as u32,
+                        total_pages,
+                        &page_hash,
+                        &page,
+                    )
+                })
+                .await?;
+            } else {
+                p2p.put_checkpoint_page(
+                    peer_id,
+                    object_kind,
+                    guild_id,
+                    checkpoint_hash,
+                    page_index as u32,
+                    total_pages,
+                    page_hash,
+                    page.clone(),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn node_blocking<T, F>(node: Arc<Mutex<Node>>, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Node) -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let mut node = node
+            .lock()
+            .map_err(|_| anyhow::anyhow!("node state lock is poisoned"))?;
+        operation(&mut node)
+    })
+    .await
+    .context("node worker failed")?
+}
+
 fn fail_dht_pending(pending: PendingDht, message: &str) {
     match pending {
         PendingDht::Put(response) | PendingDht::Provide(response) => {
@@ -887,6 +1568,85 @@ mod tests {
             .to_string()
     }
 
+    async fn form_test_guild(
+        nodes: &[Arc<Mutex<Node>>],
+        clients: &[P2pClient],
+        addresses: &[Multiaddr],
+        endpoints: &[String],
+    ) -> QuorumGuildGenesis {
+        let coordinator_id = nodes[0].lock().unwrap().keys().node_id();
+        nodes[0]
+            .lock()
+            .unwrap()
+            .create_guild(vec![endpoints[0].clone()])
+            .unwrap();
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        for index in 1..5 {
+            let invite = nodes[0]
+                .lock()
+                .unwrap()
+                .issue_guild_invite(vec![endpoints[0].clone()], expires)
+                .unwrap();
+            let local_peer = nodes[index]
+                .lock()
+                .unwrap()
+                .begin_join_guild(invite.clone(), vec![endpoints[index].clone()])
+                .unwrap();
+            clients[index]
+                .add_peer_address(coordinator_id, addresses[0].clone())
+                .await
+                .unwrap();
+            clients[index]
+                .join_guild(coordinator_id, invite, local_peer)
+                .await
+                .unwrap();
+        }
+        let (genesis, peers) = nodes[0].lock().unwrap().proposed_guild_genesis().unwrap();
+        let mut signatures = vec![
+            nodes[0]
+                .lock()
+                .unwrap()
+                .sign_guild_genesis(&genesis)
+                .unwrap(),
+        ];
+        for index in 1..5 {
+            let peer_id = nodes[index].lock().unwrap().keys().node_id();
+            clients[0]
+                .add_peer_address(peer_id, addresses[index].clone())
+                .await
+                .unwrap();
+            signatures.push(
+                clients[0]
+                    .propose_guild_genesis(peer_id, genesis.clone())
+                    .await
+                    .unwrap(),
+            );
+        }
+        signatures.sort_by_key(|signature| signature.signer);
+        let certificate = QuorumGuildGenesis {
+            genesis,
+            signatures,
+        };
+        certificate.verify().unwrap();
+        for node in nodes.iter().skip(1) {
+            let peer_id = node.lock().unwrap().keys().node_id();
+            clients[0]
+                .install_guild_genesis(peer_id, certificate.clone(), peers.clone())
+                .await
+                .unwrap();
+        }
+        nodes[0]
+            .lock()
+            .unwrap()
+            .install_guild_genesis(certificate.clone(), peers)
+            .unwrap();
+        certificate
+    }
+
     #[tokio::test]
     async fn quic_transport_uses_the_seed_identity_for_application_requests() {
         let temp = tempfile::tempdir().unwrap();
@@ -960,77 +1720,7 @@ mod tests {
             .zip(addresses.iter().cloned())
             .map(|(client, address)| peer_endpoint(client, address))
             .collect::<Vec<_>>();
-        let coordinator_id = nodes[0].lock().unwrap().keys().node_id();
-        nodes[0]
-            .lock()
-            .unwrap()
-            .create_guild(vec![endpoints[0].clone()])
-            .unwrap();
-        let expires = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + 3600;
-        for index in 1..5 {
-            let invite = nodes[0]
-                .lock()
-                .unwrap()
-                .issue_guild_invite(vec![endpoints[0].clone()], expires)
-                .unwrap();
-            let local_peer = nodes[index]
-                .lock()
-                .unwrap()
-                .begin_join_guild(invite.clone(), vec![endpoints[index].clone()])
-                .unwrap();
-            clients[index]
-                .add_peer_address(coordinator_id, addresses[0].clone())
-                .await
-                .unwrap();
-            clients[index]
-                .join_guild(coordinator_id, invite, local_peer)
-                .await
-                .unwrap();
-        }
-
-        let (genesis, peers) = nodes[0].lock().unwrap().proposed_guild_genesis().unwrap();
-        let mut signatures = vec![
-            nodes[0]
-                .lock()
-                .unwrap()
-                .sign_guild_genesis(&genesis)
-                .unwrap(),
-        ];
-        for index in 1..5 {
-            let peer_id = nodes[index].lock().unwrap().keys().node_id();
-            clients[0]
-                .add_peer_address(peer_id, addresses[index].clone())
-                .await
-                .unwrap();
-            signatures.push(
-                clients[0]
-                    .propose_guild_genesis(peer_id, genesis.clone())
-                    .await
-                    .unwrap(),
-            );
-        }
-        signatures.sort_by_key(|signature| signature.signer);
-        let certificate = QuorumGuildGenesis {
-            genesis,
-            signatures,
-        };
-        certificate.verify().unwrap();
-        for node in nodes.iter().skip(1) {
-            let peer_id = node.lock().unwrap().keys().node_id();
-            clients[0]
-                .install_guild_genesis(peer_id, certificate.clone(), peers.clone())
-                .await
-                .unwrap();
-        }
-        nodes[0]
-            .lock()
-            .unwrap()
-            .install_guild_genesis(certificate.clone(), peers)
-            .unwrap();
+        let certificate = form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
 
         for client in &clients {
             client.shutdown().await.unwrap();
@@ -1046,5 +1736,101 @@ mod tests {
             assert_eq!(reopened, certificate);
             reopened.verify().unwrap();
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an explicitly provisioned reflink test filesystem"]
+    async fn repeated_multi_owner_backups_commit_over_quic() {
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT");
+        let run_root =
+            std::path::PathBuf::from(test_root).join(format!("p2p-data-path-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&run_root).unwrap();
+        let seeds = (101_u8..=105)
+            .map(|value| Seed::from_bytes([value; 32]))
+            .collect::<Vec<_>>();
+        let mut nodes = Vec::new();
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for (index, seed) in seeds.into_iter().enumerate() {
+            let node = Node::open(run_root.join(format!("node-{index}")), seed).unwrap();
+            let node_id = node.keys().node_id();
+            let node = Arc::new(Mutex::new(node));
+            let (client, event_loop) = build_p2p(node.clone(), config(node_id)).unwrap();
+            nodes.push(node);
+            clients.push(client);
+            tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let addresses = futures::future::join_all(clients.iter().map(listening_address)).await;
+        let endpoints = clients
+            .iter()
+            .zip(addresses.iter().cloned())
+            .map(|(client, address)| peer_endpoint(client, address))
+            .collect::<Vec<_>>();
+        let genesis = form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+
+        for (owner_index, expected_generation) in [(1_usize, 1_u64), (2, 2)] {
+            let source = run_root.join(format!("source-{owner_index}"));
+            std::fs::create_dir_all(source.join("documents")).unwrap();
+            std::fs::write(
+                source.join("documents/content.bin"),
+                (0..90_000)
+                    .map(|offset| ((offset + owner_index * 29) % 251) as u8)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let owner_id = nodes[owner_index].lock().unwrap().keys().node_id();
+            nodes[owner_index]
+                .lock()
+                .unwrap()
+                .add_protected_root(&source)
+                .unwrap();
+            let descriptor = nodes[owner_index]
+                .lock()
+                .unwrap()
+                .prepare_protected_backup()
+                .unwrap();
+            let queued = nodes[0]
+                .lock()
+                .unwrap()
+                .enqueue_backup(owner_id, descriptor.clone())
+                .unwrap();
+            let checkpoint_hash = commit_backup_job(nodes[0].clone(), &clients[0], &queued)
+                .await
+                .unwrap();
+            nodes[0]
+                .lock()
+                .unwrap()
+                .complete_backup_job(&descriptor, checkpoint_hash)
+                .unwrap();
+            for node in &nodes {
+                let checkpoint = node
+                    .lock()
+                    .unwrap()
+                    .current_checkpoint(genesis.genesis.guild_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(checkpoint.checkpoint.generation, expected_generation);
+                assert_eq!(checkpoint.checkpoint.genesis_hash, genesis.hash().unwrap());
+            }
+        }
+        let final_checkpoint = nodes[0]
+            .lock()
+            .unwrap()
+            .current_checkpoint(genesis.genesis.guild_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_checkpoint.checkpoint.revisions.len(), 2);
+        assert!(final_checkpoint.checkpoint.coding_groups.len() >= 4);
+
+        for client in &clients {
+            client.shutdown().await.unwrap();
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        drop(clients);
+        drop(nodes);
+        std::fs::remove_dir_all(run_root).unwrap();
     }
 }

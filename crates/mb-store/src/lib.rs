@@ -16,4 +16,4 @@ pub use database::{
     CheckpointRow, ControlStore, DatabaseError, ParityObject, ParityStore, ProtocolRecordRow,
 };
 
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
