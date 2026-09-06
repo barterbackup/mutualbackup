@@ -8,17 +8,6 @@ repair, GC, and multiple parity volumes remains intentionally omitted.
 
 ## P0 — protection can be lost or falsely reported
 
-- [ ] **Restore every private-metadata layout that was emitted as version 2.**
-  Commit `fe061de` emitted `PrivateEntry::FileV2` with a two-word
-  `NativeFileId`; `d31a178` changed that same version-2 wire variant to a
-  one-word `link_group`, and only later did `7e6abc6` start emitting metadata
-  version 3. Postcard is positional, while current recovery decodes directly
-  into the new enum before inspecting the outer version
-  (`crates/mb-node/src/snapshot.rs:23-56,614-633,987-1017`). A genuine early-v2
-  revision therefore fails or is misparsed during seed recovery. Keep explicit
-  legacy wire structs and dispatch by format version; cover both version-2
-  layouts with immutable fixtures.
-
 - [ ] **Separate an intentional new commit from retrying an interrupted one.**
   The durable `plan_hash` covers only source path, directory address, and peer
   profiles (`crates/mb-node/src/network.rs:1051-1065`). The owner returns the

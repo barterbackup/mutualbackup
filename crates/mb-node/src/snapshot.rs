@@ -71,6 +71,81 @@ pub struct PrivateMetadata {
     pub entries: Vec<PrivateEntry>,
 }
 
+// Private metadata version 2 existed briefly with two different positional
+// postcard layouts. Keep both wire types immutable: changing PrivateEntry
+// cannot make either historical layout disappear from recovery.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct NativeV2PrivateMetadata {
+    format_version: u16,
+    root_mode: u32,
+    root_modified_secs: i64,
+    root_modified_nanos: u32,
+    entries: Vec<NativeV2PrivateEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum NativeV2PrivateEntry {
+    Directory {
+        path: String,
+        mode: u32,
+        modified_secs: i64,
+        modified_nanos: u32,
+    },
+    File {
+        path: String,
+        mode: u32,
+        logical_len: u64,
+        modified_secs: i64,
+        modified_nanos: u32,
+        sectors: Vec<SectorRef>,
+    },
+    FileV2 {
+        path: String,
+        mode: u32,
+        logical_len: u64,
+        modified_secs: i64,
+        modified_nanos: u32,
+        native_id: NativeFileId,
+        data_extents: Vec<PrivateDataExtent>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct LinkV2PrivateMetadata {
+    format_version: u16,
+    root_mode: u32,
+    root_modified_secs: i64,
+    root_modified_nanos: u32,
+    entries: Vec<LinkV2PrivateEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum LinkV2PrivateEntry {
+    Directory {
+        path: String,
+        mode: u32,
+        modified_secs: i64,
+        modified_nanos: u32,
+    },
+    File {
+        path: String,
+        mode: u32,
+        logical_len: u64,
+        modified_secs: i64,
+        modified_nanos: u32,
+        sectors: Vec<SectorRef>,
+    },
+    FileV2 {
+        path: String,
+        mode: u32,
+        logical_len: u64,
+        modified_secs: i64,
+        modified_nanos: u32,
+        link_group: u64,
+        data_extents: Vec<PrivateDataExtent>,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct LocalSectorRecipe {
     guild_id: [u8; 32],
@@ -626,11 +701,199 @@ fn load_private_metadata(
             &mut |sector_id| render_sector(control, keys, sector_id, Some(&guild_id)),
         )?);
     }
-    let metadata: PrivateMetadata = decode_canonical(&metadata_bytes)?;
-    if !matches!(metadata.format_version, 1..=3) {
-        bail!("unsupported private metadata version");
+    decode_private_metadata(&metadata_bytes)
+}
+
+fn decode_private_metadata(bytes: &[u8]) -> Result<PrivateMetadata> {
+    let (format_version, _) =
+        postcard::take_from_bytes::<u16>(bytes).context("decode private metadata version")?;
+    match format_version {
+        1 | 3 => {
+            let metadata: PrivateMetadata = decode_canonical(bytes)?;
+            if metadata.format_version != format_version {
+                bail!("private metadata version changed while decoding");
+            }
+            if format_version == 1
+                && metadata.entries.iter().any(|entry| {
+                    matches!(
+                        entry,
+                        PrivateEntry::FileV2 { .. } | PrivateEntry::HardLinkV3 { .. }
+                    )
+                })
+            {
+                bail!("version-1 private metadata contains a later entry variant");
+            }
+            Ok(metadata)
+        }
+        2 => decode_v2_private_metadata(bytes),
+        _ => bail!("unsupported private metadata version"),
     }
-    Ok(metadata)
+}
+
+fn decode_v2_private_metadata(bytes: &[u8]) -> Result<PrivateMetadata> {
+    if let Ok(metadata) = decode_canonical::<LinkV2PrivateMetadata>(bytes) {
+        if validate_link_v2_layout(&metadata).is_ok() {
+            return Ok(convert_link_v2(metadata));
+        }
+    }
+    let metadata: NativeV2PrivateMetadata = decode_canonical(bytes)
+        .context("private metadata does not match either historical version-2 layout")?;
+    convert_native_v2(metadata)
+}
+
+fn validate_link_v2_layout(metadata: &LinkV2PrivateMetadata) -> Result<()> {
+    if metadata.format_version != 2 {
+        bail!("historical link metadata has the wrong version");
+    }
+    let mut next_group = 0_u64;
+    let mut groups = BTreeSet::new();
+    for entry in &metadata.entries {
+        if let LinkV2PrivateEntry::FileV2 { link_group, .. } = entry {
+            if groups.insert(*link_group) {
+                if *link_group != next_group {
+                    bail!("historical link groups are not in emitted order");
+                }
+                next_group = next_group
+                    .checked_add(1)
+                    .context("too many historical link groups")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn convert_link_v2(metadata: LinkV2PrivateMetadata) -> PrivateMetadata {
+    PrivateMetadata {
+        format_version: metadata.format_version,
+        root_mode: metadata.root_mode,
+        root_modified_secs: metadata.root_modified_secs,
+        root_modified_nanos: metadata.root_modified_nanos,
+        entries: metadata
+            .entries
+            .into_iter()
+            .map(|entry| match entry {
+                LinkV2PrivateEntry::Directory {
+                    path,
+                    mode,
+                    modified_secs,
+                    modified_nanos,
+                } => PrivateEntry::Directory {
+                    path,
+                    mode,
+                    modified_secs,
+                    modified_nanos,
+                },
+                LinkV2PrivateEntry::File {
+                    path,
+                    mode,
+                    logical_len,
+                    modified_secs,
+                    modified_nanos,
+                    sectors,
+                } => PrivateEntry::File {
+                    path,
+                    mode,
+                    logical_len,
+                    modified_secs,
+                    modified_nanos,
+                    sectors,
+                },
+                LinkV2PrivateEntry::FileV2 {
+                    path,
+                    mode,
+                    logical_len,
+                    modified_secs,
+                    modified_nanos,
+                    link_group,
+                    data_extents,
+                } => PrivateEntry::FileV2 {
+                    path,
+                    mode,
+                    logical_len,
+                    modified_secs,
+                    modified_nanos,
+                    link_group,
+                    data_extents,
+                },
+            })
+            .collect(),
+    }
+}
+
+fn convert_native_v2(metadata: NativeV2PrivateMetadata) -> Result<PrivateMetadata> {
+    if metadata.format_version != 2 {
+        bail!("historical native-ID metadata has the wrong version");
+    }
+    let mut groups = BTreeMap::<NativeFileId, u64>::new();
+    let mut next_group = 0_u64;
+    let mut entries = Vec::with_capacity(metadata.entries.len());
+    for entry in metadata.entries {
+        entries.push(match entry {
+            NativeV2PrivateEntry::Directory {
+                path,
+                mode,
+                modified_secs,
+                modified_nanos,
+            } => PrivateEntry::Directory {
+                path,
+                mode,
+                modified_secs,
+                modified_nanos,
+            },
+            NativeV2PrivateEntry::File {
+                path,
+                mode,
+                logical_len,
+                modified_secs,
+                modified_nanos,
+                sectors,
+            } => PrivateEntry::File {
+                path,
+                mode,
+                logical_len,
+                modified_secs,
+                modified_nanos,
+                sectors,
+            },
+            NativeV2PrivateEntry::FileV2 {
+                path,
+                mode,
+                logical_len,
+                modified_secs,
+                modified_nanos,
+                native_id,
+                data_extents,
+            } => {
+                let link_group = match groups.get(&native_id) {
+                    Some(group) => *group,
+                    None => {
+                        let group = next_group;
+                        next_group = next_group
+                            .checked_add(1)
+                            .context("too many historical native file identities")?;
+                        groups.insert(native_id, group);
+                        group
+                    }
+                };
+                PrivateEntry::FileV2 {
+                    path,
+                    mode,
+                    logical_len,
+                    modified_secs,
+                    modified_nanos,
+                    link_group,
+                    data_extents,
+                }
+            }
+        });
+    }
+    Ok(PrivateMetadata {
+        format_version: metadata.format_version,
+        root_mode: metadata.root_mode,
+        root_modified_secs: metadata.root_modified_secs,
+        root_modified_nanos: metadata.root_modified_nanos,
+        entries,
+    })
 }
 
 pub(crate) fn restore_signed_root_metadata(
@@ -1012,10 +1275,7 @@ where
             load_ciphertext,
         )?);
     }
-    let metadata: PrivateMetadata = decode_canonical(&metadata_bytes)?;
-    if !matches!(metadata.format_version, 1..=3) {
-        bail!("unsupported private metadata version");
-    }
+    let metadata = decode_private_metadata(&metadata_bytes)?;
 
     create_private_dir(staging)?;
     let result = restore_entries(staging, &metadata, &encryption_key, load_ciphertext);
@@ -1448,4 +1708,47 @@ fn rename_no_replace(_source: &Path, _destination: &Path) -> Result<()> {
 
 fn hex_id(id: &[u8; 32]) -> String {
     id.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod metadata_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_immutable_native_id_v2_fixture() {
+        const FIXTURE: &[u8] = &[
+            2, 237, 3, 1, 123, 2, 2, 1, 97, 164, 3, 0, 3, 200, 3, 7, 9, 0, 2, 1, 98, 164, 3, 0, 3,
+            200, 3, 7, 9, 0,
+        ];
+        assert_v2_hard_link_fixture(decode_private_metadata(FIXTURE).unwrap());
+    }
+
+    #[test]
+    fn decodes_immutable_link_group_v2_fixture() {
+        const FIXTURE: &[u8] = &[
+            2, 237, 3, 1, 123, 2, 2, 1, 97, 164, 3, 0, 3, 200, 3, 0, 0, 2, 1, 98, 164, 3, 0, 3,
+            200, 3, 0, 0,
+        ];
+        assert_v2_hard_link_fixture(decode_private_metadata(FIXTURE).unwrap());
+    }
+
+    fn assert_v2_hard_link_fixture(metadata: PrivateMetadata) {
+        assert_eq!(metadata.format_version, 2);
+        assert_eq!(metadata.root_mode, 0o755);
+        assert_eq!(metadata.entries.len(), 2);
+        for (entry, path) in metadata.entries.iter().zip(["a", "b"]) {
+            assert!(matches!(
+                entry,
+                PrivateEntry::FileV2 {
+                    path: actual_path,
+                    mode: 0o644,
+                    logical_len: 0,
+                    modified_secs: -2,
+                    modified_nanos: 456,
+                    link_group: 0,
+                    data_extents,
+                } if actual_path == path && data_extents.is_empty()
+            ));
+        }
+    }
 }
