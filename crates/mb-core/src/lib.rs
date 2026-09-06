@@ -17,9 +17,10 @@ pub use content::{
 };
 pub use keys::{KeyIdentityError, KeyMaterial, NodeId, RecoveryPublicKey, Seed, SeedParseError};
 pub use model::{
-    CodingGroup, CodingGroupId, GuildCheckpoint, InformationRole, Member, MemberSignature,
-    ModelError, ParityRole, QuorumCheckpoint, SectorId, SectorRef, ShardRole, SignedRecord,
-    UserRevision, canonical_bytes, coding_group_id, decode_canonical,
+    CodingGroup, CodingGroupId, GuildCheckpoint, GuildGenesis, GuildInvite, InformationRole,
+    Member, MemberSignature, ModelError, ParityRole, QuorumCheckpoint, QuorumGuildGenesis,
+    SectorId, SectorRef, ShardRole, SignedRecord, UserRevision, canonical_bytes, coding_group_id,
+    decode_canonical,
 };
 pub use recovery::{
     RecoveryCryptoError, RecoveryLocator, SealedRecoveryRecord, open_recovery_record,

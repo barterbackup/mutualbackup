@@ -21,6 +21,30 @@ pub struct Member {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GuildGenesis {
+    pub format_version: u16,
+    pub guild_id: [u8; 32],
+    pub coordinator: NodeId,
+    pub members: Vec<Member>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuorumGuildGenesis {
+    pub genesis: GuildGenesis,
+    pub signatures: Vec<MemberSignature>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GuildInvite {
+    pub format_version: u16,
+    pub guild_id: [u8; 32],
+    pub coordinator: Member,
+    pub coordinator_endpoints: Vec<String>,
+    pub nonce: [u8; 16],
+    pub expires_at_unix_seconds: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SectorRef {
     pub id: SectorId,
     pub root: [u8; 32],
@@ -286,6 +310,107 @@ impl GuildCheckpoint {
     }
 }
 
+impl GuildGenesis {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.format_version != 1
+            || self.guild_id == [0; 32]
+            || self.members.len() != 5
+            || !self
+                .members
+                .iter()
+                .any(|member| member.node_id == self.coordinator)
+        {
+            return Err(ModelError::InvalidGenesis);
+        }
+        validate_members(&self.members).map_err(|_| ModelError::InvalidGenesis)
+    }
+
+    pub fn hash(&self) -> Result<[u8; 32], ModelError> {
+        self.validate()?;
+        let mut hasher = blake3::Hasher::new_derive_key("mutualbackup guild genesis v1");
+        hasher.update(&canonical_bytes(self)?);
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    pub fn member_signature(&self, keys: &KeyMaterial) -> Result<MemberSignature, ModelError> {
+        self.validate()?;
+        let signer = keys.node_id();
+        if !self.members.iter().any(|member| member.node_id == signer) {
+            return Err(ModelError::NonMemberSigner(signer));
+        }
+        Ok(MemberSignature {
+            signer,
+            signature: keys
+                .sign(b"mutualbackup/guild-genesis/v1", &canonical_bytes(self)?)
+                .to_vec(),
+        })
+    }
+}
+
+impl QuorumGuildGenesis {
+    pub fn verify(&self) -> Result<(), ModelError> {
+        self.genesis.validate()?;
+        let encoded = canonical_bytes(&self.genesis)?;
+        let member_ids = self
+            .genesis
+            .members
+            .iter()
+            .map(|member| member.node_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut previous = None;
+        let mut signers = std::collections::BTreeSet::new();
+        for signature in &self.signatures {
+            if !member_ids.contains(&signature.signer)
+                || previous.is_some_and(|node_id| node_id >= signature.signer)
+                || !signers.insert(signature.signer)
+            {
+                return Err(ModelError::InvalidGenesis);
+            }
+            let key = VerifyingKey::from_bytes(&signature.signer.0)?;
+            if key.is_weak() {
+                return Err(ModelError::WeakPublicKey);
+            }
+            key.verify_strict(
+                &signing_payload(b"mutualbackup/guild-genesis/v1", &encoded),
+                &Signature::from_slice(&signature.signature)?,
+            )?;
+            previous = Some(signature.signer);
+        }
+        if signers.len() != member_ids.len() {
+            return Err(ModelError::InsufficientQuorum {
+                actual: signers.len(),
+                required: member_ids.len(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn hash(&self) -> Result<[u8; 32], ModelError> {
+        self.verify()?;
+        self.genesis.hash()
+    }
+}
+
+impl GuildInvite {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.format_version != 1
+            || self.guild_id == [0; 32]
+            || self.coordinator_endpoints.is_empty()
+            || self.coordinator_endpoints.len() > 8
+            || self
+                .coordinator_endpoints
+                .iter()
+                .any(|endpoint| endpoint.is_empty() || endpoint.len() > 512)
+            || self.nonce == [0; 16]
+            || self.expires_at_unix_seconds == 0
+            || validate_members(std::slice::from_ref(&self.coordinator)).is_err()
+        {
+            return Err(ModelError::InvalidInvite);
+        }
+        Ok(())
+    }
+}
+
 impl QuorumCheckpoint {
     pub fn add_signature(&mut self, keys: &KeyMaterial) -> Result<(), ModelError> {
         let member_signature = self.checkpoint.member_signature(keys)?;
@@ -467,6 +592,10 @@ pub enum ModelError {
     PublicKey(#[from] ed25519_dalek::SignatureError),
     #[error("invalid guild checkpoint")]
     InvalidCheckpoint,
+    #[error("invalid guild genesis")]
+    InvalidGenesis,
+    #[error("invalid guild invite")]
+    InvalidInvite,
     #[error("weak Ed25519 public key is not accepted")]
     WeakPublicKey,
     #[error("checkpoint is not authorized by the recovering seed")]
@@ -481,6 +610,29 @@ pub enum ModelError {
     InvalidCodingRelation,
     #[error("Reed--Solomon validation failed: {0}")]
     Coding(#[from] crate::CodingError),
+}
+
+fn validate_members(members: &[Member]) -> Result<(), ModelError> {
+    let mut previous = None;
+    let mut node_ids = std::collections::BTreeSet::new();
+    let mut failure_domains = std::collections::BTreeSet::new();
+    for member in members {
+        if previous.is_some_and(|node_id| node_id >= member.node_id)
+            || !node_ids.insert(member.node_id)
+            || !failure_domains.insert(member.failure_domain.as_str())
+            || member.failure_domain.is_empty()
+            || member.failure_domain.len() > 256
+            || !member.recovery_public_key.is_contributory()
+        {
+            return Err(ModelError::InvalidGenesis);
+        }
+        let key = VerifyingKey::from_bytes(&member.node_id.0)?;
+        if key.is_weak() {
+            return Err(ModelError::WeakPublicKey);
+        }
+        previous = Some(member.node_id);
+    }
+    Ok(())
 }
 
 fn validate_group(
@@ -580,6 +732,70 @@ mod tests {
             signature: vec![0; 64],
         };
         assert!(weak.verify(b"test/member/v1").is_err());
+    }
+
+    #[test]
+    fn guild_genesis_requires_all_five_member_signatures() {
+        let keys = (1_u8..=5)
+            .map(|value| KeyMaterial::from_seed(&Seed::from_bytes([value; 32])))
+            .collect::<Vec<_>>();
+        let mut members = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| Member {
+                node_id: key.node_id(),
+                recovery_public_key: key.recovery_public_key(),
+                failure_domain: format!("host-{index}"),
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| member.node_id);
+        let genesis = GuildGenesis {
+            format_version: 1,
+            guild_id: [9; 32],
+            coordinator: keys[0].node_id(),
+            members,
+        };
+        genesis.validate().unwrap();
+
+        let mut certificate = QuorumGuildGenesis {
+            signatures: keys
+                .iter()
+                .map(|key| genesis.member_signature(key).unwrap())
+                .collect(),
+            genesis,
+        };
+        certificate
+            .signatures
+            .sort_by_key(|signature| signature.signer);
+        certificate.verify().unwrap();
+        certificate.signatures.pop();
+        assert!(matches!(
+            certificate.verify(),
+            Err(ModelError::InsufficientQuorum {
+                actual: 4,
+                required: 5
+            })
+        ));
+    }
+
+    #[test]
+    fn guild_invite_is_structurally_bounded() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([17; 32]));
+        let mut invite = GuildInvite {
+            format_version: 1,
+            guild_id: [3; 32],
+            coordinator: Member {
+                node_id: keys.node_id(),
+                recovery_public_key: keys.recovery_public_key(),
+                failure_domain: "coordinator-host".into(),
+            },
+            coordinator_endpoints: vec!["/ip4/127.0.0.1/udp/4000/quic-v1/p2p/peer-id".into()],
+            nonce: [4; 16],
+            expires_at_unix_seconds: 1,
+        };
+        invite.validate().unwrap();
+        invite.coordinator_endpoints = vec![String::new()];
+        assert!(matches!(invite.validate(), Err(ModelError::InvalidInvite)));
     }
 
     #[test]

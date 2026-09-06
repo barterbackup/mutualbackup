@@ -2,12 +2,14 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use mb_core::{
-    GuildCheckpoint, KeyMaterial, Member, MemberSignature, NodeId, QuorumCheckpoint,
-    RecoveryLocator, SectorId, SectorRef, Seed, ShardRole, SignedRecord, UserRevision,
-    canonical_bytes, decode_canonical, seal_recovery_record, sector_root, synthetic_filler_sector,
+    GuildCheckpoint, GuildGenesis, GuildInvite, KeyMaterial, Member, MemberSignature, NodeId,
+    QuorumCheckpoint, QuorumGuildGenesis, RecoveryLocator, SectorId, SectorRef, Seed, ShardRole,
+    SignedRecord, UserRevision, canonical_bytes, decode_canonical, seal_recovery_record,
+    sector_root, synthetic_filler_sector,
 };
 use mb_store::{ControlStore, ParityObject, ParityStore, probe_reflink};
 use rand::RngCore;
@@ -49,6 +51,62 @@ struct CoordinatorCommitJournal {
     plan_hash: [u8; 32],
     guild_id: [u8; 32],
     checkpoint_hash: Option<[u8; 32]>,
+}
+
+const GUILD_INVITE_DOMAIN: &[u8] = b"mutualbackup/guild-invite/v1";
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GuildPeer {
+    pub member: Member,
+    pub endpoints: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum GuildPhase {
+    Draft,
+    Joining,
+    Active,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GuildSummary {
+    pub format_version: u16,
+    pub guild_id: [u8; 32],
+    pub coordinator: NodeId,
+    pub phase: GuildPhase,
+    pub peers: Vec<GuildPeer>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct GuildDraft {
+    format_version: u16,
+    guild_id: [u8; 32],
+    coordinator: NodeId,
+    peers: Vec<GuildPeer>,
+    issued_invites: Vec<SignedRecord<GuildInvite>>,
+    used_invites: Vec<[u8; 16]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct PendingGuild {
+    format_version: u16,
+    invite: SignedRecord<GuildInvite>,
+    local_peer: GuildPeer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct GenesisSignatureLock {
+    format_version: u16,
+    genesis_hash: [u8; 32],
+    genesis: GuildGenesis,
+    signature: MemberSignature,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct InstalledGuild {
+    format_version: u16,
+    certificate: QuorumGuildGenesis,
+    peers: Vec<GuildPeer>,
 }
 
 pub type RecoveredShards = BTreeMap<([u8; 32], u8), Vec<u8>>;
@@ -288,6 +346,370 @@ impl Node {
         }
         self.control
             .put_record("node-config", b"member", &canonical_bytes(&expected)?)?;
+        Ok(())
+    }
+
+    pub fn create_guild(&mut self, endpoints: Vec<String>) -> Result<GuildSummary> {
+        self.ensure_no_guild_state()?;
+        let member = self.configured_member()?;
+        validate_endpoint_set(member.node_id, &endpoints)?;
+        let mut guild_id = [0_u8; 32];
+        while guild_id == [0; 32] {
+            rand::rngs::OsRng.fill_bytes(&mut guild_id);
+        }
+        let draft = GuildDraft {
+            format_version: 1,
+            guild_id,
+            coordinator: member.node_id,
+            peers: vec![GuildPeer { member, endpoints }],
+            issued_invites: Vec::new(),
+            used_invites: Vec::new(),
+        };
+        self.control
+            .put_record("guild-draft", b"primary", &canonical_bytes(&draft)?)?;
+        Ok(summary_from_draft(&draft))
+    }
+
+    pub fn issue_guild_invite(
+        &mut self,
+        coordinator_endpoints: Vec<String>,
+        expires_at_unix_seconds: u64,
+    ) -> Result<SignedRecord<GuildInvite>> {
+        let mut draft = self
+            .guild_draft()?
+            .context("this node has no guild draft")?;
+        if draft.coordinator != self.keys.node_id() || draft.peers.len() >= 5 {
+            anyhow::bail!("only an incomplete guild coordinator can issue invitations");
+        }
+        validate_endpoint_set(self.keys.node_id(), &coordinator_endpoints)?;
+        if expires_at_unix_seconds <= unix_seconds() {
+            anyhow::bail!("guild invitation expiry must be in the future");
+        }
+        let mut nonce = [0_u8; 16];
+        while nonce == [0; 16]
+            || draft
+                .issued_invites
+                .iter()
+                .any(|invite| invite.value.nonce == nonce)
+        {
+            rand::rngs::OsRng.fill_bytes(&mut nonce);
+        }
+        let invite = SignedRecord::sign(
+            GUILD_INVITE_DOMAIN,
+            GuildInvite {
+                format_version: 1,
+                guild_id: draft.guild_id,
+                coordinator: self.configured_member()?,
+                coordinator_endpoints,
+                nonce,
+                expires_at_unix_seconds,
+            },
+            &self.keys,
+        )?;
+        invite.value.validate()?;
+        draft.issued_invites.push(invite.clone());
+        draft
+            .issued_invites
+            .sort_by_key(|invite| invite.value.nonce);
+        self.control
+            .put_record("guild-draft", b"primary", &canonical_bytes(&draft)?)?;
+        Ok(invite)
+    }
+
+    pub fn begin_join_guild(
+        &mut self,
+        invite: SignedRecord<GuildInvite>,
+        endpoints: Vec<String>,
+    ) -> Result<GuildPeer> {
+        invite.verify(GUILD_INVITE_DOMAIN)?;
+        invite.value.validate()?;
+        if invite.signer != invite.value.coordinator.node_id
+            || invite.value.expires_at_unix_seconds <= unix_seconds()
+        {
+            anyhow::bail!("guild invitation is not authentic or has expired");
+        }
+        let local_peer = GuildPeer {
+            member: self.configured_member()?,
+            endpoints,
+        };
+        validate_endpoint_set(local_peer.member.node_id, &local_peer.endpoints)?;
+        if local_peer.member.node_id == invite.value.coordinator.node_id {
+            anyhow::bail!("guild coordinator cannot join its own invitation");
+        }
+        if let Some(installed) = self.installed_guild()? {
+            if installed.certificate.genesis.guild_id == invite.value.guild_id {
+                return installed
+                    .peers
+                    .into_iter()
+                    .find(|peer| peer.member.node_id == self.keys.node_id())
+                    .context("installed guild omits the local peer");
+            }
+            anyhow::bail!("this node already belongs to another guild");
+        }
+        if self.guild_draft()?.is_some() {
+            anyhow::bail!("a guild coordinator cannot join another guild");
+        }
+        let pending = PendingGuild {
+            format_version: 1,
+            invite,
+            local_peer: local_peer.clone(),
+        };
+        if let Some(bytes) = self.control.get_record("guild-pending", b"primary")? {
+            let existing: PendingGuild = decode_canonical(&bytes)?;
+            if existing != pending {
+                anyhow::bail!("this node already has a different pending guild invitation");
+            }
+            return Ok(local_peer);
+        }
+        self.control
+            .put_record("guild-pending", b"primary", &canonical_bytes(&pending)?)?;
+        Ok(local_peer)
+    }
+
+    pub fn accept_guild_join(
+        &mut self,
+        caller: NodeId,
+        invite: &SignedRecord<GuildInvite>,
+        peer: GuildPeer,
+    ) -> Result<()> {
+        invite.verify(GUILD_INVITE_DOMAIN)?;
+        invite.value.validate()?;
+        validate_endpoint_set(peer.member.node_id, &peer.endpoints)?;
+        let mut draft = self
+            .guild_draft()?
+            .context("this node has no guild draft")?;
+        if caller != peer.member.node_id
+            || invite.signer != self.keys.node_id()
+            || invite.value.coordinator.node_id != self.keys.node_id()
+            || invite.value.guild_id != draft.guild_id
+            || invite.value.expires_at_unix_seconds <= unix_seconds()
+            || !draft.issued_invites.iter().any(|issued| issued == invite)
+        {
+            anyhow::bail!("guild join is not authorized by an issued invitation");
+        }
+        if draft.used_invites.contains(&invite.value.nonce) {
+            if draft.peers.iter().any(|existing| existing == &peer) {
+                return Ok(());
+            }
+            anyhow::bail!("guild invitation has already been used");
+        }
+        if draft.peers.len() >= 5
+            || draft
+                .peers
+                .iter()
+                .any(|existing| existing.member.node_id == peer.member.node_id)
+            || draft
+                .peers
+                .iter()
+                .any(|existing| existing.member.failure_domain == peer.member.failure_domain)
+        {
+            anyhow::bail!("guild member or failure domain is duplicated, or guild is full");
+        }
+        draft.peers.push(peer);
+        draft.peers.sort_by_key(|entry| entry.member.node_id);
+        draft.used_invites.push(invite.value.nonce);
+        draft.used_invites.sort();
+        self.control
+            .put_record("guild-draft", b"primary", &canonical_bytes(&draft)?)?;
+        Ok(())
+    }
+
+    pub fn proposed_guild_genesis(&self) -> Result<(GuildGenesis, Vec<GuildPeer>)> {
+        let draft = self
+            .guild_draft()?
+            .context("this node has no guild draft")?;
+        if draft.coordinator != self.keys.node_id() || draft.peers.len() != 5 {
+            anyhow::bail!("guild finalization requires exactly five accepted members");
+        }
+        let genesis = GuildGenesis {
+            format_version: 1,
+            guild_id: draft.guild_id,
+            coordinator: draft.coordinator,
+            members: draft.peers.iter().map(|peer| peer.member.clone()).collect(),
+        };
+        genesis.validate()?;
+        Ok((genesis, draft.peers))
+    }
+
+    pub fn sign_guild_genesis(&mut self, genesis: &GuildGenesis) -> Result<MemberSignature> {
+        genesis.validate()?;
+        let local_member = genesis
+            .members
+            .iter()
+            .find(|member| member.node_id == self.keys.node_id())
+            .context("guild genesis omits the local node")?;
+        if local_member != &self.configured_member()? {
+            anyhow::bail!("guild genesis conflicts with the durable local member identity");
+        }
+        if genesis.coordinator == self.keys.node_id() {
+            let (expected, _) = self.proposed_guild_genesis()?;
+            if &expected != genesis {
+                anyhow::bail!("guild genesis differs from the coordinator draft");
+            }
+        } else {
+            let pending = self
+                .pending_guild()?
+                .context("no pending invitation authorizes this guild")?;
+            if pending.invite.value.guild_id != genesis.guild_id
+                || pending.invite.value.coordinator.node_id != genesis.coordinator
+                || !genesis
+                    .members
+                    .iter()
+                    .any(|member| member == &pending.invite.value.coordinator)
+            {
+                anyhow::bail!("guild genesis differs from the accepted invitation");
+            }
+        }
+        let genesis_hash = genesis.hash()?;
+        if let Some(bytes) = self
+            .control
+            .get_record("guild-genesis-signature-lock", b"primary")?
+        {
+            let lock: GenesisSignatureLock = decode_canonical(&bytes)?;
+            if lock.format_version != 1
+                || lock.genesis_hash != genesis_hash
+                || lock.genesis != *genesis
+            {
+                anyhow::bail!("local seed has already signed a conflicting guild genesis");
+            }
+            return Ok(lock.signature);
+        }
+        let signature = genesis.member_signature(&self.keys)?;
+        let lock = GenesisSignatureLock {
+            format_version: 1,
+            genesis_hash,
+            genesis: genesis.clone(),
+            signature: signature.clone(),
+        };
+        self.control.put_record(
+            "guild-genesis-signature-lock",
+            b"primary",
+            &canonical_bytes(&lock)?,
+        )?;
+        Ok(signature)
+    }
+
+    pub fn install_guild_genesis(
+        &mut self,
+        certificate: QuorumGuildGenesis,
+        mut peers: Vec<GuildPeer>,
+    ) -> Result<()> {
+        certificate.verify()?;
+        peers.sort_by_key(|peer| peer.member.node_id);
+        if peers.len() != 5
+            || peers
+                .iter()
+                .map(|peer| &peer.member)
+                .ne(certificate.genesis.members.iter())
+        {
+            anyhow::bail!("guild endpoint roster does not match certified membership");
+        }
+        for peer in &peers {
+            validate_endpoint_set(peer.member.node_id, &peer.endpoints)?;
+        }
+        let lock: GenesisSignatureLock = decode_canonical(
+            &self
+                .control
+                .get_record("guild-genesis-signature-lock", b"primary")?
+                .context("local node did not sign this guild genesis")?,
+        )?;
+        if lock.genesis_hash != certificate.hash()?
+            || !certificate
+                .signatures
+                .iter()
+                .any(|signature| signature == &lock.signature)
+        {
+            anyhow::bail!("guild certificate does not contain the locked local signature");
+        }
+        let installed = InstalledGuild {
+            format_version: 1,
+            certificate,
+            peers,
+        };
+        if let Some(existing) = self.installed_guild()? {
+            if existing == installed {
+                return Ok(());
+            }
+            anyhow::bail!("this node already has a different installed guild");
+        }
+        self.control
+            .put_record("guild-installed", b"primary", &canonical_bytes(&installed)?)?;
+        Ok(())
+    }
+
+    pub fn guild_summary(&self) -> Result<Option<GuildSummary>> {
+        if let Some(installed) = self.installed_guild()? {
+            return Ok(Some(GuildSummary {
+                format_version: 1,
+                guild_id: installed.certificate.genesis.guild_id,
+                coordinator: installed.certificate.genesis.coordinator,
+                phase: GuildPhase::Active,
+                peers: installed.peers,
+            }));
+        }
+        if let Some(draft) = self.guild_draft()? {
+            return Ok(Some(summary_from_draft(&draft)));
+        }
+        if let Some(pending) = self.pending_guild()? {
+            return Ok(Some(GuildSummary {
+                format_version: 1,
+                guild_id: pending.invite.value.guild_id,
+                coordinator: pending.invite.value.coordinator.node_id,
+                phase: GuildPhase::Joining,
+                peers: vec![
+                    GuildPeer {
+                        member: pending.invite.value.coordinator,
+                        endpoints: pending.invite.value.coordinator_endpoints,
+                    },
+                    pending.local_peer,
+                ],
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn installed_guild_certificate(&self) -> Result<Option<QuorumGuildGenesis>> {
+        Ok(self.installed_guild()?.map(|guild| guild.certificate))
+    }
+
+    fn configured_member(&self) -> Result<Member> {
+        decode_canonical(
+            &self
+                .control
+                .get_record("node-config", b"member")?
+                .context("node failure domain has not been configured")?,
+        )
+        .map_err(Into::into)
+    }
+
+    fn guild_draft(&self) -> Result<Option<GuildDraft>> {
+        self.control
+            .get_record("guild-draft", b"primary")?
+            .map(|bytes| decode_canonical(&bytes).map_err(Into::into))
+            .transpose()
+    }
+
+    fn pending_guild(&self) -> Result<Option<PendingGuild>> {
+        self.control
+            .get_record("guild-pending", b"primary")?
+            .map(|bytes| decode_canonical(&bytes).map_err(Into::into))
+            .transpose()
+    }
+
+    fn installed_guild(&self) -> Result<Option<InstalledGuild>> {
+        self.control
+            .get_record("guild-installed", b"primary")?
+            .map(|bytes| decode_canonical(&bytes).map_err(Into::into))
+            .transpose()
+    }
+
+    fn ensure_no_guild_state(&self) -> Result<()> {
+        if self.guild_draft()?.is_some()
+            || self.pending_guild()?.is_some()
+            || self.installed_guild()?.is_some()
+        {
+            anyhow::bail!("this node already has guild state");
+        }
         Ok(())
     }
 
@@ -1077,6 +1499,21 @@ impl Node {
 }
 
 fn authorize_member(control: &ControlStore, guild_id: &[u8; 32], caller: NodeId) -> Result<()> {
+    if let Some(bytes) = control.get_record("guild-installed", b"primary")? {
+        let installed: InstalledGuild = decode_canonical(&bytes)?;
+        installed.certificate.verify()?;
+        if installed.certificate.genesis.guild_id != *guild_id
+            || !installed
+                .certificate
+                .genesis
+                .members
+                .iter()
+                .any(|member| member.node_id == caller)
+        {
+            anyhow::bail!("caller is not an authorized guild member");
+        }
+        return Ok(());
+    }
     let (_, _, bytes) = control
         .checkpoint_head(guild_id)?
         .context("guild has no locally committed checkpoint")?;
@@ -1092,6 +1529,45 @@ fn authorize_member(control: &ControlStore, guild_id: &[u8; 32], caller: NodeId)
         anyhow::bail!("caller is not an authorized guild member");
     }
     Ok(())
+}
+
+fn summary_from_draft(draft: &GuildDraft) -> GuildSummary {
+    GuildSummary {
+        format_version: 1,
+        guild_id: draft.guild_id,
+        coordinator: draft.coordinator,
+        phase: GuildPhase::Draft,
+        peers: draft.peers.clone(),
+    }
+}
+
+fn validate_endpoint_set(node_id: NodeId, endpoints: &[String]) -> Result<()> {
+    use libp2p::multiaddr::Protocol;
+
+    if endpoints.is_empty() || endpoints.len() > 8 {
+        anyhow::bail!("a guild peer must advertise between one and eight endpoints");
+    }
+    let expected = node_id.libp2p_peer_id()?;
+    let mut unique = std::collections::BTreeSet::new();
+    for endpoint in endpoints {
+        if endpoint.len() > 512 || !unique.insert(endpoint) {
+            anyhow::bail!("guild endpoint is duplicated or too long");
+        }
+        let address: libp2p::Multiaddr = endpoint
+            .parse()
+            .with_context(|| format!("invalid guild endpoint {endpoint}"))?;
+        if address.iter().last() != Some(Protocol::P2p(expected)) {
+            anyhow::bail!("guild endpoint is not bound to its seed-derived peer identity");
+        }
+    }
+    Ok(())
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn checkpoint_page(

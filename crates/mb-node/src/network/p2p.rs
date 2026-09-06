@@ -14,11 +14,15 @@ use libp2p::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-use mb_core::{Member, NodeId, SignedRecord, canonical_bytes};
+use mb_core::{
+    GuildGenesis, GuildInvite, Member, MemberSignature, NodeId, QuorumGuildGenesis, SignedRecord,
+    canonical_bytes,
+};
 
 use super::{
-    Node, NodeServerConfig, NodeService, PEER_RESPONSE_DOMAIN, PeerRequest, PeerRequestEnvelope,
-    PeerResponse, PeerResponseEnvelope, make_peer_request, process_peer_request,
+    GuildPeer, Node, NodeServerConfig, NodeService, PEER_RESPONSE_DOMAIN, PeerRequest,
+    PeerRequestEnvelope, PeerResponse, PeerResponseEnvelope, make_peer_request,
+    process_peer_request,
 };
 
 const P2P_PROTOCOL: StreamProtocol = StreamProtocol::new("/mutualbackup/peer/1");
@@ -52,6 +56,7 @@ pub struct P2pPeerProfile {
 pub struct P2pStatus {
     pub peer_id: String,
     pub listen_addresses: Vec<String>,
+    pub advertised_addresses: Vec<String>,
     pub connected_peers: Vec<String>,
 }
 
@@ -76,6 +81,7 @@ pub struct P2pEventLoop {
     pending_dht: HashMap<kad::QueryId, PendingDht>,
     service: Arc<NodeService>,
     server_config: NodeServerConfig,
+    advertised_addresses: Vec<Multiaddr>,
 }
 
 #[derive(NetworkBehaviour)]
@@ -274,6 +280,7 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
             pending_dht: HashMap::new(),
             service,
             server_config,
+            advertised_addresses: config.external_addresses,
         },
     ))
 }
@@ -306,6 +313,67 @@ impl P2pClient {
             member: profile.member,
             endpoint: profile.endpoint,
         })
+    }
+
+    pub async fn join_guild(
+        &self,
+        coordinator: NodeId,
+        invite: SignedRecord<GuildInvite>,
+        peer: GuildPeer,
+    ) -> Result<()> {
+        let response = self
+            .call(
+                coordinator,
+                PeerRequest::JoinGuild {
+                    invite: Box::new(invite),
+                    peer,
+                },
+            )
+            .await?;
+        if !matches!(response, PeerResponse::Ack) {
+            bail!("peer returned the wrong response to guild join request");
+        }
+        Ok(())
+    }
+
+    pub async fn propose_guild_genesis(
+        &self,
+        peer: NodeId,
+        genesis: GuildGenesis,
+    ) -> Result<MemberSignature> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::ProposeGuildGenesis {
+                    genesis: Box::new(genesis),
+                },
+            )
+            .await?;
+        let PeerResponse::GuildGenesisSignature(signature) = response else {
+            bail!("peer returned the wrong response to guild genesis proposal");
+        };
+        Ok(signature)
+    }
+
+    pub async fn install_guild_genesis(
+        &self,
+        peer: NodeId,
+        certificate: QuorumGuildGenesis,
+        peers: Vec<GuildPeer>,
+    ) -> Result<()> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::InstallGuildGenesis {
+                    certificate: Box::new(certificate),
+                    peers,
+                },
+            )
+            .await?;
+        if !matches!(response, PeerResponse::Ack) {
+            bail!("peer returned the wrong response to guild genesis installation");
+        }
+        Ok(())
     }
 
     pub async fn status(&self) -> Result<P2pStatus> {
@@ -466,6 +534,15 @@ impl P2pEventLoop {
                     .map(ToString::to_string)
                     .collect::<Vec<_>>();
                 listen_addresses.sort();
+                let mut advertised_addresses = if self.advertised_addresses.is_empty() {
+                    listen_addresses.clone()
+                } else {
+                    self.advertised_addresses
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect()
+                };
+                advertised_addresses.sort();
                 let mut connected_peers = self
                     .swarm
                     .connected_peers()
@@ -475,6 +552,7 @@ impl P2pEventLoop {
                 let _ = response.send(P2pStatus {
                     peer_id: self.swarm.local_peer_id().to_string(),
                     listen_addresses,
+                    advertised_addresses,
                     connected_peers,
                 });
             }
@@ -803,6 +881,12 @@ mod tests {
         panic!("libp2p swarm did not start listening");
     }
 
+    fn peer_endpoint(client: &P2pClient, address: Multiaddr) -> String {
+        address
+            .with(libp2p::multiaddr::Protocol::P2p(client.local_peer_id))
+            .to_string()
+    }
+
     #[tokio::test]
     async fn quic_transport_uses_the_seed_identity_for_application_requests() {
         let temp = tempfile::tempdir().unwrap();
@@ -849,5 +933,118 @@ mod tests {
         second_client.shutdown().await.unwrap();
         first_task.await.unwrap().unwrap();
         second_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn five_peers_install_and_reopen_one_unanimous_guild_genesis() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds = (81_u8..=85)
+            .map(|value| Seed::from_bytes([value; 32]))
+            .collect::<Vec<_>>();
+        let mut nodes = Vec::new();
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for (index, seed) in seeds.iter().cloned().enumerate() {
+            let node = Node::open(temp.path().join(format!("node-{index}")), seed).unwrap();
+            let node_id = node.keys().node_id();
+            let node = Arc::new(Mutex::new(node));
+            let (client, event_loop) = build_p2p(node.clone(), config(node_id)).unwrap();
+            nodes.push(node);
+            clients.push(client);
+            tasks.push(tokio::spawn(event_loop.run()));
+        }
+
+        let addresses = futures::future::join_all(clients.iter().map(listening_address)).await;
+        let endpoints = clients
+            .iter()
+            .zip(addresses.iter().cloned())
+            .map(|(client, address)| peer_endpoint(client, address))
+            .collect::<Vec<_>>();
+        let coordinator_id = nodes[0].lock().unwrap().keys().node_id();
+        nodes[0]
+            .lock()
+            .unwrap()
+            .create_guild(vec![endpoints[0].clone()])
+            .unwrap();
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        for index in 1..5 {
+            let invite = nodes[0]
+                .lock()
+                .unwrap()
+                .issue_guild_invite(vec![endpoints[0].clone()], expires)
+                .unwrap();
+            let local_peer = nodes[index]
+                .lock()
+                .unwrap()
+                .begin_join_guild(invite.clone(), vec![endpoints[index].clone()])
+                .unwrap();
+            clients[index]
+                .add_peer_address(coordinator_id, addresses[0].clone())
+                .await
+                .unwrap();
+            clients[index]
+                .join_guild(coordinator_id, invite, local_peer)
+                .await
+                .unwrap();
+        }
+
+        let (genesis, peers) = nodes[0].lock().unwrap().proposed_guild_genesis().unwrap();
+        let mut signatures = vec![
+            nodes[0]
+                .lock()
+                .unwrap()
+                .sign_guild_genesis(&genesis)
+                .unwrap(),
+        ];
+        for index in 1..5 {
+            let peer_id = nodes[index].lock().unwrap().keys().node_id();
+            clients[0]
+                .add_peer_address(peer_id, addresses[index].clone())
+                .await
+                .unwrap();
+            signatures.push(
+                clients[0]
+                    .propose_guild_genesis(peer_id, genesis.clone())
+                    .await
+                    .unwrap(),
+            );
+        }
+        signatures.sort_by_key(|signature| signature.signer);
+        let certificate = QuorumGuildGenesis {
+            genesis,
+            signatures,
+        };
+        certificate.verify().unwrap();
+        for node in nodes.iter().skip(1) {
+            let peer_id = node.lock().unwrap().keys().node_id();
+            clients[0]
+                .install_guild_genesis(peer_id, certificate.clone(), peers.clone())
+                .await
+                .unwrap();
+        }
+        nodes[0]
+            .lock()
+            .unwrap()
+            .install_guild_genesis(certificate.clone(), peers)
+            .unwrap();
+
+        for client in &clients {
+            client.shutdown().await.unwrap();
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        drop(clients);
+        drop(nodes);
+        for (index, seed) in seeds.into_iter().enumerate() {
+            let node = Node::open(temp.path().join(format!("node-{index}")), seed).unwrap();
+            let reopened = node.installed_guild_certificate().unwrap().unwrap();
+            assert_eq!(reopened, certificate);
+            reopened.verify().unwrap();
+        }
     }
 }

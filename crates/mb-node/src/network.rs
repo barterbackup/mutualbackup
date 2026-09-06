@@ -7,12 +7,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, stream::FuturesUnordered};
 use mb_core::{
-    CodingGroup, GuildCheckpoint, InformationRole, KeyMaterial, Member, MemberSignature, NodeId,
-    ParityRole, QuorumCheckpoint, RecoveryLocator, SealedRecoveryRecord, SectorId, SectorRef, Seed,
-    ShardRole, SignedRecord, UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES,
-    V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS,
-    V1_SECTOR_SIZE, canonical_bytes, decode_canonical, encode_3_2, open_recovery_record,
-    reconstruct_3_2, sector_root,
+    CodingGroup, GuildCheckpoint, GuildGenesis, GuildInvite, InformationRole, KeyMaterial, Member,
+    MemberSignature, NodeId, ParityRole, QuorumCheckpoint, QuorumGuildGenesis, RecoveryLocator,
+    SealedRecoveryRecord, SectorId, SectorRef, Seed, ShardRole, SignedRecord, UserRevision,
+    V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS,
+    V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, canonical_bytes, decode_canonical,
+    encode_3_2, open_recovery_record, reconstruct_3_2, sector_root,
 };
 use mb_store::ParityObject;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -22,7 +22,7 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::{
-    Node,
+    GuildPeer, Node,
     node::{NodeReader, NodeReaderConfig},
 };
 
@@ -67,6 +67,17 @@ struct PeerProfile {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum PeerRequest {
     Profile,
+    JoinGuild {
+        invite: Box<SignedRecord<GuildInvite>>,
+        peer: GuildPeer,
+    },
+    ProposeGuildGenesis {
+        genesis: Box<GuildGenesis>,
+    },
+    InstallGuildGenesis {
+        certificate: Box<QuorumGuildGenesis>,
+        peers: Vec<GuildPeer>,
+    },
     BeginCommit {
         intent_id: [u8; 16],
         plan_hash: [u8; 32],
@@ -179,6 +190,9 @@ impl PeerRequest {
             | Self::GetPreparedRevisionPage { .. }
             | Self::GetCheckpointPage { .. } => None,
             Self::BeginCommit { .. } => Some("begin-commit"),
+            Self::JoinGuild { .. } => Some("join-guild"),
+            Self::ProposeGuildGenesis { .. } => Some("propose-guild-genesis"),
+            Self::InstallGuildGenesis { .. } => Some("install-guild-genesis"),
             Self::PrepareSource { .. } => Some("prepare-source"),
             Self::EnsureFiller { .. } => Some("ensure-filler"),
             Self::PublishParity { .. } => Some("publish-parity"),
@@ -194,6 +208,9 @@ impl PeerRequest {
     fn guild_scope(&self) -> Option<[u8; 32]> {
         match self {
             Self::Profile | Self::BeginCommit { .. } => None,
+            Self::JoinGuild { invite, .. } => Some(invite.value.guild_id),
+            Self::ProposeGuildGenesis { genesis } => Some(genesis.guild_id),
+            Self::InstallGuildGenesis { certificate, .. } => Some(certificate.genesis.guild_id),
             Self::PrepareSource { guild_id, .. }
             | Self::GetPreparedRevisionPage { guild_id, .. }
             | Self::EnsureFiller { guild_id, .. }
@@ -245,6 +262,7 @@ enum PeerResponse {
     },
     Bytes(Vec<u8>),
     CheckpointSignature(MemberSignature),
+    GuildGenesisSignature(MemberSignature),
     CheckpointPage {
         total_pages: u32,
         page_hash: [u8; 32],
@@ -755,9 +773,18 @@ fn process_peer_request(
             &request,
             PeerRequest::AuthorizeRecoveryPublisher { publisher, .. } if *publisher == caller
         );
+        let guild_onboarding = match &request {
+            PeerRequest::JoinGuild { peer, .. } => peer.member.node_id == caller,
+            PeerRequest::ProposeGuildGenesis { genesis } => genesis.coordinator == caller,
+            PeerRequest::InstallGuildGenesis { certificate, .. } => {
+                certificate.genesis.coordinator == caller
+            }
+            _ => false,
+        };
         if mutation_kind.is_some()
             && caller != config.trusted_coordinator
             && !self_authorized_admission
+            && !guild_onboarding
         {
             bail!("caller is not the configured guild coordinator");
         }
@@ -932,6 +959,17 @@ fn execute_peer_request(
             member: node.member(config.failure_domain.clone()),
             endpoint: config.public_endpoint.clone(),
         })),
+        PeerRequest::JoinGuild { invite, peer } => {
+            node.accept_guild_join(peer.member.node_id, &invite, peer)?;
+            Ok(PeerResponse::Ack)
+        }
+        PeerRequest::ProposeGuildGenesis { genesis } => Ok(PeerResponse::GuildGenesisSignature(
+            node.sign_guild_genesis(&genesis)?,
+        )),
+        PeerRequest::InstallGuildGenesis { certificate, peers } => {
+            node.install_guild_genesis(*certificate, peers)?;
+            Ok(PeerResponse::Ack)
+        }
         PeerRequest::BeginCommit {
             intent_id,
             plan_hash,

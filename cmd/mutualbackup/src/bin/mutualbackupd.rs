@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
     println!("control socket: {}", config.control_socket.display());
 
     tokio::select! {
-        result = serve_local_control(node, &config.control_socket) => result,
+        result = serve_local_control(node, p2p_client, &config.control_socket) => result,
         result = p2p_event_loop.run() => result,
         result = tokio::signal::ctrl_c() => {
             result?;

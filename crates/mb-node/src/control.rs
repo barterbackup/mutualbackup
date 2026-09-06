@@ -6,13 +6,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
-use mb_core::NodeId;
+use libp2p::multiaddr::Protocol;
+use libp2p::{Multiaddr, PeerId};
+use mb_core::{GuildInvite, NodeId, canonical_bytes};
+use mb_core::{QuorumGuildGenesis, SignedRecord, decode_canonical};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
 
-use crate::Node;
+use crate::{GuildSummary, Node, P2pClient};
 
 const MAX_LOCAL_FRAME_BYTES: usize = 1024 * 1024;
 
@@ -37,16 +40,30 @@ pub struct NodeStatus {
 pub enum LocalRequest {
     Status,
     AddRoot { path: PathBuf },
+    GuildStatus,
+    GuildCreate,
+    GuildInvite,
+    GuildJoin { token: String },
+    GuildFinalize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum LocalResponse {
     Status(NodeStatus),
     RootAdded(ProtectedRoot),
+    Guild(Option<GuildSummary>),
+    GuildInvite {
+        token: String,
+        expires_at_unix_seconds: u64,
+    },
     Error(String),
 }
 
-pub async fn serve_local_control(node: Arc<Mutex<Node>>, socket_path: &Path) -> Result<()> {
+pub async fn serve_local_control(
+    node: Arc<Mutex<Node>>,
+    p2p: P2pClient,
+    socket_path: &Path,
+) -> Result<()> {
     let parent = socket_path
         .parent()
         .context("control socket must have a parent directory")?;
@@ -106,8 +123,9 @@ pub async fn serve_local_control(node: Arc<Mutex<Node>>, socket_path: &Path) -> 
     loop {
         let (stream, _) = listener.accept().await?;
         let node = node.clone();
+        let p2p = p2p.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(node, stream).await {
+            if let Err(error) = handle_connection(node, p2p, stream).await {
                 tracing::warn!(%error, "local control request failed");
             }
         });
@@ -129,23 +147,191 @@ pub async fn local_control_call(
     Ok(response)
 }
 
-async fn handle_connection(node: Arc<Mutex<Node>>, mut stream: UnixStream) -> Result<()> {
+async fn handle_connection(
+    node: Arc<Mutex<Node>>,
+    p2p: P2pClient,
+    mut stream: UnixStream,
+) -> Result<()> {
     let request: LocalRequest = read_frame(&mut stream).await?;
-    let response = tokio::task::spawn_blocking(move || {
+    let response = handle_request(node, p2p, request)
+        .await
+        .unwrap_or_else(|error| LocalResponse::Error(format!("{error:#}")));
+    write_frame(&mut stream, &response).await
+}
+
+async fn handle_request(
+    node: Arc<Mutex<Node>>,
+    p2p: P2pClient,
+    request: LocalRequest,
+) -> Result<LocalResponse> {
+    match request {
+        LocalRequest::Status => {
+            blocking_node(node, |node| node.status().map(LocalResponse::Status)).await
+        }
+        LocalRequest::AddRoot { path } => {
+            blocking_node(node, move |node| {
+                node.add_protected_root(&path).map(LocalResponse::RootAdded)
+            })
+            .await
+        }
+        LocalRequest::GuildStatus => {
+            blocking_node(node, |node| node.guild_summary().map(LocalResponse::Guild)).await
+        }
+        LocalRequest::GuildCreate => {
+            let endpoints = local_endpoints(&p2p).await?;
+            blocking_node(node, move |node| {
+                node.create_guild(endpoints)
+                    .map(|guild| LocalResponse::Guild(Some(guild)))
+            })
+            .await
+        }
+        LocalRequest::GuildInvite => {
+            let endpoints = local_endpoints(&p2p).await?;
+            let expires_at_unix_seconds = unix_seconds()
+                .checked_add(7 * 24 * 60 * 60)
+                .context("clock overflow while creating invitation")?;
+            let invite = blocking_node(node, move |node| {
+                node.issue_guild_invite(endpoints, expires_at_unix_seconds)
+            })
+            .await?;
+            Ok(LocalResponse::GuildInvite {
+                token: hex::encode(canonical_bytes(&invite)?),
+                expires_at_unix_seconds,
+            })
+        }
+        LocalRequest::GuildJoin { token } => {
+            let bytes = hex::decode(token).context("guild invitation must be hexadecimal")?;
+            let invite: SignedRecord<GuildInvite> =
+                decode_canonical(&bytes).context("guild invitation has invalid encoding")?;
+            let coordinator = invite.value.coordinator.clone();
+            let endpoints = local_endpoints(&p2p).await?;
+            let local_peer = blocking_node(node.clone(), {
+                let invite = invite.clone();
+                move |node| node.begin_join_guild(invite, endpoints)
+            })
+            .await?;
+            add_peer_endpoints(
+                &p2p,
+                coordinator.node_id,
+                &invite.value.coordinator_endpoints,
+            )
+            .await?;
+            let profile = p2p.profile(coordinator.node_id).await?;
+            if profile.member != coordinator {
+                bail!("connected coordinator profile differs from the signed invitation");
+            }
+            p2p.join_guild(coordinator.node_id, invite, local_peer)
+                .await?;
+            let guild = blocking_node(node, |node| node.guild_summary()).await?;
+            Ok(LocalResponse::Guild(guild))
+        }
+        LocalRequest::GuildFinalize => {
+            let (genesis, peers, local_signature, local_node) =
+                blocking_node(node.clone(), |node| {
+                    let (genesis, peers) = node.proposed_guild_genesis()?;
+                    let signature = node.sign_guild_genesis(&genesis)?;
+                    let local_node = node.keys().node_id();
+                    Ok((genesis, peers, signature, local_node))
+                })
+                .await?;
+            let mut signatures = vec![local_signature];
+            for peer in peers
+                .iter()
+                .filter(|peer| peer.member.node_id != local_node)
+            {
+                add_peer_endpoints(&p2p, peer.member.node_id, &peer.endpoints).await?;
+                signatures.push(
+                    p2p.propose_guild_genesis(peer.member.node_id, genesis.clone())
+                        .await?,
+                );
+            }
+            signatures.sort_by_key(|signature| signature.signer);
+            let certificate = QuorumGuildGenesis {
+                genesis,
+                signatures,
+            };
+            certificate.verify()?;
+            for peer in peers
+                .iter()
+                .filter(|peer| peer.member.node_id != local_node)
+            {
+                p2p.install_guild_genesis(peer.member.node_id, certificate.clone(), peers.clone())
+                    .await?;
+            }
+            blocking_node(node, move |node| {
+                node.install_guild_genesis(certificate, peers)?;
+                node.guild_summary().map(LocalResponse::Guild)
+            })
+            .await
+        }
+    }
+}
+
+async fn blocking_node<T, F>(node: Arc<Mutex<Node>>, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Node) -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
         let mut node = node
             .lock()
             .map_err(|_| anyhow::anyhow!("node state lock is poisoned"))?;
-        match request {
-            LocalRequest::Status => node.status().map(LocalResponse::Status),
-            LocalRequest::AddRoot { path } => {
-                node.add_protected_root(&path).map(LocalResponse::RootAdded)
-            }
-        }
+        operation(&mut node)
     })
     .await
     .context("local control worker failed")?
-    .unwrap_or_else(|error| LocalResponse::Error(format!("{error:#}")));
-    write_frame(&mut stream, &response).await
+}
+
+async fn local_endpoints(p2p: &P2pClient) -> Result<Vec<String>> {
+    let status = p2p.status().await?;
+    let peer_id: PeerId = status
+        .peer_id
+        .parse()
+        .context("daemon has an invalid local libp2p peer ID")?;
+    let mut endpoints = Vec::new();
+    for value in status.advertised_addresses {
+        let mut address: Multiaddr = value
+            .parse()
+            .with_context(|| format!("invalid local advertised address {value}"))?;
+        if address.iter().any(|protocol| match protocol {
+            Protocol::Ip4(address) => address.is_unspecified(),
+            Protocol::Ip6(address) => address.is_unspecified(),
+            _ => false,
+        }) {
+            continue;
+        }
+        match address.iter().last() {
+            Some(Protocol::P2p(actual)) if actual == peer_id => {}
+            Some(Protocol::P2p(_)) => {
+                bail!("local advertised address contains another peer identity")
+            }
+            _ => address.push(Protocol::P2p(peer_id)),
+        }
+        endpoints.push(address.to_string());
+    }
+    endpoints.sort();
+    endpoints.dedup();
+    if endpoints.is_empty() {
+        bail!("daemon has no usable advertised endpoint; configure a concrete --external-address");
+    }
+    Ok(endpoints)
+}
+
+async fn add_peer_endpoints(p2p: &P2pClient, peer: NodeId, endpoints: &[String]) -> Result<()> {
+    for endpoint in endpoints {
+        let address: Multiaddr = endpoint
+            .parse()
+            .with_context(|| format!("invalid peer endpoint {endpoint}"))?;
+        p2p.add_peer_address(peer, address).await?;
+    }
+    Ok(())
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 async fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {

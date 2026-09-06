@@ -18,7 +18,7 @@ pub use network::{
     recover_member_and_republish_over_network, recover_member_over_network, recover_over_network,
     serve_directory, serve_node,
 };
-pub use node::{Node, RecoveredShards};
+pub use node::{GuildPeer, GuildPhase, GuildSummary, Node, RecoveredShards};
 pub use snapshot::{
     PrivateDataExtent, PrivateEntry, PrivateMetadata, restore_revision,
     restore_revision_from_source,

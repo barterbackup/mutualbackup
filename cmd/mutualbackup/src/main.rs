@@ -69,6 +69,11 @@ enum Command {
         #[command(subcommand)]
         command: RootCommand,
     },
+    /// Create, join, and inspect the fixed five-member prototype guild.
+    Guild {
+        #[command(subcommand)]
+        command: GuildCommand,
+    },
     /// Run a real five-node, SQLCipher-backed, seed-only recovery demonstration.
     DemoSeedRecovery {
         /// Existing directory on a reflink-capable filesystem. The command
@@ -155,6 +160,20 @@ enum RootCommand {
     Add { path: PathBuf },
 }
 
+#[derive(Debug, Subcommand)]
+enum GuildCommand {
+    /// Create a new local guild draft with this node as coordinator.
+    Create,
+    /// Issue a signed, single-use invitation valid for seven days.
+    Invite,
+    /// Join the coordinator's draft using a signed invitation token.
+    Join { token: String },
+    /// Collect all five signatures and install the immutable guild genesis.
+    Finalize,
+    /// Show local guild membership and onboarding phase.
+    Status,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -238,6 +257,38 @@ async fn main() -> Result<()> {
             };
             println!("protected root registered: {}", root.path.display());
             println!("root id: {}", root.root_id);
+        }
+        Command::Guild { command } => {
+            let request = match command {
+                GuildCommand::Create => LocalRequest::GuildCreate,
+                GuildCommand::Invite => LocalRequest::GuildInvite,
+                GuildCommand::Join { token } => LocalRequest::GuildJoin { token },
+                GuildCommand::Finalize => LocalRequest::GuildFinalize,
+                GuildCommand::Status => LocalRequest::GuildStatus,
+            };
+            match local_control_call(required_socket(&cli.socket)?, &request).await? {
+                LocalResponse::Guild(Some(guild)) => {
+                    println!("guild id:    {}", hex::encode(guild.guild_id));
+                    println!("coordinator: {}", guild.coordinator);
+                    println!("phase:       {:?}", guild.phase);
+                    println!("members:     {} of 5", guild.peers.len());
+                    for peer in guild.peers {
+                        println!(
+                            "member:      {} [{}]",
+                            peer.member.node_id, peer.member.failure_domain
+                        );
+                    }
+                }
+                LocalResponse::Guild(None) => println!("guild: (not configured)"),
+                LocalResponse::GuildInvite {
+                    token,
+                    expires_at_unix_seconds,
+                } => {
+                    println!("invitation: {token}");
+                    println!("expires unix: {expires_at_unix_seconds}");
+                }
+                _ => bail!("daemon returned the wrong response to guild request"),
+            }
         }
         Command::DemoSeedRecovery { work_dir } => demo_seed_recovery(work_dir)?,
         Command::ServeDirectory { listen } => {
