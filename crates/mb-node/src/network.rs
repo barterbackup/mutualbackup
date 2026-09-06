@@ -1,63 +1,95 @@
+#[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::net::SocketAddr;
+#[cfg(test)]
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+#[cfg(test)]
 use futures::{StreamExt, stream::FuturesUnordered};
 use mb_core::{
-    CodingGroup, GuildCheckpoint, GuildGenesis, GuildInvite, InformationRole, KeyMaterial, Member,
-    MemberSignature, NodeId, ParityRole, QuorumCheckpoint, QuorumGuildGenesis, RecoveryLocator,
-    SealedRecoveryRecord, SectorId, SectorRef, Seed, ShardRole, SignedRecord,
-    StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES,
-    V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS,
-    V1_SECTOR_SIZE, canonical_bytes, decode_canonical, encode_3_2, open_recovery_record,
-    reconstruct_3_2, sector_root,
+    CodingGroup, GuildGenesis, GuildInvite, KeyMaterial, Member, MemberSignature, NodeId,
+    QuorumGuildGenesis, SectorId, SectorRef, SignedRecord, StorageAcknowledgement,
+    V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, canonical_bytes,
+    decode_canonical,
+};
+#[cfg(test)]
+use mb_core::{
+    GuildCheckpoint, InformationRole, ParityRole, QuorumCheckpoint, RecoveryLocator,
+    SealedRecoveryRecord, Seed, ShardRole, UserRevision, V1_MAX_CODING_GROUPS, V1_RS_DATA_SHARDS,
+    V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, encode_3_2, open_recovery_record, reconstruct_3_2,
+    sector_root,
 };
 use mb_store::ParityObject;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+#[cfg(test)]
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::Semaphore,
+};
 use uuid::Uuid;
 
 use crate::{
-    BackupDescriptor, BackupJob, GuildPeer, Node,
+    BackupDescriptor, BackupJob, DhtSequenceFloors, GuildPeer, Node,
     node::{NodeReader, NodeReaderConfig},
 };
 
 mod p2p;
 pub use p2p::{
-    DhtRecord, DhtRecoveryResult, P2pClient, P2pConfig, P2pEventLoop, P2pPeerProfile, P2pStatus,
-    build_p2p, endpoint_record_key, recover_from_dht, recovery_bundle_key, recovery_mailbox_key,
-    run_coordinator_jobs, run_dht_publications,
+    DhtRecord, DhtRecoveryResult, P2pClient, P2pConfig, P2pEventLoop, P2pPath, P2pPeerProfile,
+    P2pPeerStatus, P2pStatus, build_p2p, endpoint_record_key, recover_from_dht,
+    recovery_bundle_key, recovery_mailbox_key, run_coordinator_jobs, run_dht_publications,
 };
 
+#[cfg(test)]
 const MAX_PEER_FRAME_BYTES: usize = 600 * 1024;
+#[cfg(test)]
 const MAX_DIRECTORY_FRAME_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(test)]
 const MAX_DIRECTORY_REQUEST_BYTES: usize = 72 * 1024;
+#[cfg(test)]
 const MAX_DIRECTORY_RECORD_BYTES: usize = 64 * 1024;
+#[cfg(test)]
 const MAX_DIRECTORY_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(test)]
 const MAX_DIRECTORY_PUBLISHES_PER_MINUTE: u32 = 512;
+#[cfg(test)]
 const MAX_DIRECTORY_WORKING_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(test)]
 const MAX_RECOVERY_SLOTS_PER_SUBJECT: usize = 64;
+#[cfg(test)]
 const HEADER_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
 const BODY_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const PEER_REQUEST_DOMAIN: &[u8] = b"mutualbackup/direct-request/v2";
 const PEER_RESPONSE_DOMAIN: &[u8] = b"mutualbackup/direct-response/v2";
+#[cfg(test)]
 const DIRECTORY_RECORD_DOMAIN: &[u8] = b"mutualbackup/directory-record/v1";
+#[cfg(test)]
 const DIRECTORY_ADMISSION_DOMAIN: &[u8] = b"mutualbackup/directory-admission/v1";
+#[cfg(test)]
 const RECOVERY_POW_ZERO_BYTES: usize = 2;
+#[cfg(test)]
 const RECOVERY_READ_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct NodeServerConfig {
+    #[cfg(test)]
     pub listen: SocketAddr,
     pub public_endpoint: String,
     pub failure_domain: String,
     pub trusted_coordinator: NodeId,
+    #[cfg(test)]
     pub max_connections: usize,
 }
 
@@ -91,10 +123,12 @@ enum PeerRequest {
     GetGuildGenesis {
         guild_id: [u8; 32],
     },
+    #[cfg(test)]
     BeginCommit {
         intent_id: [u8; 16],
         plan_hash: [u8; 32],
     },
+    #[cfg(test)]
     PrepareSource {
         guild_id: [u8; 32],
         source: String,
@@ -147,6 +181,7 @@ enum PeerRequest {
         checkpoint_hash: [u8; 32],
         page_index: u32,
     },
+    #[cfg(test)]
     BuildRecoveryRecord {
         publication_id: [u8; 16],
         subject: Member,
@@ -156,11 +191,13 @@ enum PeerRequest {
         expires_at_unix_seconds: u64,
         admission: Box<SignedRecord<RecoveryPublisherAdmission>>,
     },
+    #[cfg(test)]
     AuthorizeRecoveryPublisher {
         guild_id: [u8; 32],
         publisher: NodeId,
         expires_at_unix_seconds: u64,
     },
+    #[cfg(test)]
     CompleteCommit {
         intent_id: [u8; 16],
         plan_hash: [u8; 32],
@@ -207,32 +244,38 @@ impl PeerRequest {
             | Self::GetCheckpointPage { .. }
             | Self::BackupStatus { .. } => None,
             Self::GetGuildGenesis { .. } => None,
+            #[cfg(test)]
             Self::BeginCommit { .. } => Some("begin-commit"),
             Self::JoinGuild { .. } => Some("join-guild"),
             Self::ProposeGuildGenesis { .. } => Some("propose-guild-genesis"),
             Self::InstallGuildGenesis { .. } => Some("install-guild-genesis"),
             Self::SubmitBackup { .. } => Some("submit-backup"),
+            #[cfg(test)]
             Self::PrepareSource { .. } => Some("prepare-source"),
             Self::EnsureFiller { .. } => Some("ensure-filler"),
             Self::PublishParity { .. } => Some("publish-parity"),
             Self::PutCheckpointPage { .. } => Some("put-checkpoint-page"),
             Self::SignCheckpoint { .. } => Some("sign-checkpoint"),
             Self::FinalizeCheckpoint { .. } => Some("finalize-checkpoint"),
+            #[cfg(test)]
             Self::BuildRecoveryRecord { .. } => Some("build-recovery-record"),
+            #[cfg(test)]
             Self::AuthorizeRecoveryPublisher { .. } => Some("authorize-recovery-publisher"),
+            #[cfg(test)]
             Self::CompleteCommit { .. } => Some("complete-commit"),
         }
     }
 
     fn guild_scope(&self) -> Option<[u8; 32]> {
         match self {
-            Self::Profile | Self::BeginCommit { .. } => None,
+            Self::Profile => None,
+            #[cfg(test)]
+            Self::BeginCommit { .. } => None,
             Self::JoinGuild { invite, .. } => Some(invite.value.guild_id),
             Self::ProposeGuildGenesis { genesis } => Some(genesis.guild_id),
             Self::InstallGuildGenesis { certificate, .. } => Some(certificate.genesis.guild_id),
             Self::SubmitBackup { descriptor } => Some(descriptor.guild_id),
-            Self::PrepareSource { guild_id, .. }
-            | Self::GetPreparedRevisionPage { guild_id, .. }
+            Self::GetPreparedRevisionPage { guild_id, .. }
             | Self::EnsureFiller { guild_id, .. }
             | Self::GetSector { guild_id, .. }
             | Self::GetParity { guild_id, .. }
@@ -240,10 +283,12 @@ impl PeerRequest {
             | Self::SignCheckpoint { guild_id, .. }
             | Self::FinalizeCheckpoint { guild_id, .. }
             | Self::GetCheckpointPage { guild_id, .. }
-            | Self::BuildRecoveryRecord { guild_id, .. }
-            | Self::AuthorizeRecoveryPublisher { guild_id, .. }
-            | Self::CompleteCommit { guild_id, .. }
             | Self::BackupStatus { guild_id, .. } => Some(*guild_id),
+            #[cfg(test)]
+            Self::PrepareSource { guild_id, .. }
+            | Self::CompleteCommit { guild_id, .. }
+            | Self::BuildRecoveryRecord { guild_id, .. }
+            | Self::AuthorizeRecoveryPublisher { guild_id, .. } => Some(*guild_id),
             Self::GetGuildGenesis { guild_id } => Some(*guild_id),
             Self::PublishParity { object, .. } => Some(object.guild_id),
         }
@@ -265,9 +310,11 @@ struct PeerRequestEnvelope {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum PeerResponse {
     Profile(PeerProfile),
+    #[cfg(test)]
     CommitStarted {
         guild_id: [u8; 32],
     },
+    #[cfg(test)]
     PreparedRevision {
         revision_id: Uuid,
         total_pages: u32,
@@ -293,7 +340,9 @@ enum PeerResponse {
         page_hash: [u8; 32],
         bytes: Vec<u8>,
     },
+    #[cfg(test)]
     RecoveryRecord(Box<SignedRecord<PublishedRecoveryRecord>>),
+    #[cfg(test)]
     RecoveryAdmission(SignedRecord<RecoveryPublisherAdmission>),
     Ack,
 }
@@ -313,6 +362,7 @@ struct CachedOperation {
     response: PeerResponse,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct PublishedRecoveryRecord {
     format_version: u16,
@@ -326,6 +376,7 @@ struct PublishedRecoveryRecord {
     pow_nonce: u64,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct RecoveryPublisherAdmission {
     format_version: u16,
@@ -335,12 +386,14 @@ struct RecoveryPublisherAdmission {
     expires_at_unix_seconds: u64,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum DirectoryRequest {
     Publish(Box<SignedRecord<PublishedRecoveryRecord>>),
     Lookup { subject: NodeId },
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum DirectoryResponse {
     Records(Vec<SignedRecord<PublishedRecoveryRecord>>),
@@ -348,15 +401,20 @@ enum DirectoryResponse {
     Error(String),
 }
 
+#[cfg(test)]
 type RecoverySlotKey = ([u8; 32], NodeId);
+#[cfg(test)]
 struct StoredRecoveryRecord {
     record: SignedRecord<PublishedRecoveryRecord>,
     byte_len: usize,
     admission_order: u64,
 }
+#[cfg(test)]
 type PublisherRecords = BTreeMap<RecoverySlotKey, StoredRecoveryRecord>;
+#[cfg(test)]
 type RecoveryDirectoryRecords = BTreeMap<NodeId, PublisherRecords>;
 
+#[cfg(test)]
 #[derive(Default)]
 struct RecoveryDirectoryState {
     records: RecoveryDirectoryRecords,
@@ -366,6 +424,7 @@ struct RecoveryDirectoryState {
     rate_window_publishes: u32,
 }
 
+#[cfg(test)]
 #[derive(Clone, Default)]
 pub struct DirectoryState {
     inner: Arc<Mutex<RecoveryDirectoryState>>,
@@ -396,6 +455,7 @@ impl NodeService {
     }
 }
 
+#[cfg(test)]
 fn directory_records_fit(
     publishers: &PublisherRecords,
     candidate: &SignedRecord<PublishedRecoveryRecord>,
@@ -410,6 +470,7 @@ fn directory_records_fit(
     Ok(canonical_bytes(&DirectoryResponse::Records(records))?.len() <= MAX_DIRECTORY_FRAME_BYTES)
 }
 
+#[cfg(test)]
 impl RecoveryDirectoryState {
     fn publish(&mut self, record: SignedRecord<PublishedRecoveryRecord>) -> Result<()> {
         let now = unix_seconds();
@@ -530,6 +591,7 @@ impl RecoveryDirectoryState {
     }
 }
 
+#[cfg(test)]
 fn recovery_slot(subject: NodeId, publisher: NodeId, guild_id: [u8; 32]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key("mutualbackup recovery directory slot v1");
     hasher.update(&subject.0);
@@ -550,6 +612,7 @@ pub(super) fn storage_operation_id(group_id: &[u8; 32], shard_index: u8) -> [u8;
     id
 }
 
+#[cfg(test)]
 fn validate_recovery_admission(
     admission: &SignedRecord<RecoveryPublisherAdmission>,
     subject: NodeId,
@@ -571,6 +634,7 @@ fn validate_recovery_admission(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_published_recovery_record(
     record: &SignedRecord<PublishedRecoveryRecord>,
 ) -> Result<()> {
@@ -594,6 +658,7 @@ fn validate_published_recovery_record(
     Ok(())
 }
 
+#[cfg(test)]
 fn recovery_pow_commitment(record: &PublishedRecoveryRecord) -> Result<[u8; 32]> {
     let mut hasher = blake3::Hasher::new_derive_key("mutualbackup recovery directory work v1");
     hasher.update(&canonical_bytes(&(
@@ -609,6 +674,7 @@ fn recovery_pow_commitment(record: &PublishedRecoveryRecord) -> Result<[u8; 32]>
     Ok(*hasher.finalize().as_bytes())
 }
 
+#[cfg(test)]
 fn recovery_pow_digest(commitment: [u8; 32], nonce: u64) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key("mutualbackup recovery directory nonce v1");
     hasher.update(&commitment);
@@ -616,6 +682,7 @@ fn recovery_pow_digest(commitment: [u8; 32], nonce: u64) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+#[cfg(test)]
 fn valid_recovery_pow(record: &PublishedRecoveryRecord) -> Result<bool> {
     let digest = recovery_pow_digest(recovery_pow_commitment(record)?, record.pow_nonce);
     Ok(digest[..RECOVERY_POW_ZERO_BYTES]
@@ -623,6 +690,7 @@ fn valid_recovery_pow(record: &PublishedRecoveryRecord) -> Result<bool> {
         .all(|byte| *byte == 0))
 }
 
+#[cfg(test)]
 fn solve_recovery_pow(record: &mut PublishedRecoveryRecord) -> Result<()> {
     let commitment = recovery_pow_commitment(record)?;
     for nonce in 0..=u64::MAX {
@@ -637,6 +705,7 @@ fn solve_recovery_pow(record: &mut PublishedRecoveryRecord) -> Result<()> {
     bail!("recovery-directory proof-of-work nonce space was exhausted")
 }
 
+#[cfg(test)]
 pub async fn serve_node(node: Arc<Mutex<Node>>, config: NodeServerConfig) -> Result<()> {
     if config.failure_domain.is_empty() || config.max_connections == 0 {
         bail!("invalid node server configuration");
@@ -669,6 +738,7 @@ pub async fn serve_node(node: Arc<Mutex<Node>>, config: NodeServerConfig) -> Res
     }
 }
 
+#[cfg(test)]
 pub async fn serve_directory(listen: SocketAddr, state: DirectoryState) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
     let permits = Arc::new(Semaphore::new(128));
@@ -748,6 +818,7 @@ pub async fn serve_directory(listen: SocketAddr, state: DirectoryState) -> Resul
     }
 }
 
+#[cfg(test)]
 async fn handle_peer_connection(
     mut stream: TcpStream,
     service: Arc<NodeService>,
@@ -805,11 +876,15 @@ fn process_peer_request(
 
         let mutation_kind = request.mutation_kind();
         let mut node_guard = service.writer.lock().map_err(lock_error)?;
+        #[cfg(test)]
         let local_node_id = node_guard.keys().node_id();
+        #[cfg(test)]
         let self_authorized_admission = matches!(
             &request,
             PeerRequest::AuthorizeRecoveryPublisher { publisher, .. } if *publisher == caller
         );
+        #[cfg(not(test))]
+        let self_authorized_admission = false;
         let guild_onboarding = match &request {
             PeerRequest::JoinGuild { peer, .. } => peer.member.node_id == caller,
             PeerRequest::ProposeGuildGenesis { genesis } => genesis.coordinator == caller,
@@ -837,6 +912,7 @@ fn process_peer_request(
         {
             bail!("caller is not the configured guild coordinator");
         }
+        #[cfg(test)]
         if matches!(
             &request,
             PeerRequest::BeginCommit { .. }
@@ -920,6 +996,7 @@ fn validate_request_envelope(
         _ if envelope.recipient == Some(local_node) => {}
         _ => bail!("request is not addressed to this node"),
     }
+    #[cfg(test)]
     if let PeerRequest::PrepareSource { ref source, .. } = envelope.request
         && source.len() > 4096
     {
@@ -1006,7 +1083,7 @@ fn execute_read_request(
 fn execute_peer_request(
     node: &mut Node,
     config: &NodeServerConfig,
-    request_id: [u8; 16],
+    _request_id: [u8; 16],
     caller: NodeId,
     request: PeerRequest,
 ) -> Result<PeerResponse> {
@@ -1029,19 +1106,21 @@ fn execute_peer_request(
         PeerRequest::SubmitBackup { descriptor } => Ok(PeerResponse::BackupJob(
             node.enqueue_backup(caller, descriptor)?,
         )),
+        #[cfg(test)]
         PeerRequest::BeginCommit {
             intent_id,
             plan_hash,
         } => Ok(PeerResponse::CommitStarted {
             guild_id: node.begin_coordinator_commit(intent_id, plan_hash)?,
         }),
+        #[cfg(test)]
         PeerRequest::PrepareSource {
             guild_id,
             source,
             sequence,
         } => {
             let revision =
-                node.prepare_revision(guild_id, Path::new(&source), sequence, Some(request_id))?;
+                node.prepare_revision(guild_id, Path::new(&source), sequence, Some(_request_id))?;
             let bytes = canonical_bytes(&revision)?;
             let total_pages = checked_catalog_page_count(bytes.len())?;
             Ok(PeerResponse::PreparedRevision {
@@ -1141,6 +1220,7 @@ fn execute_peer_request(
         PeerRequest::GetGuildGenesis { .. } => {
             bail!("guild genesis read was sent to a mutation worker")
         }
+        #[cfg(test)]
         PeerRequest::BuildRecoveryRecord {
             publication_id: _,
             subject,
@@ -1200,6 +1280,7 @@ fn execute_peer_request(
                 node.keys(),
             )?)))
         }
+        #[cfg(test)]
         PeerRequest::AuthorizeRecoveryPublisher {
             guild_id,
             publisher,
@@ -1222,6 +1303,7 @@ fn execute_peer_request(
                 node.keys(),
             )?))
         }
+        #[cfg(test)]
         PeerRequest::CompleteCommit {
             intent_id,
             plan_hash,
@@ -1235,12 +1317,15 @@ fn execute_peer_request(
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 struct RemotePeer {
     endpoint: SocketAddr,
     profile: PeerProfile,
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
+#[allow(dead_code)]
 pub struct NetworkCommitResult {
     pub guild_id: [u8; 32],
     pub checkpoint_hash: [u8; 32],
@@ -1248,16 +1333,20 @@ pub struct NetworkCommitResult {
     pub coding_groups: usize,
 }
 
+#[cfg(test)]
 pub struct NetworkMemberRecovery {
     pub node: Node,
     pub checkpoints: Vec<QuorumCheckpoint>,
 }
 
+#[cfg(test)]
 struct RecoveredGuild {
     checkpoint: QuorumCheckpoint,
     peer_endpoints: BTreeMap<NodeId, SocketAddr>,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub async fn commit_source_over_network(
     coordinator_keys: &KeyMaterial,
     source: &Path,
@@ -1274,6 +1363,7 @@ pub async fn commit_source_over_network(
     .await
 }
 
+#[cfg(test)]
 pub async fn commit_source_over_network_with_intent(
     coordinator_keys: &KeyMaterial,
     source: &Path,
@@ -1667,6 +1757,7 @@ pub async fn commit_source_over_network_with_intent(
     })
 }
 
+#[cfg(test)]
 pub async fn recover_over_network(
     seed: Seed,
     data_dir: &Path,
@@ -1676,6 +1767,8 @@ pub async fn recover_over_network(
     recover_selected_guild_over_network(seed, data_dir, restore_target, directory, None).await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub async fn recover_guild_over_network(
     seed: Seed,
     data_dir: &Path,
@@ -1687,6 +1780,7 @@ pub async fn recover_guild_over_network(
         .await
 }
 
+#[cfg(test)]
 async fn recover_selected_guild_over_network(
     seed: Seed,
     data_dir: &Path,
@@ -1738,6 +1832,7 @@ async fn recover_selected_guild_over_network(
     Ok(node)
 }
 
+#[cfg(test)]
 pub async fn recover_member_over_network(
     seed: Seed,
     data_dir: &Path,
@@ -1750,6 +1845,7 @@ pub async fn recover_member_over_network(
     })
 }
 
+#[cfg(test)]
 pub async fn recover_member_and_republish_over_network(
     seed: Seed,
     data_dir: &Path,
@@ -1843,6 +1939,7 @@ pub async fn recover_member_and_republish_over_network(
     })
 }
 
+#[cfg(test)]
 async fn recover_member_state(
     seed: Seed,
     data_dir: &Path,
@@ -1973,6 +2070,7 @@ async fn recover_member_state(
     Ok((recovered_node, recovered_guilds))
 }
 
+#[cfg(test)]
 async fn recover_network_local_shards(
     mut recovered_node: Node,
     checkpoint: &QuorumCheckpoint,
@@ -2098,6 +2196,7 @@ async fn recover_network_local_shards(
     Ok(recovered_node)
 }
 
+#[cfg(test)]
 async fn run_node_blocking<F>(mut node: Node, operation: F) -> Result<Node>
 where
     F: FnOnce(&mut Node) -> Result<()> + Send + 'static,
@@ -2110,6 +2209,7 @@ where
     .context("node storage worker panicked")?
 }
 
+#[cfg(test)]
 async fn request_filler(
     peer: &RemotePeer,
     keys: &KeyMaterial,
@@ -2148,6 +2248,7 @@ fn checked_catalog_page_count(byte_length: usize) -> Result<u32> {
     Ok(total_pages as u32)
 }
 
+#[cfg(test)]
 async fn fetch_prepared_revision(
     peer: &RemotePeer,
     keys: &KeyMaterial,
@@ -2201,6 +2302,7 @@ async fn fetch_prepared_revision(
     Ok(revision)
 }
 
+#[cfg(test)]
 async fn publish_checkpoint_pages(
     peer: &RemotePeer,
     keys: &KeyMaterial,
@@ -2232,6 +2334,7 @@ async fn publish_checkpoint_pages(
     Ok(())
 }
 
+#[cfg(test)]
 async fn fetch_checkpoint(
     endpoint: SocketAddr,
     publisher: NodeId,
@@ -2285,6 +2388,7 @@ async fn fetch_checkpoint(
     bail!("checkpoint page count exceeds the protocol limit")
 }
 
+#[cfg(test)]
 async fn peer_call(
     endpoint: SocketAddr,
     keys: &KeyMaterial,
@@ -2325,6 +2429,7 @@ fn make_peer_request(
     )?)
 }
 
+#[cfg(test)]
 async fn send_peer_request(
     endpoint: SocketAddr,
     response_recipient: NodeId,
@@ -2353,6 +2458,7 @@ async fn send_peer_request(
         .context("peer request timed out")?
 }
 
+#[cfg(test)]
 async fn peer_call_expected(
     endpoint: SocketAddr,
     expected_signer: NodeId,
@@ -2371,6 +2477,7 @@ async fn peer_call_expected(
     Err(last_error.context("peer request was not attempted")?)
 }
 
+#[cfg(test)]
 fn expect_ack(response: PeerResponse) -> Result<()> {
     if matches!(response, PeerResponse::Ack) {
         Ok(())
@@ -2379,6 +2486,7 @@ fn expect_ack(response: PeerResponse) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 fn expect_storage_ack(response: PeerResponse, holder: NodeId, object: &ParityObject) -> Result<()> {
     let PeerResponse::StorageAcknowledgement(acknowledgement) = response else {
         bail!("peer returned the wrong storage acknowledgement response");
@@ -2399,6 +2507,7 @@ fn expect_storage_ack(response: PeerResponse, holder: NodeId, object: &ParityObj
     Ok(())
 }
 
+#[cfg(test)]
 async fn directory_publish(
     endpoint: SocketAddr,
     record: SignedRecord<PublishedRecoveryRecord>,
@@ -2410,6 +2519,7 @@ async fn directory_publish(
     }
 }
 
+#[cfg(test)]
 async fn directory_lookup(
     endpoint: SocketAddr,
     subject: NodeId,
@@ -2421,6 +2531,7 @@ async fn directory_lookup(
     }
 }
 
+#[cfg(test)]
 async fn directory_call(
     endpoint: SocketAddr,
     request: DirectoryRequest,
@@ -2434,6 +2545,7 @@ async fn directory_call(
     .context("directory request timed out")?
 }
 
+#[cfg(test)]
 async fn write_frame_limited<W: AsyncWrite + Unpin, T: Serialize>(
     writer: &mut W,
     value: &T,
@@ -2449,6 +2561,7 @@ async fn write_frame_limited<W: AsyncWrite + Unpin, T: Serialize>(
     Ok(())
 }
 
+#[cfg(test)]
 async fn write_frame_timed<W: AsyncWrite + Unpin, T: Serialize>(
     writer: &mut W,
     value: &T,
@@ -2459,6 +2572,7 @@ async fn write_frame_timed<W: AsyncWrite + Unpin, T: Serialize>(
         .context("protocol frame write timed out")?
 }
 
+#[cfg(test)]
 async fn read_frame_timed<R: AsyncRead + Unpin, T: DeserializeOwned>(
     reader: &mut R,
     limit: usize,
@@ -2476,6 +2590,7 @@ async fn read_frame_timed<R: AsyncRead + Unpin, T: DeserializeOwned>(
     Ok(decode_canonical(&bytes)?)
 }
 
+#[cfg(test)]
 fn parse_tcp_endpoint(endpoint: &str) -> Result<SocketAddr> {
     endpoint
         .strip_prefix("tcp://")
@@ -2484,6 +2599,7 @@ fn parse_tcp_endpoint(endpoint: &str) -> Result<SocketAddr> {
         .context("invalid direct TCP endpoint")
 }
 
+#[cfg(test)]
 fn validate_advertised_endpoint(endpoint: &str) -> Result<SocketAddr> {
     let address = parse_tcp_endpoint(endpoint)?;
     if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {

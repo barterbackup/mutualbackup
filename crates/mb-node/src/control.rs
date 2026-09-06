@@ -16,8 +16,8 @@ use tokio::net::{UnixListener, UnixStream};
 use uuid::Uuid;
 
 use crate::{
-    BackupJob, BackupJobState, DhtRecoveryResult, GuildSummary, Node, P2pClient, SnapshotInfo,
-    recover_from_dht,
+    BackupJob, BackupJobState, DhtRecoveryResult, GuildSummary, Node, P2pClient, P2pStatus,
+    SnapshotInfo, recover_from_dht,
 };
 
 const MAX_LOCAL_FRAME_BYTES: usize = 1024 * 1024;
@@ -39,6 +39,7 @@ pub struct NodeStatus {
     pub checkpoint_count: u64,
     pub seed_recovery_ready: bool,
     pub root_dirty: bool,
+    pub network: Option<P2pStatus>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -149,6 +150,16 @@ pub async fn serve_local_control(
 
     loop {
         let (stream, _) = listener.accept().await?;
+        let credentials = stream
+            .peer_cred()
+            .context("cannot read local control peer credentials")?;
+        if credentials.uid() != unsafe { libc::geteuid() } {
+            tracing::warn!(
+                peer_uid = credentials.uid(),
+                "rejected local control client owned by another user"
+            );
+            continue;
+        }
         let node = node.clone();
         let p2p = p2p.clone();
         tokio::spawn(async move {
@@ -193,7 +204,9 @@ async fn handle_request(
 ) -> Result<LocalResponse> {
     match request {
         LocalRequest::Status => {
-            blocking_node(node, |node| node.status().map(LocalResponse::Status)).await
+            let mut status = blocking_node(node, |node| node.status()).await?;
+            status.network = Some(p2p.status().await?);
+            Ok(LocalResponse::Status(status))
         }
         LocalRequest::AddRoot { path } => {
             blocking_node(node, move |node| {

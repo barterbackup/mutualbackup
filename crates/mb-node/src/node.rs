@@ -113,6 +113,12 @@ pub struct DhtPublicationSet {
     pub recovery: Vec<SignedRecord<RecoveryBundle>>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DhtSequenceFloors {
+    pub endpoint: u64,
+    pub recovery: BTreeMap<NodeId, u64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct DhtPublicationState {
     format_version: u16,
@@ -340,6 +346,7 @@ impl Node {
             checkpoint_count: self.control.checkpoint_head_certificates()?.len() as u64,
             seed_recovery_ready: self.seed_recovery_ready()?,
             root_dirty: self.root_dirty()?,
+            network: None,
         })
     }
 
@@ -844,6 +851,11 @@ impl Node {
                 "guild-installed".to_owned(),
                 b"primary".to_vec(),
                 canonical_bytes(&installed)?,
+            ),
+            (
+                "dht-recovery-sequence-probe".to_owned(),
+                b"primary".to_vec(),
+                canonical_bytes(&true)?,
             ),
         ])?;
         Ok(())
@@ -1677,6 +1689,7 @@ impl Node {
         &mut self,
         endpoints: Vec<String>,
         expires_at_unix_seconds: u64,
+        sequence_floors: DhtSequenceFloors,
     ) -> Result<Option<DhtPublicationSet>> {
         let Some(installed) = self.installed_guild()? else {
             return Ok(None);
@@ -1731,7 +1744,10 @@ impl Node {
             EndpointRecord {
                 format_version: 1,
                 publisher: local_id,
-                sequence: self.next_recovery_publication_sequence(&endpoint_slot, 1)?,
+                sequence: self.next_recovery_publication_sequence(
+                    &endpoint_slot,
+                    sequence_floors.endpoint.max(1),
+                )?,
                 expires_at_unix_seconds,
                 endpoints: endpoints.clone(),
             },
@@ -1748,7 +1764,15 @@ impl Node {
             .filter(|member| member.node_id != local_id)
         {
             let slot = publication_slot(b"recovery", subject.node_id, local_id, guild_id);
-            let sequence = self.next_recovery_publication_sequence(&slot, 1)?;
+            let sequence = self.next_recovery_publication_sequence(
+                &slot,
+                sequence_floors
+                    .recovery
+                    .get(&subject.node_id)
+                    .copied()
+                    .unwrap_or(1)
+                    .max(1),
+            )?;
             let sealed = self.recovery_record_for_endpoints(
                 subject,
                 guild_id,
@@ -1786,11 +1810,35 @@ impl Node {
                 expires_at_unix_seconds,
             })?,
         )?;
+        self.control.put_record(
+            "dht-recovery-sequence-probe",
+            b"primary",
+            &canonical_bytes(&false)?,
+        )?;
         Ok(Some(DhtPublicationSet {
             checkpoint_hash,
             endpoint,
             recovery,
         }))
+    }
+
+    pub fn dht_recovery_sequence_probe_subjects(&self) -> Result<Vec<NodeId>> {
+        let required = self
+            .control
+            .get_record("dht-recovery-sequence-probe", b"primary")?
+            .map(|bytes| decode_canonical::<bool>(&bytes))
+            .transpose()?
+            .unwrap_or(false);
+        if !required {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .installed_guild()?
+            .into_iter()
+            .flat_map(|guild| guild.certificate.genesis.members)
+            .filter(|member| member.node_id != self.keys.node_id())
+            .map(|member| member.node_id)
+            .collect())
     }
 
     pub fn mark_seed_recovery_ready(&mut self, checkpoint_hash: [u8; 32]) -> Result<()> {

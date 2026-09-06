@@ -109,6 +109,7 @@ pub struct PrototypeGuild {
     directory: MemoryDirectory,
 }
 
+#[allow(dead_code)]
 impl PrototypeGuild {
     pub fn create(root: &Path, seeds: Vec<Seed>) -> Result<Self> {
         if seeds.len() != 5 {

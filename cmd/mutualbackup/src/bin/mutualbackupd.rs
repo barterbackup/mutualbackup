@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
         bootstrap_addresses: parse_addresses(&config.p2p_bootstrap_addresses)?,
         relay_reservation_addresses: parse_addresses(&config.p2p_relay_addresses)?,
         enable_relay_server: config.enable_relay_server,
+        enable_hole_punching: true,
         public_endpoint: config
             .p2p_external_addresses
             .first()
@@ -46,7 +47,6 @@ async fn main() -> Result<()> {
             .expect("validated config has a listen address"),
         failure_domain: config.failure_domain.clone(),
         configure_failure_domain: !config.recovery_mode,
-        trusted_coordinator: node_id,
         max_connections: 32,
     };
     let (p2p_client, p2p_event_loop) = build_p2p(node.clone(), p2p_config)?;
