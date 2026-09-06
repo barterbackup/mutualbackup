@@ -6,8 +6,8 @@ use uuid::Uuid;
 use crate::keys::{KeyMaterial, NodeId, RecoveryPublicKey, signing_payload};
 use crate::recovery::RecoveryLocator;
 use crate::{
-    V1_CIPHER_PROFILE, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, encode_3_2,
-    sector_root,
+    V1_CIPHER_PROFILE, V1_MAX_CODING_GROUPS, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS,
+    V1_SECTOR_SIZE, encode_3_2, sector_root,
 };
 
 pub type SectorId = [u8; 32];
@@ -165,7 +165,7 @@ impl GuildCheckpoint {
             || self.revisions.is_empty()
             || self.revisions.len() > 4096
             || self.coding_groups.is_empty()
-            || self.coding_groups.len() > 1_000_000
+            || self.coding_groups.len() > V1_MAX_CODING_GROUPS
         {
             return Err(ModelError::InvalidCheckpoint);
         }

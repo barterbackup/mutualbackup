@@ -124,6 +124,18 @@ impl NodeReader {
     ) -> Result<(u32, Vec<u8>)> {
         checkpoint_page(&self.control, guild_id, checkpoint_hash, page_index)
     }
+
+    pub(crate) fn prepared_revision_page(
+        &self,
+        revision_id: Uuid,
+        page_index: u32,
+    ) -> Result<(u32, Vec<u8>)> {
+        Ok(self.control.protocol_record_page(
+            "user-revision",
+            revision_id.as_bytes(),
+            page_index,
+        )?)
+    }
 }
 
 impl Node {

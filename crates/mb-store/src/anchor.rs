@@ -12,6 +12,9 @@ use walkdir::WalkDir;
 const AREA_PREFIX: &str = ".mutualbackup-anchors";
 const AREA_MARKER: &str = ".mutualbackup-anchor-area-v1";
 const AREA_MAGIC: &str = "mutualbackup-anchor-area-v1";
+const MAX_CAPTURE_ENTRIES: usize = 8_192;
+const MAX_CAPTURE_EXTENTS: usize = 65_536;
+const MAX_RELATIVE_PATH_BYTES: usize = 4_096;
 
 #[derive(Debug, Error)]
 pub enum AnchorError {
@@ -31,6 +34,8 @@ pub enum AnchorError {
     AnchorAreaCollision(PathBuf),
     #[error("source changed while it was being captured: {0}")]
     SourceChanged(PathBuf),
+    #[error("source tree exceeds the bounded v1 capture catalog")]
+    CatalogTooLarge,
     #[error("reflink is unavailable for this source filesystem: {0}")]
     ReflinkUnavailable(std::io::Error),
     #[error("filesystem I/O error: {0}")]
@@ -329,6 +334,9 @@ fn capture_entries(
         if entry.path() == source_root {
             continue;
         }
+        if entries.len() >= MAX_CAPTURE_ENTRIES {
+            return Err(AnchorError::CatalogTooLarge);
+        }
         let relative = entry
             .path()
             .strip_prefix(source_root)
@@ -338,6 +346,9 @@ fn capture_entries(
             .to_str()
             .ok_or(AnchorError::NonUtf8Path)?
             .to_owned();
+        if relative_string.len() > MAX_RELATIVE_PATH_BYTES {
+            return Err(AnchorError::CatalogTooLarge);
+        }
         let file = open_source_beneath(root_file, relative, entry.file_type().is_dir())?;
         let before = file.metadata()?;
         if before.file_type().is_symlink() {
@@ -658,6 +669,9 @@ fn file_data_extents(file: &File, logical_len: u64) -> Result<Vec<FileExtent>, A
             offset: data,
             logical_len: hole - data,
         });
+        if extents.len() > MAX_CAPTURE_EXTENTS {
+            return Err(AnchorError::CatalogTooLarge);
+        }
         cursor = hole;
     }
     Ok(extents)

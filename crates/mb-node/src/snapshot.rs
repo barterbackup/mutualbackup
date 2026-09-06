@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -6,8 +6,8 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use mb_core::{
     KeyMaterial, SectorId, SectorPurpose, SectorRef, SignedRecord, UserRevision, V1_CIPHER_PROFILE,
-    V1_SECTOR_SIZE, canonical_bytes, crypt_sector, decode_canonical, encrypted_sector,
-    make_sector_id, sector_root,
+    V1_MAX_CATALOG_BYTES, V1_MAX_CODING_GROUPS, V1_SECTOR_SIZE, canonical_bytes, crypt_sector,
+    decode_canonical, encrypted_sector, make_sector_id, sector_root,
 };
 use mb_store::{
     AnchorFileLocator, CapturedEntry, ControlStore, FileExtent, NativeFileId, ReflinkAnchor,
@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 type RecordWrite = (String, Vec<u8>, Vec<u8>);
+const MAX_METADATA_SECTORS: usize = V1_MAX_CATALOG_BYTES.div_ceil(V1_SECTOR_SIZE);
+const MAX_DATA_SECTORS: usize = V1_MAX_CODING_GROUPS - MAX_METADATA_SECTORS;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PrivateEntry {
@@ -42,6 +44,14 @@ pub enum PrivateEntry {
         modified_nanos: u32,
         link_group: u64,
         data_extents: Vec<PrivateDataExtent>,
+    },
+    HardLinkV3 {
+        path: String,
+        mode: u32,
+        logical_len: u64,
+        modified_secs: i64,
+        modified_nanos: u32,
+        link_group: u64,
     },
 }
 
@@ -143,12 +153,16 @@ pub(crate) fn prepare_revision(
         manifest: ReflinkAnchor::capture(source_root).context("capture reflink source anchor")?,
         committed: false,
     };
+    if canonical_bytes(&anchor.manifest)?.len() > V1_MAX_CATALOG_BYTES / 2 {
+        bail!("captured source catalog exceeds the v1 bounded-object limit");
+    }
+    validate_capture_sector_budget(&anchor.manifest)?;
     let encryption_key = keys.guild_data_key(&guild_id);
     let mut data_references = Vec::new();
     let mut private_entries = Vec::new();
     let mut recipe_records = Vec::with_capacity(256);
     let mut ordinal = 0_u64;
-    let mut prepared_links = BTreeMap::<NativeFileId, (u64, Vec<PrivateDataExtent>)>::new();
+    let mut prepared_links = BTreeMap::<NativeFileId, u64>::new();
     let mut next_link_group = 0_u64;
 
     for entry in &anchor.manifest.entries {
@@ -186,7 +200,7 @@ pub(crate) fn prepare_revision(
                         make_sector_id(keys.node_id(), revision_id, SectorPurpose::Data, ordinal);
                     ordinal += 1;
                     let (reference, _) = encrypted_sector(&encryption_key, id, &plaintext)?;
-                    data_references.push(reference.clone());
+                    push_data_reference(&mut data_references, reference.clone())?;
                     file_references.push(reference.clone());
                     queue_recipe(
                         control,
@@ -221,32 +235,40 @@ pub(crate) fn prepare_revision(
                 native_id,
                 data_extents,
             } => {
-                let (link_group, private_extents) =
-                    if let Some(existing) = prepared_links.get(native_id) {
-                        existing.clone()
-                    } else {
-                        let locator = anchor.manifest.file_locator(path.clone())?;
-                        let extents = prepare_sparse_file(
-                            control,
-                            &mut recipe_records,
-                            keys,
-                            guild_id,
-                            revision_id,
-                            &mut ordinal,
-                            &locator,
-                            *logical_len,
-                            data_extents,
-                        )?;
-                        for extent in &extents {
-                            data_references.extend(extent.sectors.iter().cloned());
-                        }
-                        let link_group = next_link_group;
-                        next_link_group = next_link_group
-                            .checked_add(1)
-                            .context("too many hard-link groups in one revision")?;
-                        prepared_links.insert(*native_id, (link_group, extents.clone()));
-                        (link_group, extents)
-                    };
+                if let Some(link_group) = prepared_links.get(native_id) {
+                    private_entries.push(PrivateEntry::HardLinkV3 {
+                        path: path.clone(),
+                        mode: *mode,
+                        logical_len: *logical_len,
+                        modified_secs: *modified_secs,
+                        modified_nanos: *modified_nanos,
+                        link_group: *link_group,
+                    });
+                    continue;
+                }
+                let locator = anchor.manifest.file_locator(path.clone())?;
+                let private_extents = prepare_sparse_file(
+                    control,
+                    &mut recipe_records,
+                    keys,
+                    guild_id,
+                    revision_id,
+                    &mut ordinal,
+                    &locator,
+                    *logical_len,
+                    data_extents,
+                )?;
+                for reference in private_extents
+                    .iter()
+                    .flat_map(|extent| extent.sectors.iter())
+                {
+                    push_data_reference(&mut data_references, reference.clone())?;
+                }
+                let link_group = next_link_group;
+                next_link_group = next_link_group
+                    .checked_add(1)
+                    .context("too many hard-link groups in one revision")?;
+                prepared_links.insert(*native_id, link_group);
                 private_entries.push(PrivateEntry::FileV2 {
                     path: path.clone(),
                     mode: *mode,
@@ -261,13 +283,16 @@ pub(crate) fn prepare_revision(
     }
 
     let metadata = PrivateMetadata {
-        format_version: 2,
+        format_version: 3,
         root_mode: anchor.manifest.root_mode,
         root_modified_secs: anchor.manifest.root_modified_secs,
         root_modified_nanos: anchor.manifest.root_modified_nanos,
         entries: private_entries,
     };
     let metadata_bytes = canonical_bytes(&metadata)?;
+    if metadata_bytes.is_empty() || metadata_bytes.len() > V1_MAX_CATALOG_BYTES {
+        bail!("private metadata exceeds the v1 bounded-object limit");
+    }
     let mut metadata_references = Vec::new();
     for (metadata_ordinal, plaintext) in metadata_bytes.chunks(V1_SECTOR_SIZE).enumerate() {
         let id = make_sector_id(
@@ -304,6 +329,9 @@ pub(crate) fn prepare_revision(
         },
         keys,
     )?;
+    if canonical_bytes(&revision)?.len() > V1_MAX_CATALOG_BYTES {
+        bail!("revision catalog exceeds the v1 bounded-object limit");
+    }
     if !recipe_records.is_empty() {
         control.put_records(&recipe_records)?;
     }
@@ -423,6 +451,79 @@ fn queue_recipe(
     Ok(())
 }
 
+fn push_data_reference(references: &mut Vec<SectorRef>, reference: SectorRef) -> Result<()> {
+    if references.len() >= MAX_DATA_SECTORS {
+        bail!("source data exceeds the bounded v1 coding catalog");
+    }
+    references.push(reference);
+    Ok(())
+}
+
+fn validate_capture_sector_budget(manifest: &mb_store::StableAnchorManifest) -> Result<()> {
+    let mut sectors = 0_usize;
+    let mut seen_files = BTreeSet::new();
+    for entry in &manifest.entries {
+        let additional = match entry {
+            CapturedEntry::Directory { .. } => 0,
+            CapturedEntry::File { logical_len, .. } => {
+                usize::try_from(logical_len.div_ceil(V1_SECTOR_SIZE as u64))
+                    .context("captured file is too large for this platform")?
+            }
+            CapturedEntry::FileV2 {
+                native_id,
+                data_extents,
+                ..
+            } if seen_files.insert(*native_id) => {
+                data_extents.iter().try_fold(0_usize, |count, extent| {
+                    let extent_sectors =
+                        usize::try_from(extent.logical_len.div_ceil(V1_SECTOR_SIZE as u64))
+                            .context("captured extent is too large for this platform")?;
+                    count
+                        .checked_add(extent_sectors)
+                        .context("captured sector count overflow")
+                })?
+            }
+            CapturedEntry::FileV2 { .. } => 0,
+        };
+        sectors = sectors
+            .checked_add(additional)
+            .context("captured sector count overflow")?;
+        if sectors > MAX_DATA_SECTORS {
+            bail!("source data exceeds the bounded v1 coding catalog");
+        }
+    }
+    Ok(())
+}
+
+fn checked_metadata_length(revision: &SignedRecord<UserRevision>) -> Result<usize> {
+    if revision.value.metadata_sectors.is_empty()
+        || revision.value.metadata_sectors.len() > MAX_METADATA_SECTORS
+        || revision
+            .value
+            .metadata_sectors
+            .len()
+            .saturating_add(revision.value.data_sectors.len())
+            > V1_MAX_CODING_GROUPS
+    {
+        bail!("revision exceeds the bounded v1 metadata or coding catalog");
+    }
+    revision
+        .value
+        .metadata_sectors
+        .iter()
+        .try_fold(0_usize, |total, reference| {
+            let length = usize::try_from(reference.logical_len)
+                .context("metadata sector length does not fit memory")?;
+            let total = total
+                .checked_add(length)
+                .context("private metadata length overflow")?;
+            if length == 0 || length > V1_SECTOR_SIZE || total > V1_MAX_CATALOG_BYTES {
+                bail!("private metadata exceeds the bounded v1 object limit");
+            }
+            Ok(total)
+        })
+}
+
 pub(crate) fn install_inline_recipe(
     control: &mut ControlStore,
     guild_id: [u8; 32],
@@ -517,7 +618,7 @@ fn load_private_metadata(
     revision: &SignedRecord<UserRevision>,
 ) -> Result<PrivateMetadata> {
     let encryption_key = keys.guild_data_key(&guild_id);
-    let mut metadata_bytes = Vec::new();
+    let mut metadata_bytes = Vec::with_capacity(checked_metadata_length(revision)?);
     for reference in &revision.value.metadata_sectors {
         metadata_bytes.extend(decrypt_reference(
             &encryption_key,
@@ -526,7 +627,7 @@ fn load_private_metadata(
         )?);
     }
     let metadata: PrivateMetadata = decode_canonical(&metadata_bytes)?;
-    if !matches!(metadata.format_version, 1 | 2) {
+    if !matches!(metadata.format_version, 1..=3) {
         bail!("unsupported private metadata version");
     }
     Ok(metadata)
@@ -660,6 +761,34 @@ fn validate_recovered_manifest(
                     bail!("recovered anchor does not preserve signed hard-link groups");
                 }
             }
+            (
+                PrivateEntry::HardLinkV3 {
+                    mode,
+                    logical_len,
+                    modified_secs,
+                    modified_nanos,
+                    link_group,
+                    ..
+                },
+                CapturedEntry::FileV2 {
+                    mode: actual_mode,
+                    logical_len: actual_len,
+                    modified_secs: actual_secs,
+                    modified_nanos: actual_nanos,
+                    native_id: actual_native_id,
+                    ..
+                },
+            ) if mode == actual_mode
+                && logical_len == actual_len
+                && modified_secs == actual_secs
+                && modified_nanos == actual_nanos =>
+            {
+                if signed_to_captured.get(link_group) != Some(actual_native_id)
+                    || captured_to_signed.get(actual_native_id) != Some(link_group)
+                {
+                    bail!("recovered anchor does not preserve signed hard-link aliases");
+                }
+            }
             _ => bail!("recovered anchor entry {path} does not match signed metadata"),
         }
     }
@@ -670,7 +799,8 @@ fn private_entry_path(entry: &PrivateEntry) -> &str {
     match entry {
         PrivateEntry::Directory { path, .. }
         | PrivateEntry::File { path, .. }
-        | PrivateEntry::FileV2 { path, .. } => path,
+        | PrivateEntry::FileV2 { path, .. }
+        | PrivateEntry::HardLinkV3 { path, .. } => path,
     }
 }
 
@@ -702,6 +832,7 @@ fn recovered_anchor_recipes(
             PrivateEntry::FileV2 {
                 path, data_extents, ..
             } => (path, data_extents.clone()),
+            PrivateEntry::HardLinkV3 { .. } => continue,
         };
         let locator = manifest.file_locator(path.clone())?;
         let mut file = locator.open().context("open recovered anchor file")?;
@@ -873,7 +1004,7 @@ where
         bail!("revision does not belong to the recovering seed and guild");
     }
     let encryption_key = keys.guild_data_key(&guild_id);
-    let mut metadata_bytes = Vec::new();
+    let mut metadata_bytes = Vec::with_capacity(checked_metadata_length(revision)?);
     for reference in &revision.value.metadata_sectors {
         metadata_bytes.extend(decrypt_reference(
             &encryption_key,
@@ -882,7 +1013,7 @@ where
         )?);
     }
     let metadata: PrivateMetadata = decode_canonical(&metadata_bytes)?;
-    if !matches!(metadata.format_version, 1 | 2) {
+    if !matches!(metadata.format_version, 1..=3) {
         bail!("unsupported private metadata version");
     }
 
@@ -1099,6 +1230,30 @@ where
                         },
                     );
                 }
+            }
+            PrivateEntry::HardLinkV3 {
+                path,
+                mode,
+                logical_len,
+                modified_secs,
+                modified_nanos,
+                link_group,
+            } => {
+                let destination = safe_join(staging, path)?;
+                if let Some(parent) = destination.parent() {
+                    create_private_dir(parent)?;
+                }
+                let existing = restored_links
+                    .get(link_group)
+                    .context("hard-link alias precedes its signed primary file")?;
+                if existing.mode != *mode
+                    || existing.logical_len != *logical_len
+                    || existing.modified_secs != *modified_secs
+                    || existing.modified_nanos != *modified_nanos
+                {
+                    bail!("hard-linked alias has inconsistent signed metadata");
+                }
+                fs::hard_link(&existing.path, &destination)?;
             }
         }
     }

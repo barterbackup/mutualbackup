@@ -1,15 +1,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mb_core::{KeyMaterial, V1_SECTOR_SIZE, sector_root};
+use mb_core::{
+    KeyMaterial, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_SECTOR_SIZE,
+    sector_root,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 use crate::SCHEMA_VERSION;
 
 const CONTROL_DATABASE_ID: &[u8] = b"control.db";
-const CHECKPOINT_PAGE_BYTES: usize = 512 * 1024;
-const MAX_CHECKPOINT_PAGES: u32 = 512;
 pub type CheckpointRow = (u64, [u8; 32], Vec<u8>);
 
 #[derive(Debug, Error)]
@@ -309,10 +310,10 @@ impl ControlStore {
     ) -> Result<(), DatabaseError> {
         if !matches!(object_kind, "body" | "certificate")
             || total_pages == 0
-            || total_pages > MAX_CHECKPOINT_PAGES
+            || total_pages > V1_MAX_CATALOG_PAGES
             || page_index >= total_pages
             || bytes.is_empty()
-            || bytes.len() > CHECKPOINT_PAGE_BYTES
+            || bytes.len() > V1_CATALOG_PAGE_BYTES
             || blake3::hash(bytes).as_bytes() != page_hash
         {
             return Err(DatabaseError::Integrity);
@@ -378,38 +379,41 @@ impl ControlStore {
              WHERE object_kind = ?1 AND guild_id = ?2 AND object_id = ?3
              ORDER BY page_index",
         )?;
-        let pages = statement
-            .query_map(
-                params![object_kind, guild_id.as_slice(), object_id.as_slice()],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                        row.get::<_, Vec<u8>>(3)?,
-                    ))
-                },
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-        let total = pages
-            .first()
-            .map(|page| page.1)
-            .ok_or(DatabaseError::NotReady)?;
-        if total <= 0 || total > i64::from(MAX_CHECKPOINT_PAGES) || pages.len() != total as usize {
-            return Err(DatabaseError::NotReady);
-        }
+        let mut pages = statement.query_map(
+            params![object_kind, guild_id.as_slice(), object_id.as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )?;
         let mut assembled = Vec::new();
-        for (expected, (index, page_total, hash, bytes)) in pages.into_iter().enumerate() {
+        let mut expected_total = None;
+        let mut page_count = 0_usize;
+        for (expected, page) in pages.by_ref().enumerate() {
+            let (index, page_total, hash, bytes) = page?;
+            let total = *expected_total.get_or_insert(page_total);
             if index != expected as i64
                 || page_total != total
+                || total <= 0
+                || total > i64::from(V1_MAX_CATALOG_PAGES)
                 || hash.len() != 32
                 || bytes.is_empty()
-                || bytes.len() > CHECKPOINT_PAGE_BYTES
+                || bytes.len() > V1_CATALOG_PAGE_BYTES
                 || blake3::hash(&bytes).as_bytes() != hash.as_slice()
+                || assembled.len().saturating_add(bytes.len()) > V1_MAX_CATALOG_BYTES
             {
                 return Err(DatabaseError::Integrity);
             }
             assembled.extend_from_slice(&bytes);
+            page_count += 1;
+        }
+        let total = expected_total.ok_or(DatabaseError::NotReady)?;
+        if page_count != total as usize {
+            return Err(DatabaseError::NotReady);
         }
         Ok(assembled)
     }
@@ -440,15 +444,18 @@ impl ControlStore {
             .optional()?
             .ok_or(DatabaseError::NotReady)?;
         let byte_length = usize::try_from(byte_length).map_err(|_| DatabaseError::Integrity)?;
-        let total_pages = byte_length.div_ceil(CHECKPOINT_PAGE_BYTES);
+        if byte_length > V1_MAX_CATALOG_BYTES {
+            return Err(DatabaseError::Integrity);
+        }
+        let total_pages = byte_length.div_ceil(V1_CATALOG_PAGE_BYTES);
         if total_pages == 0
-            || total_pages > MAX_CHECKPOINT_PAGES as usize
+            || total_pages > V1_MAX_CATALOG_PAGES as usize
             || page_index as usize >= total_pages
         {
             return Err(DatabaseError::Integrity);
         }
         let offset = (page_index as usize)
-            .checked_mul(CHECKPOINT_PAGE_BYTES)
+            .checked_mul(V1_CATALOG_PAGE_BYTES)
             .ok_or(DatabaseError::Integrity)?;
         let bytes = self.connection.query_row(
             "SELECT substr(bytes, ?3, ?4) FROM protocol_records
@@ -457,7 +464,7 @@ impl ControlStore {
                 kind,
                 record_id,
                 i64::try_from(offset + 1).map_err(|_| DatabaseError::Integrity)?,
-                CHECKPOINT_PAGE_BYTES as i64,
+                V1_CATALOG_PAGE_BYTES as i64,
             ],
             |row| row.get::<_, Vec<u8>>(0),
         )?;
@@ -1356,6 +1363,33 @@ mod tests {
         assert!(store.get_record("test", b"id").unwrap().is_some());
         let wrong = KeyMaterial::from_seed(&Seed::from_bytes([2; 32]));
         assert!(ControlStore::open(&path, &wrong).is_err());
+    }
+
+    #[test]
+    fn protocol_records_are_read_in_bounded_pages() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([30; 32]));
+        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let bytes = vec![31_u8; V1_CATALOG_PAGE_BYTES + 17];
+        store
+            .put_record("user-revision", b"revision", &bytes)
+            .unwrap();
+        let (total, first) = store
+            .protocol_record_page("user-revision", b"revision", 0)
+            .unwrap();
+        let (second_total, second) = store
+            .protocol_record_page("user-revision", b"revision", 1)
+            .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(second_total, total);
+        assert_eq!(first.len(), V1_CATALOG_PAGE_BYTES);
+        assert_eq!(second.len(), 17);
+        assert_eq!([first, second].concat(), bytes);
+        assert!(
+            store
+                .protocol_record_page("user-revision", b"revision", 2)
+                .is_err()
+        );
     }
 
     #[test]

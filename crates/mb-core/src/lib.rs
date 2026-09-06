@@ -32,6 +32,18 @@ pub const V1_CIPHER_PROFILE: u16 = 1;
 pub const V1_RS_DATA_SHARDS: u16 = 3;
 pub const V1_RS_PARITY_SHARDS: u16 = 2;
 
+/// Maximum encoded size of a v1 control-plane catalog object.
+///
+/// Bulk file bytes are sectorized and are not counted here. Keeping this
+/// bound shared prevents any transport or persistence path from silently
+/// accepting a catalog that another path cannot process with bounded memory.
+pub const V1_MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
+pub const V1_CATALOG_PAGE_BYTES: usize = 512 * 1024;
+pub const V1_MAX_CATALOG_PAGES: u32 = (V1_MAX_CATALOG_BYTES / V1_CATALOG_PAGE_BYTES) as u32;
+/// A v1 checkpoint keeps coding descriptors inline; this bound keeps the
+/// resulting signed catalog below `V1_MAX_CATALOG_BYTES` with ample overhead.
+pub const V1_MAX_CODING_GROUPS: usize = 40_000;
+
 /// Hash bytes exactly as they are consumed by Reed--Solomon.
 pub fn sector_root(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()

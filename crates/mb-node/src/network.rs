@@ -9,9 +9,10 @@ use futures::{StreamExt, stream::FuturesUnordered};
 use mb_core::{
     CodingGroup, GuildCheckpoint, InformationRole, KeyMaterial, Member, MemberSignature, NodeId,
     ParityRole, QuorumCheckpoint, RecoveryLocator, SealedRecoveryRecord, SectorId, SectorRef, Seed,
-    ShardRole, SignedRecord, UserRevision, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE,
-    canonical_bytes, decode_canonical, encode_3_2, open_recovery_record, reconstruct_3_2,
-    sector_root,
+    ShardRole, SignedRecord, UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES,
+    V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS,
+    V1_SECTOR_SIZE, canonical_bytes, decode_canonical, encode_3_2, open_recovery_record,
+    reconstruct_3_2, sector_root,
 };
 use mb_store::ParityObject;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -25,8 +26,6 @@ use crate::{
     node::{NodeReader, NodeReaderConfig},
 };
 
-const CHECKPOINT_PAGE_BYTES: usize = 512 * 1024;
-const MAX_CHECKPOINT_PAGES: u32 = 512;
 const MAX_PEER_FRAME_BYTES: usize = 600 * 1024;
 const MAX_DIRECTORY_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DIRECTORY_RECORD_BYTES: usize = 64 * 1024;
@@ -65,6 +64,11 @@ enum PeerRequest {
         guild_id: [u8; 32],
         source: String,
         sequence: u64,
+    },
+    GetPreparedRevisionPage {
+        guild_id: [u8; 32],
+        revision_id: Uuid,
+        page_index: u32,
     },
     EnsureFiller {
         guild_id: [u8; 32],
@@ -149,6 +153,7 @@ impl PeerRequest {
             Self::Profile
                 | Self::GetSector { .. }
                 | Self::GetParity { .. }
+                | Self::GetPreparedRevisionPage { .. }
                 | Self::GetCheckpointPage { .. }
         )
     }
@@ -158,6 +163,7 @@ impl PeerRequest {
             Self::Profile
             | Self::GetSector { .. }
             | Self::GetParity { .. }
+            | Self::GetPreparedRevisionPage { .. }
             | Self::GetCheckpointPage { .. } => None,
             Self::BeginCommit { .. } => Some("begin-commit"),
             Self::PrepareSource { .. } => Some("prepare-source"),
@@ -176,6 +182,7 @@ impl PeerRequest {
         match self {
             Self::Profile | Self::BeginCommit { .. } => None,
             Self::PrepareSource { guild_id, .. }
+            | Self::GetPreparedRevisionPage { guild_id, .. }
             | Self::EnsureFiller { guild_id, .. }
             | Self::GetSector { guild_id, .. }
             | Self::GetParity { guild_id, .. }
@@ -209,7 +216,16 @@ enum PeerResponse {
     CommitStarted {
         guild_id: [u8; 32],
     },
-    Prepared(SignedRecord<UserRevision>),
+    PreparedRevision {
+        revision_id: Uuid,
+        total_pages: u32,
+        object_hash: [u8; 32],
+    },
+    PreparedRevisionPage {
+        total_pages: u32,
+        page_hash: [u8; 32],
+        bytes: Vec<u8>,
+    },
     Filler {
         reference: SectorRef,
         bytes: Vec<u8>,
@@ -221,7 +237,7 @@ enum PeerResponse {
         page_hash: [u8; 32],
         bytes: Vec<u8>,
     },
-    RecoveryRecord(SignedRecord<PublishedRecoveryRecord>),
+    RecoveryRecord(Box<SignedRecord<PublishedRecoveryRecord>>),
     RecoveryAdmission(SignedRecord<RecoveryPublisherAdmission>),
     Ack,
 }
@@ -544,8 +560,10 @@ fn process_peer_request(
             let reader = service.checkout_reader()?;
             let result = (|| {
                 if !matches!(&request, PeerRequest::Profile)
-                    && !(matches!(&request, PeerRequest::GetSector { .. })
-                        && caller == config.trusted_coordinator)
+                    && !(matches!(
+                        &request,
+                        PeerRequest::GetSector { .. } | PeerRequest::GetPreparedRevisionPage { .. }
+                    ) && caller == config.trusted_coordinator)
                 {
                     reader.authorize_member(
                         &request
@@ -681,6 +699,18 @@ fn execute_read_request(
         } => Ok(PeerResponse::Bytes(
             node.sector_for_guild(&guild_id, &sector_id)?,
         )),
+        PeerRequest::GetPreparedRevisionPage {
+            revision_id,
+            page_index,
+            ..
+        } => {
+            let (total_pages, bytes) = node.prepared_revision_page(revision_id, page_index)?;
+            Ok(PeerResponse::PreparedRevisionPage {
+                total_pages,
+                page_hash: *blake3::hash(&bytes).as_bytes(),
+                bytes,
+            })
+        }
         PeerRequest::GetParity {
             guild_id,
             group_id,
@@ -725,12 +755,17 @@ fn execute_peer_request(
             guild_id,
             source,
             sequence,
-        } => Ok(PeerResponse::Prepared(node.prepare_revision(
-            guild_id,
-            Path::new(&source),
-            sequence,
-            Some(request_id),
-        )?)),
+        } => {
+            let revision =
+                node.prepare_revision(guild_id, Path::new(&source), sequence, Some(request_id))?;
+            let bytes = canonical_bytes(&revision)?;
+            let total_pages = checked_catalog_page_count(bytes.len())?;
+            Ok(PeerResponse::PreparedRevision {
+                revision_id: revision.value.revision_id,
+                total_pages,
+                object_hash: *blake3::hash(&bytes).as_bytes(),
+            })
+        }
         PeerRequest::EnsureFiller {
             guild_id,
             revision_id,
@@ -808,6 +843,9 @@ fn execute_peer_request(
                 bytes,
             })
         }
+        PeerRequest::GetPreparedRevisionPage { .. } => {
+            bail!("revision-page read was sent to a mutation worker")
+        }
         PeerRequest::BuildRecoveryRecord {
             subject,
             guild_id,
@@ -847,7 +885,7 @@ fn execute_peer_request(
                 config.public_endpoint.clone(),
                 expires_at_unix_seconds,
             )?;
-            Ok(PeerResponse::RecoveryRecord(SignedRecord::sign(
+            Ok(PeerResponse::RecoveryRecord(Box::new(SignedRecord::sign(
                 DIRECTORY_RECORD_DOMAIN,
                 PublishedRecoveryRecord {
                     format_version: 2,
@@ -860,7 +898,7 @@ fn execute_peer_request(
                     sealed,
                 },
                 node.keys(),
-            )?))
+            )?)))
         }
         PeerRequest::AuthorizeRecoveryPublisher {
             guild_id,
@@ -994,9 +1032,23 @@ pub async fn commit_source_over_network(
         },
     )
     .await?;
-    let PeerResponse::Prepared(revision) = prepared else {
+    let PeerResponse::PreparedRevision {
+        revision_id,
+        total_pages,
+        object_hash,
+    } = prepared
+    else {
         bail!("owner returned the wrong response to source preparation");
     };
+    let revision = fetch_prepared_revision(
+        &peers[0],
+        coordinator_keys,
+        guild_id,
+        revision_id,
+        total_pages,
+        object_hash,
+    )
+    .await?;
     revision.verify(b"mutualbackup/user-revision/v1")?;
     if revision.value.owner != coordinator_keys.node_id() {
         bail!("prepared revision owner does not match coordinator");
@@ -1004,6 +1056,9 @@ pub async fn commit_source_over_network(
 
     let mut target_sectors = revision.value.metadata_sectors.clone();
     target_sectors.extend(revision.value.data_sectors.clone());
+    if target_sectors.is_empty() || target_sectors.len() > V1_MAX_CODING_GROUPS {
+        bail!("prepared revision exceeds the bounded v1 coding catalog");
+    }
     let mut groups = Vec::with_capacity(target_sectors.len());
     for (ordinal, target_reference) in target_sectors.iter().enumerate() {
         let owner_response = peer_call_expected(
@@ -1248,7 +1303,7 @@ pub async fn commit_source_over_network(
             let PeerResponse::RecoveryRecord(record) = response else {
                 bail!("peer returned the wrong recovery-record response");
             };
-            directory_publish(directory, record).await?;
+            directory_publish(directory, *record).await?;
         }
     }
     expect_ack(
@@ -1540,6 +1595,70 @@ async fn request_filler(
     Ok((reference, bytes))
 }
 
+fn checked_catalog_page_count(byte_length: usize) -> Result<u32> {
+    if byte_length == 0 || byte_length > V1_MAX_CATALOG_BYTES {
+        bail!("catalog object exceeds the bounded protocol limit");
+    }
+    let total_pages = byte_length.div_ceil(V1_CATALOG_PAGE_BYTES);
+    if total_pages == 0 || total_pages > V1_MAX_CATALOG_PAGES as usize {
+        bail!("catalog object has an invalid page count");
+    }
+    Ok(total_pages as u32)
+}
+
+async fn fetch_prepared_revision(
+    peer: &RemotePeer,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    expected_pages: u32,
+    expected_hash: [u8; 32],
+) -> Result<SignedRecord<UserRevision>> {
+    if expected_pages == 0 || expected_pages > V1_MAX_CATALOG_PAGES {
+        bail!("prepared revision has an invalid page count");
+    }
+    let mut assembled = Vec::new();
+    for page_index in 0..expected_pages {
+        let response = peer_call_expected(
+            peer.endpoint,
+            peer.profile.member.node_id,
+            keys,
+            PeerRequest::GetPreparedRevisionPage {
+                guild_id,
+                revision_id,
+                page_index,
+            },
+        )
+        .await?;
+        let PeerResponse::PreparedRevisionPage {
+            total_pages,
+            page_hash,
+            bytes,
+        } = response
+        else {
+            bail!("owner returned the wrong prepared-revision page response");
+        };
+        if total_pages != expected_pages
+            || bytes.is_empty()
+            || bytes.len() > V1_CATALOG_PAGE_BYTES
+            || page_index + 1 < expected_pages && bytes.len() != V1_CATALOG_PAGE_BYTES
+            || blake3::hash(&bytes).as_bytes() != &page_hash
+            || assembled.len().saturating_add(bytes.len()) > V1_MAX_CATALOG_BYTES
+        {
+            bail!("prepared revision page failed bounded assembly checks");
+        }
+        assembled.extend_from_slice(&bytes);
+    }
+    if blake3::hash(&assembled).as_bytes() != &expected_hash {
+        bail!("prepared revision object hash mismatch");
+    }
+    let revision: SignedRecord<UserRevision> = decode_canonical(&assembled)?;
+    if revision.value.revision_id != revision_id || revision.value.guild_id != guild_id {
+        bail!("prepared revision descriptor does not match its object");
+    }
+    Ok(revision)
+}
+
 async fn publish_checkpoint_pages(
     peer: &RemotePeer,
     keys: &KeyMaterial,
@@ -1548,11 +1667,8 @@ async fn publish_checkpoint_pages(
     checkpoint_hash: [u8; 32],
     bytes: &[u8],
 ) -> Result<()> {
-    let total_pages = bytes.len().div_ceil(CHECKPOINT_PAGE_BYTES);
-    if total_pages == 0 || total_pages > MAX_CHECKPOINT_PAGES as usize {
-        bail!("checkpoint object exceeds the paged protocol limit");
-    }
-    for (page_index, page) in bytes.chunks(CHECKPOINT_PAGE_BYTES).enumerate() {
+    let total_pages = checked_catalog_page_count(bytes.len())?;
+    for (page_index, page) in bytes.chunks(V1_CATALOG_PAGE_BYTES).enumerate() {
         expect_ack(
             peer_call_expected(
                 peer.endpoint,
@@ -1563,7 +1679,7 @@ async fn publish_checkpoint_pages(
                     guild_id,
                     checkpoint_hash,
                     page_index: page_index as u32,
-                    total_pages: total_pages as u32,
+                    total_pages,
                     page_hash: *blake3::hash(page).as_bytes(),
                     bytes: page.to_vec(),
                 },
@@ -1583,7 +1699,7 @@ async fn fetch_checkpoint(
 ) -> Result<QuorumCheckpoint> {
     let mut assembled = Vec::new();
     let mut expected_total = None;
-    for page_index in 0..MAX_CHECKPOINT_PAGES {
+    for page_index in 0..V1_MAX_CATALOG_PAGES {
         let response = peer_call_expected(
             endpoint,
             publisher,
@@ -1604,11 +1720,12 @@ async fn fetch_checkpoint(
             bail!("peer returned the wrong checkpoint-page response");
         };
         if total_pages == 0
-            || total_pages > MAX_CHECKPOINT_PAGES
+            || total_pages > V1_MAX_CATALOG_PAGES
             || expected_total.is_some_and(|expected| expected != total_pages)
             || page_index >= total_pages
             || bytes.is_empty()
-            || bytes.len() > CHECKPOINT_PAGE_BYTES
+            || bytes.len() > V1_CATALOG_PAGE_BYTES
+            || assembled.len().saturating_add(bytes.len()) > V1_MAX_CATALOG_BYTES
             || blake3::hash(&bytes).as_bytes() != &page_hash
         {
             bail!("peer returned an invalid checkpoint page");
@@ -1855,6 +1972,21 @@ mod tests {
         assert!(parse_tcp_endpoint("http://127.0.0.1:1234").is_err());
         assert!(validate_advertised_endpoint("tcp://0.0.0.0:1234").is_err());
         assert!(validate_advertised_endpoint("tcp://127.0.0.1:0").is_err());
+    }
+
+    #[test]
+    fn catalog_paging_uses_one_shared_end_to_end_bound() {
+        assert_eq!(checked_catalog_page_count(1).unwrap(), 1);
+        assert_eq!(
+            checked_catalog_page_count(V1_CATALOG_PAGE_BYTES + 1).unwrap(),
+            2
+        );
+        assert_eq!(
+            checked_catalog_page_count(V1_MAX_CATALOG_BYTES).unwrap(),
+            V1_MAX_CATALOG_PAGES
+        );
+        assert!(checked_catalog_page_count(0).is_err());
+        assert!(checked_catalog_page_count(V1_MAX_CATALOG_BYTES + 1).is_err());
     }
 
     #[test]
