@@ -9,10 +9,11 @@ use mb_core::{
     RecoveryLocator, SectorId, SectorRef, Seed, ShardRole, SignedRecord, UserRevision,
     canonical_bytes, decode_canonical, seal_recovery_record, sector_root, synthetic_filler_sector,
 };
-use mb_store::{ControlStore, ParityObject, ParityStore};
+use mb_store::{ControlStore, ParityObject, ParityStore, probe_reflink};
 use rand::RngCore;
 use uuid::Uuid;
 
+use crate::control::{NodeStatus, ProtectedRoot};
 use crate::snapshot::{
     build_revision_restore, install_inline_recipe, install_recovered_sector_recipe,
     install_recovery_marker, make_restore_root_private, native_directory_id, prepare_revision,
@@ -152,8 +153,11 @@ impl NodeReader {
 
 impl Node {
     pub fn open(data_dir: impl AsRef<Path>, seed: Seed) -> Result<Self> {
-        let data_dir = data_dir.as_ref().to_path_buf();
-        fs::create_dir_all(&data_dir)?;
+        let data_dir = data_dir.as_ref();
+        fs::create_dir_all(data_dir)?;
+        let data_dir = data_dir
+            .canonicalize()
+            .with_context(|| format!("cannot resolve data directory {}", data_dir.display()))?;
         set_private_directory(&data_dir)?;
         let data_dir_lock = open_data_dir_lock(&data_dir)?;
         let keys = Arc::new(KeyMaterial::from_seed(&seed));
@@ -178,6 +182,65 @@ impl Node {
 
     pub fn keys(&self) -> &KeyMaterial {
         &self.keys
+    }
+
+    pub fn status(&self) -> Result<NodeStatus> {
+        Ok(NodeStatus {
+            format_version: 1,
+            node_id: self.keys.node_id(),
+            data_dir: self.data_dir.clone(),
+            protected_root: self.protected_root()?,
+            checkpoint_count: self.control.checkpoint_head_certificates()?.len() as u64,
+        })
+    }
+
+    pub fn protected_root(&self) -> Result<Option<ProtectedRoot>> {
+        self.control
+            .get_record("node-config", b"protected-root")?
+            .map(|bytes| decode_canonical(&bytes).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn add_protected_root(&mut self, source_root: &Path) -> Result<ProtectedRoot> {
+        let source_root = source_root
+            .canonicalize()
+            .with_context(|| format!("cannot resolve protected root {}", source_root.display()))?;
+        if !source_root.is_dir() {
+            anyhow::bail!("protected root must be a directory");
+        }
+        if source_root.starts_with(&self.data_dir) || self.data_dir.starts_with(&source_root) {
+            anyhow::bail!("protected root and daemon data directory must not overlap");
+        }
+        #[cfg(unix)]
+        let filesystem_device = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&source_root)?.dev()
+        };
+        #[cfg(not(unix))]
+        let filesystem_device = 0;
+
+        let configured = self.protected_root()?;
+        if let Some(configured) = &configured {
+            if configured.path != source_root {
+                anyhow::bail!("the prototype supports exactly one protected root");
+            }
+            if configured.filesystem_device == filesystem_device {
+                return Ok(configured.clone());
+            }
+        }
+
+        probe_reflink(&source_root).context("protected root failed the reflink COW probe")?;
+        let root = ProtectedRoot {
+            format_version: 1,
+            root_id: configured
+                .map(|configured| configured.root_id)
+                .unwrap_or_else(Uuid::new_v4),
+            path: source_root,
+            filesystem_device,
+        };
+        self.control
+            .put_record("node-config", b"protected-root", &canonical_bytes(&root)?)?;
+        Ok(root)
     }
 
     pub(crate) fn reader_config(&self) -> NodeReaderConfig {

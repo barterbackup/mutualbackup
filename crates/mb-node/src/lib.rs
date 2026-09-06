@@ -1,10 +1,14 @@
 //! Active node state machine and transport-independent protocol services.
 
+mod control;
 mod lab;
 mod network;
 mod node;
 mod snapshot;
 
+pub use control::{
+    LocalRequest, LocalResponse, NodeStatus, ProtectedRoot, local_control_call, serve_local_control,
+};
 pub use lab::{MemoryDirectory, MemoryNetwork, PrototypeGuild};
 pub use mb_core::{KeyMaterial, NodeId, Seed};
 pub use network::{

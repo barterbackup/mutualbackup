@@ -1,5 +1,4 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -9,17 +8,21 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mb_core::{KeyMaterial, NodeId, Seed};
 use mb_node::{
-    DirectoryState, Node, NodeServerConfig, PrototypeGuild, commit_source_over_network_with_intent,
-    recover_guild_over_network, recover_member_and_republish_over_network, recover_over_network,
-    serve_directory, serve_node,
+    DirectoryState, LocalRequest, LocalResponse, Node, NodeServerConfig, PrototypeGuild,
+    commit_source_over_network_with_intent, local_control_call, recover_guild_over_network,
+    recover_member_and_republish_over_network, recover_over_network, serve_directory, serve_node,
 };
 use mb_store::probe_reflink;
+use mutualbackup::{DaemonConfig, read_seed, write_config, write_seed};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(name = "mutualbackup", version, about = "Mutual P2P backup prototype")]
 struct Cli {
+    /// Unix socket of the local daemon. Required by routine runtime commands.
+    #[arg(long, global = true)]
+    socket: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -30,6 +33,15 @@ enum Command {
     Init {
         #[arg(long)]
         seed_file: PathBuf,
+        /// Also create a daemon configuration file.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, requires = "config")]
+        data_dir: Option<PathBuf>,
+        #[arg(long, requires = "config")]
+        failure_domain: Option<String>,
+        #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024_u64, requires = "config")]
+        parity_budget_bytes: u64,
     },
     /// Derive the public identity for an existing recovery seed.
     Identity {
@@ -38,6 +50,13 @@ enum Command {
     },
     /// Check whether a directory passes the complete reflink COW probe.
     ReflinkProbe { path: PathBuf },
+    /// Show the persistent local daemon state.
+    Status,
+    /// Manage the single protected root in the prototype.
+    Root {
+        #[command(subcommand)]
+        command: RootCommand,
+    },
     /// Run a real five-node, SQLCipher-backed, seed-only recovery demonstration.
     DemoSeedRecovery {
         /// Existing directory on a reflink-capable filesystem. The command
@@ -118,23 +137,81 @@ enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum RootCommand {
+    /// Probe and register a reflink-capable directory.
+    Add { path: PathBuf },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .try_init()
         .ok();
-    match Cli::parse().command {
-        Command::Init { seed_file } => {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Init {
+            seed_file,
+            config,
+            data_dir,
+            failure_domain,
+            parity_budget_bytes,
+        } => {
             let seed = Seed::generate();
             write_seed(&seed_file, &seed)?;
             println!("recovery seed written to: {}", seed_file.display());
+            if let Some(config_path) = config {
+                let control_socket = cli
+                    .socket
+                    .as_ref()
+                    .context("--socket is required when --config is used")?;
+                let config = DaemonConfig {
+                    format_version: 1,
+                    data_dir: data_dir.context("--data-dir is required when --config is used")?,
+                    seed_file: seed_file.clone(),
+                    control_socket: control_socket.clone(),
+                    failure_domain: failure_domain
+                        .context("--failure-domain is required when --config is used")?,
+                    parity_budget_bytes,
+                };
+                write_config(&config_path, &config)?;
+                println!("daemon config written to: {}", config_path.display());
+            }
             print_identity(&seed, false);
         }
         Command::Identity { seed_file } => print_identity(&read_seed(&seed_file)?, false),
         Command::ReflinkProbe { path } => {
             probe_reflink(&path)?;
             println!("reflink COW probe passed: {}", path.display());
+        }
+        Command::Status => {
+            let response =
+                local_control_call(required_socket(&cli.socket)?, &LocalRequest::Status).await?;
+            let LocalResponse::Status(status) = response else {
+                bail!("daemon returned the wrong response to status request");
+            };
+            println!("node id:       {}", status.node_id);
+            println!("data dir:      {}", status.data_dir.display());
+            println!("checkpoints:   {}", status.checkpoint_count);
+            match status.protected_root {
+                Some(root) => println!("protected root: {}", root.path.display()),
+                None => println!("protected root: (not configured)"),
+            }
+        }
+        Command::Root {
+            command: RootCommand::Add { path },
+        } => {
+            let response = local_control_call(
+                required_socket(&cli.socket)?,
+                &LocalRequest::AddRoot { path },
+            )
+            .await?;
+            let LocalResponse::RootAdded(root) = response else {
+                bail!("daemon returned the wrong response to root-add request");
+            };
+            println!("protected root registered: {}", root.path.display());
+            println!("root id: {}", root.root_id);
         }
         Command::DemoSeedRecovery { work_dir } => demo_seed_recovery(work_dir)?,
         Command::ServeDirectory { listen } => {
@@ -253,43 +330,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn write_seed(path: &PathBuf, seed: &Seed) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if !parent.is_dir() {
-        bail!("seed-file parent directory does not exist");
-    }
-    let temporary = parent.join(format!(".mutualbackup-seed-{}.tmp", Uuid::new_v4()));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&temporary)
-        .with_context(|| format!("cannot create temporary seed file in {}", parent.display()))?;
-    writeln!(file, "{}", seed.encode())?;
-    file.sync_all()?;
-    let written = read_seed(&temporary)?;
-    if written.expose() != seed.expose() {
-        let _ = fs::remove_file(&temporary);
-        bail!("temporary recovery seed failed validation");
-    }
-    if let Err(error) = fs::hard_link(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        sync_directory(parent).ok();
-        return Err(error).with_context(|| format!("cannot install seed file {}", path.display()));
-    }
-    fs::remove_file(&temporary)?;
-    sync_directory(parent)?;
-    Ok(())
-}
-
-fn read_seed(path: &PathBuf) -> Result<Seed> {
-    let encoded = fs::read_to_string(path)
-        .with_context(|| format!("cannot read seed file {}", path.display()))?;
-    Seed::from_str(encoded.trim()).context("invalid recovery seed file")
+fn required_socket(socket: &Option<PathBuf>) -> Result<&Path> {
+    socket
+        .as_deref()
+        .context("this command requires --socket PATH")
 }
 
 fn parse_hex_32(value: &str) -> Result<[u8; 32]> {
@@ -297,13 +341,6 @@ fn parse_hex_32(value: &str) -> Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("guild ID must contain exactly 32 bytes"))
-}
-
-fn sync_directory(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    std::fs::File::open(path)?.sync_all()?;
-    let _ = path;
-    Ok(())
 }
 
 fn demo_seed_recovery(work_dir: PathBuf) -> Result<()> {
