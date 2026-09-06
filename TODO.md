@@ -1,253 +1,200 @@
 # Source-review TODO
 
-Source-only review of commit `0a7f7f4`. No code was built or run for this
-review. This is deliberately not the roadmap: Tor, DHT replacement, hole
-punching, link-freeze, watchers, repair, GC, multiple volumes, and other
-explicitly delayed work are omitted.
+Source-only review of `9a31da9` plus the current working tree. Nothing was
+built or executed for this review. This is not the roadmap: Tor, DHT
+replacement, hole punching, link-freeze, watchers, repair, GC, and multiple
+volumes are intentionally omitted. Every item below is a defect in behavior or
+state already implemented.
 
-The broad direction is good: keep the crate boundaries, deterministic
-seed-derived identity, owner encryption before RS, SQLCipher as the local
-container, fixed bounded sectors, and capability-probed source anchors. The
-issues below are defects in behavior that is already implemented.
+## P0 — protection can be falsely certified or checkpoint progress can wedge
 
-## P0 — fix before extending the prototype
+- [ ] **Prove the Reed--Solomon relation before signing a checkpoint.**
+  `GuildCheckpoint::validate` commits to five roots but never proves that the
+  two parity shards encode the three declared information shards
+  (`crates/mb-core/src/model.rs:412-468`). A parity holder merely checks that
+  the arbitrary bytes supplied by the coordinator match the coordinator's
+  root, and every node validates only its own local shard
+  (`crates/mb-node/src/node.rs:326-353`,
+  `crates/mb-node/src/network.rs:760-833`). A buggy or malicious coordinator
+  can therefore obtain a fully signed checkpoint whose parity is useless after
+  an information-shard loss. Have parity holders derive/verify their row from
+  authenticated information shards (or add an equally strong coding proof),
+  and add a corrupt-but-self-consistent parity regression test.
 
-- [ ] **Anchor cold-recovery authority in the recovering seed.**
-  `GuildCheckpoint::validate` accepts a self-declared member set and
-  `QuorumCheckpoint::verify` derives its quorum from that same set
-  (`crates/mb-core/src/model.rs:73-95,123-153`). Network recovery accepts any
-  publisher's decryptable locator, then selects the largest publisher-chosen
-  generation (`crates/mb-node/src/network.rs:659-720`). A malicious peer can
-  create three Sybil members, publish a generation-`u64::MAX` checkpoint, and
-  eclipse the real backup. For the current all-signers slice, require the
-  subject's checkpoint signature and an exact member entry containing both the
-  seed-derived Node ID and recovery key. Also require the locator publisher to
-  be a checkpoint member, outer and inner publishers to match, locator version
-  1, and the returned checkpoint hash to equal the locator hash. Fully validate
-  each candidate before ranking it; one bad high-generation candidate must not
-  abort recovery. Add an attacker-eclipse regression test.
+- [ ] **Bind every revision sector to its signed owner in coding-group
+  validation.** Revision coverage is indexed only as `SectorId -> SectorRef`;
+  when a matching reference appears in a group, the validator does not require
+  `InformationRole.owner` to equal the revision owner
+  (`crates/mb-core/src/model.rs:145-184,412-468`). The real owner also checks
+  only roles assigned to itself before signing (`crates/mb-node/src/node.rs:326-353`).
+  A quorum certificate can thus cover Alice's signed metadata sector while
+  assigning it to Bob; Alice accepts and cold recovery later installs no recipe
+  for that sector. Carry `(owner, reference)` through validation and require an
+  exact one-to-one owner-preserving assignment.
 
-- [ ] **Make quorum signing validate a state transition, not just its shape.**
-  A node currently signs any coordinator-supplied checkpoint that passes a few
-  structural checks (`crates/mb-node/src/network.rs:338-340`,
-  `crates/mb-node/src/node.rs:108-110`,
-  `crates/mb-core/src/model.rs:73-95,227-250`). It does not check predecessor or
-  generation, exact revision-to-group coverage, duplicate/conflicting IDs,
-  preservation of active state, its own member/recovery-key binding, or that
-  its assigned shard with the stated root is durable. It also records no
-  signed-generation lock, so it will sign competing forks. Add deterministic
-  semantic transition validation and persist the accepted generation/hash
-  before replying. A configured coordinator may schedule work but must not be
-  treated as the authority that makes an unsafe state valid.
+- [ ] **Do not overwrite an uncommitted signature lock with its child.** A node
+  may sign generation `N+1` using its generation-`N` lock even when `N` is not
+  yet the committed head (`crates/mb-node/src/node.rs:274-323`). The database
+  then replaces the sole lock row with `N+1`
+  (`crates/mb-store/src/database.rs:467-519`). A late finalize of `N` fails
+  because its lock vanished, while finalize of `N+1` fails because head `N`
+  was never installed (`database.rs:523-586`). Network reordering can therefore
+  wedge that guild permanently. Retain per-generation locks and finalize in
+  order, or refuse to sign a child until its parent certificate is committed.
 
-- [ ] **Make coding-group identities and READY parity immutable.**
-  Group IDs are arbitrary and are neither recomputed nor required to be unique
-  (`crates/mb-core/src/model.rs:45-49,92-94,227-250`); the current group-ID hash
-  omits RS/shard parameters and parity roots
-  (`crates/mb-node/src/network.rs:947-960`). Storage then keys only by
-  `(group_id, shard_index)` and overwrites even a READY row with different bytes
-  (`crates/mb-store/src/database.rs:180-188,200-225`). Define a versioned group
-  descriptor whose ID commits to the complete ordered codeword description,
-  validate it, and reject duplicate IDs. An identical publish may be an
-  idempotent success; any different root, length, or bytes for a READY key must
-  be a hard conflict. Test that a second publish cannot destroy a recoverable
-  checkpoint.
+## P1 — correctness, durability, availability, and bounded operation
 
-- [ ] **Turn seed recovery into recovery of an active node, for every member.**
-  Rendezvous records are produced only for `peers[0]`, and recovery requires
-  that member to own a revision (`crates/mb-node/src/network.rs:619-639,714-720`;
-  the lab repeats this at `crates/mb-node/src/lab.rs:264,317-345`). After an
-  owner restore, `rebuild_from_checkpoint` stores only the checkpoint
-  (`crates/mb-node/src/node.rs:151-153`); it installs no sector recipes or
-  anchors and reconstructs no parity obligation. The returned/registered node
-  therefore cannot answer `GetSector` or `GetParity`. Publish recovery state for
-  every member, recover state even when the member owns no revision, rebuild and
-  verify all current local roles, and only then mark the node active. Test blank
-  recovery of each of the five roles and use the recovered node as a shard
-  source in a later recovery.
+- [ ] **Validate revision lineage instead of trusting sequence labels.** The
+  model only checks that sequence 1 has no parent and later sequences have some
+  parent; it permits gaps, duplicate `(owner, sequence)` values, and arbitrary
+  parent hashes (`crates/mb-core/src/model.rs:145-184`). Recovery then chooses
+  whichever revision has the largest sequence without validating a chain
+  (`crates/mb-node/src/network.rs:1036-1048`,
+  `crates/mb-node/src/lab.rs:330-343`). Define the signed revision identity,
+  require each owner's head to extend its exact predecessor, reject forks and
+  duplicate sequences, and select only the authenticated head.
 
-## P1 — correctness, durability, and bounded operation
+- [ ] **Journal the coordinator's whole commit, not only individual peer
+  calls.** Every invocation chooses a fresh random guild ID and retains no
+  durable coordinator state (`crates/mb-node/src/network.rs:650-700`). Failure
+  after source capture, parity publication, signature locking, checkpoint
+  finalization, or partial directory publication cannot resume the same
+  transaction; rerunning starts a different guild and strands anchors, parity,
+  pages, and locks. Persist the draft guild/checkpoint, peer operation IDs, and
+  phase before the first side effect, then resume or explicitly abort that same
+  operation.
 
-- [ ] **Bind each signed revision to its encryption context and enforce its
-  version.** `UserRevision` omits the guild ID/key context
-  (`crates/mb-core/src/model.rs:162-171`), although preparation encrypts with a
-  caller-supplied guild ID (`crates/mb-node/src/snapshot.rs:50-59`) and restore
-  takes the containing checkpoint's guild ID (`snapshot.rs:224-243`). A valid
-  revision can therefore be replayed into another guild, pass validation, and
-  become undecryptable. Put the guild ID and current v1 cipher/sector profile in
-  the signed revision, and reject unsupported revision versions before using
-  any fields.
+- [ ] **Finish the bounded-state design; paging currently changes only the
+  wire envelope.** `PrepareSource` still returns the complete revision in one
+  600 KiB frame, imposing a backup-size ceiling in the hundreds of MiB
+  (`crates/mb-node/src/network.rs:28,171-188,705-725`). Preparation constructs
+  all private entries/references and serialized metadata in memory
+  (`crates/mb-node/src/snapshot.rs:103-200`); checkpoint fetch and staged
+  assembly concatenate the entire object, with additional copies during decode
+  (`network.rs:1225-1272`, `crates/mb-store/src/database.rs:366-414`); restore
+  concatenates all private metadata (`snapshot.rs:380-390`). Page revision
+  catalogs and metadata too, decode/validate incrementally, and enforce a small
+  end-to-end memory budget rather than a 256 MiB object cap with several live
+  copies.
 
-- [ ] **Move anchors out of the protected namespace and use stable addressing.**
-  Anchors currently live at `source_root/.mutualbackup-anchors`
-  (`crates/mb-store/src/anchor.rs:67-71`). An existing user directory with that
-  name is silently chmodded and excluded, omitting it from the backup; a
-  symlink can redirect the supposedly private store. Deleting the protected
-  root deletes its anchors, while renaming it makes every absolute recipe path
-  stale (`crates/mb-node/src/snapshot.rs:80-103,203-209`). Use an exclusively
-  created, marked app directory outside the scanned tree but on the same
-  filesystem, reject symlinks/name collisions, and address anchors by stable
-  volume/anchor ID plus validated relative path.
+- [ ] **Keep synchronous filesystem/SQLCipher work off Tokio workers and split
+  the global node lock.** Server requests run in `spawn_blocking`, but hold one
+  `Mutex<Node>` across an entire capture or store operation, so one long
+  capture serializes all reads and parks other blocking-pool jobs
+  (`crates/mb-node/src/network.rs:359-451,495-633`). The async recovery client
+  directly performs synchronous SQLCipher writes, checkpoint installation, and
+  the complete filesystem restore on its runtime thread
+  (`network.rs:1034-1048,1152-1159`). Use bounded DB/filesystem/CPU workers with
+  short ownership scopes; do not make the whole node one blocking critical
+  section.
 
-- [ ] **Remove path races from reflink capture.** The walk reads metadata from a
-  pathname and later reopens that pathname normally for `FICLONE`
-  (`crates/mb-store/src/anchor.rs:164-188,225-243`). A rename, truncate, growth,
-  or symlink substitution can clone a different inode—even a file outside the
-  protected root—while the signed manifest retains the old length and
-  properties; growth can be silently truncated by
-  `crates/mb-node/src/snapshot.rs:83-105`. Open beneath the root with no-follow
-  descriptor-relative APIs, clone from that descriptor, derive metadata from
-  the captured object, and reject/retry if identity or change metadata moves
-  across the capture boundary. Seal completed anchor files read-only before
-  registering them; they currently remain writable (`anchor.rs:232-251`).
+- [ ] **Do not leave recovered owner data permanently embedded in
+  `control.db`.** Recovery decrypts every information sector and installs it as
+  an inline plaintext recipe (`crates/mb-node/src/node.rs:424-465`,
+  `crates/mb-node/src/snapshot.rs:269-290`). Restore writes a second copy to the
+  target, but no successful transition replaces those inline rows with recipes
+  backed by a durable source anchor. An active recovered owner therefore turns
+  the control database into a full duplicate data store. Build and fsync the
+  restored anchor, atomically switch recipes to it, and retire recovery payload
+  rows only after the switch is durable.
 
-- [ ] **Bound recovery memory and remove the single-frame state ceiling.**
-  Recovery accumulates every 64 KiB ciphertext sector in one `BTreeMap`, then
-  clones sectors again during restore (`crates/mb-node/src/network.rs:733-810`;
-  `crates/mb-node/src/snapshot.rs:313-325`). Preparation likewise materializes
-  the metadata, references, recipes, and records, while every checkpoint embeds
-  all revisions/groups and must fit the 32 MiB frame
-  (`snapshot.rs:60-174`, `network.rs:24,67-71,926-944`). This makes RAM scale
-  with backup size and places a hard low-gigabyte-scale ceiling on a backup.
-  Stream verified recovered sectors into a durable bounded staging store, batch
-  preparation writes, and page/content-address checkpoint state rather than
-  serializing the whole layout into one RPC.
+- [ ] **Make anchor IDs locatable and make capture cleanup complete.**
+  `AnchorAreaLocator` has an ID, but opening an anchor only validates and uses
+  its absolute `path_hint`; renaming a parent makes every committed recipe
+  unavailable even though the anchor moved intact
+  (`crates/mb-store/src/anchor.rs:58-80,349-360,477-482`). Capture also leaks its
+  staging directory when bottom-up sync or the no-replace rename fails
+  (`anchor.rs:138-153`), and its sync walk silently drops traversal errors
+  (`anchor.rs:654-666`). Resolve the stable area/volume ID through local catalog
+  state, guard the complete capture with cleanup/reconciliation state, and
+  propagate every sync-walk error.
 
-- [ ] **Do not multiply one dead peer's timeout by every sector.** Recovery
-  probes shard holders serially for every coding group and continues through all
-  five even after three valid shards are present
-  (`crates/mb-node/src/network.rs:747-797`). A black-holed endpoint costs five
-  seconds per 64 KiB group, turning a 1 GiB recovery into roughly 23 hours of
-  avoidable waiting. Fetch with bounded concurrency, remember peer health/cut
-  off repeated timeouts, and cancel the remaining reads once any three valid
-  shards are available.
+- [ ] **Preserve filesystem semantics that the current capture accepts.**
+  Regular hard-linked aliases are captured as unrelated files because no
+  native identity/link relation is recorded; recovery always creates a new
+  inode per path (`crates/mb-store/src/anchor.rs:226-301`,
+  `crates/mb-node/src/snapshot.rs:426-474`). Sparse extents are likewise read as
+  zero bytes into sectors and restored with dense `write_all`, so a large sparse
+  file can exhaust the target disk (`snapshot.rs:124-169,448-474`). Either
+  preserve link groups and hole maps in signed private metadata or reject such
+  inputs explicitly; do not silently report a faithful restore.
 
-- [ ] **Do not issue a sole recovery pointer that expires without a refresher.**
-  Commit is the only publication path and sets every locator to 30 days
-  (`crates/mb-node/src/network.rs:619-638`); recovery rejects it afterward
-  (`network.rs:674-679`). On day 31 an otherwise intact backup becomes
-  undiscoverable. The outer directory record also has no visible generation or
-  expiry, so a captured older signed record can replace a newer one
-  (`network.rs:135-156,192-205`). Until renewal is implemented and tested, make
-  prototype records non-expiring or reject a commit whose recovery lifetime
-  cannot be maintained; add an outer monotonic anti-rollback field. Exercise
-  expiry and replay with an injected clock.
+- [ ] **Retry directory durability before adopting a published restore.** If
+  `rename_no_replace` succeeds but the parent-directory fsync fails,
+  `publish_restore` returns an error while the job remains `Ready`
+  (`crates/mb-node/src/snapshot.rs:404-408`,
+  `crates/mb-node/src/node.rs:575-582`). On retry, the existing-target branch
+  checks only `(dev, ino)`, marks the job `Complete`, and never retries that
+  fsync (`node.rs:547-557`). Sync the parent before durable adoption and bind
+  adoption to a stronger persisted marker/manifest so inode reuse cannot make
+  an unrelated directory look owned by the job.
 
-- [ ] **Put hard pre-authentication resource bounds on both TCP servers.** Node
-  and directory permits are held while an unauthenticated client performs an
-  un-timed read (`crates/mb-node/src/network.rs:163-225,229-238`). Thirty-two
-  idle sockets disable a node; accepted frames may allocate 32 MiB each before
-  signature verification, and nested `Vec` lengths are not semantically
-  bounded (`network.rs:24,937-944`). Add header/body/whole-request deadlines,
-  small message-specific limits and nested-count limits, and bounded streaming
-  for bulk data. Bound directory subjects/publishers/record size as well; its
-  current unbounded maps and ignored write error permit memory exhaustion and
-  oversized lookup failure (`network.rs:155-160,192-225`).
+- [ ] **Do not bless unknown or malformed database layouts during migration.**
+  Versions 3 and 4 are upgraded largely by `CREATE TABLE IF NOT EXISTS` plus a
+  version bump; current-version validation checks table names, not their
+  columns, constraints, or indexes (`crates/mb-store/src/database.rs:917-1027,1168-1179`).
+  Version 4 was never a committed schema. Parity versions 2--4 are relabeled
+  current without validating `parity_objects`, while the v1 path hides all old
+  rows in `parity_objects_v1_unassigned` and then opens an empty active store
+  (`database.rs:1030-1100`). Define and test every accepted source schema
+  exactly; reject undefined layouts, and require explicit reconciliation when
+  legacy parity cannot be assigned safely.
 
-- [ ] **Do not acquire the synchronous Node mutex on a Tokio worker.** After a
-  blocking request finishes, `handle_peer_connection` calls `node.lock()` on
-  the async runtime in order to sign its response
-  (`crates/mb-node/src/network.rs:229-250`). Another blocking worker can acquire
-  that lock first and hold it through a full source capture, pinning a Tokio
-  worker and potentially starving unrelated I/O and timers. Produce the signed
-  response inside the bounded blocking worker, or keep a separately usable
-  signer; no blocking mutex acquisition belongs in async code.
+- [ ] **Close the remaining server and directory resource-exhaustion paths.**
+  Reads have deadlines, but server response writes do not; clients that stop
+  reading can retain all node/directory permits indefinitely
+  (`crates/mb-node/src/network.rs:238-371,1406-1418`). Directory admission also
+  permits 64 records of up to 64 KiB each even though serializing those records
+  plus envelope overhead exceeds its 4 MiB response limit
+  (`network.rs:29-32,274-330,339-354`). Add a whole-connection/write deadline
+  and make admission limits prove that every accepted lookup result is
+  returnable within its frame and memory budgets.
 
-- [ ] **Authorize reads and bind signed requests to their destination and
-  protocol context.** `GetSector`, `GetParity`, and `GetCheckpoint` are accepted
-  from any valid signing key, not an authorized guild member
-  (`crates/mb-node/src/network.rs:85-99,259-297`). The signed request contains
-  only a request ID and enum (`network.rs:102-106`), so a captured mutation can
-  be forwarded to another node that trusts the same coordinator. Add an
-  explicit wire version, intended recipient, guild/authorization scope, caller,
-  and freshness context to the signed bytes; enforce membership/capability per
-  operation before touching storage.
+- [ ] **Prevent trivial Sybil saturation of recovery rendezvous slots.** The
+  directory accepts any self-signed key as a publisher for any subject before
+  the encrypted inner record can prove guild membership. An attacker can fill
+  the first 64 publisher slots for a known Node ID (or all 100,000 subject
+  slots), after which legitimate peers are rejected
+  (`crates/mb-node/src/network.rs:230-235,274-330`). Because cold recovery
+  depends on these records, this is an availability break, not authority over
+  recovered state. Admission/eviction must not grant scarce slots to the first
+  unauthenticated identities that write them.
 
-- [ ] **Finish crash durability before reporting capture or recovery success.**
-  Capture and restore fsync files but not all modified nested directories;
-  restored modes are changed after the last file fsync
-  (`crates/mb-store/src/anchor.rs:82-84,188,250,272-276`;
-  `crates/mb-node/src/snapshot.rs:257-259,288-309,369-373`). Recovery publishes
-  the restored target before it persists even the incomplete rebuilt state
-  (`crates/mb-node/src/network.rs:721-730`), so a later failure leaves a target
-  that blocks retry. The earlier `target.exists()` check and plain `fs::rename`
-  are also a race that can replace an entry created in between
-  (`crates/mb-node/src/snapshot.rs:235-259`). Fsync modified directories
-  bottom-up and inode metadata after chmod, journal recovery, make retry
-  idempotent, persist verified node state/roles before an atomic no-replace
-  target rename, and clean or adopt staging/final anchors on every later error
-  path.
+## P2 — format, interface, and verification defects
 
-- [ ] **Write the recovery seed atomically and directory-durably.** `init`
-  writes directly to the final `create_new` file and fsyncs only that file
-  (`cmd/mutualbackup/src/main.rs:182-195`). Interruption can leave a truncated
-  final seed that cannot be replaced, and a crash may lose the directory entry
-  after success was printed. Write and validate a mode-0600 temp file in the
-  same directory, fsync it, install it with no-replace semantics, then fsync the
-  parent directory.
+- [ ] **Do not expose or conflate guild recovery records in the directory
+  schema.** `PublishedRecoveryRecord` leaves guild ID, checkpoint hash, and
+  generation in cleartext, contrary to the opaque rendezvous design
+  (`crates/mb-node/src/network.rs:205-215`). Records are keyed only by
+  `(subject, publisher)`, so the same two nodes' records for different guilds
+  overwrite or reject one another as forks (`network.rs:230-231,294-326`). Use
+  a privacy-preserving, independently versioned slot/anti-rollback key that can
+  represent every guild without revealing the decrypted locator fields.
 
-- [ ] **Lock one data directory to one live Node and make operation replay truly
-  stable.** `Node::open` retains no process lock (`crates/mb-node/src/node.rs:23-38`).
-  Two daemons can therefore interleave a side effect and the later operation
-  cache write (`crates/mb-node/src/network.rs:280-294`), while client retries
-  always generate a fresh UUID (`network.rs:840-853`). Hold an OS lock for the
-  Node lifetime. Persist coordinator operation IDs across retries, bind cached
-  entries to request kind/hash/caller, and make same-database effects plus their
-  result atomic; reconcile cross-database effects after crashes.
+- [ ] **Align protocol integer ranges with persistence.** Checkpoint validation
+  accepts every nonzero `u64` generation, while signature locking and commit
+  convert it to SQLite `i64` and reject values above `i64::MAX`
+  (`crates/mb-core/src/model.rs:113-123`,
+  `crates/mb-store/src/database.rs:467-476,523-534`). A quorum-valid wire object
+  can therefore be impossible to persist. Constrain the wire model or store the
+  full unsigned representation consistently.
 
-## P2 — format and fidelity defects to close before compatibility promises
+- [ ] **Make `recover --restore` truthful for members without a user
+  revision.** Recovery intentionally rebuilds parity/helper roles too, but if
+  the seed owns no revision it returns success without creating the requested
+  target (`crates/mb-node/src/network.rs:1034-1050`). The CLI nevertheless
+  always prints `restored directory` (`cmd/mutualbackup/src/main.rs:164-178`).
+  Make restoration optional for storage-only recovery, or fail an explicitly
+  requested restore when there is no recoverable user revision.
 
-- [ ] **Enforce database kind and schema version on open.** Control storage only
-  inserts version 1 if absent and never reads it; parity storage has no database
-  identity/version metadata (`crates/mb-store/src/database.rs:37-59,179-189`).
-  `CREATE TABLE IF NOT EXISTS` can consequently operate on an incompatible or
-  newer database. Validate kind/version before mutation, reject unknown newer
-  versions, and run explicit transactional migrations.
-
-- [ ] **Stop silently claiming filesystem entries/properties that are not
-  restored.** Capture skips the source-root entry and silently ignores anything
-  that is neither a directory nor a regular file
-  (`crates/mb-store/src/anchor.rs:161-200`), so the restored root stays mode 0700
-  and FIFOs/sockets/devices vanish. File modification times are carried through
-  private metadata but ignored by the restore match
-  (`crates/mb-node/src/snapshot.rs:15-29,277-303`). Apply the properties already
-  recorded, including root mode/time, and fail capture explicitly on unsupported
-  object types rather than reporting a complete backup.
-
-- [ ] **Define one canonical checkpoint state identity.** Verification accepts
-  signatures in any order and accepts any quorum-or-larger subset, while
-  `hash()` includes that vector (`crates/mb-core/src/model.rs:113-159`). Reordering
-  or adding a valid surplus signature changes the locator hash without changing
-  the authorized state. Hash the canonical checkpoint body as the stable state
-  ID and carry a separately normalized quorum certificate, or enforce one exact
-  sorted certificate representation. Enforce canonical ordering/uniqueness for
-  all set-like vectors too.
-
-- [ ] **Reject weak Ed25519 and non-contributory X25519 inputs.** Incoming
-  signatures use non-strict Ed25519 verification
-  (`crates/mb-core/src/model.rs:140-145,190-196`), and recovery-record DH never
-  checks `SharedSecret::was_contributory()`
-  (`crates/mb-core/src/recovery.rs:47-55,84-91`). Use strict verification,
-  reject weak member keys, and reject low-order recovery/ephemeral keys before
-  deriving an AEAD key. Add crafted edge-case vectors.
-
-- [ ] **Make the claimed recovery invariant a mandatory test, not an optional
-  pass.** The only in-process recovery test returns successfully when
-  `MUTUALBACKUP_REFLINK_TEST_ROOT` is absent
-  (`crates/mb-node/src/lab.rs:503-510`), covers only a small honest owner-0
-  recovery, and then never asks the recovered node for a shard
-  (`lab.rs:525-549`). The network module otherwise tests only endpoint parsing
-  (`crates/mb-node/src/network.rs:982-993`), and the Nix package disables checks
-  (`flake.nix:10-18`). Make the reflink-backed acceptance suite an explicit
-  required CI job and cover the hostile/restart/post-recovery cases named above;
-  a missing test filesystem must skip visibly at the harness level, not turn the
-  test green from inside the test body.
-
-- [ ] **Reject unusable advertised endpoints before committing data.** Server
-  startup validates neither the syntax nor identity reachability of
-  `public_endpoint` (`crates/mb-node/src/network.rs:163-167`), and commit trusts
-  the returned string (`network.rs:411-420`) even though it becomes the sole
-  locator endpoint. A typo produces a successful commit that recovery cannot
-  use. Parse at startup and have commit verify enough advertised endpoints by
-  connecting and authenticating the expected Node IDs before it reports
-  success.
+- [ ] **Make the mandatory acceptance coverage exercise the claimed failure
+  boundary.** The network acceptance test removes only the recovered owner, so
+  four remote shards remain, and it exercises only the owner role
+  (`crates/mb-node/src/network.rs:1574-1665`). The in-memory all-role test also
+  keeps four remote nodes available for each recovery
+  (`crates/mb-node/src/lab.rs:597-665`). Add a required real-network case with
+  the recovered node plus one other failure, use recovered nodes as later
+  sources, and cover the invalid-parity, role-owner, lock-reordering, migration,
+  sparse-file, and interrupted-restore cases above. Also update `README.md:81-83`:
+  setting the environment variable alone no longer runs tests now marked
+  `#[ignore]`; the explicit acceptance script is required.
