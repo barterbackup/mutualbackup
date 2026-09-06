@@ -797,18 +797,7 @@ fn initialize_or_validate_control(connection: &mut Connection) -> Result<(), Dat
     if database_has_tables(connection)? {
         migrate_control(connection)?;
         validate_database_identity(connection, b"control", None)?;
-        require_tables(
-            connection,
-            &[
-                "meta",
-                "protocol_records",
-                "operations",
-                "checkpoint_signature_locks",
-                "checkpoint_heads",
-                "recovery_shards",
-                "checkpoint_pages",
-            ],
-        )?;
+        validate_control_schema(connection, SCHEMA_VERSION)?;
         return Ok(());
     }
     let transaction = connection.transaction()?;
@@ -882,7 +871,7 @@ fn initialize_or_validate_parity(
     if database_has_tables(connection)? {
         migrate_parity(connection, volume_id)?;
         validate_database_identity(connection, b"parity", Some(volume_id))?;
-        require_tables(connection, &["meta", "parity_objects"])?;
+        validate_parity_schema(connection)?;
         return Ok(());
     }
     let transaction = connection.transaction()?;
@@ -925,39 +914,15 @@ fn migrate_control(connection: &mut Connection) -> Result<(), DatabaseError> {
     }
     let version = stored_schema_version(connection)?;
     if version == SCHEMA_VERSION {
-        return Ok(());
+        return validate_control_schema(connection, version);
     }
-    if version == 0 || version > SCHEMA_VERSION {
+    if !matches!(version, 1..=3) {
         return Err(DatabaseError::IncompatibleSchema);
     }
     if version >= 2 && meta_value(connection, "database_kind")?.as_deref() != Some(b"control") {
         return Err(DatabaseError::IncompatibleSchema);
     }
-    if !table_exists(connection, "protocol_records")? || !table_exists(connection, "operations")? {
-        return Err(DatabaseError::IncompatibleSchema);
-    }
-    let operation_columns = table_columns(connection, "operations")?;
-    let expected_operations = if version == 1 {
-        ["operation_id", "kind", "state", "body"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
-    } else {
-        [
-            "operation_id",
-            "kind",
-            "caller",
-            "request_hash",
-            "state",
-            "body",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
-    };
-    if operation_columns != expected_operations {
-        return Err(DatabaseError::IncompatibleSchema);
-    }
+    validate_control_schema(connection, version)?;
 
     let transaction = connection.transaction()?;
     if version <= 2 {
@@ -1034,67 +999,19 @@ fn migrate_control(connection: &mut Connection) -> Result<(), DatabaseError> {
 
 fn migrate_parity(connection: &mut Connection, volume_id: &[u8; 16]) -> Result<(), DatabaseError> {
     if !table_exists(connection, "meta")? {
-        if !table_exists(connection, "parity_objects")? {
-            return Err(DatabaseError::IncompatibleSchema);
-        }
-        let expected = [
-            "group_id",
-            "shard_index",
-            "root",
-            "byte_length",
-            "state",
-            "bytes",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-        if table_columns(connection, "parity_objects")? != expected {
-            return Err(DatabaseError::IncompatibleSchema);
-        }
-        let transaction = connection.transaction()?;
-        transaction.execute_batch(
-            "ALTER TABLE parity_objects RENAME TO parity_objects_v1_unassigned;
-             CREATE TABLE parity_objects (
-                format_version INTEGER NOT NULL CHECK(format_version = 1),
-                guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
-                group_id BLOB NOT NULL CHECK(length(group_id) = 32),
-                shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 3 AND 4),
-                root BLOB NOT NULL CHECK(length(root) = 32),
-                byte_length INTEGER NOT NULL CHECK(byte_length = 65536),
-                state TEXT NOT NULL CHECK(state IN ('STAGED', 'READY')),
-                bytes BLOB NOT NULL,
-                PRIMARY KEY(group_id, shard_index)
-             ) STRICT;
-             CREATE TABLE meta (
-                key TEXT PRIMARY KEY,
-                value BLOB NOT NULL
-             ) STRICT;",
-        )?;
-        transaction.execute(
-            "INSERT INTO meta(key, value) VALUES ('database_kind', ?1)",
-            [b"parity".as_slice()],
-        )?;
-        transaction.execute(
-            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
-            [SCHEMA_VERSION.to_be_bytes().as_slice()],
-        )?;
-        transaction.execute(
-            "INSERT INTO meta(key, value) VALUES ('volume_id', ?1)",
-            [volume_id.as_slice()],
-        )?;
-        transaction.commit()?;
-        return Ok(());
+        return Err(DatabaseError::IncompatibleSchema);
     }
     let version = stored_schema_version(connection)?;
     if version == SCHEMA_VERSION {
-        return Ok(());
+        return validate_parity_schema(connection);
     }
-    if !(2..=SCHEMA_VERSION).contains(&version)
+    if !matches!(version, 2..=3)
         || meta_value(connection, "database_kind")?.as_deref() != Some(b"parity")
         || meta_value(connection, "volume_id")?.as_deref() != Some(volume_id.as_slice())
     {
         return Err(DatabaseError::IncompatibleSchema);
     }
+    validate_parity_schema(connection)?;
     let transaction = connection.transaction()?;
     transaction.execute(
         "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
@@ -1121,14 +1038,159 @@ fn table_exists(connection: &Connection, name: &str) -> Result<bool, DatabaseErr
     )?)
 }
 
-fn table_columns(
+const META_SCHEMA: &str = "CREATE TABLE meta (
+    key TEXT PRIMARY KEY,
+    value BLOB NOT NULL
+) STRICT";
+const PROTOCOL_RECORDS_SCHEMA: &str = "CREATE TABLE protocol_records (
+    kind TEXT NOT NULL,
+    record_id BLOB NOT NULL,
+    bytes BLOB NOT NULL,
+    PRIMARY KEY (kind, record_id)
+) STRICT";
+const OPERATIONS_V1_SCHEMA: &str = "CREATE TABLE operations (
+    operation_id BLOB PRIMARY KEY,
+    kind TEXT NOT NULL,
+    state TEXT NOT NULL,
+    body BLOB NOT NULL
+) STRICT";
+const OPERATIONS_V2_SCHEMA: &str = "CREATE TABLE operations (
+    operation_id BLOB PRIMARY KEY CHECK(length(operation_id) = 16),
+    kind TEXT NOT NULL,
+    caller BLOB NOT NULL CHECK(length(caller) = 32),
+    request_hash BLOB NOT NULL CHECK(length(request_hash) = 32),
+    state TEXT NOT NULL CHECK(state = 'COMMITTED'),
+    body BLOB NOT NULL
+) STRICT";
+const OPERATIONS_SCHEMA: &str = "CREATE TABLE operations (
+    operation_id BLOB PRIMARY KEY CHECK(length(operation_id) = 16),
+    kind TEXT NOT NULL,
+    caller BLOB NOT NULL CHECK(length(caller) = 32),
+    request_hash BLOB NOT NULL CHECK(length(request_hash) = 32),
+    state TEXT NOT NULL CHECK(state IN ('IN_PROGRESS', 'COMMITTED')),
+    body BLOB NOT NULL
+) STRICT";
+const CHECKPOINT_LOCKS_SCHEMA: &str = "CREATE TABLE checkpoint_signature_locks (
+    guild_id BLOB PRIMARY KEY CHECK(length(guild_id) = 32),
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    checkpoint_hash BLOB NOT NULL CHECK(length(checkpoint_hash) = 32),
+    checkpoint_bytes BLOB NOT NULL
+) STRICT";
+const CHECKPOINT_HEADS_SCHEMA: &str = "CREATE TABLE checkpoint_heads (
+    guild_id BLOB PRIMARY KEY CHECK(length(guild_id) = 32),
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    checkpoint_hash BLOB NOT NULL CHECK(length(checkpoint_hash) = 32),
+    checkpoint_bytes BLOB NOT NULL
+) STRICT";
+const RECOVERY_SHARDS_SCHEMA: &str = "CREATE TABLE recovery_shards (
+    checkpoint_hash BLOB NOT NULL CHECK(length(checkpoint_hash) = 32),
+    guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
+    group_id BLOB NOT NULL CHECK(length(group_id) = 32),
+    shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 0 AND 4),
+    root BLOB NOT NULL CHECK(length(root) = 32),
+    bytes BLOB NOT NULL CHECK(length(bytes) = 65536),
+    PRIMARY KEY(checkpoint_hash, group_id, shard_index)
+) STRICT";
+const CHECKPOINT_PAGES_SCHEMA: &str = "CREATE TABLE checkpoint_pages (
+    object_kind TEXT NOT NULL CHECK(object_kind IN ('body', 'certificate')),
+    guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
+    object_id BLOB NOT NULL CHECK(length(object_id) = 32),
+    page_index INTEGER NOT NULL CHECK(page_index >= 0),
+    total_pages INTEGER NOT NULL CHECK(total_pages BETWEEN 1 AND 512),
+    page_hash BLOB NOT NULL CHECK(length(page_hash) = 32),
+    bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 524288),
+    PRIMARY KEY(object_kind, object_id, page_index)
+) STRICT";
+const PARITY_OBJECTS_SCHEMA: &str = "CREATE TABLE parity_objects (
+    format_version INTEGER NOT NULL CHECK(format_version = 1),
+    guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
+    group_id BLOB NOT NULL CHECK(length(group_id) = 32),
+    shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 3 AND 4),
+    root BLOB NOT NULL CHECK(length(root) = 32),
+    byte_length INTEGER NOT NULL CHECK(byte_length = 65536),
+    state TEXT NOT NULL CHECK(state IN ('STAGED', 'READY')),
+    bytes BLOB NOT NULL,
+    PRIMARY KEY(group_id, shard_index)
+) STRICT";
+
+fn validate_control_schema(connection: &Connection, version: u32) -> Result<(), DatabaseError> {
+    let expected = match version {
+        1 => vec![
+            ("meta", META_SCHEMA),
+            ("protocol_records", PROTOCOL_RECORDS_SCHEMA),
+            ("operations", OPERATIONS_V1_SCHEMA),
+        ],
+        2 => vec![
+            ("meta", META_SCHEMA),
+            ("protocol_records", PROTOCOL_RECORDS_SCHEMA),
+            ("operations", OPERATIONS_V2_SCHEMA),
+            ("checkpoint_signature_locks", CHECKPOINT_LOCKS_SCHEMA),
+            ("checkpoint_heads", CHECKPOINT_HEADS_SCHEMA),
+        ],
+        3 => vec![
+            ("meta", META_SCHEMA),
+            ("protocol_records", PROTOCOL_RECORDS_SCHEMA),
+            ("operations", OPERATIONS_SCHEMA),
+            ("checkpoint_signature_locks", CHECKPOINT_LOCKS_SCHEMA),
+            ("checkpoint_heads", CHECKPOINT_HEADS_SCHEMA),
+        ],
+        SCHEMA_VERSION => vec![
+            ("meta", META_SCHEMA),
+            ("protocol_records", PROTOCOL_RECORDS_SCHEMA),
+            ("operations", OPERATIONS_SCHEMA),
+            ("checkpoint_signature_locks", CHECKPOINT_LOCKS_SCHEMA),
+            ("checkpoint_heads", CHECKPOINT_HEADS_SCHEMA),
+            ("recovery_shards", RECOVERY_SHARDS_SCHEMA),
+            ("checkpoint_pages", CHECKPOINT_PAGES_SCHEMA),
+        ],
+        _ => return Err(DatabaseError::IncompatibleSchema),
+    };
+    require_exact_tables(connection, &expected)
+}
+
+fn validate_parity_schema(connection: &Connection) -> Result<(), DatabaseError> {
+    require_exact_tables(
+        connection,
+        &[
+            ("meta", META_SCHEMA),
+            ("parity_objects", PARITY_OBJECTS_SCHEMA),
+        ],
+    )
+}
+
+fn require_exact_tables(
     connection: &Connection,
-    table: &'static str,
-) -> Result<std::collections::BTreeSet<String>, DatabaseError> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    Ok(statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<_, _>>()?)
+    expected: &[(&str, &str)],
+) -> Result<(), DatabaseError> {
+    let mut statement = connection.prepare(
+        "SELECT name, sql FROM sqlite_schema
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+    if actual.len() != expected.len() {
+        return Err(DatabaseError::IncompatibleSchema);
+    }
+    for (name, sql) in expected {
+        let Some(actual_sql) = actual.get(*name) else {
+            return Err(DatabaseError::IncompatibleSchema);
+        };
+        if normalize_schema_sql(actual_sql) != normalize_schema_sql(sql) {
+            return Err(DatabaseError::IncompatibleSchema);
+        }
+    }
+    Ok(())
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_whitespace() && *character != ';')
+        .flat_map(char::to_lowercase)
+        .collect::<String>()
+        .replace("ifnotexists", "")
 }
 
 fn database_has_tables(connection: &Connection) -> Result<bool, DatabaseError> {
@@ -1167,20 +1229,6 @@ fn meta_value(connection: &Connection, key: &str) -> Result<Option<Vec<u8>>, Dat
             row.get(0)
         })
         .optional()?)
-}
-
-fn require_tables(connection: &Connection, names: &[&str]) -> Result<(), DatabaseError> {
-    for name in names {
-        let present: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
-            [name],
-            |row| row.get(0),
-        )?;
-        if !present {
-            return Err(DatabaseError::IncompatibleSchema);
-        }
-    }
-    Ok(())
 }
 
 fn checkpoint_row(
@@ -1467,6 +1515,143 @@ mod tests {
             ControlStore::open(&path, &keys),
             Err(DatabaseError::IncompatibleSchema)
         ));
+    }
+
+    #[test]
+    fn malformed_current_schema_is_rejected() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([16; 32]));
+        drop(ControlStore::open(&path, &keys).unwrap());
+        {
+            let connection =
+                open_encrypted(&path, &keys.database_key(CONTROL_DATABASE_ID)).unwrap();
+            connection
+                .execute_batch(
+                    "ALTER TABLE protocol_records RENAME TO protocol_records_valid;
+                     CREATE TABLE protocol_records(
+                        kind TEXT NOT NULL, record_id BLOB NOT NULL, bytes BLOB NOT NULL
+                     ) STRICT;
+                     DROP TABLE protocol_records_valid;",
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            ControlStore::open(&path, &keys),
+            Err(DatabaseError::IncompatibleSchema)
+        ));
+    }
+
+    #[test]
+    fn undefined_version_four_is_rejected_without_relabeling() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([17; 32]));
+        drop(ControlStore::open(&path, &keys).unwrap());
+        {
+            let connection =
+                open_encrypted(&path, &keys.database_key(CONTROL_DATABASE_ID)).unwrap();
+            connection
+                .execute(
+                    "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                    [4_u32.to_be_bytes().as_slice()],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            ControlStore::open(&path, &keys),
+            Err(DatabaseError::IncompatibleSchema)
+        ));
+        let connection = open_encrypted(&path, &keys.database_key(CONTROL_DATABASE_ID)).unwrap();
+        assert_eq!(stored_schema_version(&connection).unwrap(), 4);
+    }
+
+    #[test]
+    fn unassigned_legacy_parity_requires_explicit_reconciliation() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("parity.db");
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([18; 32]));
+        let volume_id = [19; 16];
+        let mut database_id = b"parity.db/".to_vec();
+        database_id.extend_from_slice(&volume_id);
+        {
+            let connection = open_encrypted(&path, &keys.database_key(&database_id)).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE parity_objects (
+                        group_id BLOB NOT NULL CHECK(length(group_id) = 32),
+                        shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 3 AND 4),
+                        root BLOB NOT NULL CHECK(length(root) = 32),
+                        byte_length INTEGER NOT NULL CHECK(byte_length > 0),
+                        state TEXT NOT NULL CHECK(state IN ('STAGED', 'READY')),
+                        bytes BLOB NOT NULL,
+                        PRIMARY KEY(group_id, shard_index)
+                     ) STRICT;",
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            ParityStore::open(&path, &volume_id, &keys),
+            Err(DatabaseError::IncompatibleSchema)
+        ));
+        let connection = open_encrypted(&path, &keys.database_key(&database_id)).unwrap();
+        assert!(table_exists(&connection, "parity_objects").unwrap());
+        assert!(!table_exists(&connection, "meta").unwrap());
+        assert!(!table_exists(&connection, "parity_objects_v1_unassigned").unwrap());
+    }
+
+    #[test]
+    fn exact_version_two_parity_schema_migrates_with_data() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("parity.db");
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([20; 32]));
+        let volume_id = [21; 16];
+        let mut database_id = b"parity.db/".to_vec();
+        database_id.extend_from_slice(&volume_id);
+        let bytes = vec![22; V1_SECTOR_SIZE];
+        let root = sector_root(&bytes);
+        {
+            let connection = open_encrypted(&path, &keys.database_key(&database_id)).unwrap();
+            connection.execute_batch(META_SCHEMA).unwrap();
+            connection.execute_batch(PARITY_OBJECTS_SCHEMA).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO meta(key, value) VALUES ('database_kind', ?1)",
+                    [b"parity".as_slice()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
+                    [2_u32.to_be_bytes().as_slice()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO meta(key, value) VALUES ('volume_id', ?1)",
+                    [volume_id.as_slice()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO parity_objects(
+                        format_version, guild_id, group_id, shard_index, root,
+                        byte_length, state, bytes
+                     ) VALUES (1, ?1, ?2, 3, ?3, 65536, 'READY', ?4)",
+                    params![
+                        [23_u8; 32].as_slice(),
+                        [24_u8; 32].as_slice(),
+                        root.as_slice(),
+                        bytes
+                    ],
+                )
+                .unwrap();
+        }
+        let store = ParityStore::open(&path, &volume_id, &keys).unwrap();
+        assert_eq!(
+            store.load_ready(&[24; 32], 3).unwrap().bytes,
+            vec![22; V1_SECTOR_SIZE]
+        );
     }
 
     #[test]
