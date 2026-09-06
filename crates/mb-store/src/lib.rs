@@ -10,4 +10,4 @@ mod database;
 pub use anchor::{AnchorError, AnchorManifest, CapturedEntry, ReflinkAnchor, probe_reflink};
 pub use database::{ControlStore, DatabaseError, ParityObject, ParityStore};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;

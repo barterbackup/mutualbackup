@@ -48,6 +48,9 @@ pub fn seal_recovery_record(
     let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
     let recipient_public = X25519PublicKey::from(recipient.0);
     let shared_secret = ephemeral_secret.diffie_hellman(&recipient_public);
+    if !shared_secret.was_contributory() {
+        return Err(RecoveryCryptoError::Authentication);
+    }
     let key = recovery_aead_key(
         shared_secret.as_bytes(),
         &ephemeral_public.to_bytes(),
@@ -84,6 +87,9 @@ pub fn open_recovery_record(
     let ephemeral_public = X25519PublicKey::from(record.ephemeral_public_key);
     let recipient_public = keys.recovery_public_key();
     let shared_secret = keys.recovery_secret().diffie_hellman(&ephemeral_public);
+    if !shared_secret.was_contributory() {
+        return Err(RecoveryCryptoError::Authentication);
+    }
     let key = recovery_aead_key(
         shared_secret.as_bytes(),
         &record.ephemeral_public_key,

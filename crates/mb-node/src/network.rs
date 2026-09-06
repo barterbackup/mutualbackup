@@ -2,14 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use futures::{StreamExt, stream::FuturesUnordered};
 use mb_core::{
     CodingGroup, GuildCheckpoint, InformationRole, KeyMaterial, Member, MemberSignature, NodeId,
     ParityRole, QuorumCheckpoint, RecoveryLocator, SealedRecoveryRecord, SectorId, SectorRef, Seed,
-    ShardRole, SignedRecord, UserRevision, V1_SECTOR_SIZE, canonical_bytes, decode_canonical,
-    encode_3_2, open_recovery_record, reconstruct_3_2, sector_root,
+    ShardRole, SignedRecord, UserRevision, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE,
+    canonical_bytes, decode_canonical, encode_3_2, open_recovery_record, reconstruct_3_2,
+    sector_root,
 };
 use mb_store::ParityObject;
 use rand::RngCore;
@@ -134,8 +136,13 @@ struct CachedOperation {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PublishedRecoveryRecord {
+    format_version: u16,
     subject: NodeId,
     publisher: NodeId,
+    guild_id: [u8; 32],
+    checkpoint_hash: [u8; 32],
+    checkpoint_generation: u64,
+    expires_at_unix_seconds: u64,
     sealed: SealedRecoveryRecord,
 }
 
@@ -193,16 +200,40 @@ pub async fn serve_directory(listen: SocketAddr, state: DirectoryState) -> Resul
                 Ok(DirectoryRequest::Publish(record)) => {
                     if record.verify(DIRECTORY_RECORD_DOMAIN).is_err()
                         || record.signer != record.value.publisher
+                        || record.value.format_version != 1
+                        || record.value.expires_at_unix_seconds != u64::MAX
                     {
                         DirectoryResponse::Error("invalid publisher signature".to_owned())
                     } else {
                         match state.records.lock() {
                             Ok(mut records) => {
-                                records
-                                    .entry(record.value.subject)
-                                    .or_default()
-                                    .insert(record.value.publisher, record);
-                                DirectoryResponse::Ack
+                                let publishers = records.entry(record.value.subject).or_default();
+                                let accepted = match publishers.get(&record.value.publisher) {
+                                    Some(current)
+                                        if current.value.checkpoint_generation
+                                            > record.value.checkpoint_generation =>
+                                    {
+                                        false
+                                    }
+                                    Some(current)
+                                        if current.value.checkpoint_generation
+                                            == record.value.checkpoint_generation
+                                            && current.value.checkpoint_hash
+                                                != record.value.checkpoint_hash =>
+                                    {
+                                        false
+                                    }
+                                    _ => true,
+                                };
+                                if accepted {
+                                    publishers.insert(record.value.publisher, record);
+                                    DirectoryResponse::Ack
+                                } else {
+                                    DirectoryResponse::Error(
+                                        "recovery record would roll back or fork publisher state"
+                                            .to_owned(),
+                                    )
+                                }
                             }
                             Err(_) => {
                                 DirectoryResponse::Error("directory lock poisoned".to_owned())
@@ -278,11 +309,10 @@ fn process_peer_request(
             bail!("only the source node itself may request source capture");
         }
         if let Some(kind) = mutation_kind {
-            if let Some(cached_bytes) = node_guard.cached_operation(&request_id)? {
+            if let Some(cached_bytes) =
+                node_guard.cached_operation(&request_id, kind, caller, &request_hash)?
+            {
                 let cached: CachedOperation = decode_canonical(&cached_bytes)?;
-                if cached.request_hash != request_hash {
-                    bail!("operation ID was reused for a different request");
-                }
                 return Ok(cached.response);
             }
             let response = execute_peer_request(&mut node_guard, config, request)?;
@@ -290,7 +320,13 @@ fn process_peer_request(
                 request_hash,
                 response: response.clone(),
             };
-            node_guard.commit_operation(&request_id, kind, &canonical_bytes(&cached)?)?;
+            node_guard.commit_operation(
+                &request_id,
+                kind,
+                caller,
+                &request_hash,
+                &canonical_bytes(&cached)?,
+            )?;
             Ok(response)
         } else {
             execute_peer_request(&mut node_guard, config, request)
@@ -352,6 +388,9 @@ fn execute_peer_request(
             checkpoint_generation,
             expires_at_unix_seconds,
         } => {
+            if expires_at_unix_seconds != u64::MAX {
+                bail!("prototype recovery records must not expire");
+            }
             let checkpoint = node.checkpoint(&checkpoint_hash)?;
             if checkpoint.checkpoint.guild_id != guild_id
                 || checkpoint.checkpoint.generation != checkpoint_generation
@@ -374,8 +413,13 @@ fn execute_peer_request(
             Ok(PeerResponse::RecoveryRecord(SignedRecord::sign(
                 DIRECTORY_RECORD_DOMAIN,
                 PublishedRecoveryRecord {
+                    format_version: 1,
                     subject: subject.node_id,
                     publisher: node.keys().node_id(),
+                    guild_id,
+                    checkpoint_hash,
+                    checkpoint_generation,
+                    expires_at_unix_seconds,
                     sealed,
                 },
                 node.keys(),
@@ -495,22 +539,52 @@ pub async fn commit_source_over_network(
         )
         .await?;
         let shards = encode_3_2([owner_bytes, helper_a.1, helper_b.1])?;
-        let group_id = network_group_id(
+        let roles = [
+            ShardRole::Information(InformationRole {
+                owner: peers[0].profile.member.node_id,
+                sector: target_reference.clone(),
+            }),
+            ShardRole::Information(InformationRole {
+                owner: peers[1].profile.member.node_id,
+                sector: helper_a.0,
+            }),
+            ShardRole::Information(InformationRole {
+                owner: peers[2].profile.member.node_id,
+                sector: helper_b.0,
+            }),
+            ShardRole::Parity(ParityRole {
+                holder: peers[3].profile.member.node_id,
+                row: 0,
+                root: sector_root(&shards[3]),
+            }),
+            ShardRole::Parity(ParityRole {
+                holder: peers[4].profile.member.node_id,
+                row: 1,
+                root: sector_root(&shards[4]),
+            }),
+        ];
+        let mut group = CodingGroup {
+            id: [0; 32],
+            format_version: 1,
             guild_id,
-            ordinal as u64,
-            target_reference,
-            &helper_a.0,
-            &helper_b.0,
-            peers[3].profile.member.node_id,
-            peers[4].profile.member.node_id,
-        )?;
+            data_shards: V1_RS_DATA_SHARDS,
+            parity_shards: V1_RS_PARITY_SHARDS,
+            shard_size: V1_SECTOR_SIZE as u32,
+            roles,
+        };
+        group.id = group.calculate_id()?;
+        let group_id = group.id;
         let parity_a = ParityObject {
+            format_version: 1,
+            guild_id,
             group_id,
             shard_index: 3,
             root: sector_root(&shards[3]),
             bytes: shards[3].clone(),
         };
         let parity_b = ParityObject {
+            format_version: 1,
+            guild_id,
             group_id,
             shard_index: 4,
             root: sector_root(&shards[4]),
@@ -538,44 +612,22 @@ pub async fn commit_source_over_network(
             )
             .await?,
         )?;
-        groups.push(CodingGroup {
-            id: group_id,
-            shard_size: V1_SECTOR_SIZE as u32,
-            roles: [
-                ShardRole::Information(InformationRole {
-                    owner: peers[0].profile.member.node_id,
-                    sector: target_reference.clone(),
-                }),
-                ShardRole::Information(InformationRole {
-                    owner: peers[1].profile.member.node_id,
-                    sector: helper_a.0,
-                }),
-                ShardRole::Information(InformationRole {
-                    owner: peers[2].profile.member.node_id,
-                    sector: helper_b.0,
-                }),
-                ShardRole::Parity(ParityRole {
-                    holder: peers[3].profile.member.node_id,
-                    row: 0,
-                    root: parity_a.root,
-                }),
-                ShardRole::Parity(ParityRole {
-                    holder: peers[4].profile.member.node_id,
-                    row: 1,
-                    root: parity_b.root,
-                }),
-            ],
-        });
+        groups.push(group);
     }
+
+    groups.sort_by_key(|group| group.id);
+    let mut checkpoint_members = peers
+        .iter()
+        .map(|peer| peer.profile.member.clone())
+        .collect::<Vec<_>>();
+    checkpoint_members.sort_by_key(|member| member.node_id);
 
     let checkpoint_body = GuildCheckpoint {
         format_version: 1,
         guild_id,
         generation: 1,
-        members: peers
-            .iter()
-            .map(|peer| peer.profile.member.clone())
-            .collect(),
+        parent: None,
+        members: checkpoint_members,
         revisions: vec![revision],
         coding_groups: groups,
     };
@@ -596,6 +648,7 @@ pub async fn commit_source_over_network(
         };
         signatures.push(signature);
     }
+    signatures.sort_by_key(|signature| signature.signer);
     let checkpoint = QuorumCheckpoint {
         checkpoint: checkpoint_body,
         signatures,
@@ -616,31 +669,34 @@ pub async fn commit_source_over_network(
         )?;
     }
 
-    let subject = peers[0].profile.member.clone();
-    let expires_at = unix_seconds().saturating_add(30 * 24 * 60 * 60);
-    for peer in peers.iter().skip(1) {
-        let response = peer_call_expected(
-            peer.endpoint,
-            peer.profile.member.node_id,
-            coordinator_keys,
-            PeerRequest::BuildRecoveryRecord {
-                subject: subject.clone(),
-                guild_id,
-                checkpoint_hash,
-                checkpoint_generation: checkpoint.checkpoint.generation,
-                expires_at_unix_seconds: expires_at,
-            },
-        )
-        .await?;
-        let PeerResponse::RecoveryRecord(record) = response else {
-            bail!("peer returned the wrong recovery-record response");
-        };
-        directory_publish(directory, record).await?;
+    for subject in &checkpoint.checkpoint.members {
+        for peer in &peers {
+            if peer.profile.member.node_id == subject.node_id {
+                continue;
+            }
+            let response = peer_call_expected(
+                peer.endpoint,
+                peer.profile.member.node_id,
+                coordinator_keys,
+                PeerRequest::BuildRecoveryRecord {
+                    subject: subject.clone(),
+                    guild_id,
+                    checkpoint_hash,
+                    checkpoint_generation: checkpoint.checkpoint.generation,
+                    expires_at_unix_seconds: u64::MAX,
+                },
+            )
+            .await?;
+            let PeerResponse::RecoveryRecord(record) = response else {
+                bail!("peer returned the wrong recovery-record response");
+            };
+            directory_publish(directory, record).await?;
+        }
     }
     Ok(NetworkCommitResult {
         guild_id,
         checkpoint_hash,
-        owner: subject.node_id,
+        owner: peers[0].profile.member.node_id,
         coding_groups: checkpoint.checkpoint.coding_groups.len(),
     })
 }
@@ -652,18 +708,19 @@ pub async fn recover_over_network(
     directory: SocketAddr,
 ) -> Result<Node> {
     let mut recovered_node = Node::open(data_dir, seed)?;
-    let keys = recovered_node.keys();
-    let sealed_records = directory_lookup(directory, keys.node_id()).await?;
-    let mut peer_endpoints = BTreeMap::new();
+    let local_node_id = recovered_node.keys().node_id();
+    let sealed_records = directory_lookup(directory, local_node_id).await?;
     let mut candidates = Vec::new();
     for published in sealed_records {
         if published.verify(DIRECTORY_RECORD_DOMAIN).is_err()
             || published.signer != published.value.publisher
-            || published.value.subject != keys.node_id()
+            || published.value.subject != local_node_id
+            || published.value.format_version != 1
+            || published.value.expires_at_unix_seconds != u64::MAX
         {
             continue;
         }
-        let plaintext = match open_recovery_record(keys, &published.value.sealed) {
+        let plaintext = match open_recovery_record(recovered_node.keys(), &published.value.sealed) {
             Ok(plaintext) => plaintext,
             Err(_) => continue,
         };
@@ -673,8 +730,14 @@ pub async fn recover_over_network(
         };
         if signed.verify(b"mutualbackup/recovery-locator/v1").is_err()
             || signed.signer != signed.value.publisher
-            || signed.value.subject != keys.node_id()
-            || signed.value.expires_at_unix_seconds < unix_seconds()
+            || signed.value.subject != local_node_id
+            || signed.value.format_version != 1
+            || signed.value.expires_at_unix_seconds != u64::MAX
+            || signed.value.publisher != published.value.publisher
+            || signed.value.guild_id != published.value.guild_id
+            || signed.value.checkpoint_hash != published.value.checkpoint_hash
+            || signed.value.checkpoint_generation != published.value.checkpoint_generation
+            || signed.value.expires_at_unix_seconds != published.value.expires_at_unix_seconds
         {
             continue;
         }
@@ -686,11 +749,10 @@ pub async fn recover_over_network(
         else {
             continue;
         };
-        peer_endpoints.insert(signed.value.publisher, endpoint);
         let response = match peer_call_expected(
             endpoint,
             signed.value.publisher,
-            keys,
+            recovered_node.keys(),
             PeerRequest::GetCheckpoint {
                 hash: signed.value.checkpoint_hash,
             },
@@ -700,69 +762,88 @@ pub async fn recover_over_network(
             Ok(PeerResponse::Checkpoint(checkpoint)) => checkpoint,
             _ => continue,
         };
-        if response.checkpoint.guild_id == signed.value.guild_id
-            && response.checkpoint.generation == signed.value.checkpoint_generation
-            && response.verify().is_ok()
+        if response
+            .validate_recovery_authority(
+                recovered_node.keys(),
+                &signed.value,
+                published.value.publisher,
+            )
+            .is_err()
         {
-            candidates.push(response);
+            continue;
         }
+        candidates.push((response, signed.value.publisher, endpoint));
     }
     let checkpoint = candidates
-        .into_iter()
+        .iter()
+        .map(|(checkpoint, _, _)| checkpoint)
         .max_by_key(|candidate| candidate.checkpoint.generation)
+        .cloned()
         .context("no reachable recovery locator led to a valid quorum checkpoint")?;
+    let checkpoint_hash = checkpoint.hash()?;
+    let peer_endpoints = candidates
+        .into_iter()
+        .filter(|(candidate, _, _)| candidate.hash().ok() == Some(checkpoint_hash))
+        .map(|(_, publisher, endpoint)| (publisher, endpoint))
+        .collect::<BTreeMap<_, _>>();
+    let recovered_shards = recover_network_local_shards(
+        local_node_id,
+        recovered_node.keys(),
+        &checkpoint,
+        &peer_endpoints,
+    )
+    .await?;
+    recovered_node.install_recovered_checkpoint(&checkpoint, &recovered_shards)?;
     let revision = checkpoint
         .checkpoint
         .revisions
         .iter()
-        .filter(|revision| revision.value.owner == keys.node_id())
-        .max_by_key(|revision| revision.value.sequence)
-        .context("checkpoint has no revision for the recovery seed")?;
-    let ciphertexts = recover_network_sectors(keys, revision, &checkpoint, &peer_endpoints).await?;
-    restore_revision(
-        keys,
-        checkpoint.checkpoint.guild_id,
-        revision,
-        &ciphertexts,
-        restore_target,
-    )?;
-    recovered_node.rebuild_from_checkpoint(&checkpoint)?;
+        .filter(|revision| revision.value.owner == local_node_id)
+        .max_by_key(|revision| revision.value.sequence);
+    if let Some(revision) = revision {
+        let ciphertexts = local_revision_ciphertexts(revision, &checkpoint, &recovered_shards)?;
+        restore_revision(
+            recovered_node.keys(),
+            checkpoint.checkpoint.guild_id,
+            revision,
+            &ciphertexts,
+            restore_target,
+        )?;
+    }
     Ok(recovered_node)
 }
 
-async fn recover_network_sectors(
+async fn recover_network_local_shards(
+    recovering: NodeId,
     keys: &KeyMaterial,
-    revision: &SignedRecord<UserRevision>,
     checkpoint: &QuorumCheckpoint,
     peer_endpoints: &BTreeMap<NodeId, SocketAddr>,
-) -> Result<BTreeMap<SectorId, Vec<u8>>> {
-    let wanted = revision
-        .value
-        .metadata_sectors
-        .iter()
-        .chain(&revision.value.data_sectors)
-        .map(|reference| reference.id)
-        .collect::<BTreeSet<_>>();
+) -> Result<BTreeMap<([u8; 32], u8), Vec<u8>>> {
     let mut recovered = BTreeMap::new();
+    let mut unhealthy = BTreeSet::new();
     for group in &checkpoint.checkpoint.coding_groups {
         let target = group
             .roles
             .iter()
             .enumerate()
             .find_map(|(index, role)| match role {
-                ShardRole::Information(information)
-                    if information.owner == keys.node_id()
-                        && wanted.contains(&information.sector.id) =>
-                {
-                    Some((index, information.sector.clone()))
+                ShardRole::Information(information) if information.owner == recovering => {
+                    Some((index, information.sector.root))
+                }
+                ShardRole::Parity(parity) if parity.holder == recovering => {
+                    Some((index, parity.root))
                 }
                 _ => None,
             });
-        let Some((target_index, target_reference)) = target else {
+        let Some((target_index, target_root)) = target else {
             continue;
         };
         let mut shards = vec![None; 5];
+        let mut attempts = FuturesUnordered::new();
         for (index, role) in group.roles.iter().enumerate() {
+            if index == target_index {
+                continue;
+            }
             let (holder, root, request) = match role {
                 ShardRole::Information(information) => (
                     information.owner,
@@ -783,13 +864,31 @@ async fn recover_network_sectors(
             let Some(endpoint) = peer_endpoints.get(&holder) else {
                 continue;
             };
-            match peer_call_expected(*endpoint, holder, keys, request).await {
+            if unhealthy.contains(&holder) {
+                continue;
+            }
+            attempts.push(async move {
+                (
+                    holder,
+                    index,
+                    root,
+                    peer_call_expected(*endpoint, holder, keys, request).await,
+                )
+            });
+        }
+        while let Some((holder, index, root, response)) = attempts.next().await {
+            match response {
                 Ok(PeerResponse::Bytes(bytes))
                     if bytes.len() == group.shard_size as usize && sector_root(&bytes) == root =>
                 {
                     shards[index] = Some(bytes);
                 }
-                _ => {}
+                _ => {
+                    unhealthy.insert(holder);
+                }
+            }
+            if shards.iter().filter(|shard| shard.is_some()).count() == 3 {
+                break;
             }
         }
         if shards.iter().filter(|shard| shard.is_some()).count() < 3 {
@@ -798,16 +897,44 @@ async fn recover_network_sectors(
         reconstruct_3_2(&mut shards)?;
         let bytes = shards[target_index]
             .take()
-            .context("owner sector was not reconstructed")?;
-        if sector_root(&bytes) != target_reference.root {
-            bail!("reconstructed owner sector failed its signed root");
+            .context("local shard was not reconstructed")?;
+        if sector_root(&bytes) != target_root {
+            bail!("reconstructed local shard failed its signed root");
         }
-        recovered.insert(target_reference.id, bytes);
-    }
-    if !wanted.iter().all(|id| recovered.contains_key(id)) {
-        bail!("not all owner sectors were recovered");
+        recovered.insert((group.id, target_index as u8), bytes);
     }
     Ok(recovered)
+}
+
+fn local_revision_ciphertexts(
+    revision: &SignedRecord<UserRevision>,
+    checkpoint: &QuorumCheckpoint,
+    recovered_shards: &BTreeMap<([u8; 32], u8), Vec<u8>>,
+) -> Result<BTreeMap<SectorId, Vec<u8>>> {
+    let wanted = revision
+        .value
+        .metadata_sectors
+        .iter()
+        .chain(&revision.value.data_sectors)
+        .map(|reference| reference.id)
+        .collect::<BTreeSet<_>>();
+    let mut ciphertexts = BTreeMap::new();
+    for group in &checkpoint.checkpoint.coding_groups {
+        for (index, role) in group.roles.iter().enumerate() {
+            if let ShardRole::Information(information) = role
+                && wanted.contains(&information.sector.id)
+            {
+                let bytes = recovered_shards
+                    .get(&(group.id, index as u8))
+                    .context("missing recovered revision shard")?;
+                ciphertexts.insert(information.sector.id, bytes.clone());
+            }
+        }
+    }
+    if ciphertexts.len() != wanted.len() {
+        bail!("not all revision sectors were recovered");
+    }
+    Ok(ciphertexts)
 }
 
 async fn request_filler(
@@ -944,35 +1071,12 @@ async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(reader: &mut R) -
     Ok(decode_canonical(&bytes)?)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn network_group_id(
-    guild_id: [u8; 32],
-    ordinal: u64,
-    owner: &SectorRef,
-    helper_a: &SectorRef,
-    helper_b: &SectorRef,
-    parity_a: NodeId,
-    parity_b: NodeId,
-) -> Result<[u8; 32]> {
-    Ok(*blake3::hash(&canonical_bytes(&(
-        guild_id, ordinal, owner, helper_a, helper_b, parity_a, parity_b,
-    ))?)
-    .as_bytes())
-}
-
 fn parse_tcp_endpoint(endpoint: &str) -> Result<SocketAddr> {
     endpoint
         .strip_prefix("tcp://")
         .context("endpoint is not a direct TCP endpoint")?
         .parse()
         .context("invalid direct TCP endpoint")
-}
-
-fn unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 fn lock_error<T>(_: std::sync::PoisonError<T>) -> anyhow::Error {

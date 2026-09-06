@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+futures.workspace = true
 mb-core = { path = "../mb-core" }
 mb-store = { path = "../mb-store" }
 postcard.workspace = true

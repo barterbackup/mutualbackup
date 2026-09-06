@@ -19,7 +19,7 @@ pub use keys::{KeyMaterial, NodeId, RecoveryPublicKey, Seed, SeedParseError};
 pub use model::{
     CodingGroup, CodingGroupId, GuildCheckpoint, InformationRole, Member, MemberSignature,
     ModelError, ParityRole, QuorumCheckpoint, SectorId, SectorRef, ShardRole, SignedRecord,
-    UserRevision, canonical_bytes, decode_canonical,
+    UserRevision, canonical_bytes, coding_group_id, decode_canonical,
 };
 pub use recovery::{
     RecoveryCryptoError, RecoveryLocator, SealedRecoveryRecord, open_recovery_record,
@@ -28,6 +28,9 @@ pub use recovery::{
 
 /// The only sector size accepted by the first protocol profile.
 pub const V1_SECTOR_SIZE: usize = 64 * 1024;
+pub const V1_CIPHER_PROFILE: u16 = 1;
+pub const V1_RS_DATA_SHARDS: u16 = 3;
+pub const V1_RS_PARITY_SHARDS: u16 = 2;
 
 /// Hash bytes exactly as they are consumed by Reed--Solomon.
 pub fn sector_root(bytes: &[u8]) -> [u8; 32] {

@@ -38,6 +38,15 @@ impl FromStr for NodeId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RecoveryPublicKey(pub [u8; 32]);
 
+impl RecoveryPublicKey {
+    pub fn is_contributory(&self) -> bool {
+        let probe = StaticSecret::from([0x5a; 32]);
+        probe
+            .diffie_hellman(&X25519PublicKey::from(self.0))
+            .was_contributory()
+    }
+}
+
 /// High-entropy recovery seed. Its textual form is versioned and checksummed.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Seed([u8; 32]);

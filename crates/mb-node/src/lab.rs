@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 use mb_core::{
     CodingGroup, GuildCheckpoint, InformationRole, KeyMaterial, Member, NodeId, ParityRole,
-    QuorumCheckpoint, RecoveryLocator, SectorId, SectorRef, Seed, ShardRole, SignedRecord,
-    UserRevision, V1_SECTOR_SIZE, canonical_bytes, decode_canonical, encode_3_2,
-    open_recovery_record, reconstruct_3_2, seal_recovery_record, sector_root,
+    QuorumCheckpoint, RecoveryLocator, SectorId, Seed, ShardRole, SignedRecord, UserRevision,
+    V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, canonical_bytes, decode_canonical,
+    encode_3_2, open_recovery_record, reconstruct_3_2, seal_recovery_record, sector_root,
 };
 use mb_store::ParityObject;
 
@@ -85,13 +85,18 @@ impl MemoryDirectory {
         Ok(())
     }
 
-    pub fn lookup(&self, subject: NodeId) -> Result<Vec<mb_core::SealedRecoveryRecord>> {
+    pub fn lookup(&self, subject: NodeId) -> Result<Vec<(NodeId, mb_core::SealedRecoveryRecord)>> {
         Ok(self
             .records
             .lock()
             .map_err(lock_error)?
             .get(&subject)
-            .map(|publishers| publishers.values().cloned().collect())
+            .map(|publishers| {
+                publishers
+                    .iter()
+                    .map(|(publisher, record)| (*publisher, record.clone()))
+                    .collect()
+            })
             .unwrap_or_default())
     }
 }
@@ -181,22 +186,52 @@ impl PrototypeGuild {
                     ordinal as u64 * 2 + 1,
                 )?;
             let shards = encode_3_2([owner_bytes, helper_a_bytes, helper_b_bytes])?;
-            let group_id = group_id(
-                self.guild_id,
-                ordinal as u64,
-                target_reference,
-                &helper_a_reference,
-                &helper_b_reference,
-                self.members[role_indices[3]].node_id,
-                self.members[role_indices[4]].node_id,
-            )?;
+            let roles = [
+                ShardRole::Information(InformationRole {
+                    owner: self.members[role_indices[0]].node_id,
+                    sector: target_reference.clone(),
+                }),
+                ShardRole::Information(InformationRole {
+                    owner: self.members[role_indices[1]].node_id,
+                    sector: helper_a_reference,
+                }),
+                ShardRole::Information(InformationRole {
+                    owner: self.members[role_indices[2]].node_id,
+                    sector: helper_b_reference,
+                }),
+                ShardRole::Parity(ParityRole {
+                    holder: self.members[role_indices[3]].node_id,
+                    row: 0,
+                    root: sector_root(&shards[3]),
+                }),
+                ShardRole::Parity(ParityRole {
+                    holder: self.members[role_indices[4]].node_id,
+                    row: 1,
+                    root: sector_root(&shards[4]),
+                }),
+            ];
+            let mut group = CodingGroup {
+                id: [0; 32],
+                format_version: 1,
+                guild_id: self.guild_id,
+                data_shards: V1_RS_DATA_SHARDS,
+                parity_shards: V1_RS_PARITY_SHARDS,
+                shard_size: V1_SECTOR_SIZE as u32,
+                roles,
+            };
+            group.id = group.calculate_id()?;
+            let group_id = group.id;
             let parity_a = ParityObject {
+                format_version: 1,
+                guild_id: self.guild_id,
                 group_id,
                 shard_index: 3,
                 root: sector_root(&shards[3]),
                 bytes: shards[3].clone(),
             };
             let parity_b = ParityObject {
+                format_version: 1,
+                guild_id: self.guild_id,
                 group_id,
                 shard_index: 4,
                 root: sector_root(&shards[4]),
@@ -210,50 +245,35 @@ impl PrototypeGuild {
                 .lock()
                 .map_err(lock_error)?
                 .publish_parity(&parity_b)?;
-            groups.push(CodingGroup {
-                id: group_id,
-                shard_size: V1_SECTOR_SIZE as u32,
-                roles: [
-                    ShardRole::Information(InformationRole {
-                        owner: self.members[role_indices[0]].node_id,
-                        sector: target_reference.clone(),
-                    }),
-                    ShardRole::Information(InformationRole {
-                        owner: self.members[role_indices[1]].node_id,
-                        sector: helper_a_reference,
-                    }),
-                    ShardRole::Information(InformationRole {
-                        owner: self.members[role_indices[2]].node_id,
-                        sector: helper_b_reference,
-                    }),
-                    ShardRole::Parity(ParityRole {
-                        holder: self.members[role_indices[3]].node_id,
-                        row: 0,
-                        root: parity_a.root,
-                    }),
-                    ShardRole::Parity(ParityRole {
-                        holder: self.members[role_indices[4]].node_id,
-                        row: 1,
-                        root: parity_b.root,
-                    }),
-                ],
-            });
+            groups.push(group);
         }
+
+        groups.sort_by_key(|group| group.id);
+        let mut checkpoint_members = self.members.clone();
+        checkpoint_members.sort_by_key(|member| member.node_id);
 
         let mut checkpoint = QuorumCheckpoint {
             checkpoint: GuildCheckpoint {
                 format_version: 1,
                 guild_id: self.guild_id,
                 generation: 1,
-                members: self.members.clone(),
+                parent: None,
+                members: checkpoint_members,
                 revisions: vec![revision],
                 coding_groups: groups,
             },
             signatures: Vec::new(),
         };
         for node in self.nodes.iter().flatten() {
-            checkpoint.add_signature(node.lock().map_err(lock_error)?.keys())?;
+            let signature = node
+                .lock()
+                .map_err(lock_error)?
+                .sign_checkpoint(&checkpoint.checkpoint)?;
+            checkpoint.signatures.push(signature);
         }
+        checkpoint
+            .signatures
+            .sort_by_key(|signature| signature.signer);
         checkpoint.verify()?;
         let checkpoint_hash = checkpoint.hash()?;
         for node in self.nodes.iter().flatten() {
@@ -261,7 +281,9 @@ impl PrototypeGuild {
                 .map_err(lock_error)?
                 .store_checkpoint(&checkpoint)?;
         }
-        self.publish_recovery_locators(owner_index, &checkpoint, checkpoint_hash)?;
+        for subject_index in 0..self.members.len() {
+            self.publish_recovery_locators(subject_index, &checkpoint, checkpoint_hash)?;
+        }
         Ok(checkpoint)
     }
 
@@ -284,27 +306,25 @@ impl PrototypeGuild {
     ) -> Result<SharedNode> {
         let mut recovered = Node::open(data_dir, seed)?;
         let checkpoint = recover_checkpoint(recovered.keys(), &self.directory, &self.network)?;
+        let recovered_shards =
+            recover_local_shards(recovered.keys().node_id(), &checkpoint, &self.network)?;
+        recovered.install_recovered_checkpoint(&checkpoint, &recovered_shards)?;
         let revision = checkpoint
             .checkpoint
             .revisions
             .iter()
             .filter(|revision| revision.value.owner == recovered.keys().node_id())
-            .max_by_key(|revision| revision.value.sequence)
-            .context("checkpoint contains no revision for recovering node")?;
-        let ciphertexts = recover_owner_sectors(
-            recovered.keys().node_id(),
-            revision,
-            &checkpoint,
-            &self.network,
-        )?;
-        restore_revision(
-            recovered.keys(),
-            checkpoint.checkpoint.guild_id,
-            revision,
-            &ciphertexts,
-            restore_target,
-        )?;
-        recovered.rebuild_from_checkpoint(&checkpoint)?;
+            .max_by_key(|revision| revision.value.sequence);
+        if let Some(revision) = revision {
+            let ciphertexts = local_revision_ciphertexts(revision, &checkpoint, &recovered_shards)?;
+            restore_revision(
+                recovered.keys(),
+                checkpoint.checkpoint.guild_id,
+                revision,
+                &ciphertexts,
+                restore_target,
+            )?;
+        }
         let recovered = Arc::new(Mutex::new(recovered));
         self.network.register(recovered.clone())?;
         Ok(recovered)
@@ -353,7 +373,7 @@ fn recover_checkpoint(
     network: &MemoryNetwork,
 ) -> Result<QuorumCheckpoint> {
     let mut candidates = Vec::new();
-    for sealed in directory.lookup(keys.node_id())? {
+    for (published_by, sealed) in directory.lookup(keys.node_id())? {
         let plaintext = match open_recovery_record(keys, &sealed) {
             Ok(plaintext) => plaintext,
             Err(_) => continue,
@@ -364,8 +384,10 @@ fn recover_checkpoint(
         };
         if signed.verify(b"mutualbackup/recovery-locator/v1").is_err()
             || signed.signer != signed.value.publisher
+            || signed.value.publisher != published_by
             || signed.value.subject != keys.node_id()
             || signed.value.format_version != 1
+            || signed.value.expires_at_unix_seconds != u64::MAX
         {
             continue;
         }
@@ -374,8 +396,9 @@ fn recover_checkpoint(
                 Ok(checkpoint) => checkpoint,
                 Err(_) => continue,
             };
-        if checkpoint.checkpoint.guild_id == signed.value.guild_id
-            && checkpoint.checkpoint.generation == signed.value.checkpoint_generation
+        if checkpoint
+            .validate_recovery_authority(keys, &signed.value, published_by)
+            .is_ok()
         {
             candidates.push(checkpoint);
         }
@@ -386,40 +409,35 @@ fn recover_checkpoint(
         .context("no valid recovery locator led to a quorum checkpoint")
 }
 
-fn recover_owner_sectors(
-    owner: NodeId,
-    revision: &SignedRecord<UserRevision>,
+fn recover_local_shards(
+    recovering: NodeId,
     checkpoint: &QuorumCheckpoint,
     network: &MemoryNetwork,
-) -> Result<BTreeMap<SectorId, Vec<u8>>> {
-    let wanted = revision
-        .value
-        .metadata_sectors
-        .iter()
-        .chain(&revision.value.data_sectors)
-        .map(|reference| reference.id)
-        .collect::<BTreeSet<_>>();
+) -> Result<BTreeMap<([u8; 32], u8), Vec<u8>>> {
     let mut recovered = BTreeMap::new();
     for group in &checkpoint.checkpoint.coding_groups {
-        let target_indices = group
+        let target = group
             .roles
             .iter()
             .enumerate()
-            .filter_map(|(index, role)| match role {
-                ShardRole::Information(information)
-                    if information.owner == owner && wanted.contains(&information.sector.id) =>
-                {
-                    Some((index, information.sector.clone()))
+            .find_map(|(index, role)| match role {
+                ShardRole::Information(information) if information.owner == recovering => {
+                    Some((index, information.sector.root))
+                }
+                ShardRole::Parity(parity) if parity.holder == recovering => {
+                    Some((index, parity.root))
                 }
                 _ => None,
-            })
-            .collect::<Vec<_>>();
-        if target_indices.is_empty() {
+            });
+        let Some((target_index, target_root)) = target else {
             continue;
-        }
+        };
 
         let mut shards = vec![None; 5];
         for (index, role) in group.roles.iter().enumerate() {
+            if index == target_index {
+                continue;
+            }
             let (holder, expected_root, result) = match role {
                 ShardRole::Information(information) => (
                     information.owner,
@@ -447,20 +465,49 @@ fn recover_owner_sectors(
             bail!("coding group has fewer than three valid reachable shards");
         }
         reconstruct_3_2(&mut shards)?;
-        for (index, reference) in target_indices {
-            let bytes = shards[index]
-                .take()
-                .context("Reed--Solomon did not reconstruct the owner shard")?;
-            if sector_root(&bytes) != reference.root {
-                bail!("reconstructed owner sector failed its signed root");
-            }
-            recovered.insert(reference.id, bytes);
+        let bytes = shards[target_index]
+            .take()
+            .context("Reed--Solomon did not reconstruct the local shard")?;
+        if sector_root(&bytes) != target_root {
+            bail!("reconstructed local shard failed its signed root");
         }
-    }
-    if !wanted.iter().all(|id| recovered.contains_key(id)) {
-        bail!("not all sectors referenced by the owner revision were recovered");
+        recovered.insert((group.id, target_index as u8), bytes);
     }
     Ok(recovered)
+}
+
+fn local_revision_ciphertexts(
+    revision: &SignedRecord<UserRevision>,
+    checkpoint: &QuorumCheckpoint,
+    recovered_shards: &BTreeMap<([u8; 32], u8), Vec<u8>>,
+) -> Result<BTreeMap<SectorId, Vec<u8>>> {
+    let wanted = revision
+        .value
+        .metadata_sectors
+        .iter()
+        .chain(&revision.value.data_sectors)
+        .map(|reference| reference.id)
+        .collect::<BTreeSet<_>>();
+    let mut ciphertexts = BTreeMap::new();
+    for group in &checkpoint.checkpoint.coding_groups {
+        for (index, role) in group.roles.iter().enumerate() {
+            if let ShardRole::Information(information) = role
+                && wanted.contains(&information.sector.id)
+            {
+                ciphertexts.insert(
+                    information.sector.id,
+                    recovered_shards
+                        .get(&(group.id, index as u8))
+                        .context("missing recovered revision shard")?
+                        .clone(),
+                );
+            }
+        }
+    }
+    if ciphertexts.len() != wanted.len() {
+        bail!("not all revision sectors were recovered");
+    }
+    Ok(ciphertexts)
 }
 
 fn role_indices(owner: usize, node_count: usize) -> Result<[usize; 5]> {
@@ -474,22 +521,6 @@ fn role_indices(owner: usize, node_count: usize) -> Result<[usize; 5]> {
         (owner + 3) % 5,
         (owner + 4) % 5,
     ])
-}
-
-#[allow(clippy::too_many_arguments)]
-fn group_id(
-    guild_id: [u8; 32],
-    ordinal: u64,
-    owner: &SectorRef,
-    helper_a: &SectorRef,
-    helper_b: &SectorRef,
-    parity_a: NodeId,
-    parity_b: NodeId,
-) -> Result<[u8; 32]> {
-    Ok(*blake3::hash(&canonical_bytes(&(
-        guild_id, ordinal, owner, helper_a, helper_b, parity_a, parity_b,
-    ))?)
-    .as_bytes())
 }
 
 fn lock_error<T>(_: std::sync::PoisonError<T>) -> anyhow::Error {
@@ -526,26 +557,65 @@ mod tests {
             .map(|value| Seed::from_bytes([value + 20; 32]))
             .collect::<Vec<_>>();
         let mut guild = PrototypeGuild::create(&root.join("nodes"), seeds).unwrap();
-        guild.commit_source(0, &source).unwrap();
-        let lost_data_dir = guild.lose_node(0).unwrap();
-        let second_lost_data_dir = guild.lose_node(1).unwrap();
-        fs::remove_dir_all(&lost_data_dir).unwrap();
-        fs::remove_dir_all(&second_lost_data_dir).unwrap();
+        let checkpoint = guild.commit_source(0, &source).unwrap();
         fs::remove_dir_all(&source).unwrap();
 
-        let restored = root.join("restored");
-        guild
-            .recover(
-                Seed::from_bytes([20; 32]),
-                &root.join("recovered-node"),
-                &restored,
-            )
-            .unwrap();
-        assert_eq!(
-            fs::read(restored.join("docs/readme.txt")).unwrap(),
-            b"seed-only recovery works\n"
-        );
-        assert_eq!(fs::read(restored.join("large.bin")).unwrap(), large);
+        for index in 0..5 {
+            let lost_data_dir = guild.lose_node(index).unwrap();
+            fs::remove_dir_all(&lost_data_dir).unwrap();
+            let restored = root.join(format!("restored-{index}"));
+            let recovered = guild
+                .recover(
+                    Seed::from_bytes([20 + index as u8; 32]),
+                    &root.join(format!("recovered-node-{index}")),
+                    &restored,
+                )
+                .unwrap();
+            if index == 0 {
+                assert_eq!(
+                    fs::read(restored.join("docs/readme.txt")).unwrap(),
+                    b"seed-only recovery works\n"
+                );
+                assert_eq!(fs::read(restored.join("large.bin")).unwrap(), large);
+            } else {
+                assert!(!restored.exists());
+            }
+
+            let node_id = recovered.lock().unwrap().keys().node_id();
+            let (group, role_index, role) = checkpoint
+                .checkpoint
+                .coding_groups
+                .iter()
+                .find_map(|group| {
+                    group
+                        .roles
+                        .iter()
+                        .enumerate()
+                        .find(|(_, role)| match role {
+                            ShardRole::Information(information) => information.owner == node_id,
+                            ShardRole::Parity(parity) => parity.holder == node_id,
+                        })
+                        .map(|(role_index, role)| (group, role_index, role))
+                })
+                .unwrap();
+            let bytes = match role {
+                ShardRole::Information(information) => recovered
+                    .lock()
+                    .unwrap()
+                    .sector(&information.sector.id)
+                    .unwrap(),
+                ShardRole::Parity(_) => recovered
+                    .lock()
+                    .unwrap()
+                    .parity(&group.id, role_index as u8)
+                    .unwrap(),
+            };
+            let expected = match role {
+                ShardRole::Information(information) => information.sector.root,
+                ShardRole::Parity(parity) => parity.root,
+            };
+            assert_eq!(sector_root(&bytes), expected);
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 }

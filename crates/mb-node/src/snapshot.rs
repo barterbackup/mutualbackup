@@ -5,8 +5,9 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use mb_core::{
-    KeyMaterial, SectorId, SectorPurpose, SectorRef, SignedRecord, UserRevision, V1_SECTOR_SIZE,
-    canonical_bytes, crypt_sector, decode_canonical, encrypted_sector, make_sector_id, sector_root,
+    KeyMaterial, SectorId, SectorPurpose, SectorRef, SignedRecord, UserRevision, V1_CIPHER_PROFILE,
+    V1_SECTOR_SIZE, canonical_bytes, crypt_sector, decode_canonical, encrypted_sector,
+    make_sector_id, sector_root,
 };
 use mb_store::{CapturedEntry, ControlStore, ReflinkAnchor};
 use serde::{Deserialize, Serialize};
@@ -142,6 +143,8 @@ pub(crate) fn prepare_revision(
         b"mutualbackup/user-revision/v1",
         UserRevision {
             format_version: 1,
+            guild_id,
+            cipher_profile: V1_CIPHER_PROFILE,
             revision_id,
             owner: keys.node_id(),
             sequence,
@@ -188,6 +191,29 @@ pub(crate) fn install_inline_recipe(
     };
     control.put_record("local-sector", &reference.id, &canonical_bytes(&recipe)?)?;
     Ok(())
+}
+
+pub(crate) fn install_recovered_sector_recipe(
+    control: &mut ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    reference: SectorRef,
+    ciphertext: &[u8],
+) -> Result<()> {
+    if reference.logical_len as usize > V1_SECTOR_SIZE
+        || ciphertext.len() != V1_SECTOR_SIZE
+        || sector_root(ciphertext) != reference.root
+    {
+        bail!("recovered information shard does not match its descriptor");
+    }
+    let mut plaintext = ciphertext.to_vec();
+    crypt_sector(
+        &keys.guild_data_key(&guild_id),
+        reference.id,
+        &mut plaintext,
+    )?;
+    plaintext.truncate(reference.logical_len as usize);
+    install_inline_recipe(control, guild_id, reference, plaintext)
 }
 
 pub(crate) fn render_sector(
