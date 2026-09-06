@@ -20,7 +20,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::Node;
+use crate::{
+    Node,
+    node::{NodeReader, NodeReaderConfig},
+};
 
 const CHECKPOINT_PAGE_BYTES: usize = 512 * 1024;
 const MAX_CHECKPOINT_PAGES: u32 = 512;
@@ -132,6 +135,16 @@ impl CheckpointObjectKind {
 }
 
 impl PeerRequest {
+    fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Profile
+                | Self::GetSector { .. }
+                | Self::GetParity { .. }
+                | Self::GetCheckpointPage { .. }
+        )
+    }
+
     fn mutation_kind(&self) -> Option<&'static str> {
         match self {
             Self::Profile
@@ -250,21 +263,53 @@ pub struct DirectoryState {
     records: Arc<Mutex<RecoveryDirectoryRecords>>,
 }
 
+struct NodeService {
+    writer: Arc<Mutex<Node>>,
+    reader_config: NodeReaderConfig,
+    readers: Mutex<Vec<NodeReader>>,
+    max_readers: usize,
+}
+
+impl NodeService {
+    fn checkout_reader(&self) -> Result<NodeReader> {
+        if let Some(reader) = self.readers.lock().map_err(lock_error)?.pop() {
+            Ok(reader)
+        } else {
+            self.reader_config.open()
+        }
+    }
+
+    fn return_reader(&self, reader: NodeReader) -> Result<()> {
+        let mut readers = self.readers.lock().map_err(lock_error)?;
+        if readers.len() < self.max_readers {
+            readers.push(reader);
+        }
+        Ok(())
+    }
+}
+
 pub async fn serve_node(node: Arc<Mutex<Node>>, config: NodeServerConfig) -> Result<()> {
     if config.failure_domain.is_empty() || config.max_connections == 0 {
         bail!("invalid node server configuration");
     }
     validate_advertised_endpoint(&config.public_endpoint)?;
+    let reader_config = node.lock().map_err(lock_error)?.reader_config();
+    let service = Arc::new(NodeService {
+        writer: node,
+        reader_config,
+        readers: Mutex::new(Vec::new()),
+        max_readers: config.max_connections,
+    });
     let listener = TcpListener::bind(config.listen).await?;
     let permits = Arc::new(Semaphore::new(config.max_connections));
     loop {
         let (stream, _) = listener.accept().await?;
         let permit = permits.clone().acquire_owned().await?;
-        let node = node.clone();
+        let service = service.clone();
         let config = config.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle_peer_connection(stream, node, config).await {
+            if let Err(error) = handle_peer_connection(stream, service, config).await {
                 tracing::warn!(%error, "peer request failed");
             }
         });
@@ -373,14 +418,14 @@ pub async fn serve_directory(listen: SocketAddr, state: DirectoryState) -> Resul
 
 async fn handle_peer_connection(
     mut stream: TcpStream,
-    node: Arc<Mutex<Node>>,
+    service: Arc<NodeService>,
     config: NodeServerConfig,
 ) -> Result<()> {
     let signed =
         read_frame_timed::<_, SignedRecord<PeerRequestEnvelope>>(&mut stream, MAX_PEER_FRAME_BYTES)
             .await?;
     let signed_response =
-        tokio::task::spawn_blocking(move || process_peer_request(node, &config, signed))
+        tokio::task::spawn_blocking(move || process_peer_request(service, &config, signed))
             .await
             .context("peer request worker panicked")??;
     write_frame_limited(&mut stream, &signed_response, MAX_PEER_FRAME_BYTES).await?;
@@ -388,7 +433,7 @@ async fn handle_peer_connection(
 }
 
 fn process_peer_request(
-    node: Arc<Mutex<Node>>,
+    service: Arc<NodeService>,
     config: &NodeServerConfig,
     signed: SignedRecord<PeerRequestEnvelope>,
 ) -> Result<SignedRecord<PeerResponseEnvelope>> {
@@ -396,12 +441,36 @@ fn process_peer_request(
     let caller = signed.signer;
     let wire_request_hash = *blake3::hash(&canonical_bytes(&signed.value)?).as_bytes();
     let operation_hash = peer_operation_hash(&signed.value)?;
-    let mut node_guard = node.lock().map_err(lock_error)?;
     let response = (|| {
         signed.verify(PEER_REQUEST_DOMAIN)?;
-        validate_request_envelope(&signed.value, caller, node_guard.keys().node_id())?;
+        validate_request_envelope(
+            &signed.value,
+            caller,
+            service.reader_config.keys().node_id(),
+        )?;
         let request = signed.value.request;
+        if request.is_read_only() {
+            let reader = service.checkout_reader()?;
+            let result = (|| {
+                if !matches!(&request, PeerRequest::Profile)
+                    && !(matches!(&request, PeerRequest::GetSector { .. })
+                        && caller == config.trusted_coordinator)
+                {
+                    reader.authorize_member(
+                        &request
+                            .guild_scope()
+                            .context("guild-scoped request has no scope")?,
+                        caller,
+                    )?;
+                }
+                execute_read_request(&reader, config, request)
+            })();
+            service.return_reader(reader)?;
+            return result;
+        }
+
         let mutation_kind = request.mutation_kind();
+        let mut node_guard = service.writer.lock().map_err(lock_error)?;
         let local_node_id = node_guard.keys().node_id();
         if mutation_kind.is_some() && caller != config.trusted_coordinator {
             bail!("caller is not the configured guild coordinator");
@@ -414,18 +483,6 @@ fn process_peer_request(
         ) && caller != local_node_id
         {
             bail!("only the source node itself may manage its coordinator commit");
-        }
-        if mutation_kind.is_none()
-            && !matches!(&request, PeerRequest::Profile)
-            && !(matches!(&request, PeerRequest::GetSector { .. })
-                && caller == config.trusted_coordinator)
-        {
-            node_guard.authorize_member(
-                &request
-                    .guild_scope()
-                    .context("guild-scoped request has no scope")?,
-                caller,
-            )?;
         }
         if let Some(kind) = mutation_kind {
             if let Some(cached_bytes) =
@@ -451,7 +508,7 @@ fn process_peer_request(
             )?;
             Ok(response)
         } else {
-            execute_peer_request(&mut node_guard, config, request_id, request)
+            bail!("request was not classified as a read or mutation")
         }
     })();
     let error = response.map_err(|error| {
@@ -468,7 +525,7 @@ fn process_peer_request(
             request_hash: wire_request_hash,
             result: error,
         },
-        node_guard.keys(),
+        service.reader_config.keys(),
     )?)
 }
 
@@ -511,6 +568,52 @@ fn peer_operation_hash(envelope: &PeerRequestEnvelope) -> Result<[u8; 32]> {
         &envelope.request,
     ))?)
     .as_bytes())
+}
+
+fn execute_read_request(
+    node: &NodeReader,
+    config: &NodeServerConfig,
+    request: PeerRequest,
+) -> Result<PeerResponse> {
+    match request {
+        PeerRequest::Profile => Ok(PeerResponse::Profile(PeerProfile {
+            member: Member {
+                node_id: node.keys().node_id(),
+                recovery_public_key: node.keys().recovery_public_key(),
+                failure_domain: config.failure_domain.clone(),
+            },
+            endpoint: config.public_endpoint.clone(),
+        })),
+        PeerRequest::GetSector {
+            guild_id,
+            sector_id,
+        } => Ok(PeerResponse::Bytes(
+            node.sector_for_guild(&guild_id, &sector_id)?,
+        )),
+        PeerRequest::GetParity {
+            guild_id,
+            group_id,
+            shard_index,
+        } => Ok(PeerResponse::Bytes(node.parity_for_guild(
+            &guild_id,
+            &group_id,
+            shard_index,
+        )?)),
+        PeerRequest::GetCheckpointPage {
+            guild_id,
+            checkpoint_hash,
+            page_index,
+        } => {
+            let (total_pages, bytes) =
+                node.checkpoint_page(&guild_id, &checkpoint_hash, page_index)?;
+            Ok(PeerResponse::CheckpointPage {
+                total_pages,
+                page_hash: *blake3::hash(&bytes).as_bytes(),
+                bytes,
+            })
+        }
+        _ => bail!("mutation was sent to a read-only node worker"),
+    }
 }
 
 fn execute_peer_request(
@@ -1026,7 +1129,10 @@ pub async fn recover_over_network(
     restore_target: &Path,
     directory: SocketAddr,
 ) -> Result<Node> {
-    let mut recovered_node = Node::open(data_dir, seed)?;
+    let data_dir = data_dir.to_path_buf();
+    let mut recovered_node = tokio::task::spawn_blocking(move || Node::open(data_dir, seed))
+        .await
+        .context("node-open worker panicked")??;
     let local_node_id = recovered_node.keys().node_id();
     let sealed_records = directory_lookup(directory, local_node_id).await?;
     let mut candidates = Vec::new();
@@ -1104,30 +1210,38 @@ pub async fn recover_over_network(
         .filter(|(candidate, _, _)| candidate.hash().ok() == Some(checkpoint_hash))
         .map(|(_, publisher, endpoint)| (publisher, endpoint))
         .collect::<BTreeMap<_, _>>();
-    recover_network_local_shards(&mut recovered_node, &checkpoint, &peer_endpoints).await?;
-    recovered_node.install_recovered_checkpoint(&checkpoint)?;
+    recovered_node =
+        recover_network_local_shards(recovered_node, &checkpoint, &peer_endpoints).await?;
     let revision = checkpoint
         .checkpoint
         .revisions
         .iter()
         .filter(|revision| revision.value.owner == local_node_id)
         .max_by_key(|revision| revision.value.sequence);
-    if let Some(revision) = revision {
-        recovered_node.restore_recovered_revision(
-            &checkpoint_hash,
-            checkpoint.checkpoint.guild_id,
-            revision,
-            restore_target,
-        )?;
-    }
+    let revision = revision.cloned();
+    let checkpoint_for_worker = checkpoint.clone();
+    let restore_target = restore_target.to_path_buf();
+    recovered_node = run_node_blocking(recovered_node, move |node| {
+        node.install_recovered_checkpoint(&checkpoint_for_worker)?;
+        if let Some(revision) = revision.as_ref() {
+            node.restore_recovered_revision(
+                &checkpoint_hash,
+                checkpoint_for_worker.checkpoint.guild_id,
+                revision,
+                &restore_target,
+            )?;
+        }
+        Ok(())
+    })
+    .await?;
     Ok(recovered_node)
 }
 
 async fn recover_network_local_shards(
-    recovered_node: &mut Node,
+    mut recovered_node: Node,
     checkpoint: &QuorumCheckpoint,
     peer_endpoints: &BTreeMap<NodeId, SocketAddr>,
-) -> Result<()> {
+) -> Result<Node> {
     let recovering = recovered_node.keys().node_id();
     let checkpoint_hash = checkpoint.hash()?;
     let mut unhealthy = BTreeSet::new();
@@ -1223,15 +1337,32 @@ async fn recover_network_local_shards(
             bail!("reconstructed local shard failed its signed root");
         }
         drop(attempts);
-        recovered_node.stage_recovered_shard(
-            &checkpoint_hash,
-            &checkpoint.checkpoint.guild_id,
-            group,
-            target_index as u8,
-            &bytes,
-        )?;
+        let group = group.clone();
+        let guild_id = checkpoint.checkpoint.guild_id;
+        recovered_node = run_node_blocking(recovered_node, move |node| {
+            node.stage_recovered_shard(
+                &checkpoint_hash,
+                &guild_id,
+                &group,
+                target_index as u8,
+                &bytes,
+            )
+        })
+        .await?;
     }
-    Ok(())
+    Ok(recovered_node)
+}
+
+async fn run_node_blocking<F>(mut node: Node, operation: F) -> Result<Node>
+where
+    F: FnOnce(&mut Node) -> Result<()> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        operation(&mut node)?;
+        Ok(node)
+    })
+    .await
+    .context("node storage worker panicked")?
 }
 
 async fn request_filler(
@@ -1594,6 +1725,45 @@ mod tests {
         stale.issued_at_unix_seconds = 1;
         stale.expires_at_unix_seconds = 2;
         assert!(validate_request_envelope(&stale, caller.node_id(), recipient).is_err());
+    }
+
+    #[test]
+    fn read_workers_do_not_wait_for_the_mutation_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([54; 32]);
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let reader_config = node.lock().unwrap().reader_config();
+        let service = Arc::new(NodeService {
+            writer: node.clone(),
+            reader_config,
+            readers: Mutex::new(Vec::new()),
+            max_readers: 2,
+        });
+        let config = NodeServerConfig {
+            listen: free_address(),
+            public_endpoint: "tcp://127.0.0.1:1".to_owned(),
+            failure_domain: "test-host".to_owned(),
+            trusted_coordinator: KeyMaterial::from_seed(&Seed::from_bytes([55; 32])).node_id(),
+            max_connections: 2,
+        };
+        let caller = KeyMaterial::from_seed(&Seed::from_bytes([56; 32]));
+        let request = make_peer_request(&caller, None, PeerRequest::Profile).unwrap();
+        let writer_guard = node.lock().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            sender
+                .send(process_peer_request(service, &config, request))
+                .unwrap();
+        });
+        let response = receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("a profile read waited for the held mutation lock")
+            .unwrap();
+        assert!(matches!(
+            response.value.result,
+            Ok(PeerResponse::Profile(_))
+        ));
+        drop(writer_guard);
     }
 
     #[tokio::test]

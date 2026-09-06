@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use mb_core::{
@@ -52,9 +53,77 @@ pub type RecoveredShards = BTreeMap<([u8; 32], u8), Vec<u8>>;
 pub struct Node {
     data_dir: PathBuf,
     _data_dir_lock: File,
-    keys: KeyMaterial,
+    keys: Arc<KeyMaterial>,
     control: ControlStore,
     parity: ParityStore,
+}
+
+#[derive(Clone)]
+pub(crate) struct NodeReaderConfig {
+    keys: Arc<KeyMaterial>,
+    control_path: PathBuf,
+    parity_path: PathBuf,
+    volume_id: [u8; 16],
+}
+
+pub(crate) struct NodeReader {
+    keys: Arc<KeyMaterial>,
+    control: ControlStore,
+    parity: ParityStore,
+}
+
+impl NodeReaderConfig {
+    pub(crate) fn open(&self) -> Result<NodeReader> {
+        Ok(NodeReader {
+            keys: self.keys.clone(),
+            control: ControlStore::open(&self.control_path, &self.keys)?,
+            parity: ParityStore::open(&self.parity_path, &self.volume_id, &self.keys)?,
+        })
+    }
+
+    pub(crate) fn keys(&self) -> &KeyMaterial {
+        &self.keys
+    }
+}
+
+impl NodeReader {
+    pub(crate) fn keys(&self) -> &KeyMaterial {
+        &self.keys
+    }
+
+    pub(crate) fn authorize_member(&self, guild_id: &[u8; 32], caller: NodeId) -> Result<()> {
+        authorize_member(&self.control, guild_id, caller)
+    }
+
+    pub(crate) fn sector_for_guild(
+        &self,
+        guild_id: &[u8; 32],
+        sector_id: &SectorId,
+    ) -> Result<Vec<u8>> {
+        render_sector(&self.control, &self.keys, sector_id, Some(guild_id))
+    }
+
+    pub(crate) fn parity_for_guild(
+        &self,
+        guild_id: &[u8; 32],
+        group_id: &[u8; 32],
+        shard_index: u8,
+    ) -> Result<Vec<u8>> {
+        let object = self.parity.load_ready(group_id, shard_index)?;
+        if object.guild_id != *guild_id {
+            anyhow::bail!("parity object does not belong to the requested guild");
+        }
+        Ok(object.bytes)
+    }
+
+    pub(crate) fn checkpoint_page(
+        &self,
+        guild_id: &[u8; 32],
+        checkpoint_hash: &[u8; 32],
+        page_index: u32,
+    ) -> Result<(u32, Vec<u8>)> {
+        checkpoint_page(&self.control, guild_id, checkpoint_hash, page_index)
+    }
 }
 
 impl Node {
@@ -63,7 +132,7 @@ impl Node {
         fs::create_dir_all(&data_dir)?;
         set_private_directory(&data_dir)?;
         let data_dir_lock = open_data_dir_lock(&data_dir)?;
-        let keys = KeyMaterial::from_seed(&seed);
+        let keys = Arc::new(KeyMaterial::from_seed(&seed));
         let mut volume_id = [0_u8; 16];
         volume_id.copy_from_slice(&blake3::hash(&keys.node_id().0).as_bytes()[..16]);
         let control = ControlStore::open(data_dir.join("control.db"), &keys)?;
@@ -83,6 +152,17 @@ impl Node {
 
     pub fn keys(&self) -> &KeyMaterial {
         &self.keys
+    }
+
+    pub(crate) fn reader_config(&self) -> NodeReaderConfig {
+        let mut volume_id = [0_u8; 16];
+        volume_id.copy_from_slice(&blake3::hash(&self.keys.node_id().0).as_bytes()[..16]);
+        NodeReaderConfig {
+            keys: self.keys.clone(),
+            control_path: self.control.path().to_path_buf(),
+            parity_path: self.parity.path().to_path_buf(),
+            volume_id,
+        }
     }
 
     pub fn member(&self, failure_domain: impl Into<String>) -> Member {
@@ -366,16 +446,7 @@ impl Node {
         checkpoint_hash: &[u8; 32],
         page_index: u32,
     ) -> Result<(u32, Vec<u8>)> {
-        let (_, head_hash, _) = self
-            .control
-            .checkpoint_head(guild_id)?
-            .context("guild checkpoint is unavailable")?;
-        if head_hash != *checkpoint_hash {
-            anyhow::bail!("only the current checkpoint is page-readable");
-        }
-        Ok(self
-            .control
-            .protocol_record_page("guild-checkpoint", checkpoint_hash, page_index)?)
+        checkpoint_page(&self.control, guild_id, checkpoint_hash, page_index)
     }
 
     fn validate_local_member(&self, checkpoint: &GuildCheckpoint) -> Result<()> {
@@ -521,22 +592,7 @@ impl Node {
     }
 
     pub fn authorize_member(&self, guild_id: &[u8; 32], caller: NodeId) -> Result<()> {
-        let (_, _, bytes) = self
-            .control
-            .checkpoint_head(guild_id)?
-            .context("guild has no locally committed checkpoint")?;
-        let checkpoint: QuorumCheckpoint = decode_canonical(&bytes)?;
-        checkpoint.verify()?;
-        if checkpoint.checkpoint.guild_id != *guild_id
-            || !checkpoint
-                .checkpoint
-                .members
-                .iter()
-                .any(|member| member.node_id == caller)
-        {
-            anyhow::bail!("caller is not an authorized guild member");
-        }
-        Ok(())
+        authorize_member(&self.control, guild_id, caller)
     }
 
     pub fn install_recovered_checkpoint(
@@ -822,6 +878,39 @@ impl Node {
             .put_operation_result(operation_id, kind, &caller.0, request_hash, result)?;
         Ok(())
     }
+}
+
+fn authorize_member(control: &ControlStore, guild_id: &[u8; 32], caller: NodeId) -> Result<()> {
+    let (_, _, bytes) = control
+        .checkpoint_head(guild_id)?
+        .context("guild has no locally committed checkpoint")?;
+    let checkpoint: QuorumCheckpoint = decode_canonical(&bytes)?;
+    checkpoint.verify()?;
+    if checkpoint.checkpoint.guild_id != *guild_id
+        || !checkpoint
+            .checkpoint
+            .members
+            .iter()
+            .any(|member| member.node_id == caller)
+    {
+        anyhow::bail!("caller is not an authorized guild member");
+    }
+    Ok(())
+}
+
+fn checkpoint_page(
+    control: &ControlStore,
+    guild_id: &[u8; 32],
+    checkpoint_hash: &[u8; 32],
+    page_index: u32,
+) -> Result<(u32, Vec<u8>)> {
+    let (_, head_hash, _) = control
+        .checkpoint_head(guild_id)?
+        .context("guild checkpoint is unavailable")?;
+    if head_hash != *checkpoint_hash {
+        anyhow::bail!("only the current checkpoint is page-readable");
+    }
+    Ok(control.protocol_record_page("guild-checkpoint", checkpoint_hash, page_index)?)
 }
 
 fn parity_proof_id(group_id: &[u8; 32], shard_index: u8) -> [u8; 33] {
