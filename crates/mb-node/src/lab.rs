@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 use mb_core::{
     CodingGroup, GuildCheckpoint, InformationRole, KeyMaterial, Member, NodeId, ParityRole,
-    QuorumCheckpoint, RecoveryLocator, SectorId, Seed, ShardRole, SignedRecord, UserRevision,
-    V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, canonical_bytes, decode_canonical,
-    encode_3_2, open_recovery_record, reconstruct_3_2, seal_recovery_record, sector_root,
+    QuorumCheckpoint, RecoveryLocator, SectorId, Seed, ShardRole, SignedRecord, V1_RS_DATA_SHARDS,
+    V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, canonical_bytes, decode_canonical, encode_3_2,
+    open_recovery_record, reconstruct_3_2, seal_recovery_record, sector_root,
 };
 use mb_store::ParityObject;
 
-use crate::{Node, RecoveredShards, restore_revision};
+use crate::{Node, RecoveredShards};
 
 type SharedNode = Arc<Mutex<Node>>;
 
@@ -308,7 +308,25 @@ impl PrototypeGuild {
         let checkpoint = recover_checkpoint(recovered.keys(), &self.directory, &self.network)?;
         let recovered_shards =
             recover_local_shards(recovered.keys().node_id(), &checkpoint, &self.network)?;
-        recovered.install_recovered_checkpoint(&checkpoint, &recovered_shards)?;
+        let checkpoint_hash = checkpoint.hash()?;
+        for ((group_id, shard_index), bytes) in &recovered_shards {
+            let group = checkpoint
+                .checkpoint
+                .coding_groups
+                .binary_search_by_key(group_id, |group| group.id)
+                .ok()
+                .map(|index| &checkpoint.checkpoint.coding_groups[index])
+                .context("recovered unknown coding group")?;
+            recovered.stage_recovered_shard(
+                &checkpoint_hash,
+                &checkpoint.checkpoint.guild_id,
+                group,
+                *shard_index,
+                bytes,
+            )?;
+        }
+        recovered.install_recovered_checkpoint(&checkpoint)?;
+        drop(recovered_shards);
         let revision = checkpoint
             .checkpoint
             .revisions
@@ -316,12 +334,10 @@ impl PrototypeGuild {
             .filter(|revision| revision.value.owner == recovered.keys().node_id())
             .max_by_key(|revision| revision.value.sequence);
         if let Some(revision) = revision {
-            let ciphertexts = local_revision_ciphertexts(revision, &checkpoint, &recovered_shards)?;
-            restore_revision(
-                recovered.keys(),
+            recovered.restore_recovered_revision(
+                &checkpoint_hash,
                 checkpoint.checkpoint.guild_id,
                 revision,
-                &ciphertexts,
                 restore_target,
             )?;
         }
@@ -474,40 +490,6 @@ fn recover_local_shards(
         recovered.insert((group.id, target_index as u8), bytes);
     }
     Ok(recovered)
-}
-
-fn local_revision_ciphertexts(
-    revision: &SignedRecord<UserRevision>,
-    checkpoint: &QuorumCheckpoint,
-    recovered_shards: &RecoveredShards,
-) -> Result<BTreeMap<SectorId, Vec<u8>>> {
-    let wanted = revision
-        .value
-        .metadata_sectors
-        .iter()
-        .chain(&revision.value.data_sectors)
-        .map(|reference| reference.id)
-        .collect::<BTreeSet<_>>();
-    let mut ciphertexts = BTreeMap::new();
-    for group in &checkpoint.checkpoint.coding_groups {
-        for (index, role) in group.roles.iter().enumerate() {
-            if let ShardRole::Information(information) = role
-                && wanted.contains(&information.sector.id)
-            {
-                ciphertexts.insert(
-                    information.sector.id,
-                    recovered_shards
-                        .get(&(group.id, index as u8))
-                        .context("missing recovered revision shard")?
-                        .clone(),
-                );
-            }
-        }
-    }
-    if ciphertexts.len() != wanted.len() {
-        bail!("not all revision sectors were recovered");
-    }
-    Ok(ciphertexts)
 }
 
 fn role_indices(owner: usize, node_count: usize) -> Result<[usize; 5]> {

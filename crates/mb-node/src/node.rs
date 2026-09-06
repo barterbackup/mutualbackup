@@ -12,8 +12,27 @@ use mb_store::{ControlStore, ParityObject, ParityStore};
 use uuid::Uuid;
 
 use crate::snapshot::{
-    install_inline_recipe, install_recovered_sector_recipe, prepare_revision, render_sector,
+    build_revision_restore, install_inline_recipe, install_recovered_sector_recipe,
+    native_directory_id, prepare_revision, publish_restore, render_sector,
 };
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+enum RecoveryJobState {
+    Building,
+    Ready,
+    Complete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct RecoveryJob {
+    format_version: u16,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    target: PathBuf,
+    staging: PathBuf,
+    staged_native_id: Option<(u64, u64)>,
+    state: RecoveryJobState,
+}
 
 pub type RecoveredShards = BTreeMap<([u8; 32], u8), Vec<u8>>;
 
@@ -160,6 +179,84 @@ impl Node {
             &body,
         )?;
         Ok(checkpoint.member_signature(&self.keys)?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_checkpoint_page(
+        &mut self,
+        object_kind: &str,
+        guild_id: &[u8; 32],
+        checkpoint_hash: &[u8; 32],
+        page_index: u32,
+        total_pages: u32,
+        page_hash: &[u8; 32],
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.control.stage_checkpoint_page(
+            object_kind,
+            guild_id,
+            checkpoint_hash,
+            page_index,
+            total_pages,
+            page_hash,
+            bytes,
+        )?;
+        Ok(())
+    }
+
+    pub fn sign_staged_checkpoint(
+        &mut self,
+        guild_id: &[u8; 32],
+        checkpoint_hash: &[u8; 32],
+    ) -> Result<MemberSignature> {
+        let bytes = self
+            .control
+            .assembled_checkpoint_object("body", guild_id, checkpoint_hash)?;
+        let checkpoint: GuildCheckpoint = decode_canonical(&bytes)?;
+        if checkpoint.guild_id != *guild_id || checkpoint.hash()? != *checkpoint_hash {
+            anyhow::bail!("staged checkpoint body has the wrong identity");
+        }
+        self.sign_checkpoint(&checkpoint)
+    }
+
+    pub fn finalize_staged_checkpoint(
+        &mut self,
+        guild_id: &[u8; 32],
+        checkpoint_hash: &[u8; 32],
+    ) -> Result<[u8; 32]> {
+        if let Ok(existing) = self.checkpoint(checkpoint_hash)
+            && existing.checkpoint.guild_id == *guild_id
+        {
+            return Ok(*checkpoint_hash);
+        }
+        let bytes =
+            self.control
+                .assembled_checkpoint_object("certificate", guild_id, checkpoint_hash)?;
+        let checkpoint: QuorumCheckpoint = decode_canonical(&bytes)?;
+        if checkpoint.checkpoint.guild_id != *guild_id || checkpoint.hash()? != *checkpoint_hash {
+            anyhow::bail!("staged checkpoint certificate has the wrong identity");
+        }
+        let hash = self.store_checkpoint(&checkpoint)?;
+        self.control.clear_checkpoint_pages(checkpoint_hash)?;
+        Ok(hash)
+    }
+
+    pub fn checkpoint_page(
+        &self,
+        guild_id: &[u8; 32],
+        checkpoint_hash: &[u8; 32],
+        page_index: u32,
+    ) -> Result<(u32, Vec<u8>)> {
+        let (_, head_hash, _) = self
+            .control
+            .checkpoint_head(guild_id)?
+            .context("guild checkpoint is unavailable")?;
+        if head_hash != *checkpoint_hash {
+            anyhow::bail!("only the current checkpoint is page-readable");
+        }
+        Ok(self
+            .control
+            .protocol_record_page("guild-checkpoint", checkpoint_hash, page_index)?)
     }
 
     fn validate_local_member(&self, checkpoint: &GuildCheckpoint) -> Result<()> {
@@ -317,66 +414,173 @@ impl Node {
     pub fn install_recovered_checkpoint(
         &mut self,
         checkpoint: &QuorumCheckpoint,
-        recovered_shards: &RecoveredShards,
     ) -> Result<[u8; 32]> {
         checkpoint.verify()?;
         self.validate_local_member(&checkpoint.checkpoint)?;
         if !checkpoint.has_signature(self.keys.node_id()) {
             anyhow::bail!("checkpoint is not authorized by the recovering seed");
         }
-        let mut expected = 0_usize;
+        let checkpoint_hash = checkpoint.hash()?;
         for group in &checkpoint.checkpoint.coding_groups {
             for (index, role) in group.roles.iter().enumerate() {
-                let local = match role {
+                match role {
                     ShardRole::Information(information)
                         if information.owner == self.keys.node_id() =>
                     {
-                        let bytes = recovered_shards
-                            .get(&(group.id, index as u8))
-                            .context("recovery omitted a local information shard")?;
+                        let bytes = self.control.recovery_shard(
+                            &checkpoint_hash,
+                            &checkpoint.checkpoint.guild_id,
+                            &group.id,
+                            index as u8,
+                            &information.sector.root,
+                        )?;
                         install_recovered_sector_recipe(
                             &mut self.control,
                             &self.keys,
                             checkpoint.checkpoint.guild_id,
                             information.sector.clone(),
-                            bytes,
+                            &bytes,
                         )?;
-                        true
                     }
                     ShardRole::Parity(parity) if parity.holder == self.keys.node_id() => {
-                        let bytes = recovered_shards
-                            .get(&(group.id, index as u8))
-                            .context("recovery omitted a local parity shard")?;
+                        let bytes = self.control.recovery_shard(
+                            &checkpoint_hash,
+                            &checkpoint.checkpoint.guild_id,
+                            &group.id,
+                            index as u8,
+                            &parity.root,
+                        )?;
                         self.publish_parity(&ParityObject {
                             format_version: group.format_version,
                             guild_id: checkpoint.checkpoint.guild_id,
                             group_id: group.id,
                             shard_index: index as u8,
                             root: parity.root,
-                            bytes: bytes.clone(),
+                            bytes,
                         })?;
-                        true
                     }
-                    _ => false,
-                };
-                expected += usize::from(local);
+                    _ => {}
+                }
             }
         }
-        if recovered_shards.len() != expected {
-            anyhow::bail!("recovery supplied unexpected local shards");
-        }
         self.validate_local_roles(&checkpoint.checkpoint)?;
-        let hash = checkpoint.hash()?;
         self.control.commit_checkpoint(
             &checkpoint.checkpoint.guild_id,
             checkpoint.checkpoint.generation,
             checkpoint.checkpoint.parent.as_ref(),
-            &hash,
+            &checkpoint_hash,
             &canonical_bytes(&checkpoint.checkpoint)?,
             &canonical_bytes(checkpoint)?,
             false,
         )?;
-        Ok(hash)
+        self.control.clear_recovery_shards(&checkpoint_hash)?;
+        Ok(checkpoint_hash)
+    }
+
+    pub fn stage_recovered_shard(
+        &mut self,
+        checkpoint_hash: &[u8; 32],
+        guild_id: &[u8; 32],
+        group: &mb_core::CodingGroup,
+        shard_index: u8,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let role = group
+            .roles
+            .get(shard_index as usize)
+            .context("recovered shard index is out of range")?;
+        let root = match role {
+            ShardRole::Information(information) if information.owner == self.keys.node_id() => {
+                information.sector.root
+            }
+            ShardRole::Parity(parity) if parity.holder == self.keys.node_id() => parity.root,
+            _ => anyhow::bail!("recovered shard is not assigned to the local node"),
+        };
+        if group.guild_id != *guild_id {
+            anyhow::bail!("recovered shard has the wrong guild context");
+        }
+        self.control.stage_recovery_shard(
+            checkpoint_hash,
+            guild_id,
+            &group.id,
+            shard_index,
+            &root,
+            bytes,
+        )?;
+        Ok(())
+    }
+
+    pub fn restore_recovered_revision(
+        &mut self,
+        checkpoint_hash: &[u8; 32],
+        guild_id: [u8; 32],
+        revision: &SignedRecord<UserRevision>,
+        target: &Path,
+    ) -> Result<()> {
+        let parent = target.parent().context("restore target has no parent")?;
+        fs::create_dir_all(parent)?;
+        let existing = self.control.get_record("recovery-job", checkpoint_hash)?;
+        let mut job = match existing {
+            Some(bytes) => {
+                let job: RecoveryJob = decode_canonical(&bytes)?;
+                if job.format_version != 1
+                    || job.guild_id != guild_id
+                    || job.revision_id != revision.value.revision_id
+                    || job.target != target
+                    || job.staging.parent() != Some(parent)
+                {
+                    anyhow::bail!("recovery job conflicts with durable local state");
+                }
+                job
+            }
+            None => RecoveryJob {
+                format_version: 1,
+                guild_id,
+                revision_id: revision.value.revision_id,
+                target: target.to_path_buf(),
+                staging: parent.join(format!(".mutualbackup-restore-{}", Uuid::new_v4())),
+                staged_native_id: None,
+                state: RecoveryJobState::Building,
+            },
+        };
+
+        if target.exists() {
+            let expected = job
+                .staged_native_id
+                .context("existing restore target is not owned by this recovery job")?;
+            if native_directory_id(target)? != expected {
+                anyhow::bail!("existing restore target was created by another actor");
+            }
+            job.state = RecoveryJobState::Complete;
+            self.control
+                .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
+            return Ok(());
+        }
+
+        if job.staging.exists() {
+            fs::remove_dir_all(&job.staging)?;
+            sync_directory(parent)?;
+        }
+        job.state = RecoveryJobState::Building;
+        job.staged_native_id = None;
+        self.control
+            .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
+        build_revision_restore(
+            &self.keys,
+            guild_id,
+            revision,
+            &job.staging,
+            &mut |sector_id| self.sector(sector_id),
+        )?;
+        job.staged_native_id = Some(native_directory_id(&job.staging)?);
+        job.state = RecoveryJobState::Ready;
+        self.control
+            .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
+        publish_restore(&job.staging, target)?;
+        job.state = RecoveryJobState::Complete;
+        self.control
+            .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
+        Ok(())
     }
 
     pub fn cached_operation(
@@ -422,6 +626,13 @@ fn open_data_dir_lock(data_dir: &Path) -> Result<File> {
     }
     FileExt::try_lock_exclusive(&file).context("node data directory is already in use")?;
     Ok(file)
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(path)?.sync_all()?;
+    let _ = path;
+    Ok(())
 }
 
 #[cfg(unix)]

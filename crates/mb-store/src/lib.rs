@@ -13,4 +13,4 @@ pub use anchor::{
 };
 pub use database::{CheckpointRow, ControlStore, DatabaseError, ParityObject, ParityStore};
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 5;

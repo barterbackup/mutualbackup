@@ -8,6 +8,8 @@ use thiserror::Error;
 use crate::SCHEMA_VERSION;
 
 const CONTROL_DATABASE_ID: &[u8] = b"control.db";
+const CHECKPOINT_PAGE_BYTES: usize = 512 * 1024;
+const MAX_CHECKPOINT_PAGES: u32 = 512;
 pub type CheckpointRow = (u64, [u8; 32], Vec<u8>);
 
 #[derive(Debug, Error)]
@@ -193,6 +195,273 @@ impl ControlStore {
         guild_id: &[u8; 32],
     ) -> Result<Option<CheckpointRow>, DatabaseError> {
         checkpoint_row(&self.connection, "checkpoint_heads", guild_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_recovery_shard(
+        &mut self,
+        checkpoint_hash: &[u8; 32],
+        guild_id: &[u8; 32],
+        group_id: &[u8; 32],
+        shard_index: u8,
+        root: &[u8; 32],
+        bytes: &[u8],
+    ) -> Result<(), DatabaseError> {
+        if shard_index > 4 || bytes.len() != V1_SECTOR_SIZE || sector_root(bytes) != *root {
+            return Err(DatabaseError::Integrity);
+        }
+        let transaction = self.connection.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT guild_id, root, bytes FROM recovery_shards
+                 WHERE checkpoint_hash = ?1 AND group_id = ?2 AND shard_index = ?3",
+                params![checkpoint_hash.as_slice(), group_id.as_slice(), shard_index],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((stored_guild, stored_root, stored_bytes)) = existing {
+            if stored_guild.as_slice() != guild_id
+                || stored_root.as_slice() != root
+                || stored_bytes != bytes
+            {
+                return Err(DatabaseError::Conflict);
+            }
+            transaction.commit()?;
+            return Ok(());
+        }
+        transaction.execute(
+            "INSERT INTO recovery_shards(
+                checkpoint_hash, guild_id, group_id, shard_index, root, bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                checkpoint_hash.as_slice(),
+                guild_id.as_slice(),
+                group_id.as_slice(),
+                shard_index,
+                root.as_slice(),
+                bytes,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn recovery_shard(
+        &self,
+        checkpoint_hash: &[u8; 32],
+        guild_id: &[u8; 32],
+        group_id: &[u8; 32],
+        shard_index: u8,
+        root: &[u8; 32],
+    ) -> Result<Vec<u8>, DatabaseError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT bytes FROM recovery_shards
+                 WHERE checkpoint_hash = ?1 AND guild_id = ?2
+                   AND group_id = ?3 AND shard_index = ?4 AND root = ?5",
+                params![
+                    checkpoint_hash.as_slice(),
+                    guild_id.as_slice(),
+                    group_id.as_slice(),
+                    shard_index,
+                    root.as_slice(),
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .ok_or(DatabaseError::NotReady)?;
+        if row.len() != V1_SECTOR_SIZE || sector_root(&row) != *root {
+            return Err(DatabaseError::Integrity);
+        }
+        Ok(row)
+    }
+
+    pub fn clear_recovery_shards(
+        &mut self,
+        checkpoint_hash: &[u8; 32],
+    ) -> Result<(), DatabaseError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM recovery_shards WHERE checkpoint_hash = ?1",
+            [checkpoint_hash.as_slice()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_checkpoint_page(
+        &mut self,
+        object_kind: &str,
+        guild_id: &[u8; 32],
+        object_id: &[u8; 32],
+        page_index: u32,
+        total_pages: u32,
+        page_hash: &[u8; 32],
+        bytes: &[u8],
+    ) -> Result<(), DatabaseError> {
+        if !matches!(object_kind, "body" | "certificate")
+            || total_pages == 0
+            || total_pages > MAX_CHECKPOINT_PAGES
+            || page_index >= total_pages
+            || bytes.is_empty()
+            || bytes.len() > CHECKPOINT_PAGE_BYTES
+            || blake3::hash(bytes).as_bytes() != page_hash
+        {
+            return Err(DatabaseError::Integrity);
+        }
+        let transaction = self.connection.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT guild_id, total_pages, page_hash, bytes
+                 FROM checkpoint_pages
+                 WHERE object_kind = ?1 AND object_id = ?2 AND page_index = ?3",
+                params![object_kind, object_id.as_slice(), page_index],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((stored_guild, stored_total, stored_hash, stored_bytes)) = existing {
+            if stored_guild.as_slice() != guild_id
+                || stored_total != i64::from(total_pages)
+                || stored_hash.as_slice() != page_hash
+                || stored_bytes != bytes
+            {
+                return Err(DatabaseError::Conflict);
+            }
+            transaction.commit()?;
+            return Ok(());
+        }
+        transaction.execute(
+            "INSERT INTO checkpoint_pages(
+                object_kind, guild_id, object_id, page_index, total_pages, page_hash, bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                object_kind,
+                guild_id.as_slice(),
+                object_id.as_slice(),
+                page_index,
+                total_pages,
+                page_hash.as_slice(),
+                bytes,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn assembled_checkpoint_object(
+        &self,
+        object_kind: &str,
+        guild_id: &[u8; 32],
+        object_id: &[u8; 32],
+    ) -> Result<Vec<u8>, DatabaseError> {
+        if !matches!(object_kind, "body" | "certificate") {
+            return Err(DatabaseError::Integrity);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT page_index, total_pages, page_hash, bytes
+             FROM checkpoint_pages
+             WHERE object_kind = ?1 AND guild_id = ?2 AND object_id = ?3
+             ORDER BY page_index",
+        )?;
+        let pages = statement
+            .query_map(
+                params![object_kind, guild_id.as_slice(), object_id.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let total = pages
+            .first()
+            .map(|page| page.1)
+            .ok_or(DatabaseError::NotReady)?;
+        if total <= 0 || total > i64::from(MAX_CHECKPOINT_PAGES) || pages.len() != total as usize {
+            return Err(DatabaseError::NotReady);
+        }
+        let mut assembled = Vec::new();
+        for (expected, (index, page_total, hash, bytes)) in pages.into_iter().enumerate() {
+            if index != expected as i64
+                || page_total != total
+                || hash.len() != 32
+                || bytes.is_empty()
+                || bytes.len() > CHECKPOINT_PAGE_BYTES
+                || blake3::hash(&bytes).as_bytes() != hash.as_slice()
+            {
+                return Err(DatabaseError::Integrity);
+            }
+            assembled.extend_from_slice(&bytes);
+        }
+        Ok(assembled)
+    }
+
+    pub fn clear_checkpoint_pages(&mut self, object_id: &[u8; 32]) -> Result<(), DatabaseError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM checkpoint_pages WHERE object_id = ?1",
+            [object_id.as_slice()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn protocol_record_page(
+        &self,
+        kind: &str,
+        record_id: &[u8],
+        page_index: u32,
+    ) -> Result<(u32, Vec<u8>), DatabaseError> {
+        let byte_length: i64 = self
+            .connection
+            .query_row(
+                "SELECT length(bytes) FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
+                params![kind, record_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(DatabaseError::NotReady)?;
+        let byte_length = usize::try_from(byte_length).map_err(|_| DatabaseError::Integrity)?;
+        let total_pages = byte_length.div_ceil(CHECKPOINT_PAGE_BYTES);
+        if total_pages == 0
+            || total_pages > MAX_CHECKPOINT_PAGES as usize
+            || page_index as usize >= total_pages
+        {
+            return Err(DatabaseError::Integrity);
+        }
+        let offset = (page_index as usize)
+            .checked_mul(CHECKPOINT_PAGE_BYTES)
+            .ok_or(DatabaseError::Integrity)?;
+        let bytes = self.connection.query_row(
+            "SELECT substr(bytes, ?3, ?4) FROM protocol_records
+             WHERE kind = ?1 AND record_id = ?2",
+            params![
+                kind,
+                record_id,
+                i64::try_from(offset + 1).map_err(|_| DatabaseError::Integrity)?,
+                CHECKPOINT_PAGE_BYTES as i64,
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        Ok((total_pages as u32, bytes))
     }
 
     pub fn lock_checkpoint_signature(
@@ -530,6 +799,8 @@ fn initialize_or_validate_control(connection: &mut Connection) -> Result<(), Dat
                 "operations",
                 "checkpoint_signature_locks",
                 "checkpoint_heads",
+                "recovery_shards",
+                "checkpoint_pages",
             ],
         )?;
         return Ok(());
@@ -565,6 +836,25 @@ fn initialize_or_validate_control(connection: &mut Connection) -> Result<(), Dat
             generation INTEGER NOT NULL CHECK(generation > 0),
             checkpoint_hash BLOB NOT NULL CHECK(length(checkpoint_hash) = 32),
             checkpoint_bytes BLOB NOT NULL
+         ) STRICT;
+         CREATE TABLE recovery_shards (
+            checkpoint_hash BLOB NOT NULL CHECK(length(checkpoint_hash) = 32),
+            guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
+            group_id BLOB NOT NULL CHECK(length(group_id) = 32),
+            shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 0 AND 4),
+            root BLOB NOT NULL CHECK(length(root) = 32),
+            bytes BLOB NOT NULL CHECK(length(bytes) = 65536),
+            PRIMARY KEY(checkpoint_hash, group_id, shard_index)
+         ) STRICT;
+         CREATE TABLE checkpoint_pages (
+            object_kind TEXT NOT NULL CHECK(object_kind IN ('body', 'certificate')),
+            guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
+            object_id BLOB NOT NULL CHECK(length(object_id) = 32),
+            page_index INTEGER NOT NULL CHECK(page_index >= 0),
+            total_pages INTEGER NOT NULL CHECK(total_pages BETWEEN 1 AND 512),
+            page_hash BLOB NOT NULL CHECK(length(page_hash) = 32),
+            bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 524288),
+            PRIMARY KEY(object_kind, object_id, page_index)
          ) STRICT;",
     )?;
     transaction.execute(

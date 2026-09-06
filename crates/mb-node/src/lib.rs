@@ -12,4 +12,4 @@ pub use network::{
     recover_over_network, serve_directory, serve_node,
 };
 pub use node::{Node, RecoveredShards};
-pub use snapshot::{PrivateEntry, PrivateMetadata, restore_revision};
+pub use snapshot::{PrivateEntry, PrivateMetadata, restore_revision, restore_revision_from_source};

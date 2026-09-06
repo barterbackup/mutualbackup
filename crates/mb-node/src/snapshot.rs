@@ -81,7 +81,7 @@ pub(crate) fn prepare_revision(
     let encryption_key = keys.guild_data_key(&guild_id);
     let mut data_references = Vec::new();
     let mut private_entries = Vec::new();
-    let mut recipes = Vec::new();
+    let mut recipe_records = Vec::with_capacity(256);
     let mut ordinal = 0_u64;
 
     for entry in &anchor.entries {
@@ -121,14 +121,18 @@ pub(crate) fn prepare_revision(
                     let (reference, _) = encrypted_sector(&encryption_key, id, &plaintext)?;
                     data_references.push(reference.clone());
                     file_references.push(reference.clone());
-                    recipes.push(LocalSectorRecipe {
-                        guild_id,
-                        reference,
-                        source: LocalPlaintextSource::AnchorFile {
-                            locator: locator.clone(),
-                            offset,
+                    queue_recipe(
+                        control,
+                        &mut recipe_records,
+                        LocalSectorRecipe {
+                            guild_id,
+                            reference,
+                            source: LocalPlaintextSource::AnchorFile {
+                                locator: locator.clone(),
+                                offset,
+                            },
                         },
-                    });
+                    )?;
                     offset += logical_len as u64;
                     remaining -= logical_len as u64;
                 }
@@ -162,11 +166,15 @@ pub(crate) fn prepare_revision(
         );
         let (reference, _) = encrypted_sector(&encryption_key, id, plaintext)?;
         metadata_references.push(reference.clone());
-        recipes.push(LocalSectorRecipe {
-            guild_id,
-            reference,
-            source: LocalPlaintextSource::Inline(plaintext.to_vec()),
-        });
+        queue_recipe(
+            control,
+            &mut recipe_records,
+            LocalSectorRecipe {
+                guild_id,
+                reference,
+                source: LocalPlaintextSource::Inline(plaintext.to_vec()),
+            },
+        )?;
     }
 
     let revision = SignedRecord::sign(
@@ -184,28 +192,40 @@ pub(crate) fn prepare_revision(
         },
         keys,
     )?;
-    let mut records = recipes
-        .iter()
-        .map(|recipe| {
-            Ok((
-                "local-sector".to_owned(),
-                recipe.reference.id.to_vec(),
-                canonical_bytes(recipe)?,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    records.push((
-        "anchor-manifest".to_owned(),
-        revision_id.as_bytes().to_vec(),
-        canonical_bytes(&anchor)?,
-    ));
-    records.push((
-        "user-revision".to_owned(),
-        revision_id.as_bytes().to_vec(),
-        canonical_bytes(&revision)?,
-    ));
+    if !recipe_records.is_empty() {
+        control.put_records(&recipe_records)?;
+    }
+    let records = vec![
+        (
+            "anchor-manifest".to_owned(),
+            revision_id.as_bytes().to_vec(),
+            canonical_bytes(&anchor)?,
+        ),
+        (
+            "user-revision".to_owned(),
+            revision_id.as_bytes().to_vec(),
+            canonical_bytes(&revision)?,
+        ),
+    ];
     control.put_records(&records)?;
     Ok(revision)
+}
+
+fn queue_recipe(
+    control: &mut ControlStore,
+    records: &mut Vec<(String, Vec<u8>, Vec<u8>)>,
+    recipe: LocalSectorRecipe,
+) -> Result<()> {
+    records.push((
+        "local-sector".to_owned(),
+        recipe.reference.id.to_vec(),
+        canonical_bytes(&recipe)?,
+    ));
+    if records.len() == records.capacity() {
+        control.put_records(records)?;
+        records.clear();
+    }
+    Ok(())
 }
 
 pub(crate) fn install_inline_recipe(
@@ -287,44 +307,108 @@ pub fn restore_revision(
     ciphertexts: &BTreeMap<SectorId, Vec<u8>>,
     target: &Path,
 ) -> Result<()> {
-    revision.verify(b"mutualbackup/user-revision/v1")?;
-    if revision.signer != keys.node_id() || revision.value.owner != keys.node_id() {
-        bail!("revision does not belong to the recovering seed");
-    }
+    restore_revision_from_source(keys, guild_id, revision, target, |sector_id| {
+        ciphertexts
+            .get(sector_id)
+            .cloned()
+            .with_context(|| format!("missing recovered sector {}", hex_id(sector_id)))
+    })
+}
+
+pub fn restore_revision_from_source<F>(
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+    target: &Path,
+    mut load_ciphertext: F,
+) -> Result<()>
+where
+    F: FnMut(&SectorId) -> Result<Vec<u8>>,
+{
     if target.exists() {
         bail!("restore target already exists: {}", target.display());
+    }
+    let parent = target.parent().context("restore target has no parent")?;
+    fs::create_dir_all(parent)?;
+    let staging = parent.join(format!(".mutualbackup-restore-{}", Uuid::new_v4()));
+    build_revision_restore(keys, guild_id, revision, &staging, &mut load_ciphertext)?;
+    publish_restore(&staging, target)
+}
+
+pub(crate) fn build_revision_restore<F>(
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+    staging: &Path,
+    load_ciphertext: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&SectorId) -> Result<Vec<u8>>,
+{
+    revision.verify(b"mutualbackup/user-revision/v1")?;
+    if revision.signer != keys.node_id()
+        || revision.value.owner != keys.node_id()
+        || revision.value.guild_id != guild_id
+        || revision.value.format_version != 1
+        || revision.value.cipher_profile != V1_CIPHER_PROFILE
+    {
+        bail!("revision does not belong to the recovering seed and guild");
     }
     let encryption_key = keys.guild_data_key(&guild_id);
     let mut metadata_bytes = Vec::new();
     for reference in &revision.value.metadata_sectors {
-        metadata_bytes.extend(decrypt_reference(&encryption_key, reference, ciphertexts)?);
+        metadata_bytes.extend(decrypt_reference(
+            &encryption_key,
+            reference,
+            load_ciphertext,
+        )?);
     }
     let metadata: PrivateMetadata = decode_canonical(&metadata_bytes)?;
     if metadata.format_version != 1 {
         bail!("unsupported private metadata version");
     }
 
-    let parent = target.parent().context("restore target has no parent")?;
-    fs::create_dir_all(parent)?;
-    let staging = parent.join(format!(".mutualbackup-restore-{}", Uuid::new_v4()));
-    create_private_dir(&staging)?;
-    let result = restore_entries(&staging, &metadata, &encryption_key, ciphertexts);
+    create_private_dir(staging)?;
+    let result = restore_entries(staging, &metadata, &encryption_key, load_ciphertext);
     if let Err(error) = result {
-        let _ = fs::remove_dir_all(&staging);
+        let _ = fs::remove_dir_all(staging);
         return Err(error);
     }
-    sync_tree_bottom_up(&staging)?;
-    rename_no_replace(&staging, target)?;
+    sync_tree_bottom_up(staging)?;
+    Ok(())
+}
+
+pub(crate) fn publish_restore(staging: &Path, target: &Path) -> Result<()> {
+    let parent = target.parent().context("restore target has no parent")?;
+    rename_no_replace(staging, target)?;
     sync_directory(parent)?;
     Ok(())
 }
 
-fn restore_entries(
+#[cfg(unix)]
+pub(crate) fn native_directory_id(path: &Path) -> Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("restore object is not a directory");
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn native_directory_id(_path: &Path) -> Result<(u64, u64)> {
+    bail!("native restore identity is not implemented on this platform")
+}
+
+fn restore_entries<F>(
     staging: &Path,
     metadata: &PrivateMetadata,
     encryption_key: &[u8; 32],
-    ciphertexts: &BTreeMap<SectorId, Vec<u8>>,
-) -> Result<()> {
+    load_ciphertext: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&SectorId) -> Result<Vec<u8>>,
+{
     let mut directory_metadata = Vec::new();
     for entry in &metadata.entries {
         match entry {
@@ -356,7 +440,7 @@ fn restore_entries(
                     .open(&destination)?;
                 let mut written = 0_u64;
                 for reference in sectors {
-                    let plaintext = decrypt_reference(encryption_key, reference, ciphertexts)?;
+                    let plaintext = decrypt_reference(encryption_key, reference, load_ciphertext)?;
                     file.write_all(&plaintext)?;
                     written += plaintext.len() as u64;
                 }
@@ -381,15 +465,15 @@ fn restore_entries(
     Ok(())
 }
 
-fn decrypt_reference(
+fn decrypt_reference<F>(
     encryption_key: &[u8; 32],
     reference: &SectorRef,
-    ciphertexts: &BTreeMap<SectorId, Vec<u8>>,
-) -> Result<Vec<u8>> {
-    let mut bytes = ciphertexts
-        .get(&reference.id)
-        .with_context(|| format!("missing recovered sector {}", hex_id(&reference.id)))?
-        .clone();
+    load_ciphertext: &mut F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(&SectorId) -> Result<Vec<u8>>,
+{
+    let mut bytes = load_ciphertext(&reference.id)?;
     if bytes.len() != V1_SECTOR_SIZE || sector_root(&bytes) != reference.root {
         bail!("recovered sector failed its signed root");
     }

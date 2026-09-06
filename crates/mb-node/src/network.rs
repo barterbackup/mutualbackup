@@ -21,9 +21,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::{Node, RecoveredShards, restore_revision};
+use crate::Node;
 
-const MAX_PEER_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const CHECKPOINT_PAGE_BYTES: usize = 512 * 1024;
+const MAX_CHECKPOINT_PAGES: u32 = 512;
+const MAX_PEER_FRAME_BYTES: usize = 600 * 1024;
 const MAX_DIRECTORY_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DIRECTORY_RECORD_BYTES: usize = 64 * 1024;
 const MAX_DIRECTORY_SUBJECTS: usize = 100_000;
@@ -74,15 +76,27 @@ enum PeerRequest {
         group_id: [u8; 32],
         shard_index: u8,
     },
-    SignCheckpoint {
-        checkpoint: GuildCheckpoint,
-    },
-    StoreCheckpoint {
-        checkpoint: QuorumCheckpoint,
-    },
-    GetCheckpoint {
+    PutCheckpointPage {
+        object_kind: CheckpointObjectKind,
         guild_id: [u8; 32],
-        hash: [u8; 32],
+        checkpoint_hash: [u8; 32],
+        page_index: u32,
+        total_pages: u32,
+        page_hash: [u8; 32],
+        bytes: Vec<u8>,
+    },
+    SignCheckpoint {
+        guild_id: [u8; 32],
+        checkpoint_hash: [u8; 32],
+    },
+    FinalizeCheckpoint {
+        guild_id: [u8; 32],
+        checkpoint_hash: [u8; 32],
+    },
+    GetCheckpointPage {
+        guild_id: [u8; 32],
+        checkpoint_hash: [u8; 32],
+        page_index: u32,
     },
     BuildRecoveryRecord {
         subject: Member,
@@ -93,18 +107,34 @@ enum PeerRequest {
     },
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+enum CheckpointObjectKind {
+    Body,
+    Certificate,
+}
+
+impl CheckpointObjectKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Body => "body",
+            Self::Certificate => "certificate",
+        }
+    }
+}
+
 impl PeerRequest {
     fn mutation_kind(&self) -> Option<&'static str> {
         match self {
             Self::Profile
             | Self::GetSector { .. }
             | Self::GetParity { .. }
-            | Self::GetCheckpoint { .. } => None,
+            | Self::GetCheckpointPage { .. } => None,
             Self::PrepareSource { .. } => Some("prepare-source"),
             Self::EnsureFiller { .. } => Some("ensure-filler"),
             Self::PublishParity { .. } => Some("publish-parity"),
+            Self::PutCheckpointPage { .. } => Some("put-checkpoint-page"),
             Self::SignCheckpoint { .. } => Some("sign-checkpoint"),
-            Self::StoreCheckpoint { .. } => Some("store-checkpoint"),
+            Self::FinalizeCheckpoint { .. } => Some("finalize-checkpoint"),
             Self::BuildRecoveryRecord { .. } => Some("build-recovery-record"),
         }
     }
@@ -116,11 +146,12 @@ impl PeerRequest {
             | Self::EnsureFiller { guild_id, .. }
             | Self::GetSector { guild_id, .. }
             | Self::GetParity { guild_id, .. }
-            | Self::GetCheckpoint { guild_id, .. }
+            | Self::PutCheckpointPage { guild_id, .. }
+            | Self::SignCheckpoint { guild_id, .. }
+            | Self::FinalizeCheckpoint { guild_id, .. }
+            | Self::GetCheckpointPage { guild_id, .. }
             | Self::BuildRecoveryRecord { guild_id, .. } => Some(*guild_id),
             Self::PublishParity { object } => Some(object.guild_id),
-            Self::SignCheckpoint { checkpoint } => Some(checkpoint.guild_id),
-            Self::StoreCheckpoint { checkpoint } => Some(checkpoint.checkpoint.guild_id),
         }
     }
 }
@@ -147,7 +178,11 @@ enum PeerResponse {
     },
     Bytes(Vec<u8>),
     CheckpointSignature(MemberSignature),
-    Checkpoint(QuorumCheckpoint),
+    CheckpointPage {
+        total_pages: u32,
+        page_hash: [u8; 32],
+        bytes: Vec<u8>,
+    },
     RecoveryRecord(SignedRecord<PublishedRecoveryRecord>),
     Ack,
 }
@@ -505,19 +540,51 @@ fn execute_peer_request(
             &group_id,
             shard_index,
         )?)),
-        PeerRequest::SignCheckpoint { checkpoint } => Ok(PeerResponse::CheckpointSignature(
-            node.sign_checkpoint(&checkpoint)?,
-        )),
-        PeerRequest::StoreCheckpoint { checkpoint } => {
-            node.store_checkpoint(&checkpoint)?;
+        PeerRequest::PutCheckpointPage {
+            object_kind,
+            guild_id,
+            checkpoint_hash,
+            page_index,
+            total_pages,
+            page_hash,
+            bytes,
+        } => {
+            node.stage_checkpoint_page(
+                object_kind.as_str(),
+                &guild_id,
+                &checkpoint_hash,
+                page_index,
+                total_pages,
+                &page_hash,
+                &bytes,
+            )?;
             Ok(PeerResponse::Ack)
         }
-        PeerRequest::GetCheckpoint { guild_id, hash } => {
-            let checkpoint = node.checkpoint(&hash)?;
-            if checkpoint.checkpoint.guild_id != guild_id {
-                bail!("checkpoint does not belong to the requested guild");
-            }
-            Ok(PeerResponse::Checkpoint(checkpoint))
+        PeerRequest::SignCheckpoint {
+            guild_id,
+            checkpoint_hash,
+        } => Ok(PeerResponse::CheckpointSignature(
+            node.sign_staged_checkpoint(&guild_id, &checkpoint_hash)?,
+        )),
+        PeerRequest::FinalizeCheckpoint {
+            guild_id,
+            checkpoint_hash,
+        } => {
+            node.finalize_staged_checkpoint(&guild_id, &checkpoint_hash)?;
+            Ok(PeerResponse::Ack)
+        }
+        PeerRequest::GetCheckpointPage {
+            guild_id,
+            checkpoint_hash,
+            page_index,
+        } => {
+            let (total_pages, bytes) =
+                node.checkpoint_page(&guild_id, &checkpoint_hash, page_index)?;
+            Ok(PeerResponse::CheckpointPage {
+                total_pages,
+                page_hash: *blake3::hash(&bytes).as_bytes(),
+                bytes,
+            })
         }
         PeerRequest::BuildRecoveryRecord {
             subject,
@@ -784,6 +851,19 @@ pub async fn commit_source_over_network(
         coding_groups: groups,
     };
     checkpoint_body.validate()?;
+    let checkpoint_hash = checkpoint_body.hash()?;
+    let checkpoint_body_bytes = canonical_bytes(&checkpoint_body)?;
+    for peer in &peers {
+        publish_checkpoint_pages(
+            peer,
+            coordinator_keys,
+            CheckpointObjectKind::Body,
+            guild_id,
+            checkpoint_hash,
+            &checkpoint_body_bytes,
+        )
+        .await?;
+    }
     let mut signatures = Vec::new();
     for peer in &peers {
         let response = peer_call_expected(
@@ -791,7 +871,8 @@ pub async fn commit_source_over_network(
             peer.profile.member.node_id,
             coordinator_keys,
             PeerRequest::SignCheckpoint {
-                checkpoint: checkpoint_body.clone(),
+                guild_id,
+                checkpoint_hash,
             },
         )
         .await?;
@@ -806,15 +887,28 @@ pub async fn commit_source_over_network(
         signatures,
     };
     checkpoint.verify()?;
-    let checkpoint_hash = checkpoint.hash()?;
+    if checkpoint.hash()? != checkpoint_hash {
+        bail!("quorum certificate changed the checkpoint state identity");
+    }
+    let certificate_bytes = canonical_bytes(&checkpoint)?;
     for peer in &peers {
+        publish_checkpoint_pages(
+            peer,
+            coordinator_keys,
+            CheckpointObjectKind::Certificate,
+            guild_id,
+            checkpoint_hash,
+            &certificate_bytes,
+        )
+        .await?;
         expect_ack(
             peer_call_expected(
                 peer.endpoint,
                 peer.profile.member.node_id,
                 coordinator_keys,
-                PeerRequest::StoreCheckpoint {
-                    checkpoint: checkpoint.clone(),
+                PeerRequest::FinalizeCheckpoint {
+                    guild_id,
+                    checkpoint_hash,
                 },
             )
             .await?,
@@ -901,18 +995,16 @@ pub async fn recover_over_network(
         else {
             continue;
         };
-        let response = match peer_call_expected(
+        let response = match fetch_checkpoint(
             endpoint,
             signed.value.publisher,
             recovered_node.keys(),
-            PeerRequest::GetCheckpoint {
-                guild_id: signed.value.guild_id,
-                hash: signed.value.checkpoint_hash,
-            },
+            signed.value.guild_id,
+            signed.value.checkpoint_hash,
         )
         .await
         {
-            Ok(PeerResponse::Checkpoint(checkpoint)) => checkpoint,
+            Ok(checkpoint) => checkpoint,
             _ => continue,
         };
         if response
@@ -939,14 +1031,8 @@ pub async fn recover_over_network(
         .filter(|(candidate, _, _)| candidate.hash().ok() == Some(checkpoint_hash))
         .map(|(_, publisher, endpoint)| (publisher, endpoint))
         .collect::<BTreeMap<_, _>>();
-    let recovered_shards = recover_network_local_shards(
-        local_node_id,
-        recovered_node.keys(),
-        &checkpoint,
-        &peer_endpoints,
-    )
-    .await?;
-    recovered_node.install_recovered_checkpoint(&checkpoint, &recovered_shards)?;
+    recover_network_local_shards(&mut recovered_node, &checkpoint, &peer_endpoints).await?;
+    recovered_node.install_recovered_checkpoint(&checkpoint)?;
     let revision = checkpoint
         .checkpoint
         .revisions
@@ -954,12 +1040,10 @@ pub async fn recover_over_network(
         .filter(|revision| revision.value.owner == local_node_id)
         .max_by_key(|revision| revision.value.sequence);
     if let Some(revision) = revision {
-        let ciphertexts = local_revision_ciphertexts(revision, &checkpoint, &recovered_shards)?;
-        restore_revision(
-            recovered_node.keys(),
+        recovered_node.restore_recovered_revision(
+            &checkpoint_hash,
             checkpoint.checkpoint.guild_id,
             revision,
-            &ciphertexts,
             restore_target,
         )?;
     }
@@ -967,12 +1051,12 @@ pub async fn recover_over_network(
 }
 
 async fn recover_network_local_shards(
-    recovering: NodeId,
-    keys: &KeyMaterial,
+    recovered_node: &mut Node,
     checkpoint: &QuorumCheckpoint,
     peer_endpoints: &BTreeMap<NodeId, SocketAddr>,
-) -> Result<RecoveredShards> {
-    let mut recovered = BTreeMap::new();
+) -> Result<()> {
+    let recovering = recovered_node.keys().node_id();
+    let checkpoint_hash = checkpoint.hash()?;
     let mut unhealthy = BTreeSet::new();
     for group in &checkpoint.checkpoint.coding_groups {
         let target = group
@@ -1022,12 +1106,21 @@ async fn recover_network_local_shards(
             if unhealthy.contains(&holder) {
                 continue;
             }
+            let signed_request = make_peer_request(recovered_node.keys(), Some(holder), request)?;
             attempts.push(async move {
                 (
                     holder,
                     index,
                     root,
-                    peer_call_expected(*endpoint, holder, keys, request).await,
+                    async {
+                        let (signer, response) =
+                            send_peer_request(*endpoint, recovering, &signed_request).await?;
+                        if signer != holder {
+                            bail!("peer response was signed by an unexpected identity");
+                        }
+                        Ok(response)
+                    }
+                    .await,
                 )
             });
         }
@@ -1056,40 +1149,16 @@ async fn recover_network_local_shards(
         if sector_root(&bytes) != target_root {
             bail!("reconstructed local shard failed its signed root");
         }
-        recovered.insert((group.id, target_index as u8), bytes);
+        drop(attempts);
+        recovered_node.stage_recovered_shard(
+            &checkpoint_hash,
+            &checkpoint.checkpoint.guild_id,
+            group,
+            target_index as u8,
+            &bytes,
+        )?;
     }
-    Ok(recovered)
-}
-
-fn local_revision_ciphertexts(
-    revision: &SignedRecord<UserRevision>,
-    checkpoint: &QuorumCheckpoint,
-    recovered_shards: &RecoveredShards,
-) -> Result<BTreeMap<SectorId, Vec<u8>>> {
-    let wanted = revision
-        .value
-        .metadata_sectors
-        .iter()
-        .chain(&revision.value.data_sectors)
-        .map(|reference| reference.id)
-        .collect::<BTreeSet<_>>();
-    let mut ciphertexts = BTreeMap::new();
-    for group in &checkpoint.checkpoint.coding_groups {
-        for (index, role) in group.roles.iter().enumerate() {
-            if let ShardRole::Information(information) = role
-                && wanted.contains(&information.sector.id)
-            {
-                let bytes = recovered_shards
-                    .get(&(group.id, index as u8))
-                    .context("missing recovered revision shard")?;
-                ciphertexts.insert(information.sector.id, bytes.clone());
-            }
-        }
-    }
-    if ciphertexts.len() != wanted.len() {
-        bail!("not all revision sectors were recovered");
-    }
-    Ok(ciphertexts)
+    Ok(())
 }
 
 async fn request_filler(
@@ -1119,13 +1188,99 @@ async fn request_filler(
     Ok((reference, bytes))
 }
 
+async fn publish_checkpoint_pages(
+    peer: &RemotePeer,
+    keys: &KeyMaterial,
+    object_kind: CheckpointObjectKind,
+    guild_id: [u8; 32],
+    checkpoint_hash: [u8; 32],
+    bytes: &[u8],
+) -> Result<()> {
+    let total_pages = bytes.len().div_ceil(CHECKPOINT_PAGE_BYTES);
+    if total_pages == 0 || total_pages > MAX_CHECKPOINT_PAGES as usize {
+        bail!("checkpoint object exceeds the paged protocol limit");
+    }
+    for (page_index, page) in bytes.chunks(CHECKPOINT_PAGE_BYTES).enumerate() {
+        expect_ack(
+            peer_call_expected(
+                peer.endpoint,
+                peer.profile.member.node_id,
+                keys,
+                PeerRequest::PutCheckpointPage {
+                    object_kind,
+                    guild_id,
+                    checkpoint_hash,
+                    page_index: page_index as u32,
+                    total_pages: total_pages as u32,
+                    page_hash: *blake3::hash(page).as_bytes(),
+                    bytes: page.to_vec(),
+                },
+            )
+            .await?,
+        )?;
+    }
+    Ok(())
+}
+
+async fn fetch_checkpoint(
+    endpoint: SocketAddr,
+    publisher: NodeId,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    checkpoint_hash: [u8; 32],
+) -> Result<QuorumCheckpoint> {
+    let mut assembled = Vec::new();
+    let mut expected_total = None;
+    for page_index in 0..MAX_CHECKPOINT_PAGES {
+        let response = peer_call_expected(
+            endpoint,
+            publisher,
+            keys,
+            PeerRequest::GetCheckpointPage {
+                guild_id,
+                checkpoint_hash,
+                page_index,
+            },
+        )
+        .await?;
+        let PeerResponse::CheckpointPage {
+            total_pages,
+            page_hash,
+            bytes,
+        } = response
+        else {
+            bail!("peer returned the wrong checkpoint-page response");
+        };
+        if total_pages == 0
+            || total_pages > MAX_CHECKPOINT_PAGES
+            || expected_total.is_some_and(|expected| expected != total_pages)
+            || page_index >= total_pages
+            || bytes.is_empty()
+            || bytes.len() > CHECKPOINT_PAGE_BYTES
+            || blake3::hash(&bytes).as_bytes() != &page_hash
+        {
+            bail!("peer returned an invalid checkpoint page");
+        }
+        expected_total = Some(total_pages);
+        assembled.extend_from_slice(&bytes);
+        if page_index + 1 == total_pages {
+            let checkpoint: QuorumCheckpoint = decode_canonical(&assembled)?;
+            if checkpoint.hash()? != checkpoint_hash || checkpoint.checkpoint.guild_id != guild_id {
+                bail!("paged checkpoint has the wrong state identity");
+            }
+            return Ok(checkpoint);
+        }
+    }
+    bail!("checkpoint page count exceeds the protocol limit")
+}
+
 async fn peer_call(
     endpoint: SocketAddr,
     keys: &KeyMaterial,
     request: PeerRequest,
 ) -> Result<(NodeId, PeerResponse)> {
     let signed_request = make_peer_request(keys, None, request)?;
-    send_peer_request(endpoint, keys, &signed_request).await
+    send_peer_request(endpoint, keys.node_id(), &signed_request).await
 }
 
 fn make_peer_request(
@@ -1161,7 +1316,7 @@ fn make_peer_request(
 
 async fn send_peer_request(
     endpoint: SocketAddr,
-    keys: &KeyMaterial,
+    response_recipient: NodeId,
     signed_request: &SignedRecord<PeerRequestEnvelope>,
 ) -> Result<(NodeId, PeerResponse)> {
     let request_hash = *blake3::hash(&canonical_bytes(&signed_request.value)?).as_bytes();
@@ -1174,7 +1329,7 @@ async fn send_peer_request(
         response.verify(PEER_RESPONSE_DOMAIN)?;
         if response.value.format_version != 1
             || response.value.request_id != request_id
-            || response.value.recipient != keys.node_id()
+            || response.value.recipient != response_recipient
             || response.value.request_hash != request_hash
         {
             bail!("peer response context mismatch");
@@ -1196,7 +1351,7 @@ async fn peer_call_expected(
     let signed_request = make_peer_request(keys, Some(expected_signer), request)?;
     let mut last_error = None;
     for _ in 0..2 {
-        match send_peer_request(endpoint, keys, &signed_request).await {
+        match send_peer_request(endpoint, keys.node_id(), &signed_request).await {
             Ok((signer, response)) if signer == expected_signer => return Ok(response),
             Ok(_) => last_error = Some(anyhow::anyhow!("unexpected peer response identity")),
             Err(error) => last_error = Some(error),
@@ -1484,6 +1639,19 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(recovered.keys().node_id(), coordinator_keys.node_id());
+        assert_eq!(
+            fs::read(restored.join("payload")).unwrap(),
+            vec![0x5a; 150_000]
+        );
+        drop(recovered);
+        let recovered = recover_over_network(
+            Seed::from_bytes([100; 32]),
+            &root.join("recovered-node"),
+            &restored,
+            directory_address,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             fs::read(restored.join("payload")).unwrap(),
             vec![0x5a; 150_000]
