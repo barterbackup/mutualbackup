@@ -1,89 +1,75 @@
 # MutualBackup prototype
 
-This repository contains the first runnable vertical slice of the design in
-[`plan.md`](plan.md). It protects a directory with reflink snapshots, encrypts
-the owner's fixed-size sectors, forms real Reed–Solomon `3+2` coding groups
-across five independent identities and failure domains, stores control/parity
-state in HMAC-protected SQLCipher databases, and recovers a lost node from its
-offline seed.
+This repository contains the first usable vertical slice of the design in
+[`plan.md`](plan.md). Five persistent daemons form a static guild, capture
+reflink snapshots, encrypt owner sectors, build real Reed–Solomon `3+2`
+codewords, store parity in HMAC-protected SQLCipher databases, publish recovery
+state through Kademlia, and recover a lost member from its offline seed.
 
-The prototype is deliberately narrow. It currently supports Linux reflinks and
-signed direct TCP on a trusted network. The recovery directory is an in-memory
-stand-in for the future DHT. QUIC, NAT traversal, guild relays, Arti onion
-fallback, link-freeze, writer-incarnation fencing, membership changes, audits,
-repair, and garbage collection remain later slices. Direct TCP authenticates
-protocol messages but does not encrypt the transport; owner data and private
-metadata are encrypted before they leave the owner.
+Peer traffic uses authenticated QUIC with Identify, circuit relay v2,
+AutoNAT/DCUtR hole punching, and one seed-derived identity. Tor/Arti is
+deliberately outside this milestone, as are non-reflink source backends,
+membership changes, audits, repair, and garbage collection. Do not entrust
+unique data to this prototype.
 
-Do not entrust unique data to this prototype.
+## Programs
 
-## Fast hand test
+- `mutualbackupd --config NODE.toml` owns one node's databases, source anchors,
+  peer network, DHT publication, watcher, and durable jobs.
+- `mutualbackup` is the local control and offline bootstrap CLI. Run
+  `mutualbackup --help` and its subcommand help for the complete interface.
 
-On an x86-64 Linux system with Btrfs, XFS, or another filesystem that passes
-the full reflink COW probe:
+A new node starts with `mutualbackup init --seed-file SEED --config NODE.toml
+--data-dir DATA --failure-domain LABEL`. Keep the generated seed offline: a
+fresh recovery-mode daemon can be initialized with `mutualbackup recover-init`
+using only that seed and generic bootstrap multiaddresses.
 
-```sh
-./dist/mutualbackup-x86_64-linux reflink-probe /path/on/reflink/filesystem
-./scripts/network-smoke.sh \
-  ./dist/mutualbackup-x86_64-linux \
-  /path/on/reflink/filesystem
-```
-
-The smoke test starts a recovery directory and five complete node processes,
-each with its own seed, identity, SQLCipher databases, failure domain, and
-protocol endpoint. It commits a small sparse source tree, stops the owner and
-one helper, deletes those two node directories and the plaintext source, and
-recovers into a clean directory using only the separately held owner seed. It
-then compares every restored file hash. All test material is placed in a new
-`mutualbackup-network-smoke.*` directory and is left there for inspection.
-
-## Commands
+Routine operations go through the daemon:
 
 ```text
-mutualbackup init --seed-file PATH
-mutualbackup identity --seed-file PATH
-mutualbackup reflink-probe PATH
-mutualbackup serve-directory --listen IP:PORT
-mutualbackup serve-node --seed-file PATH --data-dir PATH \
-  --listen IP:PORT --public-endpoint tcp://IP:PORT \
-  --failure-domain LABEL --trusted-coordinator NODE_ID
-mutualbackup commit --seed-file PATH --source PATH --directory IP:PORT \
-  --peer IP:PORT --peer IP:PORT --peer IP:PORT --peer IP:PORT --peer IP:PORT
-mutualbackup recover --seed-file PATH --data-dir NEW_PATH \
-  --restore NEW_PATH --directory IP:PORT
+mutualbackup status
+mutualbackup root add PATH
+mutualbackup guild create|invite|join|finalize|status
+mutualbackup backup --wait
+mutualbackup snapshot list
+mutualbackup snapshot restore TARGET [--revision UUID]
+mutualbackup restore TARGET
 ```
 
-`init` creates the seed file exclusively with mode `0600` and refuses to
-overwrite it. Keep an offline copy: recovery intentionally does not need the
-old `data-dir`, source tree, anchors, guild ID, checkpoint hash, or peer list.
-The current fixed network profile requires exactly five distinct peer
-identities and five distinct failure-domain labels. The coordinator must be one
-of those peers and must be the owner of the protected source.
+The CLI and daemon use a same-user Unix control socket. Pass `--socket` when a
+configuration does not use the default location below `XDG_RUNTIME_DIR`.
 
-`demo-seed-recovery --work-dir PATH` is a shorter, single-process version of
-the same destructive-loss demonstration. It creates and deletes data only
-inside a uniquely named demonstration directory.
-
-## Build and test
+## Build and acceptance
 
 The pinned Nix development shell supplies Rust and the native build tools for
 the bundled SQLCipher/OpenSSL build:
 
 ```sh
-nix develop -c cargo test --workspace --all-targets
+nix develop -c cargo test --workspace
 nix build
 ```
 
-`nix build` produces a statically linked Linux binary at
-`result/bin/mutualbackup`. The prebuilt file under `dist/` is produced by this
-same expression.
+The destructive acceptance tests need a disposable directory on a filesystem
+that supports reflinks. They start real daemons and use real QUIC, relay,
+Kademlia, SQLCipher, process restarts, and seed-only recovery:
 
-Set `MUTUALBACKUP_REFLINK_TEST_ROOT` to a disposable reflink-capable directory,
-then run `bash scripts/reflink-acceptance.sh` for the required reflink and
-end-to-end network loss/recovery coverage. The ordinary workspace test command
-intentionally leaves these destructive tests ignored.
+```sh
+MUTUALBACKUP_REFLINK_TEST_ROOT=/mnt/disposable-btrfs \
+  nix develop -c bash scripts/reflink-acceptance.sh
+```
 
-The SQLCipher tests verify an encrypted header, reject a wrong key through page
-HMAC failure, run `cipher_integrity_check`, and reject parity whose committed
-root no longer matches. The coding tests reconstruct from every possible pair
-of missing shards.
+For only the five-daemon product acceptance scenario:
+
+```sh
+nix develop -c bash scripts/network-smoke.sh /mnt/disposable-btrfs
+```
+
+The product test creates three checkpoint generations for two owners, kills
+and restarts the coordinator during work, restarts every daemon, then destroys
+one owner's complete local state plus another peer. A fresh daemon derives the
+same identity from the offline seed, discovers recovery records from a generic
+bootstrap peer, restores the latest 4 MiB file byte-for-byte, and republishes a
+new reachable endpoint.
+
+The SQLCipher tests verify encrypted pages and HMAC rejection with a wrong key.
+Coding tests reconstruct every supported pair of missing shards.
