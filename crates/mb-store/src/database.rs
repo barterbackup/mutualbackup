@@ -219,6 +219,13 @@ impl ControlStore {
         Ok(result)
     }
 
+    pub fn clear_recomputable_operations(&mut self) -> Result<(), DatabaseError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM operations WHERE kind = 'ensure-filler'", [])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn locked_checkpoint(
         &self,
         guild_id: &[u8; 32],
@@ -607,6 +614,15 @@ impl ControlStore {
                     && stored_hash == *checkpoint_hash
                     && stored_bytes == checkpoint_certificate_bytes =>
             {
+                if !require_signature_lock {
+                    upsert_checkpoint_signature_lock(
+                        &transaction,
+                        guild_id,
+                        generation_i64,
+                        checkpoint_hash,
+                        checkpoint_body_bytes,
+                    )?;
+                }
                 transaction.commit()?;
                 return Ok(());
             }
@@ -615,6 +631,7 @@ impl ControlStore {
                     && parent == Some(&stored_hash) => {}
             Some(_) => return Err(DatabaseError::Conflict),
             None if generation == 1 && parent.is_none() => {}
+            None if !require_signature_lock => {}
             None => return Err(DatabaseError::Conflict),
         }
         transaction.execute(
@@ -638,6 +655,15 @@ impl ControlStore {
                 checkpoint_certificate_bytes,
             ],
         )?;
+        if !require_signature_lock {
+            upsert_checkpoint_signature_lock(
+                &transaction,
+                guild_id,
+                generation_i64,
+                checkpoint_hash,
+                checkpoint_body_bytes,
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -645,6 +671,31 @@ impl ControlStore {
     pub fn cipher_integrity_check(&self) -> Result<(), DatabaseError> {
         cipher_integrity_check(&self.connection)
     }
+}
+
+fn upsert_checkpoint_signature_lock(
+    transaction: &rusqlite::Transaction<'_>,
+    guild_id: &[u8; 32],
+    generation: i64,
+    checkpoint_hash: &[u8; 32],
+    checkpoint_body_bytes: &[u8],
+) -> Result<(), rusqlite::Error> {
+    transaction.execute(
+        "INSERT INTO checkpoint_signature_locks(
+            guild_id, generation, checkpoint_hash, checkpoint_bytes
+         ) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(guild_id) DO UPDATE SET
+            generation = excluded.generation,
+            checkpoint_hash = excluded.checkpoint_hash,
+            checkpoint_bytes = excluded.checkpoint_bytes",
+        params![
+            guild_id.as_slice(),
+            generation,
+            checkpoint_hash.as_slice(),
+            checkpoint_body_bytes,
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1527,6 +1578,35 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_filler_responses_are_removed_from_old_journals() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([4; 32]));
+        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let operation = [5; 16];
+        let caller = [6; 32];
+        let request = [7; 32];
+        store
+            .begin_operation(&operation, "ensure-filler", &caller, &request)
+            .unwrap();
+        store
+            .put_operation_result(
+                &operation,
+                "ensure-filler",
+                &caller,
+                &request,
+                &vec![8; V1_SECTOR_SIZE],
+            )
+            .unwrap();
+        store.clear_recomputable_operations().unwrap();
+        assert_eq!(
+            store
+                .begin_operation(&operation, "ensure-filler", &caller, &request)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn checkpoint_child_waits_for_parent_finalization() {
         let temp = tempdir().unwrap();
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([13; 32]));
@@ -1560,6 +1640,39 @@ mod tests {
             .unwrap();
         store
             .lock_checkpoint_signature(&guild_id, 2, Some(&first_hash), &second_hash, b"body-2")
+            .unwrap();
+    }
+
+    #[test]
+    fn recovered_checkpoint_restores_its_exact_signature_lock() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([12; 32]));
+        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let guild_id = [4; 32];
+        let checkpoint_hash = [5; 32];
+        store
+            .commit_checkpoint(
+                &guild_id,
+                7,
+                Some(&[6; 32]),
+                &checkpoint_hash,
+                b"authenticated-body",
+                b"authenticated-certificate",
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            store.locked_checkpoint(&guild_id).unwrap().unwrap(),
+            (7, checkpoint_hash, b"authenticated-body".to_vec())
+        );
+        store
+            .lock_checkpoint_signature(
+                &guild_id,
+                7,
+                Some(&[6; 32]),
+                &checkpoint_hash,
+                b"authenticated-body",
+            )
             .unwrap();
     }
 

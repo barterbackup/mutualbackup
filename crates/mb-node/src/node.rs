@@ -129,9 +129,19 @@ impl NodeReader {
 
     pub(crate) fn prepared_revision_page(
         &self,
+        guild_id: &[u8; 32],
         revision_id: Uuid,
         page_index: u32,
     ) -> Result<(u32, Vec<u8>)> {
+        let bytes = self
+            .control
+            .get_record("user-revision", revision_id.as_bytes())?
+            .context("prepared revision is unavailable")?;
+        let revision: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
+        revision.verify(b"mutualbackup/user-revision/v1")?;
+        if revision.value.guild_id != *guild_id || revision.value.revision_id != revision_id {
+            anyhow::bail!("prepared revision does not belong to the authorized guild");
+        }
         Ok(self.control.protocol_record_page(
             "user-revision",
             revision_id.as_bytes(),
@@ -149,7 +159,8 @@ impl Node {
         let keys = Arc::new(KeyMaterial::from_seed(&seed));
         let mut volume_id = [0_u8; 16];
         volume_id.copy_from_slice(&blake3::hash(&keys.node_id().0).as_bytes()[..16]);
-        let control = ControlStore::open(data_dir.join("control.db"), &keys)?;
+        let mut control = ControlStore::open(data_dir.join("control.db"), &keys)?;
+        control.clear_recomputable_operations()?;
         reconcile_pending_captures(&control)?;
         let parity = ParityStore::open(data_dir.join("parity.db"), &volume_id, &keys)?;
         Ok(Self {
@@ -497,6 +508,7 @@ impl Node {
         if let Ok(existing) = self.checkpoint(checkpoint_hash)
             && existing.checkpoint.guild_id == *guild_id
         {
+            self.control.clear_checkpoint_pages(checkpoint_hash)?;
             return Ok(*checkpoint_hash);
         }
         let bytes =
@@ -1078,6 +1090,48 @@ mod tests {
         node.configure_failure_domain("host-a").unwrap();
         node.configure_failure_domain("host-a").unwrap();
         assert!(node.configure_failure_domain("host-b").is_err());
+    }
+
+    #[test]
+    fn prepared_revision_pages_are_bound_to_the_requested_guild() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut node = Node::open(temp.path(), Seed::from_bytes([88; 32])).unwrap();
+        let guild_id = [87; 32];
+        let revision_id = Uuid::from_bytes([86; 16]);
+        let revision = SignedRecord::sign(
+            b"mutualbackup/user-revision/v1",
+            UserRevision {
+                format_version: 1,
+                guild_id,
+                cipher_profile: mb_core::V1_CIPHER_PROFILE,
+                revision_id,
+                owner: node.keys().node_id(),
+                sequence: 1,
+                parent: None,
+                metadata_sectors: Vec::new(),
+                data_sectors: Vec::new(),
+            },
+            node.keys(),
+        )
+        .unwrap();
+        node.control
+            .put_record(
+                "user-revision",
+                revision_id.as_bytes(),
+                &canonical_bytes(&revision).unwrap(),
+            )
+            .unwrap();
+        let reader = node.reader_config().open().unwrap();
+        assert!(
+            reader
+                .prepared_revision_page(&guild_id, revision_id, 0)
+                .is_ok()
+        );
+        assert!(
+            reader
+                .prepared_revision_page(&[85; 32], revision_id, 0)
+                .is_err()
+        );
     }
 
     #[test]

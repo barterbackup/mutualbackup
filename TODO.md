@@ -33,16 +33,6 @@ repair, GC, and multiple parity volumes remains intentionally omitted.
   recovered member durably publish a separately versioned current endpoint
   before treating it as an active recovery source.
 
-- [ ] **Allow a recovered node to reproduce its signature for its installed
-  checkpoint.** Recovery installs a checkpoint head without restoring a
-  signature lock (`crates/mb-node/src/node.rs:610-673`). The transition layer
-  accepts an identical generation/hash, but `lock_checkpoint_signature`
-  rejects that request when a head exists and no lock does
-  (`node.rs:494-495`; `crates/mb-store/src/database.rs:474-532`). Retrying the
-  original coordinator journal after a helper was seed-recovered therefore
-  wedges at `SignCheckpoint`. Recreate the exact matching lock/signature from
-  authenticated recovered state, without permitting a same-generation fork.
-
 - [ ] **Do not permanently blacklist a holder after one recovery read
   failure.** Normal peer mutations receive a bounded retry, but shard recovery
   calls `send_peer_request` only once and adds the holder to a recovery-wide
@@ -52,24 +42,6 @@ repair, GC, and multiple parity volumes remains intentionally omitted.
   remain, so one transient error makes a reconstructable group fail. Retry
   transient failures under a bounded budget and distinguish connectivity from
   authenticated corrupt data before opening a circuit for that holder.
-
-- [ ] **Do not cache deterministic filler payloads in the operation journal.**
-  Each `EnsureFiller` response contains a full 64 KiB shard
-  (`crates/mb-node/src/network.rs:818-825,1640-1664`), and generic mutation
-  caching serializes that response permanently into `operations`
-  (`network.rs:645-666`; `crates/mb-store/src/database.rs:105-184`). At the
-  supported 40,000-group limit, each of the two filler peers stores roughly
-  2.6 GiB of reproducible payload in `control.db`, defeating the payload-free
-  filler recipe. Cache only a compact descriptor and recompute the bytes on
-  replay, with a bounded operation-cache lifecycle.
-
-- [ ] **Retry staged-page cleanup after checkpoint finalization.** Checkpoint
-  storage and deletion of its staged body/certificate pages are separate
-  transactions (`crates/mb-node/src/node.rs:443-452`). If the process or delete
-  fails after the checkpoint commit, the retry's existing-checkpoint fast path
-  returns before cleanup (`node.rs:438-442`), permanently retaining as much as
-  about 64 MiB per node per interrupted finalization. Clear matching pages in
-  the idempotent path or commit/retire them as one recoverable transition.
 
 - [ ] **Protect global directory capacity from attacker-owned subjects.** A
   subject signature protects an honest subject's slots, but an attacker can
@@ -120,15 +92,6 @@ repair, GC, and multiple parity volumes remains intentionally omitted.
   as `+0.5s`, and multiple distinct old timestamps collapse to the same value.
   Produce the normalized signed `(seconds, nanoseconds)` pair with checked
   arithmetic and add boundary vectors around the Unix epoch.
-
-- [ ] **Bind prepared-revision page reads to the authorized guild.** The server
-  authorizes `GetPreparedRevisionPage` using the request's `guild_id`, but the
-  read handler discards that field and fetches solely by `revision_id`
-  (`crates/mb-node/src/network.rs:608-624,751-761`;
-  `crates/mb-node/src/node.rs:128-137`). A member authorized in guild A can
-  retrieve a known revision catalog belonging to guild B from a node in both.
-  Load and validate the signed revision's guild before returning any page, or
-  key persisted revisions by guild as well as revision ID.
 
 - [ ] **Do not expose checkpoint generation through the opaque rendezvous
   wrapper.** Guild ID and checkpoint hash are now sealed, but the public

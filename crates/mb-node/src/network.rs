@@ -649,6 +649,12 @@ fn process_peer_request(
             bail!("only the source node itself may manage its coordinator commit");
         }
         if let Some(kind) = mutation_kind {
+            if kind == "ensure-filler" {
+                // Filler bytes are deterministic and installation is
+                // idempotent. Recompute them instead of retaining a 64 KiB
+                // response for every coding group in the operation journal.
+                return execute_peer_request(&mut node_guard, config, request_id, request);
+            }
             if let Some(cached_bytes) =
                 node_guard.cached_operation(&request_id, kind, caller, &operation_hash)?
             {
@@ -755,11 +761,12 @@ fn execute_read_request(
             node.sector_for_guild(&guild_id, &sector_id)?,
         )),
         PeerRequest::GetPreparedRevisionPage {
+            guild_id,
             revision_id,
             page_index,
-            ..
         } => {
-            let (total_pages, bytes) = node.prepared_revision_page(revision_id, page_index)?;
+            let (total_pages, bytes) =
+                node.prepared_revision_page(&guild_id, revision_id, page_index)?;
             Ok(PeerResponse::PreparedRevisionPage {
                 total_pages,
                 page_hash: *blake3::hash(&bytes).as_bytes(),
