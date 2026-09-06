@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 hex.workspace = true
+libp2p.workspace = true
 mb-core = { path = "../../crates/mb-core" }
 mb-node = { path = "../../crates/mb-node" }
 mb-store = { path = "../../crates/mb-store" }

@@ -16,6 +16,16 @@ pub struct DaemonConfig {
     pub control_socket: PathBuf,
     pub failure_domain: String,
     pub parity_budget_bytes: u64,
+    #[serde(default = "default_p2p_listen_addresses")]
+    pub p2p_listen_addresses: Vec<String>,
+    #[serde(default)]
+    pub p2p_external_addresses: Vec<String>,
+    #[serde(default)]
+    pub p2p_bootstrap_addresses: Vec<String>,
+    #[serde(default)]
+    pub p2p_relay_addresses: Vec<String>,
+    #[serde(default)]
+    pub enable_relay_server: bool,
 }
 
 impl DaemonConfig {
@@ -29,11 +39,18 @@ impl DaemonConfig {
         if self.parity_budget_bytes == 0 {
             bail!("parity_budget_bytes must be greater than zero");
         }
+        if self.p2p_listen_addresses.is_empty() {
+            bail!("at least one p2p listen address is required");
+        }
         if self.data_dir == self.seed_file || self.control_socket == self.seed_file {
             bail!("daemon paths must be distinct");
         }
         Ok(())
     }
+}
+
+pub fn default_p2p_listen_addresses() -> Vec<String> {
+    vec!["/ip4/0.0.0.0/udp/0/quic-v1".to_owned()]
 }
 
 pub fn read_config(path: &Path) -> Result<DaemonConfig> {
@@ -136,6 +153,11 @@ mod tests {
                 control_socket: PathBuf::from("run/control.sock"),
                 failure_domain: "disk-a".into(),
                 parity_budget_bytes: 1024,
+                p2p_listen_addresses: default_p2p_listen_addresses(),
+                p2p_external_addresses: Vec::new(),
+                p2p_bootstrap_addresses: Vec::new(),
+                p2p_relay_addresses: Vec::new(),
+                enable_relay_server: false,
             },
         )
         .unwrap();

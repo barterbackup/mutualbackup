@@ -12,6 +12,7 @@ futures.workspace = true
 filetime.workspace = true
 fs2.workspace = true
 libc.workspace = true
+libp2p.workspace = true
 mb-core = { path = "../mb-core" }
 mb-store = { path = "../mb-store" }
 postcard.workspace = true

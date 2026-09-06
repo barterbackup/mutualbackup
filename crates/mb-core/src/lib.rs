@@ -1,7 +1,7 @@
 //! Deterministic protocol primitives for MutualBackup.
 //!
-//! This crate deliberately has no network, filesystem, clock, or database
-//! dependencies. The async runtime surrounds these synchronous state and
+//! This crate deliberately performs no network I/O, filesystem I/O, clock, or
+//! database work. The async runtime surrounds these synchronous state and
 //! cryptographic operations.
 
 mod coding;
@@ -15,7 +15,7 @@ pub use content::{
     ContentError, SectorPurpose, crypt_sector, encrypted_sector, make_sector_id,
     synthetic_filler_sector,
 };
-pub use keys::{KeyMaterial, NodeId, RecoveryPublicKey, Seed, SeedParseError};
+pub use keys::{KeyIdentityError, KeyMaterial, NodeId, RecoveryPublicKey, Seed, SeedParseError};
 pub use model::{
     CodingGroup, CodingGroupId, GuildCheckpoint, InformationRole, Member, MemberSignature,
     ModelError, ParityRole, QuorumCheckpoint, SectorId, SectorRef, ShardRole, SignedRecord,

@@ -26,6 +26,11 @@ use crate::{
     node::{NodeReader, NodeReaderConfig},
 };
 
+mod p2p;
+pub use p2p::{
+    DhtRecord, P2pClient, P2pConfig, P2pEventLoop, P2pPeerProfile, P2pStatus, build_p2p,
+};
+
 const MAX_PEER_FRAME_BYTES: usize = 600 * 1024;
 const MAX_DIRECTORY_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DIRECTORY_REQUEST_BYTES: usize = 72 * 1024;

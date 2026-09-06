@@ -34,6 +34,13 @@ impl FromStr for NodeId {
     }
 }
 
+impl NodeId {
+    pub fn libp2p_peer_id(&self) -> Result<libp2p_identity::PeerId, KeyIdentityError> {
+        let public = libp2p_identity::ed25519::PublicKey::try_from_bytes(&self.0)?;
+        Ok(libp2p_identity::PublicKey::from(public).to_peer_id())
+    }
+}
+
 /// Public key used to encrypt cold-recovery locators and key envelopes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RecoveryPublicKey(pub [u8; 32]);
@@ -114,6 +121,12 @@ pub enum SeedParseError {
     Checksum,
 }
 
+#[derive(Debug, Error)]
+pub enum KeyIdentityError {
+    #[error("invalid libp2p identity key: {0}")]
+    Libp2p(#[from] libp2p_identity::DecodingError),
+}
+
 /// Domain-separated keys deterministically recoverable from one seed.
 pub struct KeyMaterial {
     signing: SigningKey,
@@ -139,6 +152,11 @@ impl KeyMaterial {
 
     pub fn verifying_key(&self) -> VerifyingKey {
         self.signing.verifying_key()
+    }
+
+    pub fn libp2p_keypair(&self) -> libp2p_identity::Keypair {
+        libp2p_identity::Keypair::ed25519_from_bytes(self.signing.to_bytes())
+            .expect("an Ed25519 signing key is always a valid libp2p identity key")
     }
 
     pub fn recovery_public_key(&self) -> RecoveryPublicKey {
@@ -257,5 +275,10 @@ mod tests {
         assert_ne!(first.node_id().0, first.recovery_public_key().0);
         assert_eq!(first.onion_hostname(), second.onion_hostname());
         assert!(first.onion_hostname().ends_with(".onion"));
+        let libp2p_keypair = first.libp2p_keypair();
+        assert_eq!(
+            first.node_id().libp2p_peer_id().unwrap(),
+            libp2p_keypair.public().to_peer_id()
+        );
     }
 }

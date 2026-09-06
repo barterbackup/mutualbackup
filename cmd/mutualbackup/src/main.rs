@@ -13,7 +13,9 @@ use mb_node::{
     recover_member_and_republish_over_network, recover_over_network, serve_directory, serve_node,
 };
 use mb_store::probe_reflink;
-use mutualbackup::{DaemonConfig, read_seed, write_config, write_seed};
+use mutualbackup::{
+    DaemonConfig, default_p2p_listen_addresses, read_seed, write_config, write_seed,
+};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -42,6 +44,16 @@ enum Command {
         failure_domain: Option<String>,
         #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024_u64, requires = "config")]
         parity_budget_bytes: u64,
+        #[arg(long = "listen", requires = "config")]
+        p2p_listen_addresses: Vec<String>,
+        #[arg(long = "external-address", requires = "config")]
+        p2p_external_addresses: Vec<String>,
+        #[arg(long = "bootstrap", requires = "config")]
+        p2p_bootstrap_addresses: Vec<String>,
+        #[arg(long = "relay", requires = "config")]
+        p2p_relay_addresses: Vec<String>,
+        #[arg(long, requires = "config")]
+        enable_relay_server: bool,
     },
     /// Derive the public identity for an existing recovery seed.
     Identity {
@@ -157,6 +169,11 @@ async fn main() -> Result<()> {
             data_dir,
             failure_domain,
             parity_budget_bytes,
+            p2p_listen_addresses,
+            p2p_external_addresses,
+            p2p_bootstrap_addresses,
+            p2p_relay_addresses,
+            enable_relay_server,
         } => {
             let seed = Seed::generate();
             write_seed(&seed_file, &seed)?;
@@ -174,6 +191,15 @@ async fn main() -> Result<()> {
                     failure_domain: failure_domain
                         .context("--failure-domain is required when --config is used")?,
                     parity_budget_bytes,
+                    p2p_listen_addresses: if p2p_listen_addresses.is_empty() {
+                        default_p2p_listen_addresses()
+                    } else {
+                        p2p_listen_addresses
+                    },
+                    p2p_external_addresses,
+                    p2p_bootstrap_addresses,
+                    p2p_relay_addresses,
+                    enable_relay_server,
                 };
                 write_config(&config_path, &config)?;
                 println!("daemon config written to: {}", config_path.display());
