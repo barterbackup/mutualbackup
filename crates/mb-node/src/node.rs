@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -17,6 +17,7 @@ use crate::snapshot::{
 
 pub struct Node {
     data_dir: PathBuf,
+    _data_dir_lock: File,
     keys: KeyMaterial,
     control: ControlStore,
     parity: ParityStore,
@@ -27,6 +28,7 @@ impl Node {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(&data_dir)?;
         set_private_directory(&data_dir)?;
+        let data_dir_lock = open_data_dir_lock(&data_dir)?;
         let keys = KeyMaterial::from_seed(&seed);
         let mut volume_id = [0_u8; 16];
         volume_id.copy_from_slice(&blake3::hash(&keys.node_id().0).as_bytes()[..16]);
@@ -34,6 +36,7 @@ impl Node {
         let parity = ParityStore::open(data_dir.join("parity.db"), &volume_id, &keys)?;
         Ok(Self {
             data_dir,
+            _data_dir_lock: data_dir_lock,
             keys,
             control,
             parity,
@@ -362,6 +365,24 @@ impl Node {
     }
 }
 
+fn open_data_dir_lock(data_dir: &Path) -> Result<File> {
+    use fs2::FileExt;
+
+    let path = data_dir.join(".node.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    FileExt::try_lock_exclusive(&file).context("node data directory is already in use")?;
+    Ok(file)
+}
+
 #[cfg(unix)]
 fn set_private_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -372,4 +393,18 @@ fn set_private_directory(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn set_private_directory(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_directory_has_one_live_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = Node::open(temp.path(), Seed::from_bytes([91; 32])).unwrap();
+        assert!(Node::open(temp.path(), Seed::from_bytes([91; 32])).is_err());
+        drop(first);
+        Node::open(temp.path(), Seed::from_bytes([91; 32])).unwrap();
+    }
 }

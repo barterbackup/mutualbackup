@@ -9,7 +9,7 @@ use mb_core::{
     V1_SECTOR_SIZE, canonical_bytes, crypt_sector, decode_canonical, encrypted_sector,
     make_sector_id, sector_root,
 };
-use mb_store::{CapturedEntry, ControlStore, ReflinkAnchor};
+use mb_store::{AnchorFileLocator, CapturedEntry, ControlStore, ReflinkAnchor};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -18,6 +18,8 @@ pub enum PrivateEntry {
     Directory {
         path: String,
         mode: u32,
+        modified_secs: i64,
+        modified_nanos: u32,
     },
     File {
         path: String,
@@ -32,6 +34,9 @@ pub enum PrivateEntry {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PrivateMetadata {
     pub format_version: u16,
+    pub root_mode: u32,
+    pub root_modified_secs: i64,
+    pub root_modified_nanos: u32,
     pub entries: Vec<PrivateEntry>,
 }
 
@@ -44,7 +49,10 @@ pub(crate) struct LocalSectorRecipe {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum LocalPlaintextSource {
-    AnchorFile { path: PathBuf, offset: u64 },
+    AnchorFile {
+        locator: AnchorFileLocator,
+        offset: u64,
+    },
     Inline(Vec<u8>),
 }
 
@@ -65,10 +73,17 @@ pub(crate) fn prepare_revision(
 
     for entry in &anchor.entries {
         match entry {
-            CapturedEntry::Directory { path, mode } => {
+            CapturedEntry::Directory {
+                path,
+                mode,
+                modified_secs,
+                modified_nanos,
+            } => {
                 private_entries.push(PrivateEntry::Directory {
                     path: path.clone(),
                     mode: *mode,
+                    modified_secs: *modified_secs,
+                    modified_nanos: *modified_nanos,
                 });
             }
             CapturedEntry::File {
@@ -78,9 +93,8 @@ pub(crate) fn prepare_revision(
                 modified_secs,
                 modified_nanos,
             } => {
-                let anchor_path = anchor.anchor_root.join(path);
-                let mut file = File::open(&anchor_path)
-                    .with_context(|| format!("open captured file {}", anchor_path.display()))?;
+                let locator = anchor.file_locator(path.clone())?;
+                let mut file = locator.open().context("open captured anchor file")?;
                 let mut remaining = *logical_len;
                 let mut offset = 0_u64;
                 let mut file_references = Vec::new();
@@ -98,7 +112,7 @@ pub(crate) fn prepare_revision(
                         guild_id,
                         reference,
                         source: LocalPlaintextSource::AnchorFile {
-                            path: anchor_path.clone(),
+                            locator: locator.clone(),
                             offset,
                         },
                     });
@@ -119,6 +133,9 @@ pub(crate) fn prepare_revision(
 
     let metadata = PrivateMetadata {
         format_version: 1,
+        root_mode: anchor.root_mode,
+        root_modified_secs: anchor.root_modified_secs,
+        root_modified_nanos: anchor.root_modified_nanos,
         entries: private_entries,
     };
     let metadata_bytes = canonical_bytes(&metadata)?;
@@ -226,9 +243,8 @@ pub(crate) fn render_sector(
         .context("local sector recipe is unavailable")?;
     let recipe: LocalSectorRecipe = decode_canonical(&encoded)?;
     let plaintext = match &recipe.source {
-        LocalPlaintextSource::AnchorFile { path, offset } => {
-            let mut file = File::open(path)
-                .with_context(|| format!("open source anchor {}", path.display()))?;
+        LocalPlaintextSource::AnchorFile { locator, offset } => {
+            let mut file = locator.open().context("open source anchor")?;
             file.seek(SeekFrom::Start(*offset))?;
             let mut plaintext = vec![0_u8; recipe.reference.logical_len as usize];
             file.read_exact(&mut plaintext)?;
@@ -280,8 +296,8 @@ pub fn restore_revision(
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
-    sync_directory(&staging)?;
-    fs::rename(&staging, target)?;
+    sync_tree_bottom_up(&staging)?;
+    rename_no_replace(&staging, target)?;
     sync_directory(parent)?;
     Ok(())
 }
@@ -292,20 +308,26 @@ fn restore_entries(
     encryption_key: &[u8; 32],
     ciphertexts: &BTreeMap<SectorId, Vec<u8>>,
 ) -> Result<()> {
-    let mut directory_modes = Vec::new();
+    let mut directory_metadata = Vec::new();
     for entry in &metadata.entries {
         match entry {
-            PrivateEntry::Directory { path, mode } => {
+            PrivateEntry::Directory {
+                path,
+                mode,
+                modified_secs,
+                modified_nanos,
+            } => {
                 let destination = safe_join(staging, path)?;
                 create_private_dir(&destination)?;
-                directory_modes.push((destination, *mode));
+                directory_metadata.push((destination, *mode, *modified_secs, *modified_nanos));
             }
             PrivateEntry::File {
                 path,
                 mode,
                 logical_len,
+                modified_secs,
+                modified_nanos,
                 sectors,
-                ..
             } => {
                 let destination = safe_join(staging, path)?;
                 if let Some(parent) = destination.parent() {
@@ -324,14 +346,20 @@ fn restore_entries(
                 if written != *logical_len {
                     bail!("restored file length does not match signed metadata");
                 }
-                file.sync_all()?;
-                set_mode(&destination, *mode)?;
+                set_metadata_durable(&file, &destination, *mode, *modified_secs, *modified_nanos)?;
             }
         }
     }
-    directory_modes.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
-    for (path, mode) in directory_modes {
-        set_mode(&path, mode)?;
+    directory_metadata.push((
+        staging.to_path_buf(),
+        metadata.root_mode,
+        metadata.root_modified_secs,
+        metadata.root_modified_nanos,
+    ));
+    directory_metadata.sort_by_key(|(path, ..)| std::cmp::Reverse(path.components().count()));
+    for (path, mode, modified_secs, modified_nanos) in directory_metadata {
+        let directory = File::open(&path)?;
+        set_metadata_durable(&directory, &path, mode, modified_secs, modified_nanos)?;
     }
     Ok(())
 }
@@ -387,6 +415,25 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
+fn set_metadata_durable(
+    file: &File,
+    path: &Path,
+    mode: u32,
+    modified_secs: i64,
+    modified_nanos: u32,
+) -> Result<()> {
+    if modified_nanos >= 1_000_000_000 {
+        bail!("invalid modification timestamp");
+    }
+    set_mode(path, mode)?;
+    filetime::set_file_mtime(
+        path,
+        filetime::FileTime::from_unix_time(modified_secs, modified_nanos),
+    )?;
+    file.sync_all()?;
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
@@ -397,6 +444,51 @@ fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     let _ = path;
     Ok(())
+}
+
+fn sync_tree_bottom_up(root: &Path) -> Result<()> {
+    let mut directories = walkdir::WalkDir::new(root)
+        .min_depth(0)
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|entry| entry.file_type().is_dir())
+        .map(|entry| entry.into_path())
+        .collect::<Vec<_>>();
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in directories {
+        sync_directory(&path)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn rename_no_replace(source: &Path, destination: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes())?;
+    let destination = CString::new(destination.as_os_str().as_bytes())?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == -1 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_no_replace(_source: &Path, _destination: &Path) -> Result<()> {
+    bail!("atomic no-replace restore is currently implemented only on Linux")
 }
 
 fn hex_id(id: &[u8; 32]) -> String {

@@ -1,7 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
@@ -180,6 +180,11 @@ async fn main() -> Result<()> {
 }
 
 fn write_seed(path: &PathBuf, seed: &Seed) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        bail!("seed-file parent directory does not exist");
+    }
+    let temporary = parent.join(format!(".mutualbackup-seed-{}.tmp", Uuid::new_v4()));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -188,10 +193,22 @@ fn write_seed(path: &PathBuf, seed: &Seed) -> Result<()> {
         options.mode(0o600);
     }
     let mut file = options
-        .open(path)
-        .with_context(|| format!("cannot create seed file {}", path.display()))?;
+        .open(&temporary)
+        .with_context(|| format!("cannot create temporary seed file in {}", parent.display()))?;
     writeln!(file, "{}", seed.encode())?;
     file.sync_all()?;
+    let written = read_seed(&temporary)?;
+    if written.expose() != seed.expose() {
+        let _ = fs::remove_file(&temporary);
+        bail!("temporary recovery seed failed validation");
+    }
+    if let Err(error) = fs::hard_link(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        sync_directory(parent).ok();
+        return Err(error).with_context(|| format!("cannot install seed file {}", path.display()));
+    }
+    fs::remove_file(&temporary)?;
+    sync_directory(parent)?;
     Ok(())
 }
 
@@ -199,6 +216,13 @@ fn read_seed(path: &PathBuf) -> Result<Seed> {
     let encoded = fs::read_to_string(path)
         .with_context(|| format!("cannot read seed file {}", path.display()))?;
     Seed::from_str(encoded.trim()).context("invalid recovery seed file")
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(path)?.sync_all()?;
+    let _ = path;
+    Ok(())
 }
 
 fn demo_seed_recovery(work_dir: PathBuf) -> Result<()> {
@@ -267,4 +291,35 @@ fn print_identity(seed: &Seed, expose_seed: bool) {
         "recovery key:   {}",
         hex::encode(keys.recovery_public_key().0)
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_install_is_no_replace_and_private() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("recovery.seed");
+        let first = Seed::from_bytes([31; 32]);
+        write_seed(&path, &first).unwrap();
+        assert_eq!(read_seed(&path).unwrap().expose(), first.expose());
+        assert!(write_seed(&path, &Seed::from_bytes([32; 32])).is_err());
+        assert_eq!(read_seed(&path).unwrap().expose(), first.expose());
+        assert_eq!(
+            fs::read_dir(temp.path())
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .count(),
+            1
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
 }

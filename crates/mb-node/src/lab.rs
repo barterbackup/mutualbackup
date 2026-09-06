@@ -553,6 +553,42 @@ mod tests {
             .collect::<Vec<_>>();
         fs::write(source.join("large.bin"), &large).unwrap();
 
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::fs::PermissionsExt;
+
+            let unsupported = source.join("unsupported-fifo");
+            let name = CString::new(unsupported.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+            let seeds = (0_u8..5)
+                .map(|value| Seed::from_bytes([value + 70; 32]))
+                .collect::<Vec<_>>();
+            let mut rejecting_guild =
+                PrototypeGuild::create(&root.join("rejecting-nodes"), seeds).unwrap();
+            assert!(rejecting_guild.commit_source(0, &source).is_err());
+            fs::remove_file(unsupported).unwrap();
+
+            fs::set_permissions(
+                source.join("docs/readme.txt"),
+                fs::Permissions::from_mode(0o640),
+            )
+            .unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o751)).unwrap();
+            filetime::set_file_mtime(
+                source.join("docs/readme.txt"),
+                filetime::FileTime::from_unix_time(1_700_000_001, 123_456_789),
+            )
+            .unwrap();
+            filetime::set_file_mtime(
+                &source,
+                filetime::FileTime::from_unix_time(1_700_000_002, 987_654_321),
+            )
+            .unwrap();
+        }
+
         let seeds = (0_u8..5)
             .map(|value| Seed::from_bytes([value + 20; 32]))
             .collect::<Vec<_>>();
@@ -577,6 +613,19 @@ mod tests {
                     b"seed-only recovery works\n"
                 );
                 assert_eq!(fs::read(restored.join("large.bin")).unwrap(), large);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+                    let root_metadata = fs::metadata(&restored).unwrap();
+                    assert_eq!(root_metadata.permissions().mode() & 0o7777, 0o751);
+                    assert_eq!(root_metadata.mtime(), 1_700_000_002);
+                    assert_eq!(root_metadata.mtime_nsec(), 987_654_321);
+                    let file_metadata = fs::metadata(restored.join("docs/readme.txt")).unwrap();
+                    assert_eq!(file_metadata.permissions().mode() & 0o7777, 0o640);
+                    assert_eq!(file_metadata.mtime(), 1_700_000_001);
+                    assert_eq!(file_metadata.mtime_nsec(), 123_456_789);
+                }
             } else {
                 assert!(!restored.exists());
             }

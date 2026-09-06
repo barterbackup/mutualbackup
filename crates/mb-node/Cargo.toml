@@ -9,6 +9,9 @@ rust-version.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 futures.workspace = true
+filetime.workspace = true
+fs2.workspace = true
+libc.workspace = true
 mb-core = { path = "../mb-core" }
 mb-store = { path = "../mb-store" }
 postcard.workspace = true
@@ -18,6 +21,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+walkdir.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

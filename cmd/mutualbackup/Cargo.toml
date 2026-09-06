@@ -19,3 +19,6 @@ mb-store = { path = "../../crates/mb-store" }
 tokio.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

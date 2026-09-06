@@ -7,7 +7,10 @@
 mod anchor;
 mod database;
 
-pub use anchor::{AnchorError, AnchorManifest, CapturedEntry, ReflinkAnchor, probe_reflink};
+pub use anchor::{
+    AnchorAreaLocator, AnchorError, AnchorFileLocator, AnchorManifest, CapturedEntry,
+    ReflinkAnchor, probe_reflink,
+};
 pub use database::{ControlStore, DatabaseError, ParityObject, ParityStore};
 
 pub const SCHEMA_VERSION: u32 = 2;
