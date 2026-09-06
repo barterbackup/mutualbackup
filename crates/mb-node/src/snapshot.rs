@@ -11,7 +11,7 @@ use mb_core::{
 };
 use mb_store::{
     AnchorFileLocator, CapturedEntry, ControlStore, FileExtent, NativeFileId, ReflinkAnchor,
-    StableAnchorFileLocator,
+    ReflinkCapturePlan, StableAnchorFileLocator,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -171,6 +171,30 @@ struct PendingAnchor {
     committed: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct CaptureIntent {
+    format_version: u16,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    sequence: u64,
+    parent: Option<[u8; 32]>,
+    requested_source: PathBuf,
+    plan: ReflinkCapturePlan,
+}
+
+pub(crate) fn reconcile_pending_captures(control: &ControlStore) -> Result<()> {
+    for (record_id, bytes) in control.records("capture-intent")? {
+        let intent: CaptureIntent = decode_canonical(&bytes)?;
+        if intent.format_version != 1 || record_id.as_slice() != intent.revision_id.as_bytes() {
+            bail!("pending source capture is inconsistent");
+        }
+        // An offline source volume must not prevent unrelated guilds from
+        // starting. The exact plan remains durable for a later explicit retry.
+        let _ = ReflinkAnchor::reconcile_capture(&intent.plan);
+    }
+    Ok(())
+}
+
 impl PendingAnchor {
     fn commit(&mut self) {
         self.committed = true;
@@ -224,8 +248,41 @@ pub(crate) fn prepare_revision(
         None if sequence == 1 => None,
         None => bail!("the first local revision must have sequence one"),
     };
+    let intent = match control.get_record("capture-intent", revision_id.as_bytes())? {
+        Some(bytes) => {
+            let intent: CaptureIntent = decode_canonical(&bytes)?;
+            if intent.format_version != 1
+                || intent.guild_id != guild_id
+                || intent.revision_id != revision_id
+                || intent.sequence != sequence
+                || intent.parent != parent
+                || intent.requested_source != source_root
+            {
+                bail!("pending source capture conflicts with the retried operation");
+            }
+            intent
+        }
+        None => {
+            let intent = CaptureIntent {
+                format_version: 1,
+                guild_id,
+                revision_id,
+                sequence,
+                parent,
+                requested_source: source_root.to_path_buf(),
+                plan: ReflinkAnchor::plan(source_root).context("plan reflink source anchor")?,
+            };
+            control.put_record(
+                "capture-intent",
+                revision_id.as_bytes(),
+                &canonical_bytes(&intent)?,
+            )?;
+            intent
+        }
+    };
     let mut anchor = PendingAnchor {
-        manifest: ReflinkAnchor::capture(source_root).context("capture reflink source anchor")?,
+        manifest: ReflinkAnchor::capture_plan(&intent.plan)
+            .context("capture reflink source anchor")?,
         committed: false,
     };
     if canonical_bytes(&anchor.manifest)?.len() > V1_MAX_CATALOG_BYTES / 2 {
@@ -278,7 +335,6 @@ pub(crate) fn prepare_revision(
                     push_data_reference(&mut data_references, reference.clone())?;
                     file_references.push(reference.clone());
                     queue_recipe(
-                        control,
                         &mut recipe_records,
                         LocalSectorRecipe {
                             guild_id,
@@ -323,7 +379,6 @@ pub(crate) fn prepare_revision(
                 }
                 let locator = anchor.manifest.file_locator(path.clone())?;
                 let private_extents = prepare_sparse_file(
-                    control,
                     &mut recipe_records,
                     keys,
                     guild_id,
@@ -379,7 +434,6 @@ pub(crate) fn prepare_revision(
         let (reference, _) = encrypted_sector(&encryption_key, id, plaintext)?;
         metadata_references.push(reference.clone());
         queue_recipe(
-            control,
             &mut recipe_records,
             LocalSectorRecipe {
                 guild_id,
@@ -407,10 +461,8 @@ pub(crate) fn prepare_revision(
     if canonical_bytes(&revision)?.len() > V1_MAX_CATALOG_BYTES {
         bail!("revision catalog exceeds the v1 bounded-object limit");
     }
-    if !recipe_records.is_empty() {
-        control.put_records(&recipe_records)?;
-    }
-    let records = vec![
+    let mut records = recipe_records;
+    records.extend([
         (
             "anchor-manifest".to_owned(),
             revision_id.as_bytes().to_vec(),
@@ -426,15 +478,14 @@ pub(crate) fn prepare_revision(
             guild_id.to_vec(),
             canonical_bytes(&revision)?,
         ),
-    ];
-    control.put_records(&records)?;
+    ]);
+    control.finalize_capture_records(revision_id.as_bytes(), &records)?;
     anchor.commit();
     Ok(revision)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_sparse_file(
-    control: &mut ControlStore,
     recipe_records: &mut Vec<RecordWrite>,
     keys: &KeyMaterial,
     guild_id: [u8; 32],
@@ -469,7 +520,6 @@ fn prepare_sparse_file(
             let (reference, _) = encrypted_sector(&encryption_key, id, &plaintext)?;
             sectors.push(reference.clone());
             queue_recipe(
-                control,
                 recipe_records,
                 LocalSectorRecipe {
                     guild_id,
@@ -509,20 +559,12 @@ fn validate_file_extents(
     Ok(())
 }
 
-fn queue_recipe(
-    control: &mut ControlStore,
-    records: &mut Vec<RecordWrite>,
-    recipe: LocalSectorRecipe,
-) -> Result<()> {
+fn queue_recipe(records: &mut Vec<RecordWrite>, recipe: LocalSectorRecipe) -> Result<()> {
     records.push((
         "local-sector".to_owned(),
         recipe.reference.id.to_vec(),
         canonical_bytes(&recipe)?,
     ));
-    if records.len() == records.capacity() {
-        control.put_records(records)?;
-        records.clear();
-    }
     Ok(())
 }
 

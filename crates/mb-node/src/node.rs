@@ -16,8 +16,8 @@ use uuid::Uuid;
 use crate::snapshot::{
     build_revision_restore, install_inline_recipe, install_recovered_sector_recipe,
     install_recovery_marker, make_restore_root_private, native_directory_id, prepare_revision,
-    publish_restore, reanchor_recovered_revision, remove_recovery_marker, render_sector,
-    restore_signed_root_metadata, verify_recovery_marker,
+    publish_restore, reanchor_recovered_revision, reconcile_pending_captures,
+    remove_recovery_marker, render_sector, restore_signed_root_metadata, verify_recovery_marker,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -150,6 +150,7 @@ impl Node {
         let mut volume_id = [0_u8; 16];
         volume_id.copy_from_slice(&blake3::hash(&keys.node_id().0).as_bytes()[..16]);
         let control = ControlStore::open(data_dir.join("control.db"), &keys)?;
+        reconcile_pending_captures(&control)?;
         let parity = ParityStore::open(data_dir.join("parity.db"), &volume_id, &keys)?;
         Ok(Self {
             data_dir,

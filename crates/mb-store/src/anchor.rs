@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
+use mb_core::{canonical_bytes, decode_canonical};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -12,6 +13,7 @@ use walkdir::WalkDir;
 const AREA_PREFIX: &str = ".mutualbackup-anchors";
 const AREA_MARKER: &str = ".mutualbackup-anchor-area-v1";
 const AREA_MAGIC: &str = "mutualbackup-anchor-area-v1";
+const CAPTURE_MANIFEST_PREFIX: &str = ".mutualbackup-capture-manifest-v1-";
 const MAX_CAPTURE_ENTRIES: usize = 8_192;
 const MAX_CAPTURE_EXTENTS: usize = 65_536;
 const MAX_RELATIVE_PATH_BYTES: usize = 4_096;
@@ -108,6 +110,35 @@ pub struct StableAnchorFileLocator {
     pub area: StableAnchorAreaLocator,
     pub anchor_id: Uuid,
     pub relative_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReflinkCapturePlan {
+    format_version: u16,
+    anchor_id: Uuid,
+    source_root: PathBuf,
+    area: StableAnchorAreaLocator,
+    root_version: CaptureVersion,
+    root_mode: u32,
+    root_modified_secs: i64,
+    root_modified_nanos: u32,
+}
+
+impl ReflinkCapturePlan {
+    pub fn source_root(&self) -> &Path {
+        &self.source_root
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct CaptureVersion {
+    device: u64,
+    inode: u64,
+    logical_len: u64,
+    modified_secs: i64,
+    modified_nanos: i64,
+    changed_secs: i64,
+    changed_nanos: i64,
 }
 
 impl StableAnchorFileLocator {
@@ -207,6 +238,11 @@ pub struct ReflinkAnchor;
 
 impl ReflinkAnchor {
     pub fn capture(source_root: impl AsRef<Path>) -> Result<StableAnchorManifest, AnchorError> {
+        let plan = Self::plan(source_root)?;
+        Self::capture_plan(&plan)
+    }
+
+    pub fn plan(source_root: impl AsRef<Path>) -> Result<ReflinkCapturePlan, AnchorError> {
         let source_root = source_root
             .as_ref()
             .canonicalize()
@@ -219,42 +255,125 @@ impl ReflinkAnchor {
         probe_reflink(&source_root)?;
 
         let area = ensure_anchor_area(&source_root, &root_metadata)?;
-        let anchor_id = Uuid::new_v4();
-        let staging_name = format!(".staging-{anchor_id}");
-        let staging = area.path_hint.join(&staging_name);
-        let anchor_root = area.path_hint.join(anchor_id.to_string());
+        let (root_modified_secs, root_modified_nanos) = modified_parts(&root_metadata);
+        Ok(ReflinkCapturePlan {
+            format_version: 1,
+            anchor_id: Uuid::new_v4(),
+            source_root,
+            area,
+            root_version: capture_version(&root_metadata),
+            root_mode: unix_mode(&root_metadata),
+            root_modified_secs,
+            root_modified_nanos,
+        })
+    }
+
+    pub fn capture_plan(plan: &ReflinkCapturePlan) -> Result<StableAnchorManifest, AnchorError> {
+        if plan.format_version != 1 {
+            return Err(AnchorError::InvalidRoot);
+        }
+        validate_stable_anchor_area(&plan.area.path_hint, plan.area.area_id)?;
+        let staging_name = format!(".staging-{}", plan.anchor_id);
+        let staging = plan.area.path_hint.join(&staging_name);
+        let anchor_root = plan.area.path_hint.join(plan.anchor_id.to_string());
+        if anchor_root.exists() {
+            match read_planned_manifest(&anchor_root, plan) {
+                Ok(manifest) => return Ok(manifest),
+                Err(_) => Self::discard_capture(plan)?,
+            }
+        }
+        remove_capture_directory(&staging)?;
+        sync_directory(&plan.area.path_hint)?;
+
+        let source_root = plan
+            .source_root
+            .canonicalize()
+            .map_err(|_| AnchorError::InvalidRoot)?;
+        if source_root != plan.source_root {
+            return Err(AnchorError::InvalidRoot);
+        }
+        let root_file = open_source_root(&source_root)?;
+        let root_metadata = root_file.metadata()?;
+        if !root_metadata.is_dir() || capture_version(&root_metadata) != plan.root_version {
+            return Err(AnchorError::SourceChanged(PathBuf::new()));
+        }
         create_private_dir_new(&staging)?;
 
         let capture_result = (|| {
             let entries = capture_entries(&source_root, &root_file, &root_metadata, &staging)?;
+            let manifest = StableAnchorManifest {
+                format_version: 2,
+                anchor_id: plan.anchor_id,
+                source_root_hint: source_root.clone(),
+                area: plan.area.clone(),
+                root_mode: plan.root_mode,
+                root_modified_secs: plan.root_modified_secs,
+                root_modified_nanos: plan.root_modified_nanos,
+                entries,
+            };
+            let manifest_path = staging.join(capture_manifest_name(plan.anchor_id));
+            let mut manifest_file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&manifest_path)?;
+            let manifest_bytes = canonical_bytes(&manifest)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            manifest_file.write_all(&manifest_bytes)?;
+            manifest_file.sync_all()?;
+            seal_anchor_file(&manifest_path)?;
             sync_tree_bottom_up(&staging)?;
             rename_no_replace(&staging, &anchor_root)?;
-            Ok::<_, AnchorError>(entries)
+            Ok::<_, AnchorError>(manifest)
         })();
-        let entries = match capture_result {
-            Ok(entries) => entries,
+        let manifest = match capture_result {
+            Ok(manifest) => manifest,
             Err(error) => {
                 let _ = fs::remove_dir_all(&staging);
-                let _ = sync_directory(&area.path_hint);
+                let _ = sync_directory(&plan.area.path_hint);
                 return Err(error);
             }
         };
-        if let Err(error) = sync_directory(&area.path_hint) {
+        if let Err(error) = sync_directory(&plan.area.path_hint) {
             let _ = fs::remove_dir_all(&anchor_root);
-            let _ = sync_directory(&area.path_hint);
+            let _ = sync_directory(&plan.area.path_hint);
             return Err(error.into());
         }
-        let (root_modified_secs, root_modified_nanos) = modified_parts(&root_metadata);
-        Ok(StableAnchorManifest {
-            format_version: 2,
-            anchor_id,
-            source_root_hint: source_root,
-            area,
-            root_mode: unix_mode(&root_metadata),
-            root_modified_secs,
-            root_modified_nanos,
-            entries,
-        })
+        Ok(manifest)
+    }
+
+    pub fn discard_capture(plan: &ReflinkCapturePlan) -> Result<(), AnchorError> {
+        if plan.format_version != 1 {
+            return Err(AnchorError::InvalidRoot);
+        }
+        validate_stable_anchor_area(&plan.area.path_hint, plan.area.area_id)?;
+        remove_capture_directory(
+            &plan
+                .area
+                .path_hint
+                .join(format!(".staging-{}", plan.anchor_id)),
+        )?;
+        remove_capture_directory(&plan.area.path_hint.join(plan.anchor_id.to_string()))?;
+        sync_directory(&plan.area.path_hint)?;
+        Ok(())
+    }
+
+    pub fn reconcile_capture(plan: &ReflinkCapturePlan) -> Result<(), AnchorError> {
+        if plan.format_version != 1 {
+            return Err(AnchorError::InvalidRoot);
+        }
+        validate_stable_anchor_area(&plan.area.path_hint, plan.area.area_id)?;
+        let anchor_root = plan.area.path_hint.join(plan.anchor_id.to_string());
+        if anchor_root.exists() {
+            read_planned_manifest(&anchor_root, plan)?;
+        }
+        remove_capture_directory(
+            &plan
+                .area
+                .path_hint
+                .join(format!(".staging-{}", plan.anchor_id)),
+        )?;
+        sync_directory(&plan.area.path_hint)?;
+        Ok(())
     }
 }
 
@@ -618,6 +737,80 @@ fn entry_path(entry: &CapturedEntry) -> &str {
         CapturedEntry::Directory { path, .. }
         | CapturedEntry::File { path, .. }
         | CapturedEntry::FileV2 { path, .. } => path,
+    }
+}
+
+fn remove_capture_directory(path: &Path) -> Result<(), AnchorError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(AnchorError::AnchorAreaCollision(path.to_path_buf()));
+    }
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+fn read_planned_manifest(
+    anchor_root: &Path,
+    plan: &ReflinkCapturePlan,
+) -> Result<StableAnchorManifest, AnchorError> {
+    let root_metadata = fs::symlink_metadata(anchor_root)?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return Err(AnchorError::AnchorAreaCollision(anchor_root.to_path_buf()));
+    }
+    let path = anchor_root.join(capture_manifest_name(plan.anchor_id));
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 64 * 1024 * 1024
+    {
+        return Err(AnchorError::AnchorAreaCollision(anchor_root.to_path_buf()));
+    }
+    let manifest: StableAnchorManifest = decode_canonical(&fs::read(path)?)
+        .map_err(|_| AnchorError::AnchorAreaCollision(anchor_root.to_path_buf()))?;
+    if manifest.format_version != 2
+        || manifest.anchor_id != plan.anchor_id
+        || manifest.source_root_hint != plan.source_root
+        || manifest.area != plan.area
+        || manifest.root_mode != plan.root_mode
+        || manifest.root_modified_secs != plan.root_modified_secs
+        || manifest.root_modified_nanos != plan.root_modified_nanos
+    {
+        return Err(AnchorError::AnchorAreaCollision(anchor_root.to_path_buf()));
+    }
+    Ok(manifest)
+}
+
+fn capture_manifest_name(anchor_id: Uuid) -> String {
+    format!("{CAPTURE_MANIFEST_PREFIX}{anchor_id}")
+}
+
+#[cfg(unix)]
+fn capture_version(metadata: &fs::Metadata) -> CaptureVersion {
+    use std::os::unix::fs::MetadataExt;
+    CaptureVersion {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        logical_len: metadata.len(),
+        modified_secs: metadata.mtime(),
+        modified_nanos: metadata.mtime_nsec(),
+        changed_secs: metadata.ctime(),
+        changed_nanos: metadata.ctime_nsec(),
+    }
+}
+
+#[cfg(not(unix))]
+fn capture_version(metadata: &fs::Metadata) -> CaptureVersion {
+    let (modified_secs, modified_nanos) = modified_parts(metadata);
+    CaptureVersion {
+        device: 0,
+        inode: 0,
+        logical_len: metadata.len(),
+        modified_secs,
+        modified_nanos: i64::from(modified_nanos),
+        changed_secs: modified_secs,
+        changed_nanos: i64::from(modified_nanos),
     }
 }
 

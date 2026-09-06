@@ -10,16 +10,6 @@ repair, GC, and multiple parity volumes remains intentionally omitted.
 
 ## P1 — correctness, durability, availability, and resource bounds
 
-- [ ] **Journal source capture and its database records as one recoverable
-  transition.** A durable anchor is installed before any intent naming it is
-  persisted; sector recipes are then committed in 256-row batches, separately
-  from the manifest, revision, and head
-  (`crates/mb-node/src/snapshot.rs:94-110,152-163,335-356,437-450`). A process
-  crash can leave an undiscoverable anchor, while a later preparation error can
-  remove the anchor but leave dangling `local-sector` rows. Persist a pending
-  capture before materialization and either finalize atomically or reconcile
-  all rows and anchor directories on retry/startup.
-
 - [ ] **Recover guilds independently instead of comparing their generations.**
   The commit and directory paths can create and retain distinct guilds for the
   same seed, as the design permits, but recovery puts every valid checkpoint

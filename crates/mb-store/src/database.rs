@@ -102,6 +102,41 @@ impl ControlStore {
             .map_err(DatabaseError::from)
     }
 
+    pub fn records(&self, kind: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT record_id, bytes FROM protocol_records WHERE kind = ?1 ORDER BY record_id",
+        )?;
+        let rows = statement.query_map([kind], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::from)
+    }
+
+    pub fn finalize_capture_records(
+        &mut self,
+        capture_id: &[u8; 16],
+        records: &[(String, Vec<u8>, Vec<u8>)],
+    ) -> Result<(), DatabaseError> {
+        let transaction = self.connection.transaction()?;
+        {
+            let mut statement = transaction.prepare_cached(
+                "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+            )?;
+            for (kind, record_id, bytes) in records {
+                statement.execute(params![kind, record_id, bytes])?;
+            }
+        }
+        let removed = transaction.execute(
+            "DELETE FROM protocol_records WHERE kind = 'capture-intent' AND record_id = ?1",
+            [capture_id.as_slice()],
+        )?;
+        if removed != 1 {
+            return Err(DatabaseError::Conflict);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn put_operation_result(
         &mut self,
         operation_id: &[u8; 16],
@@ -1398,6 +1433,59 @@ mod tests {
             store
                 .protocol_record_page("user-revision", b"revision", 2)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn capture_finalization_publishes_records_and_retires_intent_atomically() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([29; 32]));
+        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let capture_id = [28; 16];
+        store
+            .put_record("capture-intent", &capture_id, b"pending")
+            .unwrap();
+        store
+            .finalize_capture_records(
+                &capture_id,
+                &[(
+                    "user-revision".to_owned(),
+                    b"revision".to_vec(),
+                    b"body".to_vec(),
+                )],
+            )
+            .unwrap();
+        assert!(
+            store
+                .get_record("capture-intent", &capture_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_record("user-revision", b"revision")
+                .unwrap()
+                .unwrap(),
+            b"body"
+        );
+
+        assert!(
+            store
+                .finalize_capture_records(
+                    &[27; 16],
+                    &[(
+                        "user-revision".to_owned(),
+                        b"other".to_vec(),
+                        b"bad".to_vec(),
+                    )],
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .get_record("user-revision", b"other")
+                .unwrap()
+                .is_none()
         );
     }
 
