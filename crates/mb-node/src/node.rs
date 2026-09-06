@@ -873,7 +873,16 @@ impl Node {
                 anyhow::bail!("existing restore target was created by another actor");
             }
             match job.state {
-                RecoveryJobState::Complete => return Ok(()),
+                RecoveryJobState::Complete => {
+                    reanchor_recovered_revision(
+                        &mut self.control,
+                        &self.keys,
+                        guild_id,
+                        revision,
+                        target,
+                    )?;
+                    return Ok(());
+                }
                 RecoveryJobState::Ready => {
                     verify_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
                     sync_directory(parent)?;
@@ -1121,7 +1130,7 @@ mod tests {
     #[test]
     fn prepared_revision_pages_are_bound_to_the_requested_guild() {
         let temp = tempfile::tempdir().unwrap();
-        let mut node = Node::open(temp.path(), Seed::from_bytes([88; 32])).unwrap();
+        let node = Node::open(temp.path(), Seed::from_bytes([88; 32])).unwrap();
         let guild_id = [87; 32];
         let revision_id = Uuid::from_bytes([86; 16]);
         let revision = SignedRecord::sign(

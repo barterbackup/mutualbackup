@@ -12,6 +12,8 @@ pub use anchor::{
     NativeFileId, ReflinkAnchor, ReflinkCapturePlan, StableAnchorAreaLocator,
     StableAnchorFileLocator, StableAnchorManifest, probe_reflink,
 };
-pub use database::{CheckpointRow, ControlStore, DatabaseError, ParityObject, ParityStore};
+pub use database::{
+    CheckpointRow, ControlStore, DatabaseError, ParityObject, ParityStore, ProtocolRecordRow,
+};
 
 pub const SCHEMA_VERSION: u32 = 5;

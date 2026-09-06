@@ -1645,39 +1645,46 @@ pub async fn recover_member_and_republish_over_network(
             if subject.node_id == local_node {
                 continue;
             }
-            let Some(endpoint) = guild.peer_endpoints.get(&subject.node_id) else {
-                continue;
-            };
-            let response = peer_call_expected(
-                *endpoint,
-                subject.node_id,
-                node.keys(),
-                PeerRequest::AuthorizeRecoveryPublisher {
-                    guild_id: guild.checkpoint.checkpoint.guild_id,
-                    publisher: local_node,
-                    expires_at_unix_seconds: u64::MAX,
-                },
-            )
-            .await?;
-            let PeerResponse::RecoveryAdmission(admission) = response else {
-                bail!("peer returned the wrong recovery-admission response");
-            };
             let slot = recovery_slot(
                 subject.node_id,
                 local_node,
                 guild.checkpoint.checkpoint.guild_id,
             );
-            validate_recovery_admission(&admission, subject.node_id, local_node, slot, u64::MAX)?;
-            let minimum_sequence = directory_lookup(directory, subject.node_id)
-                .await?
-                .into_iter()
+            let published_records = directory_lookup(directory, subject.node_id).await?;
+            let previous = published_records
+                .iter()
                 .filter(|record| {
                     record.value.publisher == local_node
                         && record.value.slot == slot
                         && validate_published_recovery_record(record).is_ok()
                 })
+                .max_by_key(|record| record.value.slot_sequence);
+            let admission = match previous {
+                Some(record) => record.value.admission.clone(),
+                None => {
+                    let Some(endpoint) = guild.peer_endpoints.get(&subject.node_id) else {
+                        continue;
+                    };
+                    let response = peer_call_expected(
+                        *endpoint,
+                        subject.node_id,
+                        node.keys(),
+                        PeerRequest::AuthorizeRecoveryPublisher {
+                            guild_id: guild.checkpoint.checkpoint.guild_id,
+                            publisher: local_node,
+                            expires_at_unix_seconds: u64::MAX,
+                        },
+                    )
+                    .await?;
+                    let PeerResponse::RecoveryAdmission(admission) = response else {
+                        bail!("peer returned the wrong recovery-admission response");
+                    };
+                    admission
+                }
+            };
+            validate_recovery_admission(&admission, subject.node_id, local_node, slot, u64::MAX)?;
+            let minimum_sequence = previous
                 .map(|record| record.value.slot_sequence)
-                .max()
                 .map(|sequence| {
                     sequence
                         .checked_add(1)
@@ -2833,25 +2840,39 @@ mod tests {
             vec![0x5a; 150_000]
         );
 
+        drop(recovered);
+        let recovered_zero_address = free_address();
+        let recovered_zero_endpoint = format!("tcp://{recovered_zero_address}");
+        let recovered_zero = recover_member_and_republish_over_network(
+            Seed::from_bytes([100; 32]),
+            &root.join("recovered-node"),
+            directory_address,
+            recovered_zero_endpoint.clone(),
+        )
+        .await
+        .unwrap();
         let recovered_zero_task = tokio::spawn(serve_node(
-            Arc::new(Mutex::new(recovered)),
+            Arc::new(Mutex::new(recovered_zero.node)),
             NodeServerConfig {
-                listen: peer_addresses[0],
-                public_endpoint: format!("tcp://{}", peer_addresses[0]),
+                listen: recovered_zero_address,
+                public_endpoint: recovered_zero_endpoint,
                 failure_domain: "host-0".to_owned(),
                 trusted_coordinator: coordinator_keys.node_id(),
                 max_connections: 8,
             },
         ));
-        wait_until_listening(peer_addresses[0]).await;
+        wait_until_listening(recovered_zero_address).await;
 
         peer_tasks[2].abort();
         let _ = (&mut peer_tasks[2]).await;
         fs::remove_dir_all(root.join("node-2")).unwrap();
-        let recovered_one = recover_member_over_network(
+        let recovered_one_address = free_address();
+        let recovered_one_endpoint = format!("tcp://{recovered_one_address}");
+        let recovered_one = recover_member_and_republish_over_network(
             Seed::from_bytes([101; 32]),
             &root.join("recovered-node-1"),
             directory_address,
+            recovered_one_endpoint.clone(),
         )
         .await
         .unwrap();
@@ -2867,14 +2888,14 @@ mod tests {
         let recovered_one_task = tokio::spawn(serve_node(
             Arc::new(Mutex::new(recovered_one.node)),
             NodeServerConfig {
-                listen: peer_addresses[1],
-                public_endpoint: format!("tcp://{}", peer_addresses[1]),
+                listen: recovered_one_address,
+                public_endpoint: recovered_one_endpoint,
                 failure_domain: "host-1".to_owned(),
                 trusted_coordinator: coordinator_keys.node_id(),
                 max_connections: 8,
             },
         ));
-        wait_until_listening(peer_addresses[1]).await;
+        wait_until_listening(recovered_one_address).await;
 
         peer_tasks[3].abort();
         let _ = (&mut peer_tasks[3]).await;

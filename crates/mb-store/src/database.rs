@@ -12,6 +12,7 @@ use crate::SCHEMA_VERSION;
 
 const CONTROL_DATABASE_ID: &[u8] = b"control.db";
 pub type CheckpointRow = (u64, [u8; 32], Vec<u8>);
+pub type ProtocolRecordRow = (Vec<u8>, Vec<u8>);
 
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -54,18 +55,16 @@ impl ControlStore {
     }
 
     pub fn put_record(
-        &mut self,
+        &self,
         kind: &str,
         record_id: &[u8],
         bytes: &[u8],
     ) -> Result<(), DatabaseError> {
-        let transaction = self.connection.transaction()?;
-        transaction.execute(
+        self.connection.execute(
             "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
              ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
             params![kind, record_id, bytes],
         )?;
-        transaction.commit()?;
         Ok(())
     }
 
@@ -102,7 +101,7 @@ impl ControlStore {
             .map_err(DatabaseError::from)
     }
 
-    pub fn records(&self, kind: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DatabaseError> {
+    pub fn records(&self, kind: &str) -> Result<Vec<ProtocolRecordRow>, DatabaseError> {
         let mut statement = self.connection.prepare(
             "SELECT record_id, bytes FROM protocol_records WHERE kind = ?1 ORDER BY record_id",
         )?;
@@ -1474,7 +1473,7 @@ mod tests {
         let path = temp.path().join("control.db");
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([1; 32]));
         {
-            let mut store = ControlStore::open(&path, &keys).unwrap();
+            let store = ControlStore::open(&path, &keys).unwrap();
             store
                 .put_record("test", b"id", b"plaintext-marker-should-not-leak")
                 .unwrap();
@@ -1506,7 +1505,7 @@ mod tests {
     fn protocol_records_are_read_in_bounded_pages() {
         let temp = tempdir().unwrap();
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([30; 32]));
-        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
         let bytes = vec![31_u8; V1_CATALOG_PAGE_BYTES + 17];
         store
             .put_record("user-revision", b"revision", &bytes)

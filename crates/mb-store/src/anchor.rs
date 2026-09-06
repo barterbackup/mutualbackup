@@ -1,8 +1,12 @@
 use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
+use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use mb_core::{canonical_bytes, decode_canonical};
 use serde::{Deserialize, Serialize};
@@ -17,6 +21,15 @@ const CAPTURE_MANIFEST_PREFIX: &str = ".mutualbackup-capture-manifest-v1-";
 const MAX_CAPTURE_ENTRIES: usize = 8_192;
 const MAX_CAPTURE_EXTENTS: usize = 65_536;
 const MAX_RELATIVE_PATH_BYTES: usize = 4_096;
+const FAILED_AREA_SCAN_RETRY: Duration = Duration::from_secs(60);
+
+static ANCHOR_AREA_INDEX: OnceLock<Mutex<BTreeMap<Uuid, AnchorAreaIndexEntry>>> = OnceLock::new();
+
+#[derive(Clone)]
+enum AnchorAreaIndexEntry {
+    Resolved(PathBuf),
+    MissingUntil(Instant),
+}
 
 #[derive(Debug, Error)]
 pub enum AnchorError {
@@ -34,6 +47,8 @@ pub enum AnchorError {
     UnsafePath,
     #[error("an unrecognized or unsafe source-anchor area already exists: {0}")]
     AnchorAreaCollision(PathBuf),
+    #[error("the in-process anchor-area index is unavailable")]
+    AnchorAreaIndexUnavailable,
     #[error("source changed while it was being captured: {0}")]
     SourceChanged(PathBuf),
     #[error("source tree exceeds the bounded v1 capture catalog")]
@@ -143,9 +158,17 @@ struct CaptureVersion {
 
 impl StableAnchorFileLocator {
     pub fn open(&self) -> Result<File, AnchorError> {
+        self.open_with_area_hint(None).map(|(file, _)| file)
+    }
+
+    pub fn open_with_area_hint(
+        &self,
+        area_hint: Option<&Path>,
+    ) -> Result<(File, PathBuf), AnchorError> {
         validate_relative(Path::new(&self.relative_path))?;
-        let area = resolve_anchor_area(&self.area)?;
-        open_anchor_beneath(&area, self.anchor_id, Path::new(&self.relative_path))
+        let area = resolve_anchor_area_with_hint(&self.area, area_hint)?;
+        let file = open_anchor_beneath(&area, self.anchor_id, Path::new(&self.relative_path))?;
+        Ok((file, area))
     }
 }
 
@@ -638,62 +661,195 @@ fn validate_stable_anchor_area(path: &Path, expected_id: Uuid) -> Result<(), Anc
 }
 
 fn resolve_anchor_area(area: &StableAnchorAreaLocator) -> Result<PathBuf, AnchorError> {
-    if validate_stable_anchor_area(&area.path_hint, area.area_id).is_ok() {
-        return Ok(area.path_hint.clone());
+    resolve_anchor_area_with_hint(area, None)
+}
+
+fn resolve_anchor_area_with_hint(
+    area: &StableAnchorAreaLocator,
+    catalog_hint: Option<&Path>,
+) -> Result<PathBuf, AnchorError> {
+    let mut hints = Vec::with_capacity(2);
+    if let Some(hint) = catalog_hint {
+        hints.push(hint.to_path_buf());
     }
-    validate_volume_root(area)?;
-    let mut resolved = None;
-    let walker = WalkDir::new(&area.volume_root_hint)
-        .follow_links(false)
-        .same_file_system(true)
-        .into_iter();
-    for result in walker {
-        let entry = match result {
-            Ok(entry) => entry,
+    if !hints.contains(&area.path_hint) {
+        hints.push(area.path_hint.clone());
+    }
+    for hint in hints {
+        if validate_stable_anchor_area(&hint, area.area_id).is_ok() {
+            return Ok(hint);
+        }
+    }
+
+    let index = ANCHOR_AREA_INDEX.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut index = index
+        .lock()
+        .map_err(|_| AnchorError::AnchorAreaIndexUnavailable)?;
+    match index.get(&area.area_id).cloned() {
+        Some(AnchorAreaIndexEntry::Resolved(path))
+            if validate_stable_anchor_area(&path, area.area_id).is_ok() =>
+        {
+            return Ok(path);
+        }
+        Some(AnchorAreaIndexEntry::MissingUntil(retry_after)) if Instant::now() < retry_after => {
+            return Err(AnchorError::AnchorAreaCollision(area.path_hint.clone()));
+        }
+        _ => {
+            index.remove(&area.area_id);
+        }
+    }
+
+    match discover_anchor_area(area) {
+        Ok(path) => {
+            index.insert(area.area_id, AnchorAreaIndexEntry::Resolved(path.clone()));
+            Ok(path)
+        }
+        Err(error) => {
+            index.insert(
+                area.area_id,
+                AnchorAreaIndexEntry::MissingUntil(Instant::now() + FAILED_AREA_SCAN_RETRY),
+            );
             Err(error)
-                if error
-                    .io_error()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied) =>
+        }
+    }
+}
+
+fn discover_anchor_area(area: &StableAnchorAreaLocator) -> Result<PathBuf, AnchorError> {
+    for root in anchor_discovery_roots(area) {
+        let Ok(metadata) = fs::symlink_metadata(&root) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let mut matches = BTreeMap::<NativeFileId, PathBuf>::new();
+        let mut walker = WalkDir::new(&root)
+            .follow_links(false)
+            .same_file_system(true)
+            .into_iter();
+        while let Some(result) = walker.next() {
+            let entry = match result {
+                Ok(entry) => entry,
+                Err(error)
+                    if error.io_error().is_some_and(|error| {
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                        )
+                    }) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if !entry.file_type().is_dir()
+                || !entry.file_name().to_string_lossy().starts_with(AREA_PREFIX)
             {
                 continue;
             }
-            Err(error) => return Err(error.into()),
-        };
-        if !entry.file_type().is_dir()
-            || !entry.file_name().to_string_lossy().starts_with(AREA_PREFIX)
-            || read_area_marker(entry.path()).ok() != Some(area.area_id)
-        {
-            continue;
+            walker.skip_current_dir();
+            if validate_stable_anchor_area(entry.path(), area.area_id).is_err() {
+                continue;
+            }
+            let identity = native_file_id(&entry.metadata()?);
+            matches
+                .entry(identity)
+                .or_insert_with(|| entry.path().to_path_buf());
         }
-        if resolved.replace(entry.path().to_path_buf()).is_some() {
-            return Err(AnchorError::AnchorAreaCollision(entry.path().to_path_buf()));
+        if matches.len() > 1 {
+            return Err(AnchorError::AnchorAreaCollision(
+                matches
+                    .into_values()
+                    .next()
+                    .unwrap_or_else(|| area.path_hint.clone()),
+            ));
+        }
+        if let Some(path) = matches.into_values().next() {
+            return Ok(path);
         }
     }
-    resolved.ok_or_else(|| AnchorError::AnchorAreaCollision(area.path_hint.clone()))
+    Err(AnchorError::AnchorAreaCollision(area.path_hint.clone()))
 }
 
-#[cfg(unix)]
-fn validate_volume_root(area: &StableAnchorAreaLocator) -> Result<(), AnchorError> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = fs::symlink_metadata(&area.volume_root_hint)
-        .map_err(|_| AnchorError::AnchorAreaCollision(area.volume_root_hint.clone()))?;
-    if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.dev() != area.volume_device
+fn anchor_discovery_roots(area: &StableAnchorAreaLocator) -> Vec<PathBuf> {
+    #[allow(unused_mut)]
+    let mut roots = vec![area.volume_root_hint.clone()];
+    #[cfg(target_os = "linux")]
     {
-        return Err(AnchorError::AnchorAreaCollision(
-            area.volume_root_hint.clone(),
-        ));
+        let mut seen = BTreeSet::from([area.volume_root_hint.clone()]);
+        for root in linux_data_mount_points() {
+            if seen.insert(root.clone()) {
+                roots.push(root);
+            }
+        }
     }
-    Ok(())
+    roots
 }
 
-#[cfg(not(unix))]
-fn validate_volume_root(area: &StableAnchorAreaLocator) -> Result<(), AnchorError> {
-    Err(AnchorError::AnchorAreaCollision(
-        area.volume_root_hint.clone(),
-    ))
+#[cfg(target_os = "linux")]
+fn linux_data_mount_points() -> Vec<PathBuf> {
+    let Ok(contents) = fs::read_to_string("/proc/self/mountinfo") else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let separator = fields.iter().position(|field| *field == "-")?;
+            let filesystem = *fields.get(separator + 1)?;
+            if !is_data_filesystem(filesystem) {
+                return None;
+            }
+            decode_mount_path(fields.get(4)?)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn is_data_filesystem(filesystem: &str) -> bool {
+    matches!(
+        filesystem,
+        "bcachefs"
+            | "btrfs"
+            | "ext2"
+            | "ext3"
+            | "ext4"
+            | "f2fs"
+            | "fuseblk"
+            | "ntfs3"
+            | "ocfs2"
+            | "overlay"
+            | "tmpfs"
+            | "virtiofs"
+            | "xfs"
+            | "zfs"
+    ) || filesystem.starts_with("fuse.")
+}
+
+#[cfg(target_os = "linux")]
+fn decode_mount_path(encoded: &str) -> Option<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let encoded = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut index = 0;
+    while index < encoded.len() {
+        if encoded[index] == b'\\' && index + 3 < encoded.len() {
+            let digits = &encoded[index + 1..index + 4];
+            if digits.iter().all(|digit| matches!(digit, b'0'..=b'7')) {
+                let value = u16::from(digits[0] - b'0') * 64
+                    + u16::from(digits[1] - b'0') * 8
+                    + u16::from(digits[2] - b'0');
+                decoded.push(u8::try_from(value).ok()?);
+                index += 4;
+                continue;
+            }
+        }
+        decoded.push(encoded[index]);
+        index += 1;
+    }
+    Some(PathBuf::from(OsString::from_vec(decoded)))
 }
 
 fn validate_anchor_area(area: &AnchorAreaLocator) -> Result<(), AnchorError> {
@@ -1242,17 +1398,55 @@ mod tests {
 
         let manifest = ReflinkAnchor::capture(&source).unwrap();
         let locator = manifest.file_locator("payload".to_owned()).unwrap();
+        let area_name = locator.area.path_hint.file_name().unwrap().to_owned();
         fs::rename(&original_parent, &moved_parent).unwrap();
         sync_directory(&root).unwrap();
 
         let mut payload = String::new();
-        locator
-            .open()
-            .unwrap()
-            .read_to_string(&mut payload)
-            .unwrap();
+        let moved_area = moved_parent.join(area_name);
+        let (mut file, resolved_area) = locator.open_with_area_hint(Some(&moved_area)).unwrap();
+        file.read_to_string(&mut payload).unwrap();
         assert_eq!(payload, "stable anchor");
+        assert_eq!(resolved_area, moved_area);
         manifest.remove().unwrap();
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mountinfo_paths_are_decoded_without_a_shell() {
+        assert_eq!(
+            decode_mount_path("/media/a\\040b\\134c").unwrap(),
+            PathBuf::from("/media/a b\\c")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stable_locator_opens_through_an_indexed_area_hint() {
+        let temp = tempfile::tempdir().unwrap();
+        let area_id = Uuid::new_v4();
+        let anchor_id = Uuid::new_v4();
+        let area = temp.path().join(format!("{AREA_PREFIX}-indexed-test"));
+        fs::create_dir(&area).unwrap();
+        fs::write(area.join(AREA_MARKER), format!("{AREA_MAGIC}\n{area_id}\n")).unwrap();
+        fs::create_dir(area.join(anchor_id.to_string())).unwrap();
+        fs::write(area.join(anchor_id.to_string()).join("payload"), b"indexed").unwrap();
+        let locator = StableAnchorFileLocator {
+            area: StableAnchorAreaLocator {
+                area_id,
+                path_hint: temp.path().join("stale-area"),
+                volume_device: u64::MAX,
+                volume_root_hint: temp.path().join("stale-volume"),
+            },
+            anchor_id,
+            relative_path: "payload".to_owned(),
+        };
+
+        let (mut file, resolved) = locator.open_with_area_hint(Some(&area)).unwrap();
+        let mut payload = String::new();
+        file.read_to_string(&mut payload).unwrap();
+        assert_eq!(payload, "indexed");
+        assert_eq!(resolved, area);
     }
 }

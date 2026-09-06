@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 type RecordWrite = (String, Vec<u8>, Vec<u8>);
+const ANCHOR_AREA_LOCATION_KIND: &str = "anchor-area-location";
 const MAX_METADATA_SECTORS: usize = V1_MAX_CATALOG_BYTES.div_ceil(V1_SECTOR_SIZE);
 const MAX_DATA_SECTORS: usize = V1_MAX_CODING_GROUPS - MAX_METADATA_SECTORS;
 
@@ -464,6 +465,11 @@ pub(crate) fn prepare_revision(
     let mut records = recipe_records;
     records.extend([
         (
+            ANCHOR_AREA_LOCATION_KIND.to_owned(),
+            anchor.manifest.area.area_id.as_bytes().to_vec(),
+            canonical_bytes(&anchor.manifest.area.path_hint)?,
+        ),
+        (
             "anchor-manifest".to_owned(),
             revision_id.as_bytes().to_vec(),
             canonical_bytes(&anchor.manifest)?,
@@ -736,6 +742,11 @@ fn recovered_anchor_records(
     validate_recovered_manifest(metadata, manifest)?;
     let mut records = recovered_anchor_recipes(keys, guild_id, revision, metadata, manifest)?;
     records.push((
+        ANCHOR_AREA_LOCATION_KIND.to_owned(),
+        manifest.area.area_id.as_bytes().to_vec(),
+        canonical_bytes(&manifest.area.path_hint)?,
+    ));
+    records.push((
         "anchor-manifest".to_owned(),
         revision.value.revision_id.as_bytes().to_vec(),
         canonical_bytes(manifest)?,
@@ -788,10 +799,10 @@ fn decode_private_metadata(bytes: &[u8]) -> Result<PrivateMetadata> {
 }
 
 fn decode_v2_private_metadata(bytes: &[u8]) -> Result<PrivateMetadata> {
-    if let Ok(metadata) = decode_canonical::<LinkV2PrivateMetadata>(bytes) {
-        if validate_link_v2_layout(&metadata).is_ok() {
-            return Ok(convert_link_v2(metadata));
-        }
+    if let Ok(metadata) = decode_canonical::<LinkV2PrivateMetadata>(bytes)
+        && validate_link_v2_layout(&metadata).is_ok()
+    {
+        return Ok(convert_link_v2(metadata));
     }
     let metadata: NativeV2PrivateMetadata = decode_canonical(bytes)
         .context("private metadata does not match either historical version-2 layout")?;
@@ -805,15 +816,15 @@ fn validate_link_v2_layout(metadata: &LinkV2PrivateMetadata) -> Result<()> {
     let mut next_group = 0_u64;
     let mut groups = BTreeSet::new();
     for entry in &metadata.entries {
-        if let LinkV2PrivateEntry::FileV2 { link_group, .. } = entry {
-            if groups.insert(*link_group) {
-                if *link_group != next_group {
-                    bail!("historical link groups are not in emitted order");
-                }
-                next_group = next_group
-                    .checked_add(1)
-                    .context("too many historical link groups")?;
+        if let LinkV2PrivateEntry::FileV2 { link_group, .. } = entry
+            && groups.insert(*link_group)
+        {
+            if *link_group != next_group {
+                bail!("historical link groups are not in emitted order");
             }
+            next_group = next_group
+                .checked_add(1)
+                .context("too many historical link groups")?;
         }
     }
     Ok(())
@@ -1247,7 +1258,19 @@ pub(crate) fn render_sector(
             plaintext
         }
         LocalPlaintextSource::StableAnchorFile { locator, offset } => {
-            let mut file = locator.open().context("open stable source anchor")?;
+            let area_hint = control
+                .get_record(ANCHOR_AREA_LOCATION_KIND, locator.area.area_id.as_bytes())?
+                .and_then(|bytes| decode_canonical::<PathBuf>(&bytes).ok());
+            let (mut file, resolved_area) = locator
+                .open_with_area_hint(area_hint.as_deref())
+                .context("open stable source anchor")?;
+            if area_hint.as_ref() != Some(&resolved_area) {
+                control.put_record(
+                    ANCHOR_AREA_LOCATION_KIND,
+                    locator.area.area_id.as_bytes(),
+                    &canonical_bytes(&resolved_area)?,
+                )?;
+            }
             file.seek(SeekFrom::Start(*offset))?;
             let mut plaintext = vec![0_u8; recipe.reference.logical_len as usize];
             file.read_exact(&mut plaintext)?;
