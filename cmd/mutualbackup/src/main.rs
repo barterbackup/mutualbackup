@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mb_core::{KeyMaterial, NodeId, Seed};
 use mb_node::{
-    DirectoryState, Node, NodeServerConfig, PrototypeGuild, commit_source_over_network,
+    DirectoryState, Node, NodeServerConfig, PrototypeGuild, commit_source_over_network_with_intent,
     recover_over_network, serve_directory, serve_node,
 };
 use mb_store::probe_reflink;
@@ -78,6 +78,9 @@ enum Command {
         /// Repeat exactly five times; one endpoint must be this seed's node.
         #[arg(long, required = true)]
         peer: Vec<SocketAddr>,
+        /// Resume the durable commit with this previously printed intent UUID.
+        #[arg(long)]
+        resume_intent: Option<Uuid>,
     },
     /// Recover into an empty target using only the seed and public directory.
     Recover {
@@ -146,13 +149,18 @@ async fn main() -> Result<()> {
             source,
             directory,
             peer,
+            resume_intent,
         } => {
             let seed = read_seed(&seed_file)?;
             let keys = KeyMaterial::from_seed(&seed);
             let source = source
                 .canonicalize()
                 .with_context(|| format!("cannot resolve source {}", source.display()))?;
-            let result = commit_source_over_network(&keys, &source, directory, peer).await?;
+            let intent_id = resume_intent.unwrap_or_else(Uuid::new_v4);
+            println!("commit intent:      {intent_id}");
+            let result =
+                commit_source_over_network_with_intent(&keys, &source, directory, peer, intent_id)
+                    .await?;
             println!("commit succeeded");
             println!("guild id:          {}", hex::encode(result.guild_id));
             println!("checkpoint:        {}", hex::encode(result.checkpoint_hash));

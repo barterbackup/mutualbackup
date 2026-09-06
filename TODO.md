@@ -8,18 +8,6 @@ repair, GC, and multiple parity volumes remains intentionally omitted.
 
 ## P0 — protection can be lost or falsely reported
 
-- [ ] **Separate an intentional new commit from retrying an interrupted one.**
-  The durable `plan_hash` covers only source path, directory address, and peer
-  profiles (`crates/mb-node/src/network.rs:1051-1065`). The owner returns the
-  same guild for that hash forever (`crates/mb-node/src/node.rs:188-209`), and
-  `PrepareSource` is always the same deterministic sequence-1 request
-  (`crates/mb-node/src/network.rs:1076-1084,1824-1852`). Consequently, editing
-  the source and running the same user-facing `commit` command again reports
-  the original checkpoint as a successful commit; the test currently blesses
-  that behavior (`network.rs:2382-2399`). Give each deliberate snapshot a
-  persisted intent ID and make retry/resume explicit; a completed intent must
-  not silently mask later source changes.
-
 - [ ] **Make each signer attest its own failure-domain claim.** The coordinator
   supplies the labels that model validation uses, but local checkpoint
   validation compares only the node and recovery keys

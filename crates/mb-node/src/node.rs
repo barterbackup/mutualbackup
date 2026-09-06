@@ -43,6 +43,7 @@ struct RecoveryJob {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct CoordinatorCommitJournal {
     format_version: u16,
+    intent_id: [u8; 16],
     plan_hash: [u8; 32],
     guild_id: [u8; 32],
     checkpoint_hash: Option<[u8; 32]>,
@@ -185,10 +186,20 @@ impl Node {
         }
     }
 
-    pub fn begin_coordinator_commit(&mut self, plan_hash: [u8; 32]) -> Result<[u8; 32]> {
-        if let Some(bytes) = self.control.get_record("coordinator-commit", &plan_hash)? {
+    pub fn begin_coordinator_commit(
+        &mut self,
+        intent_id: [u8; 16],
+        plan_hash: [u8; 32],
+    ) -> Result<[u8; 32]> {
+        if let Some(bytes) = self
+            .control
+            .get_record("coordinator-commit-intent", &intent_id)?
+        {
             let journal: CoordinatorCommitJournal = decode_canonical(&bytes)?;
-            if journal.format_version != 1 || journal.plan_hash != plan_hash {
+            if journal.format_version != 2
+                || journal.intent_id != intent_id
+                || journal.plan_hash != plan_hash
+            {
                 anyhow::bail!("coordinator commit journal is inconsistent");
             }
             return Ok(journal.guild_id);
@@ -196,14 +207,15 @@ impl Node {
         let mut guild_id = [0_u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut guild_id);
         let journal = CoordinatorCommitJournal {
-            format_version: 1,
+            format_version: 2,
+            intent_id,
             plan_hash,
             guild_id,
             checkpoint_hash: None,
         };
         self.control.put_record(
-            "coordinator-commit",
-            &plan_hash,
+            "coordinator-commit-intent",
+            &intent_id,
             &canonical_bytes(&journal)?,
         )?;
         Ok(guild_id)
@@ -211,16 +223,18 @@ impl Node {
 
     pub fn complete_coordinator_commit(
         &mut self,
+        intent_id: [u8; 16],
         plan_hash: [u8; 32],
         guild_id: [u8; 32],
         checkpoint_hash: [u8; 32],
     ) -> Result<()> {
         let bytes = self
             .control
-            .get_record("coordinator-commit", &plan_hash)?
+            .get_record("coordinator-commit-intent", &intent_id)?
             .context("coordinator commit journal is unavailable")?;
         let mut journal: CoordinatorCommitJournal = decode_canonical(&bytes)?;
-        if journal.format_version != 1
+        if journal.format_version != 2
+            || journal.intent_id != intent_id
             || journal.plan_hash != plan_hash
             || journal.guild_id != guild_id
             || journal
@@ -235,8 +249,8 @@ impl Node {
         }
         journal.checkpoint_hash = Some(checkpoint_hash);
         self.control.put_record(
-            "coordinator-commit",
-            &plan_hash,
+            "coordinator-commit-intent",
+            &intent_id,
             &canonical_bytes(&journal)?,
         )?;
         Ok(())
@@ -981,6 +995,20 @@ mod tests {
         assert!(Node::open(temp.path(), Seed::from_bytes([91; 32])).is_err());
         drop(first);
         Node::open(temp.path(), Seed::from_bytes([91; 32])).unwrap();
+    }
+
+    #[test]
+    fn coordinator_commit_retries_are_explicitly_bound_to_an_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut node = Node::open(temp.path(), Seed::from_bytes([90; 32])).unwrap();
+        let first = node.begin_coordinator_commit([1; 16], [2; 32]).unwrap();
+        assert_eq!(
+            node.begin_coordinator_commit([1; 16], [2; 32]).unwrap(),
+            first
+        );
+        assert!(node.begin_coordinator_commit([1; 16], [3; 32]).is_err());
+        let second = node.begin_coordinator_commit([4; 16], [2; 32]).unwrap();
+        assert_ne!(second, first);
     }
 
     #[test]

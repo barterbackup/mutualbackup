@@ -59,6 +59,7 @@ struct PeerProfile {
 enum PeerRequest {
     Profile,
     BeginCommit {
+        intent_id: [u8; 16],
         plan_hash: [u8; 32],
     },
     PrepareSource {
@@ -126,6 +127,7 @@ enum PeerRequest {
         expires_at_unix_seconds: u64,
     },
     CompleteCommit {
+        intent_id: [u8; 16],
         plan_hash: [u8; 32],
         guild_id: [u8; 32],
         checkpoint_hash: [u8; 32],
@@ -797,8 +799,11 @@ fn execute_peer_request(
             member: node.member(config.failure_domain.clone()),
             endpoint: config.public_endpoint.clone(),
         })),
-        PeerRequest::BeginCommit { plan_hash } => Ok(PeerResponse::CommitStarted {
-            guild_id: node.begin_coordinator_commit(plan_hash)?,
+        PeerRequest::BeginCommit {
+            intent_id,
+            plan_hash,
+        } => Ok(PeerResponse::CommitStarted {
+            guild_id: node.begin_coordinator_commit(intent_id, plan_hash)?,
         }),
         PeerRequest::PrepareSource {
             guild_id,
@@ -975,11 +980,12 @@ fn execute_peer_request(
             )?))
         }
         PeerRequest::CompleteCommit {
+            intent_id,
             plan_hash,
             guild_id,
             checkpoint_hash,
         } => {
-            node.complete_coordinator_commit(plan_hash, guild_id, checkpoint_hash)?;
+            node.complete_coordinator_commit(intent_id, plan_hash, guild_id, checkpoint_hash)?;
             Ok(PeerResponse::Ack)
         }
     }
@@ -1004,6 +1010,23 @@ pub async fn commit_source_over_network(
     source: &Path,
     directory: SocketAddr,
     peer_endpoints: Vec<SocketAddr>,
+) -> Result<NetworkCommitResult> {
+    commit_source_over_network_with_intent(
+        coordinator_keys,
+        source,
+        directory,
+        peer_endpoints,
+        Uuid::new_v4(),
+    )
+    .await
+}
+
+pub async fn commit_source_over_network_with_intent(
+    coordinator_keys: &KeyMaterial,
+    source: &Path,
+    directory: SocketAddr,
+    peer_endpoints: Vec<SocketAddr>,
+    intent_id: Uuid,
 ) -> Result<NetworkCommitResult> {
     if peer_endpoints.len() != 5 {
         bail!("the first network profile requires exactly five peer endpoints");
@@ -1067,7 +1090,10 @@ pub async fn commit_source_over_network(
         peers[0].endpoint,
         peers[0].profile.member.node_id,
         coordinator_keys,
-        PeerRequest::BeginCommit { plan_hash },
+        PeerRequest::BeginCommit {
+            intent_id: *intent_id.as_bytes(),
+            plan_hash,
+        },
     )
     .await?;
     let PeerResponse::CommitStarted { guild_id } = started else {
@@ -1364,6 +1390,7 @@ pub async fn commit_source_over_network(
             peers[0].profile.member.node_id,
             coordinator_keys,
             PeerRequest::CompleteCommit {
+                intent_id: *intent_id.as_bytes(),
                 plan_hash,
                 guild_id,
                 checkpoint_hash,
@@ -2379,19 +2406,22 @@ mod tests {
             peer_tasks.push(task);
         }
 
-        let first_commit = commit_source_over_network(
+        let commit_intent = Uuid::new_v4();
+        let first_commit = commit_source_over_network_with_intent(
             &coordinator_keys,
             &source,
             directory_address,
             peer_addresses.clone(),
+            commit_intent,
         )
         .await
         .unwrap();
-        let retried_commit = commit_source_over_network(
+        let retried_commit = commit_source_over_network_with_intent(
             &coordinator_keys,
             &source,
             directory_address,
             peer_addresses.clone(),
+            commit_intent,
         )
         .await
         .unwrap();
