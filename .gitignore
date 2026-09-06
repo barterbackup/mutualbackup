@@ -1,0 +1,7 @@
+/target/
+/result
+/dist/
+*.db
+*.db-shm
+*.db-wal
+.mutualbackup-anchors/

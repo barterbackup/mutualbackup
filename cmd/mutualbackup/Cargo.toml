@@ -1,0 +1,21 @@
+[package]
+name = "mutualbackup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mutualbackup"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+hex.workspace = true
+mb-core = { path = "../../crates/mb-core" }
+mb-node = { path = "../../crates/mb-node" }
+mb-store = { path = "../../crates/mb-store" }
+tokio.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "mb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake3.workspace = true
+chacha20.workspace = true
+chacha20poly1305.workspace = true
+data-encoding.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+postcard.workspace = true
+rand.workspace = true
+reed-solomon-erasure.workspace = true
+serde.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
