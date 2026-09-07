@@ -20,21 +20,42 @@
       packages.${system}.default = staticBinary;
       checks.${system}.default = staticBinary;
 
-      devShells.${system}.default = pkgs.mkShell {
-        packages = with pkgs; [
-          cargo
-          clang
-          gnumake
-          openssl
-          perl
-          pkg-config
-          rustc
-          rustfmt
-          clippy
-          sqlcipher
-        ];
+      devShells.${system} = {
+        default = pkgs.mkShell {
+          packages = with pkgs; [
+            cargo
+            clang
+            gnumake
+            openssl
+            perl
+            pkg-config
+            rustc
+            rustfmt
+            clippy
+            sqlcipher
+          ];
 
-        RUST_BACKTRACE = "1";
+          RUST_BACKTRACE = "1";
+        };
+
+        # Host-side tools used by scripts/docker-lab.sh. This shell deliberately
+        # does not depend on staticBinary: entering it must not build the project.
+        docker-lab = pkgs.mkShell {
+          packages = with pkgs; [
+            btrfs-progs
+            coreutils
+            docker-client
+            gawk
+            gnugrep
+            gnused
+            util-linux
+          ];
+
+          shellHook = ''
+            echo "MutualBackup Docker lab tools are available."
+            echo "The host must still provide a Docker daemon, sudo/root access, and loop+Btrfs kernel support."
+          '';
+        };
       };
     };
 }

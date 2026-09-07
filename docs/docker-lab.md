@@ -40,10 +40,21 @@ The host must be x86-64 Linux with:
 
 - a running Docker daemon;
 - `sudo` or a root shell;
-- `btrfs-progs` (`mkfs.btrfs`);
-- `util-linux` (`losetup`, `findmnt`, `mountpoint`, `mount`, and `umount`);
 - kernel loop-device and Btrfs support;
 - the two prebuilt static MutualBackup binaries.
+
+Enter the pinned runtime-tools shell before using the controller:
+
+```sh
+nix develop .#docker-lab
+```
+
+That shell supplies the Docker CLI, `btrfs-progs`, `util-linux` loop/mount
+commands, and the ordinary shell utilities used by the controller. It does not
+depend on the MutualBackup Nix package and therefore does not compile the
+project. A development shell cannot provide privileged host services: the
+Docker daemon, `sudo`/root authorization, and kernel loop-device and Btrfs
+support must already exist on the host.
 
 The default binary paths are:
 

@@ -27,7 +27,9 @@ is available as [`mutualbackup.example.toml`](mutualbackup.example.toml).
 For an isolated five-container environment with one disposable loop-backed
 Btrfs filesystem per node, automatic seed/config management, host-visible file
 exchange directories, and node reinitialization from seed, see the
-[`Docker lab guide`](docs/docker-lab.md).
+[`Docker lab guide`](docs/docker-lab.md). Enter its pinned tool environment
+with `nix develop .#docker-lab`; this supplies the host-side commands without
+building MutualBackup.
 
 A new node starts with `mutualbackup init --seed-file SEED --config NODE.toml
 --data-dir DATA --failure-domain LABEL`. Protect the generated seed and retain
