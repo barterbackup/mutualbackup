@@ -174,6 +174,14 @@ struct RootDirtyState {
     reason: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct SeedRecoveryReadiness {
+    format_version: u16,
+    checkpoint_hash: [u8; 32],
+    confirmed_until_unix_seconds: u64,
+    publishers: Vec<NodeId>,
+}
+
 pub type RecoveredShards = BTreeMap<([u8; 32], u8), Vec<u8>>;
 
 pub struct Node {
@@ -892,6 +900,19 @@ impl Node {
         Ok(None)
     }
 
+    pub fn pending_guild_join(&self) -> Result<Option<(SignedRecord<GuildInvite>, GuildPeer)>> {
+        Ok(self
+            .pending_guild()?
+            .map(|pending| (pending.invite, pending.local_peer)))
+    }
+
+    pub fn cancel_pending_guild_join(&mut self) -> Result<()> {
+        if !self.control.delete_record("guild-pending", b"primary")? {
+            anyhow::bail!("this node has no pending guild join to cancel");
+        }
+        Ok(())
+    }
+
     pub fn installed_guild_certificate(&self) -> Result<Option<QuorumGuildGenesis>> {
         Ok(self.installed_guild()?.map(|guild| guild.certificate))
     }
@@ -1277,6 +1298,14 @@ impl Node {
         crate::snapshot::local_recipe_is_inline(&self.control, sector_id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn forget_local_sector(&self, sector_id: &SectorId) -> Result<()> {
+        if !self.control.delete_record("local-sector", sector_id)? {
+            anyhow::bail!("local sector recipe is unavailable");
+        }
+        Ok(())
+    }
+
     pub fn publish_verified_parity(
         &mut self,
         group: &mb_core::CodingGroup,
@@ -1508,13 +1537,12 @@ impl Node {
     }
 
     fn validate_local_member(&self, checkpoint: &GuildCheckpoint) -> Result<()> {
-        if let Some(installed) = self.installed_guild()? {
-            if checkpoint.guild_id != installed.certificate.genesis.guild_id
+        if let Some(installed) = self.installed_guild()?
+            && (checkpoint.guild_id != installed.certificate.genesis.guild_id
                 || checkpoint.genesis_hash != installed.certificate.hash()?
-                || checkpoint.members != installed.certificate.genesis.members
-            {
-                anyhow::bail!("checkpoint is not bound to the installed guild genesis");
-            }
+                || checkpoint.members != installed.certificate.genesis.members)
+        {
+            anyhow::bail!("checkpoint is not bound to the installed guild genesis");
         }
         let member = checkpoint
             .members
@@ -1841,7 +1869,11 @@ impl Node {
             .collect())
     }
 
-    pub fn mark_seed_recovery_ready(&mut self, checkpoint_hash: [u8; 32]) -> Result<()> {
+    pub fn update_seed_recovery_readiness(
+        &mut self,
+        checkpoint_hash: [u8; 32],
+        confirmations: Vec<(NodeId, u64)>,
+    ) -> Result<()> {
         let checkpoint = self.checkpoint(&checkpoint_hash)?;
         if checkpoint.checkpoint.guild_id
             != self
@@ -1853,10 +1885,28 @@ impl Node {
         {
             anyhow::bail!("recovery readiness checkpoint belongs to another guild");
         }
+        let now = unix_seconds();
+        let mut by_publisher = BTreeMap::new();
+        for (publisher, expires_at) in confirmations {
+            if expires_at > now {
+                by_publisher
+                    .entry(publisher)
+                    .and_modify(|current: &mut u64| *current = (*current).max(expires_at))
+                    .or_insert(expires_at);
+            }
+        }
+        let mut expiries = by_publisher.values().copied().collect::<Vec<_>>();
+        expiries.sort_unstable_by(|left, right| right.cmp(left));
+        let confirmed_until_unix_seconds = expiries.get(2).copied().unwrap_or(0);
         self.control.put_record(
             "seed-recovery-ready",
             b"primary",
-            &canonical_bytes(&checkpoint_hash)?,
+            &canonical_bytes(&SeedRecoveryReadiness {
+                format_version: 1,
+                checkpoint_hash,
+                confirmed_until_unix_seconds,
+                publishers: by_publisher.into_keys().collect(),
+            })?,
         )?;
         Ok(())
     }
@@ -1865,13 +1915,19 @@ impl Node {
         let Some(bytes) = self.control.get_record("seed-recovery-ready", b"primary")? else {
             return Ok(false);
         };
-        let ready: [u8; 32] = decode_canonical(&bytes)?;
+        let ready: SeedRecoveryReadiness = decode_canonical(&bytes)?;
+        if ready.format_version != 1
+            || ready.publishers.len() < 3
+            || ready.confirmed_until_unix_seconds <= unix_seconds()
+        {
+            return Ok(false);
+        }
         let Some(installed) = self.installed_guild()? else {
             return Ok(false);
         };
         Ok(self
             .current_checkpoint(installed.certificate.genesis.guild_id)?
-            .is_some_and(|checkpoint| checkpoint.hash().ok() == Some(ready)))
+            .is_some_and(|checkpoint| checkpoint.hash().ok() == Some(ready.checkpoint_hash)))
     }
 
     pub fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>> {
@@ -1935,6 +1991,49 @@ impl Node {
             checkpoint_generation: checkpoint.checkpoint.generation,
             checkpoint_hash: checkpoint.hash()?,
         })
+    }
+
+    pub(crate) fn snapshot_repair_plan(
+        &self,
+        revision_id: Option<Uuid>,
+    ) -> Result<(QuorumCheckpoint, SignedRecord<UserRevision>, Vec<GuildPeer>)> {
+        let installed = self
+            .installed_guild()?
+            .context("this node has no active guild")?;
+        let checkpoint = self
+            .current_checkpoint(installed.certificate.genesis.guild_id)?
+            .context("guild has no committed snapshots")?;
+        checkpoint.verify()?;
+        let revision = match revision_id {
+            Some(revision_id) => checkpoint.checkpoint.revisions.iter().find(|revision| {
+                revision.value.owner == self.keys.node_id()
+                    && revision.value.revision_id == revision_id
+            }),
+            None => checkpoint
+                .checkpoint
+                .revisions
+                .iter()
+                .filter(|revision| revision.value.owner == self.keys.node_id())
+                .max_by_key(|revision| revision.value.sequence),
+        }
+        .cloned()
+        .context("requested snapshot is unavailable for this node")?;
+        Ok((checkpoint, revision, installed.peers))
+    }
+
+    pub(crate) fn install_repaired_information_sector(
+        &mut self,
+        guild_id: [u8; 32],
+        reference: SectorRef,
+        ciphertext: &[u8],
+    ) -> Result<()> {
+        install_recovered_sector_recipe(
+            &mut self.control,
+            &self.keys,
+            guild_id,
+            reference,
+            ciphertext,
+        )
     }
 
     pub fn next_recovery_publication_sequence(

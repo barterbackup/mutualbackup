@@ -12,7 +12,7 @@ use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder, autonat, dcutr, identify, kad, noise, ping, relay,
     request_response, yamux,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use mb_core::{
     CodingGroup, GuildCheckpoint, GuildGenesis, GuildInvite, InformationRole, Member,
@@ -25,11 +25,13 @@ use mb_core::{
 use mb_store::ParityObject;
 use uuid::Uuid;
 
+use crate::node::{GuildPhase, SnapshotInfo};
+
 use super::{
     BackupDescriptor, BackupJob, CheckpointObjectKind, DhtSequenceFloors, GuildPeer, Node,
     NodeServerConfig, NodeService, PEER_RESPONSE_DOMAIN, PeerRequest, PeerRequestEnvelope,
     PeerResponse, PeerResponseEnvelope, checked_catalog_page_count, make_peer_request,
-    process_peer_request, storage_operation_id,
+    peer_error_response, process_peer_request, storage_operation_id,
 };
 
 const P2P_PROTOCOL: StreamProtocol = StreamProtocol::new("/mutualbackup/peer/1");
@@ -39,6 +41,13 @@ const COMMAND_CAPACITY: usize = 128;
 const DHT_TTL: Duration = Duration::from_secs(15 * 60);
 const DHT_REPUBLISH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DHT_MAX_PACKET_BYTES: usize = 128 * 1024;
+const BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+const MAX_DHT_RECORDS_PER_QUERY: usize = 64;
+const MAX_DHT_PROVIDERS_PER_QUERY: usize = 64;
+const MAX_RELAY_RESERVATIONS: usize = 5;
+const MAX_RELAY_CIRCUITS: usize = 8;
+const MAX_RELAY_CIRCUIT_BYTES: u64 = 8 * 1024 * 1024;
+const SHARD_FETCH_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct P2pConfig {
@@ -103,11 +112,14 @@ pub struct P2pEventLoop {
     commands: mpsc::Receiver<Command>,
     inbound_results: mpsc::Receiver<InboundResult>,
     inbound_sender: mpsc::Sender<InboundResult>,
+    inbound_permits: Arc<Semaphore>,
     pending_requests: HashMap<request_response::OutboundRequestId, PendingRequest>,
     pending_dht: HashMap<kad::QueryId, PendingDht>,
     service: Arc<NodeService>,
     server_config: NodeServerConfig,
     advertised_addresses: Vec<Multiaddr>,
+    bootstrap_addresses: Vec<Multiaddr>,
+    bootstrap_retry: tokio::time::Interval,
     connection_paths: HashMap<ConnectionId, (PeerId, P2pPath)>,
     last_application_paths: HashMap<PeerId, P2pPath>,
 }
@@ -125,6 +137,7 @@ struct Behaviour {
     dcutr: Toggle<dcutr::Behaviour>,
     autonat: autonat::Behaviour,
     ping: ping::Behaviour,
+    limits: libp2p::connection_limits::Behaviour,
 }
 
 enum Command {
@@ -208,6 +221,18 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
     let local_peer_id = identity.public().to_peer_id();
     let relay_server_enabled = config.enable_relay_server;
     let hole_punching_enabled = config.enable_hole_punching;
+    let max_connections =
+        u32::try_from(config.max_connections).context("libp2p connection limit exceeds u32")?;
+    let relay_config = relay::Config {
+        max_reservations: MAX_RELAY_RESERVATIONS,
+        max_reservations_per_peer: 1,
+        reservation_duration: Duration::from_secs(15 * 60),
+        max_circuits: MAX_RELAY_CIRCUITS,
+        max_circuits_per_peer: 2,
+        max_circuit_duration: Duration::from_secs(2 * 60),
+        max_circuit_bytes: MAX_RELAY_CIRCUIT_BYTES,
+        ..relay::Config::default()
+    };
     let mut swarm = SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_quic()
@@ -239,12 +264,19 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
                 kademlia,
                 relay_client,
                 relay_server: Toggle::from(
-                    relay_server_enabled
-                        .then(|| relay::Behaviour::new(peer_id, relay::Config::default())),
+                    relay_server_enabled.then(|| relay::Behaviour::new(peer_id, relay_config)),
                 ),
                 dcutr: Toggle::from(hole_punching_enabled.then(|| dcutr::Behaviour::new(peer_id))),
                 autonat: autonat::Behaviour::new(peer_id, autonat::Config::default()),
                 ping: ping::Behaviour::new(ping::Config::new()),
+                limits: libp2p::connection_limits::Behaviour::new(
+                    libp2p::connection_limits::ConnectionLimits::default()
+                        .with_max_pending_incoming(Some(max_connections))
+                        .with_max_pending_outgoing(Some(max_connections))
+                        .with_max_established_incoming(Some(max_connections))
+                        .with_max_established(Some(max_connections))
+                        .with_max_established_per_peer(Some(4)),
+                ),
             }
         })?
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(120)))
@@ -285,6 +317,7 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
         reader_config,
         readers: Mutex::new(Vec::new()),
         max_readers: config.max_connections,
+        active_readers: std::sync::atomic::AtomicUsize::new(0),
     });
     let server_config = NodeServerConfig {
         #[cfg(test)]
@@ -307,11 +340,14 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
             commands: command_receiver,
             inbound_results,
             inbound_sender,
+            inbound_permits: Arc::new(Semaphore::new(config.max_connections)),
             pending_requests: HashMap::new(),
             pending_dht: HashMap::new(),
             service,
             server_config,
             advertised_addresses: config.external_addresses,
+            bootstrap_addresses: config.bootstrap_addresses,
+            bootstrap_retry: tokio::time::interval(BOOTSTRAP_RETRY_INTERVAL),
             connection_paths: HashMap::new(),
             last_application_paths: HashMap::new(),
         },
@@ -777,8 +813,29 @@ impl P2pEventLoop {
                         Err(error) => tracing::warn!(%error, "peer request worker failed"),
                     }
                 }
+                _ = self.bootstrap_retry.tick(), if !self.bootstrap_addresses.is_empty() => {
+                    self.retry_bootstrap();
+                }
                 event = self.swarm.select_next_some() => self.handle_swarm_event(event),
             }
+        }
+    }
+
+    fn retry_bootstrap(&mut self) {
+        for address in &self.bootstrap_addresses {
+            let peer = address.iter().find_map(|protocol| match protocol {
+                libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
+                _ => None,
+            });
+            if peer.is_some_and(|peer| self.swarm.is_connected(&peer)) {
+                continue;
+            }
+            if let Err(error) = self.swarm.dial(address.clone()) {
+                tracing::debug!(%address, %error, "libp2p bootstrap retry was rejected");
+            }
+        }
+        if let Err(error) = self.swarm.behaviour_mut().kademlia.bootstrap() {
+            tracing::debug!(%error, "Kademlia bootstrap retry could not start");
         }
     }
 
@@ -1066,7 +1123,39 @@ impl P2pEventLoop {
                         let service = self.service.clone();
                         let config = self.server_config.clone();
                         let sender = self.inbound_sender.clone();
+                        let permit = match self.inbound_permits.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                match peer_error_response(
+                                    &service,
+                                    &request,
+                                    "peer request capacity is exhausted",
+                                ) {
+                                    Ok(response) => {
+                                        if self
+                                            .swarm
+                                            .behaviour_mut()
+                                            .peer
+                                            .send_response(channel, response)
+                                            .is_err()
+                                        {
+                                            tracing::warn!(
+                                                "overloaded peer disconnected before rejection"
+                                            );
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            %error,
+                                            "could not encode peer overload response"
+                                        );
+                                    }
+                                }
+                                return;
+                            }
+                        };
                         tokio::task::spawn_blocking(move || {
+                            let _permit = permit;
                             let response = process_peer_request(service, &config, request);
                             let _ = sender.blocking_send(InboundResult { channel, response });
                         });
@@ -1121,11 +1210,13 @@ impl P2pEventLoop {
                 kad::QueryResult::GetRecord(result),
             ) => match result {
                 Ok(kad::GetRecordOk::FoundRecord(found)) => {
-                    records.push(DhtRecord {
-                        publisher: found.record.publisher.map(|peer| peer.to_string()),
-                        value: found.record.value,
-                    });
-                    if last {
+                    if records.len() < MAX_DHT_RECORDS_PER_QUERY {
+                        records.push(DhtRecord {
+                            publisher: found.record.publisher.map(|peer| peer.to_string()),
+                            value: found.record.value,
+                        });
+                    }
+                    if last || records.len() == MAX_DHT_RECORDS_PER_QUERY {
                         let _ = response.send(Ok(records));
                     } else {
                         self.pending_dht
@@ -1152,8 +1243,13 @@ impl P2pEventLoop {
                 Ok(kad::GetProvidersOk::FoundProviders {
                     providers: found, ..
                 }) => {
-                    providers.extend(found.into_iter().map(|peer| peer.to_string()));
-                    if last {
+                    for provider in found {
+                        if providers.len() == MAX_DHT_PROVIDERS_PER_QUERY {
+                            break;
+                        }
+                        providers.insert(provider.to_string());
+                    }
+                    if last || providers.len() == MAX_DHT_PROVIDERS_PER_QUERY {
                         let _ = response.send(Ok(providers.into_iter().collect()));
                     } else {
                         self.pending_dht.insert(
@@ -1229,8 +1325,66 @@ pub async fn run_dht_publications(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Res
         if let Err(error) = publish_dht_once(node.clone(), &p2p).await {
             tracing::warn!(%error, "DHT publication/readiness pass failed");
         }
+        if let Err(error) = refresh_guild_endpoints(node.clone(), &p2p).await {
+            tracing::warn!(%error, "DHT endpoint refresh pass failed");
+        }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+async fn refresh_guild_endpoints(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
+    let (guild, local_id) = node_blocking(node, |node| {
+        Ok((node.guild_summary()?, node.keys().node_id()))
+    })
+    .await?;
+    let Some(guild) = guild else {
+        return Ok(());
+    };
+    if !matches!(guild.phase, GuildPhase::Active) {
+        return Ok(());
+    }
+    let mut queries = FuturesUnordered::new();
+    for peer in guild.peers {
+        if peer.member.node_id == local_id {
+            continue;
+        }
+        let member = peer.member.node_id;
+        let peer_id = member.libp2p_peer_id()?.to_string();
+        queries.push(async move { (member, p2p.get_record(endpoint_record_key(&peer_id)).await) });
+    }
+    while let Some((member, records)) = queries.next().await {
+        let records = match records {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::debug!(%member, %error, "guild endpoint lookup failed");
+                continue;
+            }
+        };
+        let endpoint = match select_endpoint_record(member, records) {
+            Ok(Some(endpoint)) => endpoint,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(%member, %error, "guild member published conflicting endpoints");
+                continue;
+            }
+        };
+        for value in endpoint.value.endpoints {
+            let Ok(address) = value.parse::<Multiaddr>() else {
+                tracing::warn!(%member, endpoint = %value, "ignored malformed signed endpoint");
+                continue;
+            };
+            if address.iter().last()
+                != Some(libp2p::multiaddr::Protocol::P2p(member.libp2p_peer_id()?))
+            {
+                tracing::warn!(%member, endpoint = %value, "ignored endpoint bound to another peer");
+                continue;
+            }
+            if let Err(error) = p2p.add_peer_address(member, address).await {
+                tracing::debug!(%member, endpoint = %value, %error, "could not cache signed endpoint");
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn publish_dht_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
@@ -1295,26 +1449,39 @@ async fn publish_dht_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()>
         let key = recovery_bundle_key(local_id, &provider);
         bundle_queries.push(async move { (provider, p2p.get_record(key).await) });
     }
-    let mut valid_publishers = BTreeSet::new();
+    let mut confirmations = Vec::new();
     while let Some((provider, records)) = bundle_queries.next().await {
-        if let Some(bundle) = select_recovery_bundle(&provider, local_id, records?)? {
-            if validate_ready_bundle(
-                node.clone(),
-                &provider,
-                publications.checkpoint_hash,
-                bundle,
-            )
-            .await
-            .is_ok()
-            {
-                valid_publishers.insert(provider.clone());
+        let Ok(records) = records else {
+            tracing::warn!(%provider, "DHT readiness provider lookup failed");
+            continue;
+        };
+        let bundle = match select_recovery_bundle(&provider, local_id, records) {
+            Ok(Some(bundle)) => bundle,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(%provider, %error, "rejected conflicting DHT readiness records");
+                continue;
             }
+        };
+        let publisher = bundle.value.publisher;
+        let expires_at = bundle.value.expires_at_unix_seconds;
+        if validate_ready_bundle(
+            node.clone(),
+            &provider,
+            publications.checkpoint_hash,
+            bundle,
+        )
+        .await
+        .is_ok()
+        {
+            confirmations.push((publisher, expires_at));
         }
     }
-    if valid_publishers.len() >= 3 {
-        let hash = publications.checkpoint_hash;
-        node_blocking(node, move |node| node.mark_seed_recovery_ready(hash)).await?;
-    }
+    let hash = publications.checkpoint_hash;
+    node_blocking(node, move |node| {
+        node.update_seed_recovery_readiness(hash, confirmations)
+    })
+    .await?;
     Ok(())
 }
 
@@ -1344,6 +1511,7 @@ async fn validate_ready_bundle(
             || locator.value.subject != bundle.value.subject
             || locator.value.checkpoint_hash != checkpoint_hash
             || locator.value.expires_at_unix_seconds != bundle.value.expires_at_unix_seconds
+            || !valid_endpoint_values(locator.value.publisher, &locator.value.endpoints)
         {
             bail!("sealed recovery locator differs from its DHT bundle");
         }
@@ -1378,7 +1546,7 @@ pub struct DhtRecoveryResult {
     pub guild_id: [u8; 32],
     pub checkpoint_hash: [u8; 32],
     pub generation: u64,
-    pub revision_id: Uuid,
+    pub revision_id: Option<Uuid>,
 }
 
 #[derive(Clone)]
@@ -1387,14 +1555,20 @@ struct RecoveryCandidate {
     locator: mb_core::RecoveryLocator,
 }
 
+struct ValidatedRecoveryHead {
+    guild_id: [u8; 32],
+    checkpoint_hash: [u8; 32],
+    generation: u64,
+    genesis: QuorumGuildGenesis,
+    checkpoint: QuorumCheckpoint,
+    candidates: Vec<RecoveryCandidate>,
+}
+
 pub async fn recover_from_dht(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
     restore_target: &std::path::Path,
 ) -> Result<DhtRecoveryResult> {
-    if restore_target.exists() {
-        bail!("restore target must not already exist");
-    }
     let subject = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
     let providers = p2p.get_providers(recovery_mailbox_key(subject)).await?;
     let mut bundle_queries = FuturesUnordered::new();
@@ -1404,113 +1578,96 @@ pub async fn recover_from_dht(
     }
     let mut candidates = Vec::new();
     while let Some((provider, records)) = bundle_queries.next().await {
-        if let Some(bundle) = select_recovery_bundle(&provider, subject, records?)? {
-            let provider_for_check = provider.clone();
-            let checked = node_blocking(node.clone(), move |node| {
-                decode_recovery_candidate(node, &provider_for_check, bundle)
-            })
-            .await;
-            if let Ok(candidate) = checked {
-                candidates.push(candidate);
+        let Ok(records) = records else {
+            tracing::warn!(%provider, "recovery provider lookup failed");
+            continue;
+        };
+        let bundle = match select_recovery_bundle(&provider, subject, records) {
+            Ok(Some(bundle)) => bundle,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(%provider, %error, "recovery provider published conflicting records");
+                continue;
+            }
+        };
+        let provider_for_check = provider.clone();
+        match node_blocking(node.clone(), move |node| {
+            decode_recovery_candidate(node, &provider_for_check, bundle)
+        })
+        .await
+        {
+            Ok(candidate) => candidates.push(candidate),
+            Err(error) => {
+                tracing::warn!(%provider, %error, "ignored invalid recovery candidate");
             }
         }
     }
-    let mut head_publishers = BTreeMap::<_, BTreeSet<NodeId>>::new();
-    for candidate in &candidates {
-        head_publishers
+    let mut candidates_by_head = BTreeMap::<_, Vec<RecoveryCandidate>>::new();
+    for candidate in candidates {
+        candidates_by_head
             .entry((
                 candidate.locator.checkpoint_generation,
                 candidate.locator.guild_id,
                 candidate.locator.checkpoint_hash,
             ))
             .or_default()
-            .insert(candidate.publisher);
+            .push(candidate);
     }
-    let highest_generation = head_publishers
+    for group in candidates_by_head.values_mut() {
+        group.sort_by_key(|candidate| candidate.publisher);
+        group.dedup_by_key(|candidate| candidate.publisher);
+    }
+    let mut generations = candidates_by_head
         .iter()
-        .filter(|(_, publishers)| publishers.len() >= 3)
+        .filter(|(_, candidates)| candidates.len() >= 3)
         .map(|((generation, _, _), _)| *generation)
-        .max()
-        .context("Kademlia returned no recovery head confirmed by three publishers")?;
-    let mut heads = head_publishers
-        .iter()
-        .filter(|((generation, _, _), publishers)| {
-            *generation == highest_generation && publishers.len() >= 3
-        })
-        .map(|((_, guild_id, checkpoint_hash), _)| (*guild_id, *checkpoint_hash));
-    let (guild_id, checkpoint_hash) = heads
-        .next()
-        .context("no eligible recovery checkpoint head")?;
-    if heads.next().is_some() {
-        bail!("recovery bundles advertise conflicting quorum checkpoint heads");
-    }
-    candidates.retain(|candidate| {
-        candidate.locator.guild_id == guild_id
-            && candidate.locator.checkpoint_hash == checkpoint_hash
-            && candidate.locator.checkpoint_generation == highest_generation
-    });
-    candidates.sort_by_key(|candidate| candidate.publisher);
-    candidates.dedup_by_key(|candidate| candidate.publisher);
-    if candidates.len() < 3 {
-        bail!("recovery requires current bundles from at least three independent publishers");
-    }
-    for candidate in &candidates {
-        for endpoint in &candidate.locator.endpoints {
-            p2p.add_peer_address(candidate.publisher, endpoint.parse()?)
-                .await?;
-        }
+        .collect::<Vec<_>>();
+    generations.sort_unstable_by(|left, right| right.cmp(left));
+    generations.dedup();
+    if generations.is_empty() {
+        bail!("Kademlia returned no recovery head confirmed by three publishers");
     }
 
-    let mut state_attempts = FuturesUnordered::new();
-    for candidate in &candidates {
-        let publisher = candidate.publisher;
-        state_attempts.push(async move {
-            let genesis = p2p.guild_genesis(publisher, guild_id).await?;
-            let checkpoint =
-                fetch_p2p_checkpoint(p2p, publisher, guild_id, checkpoint_hash).await?;
-            Ok::<_, anyhow::Error>((genesis, checkpoint))
-        });
-    }
-    let mut recovered_state = None;
-    while let Some(attempt) = state_attempts.next().await {
-        if let Ok(state) = attempt {
-            recovered_state = Some(state);
-            break;
+    let mut selected = None;
+    for generation in generations {
+        let mut valid_heads = Vec::new();
+        for ((head_generation, guild_id, checkpoint_hash), head_candidates) in &candidates_by_head {
+            if *head_generation != generation {
+                continue;
+            }
+            match validate_recovery_head(
+                node.clone(),
+                p2p,
+                *guild_id,
+                *checkpoint_hash,
+                generation,
+                head_candidates.clone(),
+            )
+            .await
+            {
+                Ok(head) => valid_heads.push(head),
+                Err(error) => {
+                    tracing::warn!(generation, %error, "ignored uncertified recovery head");
+                }
+            }
+        }
+        match valid_heads.len() {
+            0 => continue,
+            1 => {
+                selected = valid_heads.pop();
+                break;
+            }
+            _ => bail!("multiple certified recovery heads exist at generation {generation}"),
         }
     }
-    let (genesis, checkpoint) =
-        recovered_state.context("no recovery publisher served the certified guild state")?;
-    genesis.verify()?;
-    checkpoint.verify()?;
-    if genesis.genesis.guild_id != guild_id
-        || genesis.hash()? != checkpoint.checkpoint.genesis_hash
-        || checkpoint.checkpoint.guild_id != guild_id
-        || checkpoint.checkpoint.generation != highest_generation
-        || checkpoint.hash()? != checkpoint_hash
-        || checkpoint.checkpoint.members != genesis.genesis.members
-    {
-        bail!("recovered genesis and checkpoint do not form one certified state");
-    }
-    let checkpoint_for_validation = checkpoint.clone();
-    let candidates_for_validation = candidates.clone();
-    let valid_locators = node_blocking(node.clone(), move |node| {
-        Ok(candidates_for_validation
-            .iter()
-            .filter(|candidate| {
-                checkpoint_for_validation
-                    .validate_recovery_authority(
-                        node.keys(),
-                        &candidate.locator,
-                        candidate.publisher,
-                    )
-                    .is_ok()
-            })
-            .count())
-    })
-    .await?;
-    if valid_locators < 3 {
-        bail!("fewer than three recovery locators are authorized by the checkpoint");
-    }
+    let ValidatedRecoveryHead {
+        guild_id,
+        checkpoint_hash,
+        generation,
+        genesis,
+        checkpoint,
+        candidates,
+    } = selected.context("no advertised recovery head could be certified")?;
 
     let local_endpoints = advertised_p2p_endpoints(p2p).await?;
     let mut roster = genesis
@@ -1535,7 +1692,14 @@ pub async fn recover_from_dht(
     }
     let mut endpoint_records = HashMap::new();
     while let Some((member, records)) = endpoint_queries.next().await {
-        endpoint_records.insert(member, records?);
+        match records {
+            Ok(records) => {
+                endpoint_records.insert(member, records);
+            }
+            Err(error) => {
+                tracing::warn!(%member, %error, "endpoint lookup failed during recovery");
+            }
+        }
     }
     for peer in &mut roster {
         if peer.member.node_id == subject {
@@ -1548,18 +1712,32 @@ pub async fn recover_from_dht(
         {
             peer.endpoints = candidate.locator.endpoints.clone();
         }
-        if let Some(endpoint) = select_endpoint_record(
+        match select_endpoint_record(
             peer.member.node_id,
             endpoint_records
                 .remove(&peer.member.node_id)
                 .unwrap_or_default(),
-        )? {
-            peer.endpoints = endpoint.value.endpoints;
+        ) {
+            Ok(Some(endpoint)) => peer.endpoints = endpoint.value.endpoints,
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(member = %peer.member.node_id, %error, "ignored conflicting endpoint records");
+            }
         }
+        let mut usable_endpoints = Vec::new();
         for endpoint in &peer.endpoints {
-            p2p.add_peer_address(peer.member.node_id, endpoint.parse()?)
-                .await?;
+            let Ok(address) = endpoint.parse::<Multiaddr>() else {
+                tracing::warn!(member = %peer.member.node_id, %endpoint, "ignored malformed endpoint");
+                continue;
+            };
+            match p2p.add_peer_address(peer.member.node_id, address).await {
+                Ok(()) => usable_endpoints.push(endpoint.clone()),
+                Err(error) => {
+                    tracing::warn!(member = %peer.member.node_id, %endpoint, %error, "ignored unusable endpoint");
+                }
+            }
         }
+        peer.endpoints = usable_endpoints;
     }
     let recovered_genesis = genesis.clone();
     let recovered_roster = roster.clone();
@@ -1580,20 +1758,102 @@ pub async fn recover_from_dht(
         .iter()
         .filter(|revision| revision.value.owner == subject)
         .max_by_key(|revision| revision.value.sequence)
-        .cloned()
-        .context("recovered member has no protected-root revision")?;
-    let revision_id = revision.value.revision_id;
-    let target = restore_target.to_path_buf();
-    node_blocking(node, move |node| {
-        node.restore_recovered_revision(&checkpoint_hash, guild_id, &revision, &target)
-    })
-    .await?;
+        .cloned();
+    let revision_id = revision.as_ref().map(|revision| revision.value.revision_id);
+    if let Some(revision) = revision {
+        if restore_target.exists() {
+            bail!("restore target must not already exist");
+        }
+        let target = restore_target.to_path_buf();
+        node_blocking(node, move |node| {
+            node.restore_recovered_revision(&checkpoint_hash, guild_id, &revision, &target)
+        })
+        .await?;
+    }
     Ok(DhtRecoveryResult {
         guild_id,
         checkpoint_hash,
-        generation: highest_generation,
+        generation,
         revision_id,
     })
+}
+
+async fn validate_recovery_head(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    guild_id: [u8; 32],
+    checkpoint_hash: [u8; 32],
+    generation: u64,
+    candidates: Vec<RecoveryCandidate>,
+) -> Result<ValidatedRecoveryHead> {
+    for candidate in &candidates {
+        for endpoint in &candidate.locator.endpoints {
+            let Ok(address) = endpoint.parse::<Multiaddr>() else {
+                continue;
+            };
+            if let Err(error) = p2p.add_peer_address(candidate.publisher, address).await {
+                tracing::debug!(publisher = %candidate.publisher, %endpoint, %error, "candidate endpoint was not usable");
+            }
+        }
+    }
+    let mut state_attempts = FuturesUnordered::new();
+    for candidate in &candidates {
+        let publisher = candidate.publisher;
+        state_attempts.push(async move {
+            let genesis = p2p.guild_genesis(publisher, guild_id).await?;
+            let checkpoint =
+                fetch_p2p_checkpoint(p2p, publisher, guild_id, checkpoint_hash).await?;
+            Ok::<_, anyhow::Error>((genesis, checkpoint))
+        });
+    }
+    while let Some(attempt) = state_attempts.next().await {
+        let Ok((genesis, checkpoint)) = attempt else {
+            continue;
+        };
+        let state_matches = (|| -> Result<bool> {
+            genesis.verify()?;
+            checkpoint.verify()?;
+            Ok(genesis.genesis.guild_id == guild_id
+                && genesis.hash()? == checkpoint.checkpoint.genesis_hash
+                && checkpoint.checkpoint.guild_id == guild_id
+                && checkpoint.checkpoint.generation == generation
+                && checkpoint.hash()? == checkpoint_hash
+                && checkpoint.checkpoint.members == genesis.genesis.members)
+        })()
+        .unwrap_or(false);
+        if !state_matches {
+            continue;
+        }
+        let checkpoint_for_validation = checkpoint.clone();
+        let candidates_for_validation = candidates.clone();
+        let valid_candidates = node_blocking(node.clone(), move |node| {
+            Ok(candidates_for_validation
+                .iter()
+                .filter(|candidate| {
+                    checkpoint_for_validation
+                        .validate_recovery_authority(
+                            node.keys(),
+                            &candidate.locator,
+                            candidate.publisher,
+                        )
+                        .is_ok()
+                })
+                .cloned()
+                .collect::<Vec<_>>())
+        })
+        .await?;
+        if valid_candidates.len() >= 3 {
+            return Ok(ValidatedRecoveryHead {
+                guild_id,
+                checkpoint_hash,
+                generation,
+                genesis,
+                checkpoint,
+                candidates: valid_candidates,
+            });
+        }
+    }
+    bail!("no publisher served a certified state authorizing three recovery locators")
 }
 
 fn decode_recovery_candidate(
@@ -1620,7 +1880,7 @@ fn decode_recovery_candidate(
         || locator.value.publisher != bundle.value.publisher
         || locator.value.expires_at_unix_seconds != bundle.value.expires_at_unix_seconds
         || locator.value.expires_at_unix_seconds <= unix_seconds()
-        || locator.value.endpoints.is_empty()
+        || !valid_endpoint_values(locator.value.publisher, &locator.value.endpoints)
     {
         bail!("sealed recovery locator differs from its bundle");
     }
@@ -1676,11 +1936,12 @@ fn select_endpoint_record(
             continue;
         };
         if endpoint.verify(b"mutualbackup/endpoint-record/v1").is_err()
+            || endpoint.value.format_version != 1
             || endpoint.signer != publisher
             || endpoint.value.publisher != publisher
             || endpoint.value.sequence == 0
             || endpoint.value.expires_at_unix_seconds <= unix_seconds()
-            || endpoint.value.endpoints.is_empty()
+            || !valid_endpoint_values(publisher, &endpoint.value.endpoints)
         {
             continue;
         }
@@ -1696,6 +1957,23 @@ fn select_endpoint_record(
         }
     }
     Ok(selected.map(|(_, _, endpoint)| endpoint))
+}
+
+fn valid_endpoint_values(publisher: NodeId, endpoints: &[String]) -> bool {
+    if endpoints.is_empty() || endpoints.len() > 8 {
+        return false;
+    }
+    let Ok(expected) = publisher.libp2p_peer_id() else {
+        return false;
+    };
+    let mut unique = BTreeSet::new();
+    endpoints.iter().all(|value| {
+        value.len() <= 512
+            && unique.insert(value)
+            && value.parse::<Multiaddr>().is_ok_and(|address| {
+                address.iter().last() == Some(libp2p::multiaddr::Protocol::P2p(expected))
+            })
+    })
 }
 
 fn highest_endpoint_sequence(publisher: NodeId, records: Vec<DhtRecord>) -> Result<Option<u64>> {
@@ -1812,56 +2090,7 @@ async fn recover_p2p_local_shards(
         let Some((target_index, target_root)) = target else {
             continue;
         };
-        let mut attempts = futures::stream::FuturesUnordered::new();
-        for (index, role) in group.roles.iter().enumerate() {
-            if index == target_index {
-                continue;
-            }
-            let (holder, root, sector_id) = match role {
-                ShardRole::Information(information) => (
-                    information.owner,
-                    information.sector.root,
-                    Some(information.sector.id),
-                ),
-                ShardRole::Parity(parity) => (parity.holder, parity.root, None),
-            };
-            if !roster
-                .iter()
-                .any(|peer| peer.member.node_id == holder && !peer.endpoints.is_empty())
-            {
-                continue;
-            }
-            let client = p2p.clone();
-            let guild_id = checkpoint.checkpoint.guild_id;
-            let group_id = group.id;
-            attempts.push(async move {
-                let result = if let Some(sector_id) = sector_id {
-                    client.sector(holder, guild_id, sector_id).await
-                } else {
-                    client.parity(holder, guild_id, group_id, index as u8).await
-                };
-                (index, root, result)
-            });
-        }
-        let mut shards = vec![None; 5];
-        while let Some((index, root, result)) = attempts.next().await {
-            if let Ok(bytes) = result
-                && bytes.len() == group.shard_size as usize
-                && sector_root(&bytes) == root
-            {
-                shards[index] = Some(bytes);
-            }
-            if shards.iter().filter(|shard| shard.is_some()).count() >= 3 {
-                break;
-            }
-        }
-        if shards.iter().filter(|shard| shard.is_some()).count() < 3 {
-            bail!("coding group has fewer than three reachable valid shards");
-        }
-        mb_core::reconstruct_3_2(&mut shards)?;
-        let bytes = shards[target_index]
-            .take()
-            .context("target shard was not reconstructed")?;
+        let bytes = reconstruct_shard_from_peers(p2p, group, target_index, roster).await?;
         if sector_root(&bytes) != target_root {
             bail!("reconstructed target shard failed its certified root");
         }
@@ -1879,6 +2108,155 @@ async fn recover_p2p_local_shards(
         .await?;
     }
     Ok(())
+}
+
+async fn reconstruct_shard_from_peers(
+    p2p: &P2pClient,
+    group: &CodingGroup,
+    target_index: usize,
+    roster: &[GuildPeer],
+) -> Result<Vec<u8>> {
+    if target_index >= group.roles.len() {
+        bail!("target shard index is outside its coding group");
+    }
+    for peer in roster {
+        for endpoint in &peer.endpoints {
+            let Ok(address) = endpoint.parse::<Multiaddr>() else {
+                continue;
+            };
+            let _ = p2p.add_peer_address(peer.member.node_id, address).await;
+        }
+    }
+    let mut shards = vec![None; group.roles.len()];
+    for attempt in 0..SHARD_FETCH_ATTEMPTS {
+        let mut requests = FuturesUnordered::new();
+        for (index, role) in group.roles.iter().enumerate() {
+            if index == target_index || shards[index].is_some() {
+                continue;
+            }
+            let (holder, root, sector_id) = match role {
+                ShardRole::Information(information) => (
+                    information.owner,
+                    information.sector.root,
+                    Some(information.sector.id),
+                ),
+                ShardRole::Parity(parity) => (parity.holder, parity.root, None),
+            };
+            if !roster.iter().any(|peer| peer.member.node_id == holder) {
+                continue;
+            }
+            let client = p2p.clone();
+            let guild_id = group.guild_id;
+            let group_id = group.id;
+            requests.push(async move {
+                let result = if let Some(sector_id) = sector_id {
+                    client.sector(holder, guild_id, sector_id).await
+                } else {
+                    client.parity(holder, guild_id, group_id, index as u8).await
+                };
+                (index, root, result)
+            });
+        }
+        while let Some((index, root, result)) = requests.next().await {
+            if let Ok(bytes) = result
+                && bytes.len() == group.shard_size as usize
+                && sector_root(&bytes) == root
+            {
+                shards[index] = Some(bytes);
+            }
+            // Reconstruction needs any three valid shards. Do not wait for an
+            // unrelated offline holder once that threshold has been reached;
+            // cold recovery can span many coding groups and otherwise pays the
+            // full request timeout once per group.
+            if shards.iter().filter(|shard| shard.is_some()).count()
+                >= usize::from(V1_RS_DATA_SHARDS)
+            {
+                break;
+            }
+        }
+        if shards.iter().filter(|shard| shard.is_some()).count() >= usize::from(V1_RS_DATA_SHARDS) {
+            break;
+        }
+        if attempt + 1 < SHARD_FETCH_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    if shards.iter().filter(|shard| shard.is_some()).count() < usize::from(V1_RS_DATA_SHARDS) {
+        bail!(
+            "coding group {} has fewer than three reachable valid shards after {} attempts",
+            hex::encode(group.id),
+            SHARD_FETCH_ATTEMPTS
+        );
+    }
+    mb_core::reconstruct_3_2(&mut shards)?;
+    shards[target_index]
+        .take()
+        .context("target shard was not reconstructed")
+}
+
+pub(crate) async fn restore_snapshot_with_p2p(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    revision_id: Option<Uuid>,
+    target: &std::path::Path,
+) -> Result<SnapshotInfo> {
+    if target.exists() {
+        bail!("restore target must not already exist");
+    }
+    let (checkpoint, revision, roster) = node_blocking(node.clone(), move |node| {
+        node.snapshot_repair_plan(revision_id)
+    })
+    .await?;
+    let guild_id = checkpoint.checkpoint.guild_id;
+    let references = revision
+        .value
+        .metadata_sectors
+        .iter()
+        .chain(&revision.value.data_sectors)
+        .cloned()
+        .collect::<Vec<_>>();
+    for reference in references {
+        let sector_id = reference.id;
+        let expected_root = reference.root;
+        let local_is_valid = node_blocking(node.clone(), move |node| {
+            Ok(node
+                .sector_for_guild(&guild_id, &sector_id)
+                .is_ok_and(|bytes| {
+                    bytes.len() == V1_SECTOR_SIZE && sector_root(&bytes) == expected_root
+                }))
+        })
+        .await?;
+        if local_is_valid {
+            continue;
+        }
+        let (group, target_index) = checkpoint
+            .checkpoint
+            .coding_groups
+            .iter()
+            .find_map(|group| {
+                group
+                    .roles
+                    .iter()
+                    .enumerate()
+                    .find(|(_, role)| {
+                        matches!(role, ShardRole::Information(information) if information.sector == reference)
+                    })
+                    .map(|(index, _)| (group, index))
+            })
+            .context("snapshot sector is not present in the certified coding catalog")?;
+        let bytes = reconstruct_shard_from_peers(p2p, group, target_index, &roster).await?;
+        let reference_for_install = reference.clone();
+        node_blocking(node.clone(), move |node| {
+            node.install_repaired_information_sector(guild_id, reference_for_install, &bytes)
+        })
+        .await?;
+    }
+    let target = target.to_path_buf();
+    let selected_revision = revision.value.revision_id;
+    node_blocking(node, move |node| {
+        node.restore_snapshot(Some(selected_revision), &target)
+    })
+    .await
 }
 
 fn dht_key(kind: &[u8], parts: &[&[u8]]) -> Vec<u8> {
@@ -2460,7 +2838,10 @@ mod tests {
                 publisher,
                 sequence,
                 expires_at_unix_seconds: unix_seconds() + 300,
-                endpoints: vec![format!("/ip4/127.0.0.1/udp/{port}/quic-v1")],
+                endpoints: vec![format!(
+                    "/ip4/127.0.0.1/udp/{port}/quic-v1/p2p/{}",
+                    publisher.libp2p_peer_id().unwrap()
+                )],
             };
             let signed =
                 SignedRecord::sign(b"mutualbackup/endpoint-record/v1", value, &keys).unwrap();
@@ -2631,6 +3012,53 @@ mod tests {
             .unwrap();
         let providers = second_client.get_providers(record_key).await.unwrap();
         assert!(providers.contains(&first_client.local_peer_id()));
+
+        first_client.shutdown().await.unwrap();
+        second_client.shutdown().await.unwrap();
+        first_task.await.unwrap().unwrap();
+        second_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_worker_limit_rejects_overload_and_recovers() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_node = Node::open(temp.path().join("first"), Seed::from_bytes([68; 32])).unwrap();
+        let second_node =
+            Node::open(temp.path().join("second"), Seed::from_bytes([69; 32])).unwrap();
+        let first_id = first_node.keys().node_id();
+        let second_id = second_node.keys().node_id();
+        let (first_client, first_loop) =
+            build_p2p(Arc::new(Mutex::new(first_node)), config(first_id)).unwrap();
+        let mut second_config = config(second_id);
+        second_config.max_connections = 1;
+        let (second_client, second_loop) =
+            build_p2p(Arc::new(Mutex::new(second_node)), second_config).unwrap();
+        let held_permit = second_loop
+            .inbound_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let first_task = tokio::spawn(first_loop.run());
+        let second_task = tokio::spawn(second_loop.run());
+
+        let second_address = listening_address(&second_client).await;
+        first_client
+            .add_peer_address(second_id, second_address)
+            .await
+            .unwrap();
+        let error = first_client.profile(second_id).await.unwrap_err();
+        assert!(error.to_string().contains("capacity is exhausted"));
+        drop(held_permit);
+        assert_eq!(
+            first_client
+                .profile(second_id)
+                .await
+                .unwrap()
+                .member
+                .node_id,
+            second_id
+        );
 
         first_client.shutdown().await.unwrap();
         second_client.shutdown().await.unwrap();
@@ -2886,11 +3314,23 @@ mod tests {
             .unwrap();
         assert_eq!(final_checkpoint.checkpoint.revisions.len(), 2);
         assert!(final_checkpoint.checkpoint.coding_groups.len() >= 4);
-        let healthy_restore = run_root.join("healthy-restore-node-2");
+        let forgotten_sector = final_checkpoint
+            .checkpoint
+            .revisions
+            .iter()
+            .find(|revision| revision.value.owner == nodes[2].lock().unwrap().keys().node_id())
+            .unwrap()
+            .value
+            .metadata_sectors[0]
+            .id;
         nodes[2]
             .lock()
             .unwrap()
-            .restore_snapshot(None, &healthy_restore)
+            .forget_local_sector(&forgotten_sector)
+            .unwrap();
+        let healthy_restore = run_root.join("healthy-restore-node-2");
+        restore_snapshot_with_p2p(nodes[2].clone(), &clients[2], None, &healthy_restore)
+            .await
             .unwrap();
         assert_eq!(
             std::fs::read(healthy_restore.join("documents/content.bin")).unwrap(),
@@ -2934,6 +3374,20 @@ mod tests {
                 .all(|node| node.lock().unwrap().seed_recovery_ready().unwrap()),
             "all subjects must find current bundles from at least three other publishers"
         );
+        let final_hash = final_checkpoint.hash().unwrap();
+        let expires = unix_seconds() + 300;
+        nodes[0]
+            .lock()
+            .unwrap()
+            .update_seed_recovery_readiness(
+                final_hash,
+                vec![
+                    (nodes[1].lock().unwrap().keys().node_id(), expires),
+                    (nodes[2].lock().unwrap().keys().node_id(), expires),
+                ],
+            )
+            .unwrap();
+        assert!(!nodes[0].lock().unwrap().seed_recovery_ready().unwrap());
 
         clients[1].shutdown().await.unwrap();
         clients[4].shutdown().await.unwrap();

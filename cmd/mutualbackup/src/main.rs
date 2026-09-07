@@ -119,6 +119,10 @@ enum GuildCommand {
     Invite,
     /// Join the coordinator's draft using a signed invitation token.
     Join { token: String },
+    /// Retry delivery of a durably pending guild join.
+    Retry,
+    /// Discard a pending guild join so another invitation can be used.
+    Cancel,
     /// Collect all five signatures and install the immutable guild genesis.
     Finalize,
     /// Show local guild membership and onboarding phase.
@@ -229,6 +233,8 @@ async fn main() -> Result<()> {
                 GuildCommand::Create => LocalRequest::GuildCreate,
                 GuildCommand::Invite => LocalRequest::GuildInvite,
                 GuildCommand::Join { token } => LocalRequest::GuildJoin { token },
+                GuildCommand::Retry => LocalRequest::GuildRetry,
+                GuildCommand::Cancel => LocalRequest::GuildCancel,
                 GuildCommand::Finalize => LocalRequest::GuildFinalize,
                 GuildCommand::Status => LocalRequest::GuildStatus,
             };
@@ -318,11 +324,16 @@ async fn main() -> Result<()> {
             let LocalResponse::Recovered(result) = response else {
                 bail!("daemon returned the wrong response to restore request");
             };
-            println!("restore succeeded: {}", target.display());
             println!("guild id:    {}", hex::encode(result.guild_id));
             println!("checkpoint:  {}", hex::encode(result.checkpoint_hash));
             println!("generation:  {}", result.generation);
-            println!("revision:    {}", result.revision_id);
+            if let Some(revision_id) = result.revision_id {
+                println!("restore succeeded: {}", target.display());
+                println!("revision:    {revision_id}");
+            } else {
+                println!("recovery succeeded: guild state and assigned shards restored");
+                println!("revision:    (this node has no protected-root revision)");
+            }
         }
         Command::Snapshot { command } => match command {
             SnapshotCommand::List => {

@@ -406,10 +406,13 @@ EOF
 write_recovery_config() {
     local node=$1
     local bootstrap_node=$2
-    local config relay
+    local config relay relay_server
     config=$(node_config "$node")
     relay='[]'
-    if ((node != 0)) && container_running 0; then
+    relay_server=false
+    if ((node == 0)); then
+        relay_server=true
+    else
         relay="[\"$(peer_endpoint 0)\"]"
     fi
     umask 077
@@ -425,7 +428,7 @@ p2p_listen_addresses = ["/ip4/0.0.0.0/udp/$(node_port "$node")/quic-v1"]
 p2p_external_addresses = ["/ip4/$(node_ip "$node")/udp/$(node_port "$node")/quic-v1"]
 p2p_bootstrap_addresses = ["$(peer_endpoint "$bootstrap_node")"]
 p2p_relay_addresses = $relay
-enable_relay_server = false
+enable_relay_server = $relay_server
 EOF
 }
 
@@ -524,7 +527,10 @@ ensure_guild() {
             invite=$(cli_raw 0 guild invite | sed -n 's/^invitation: //p')
             [[ -n $invite ]] || die "node 0 did not return an invitation for node $node"
             cli_raw "$node" guild join "$invite" >/dev/null
-        elif [[ $node_phase != Joining ]]; then
+        elif [[ $node_phase == Joining ]]; then
+            say "retrying the pending guild join for node $node"
+            cli_raw "$node" guild retry >/dev/null
+        else
             die "node $node is in unexpected guild phase $node_phase"
         fi
     done

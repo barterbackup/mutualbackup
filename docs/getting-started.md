@@ -67,7 +67,7 @@ Paths may be absolute or relative to the TOML file containing them.
 | `p2p_external_addresses` | Concrete addresses advertised to peers. Do not advertise `0.0.0.0` or port `0`. |
 | `p2p_bootstrap_addresses` | Known peers used to enter the Kademlia network, including `/p2p/PEER_ID`. |
 | `p2p_relay_addresses` | Relay nodes on which this node should reserve a circuit, also including `/p2p/PEER_ID`. |
-| `enable_relay_server` | Whether this node accepts circuit-relay reservations for other peers. |
+| `enable_relay_server` | Whether this node accepts rate- and resource-limited circuit-relay reservations. It is opt-in and should remain off on a public address until guild-only admission is implemented. |
 
 The config is not a CLI profile: routine CLI commands still select a daemon
 with `--socket`. This permits several daemons under the same Unix account.

@@ -103,6 +103,13 @@ impl ControlStore {
             .map_err(DatabaseError::from)
     }
 
+    pub fn delete_record(&self, kind: &str, record_id: &[u8]) -> Result<bool, DatabaseError> {
+        Ok(self.connection.execute(
+            "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
+            params![kind, record_id],
+        )? == 1)
+    }
+
     pub fn records(&self, kind: &str) -> Result<Vec<ProtocolRecordRow>, DatabaseError> {
         let mut statement = self.connection.prepare(
             "SELECT record_id, bytes FROM protocol_records WHERE kind = ?1 ORDER BY record_id",

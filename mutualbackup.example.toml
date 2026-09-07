@@ -29,5 +29,6 @@ p2p_external_addresses = ["/ip4/127.0.0.1/udp/44000/quic-v1"]
 p2p_bootstrap_addresses = []
 p2p_relay_addresses = []
 
-# One reachable guild member may provide relay service to the others.
-enable_relay_server = true
+# Relay service is opt-in. Leave it off on a public address until guild-only
+# relay admission is implemented; the private Docker lab enables it explicitly.
+enable_relay_server = false

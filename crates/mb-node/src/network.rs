@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 #[cfg(test)]
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::time::Duration;
@@ -43,6 +44,7 @@ use crate::{
 };
 
 mod p2p;
+pub(crate) use p2p::restore_snapshot_with_p2p;
 pub use p2p::{
     DhtRecord, DhtRecoveryResult, P2pClient, P2pConfig, P2pEventLoop, P2pPath, P2pPeerProfile,
     P2pPeerStatus, P2pStatus, build_p2p, endpoint_record_key, recover_from_dht,
@@ -435,18 +437,31 @@ struct NodeService {
     reader_config: NodeReaderConfig,
     readers: Mutex<Vec<NodeReader>>,
     max_readers: usize,
+    active_readers: AtomicUsize,
 }
 
 impl NodeService {
     fn checkout_reader(&self) -> Result<NodeReader> {
-        if let Some(reader) = self.readers.lock().map_err(lock_error)?.pop() {
-            Ok(reader)
-        } else {
-            self.reader_config.open()
+        self.active_readers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.max_readers).then_some(active + 1)
+            })
+            .map_err(|_| anyhow::anyhow!("peer read capacity is exhausted"))?;
+        let reader = (|| {
+            if let Some(reader) = self.readers.lock().map_err(lock_error)?.pop() {
+                Ok(reader)
+            } else {
+                self.reader_config.open()
+            }
+        })();
+        if reader.is_err() {
+            self.active_readers.fetch_sub(1, Ordering::AcqRel);
         }
+        reader
     }
 
     fn return_reader(&self, reader: NodeReader) -> Result<()> {
+        self.active_readers.fetch_sub(1, Ordering::AcqRel);
         let mut readers = self.readers.lock().map_err(lock_error)?;
         if readers.len() < self.max_readers {
             readers.push(reader);
@@ -721,6 +736,7 @@ pub async fn serve_node(node: Arc<Mutex<Node>>, config: NodeServerConfig) -> Res
         reader_config,
         readers: Mutex::new(Vec::new()),
         max_readers: config.max_connections,
+        active_readers: AtomicUsize::new(0),
     });
     let listener = TcpListener::bind(config.listen).await?;
     let permits = Arc::new(Semaphore::new(config.max_connections));
@@ -969,6 +985,24 @@ fn process_peer_request(
             recipient: caller,
             request_hash: wire_request_hash,
             result: error,
+        },
+        service.reader_config.keys(),
+    )?)
+}
+
+fn peer_error_response(
+    service: &NodeService,
+    signed: &SignedRecord<PeerRequestEnvelope>,
+    message: &str,
+) -> Result<SignedRecord<PeerResponseEnvelope>> {
+    Ok(SignedRecord::sign(
+        PEER_RESPONSE_DOMAIN,
+        PeerResponseEnvelope {
+            format_version: 1,
+            request_id: signed.value.request_id,
+            recipient: signed.signer,
+            request_hash: *blake3::hash(&canonical_bytes(&signed.value)?).as_bytes(),
+            result: Err(message.to_owned()),
         },
         service.reader_config.keys(),
     )?)
@@ -2706,6 +2740,7 @@ mod tests {
             reader_config,
             readers: Mutex::new(Vec::new()),
             max_readers: 2,
+            active_readers: AtomicUsize::new(0),
         });
         let config = NodeServerConfig {
             listen: free_address(),
@@ -2732,6 +2767,27 @@ mod tests {
             Ok(PeerResponse::Profile(_))
         ));
         drop(writer_guard);
+    }
+
+    #[test]
+    fn reader_pool_enforces_its_active_limit_and_recovers() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = Arc::new(Mutex::new(
+            Node::open(temp.path(), Seed::from_bytes([57; 32])).unwrap(),
+        ));
+        let reader_config = node.lock().unwrap().reader_config();
+        let service = NodeService {
+            writer: node,
+            reader_config,
+            readers: Mutex::new(Vec::new()),
+            max_readers: 1,
+            active_readers: AtomicUsize::new(0),
+        };
+        let reader = service.checkout_reader().unwrap();
+        assert!(service.checkout_reader().is_err());
+        service.return_reader(reader).unwrap();
+        let reader = service.checkout_reader().unwrap();
+        service.return_reader(reader).unwrap();
     }
 
     #[tokio::test]

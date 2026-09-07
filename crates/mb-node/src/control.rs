@@ -13,14 +13,16 @@ use mb_core::{QuorumGuildGenesis, SignedRecord, decode_canonical};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::{
     BackupJob, BackupJobState, DhtRecoveryResult, GuildSummary, Node, P2pClient, P2pStatus,
-    SnapshotInfo, recover_from_dht,
+    SnapshotInfo, network::restore_snapshot_with_p2p, recover_from_dht,
 };
 
 const MAX_LOCAL_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_LOCAL_CONNECTIONS: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProtectedRoot {
@@ -54,6 +56,8 @@ pub enum LocalRequest {
     GuildJoin {
         token: String,
     },
+    GuildRetry,
+    GuildCancel,
     GuildFinalize,
     Backup {
         wait: bool,
@@ -148,6 +152,7 @@ pub async fn serve_local_control(
         inode: metadata.ino(),
     };
 
+    let permits = Arc::new(Semaphore::new(MAX_LOCAL_CONNECTIONS));
     loop {
         let (stream, _) = listener.accept().await?;
         let credentials = stream
@@ -160,9 +165,11 @@ pub async fn serve_local_control(
             );
             continue;
         }
+        let permit = permits.clone().acquire_owned().await?;
         let node = node.clone();
         let p2p = p2p.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(error) = handle_connection(node, p2p, stream).await {
                 tracing::warn!(%error, "local control request failed");
             }
@@ -243,27 +250,29 @@ async fn handle_request(
             let bytes = hex::decode(token).context("guild invitation must be hexadecimal")?;
             let invite: SignedRecord<GuildInvite> =
                 decode_canonical(&bytes).context("guild invitation has invalid encoding")?;
-            let coordinator = invite.value.coordinator.clone();
             let endpoints = local_endpoints(&p2p).await?;
             let local_peer = blocking_node(node.clone(), {
                 let invite = invite.clone();
                 move |node| node.begin_join_guild(invite, endpoints)
             })
             .await?;
-            add_peer_endpoints(
-                &p2p,
-                coordinator.node_id,
-                &invite.value.coordinator_endpoints,
-            )
-            .await?;
-            let profile = p2p.profile(coordinator.node_id).await?;
-            if profile.member != coordinator {
-                bail!("connected coordinator profile differs from the signed invitation");
-            }
-            p2p.join_guild(coordinator.node_id, invite, local_peer)
-                .await?;
+            complete_guild_join(&p2p, invite, local_peer).await?;
             let guild = blocking_node(node, |node| node.guild_summary()).await?;
             Ok(LocalResponse::Guild(guild))
+        }
+        LocalRequest::GuildRetry => {
+            let (invite, local_peer) = blocking_node(node.clone(), |node| {
+                node.pending_guild_join()?
+                    .context("this node has no pending guild join to retry")
+            })
+            .await?;
+            complete_guild_join(&p2p, invite, local_peer).await?;
+            let guild = blocking_node(node, |node| node.guild_summary()).await?;
+            Ok(LocalResponse::Guild(guild))
+        }
+        LocalRequest::GuildCancel => {
+            blocking_node(node, |node| node.cancel_pending_guild_join()).await?;
+            Ok(LocalResponse::Guild(None))
         }
         LocalRequest::GuildFinalize => {
             let (genesis, peers, local_signature, local_node) =
@@ -389,14 +398,30 @@ async fn handle_request(
         LocalRequest::SnapshotRestore {
             revision_id,
             target,
-        } => {
-            blocking_node(node, move |node| {
-                node.restore_snapshot(revision_id, &target)
-                    .map(LocalResponse::SnapshotRestored)
-            })
+        } => restore_snapshot_with_p2p(node, &p2p, revision_id, &target)
             .await
-        }
+            .map(LocalResponse::SnapshotRestored),
     }
+}
+
+async fn complete_guild_join(
+    p2p: &P2pClient,
+    invite: SignedRecord<GuildInvite>,
+    local_peer: crate::GuildPeer,
+) -> Result<()> {
+    let coordinator = invite.value.coordinator.clone();
+    add_peer_endpoints(
+        p2p,
+        coordinator.node_id,
+        &invite.value.coordinator_endpoints,
+    )
+    .await?;
+    let profile = p2p.profile(coordinator.node_id).await?;
+    if profile.member != coordinator {
+        bail!("connected coordinator profile differs from the signed invitation");
+    }
+    p2p.join_guild(coordinator.node_id, invite, local_peer)
+        .await
 }
 
 async fn query_backup_job(
