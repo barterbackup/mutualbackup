@@ -84,12 +84,14 @@ For only the five-daemon product acceptance scenario:
 nix develop -c bash scripts/network-smoke.sh /mnt/disposable-btrfs
 ```
 
-The product test creates three checkpoint generations for two owners, kills
-and restarts the coordinator during work, restarts every daemon, then destroys
-one owner's complete local state plus another peer. A fresh daemon derives the
-same identity from the offline recovery string, discovers recovery records from a generic
-bootstrap peer, restores the latest 4 MiB file byte-for-byte, and republishes a
-new reachable endpoint.
+The product test creates checkpoint generations for two owners, resumes a
+failed join and an interrupted backup, repairs deleted local anchors while a
+source and shard holder are unavailable, and rejects poisoned DHT hints. It
+then destroys an owner's complete local state plus another peer, starts the
+owner while its bootstrap is offline, recovers both that owner and the
+storage-only peer from their recovery strings, changes endpoints, restarts the
+guild, and commits another backup. Relay reservations, guild-only admission,
+selected paths, and transferred application bytes are asserted along the way.
 
 The SQLCipher tests verify encrypted pages and HMAC rejection with a wrong key.
 Coding tests reconstruct every supported pair of missing shards.

@@ -5,11 +5,21 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::UdpSocket;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use mb_core::{
+    EndpointRecord, KeyMaterial, NodeId, RecoveryBundle, SealedRecoveryRecord, Seed, SignedRecord,
+    canonical_bytes,
+};
+use mb_node::{
+    Node, P2pConfig, build_p2p, endpoint_record_key, recovery_bundle_key, recovery_mailbox_key,
+};
+use mutualbackup::{DaemonConfig, read_config};
 use uuid::Uuid;
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
@@ -156,7 +166,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     fs::create_dir(&seed_dir).unwrap();
     set_private(&seed_dir);
 
-    let reserved_ports = (0..6)
+    let reserved_ports = (0..9)
         .map(|_| UdpSocket::bind("127.0.0.1:0").unwrap())
         .collect::<Vec<_>>();
     let ports = reserved_ports
@@ -169,6 +179,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         .collect::<Vec<_>>();
 
     let mut peer_ids = Vec::new();
+    let mut node_ids = Vec::new();
     let mut sockets = Vec::new();
     let mut configs = Vec::new();
     for index in 0..5 {
@@ -199,15 +210,17 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
             args.push(os("--enable-relay-server"));
         } else {
             let bootstrap = format!("{}/p2p/{}", transports[0], peer_ids[0]);
-            args.extend([
-                os("--bootstrap"),
-                os(&bootstrap),
-                os("--relay"),
-                os(&bootstrap),
-            ]);
+            args.extend([os("--bootstrap"), os(&bootstrap)]);
         }
         let output = run_cli(&args, CLI_TIMEOUT).unwrap();
+        let recovery_string = fs::read_to_string(&seed).unwrap();
+        assert_eq!(recovery_string.split_whitespace().count(), 24);
         peer_ids.push(value_after(&output, "libp2p peer id: "));
+        node_ids.push(
+            value_after(&output, "node id:       ")
+                .parse::<NodeId>()
+                .unwrap(),
+        );
         sockets.push(socket);
         configs.push(config);
     }
@@ -230,15 +243,42 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         );
     }
 
+    exercise_local_control_limit(&sockets[0], &mut daemons[0]);
+
     cli(&sockets[0], ["guild", "create"], CLI_TIMEOUT);
+    let invite = cli(&sockets[0], ["guild", "invite"], CLI_TIMEOUT);
+    let token = value_after(&invite, "invitation: ");
+    daemons[0].stop();
+    let failed_join = run_cli(
+        &[
+            os("--socket"),
+            sockets[1].as_os_str().to_owned(),
+            os("guild"),
+            os("join"),
+            os(&token),
+        ],
+        CLI_TIMEOUT,
+    )
+    .unwrap_err();
+    assert!(
+        cli(&sockets[1], ["guild", "status"], CLI_TIMEOUT).contains("Joining"),
+        "failed join did not persist a resumable state: {failed_join}"
+    );
+    daemons[0].start();
+    wait_for_status(&sockets[0], &mut daemons[0], Duration::from_secs(30));
     for index in 1..5 {
+        wait_for_status_text(
+            &sockets[index],
+            &mut daemons[index],
+            &peer_ids[0],
+            Duration::from_secs(45),
+        );
+    }
+    assert!(retry_pending_guild_join(&sockets[1], Duration::from_secs(90)).contains("Joining"));
+    for index in 2..5 {
         let invite = cli(&sockets[0], ["guild", "invite"], CLI_TIMEOUT);
         let token = value_after(&invite, "invitation: ");
-        cli(
-            &sockets[index],
-            ["guild", "join", token.as_str()],
-            CLI_TIMEOUT,
-        );
+        join_guild_with_retry(&sockets[index], token.as_str(), Duration::from_secs(90));
     }
     let finalized = cli(&sockets[0], ["guild", "finalize"], Duration::from_secs(60));
     assert!(finalized.contains("members:     5 of 5"));
@@ -265,7 +305,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     let second = cli(&sockets[2], ["backup", "--wait"], Duration::from_secs(120));
     assert!(second.contains("state:      Committed"));
 
-    let expected_latest = deterministic_bytes(4 * 1024 * 1024 + 31, 41);
+    let expected_latest = deterministic_bytes(1024 * 1024 + 31, 41);
     fs::write(
         owner_one_source.join("documents/data.bin"),
         &expected_latest,
@@ -278,15 +318,35 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     daemons[0].start();
     wait_for_status(&sockets[0], &mut daemons[0], Duration::from_secs(30));
     wait_for_backup(&sockets[1], &interrupted_revision, Duration::from_secs(180));
+    wait_for_peer_transfer(
+        &sockets[0],
+        &mut daemons[0],
+        &peer_ids[1],
+        "Direct",
+        Duration::from_secs(30),
+    );
 
     let snapshots = cli(&sockets[1], ["snapshot", "list"], CLI_TIMEOUT);
     assert_eq!(snapshots.lines().count(), 2);
+    remove_anchor_areas(&run_root.join("p1"));
+    let unavailable_source = run_root.join("p2/source-unavailable");
+    fs::rename(&owner_two_source, &unavailable_source).unwrap();
+    wait_for_status_text(
+        &sockets[2],
+        &mut daemons[2],
+        "root dirty:     true",
+        Duration::from_secs(30),
+    );
+    daemons[3].stop();
     let healthy_restore = run_root.join("healthy");
     cli_path(&sockets[1], ["snapshot", "restore"], &healthy_restore);
     assert_eq!(
         fs::read(healthy_restore.join("documents/data.bin")).unwrap(),
         expected_latest
     );
+    daemons[3].start();
+    wait_for_status(&sockets[3], &mut daemons[3], Duration::from_secs(30));
+    fs::rename(&unavailable_source, &owner_two_source).unwrap();
 
     for daemon in &mut daemons {
         daemon.stop();
@@ -313,6 +373,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     daemons[4].stop();
     fs::remove_dir_all(run_root.join("p1")).unwrap();
     fs::remove_dir_all(run_root.join("p4")).unwrap();
+    daemons[0].stop();
 
     let recovered_dir = run_root.join("recovered");
     fs::create_dir(&recovered_dir).unwrap();
@@ -341,35 +402,550 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         CLI_TIMEOUT,
     )
     .unwrap();
-    let mut recovered_daemon = Daemon::new(recovered_config, run_root.join("recovered.log"));
+    let mut recovered_daemon =
+        Daemon::new(recovered_config.clone(), run_root.join("recovered.log"));
     recovered_daemon.start();
     wait_for_status(
         &recovered_socket,
         &mut recovered_daemon,
         Duration::from_secs(30),
     );
+    let isolated_status = cli(&recovered_socket, ["status"], CLI_TIMEOUT);
+    assert!(!isolated_status.contains("peer connection:"));
+    daemons[0].start();
+    wait_for_status(&sockets[0], &mut daemons[0], Duration::from_secs(30));
+    wait_for_status_text(
+        &recovered_socket,
+        &mut recovered_daemon,
+        &peer_ids[0],
+        Duration::from_secs(45),
+    );
+    wait_for_status_text(
+        &sockets[0],
+        &mut daemons[0],
+        &peer_ids[2],
+        Duration::from_secs(45),
+    );
+    let mut dht_noise = DhtNoise::start(
+        run_root.join("dht-noise"),
+        bootstrap.clone(),
+        node_ids[1],
+        peer_ids[2].clone(),
+    );
     let restored = run_root.join("restored-from-seed");
-    cli_path_with_timeout(
+    let recovery_output = cli_path_with_timeout(
         &recovered_socket,
         ["restore"],
         &restored,
         Duration::from_secs(180),
     );
+    assert!(recovery_output.contains("restore succeeded:"));
     assert_eq!(
         fs::read(restored.join("documents/data.bin")).unwrap(),
         expected_latest
     );
+    dht_noise.stop();
     wait_for_recovery_ready(
         &recovered_socket,
         &mut recovered_daemon,
         Duration::from_secs(90),
     );
 
+    let storage_recovered_dir = run_root.join("storage-recovered");
+    fs::create_dir(&storage_recovered_dir).unwrap();
+    set_private(&storage_recovered_dir);
+    let storage_recovered_socket = storage_recovered_dir.join("control.sock");
+    let storage_recovered_config = storage_recovered_dir.join("node.toml");
+    run_cli(
+        &[
+            os("--socket"),
+            storage_recovered_socket.as_os_str().to_owned(),
+            os("recover-init"),
+            os("--seed-file"),
+            seed_dir.join("p4.seed").into_os_string(),
+            os("--config"),
+            storage_recovered_config.as_os_str().to_owned(),
+            os("--data-dir"),
+            storage_recovered_dir.join("state").into_os_string(),
+            os("--listen"),
+            os(&transports[7]),
+            os("--external-address"),
+            os(&transports[7]),
+            os("--bootstrap"),
+            os(&bootstrap),
+        ],
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+    let mut storage_recovered_daemon = Daemon::new(
+        storage_recovered_config.clone(),
+        run_root.join("storage-recovered.log"),
+    );
+    storage_recovered_daemon.start();
+    wait_for_status(
+        &storage_recovered_socket,
+        &mut storage_recovered_daemon,
+        Duration::from_secs(30),
+    );
+    let storage_restore_target = run_root.join("storage-only-restore-target");
+    let storage_recovery = cli_path_with_timeout(
+        &storage_recovered_socket,
+        ["restore"],
+        &storage_restore_target,
+        Duration::from_secs(180),
+    );
+    assert!(storage_recovery.contains("guild state and assigned shards restored"));
+    assert!(!storage_restore_target.exists());
+
+    daemons[0].stop();
+    daemons[2].stop();
+    daemons[3].stop();
     recovered_daemon.stop();
-    for daemon in &mut daemons {
-        daemon.stop();
-    }
+    storage_recovered_daemon.stop();
+
+    let relay = format!("{}/p2p/{}", transports[5], peer_ids[1]);
+    update_config(&recovered_config, |config| {
+        config.enable_relay_server = true
+    });
+    update_config(&configs[3], |config| {
+        config.p2p_listen_addresses = vec![transports[6].clone()];
+        config.p2p_external_addresses = vec![transports[3].clone()];
+        config.p2p_relay_addresses = vec![relay.clone()];
+        config.enable_hole_punching = true;
+    });
+    update_config(&storage_recovered_config, |config| {
+        config.p2p_listen_addresses.clear();
+        config.p2p_external_addresses.clear();
+        config.p2p_relay_addresses = vec![relay.clone()];
+        config.enable_hole_punching = false;
+    });
+
+    daemons[0].start();
+    wait_for_status(&sockets[0], &mut daemons[0], Duration::from_secs(30));
+    recovered_daemon.start();
+    wait_for_status(
+        &recovered_socket,
+        &mut recovered_daemon,
+        Duration::from_secs(30),
+    );
+    daemons[2].start();
+    daemons[3].start();
+    storage_recovered_daemon.start();
+    wait_for_status(&sockets[2], &mut daemons[2], Duration::from_secs(30));
+    wait_for_status(&sockets[3], &mut daemons[3], Duration::from_secs(30));
+    wait_for_status(
+        &storage_recovered_socket,
+        &mut storage_recovered_daemon,
+        Duration::from_secs(30),
+    );
+    wait_for_status_text(
+        &sockets[3],
+        &mut daemons[3],
+        "/p2p-circuit",
+        Duration::from_secs(45),
+    );
+    wait_for_status_text(
+        &storage_recovered_socket,
+        &mut storage_recovered_daemon,
+        "/p2p-circuit",
+        Duration::from_secs(45),
+    );
+
+    let final_owner_two = deterministic_bytes(512_031, 83);
+    fs::write(
+        owner_two_source.join("documents/data.bin"),
+        &final_owner_two,
+    )
+    .unwrap();
+    let topology_backup = cli(&sockets[2], ["backup", "--wait"], Duration::from_secs(180));
+    assert!(topology_backup.contains("state:      Committed"));
+    wait_for_peer_transfer(
+        &sockets[0],
+        &mut daemons[0],
+        &peer_ids[1],
+        "Direct",
+        Duration::from_secs(30),
+    );
+    wait_for_peer_bytes(
+        &sockets[0],
+        &mut daemons[0],
+        &peer_ids[3],
+        Duration::from_secs(30),
+    );
+    wait_for_peer_bytes(
+        &sockets[0],
+        &mut daemons[0],
+        &peer_ids[4],
+        Duration::from_secs(30),
+    );
+
+    let outsider_dir = run_root.join("outsider");
+    fs::create_dir(&outsider_dir).unwrap();
+    set_private(&outsider_dir);
+    let outsider_socket = outsider_dir.join("control.sock");
+    let outsider_config = outsider_dir.join("node.toml");
+    run_cli(
+        &[
+            os("--socket"),
+            outsider_socket.as_os_str().to_owned(),
+            os("init"),
+            os("--seed-file"),
+            seed_dir.join("outsider.seed").into_os_string(),
+            os("--config"),
+            outsider_config.as_os_str().to_owned(),
+            os("--data-dir"),
+            outsider_dir.join("state").into_os_string(),
+            os("--failure-domain"),
+            os("outsider"),
+            os("--listen"),
+            os(&transports[8]),
+            os("--external-address"),
+            os(&transports[8]),
+            os("--bootstrap"),
+            os(&bootstrap),
+            os("--relay"),
+            os(&relay),
+        ],
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+    let mut outsider_daemon = Daemon::new(outsider_config, run_root.join("outsider.log"));
+    outsider_daemon.start();
+    wait_for_status(
+        &outsider_socket,
+        &mut outsider_daemon,
+        Duration::from_secs(30),
+    );
+    thread::sleep(Duration::from_secs(7));
+    let outsider_status = cli(&outsider_socket, ["status"], CLI_TIMEOUT);
+    assert!(
+        !outsider_status.contains("/p2p-circuit"),
+        "nonmember obtained a guild-only relay reservation:\n{outsider_status}"
+    );
+    outsider_daemon.stop();
+    storage_recovered_daemon.stop();
+    recovered_daemon.stop();
+    daemons[0].stop();
+    daemons[2].stop();
+    daemons[3].stop();
     fs::remove_dir_all(&run_root).unwrap();
+}
+
+struct DhtNoise {
+    shutdown: Option<mpsc::Sender<()>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl DhtNoise {
+    fn start(
+        data_dir: PathBuf,
+        bootstrap: String,
+        recovery_subject: NodeId,
+        poisoned_endpoint_peer: String,
+    ) -> Self {
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let seed = Seed::from_bytes([211; 32]);
+                let keys = KeyMaterial::from_seed(&seed);
+                let publisher = keys.node_id();
+                let node = Arc::new(Mutex::new(Node::open(data_dir, seed).unwrap()));
+                let (client, event_loop) = build_p2p(
+                    node,
+                    P2pConfig {
+                        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
+                        external_addresses: Vec::new(),
+                        bootstrap_addresses: vec![bootstrap.parse().unwrap()],
+                        relay_reservation_addresses: Vec::new(),
+                        enable_relay_server: false,
+                        enable_hole_punching: true,
+                        public_endpoint: "/ip4/127.0.0.1/udp/0/quic-v1".into(),
+                        failure_domain: "malicious-dht-publisher".into(),
+                        configure_failure_domain: true,
+                        max_connections: 4,
+                    },
+                )
+                .unwrap();
+                let event_task = tokio::spawn(event_loop.run());
+                let outcome = async {
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+                    let status = loop {
+                        let status = client.status().await?;
+                        if !status.peers.is_empty() {
+                            break status;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            anyhow::bail!("malicious DHT publisher did not reach bootstrap");
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    };
+                    let peer_id = client.local_peer_id();
+                    let expired_bundle = SignedRecord::sign(
+                        b"mutualbackup/recovery-bundle/v1",
+                        RecoveryBundle {
+                            format_version: 1,
+                            subject: recovery_subject,
+                            publisher,
+                            sequence: u64::MAX,
+                            expires_at_unix_seconds: unix_seconds().saturating_sub(1),
+                            sealed: SealedRecoveryRecord {
+                                format_version: 1,
+                                ephemeral_public_key: [1; 32],
+                                nonce: [2; 24],
+                                ciphertext: vec![3],
+                            },
+                        },
+                        &keys,
+                    )?;
+                    client
+                        .put_record(
+                            recovery_bundle_key(recovery_subject, &peer_id),
+                            canonical_bytes(&expired_bundle)?,
+                        )
+                        .await?;
+                    client
+                        .start_providing(recovery_mailbox_key(recovery_subject))
+                        .await?;
+
+                    let endpoint = status
+                        .advertised_addresses
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("noise node has no endpoint"))?;
+                    let poisoned_endpoint = SignedRecord::sign(
+                        b"mutualbackup/endpoint-record/v1",
+                        EndpointRecord {
+                            format_version: 1,
+                            publisher,
+                            sequence: u64::MAX,
+                            expires_at_unix_seconds: unix_seconds() + 300,
+                            endpoints: vec![format!("{endpoint}/p2p/{peer_id}")],
+                        },
+                        &keys,
+                    )?;
+                    client
+                        .put_record(
+                            endpoint_record_key(&poisoned_endpoint_peer),
+                            canonical_bytes(&poisoned_endpoint)?,
+                        )
+                        .await?;
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await;
+                ready_sender
+                    .send(outcome.map_err(|error| format!("{error:#}")))
+                    .unwrap();
+                loop {
+                    match shutdown_receiver.try_recv() {
+                        Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                        Err(mpsc::TryRecvError::Empty) => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+                client.shutdown().await.unwrap();
+                event_task.await.unwrap().unwrap();
+            });
+        });
+        ready_receiver
+            .recv_timeout(Duration::from_secs(45))
+            .expect("malicious DHT publisher did not report readiness")
+            .unwrap();
+        Self {
+            shutdown: Some(shutdown_sender),
+            worker: Some(worker),
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+
+impl Drop for DhtNoise {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn exercise_local_control_limit(socket: &Path, daemon: &mut Daemon) {
+    let held = (0..17)
+        .map(|_| UnixStream::connect(socket).unwrap())
+        .collect::<Vec<_>>();
+    thread::sleep(Duration::from_millis(250));
+    let saturated = run_cli(
+        &[os("--socket"), socket.as_os_str().to_owned(), os("status")],
+        Duration::from_millis(750),
+    );
+    assert!(
+        saturated.is_err(),
+        "control connection N+1 was not backpressured"
+    );
+    drop(held);
+    wait_for_status(socket, daemon, Duration::from_secs(10));
+}
+
+fn join_guild_with_retry(socket: &Path, token: &str, timeout: Duration) {
+    let initial = [
+        os("--socket"),
+        socket.as_os_str().to_owned(),
+        os("guild"),
+        os("join"),
+        os(token),
+    ];
+    if run_cli(&initial, CLI_TIMEOUT).is_ok() {
+        return;
+    }
+    retry_pending_guild_join(socket, timeout);
+}
+
+fn retry_pending_guild_join(socket: &Path, timeout: Duration) -> String {
+    let retry = [
+        os("--socket"),
+        socket.as_os_str().to_owned(),
+        os("guild"),
+        os("retry"),
+    ];
+    let deadline = Instant::now() + timeout;
+    loop {
+        match run_cli(&retry, CLI_TIMEOUT) {
+            Ok(output) => return output,
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "pending guild join never resumed: {error}"
+                );
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+fn remove_anchor_areas(node_dir: &Path) {
+    let areas = fs::read_dir(node_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with(".mutualbackup-anchors-"))
+        })
+        .collect::<Vec<_>>();
+    assert!(!areas.is_empty(), "no local source-anchor area was created");
+    for area in areas {
+        fs::remove_dir_all(area).unwrap();
+    }
+}
+
+fn update_config(path: &Path, update: impl FnOnce(&mut DaemonConfig)) {
+    let mut config = read_config(path).unwrap();
+    update(&mut config);
+    config.validate().unwrap();
+    fs::write(path, toml::to_string_pretty(&config).unwrap()).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    OpenOptions::new()
+        .read(true)
+        .open(path)
+        .unwrap()
+        .sync_all()
+        .unwrap();
+}
+
+fn wait_for_status_text(
+    socket: &Path,
+    daemon: &mut Daemon,
+    expected: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = wait_for_status(socket, daemon, Duration::from_secs(5));
+        if status.contains(expected) {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "status never contained {expected:?}:\n{status}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_peer_transfer(
+    socket: &Path,
+    daemon: &mut Daemon,
+    peer_id: &str,
+    path: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = wait_for_status(socket, daemon, Duration::from_secs(5));
+        if let Some(line) = status.lines().find(|line| {
+            line.strip_prefix("peer connection: ")
+                .is_some_and(|tail| tail.starts_with(peer_id))
+        }) {
+            let sent = numeric_status_field(line, "sent=");
+            let received = numeric_status_field(line, "received=");
+            if line.contains(&format!("last-application=Some({path})"))
+                && sent.is_some_and(|bytes| bytes > 0)
+                && received.is_some_and(|bytes| bytes > 0)
+            {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "peer {peer_id} never transferred over {path}:\n{status}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_peer_bytes(socket: &Path, daemon: &mut Daemon, peer_id: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = wait_for_status(socket, daemon, Duration::from_secs(5));
+        if let Some(line) = status.lines().find(|line| {
+            line.strip_prefix("peer connection: ")
+                .is_some_and(|tail| tail.starts_with(peer_id))
+        }) {
+            let sent = numeric_status_field(line, "sent=");
+            let received = numeric_status_field(line, "received=");
+            if sent.is_some_and(|bytes| bytes > 0) && received.is_some_and(|bytes| bytes > 0) {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "peer {peer_id} never transferred application bytes:\n{status}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn numeric_status_field(line: &str, prefix: &str) -> Option<u64> {
+    line.split_ascii_whitespace()
+        .find_map(|field| field.strip_prefix(prefix))?
+        .parse()
+        .ok()
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn os(value: impl AsRef<OsStr>) -> OsString {

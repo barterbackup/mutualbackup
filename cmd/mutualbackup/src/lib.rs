@@ -33,6 +33,8 @@ pub struct DaemonConfig {
     pub p2p_relay_addresses: Vec<String>,
     #[serde(default)]
     pub enable_relay_server: bool,
+    #[serde(default = "default_enable_hole_punching")]
+    pub enable_hole_punching: bool,
 }
 
 impl DaemonConfig {
@@ -48,8 +50,8 @@ impl DaemonConfig {
         if self.parity_budget_bytes == 0 {
             bail!("parity_budget_bytes must be greater than zero");
         }
-        if self.p2p_listen_addresses.is_empty() {
-            bail!("at least one p2p listen address is required");
+        if self.p2p_listen_addresses.is_empty() && self.p2p_relay_addresses.is_empty() {
+            bail!("at least one p2p listen or relay address is required");
         }
         if let Some(seed_file) = &self.seed_file
             && (self.data_dir == *seed_file || self.control_socket == *seed_file)
@@ -62,6 +64,10 @@ impl DaemonConfig {
 
 pub fn default_p2p_listen_addresses() -> Vec<String> {
     vec!["/ip4/0.0.0.0/udp/0/quic-v1".to_owned()]
+}
+
+fn default_enable_hole_punching() -> bool {
+    true
 }
 
 pub fn read_config(path: &Path) -> Result<DaemonConfig> {
@@ -237,6 +243,7 @@ mod tests {
                 p2p_bootstrap_addresses: Vec::new(),
                 p2p_relay_addresses: Vec::new(),
                 enable_relay_server: false,
+                enable_hole_punching: true,
             },
         )
         .unwrap();

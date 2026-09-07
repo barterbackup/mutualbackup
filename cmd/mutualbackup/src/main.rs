@@ -61,6 +61,9 @@ enum Command {
         p2p_relay_addresses: Vec<String>,
         #[arg(long, requires = "config")]
         enable_relay_server: bool,
+        /// Do not attempt DCUtR upgrades of relay connections.
+        #[arg(long, requires = "config")]
+        disable_hole_punching: bool,
     },
     /// Derive public identity from a recovery string.
     Identity {
@@ -118,6 +121,9 @@ enum Command {
         p2p_bootstrap_addresses: Vec<String>,
         #[arg(long = "relay")]
         p2p_relay_addresses: Vec<String>,
+        /// Do not attempt DCUtR upgrades of relay connections.
+        #[arg(long)]
+        disable_hole_punching: bool,
     },
     /// Restore this identity's latest revision through the recovery-mode daemon.
     Restore { target: PathBuf },
@@ -184,6 +190,7 @@ async fn main() -> Result<()> {
             p2p_bootstrap_addresses,
             p2p_relay_addresses,
             enable_relay_server,
+            disable_hole_punching,
         } => {
             let generated = !seed_stdin && !prompt_recovery;
             let recovery = if seed_stdin {
@@ -233,6 +240,7 @@ async fn main() -> Result<()> {
                     p2p_bootstrap_addresses,
                     p2p_relay_addresses,
                     enable_relay_server,
+                    enable_hole_punching: !disable_hole_punching,
                 };
                 write_config(&config_path, &config)?;
                 println!("daemon config written to: {}", config_path.display());
@@ -271,6 +279,12 @@ async fn main() -> Result<()> {
             }
             if let Some(network) = status.network {
                 println!("libp2p peer id: {}", network.peer_id);
+                for address in network.listen_addresses {
+                    println!("listen address: {address}");
+                }
+                for address in network.advertised_addresses {
+                    println!("advertised address: {address}");
+                }
                 for peer in network.peers {
                     println!(
                         "peer connection: {} active={:?} last-application={:?} sent={} received={}",
@@ -371,6 +385,7 @@ async fn main() -> Result<()> {
             p2p_external_addresses,
             p2p_bootstrap_addresses,
             p2p_relay_addresses,
+            disable_hole_punching,
         } => {
             let recovery = recovery_input(seed_file.as_deref(), seed_stdin).await?;
             let seed = derive_seed(&recovery)
@@ -403,6 +418,7 @@ async fn main() -> Result<()> {
                     p2p_bootstrap_addresses,
                     p2p_relay_addresses,
                     enable_relay_server: false,
+                    enable_hole_punching: !disable_hole_punching,
                 },
             )?;
             println!("recovery daemon config written to: {}", config.display());

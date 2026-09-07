@@ -94,6 +94,22 @@ fn start_node_runtime(
     config: &DaemonConfig,
     node: Node,
 ) -> Result<(Arc<Mutex<Node>>, mb_node::P2pClient, mb_node::P2pEventLoop)> {
+    let direct_endpoint = config
+        .p2p_external_addresses
+        .first()
+        .or_else(|| config.p2p_listen_addresses.first())
+        .cloned();
+    let public_endpoint = match direct_endpoint {
+        Some(endpoint) => endpoint,
+        None => format!(
+            "{}/p2p-circuit/p2p/{}",
+            config
+                .p2p_relay_addresses
+                .first()
+                .context("validated config has no relay address")?,
+            config.expected_node_id.libp2p_peer_id()?
+        ),
+    };
     let node = Arc::new(Mutex::new(node));
     let p2p_config = P2pConfig {
         listen_addresses: parse_addresses(&config.p2p_listen_addresses)?,
@@ -101,13 +117,8 @@ fn start_node_runtime(
         bootstrap_addresses: parse_addresses(&config.p2p_bootstrap_addresses)?,
         relay_reservation_addresses: parse_addresses(&config.p2p_relay_addresses)?,
         enable_relay_server: config.enable_relay_server,
-        enable_hole_punching: true,
-        public_endpoint: config
-            .p2p_external_addresses
-            .first()
-            .or_else(|| config.p2p_listen_addresses.first())
-            .cloned()
-            .expect("validated config has a listen address"),
+        enable_hole_punching: config.enable_hole_punching,
+        public_endpoint,
         failure_domain: config.failure_domain.clone(),
         configure_failure_domain: !config.recovery_mode,
         max_connections: 32,

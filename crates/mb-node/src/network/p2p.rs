@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, stream::FuturesUnordered};
+use libp2p::core::transport::ListenerId;
 use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{ConnectionId, NetworkBehaviour, StreamProtocol, SwarmEvent};
@@ -42,6 +43,7 @@ const DHT_TTL: Duration = Duration::from_secs(15 * 60);
 const DHT_REPUBLISH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DHT_MAX_PACKET_BYTES: usize = 128 * 1024;
 const BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+const RELAY_RESERVATION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_DHT_RECORDS_PER_QUERY: usize = 64;
 const MAX_DHT_PROVIDERS_PER_QUERY: usize = 64;
 const MAX_RELAY_RESERVATIONS: usize = 5;
@@ -122,6 +124,9 @@ pub struct P2pEventLoop {
     advertised_addresses: Vec<Multiaddr>,
     bootstrap_addresses: Vec<Multiaddr>,
     bootstrap_retry: tokio::time::Interval,
+    relay_reservations: Vec<Multiaddr>,
+    relay_listeners: HashMap<ListenerId, Multiaddr>,
+    relay_retry: tokio::time::Interval,
     connection_paths: HashMap<ConnectionId, (PeerId, P2pPath)>,
     last_application_paths: HashMap<PeerId, P2pPath>,
     transfer_counters: HashMap<PeerId, TransferCounters>,
@@ -213,24 +218,33 @@ enum PendingDht {
 }
 
 fn guild_relay_admission(node: Arc<Mutex<Node>>) -> Box<dyn relay::RateLimiter> {
-    Box::new(move |peer: PeerId, _address: &Multiaddr, _now: std::time::Instant| {
-        let Ok(node) = node.lock() else {
-            return false;
-        };
-        let Ok(Some(guild)) = node.guild_summary() else {
-            return false;
-        };
-        guild.phase == GuildPhase::Active
-            && guild.peers.iter().any(|candidate| {
-                candidate.member.node_id.libp2p_peer_id().ok() == Some(peer)
-            })
-    })
+    Box::new(
+        move |peer: PeerId, _address: &Multiaddr, _now: std::time::Instant| {
+            let Ok(node) = node.lock() else {
+                return false;
+            };
+            let Ok(Some(guild)) = node.guild_summary() else {
+                return false;
+            };
+            let admitted = guild.phase == GuildPhase::Active
+                && guild
+                    .peers
+                    .iter()
+                    .any(|candidate| candidate.member.node_id.libp2p_peer_id().ok() == Some(peer));
+            tracing::debug!(%peer, admitted, "relay guild admission decision");
+            admitted
+        },
+    )
 }
 
 fn cbor_wire_len<T: serde::Serialize>(value: &T) -> Result<u64> {
     let bytes = cbor4ii::serde::to_vec(Vec::new(), value)
         .map_err(|error| anyhow::anyhow!("CBOR size accounting failed: {error}"))?;
     Ok(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+}
+
+fn retry_interval(period: Duration) -> tokio::time::Interval {
+    tokio::time::interval_at(tokio::time::Instant::now() + period, period)
 }
 
 pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient, P2pEventLoop)> {
@@ -333,14 +347,18 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
             tracing::warn!(%address, %error, "initial libp2p dial was rejected");
         }
     }
+    let mut relay_reservations = Vec::new();
+    let mut relay_listeners = HashMap::new();
     for address in &config.relay_reservation_addresses {
         add_address_to_swarm(&mut swarm, address.clone())?;
         let reservation = address
             .clone()
             .with(libp2p::multiaddr::Protocol::P2pCircuit);
-        swarm
+        let listener = swarm
             .listen_on(reservation.clone())
             .with_context(|| format!("cannot request relay reservation through {reservation}"))?;
+        relay_reservations.push(reservation.clone());
+        relay_listeners.insert(listener, reservation);
     }
     if !config.bootstrap_addresses.is_empty()
         && let Err(error) = swarm.behaviour_mut().kademlia.bootstrap()
@@ -384,7 +402,10 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
             server_config,
             advertised_addresses: config.external_addresses,
             bootstrap_addresses: config.bootstrap_addresses,
-            bootstrap_retry: tokio::time::interval(BOOTSTRAP_RETRY_INTERVAL),
+            bootstrap_retry: retry_interval(BOOTSTRAP_RETRY_INTERVAL),
+            relay_reservations,
+            relay_listeners,
+            relay_retry: retry_interval(RELAY_RESERVATION_RETRY_INTERVAL),
             connection_paths: HashMap::new(),
             last_application_paths: HashMap::new(),
             transfer_counters: HashMap::new(),
@@ -859,6 +880,9 @@ impl P2pEventLoop {
                 _ = self.bootstrap_retry.tick(), if !self.bootstrap_addresses.is_empty() => {
                     self.retry_bootstrap();
                 }
+                _ = self.relay_retry.tick(), if !self.relay_reservations.is_empty() => {
+                    self.retry_relay_reservations();
+                }
                 event = self.swarm.select_next_some() => self.handle_swarm_event(event),
             }
         }
@@ -879,6 +903,26 @@ impl P2pEventLoop {
         }
         if let Err(error) = self.swarm.behaviour_mut().kademlia.bootstrap() {
             tracing::debug!(%error, "Kademlia bootstrap retry could not start");
+        }
+    }
+
+    fn retry_relay_reservations(&mut self) {
+        for reservation in &self.relay_reservations {
+            if self
+                .relay_listeners
+                .values()
+                .any(|pending| pending == reservation)
+            {
+                continue;
+            }
+            match self.swarm.listen_on(reservation.clone()) {
+                Ok(listener) => {
+                    self.relay_listeners.insert(listener, reservation.clone());
+                }
+                Err(error) => {
+                    tracing::warn!(%reservation, %error, "relay reservation retry was rejected");
+                }
+            }
         }
     }
 
@@ -1106,11 +1150,28 @@ impl P2pEventLoop {
                 }
                 tracing::info!(?event, "DCUtR event");
             }
+            SwarmEvent::Behaviour(BehaviourEvent::RelayClient(event)) => {
+                tracing::info!(?event, "relay client event");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::RelayServer(event)) => {
+                tracing::info!(?event, "relay server event");
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Autonat(event)) => {
                 tracing::debug!(?event, "AutoNAT event");
             }
             SwarmEvent::NewListenAddr { address, .. } => {
                 tracing::info!(%address, "libp2p listening");
+            }
+            event @ SwarmEvent::ListenerError { .. } => {
+                tracing::warn!(?event, "libp2p listener failed");
+            }
+            SwarmEvent::ListenerClosed {
+                listener_id,
+                addresses,
+                reason,
+            } => {
+                self.relay_listeners.remove(&listener_id);
+                tracing::warn!(?listener_id, ?addresses, ?reason, "libp2p listener closed");
             }
             SwarmEvent::ConnectionEstablished {
                 peer_id,
@@ -3041,8 +3102,11 @@ mod tests {
             .enumerate()
             .map(|(index, seed)| {
                 Arc::new(Mutex::new(
-                    Node::open(temp.join(format!("guild-{index}")), Seed::from_bytes([seed; 32]))
-                        .unwrap(),
+                    Node::open(
+                        temp.join(format!("guild-{index}")),
+                        Seed::from_bytes([seed; 32]),
+                    )
+                    .unwrap(),
                 ))
             })
             .collect::<Vec<_>>();
@@ -3077,6 +3141,57 @@ mod tests {
             .into_iter()
             .map(|node| Arc::try_unwrap(node).ok().unwrap().into_inner().unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn relay_reservation_recovers_from_a_concurrent_bootstrap_dial() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut guild_nodes = active_test_guild_nodes(temp.path()).await.into_iter();
+        let relay_node = guild_nodes.next().unwrap();
+        let member_node = guild_nodes.next().unwrap();
+        let relay_id = relay_node.keys().node_id();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let relay_transport: Multiaddr = format!(
+            "/ip4/127.0.0.1/udp/{}/quic-v1",
+            socket.local_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap();
+        drop(socket);
+        let mut relay_config = config(relay_id);
+        relay_config.enable_hole_punching = false;
+        relay_config.listen_addresses = vec![relay_transport.clone()];
+        relay_config.external_addresses = vec![relay_transport];
+        let (relay_client, relay_loop) =
+            build_p2p(Arc::new(Mutex::new(relay_node)), relay_config).unwrap();
+        let relay_task = tokio::spawn(relay_loop.run());
+        let relay_address =
+            listening_address(&relay_client)
+                .await
+                .with(libp2p::multiaddr::Protocol::P2p(
+                    relay_client.local_peer_id().parse().unwrap(),
+                ));
+
+        let member_id = member_node.keys().node_id();
+        let mut member_config = config(member_id);
+        member_config.enable_relay_server = false;
+        member_config.enable_hole_punching = false;
+        member_config.bootstrap_addresses = vec![relay_address.clone()];
+        member_config.relay_reservation_addresses = vec![relay_address];
+        let (member_client, member_loop) =
+            build_p2p(Arc::new(Mutex::new(member_node)), member_config).unwrap();
+        let member_task = tokio::spawn(member_loop.run());
+        assert!(
+            relayed_address(&member_client)
+                .await
+                .to_string()
+                .contains("/p2p-circuit")
+        );
+
+        member_client.shutdown().await.unwrap();
+        relay_client.shutdown().await.unwrap();
+        member_task.await.unwrap().unwrap();
+        relay_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -3297,11 +3412,8 @@ mod tests {
         let mut nonmember_config = config(nonmember_id);
         nonmember_config.enable_relay_server = false;
         nonmember_config.relay_reservation_addresses = vec![relay_address];
-        let (nonmember_client, nonmember_loop) = build_p2p(
-            Arc::new(Mutex::new(nonmember_node)),
-            nonmember_config,
-        )
-        .unwrap();
+        let (nonmember_client, nonmember_loop) =
+            build_p2p(Arc::new(Mutex::new(nonmember_node)), nonmember_config).unwrap();
         let nonmember_task = tokio::spawn(nonmember_loop.run());
         for _ in 0..200 {
             assert!(
@@ -3533,6 +3645,20 @@ mod tests {
                 vec![
                     (nodes[1].lock().unwrap().keys().node_id(), expires),
                     (nodes[2].lock().unwrap().keys().node_id(), expires),
+                ],
+            )
+            .unwrap();
+        assert!(!nodes[0].lock().unwrap().seed_recovery_ready().unwrap());
+        let expired = unix_seconds().saturating_sub(1);
+        nodes[0]
+            .lock()
+            .unwrap()
+            .update_seed_recovery_readiness(
+                final_hash,
+                vec![
+                    (nodes[1].lock().unwrap().keys().node_id(), expired),
+                    (nodes[2].lock().unwrap().keys().node_id(), expired),
+                    (nodes[3].lock().unwrap().keys().node_id(), expired),
                 ],
             )
             .unwrap();

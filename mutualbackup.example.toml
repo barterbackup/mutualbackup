@@ -33,6 +33,8 @@ p2p_external_addresses = ["/ip4/127.0.0.1/udp/44000/quic-v1"]
 p2p_bootstrap_addresses = []
 p2p_relay_addresses = []
 
-# Relay service is opt-in. Leave it off on a public address until guild-only
-# relay admission is implemented; the private Docker lab enables it explicitly.
+# Relay service is opt-in and admits only active members of this node's guild.
 enable_relay_server = false
+
+# DCUtR upgrades relay circuits to direct QUIC when both peers can punch through.
+enable_hole_punching = true
