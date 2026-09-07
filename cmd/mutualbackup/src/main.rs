@@ -273,8 +273,12 @@ async fn main() -> Result<()> {
                 println!("libp2p peer id: {}", network.peer_id);
                 for peer in network.peers {
                     println!(
-                        "peer connection: {} active={:?} last-application={:?}",
-                        peer.peer_id, peer.active_paths, peer.last_application_path
+                        "peer connection: {} active={:?} last-application={:?} sent={} received={}",
+                        peer.peer_id,
+                        peer.active_paths,
+                        peer.last_application_path,
+                        peer.application_bytes_sent,
+                        peer.application_bytes_received
                     );
                 }
             }

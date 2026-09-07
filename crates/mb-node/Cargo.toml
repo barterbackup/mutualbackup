@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+cbor4ii.workspace = true
 futures.workspace = true
 filetime.workspace = true
 fs2.workspace = true
@@ -29,6 +30,5 @@ walkdir.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-cbor4ii.workspace = true
 cddl-cat.workspace = true
 tempfile.workspace = true

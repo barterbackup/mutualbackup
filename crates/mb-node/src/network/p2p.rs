@@ -85,6 +85,8 @@ pub struct P2pPeerStatus {
     pub peer_id: String,
     pub active_paths: Vec<P2pPath>,
     pub last_application_path: Option<P2pPath>,
+    pub application_bytes_sent: u64,
+    pub application_bytes_received: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -122,6 +124,7 @@ pub struct P2pEventLoop {
     bootstrap_retry: tokio::time::Interval,
     connection_paths: HashMap<ConnectionId, (PeerId, P2pPath)>,
     last_application_paths: HashMap<PeerId, P2pPath>,
+    transfer_counters: HashMap<PeerId, TransferCounters>,
 }
 
 #[derive(NetworkBehaviour)]
@@ -185,8 +188,15 @@ struct PendingRequest {
 }
 
 struct InboundResult {
+    peer: PeerId,
     channel: request_response::ResponseChannel<SignedRecord<PeerResponseEnvelope>>,
     response: Result<SignedRecord<PeerResponseEnvelope>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TransferCounters {
+    sent: u64,
+    received: u64,
 }
 
 enum PendingDht {
@@ -200,6 +210,27 @@ enum PendingDht {
         providers: BTreeSet<String>,
         response: oneshot::Sender<Result<Vec<String>>>,
     },
+}
+
+fn guild_relay_admission(node: Arc<Mutex<Node>>) -> Box<dyn relay::RateLimiter> {
+    Box::new(move |peer: PeerId, _address: &Multiaddr, _now: std::time::Instant| {
+        let Ok(node) = node.lock() else {
+            return false;
+        };
+        let Ok(Some(guild)) = node.guild_summary() else {
+            return false;
+        };
+        guild.phase == GuildPhase::Active
+            && guild.peers.iter().any(|candidate| {
+                candidate.member.node_id.libp2p_peer_id().ok() == Some(peer)
+            })
+    })
+}
+
+fn cbor_wire_len<T: serde::Serialize>(value: &T) -> Result<u64> {
+    let bytes = cbor4ii::serde::to_vec(Vec::new(), value)
+        .map_err(|error| anyhow::anyhow!("CBOR size accounting failed: {error}"))?;
+    Ok(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
 }
 
 pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient, P2pEventLoop)> {
@@ -223,7 +254,7 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
     let hole_punching_enabled = config.enable_hole_punching;
     let max_connections =
         u32::try_from(config.max_connections).context("libp2p connection limit exceeds u32")?;
-    let relay_config = relay::Config {
+    let mut relay_config = relay::Config {
         max_reservations: MAX_RELAY_RESERVATIONS,
         max_reservations_per_peer: 1,
         reservation_duration: Duration::from_secs(15 * 60),
@@ -233,6 +264,12 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
         max_circuit_bytes: MAX_RELAY_CIRCUIT_BYTES,
         ..relay::Config::default()
     };
+    relay_config
+        .reservation_rate_limiters
+        .push(guild_relay_admission(node.clone()));
+    relay_config
+        .circuit_src_rate_limiters
+        .push(guild_relay_admission(node.clone()));
     let mut swarm = SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_quic()
@@ -350,6 +387,7 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
             bootstrap_retry: tokio::time::interval(BOOTSTRAP_RETRY_INTERVAL),
             connection_paths: HashMap::new(),
             last_application_paths: HashMap::new(),
+            transfer_counters: HashMap::new(),
         },
     ))
 }
@@ -806,6 +844,11 @@ impl P2pEventLoop {
                 Some(result) = self.inbound_results.recv() => {
                     match result.response {
                         Ok(response) => {
+                            if let Ok(bytes) = cbor_wire_len(&response) {
+                                let counter =
+                                    self.transfer_counters.entry(result.peer).or_default();
+                                counter.sent = counter.sent.saturating_add(bytes);
+                            }
                             if self.swarm.behaviour_mut().peer.send_response(result.channel, response).is_err() {
                                 tracing::warn!("peer disconnected before its response was ready");
                             }
@@ -866,6 +909,10 @@ impl P2pEventLoop {
                             .map(|bytes| *blake3::hash(&bytes).as_bytes());
                         match request_hash {
                             Ok(request_hash) => {
+                                if let Ok(bytes) = cbor_wire_len(&request) {
+                                    let counter = self.transfer_counters.entry(peer).or_default();
+                                    counter.sent = counter.sent.saturating_add(bytes);
+                                }
                                 let outbound_id =
                                     self.swarm.behaviour_mut().peer.send_request(&peer, request);
                                 self.pending_requests.insert(
@@ -936,6 +983,14 @@ impl P2pEventLoop {
                             peer_id: peer.to_string(),
                             active_paths,
                             last_application_path: self.last_application_paths.get(peer).copied(),
+                            application_bytes_sent: self
+                                .transfer_counters
+                                .get(peer)
+                                .map_or(0, |counter| counter.sent),
+                            application_bytes_received: self
+                                .transfer_counters
+                                .get(peer)
+                                .map_or(0, |counter| counter.received),
                         }
                     })
                     .collect::<Vec<_>>();
@@ -1116,6 +1171,10 @@ impl P2pEventLoop {
                     request_response::Message::Request {
                         request, channel, ..
                     } => {
+                        if let Ok(bytes) = cbor_wire_len(&request) {
+                            let counter = self.transfer_counters.entry(peer).or_default();
+                            counter.received = counter.received.saturating_add(bytes);
+                        }
                         if request.signer.libp2p_peer_id().ok() != Some(peer) {
                             tracing::warn!(%peer, "application signer does not match libp2p peer");
                             return;
@@ -1132,6 +1191,11 @@ impl P2pEventLoop {
                                     crate::WireError::busy("peer request capacity is exhausted"),
                                 ) {
                                     Ok(response) => {
+                                        if let Ok(bytes) = cbor_wire_len(&response) {
+                                            let counter =
+                                                self.transfer_counters.entry(peer).or_default();
+                                            counter.sent = counter.sent.saturating_add(bytes);
+                                        }
                                         if self
                                             .swarm
                                             .behaviour_mut()
@@ -1157,13 +1221,21 @@ impl P2pEventLoop {
                         tokio::task::spawn_blocking(move || {
                             let _permit = permit;
                             let response = process_peer_request(service, &config, request);
-                            let _ = sender.blocking_send(InboundResult { channel, response });
+                            let _ = sender.blocking_send(InboundResult {
+                                peer,
+                                channel,
+                                response,
+                            });
                         });
                     }
                     request_response::Message::Response {
                         request_id,
                         response,
                     } => {
+                        if let Ok(bytes) = cbor_wire_len(&response) {
+                            let counter = self.transfer_counters.entry(peer).or_default();
+                            counter.received = counter.received.saturating_add(bytes);
+                        }
                         if let Some(pending) = self.pending_requests.remove(&request_id) {
                             let result = if pending.peer == peer {
                                 validate_outbound_response(response, &pending)
@@ -2964,6 +3036,49 @@ mod tests {
         certificate
     }
 
+    async fn active_test_guild_nodes(temp: &std::path::Path) -> Vec<Node> {
+        let nodes = (73_u8..=77)
+            .enumerate()
+            .map(|(index, seed)| {
+                Arc::new(Mutex::new(
+                    Node::open(temp.join(format!("guild-{index}")), Seed::from_bytes([seed; 32]))
+                        .unwrap(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for node in &nodes {
+            let node_id = node.lock().unwrap().keys().node_id();
+            let mut initial_config = config(node_id);
+            initial_config.enable_relay_server = false;
+            let (client, event_loop) = build_p2p(node.clone(), initial_config).unwrap();
+            clients.push(client);
+            tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let mut addresses = Vec::new();
+        for client in &clients {
+            addresses.push(listening_address(client).await);
+        }
+        let endpoints = clients
+            .iter()
+            .zip(&addresses)
+            .map(|(client, address)| peer_endpoint(client, address.clone()))
+            .collect::<Vec<_>>();
+        form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+        for client in &clients {
+            client.shutdown().await.unwrap();
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        drop(clients);
+        nodes
+            .into_iter()
+            .map(|node| Arc::try_unwrap(node).ok().unwrap().into_inner().unwrap())
+            .collect()
+    }
+
     #[tokio::test]
     async fn quic_transport_uses_the_seed_identity_for_application_requests() {
         let temp = tempfile::tempdir().unwrap();
@@ -2998,6 +3113,8 @@ mod tests {
             .find(|peer| peer.peer_id == second_client.local_peer_id())
             .unwrap();
         assert_eq!(connection.last_application_path, Some(P2pPath::Direct));
+        assert!(connection.application_bytes_sent > 0);
+        assert!(connection.application_bytes_received > 0);
 
         let record_key = b"mutualbackup-test-record".to_vec();
         first_client
@@ -3069,7 +3186,12 @@ mod tests {
     #[tokio::test]
     async fn relay_circuit_supports_application_requests_and_dcutr_upgrade() {
         let temp = tempfile::tempdir().unwrap();
-        let relay_node = Node::open(temp.path().join("relay"), Seed::from_bytes([73; 32])).unwrap();
+        let mut guild_nodes = active_test_guild_nodes(temp.path()).await.into_iter();
+        let relay_node = guild_nodes.next().unwrap();
+        let first_node = guild_nodes.next().unwrap();
+        let second_node = guild_nodes.next().unwrap();
+        let fallback_node = guild_nodes.next().unwrap();
+        let _offline_member = guild_nodes.next().unwrap();
         let relay_id = relay_node.keys().node_id();
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let relay_port = socket.local_addr().unwrap().port();
@@ -3090,9 +3212,6 @@ mod tests {
                     relay_client.local_peer_id().parse().unwrap(),
                 ));
 
-        let first_node = Node::open(temp.path().join("first"), Seed::from_bytes([74; 32])).unwrap();
-        let second_node =
-            Node::open(temp.path().join("second"), Seed::from_bytes([75; 32])).unwrap();
         let first_id = first_node.keys().node_id();
         let second_id = second_node.keys().node_id();
         let mut first_config = config(first_id);
@@ -3142,16 +3261,16 @@ mod tests {
         assert!(status.peers.iter().any(|peer| {
             peer.peer_id == second_client.local_peer_id()
                 && peer.last_application_path == Some(P2pPath::HolePunched)
+                && peer.application_bytes_sent > 0
+                && peer.application_bytes_received > 0
         }));
 
-        let fallback_node =
-            Node::open(temp.path().join("fallback"), Seed::from_bytes([76; 32])).unwrap();
         let fallback_id = fallback_node.keys().node_id();
         let mut fallback_config = config(fallback_id);
         fallback_config.listen_addresses.clear();
         fallback_config.enable_relay_server = false;
         fallback_config.enable_hole_punching = false;
-        fallback_config.relay_reservation_addresses = vec![relay_address];
+        fallback_config.relay_reservation_addresses = vec![relay_address.clone()];
         let (fallback_client, fallback_loop) =
             build_p2p(Arc::new(Mutex::new(fallback_node)), fallback_config).unwrap();
         let fallback_task = tokio::spawn(fallback_loop.run());
@@ -3166,17 +3285,47 @@ mod tests {
             status.peers.iter().any(|peer| {
                 peer.peer_id == fallback_client.local_peer_id()
                     && peer.last_application_path == Some(P2pPath::RelayFallback)
+                    && peer.application_bytes_sent > 0
+                    && peer.application_bytes_received > 0
             }),
             "fallback request did not use the relay circuit: {status:?}"
         );
 
+        let nonmember_node =
+            Node::open(temp.path().join("nonmember"), Seed::from_bytes([90; 32])).unwrap();
+        let nonmember_id = nonmember_node.keys().node_id();
+        let mut nonmember_config = config(nonmember_id);
+        nonmember_config.enable_relay_server = false;
+        nonmember_config.relay_reservation_addresses = vec![relay_address];
+        let (nonmember_client, nonmember_loop) = build_p2p(
+            Arc::new(Mutex::new(nonmember_node)),
+            nonmember_config,
+        )
+        .unwrap();
+        let nonmember_task = tokio::spawn(nonmember_loop.run());
+        for _ in 0..200 {
+            assert!(
+                nonmember_client
+                    .status()
+                    .await
+                    .unwrap()
+                    .advertised_addresses
+                    .iter()
+                    .all(|address| !address.contains("/p2p-circuit")),
+                "nonmember obtained a guild-only relay reservation"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
         first_client.shutdown().await.unwrap();
         second_client.shutdown().await.unwrap();
         fallback_client.shutdown().await.unwrap();
+        nonmember_client.shutdown().await.unwrap();
         relay_client.shutdown().await.unwrap();
         first_task.await.unwrap().unwrap();
         second_task.await.unwrap().unwrap();
         fallback_task.await.unwrap().unwrap();
+        nonmember_task.await.unwrap().unwrap();
         relay_task.await.unwrap().unwrap();
     }
 

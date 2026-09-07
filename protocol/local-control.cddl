@@ -70,7 +70,9 @@ p2p-status = {
 p2p-peer-status = {
   peer_id: tstr,
   active_paths: [* p2p-path],
-  last_application_path: null / p2p-path
+  last_application_path: null / p2p-path,
+  application_bytes_sent: uint,
+  application_bytes_received: uint
 }
 
 p2p-path = "direct" / "relayed" / "hole-punched" / "relay-fallback"
