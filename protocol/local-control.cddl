@@ -1,0 +1,134 @@
+; MutualBackup local Unix-socket JSON data model.
+; Frames are a 4-byte big-endian length followed by UTF-8 JSON.
+
+local-request-envelope = {
+  format_version: 1,
+  request_id: bytes16-array,
+  request: local-request
+}
+
+local-response-envelope = {
+  format_version: 1,
+  request_id: bytes16-array,
+  result: { "Ok": local-response } / { "Err": wire-error }
+}
+
+local-request =
+    "Status"
+  / { "Unlock": { secret: bytes32-array } }
+  / { "AddRoot": { path: tstr } }
+  / "GuildStatus"
+  / "GuildCreate"
+  / "GuildInvite"
+  / { "GuildJoin": { token: tstr } }
+  / "GuildRetry"
+  / "GuildCancel"
+  / "GuildFinalize"
+  / { "Backup": { wait: bool } }
+  / { "BackupStatus": { revision_id: uuid-text } }
+  / { "Recover": { target: tstr } }
+  / "SnapshotList"
+  / { "SnapshotRestore": { revision_id: null / uuid-text, target: tstr } }
+
+local-response =
+    { "Locked": { expected_node_id: bytes32-array } }
+  / { "Unlocked": { node_id: bytes32-array } }
+  / { "Status": node-status }
+  / { "RootAdded": protected-root }
+  / { "Guild": null / guild-summary }
+  / { "GuildInvite": { token: tstr, expires_at_unix_seconds: uint } }
+  / { "BackupJob": backup-job }
+  / { "Recovered": dht-recovery-result }
+  / { "Snapshots": [* snapshot-info] }
+  / { "SnapshotRestored": snapshot-info }
+
+node-status = {
+  format_version: uint,
+  node_id: bytes32-array,
+  data_dir: tstr,
+  protected_root: null / protected-root,
+  checkpoint_count: uint,
+  seed_recovery_ready: bool,
+  root_dirty: bool,
+  network: null / p2p-status
+}
+
+protected-root = {
+  format_version: uint,
+  root_id: uuid-text,
+  path: tstr,
+  filesystem_device: uint
+}
+
+p2p-status = {
+  peer_id: tstr,
+  listen_addresses: [* tstr],
+  advertised_addresses: [* tstr],
+  peers: [* p2p-peer-status]
+}
+
+p2p-peer-status = {
+  peer_id: tstr,
+  active_paths: [* p2p-path],
+  last_application_path: null / p2p-path
+}
+
+p2p-path = "direct" / "relayed" / "hole-punched" / "relay-fallback"
+
+guild-summary = {
+  format_version: uint,
+  guild_id: bytes32-array,
+  coordinator: bytes32-array,
+  phase: "Draft" / "Joining" / "Active",
+  peers: [* guild-peer]
+}
+
+guild-peer = { member: member, endpoints: [* tstr] }
+member = {
+  node_id: bytes32-array,
+  recovery_public_key: bytes32-array,
+  failure_domain: tstr
+}
+
+backup-descriptor = {
+  format_version: uint,
+  guild_id: bytes32-array,
+  owner: bytes32-array,
+  revision_id: uuid-text,
+  total_pages: uint,
+  object_hash: bytes32-array
+}
+
+backup-job = {
+  format_version: uint,
+  descriptor: backup-descriptor,
+  state: "Pending" / "Running" / "Committed" / "Failed",
+  checkpoint_hash: null / bytes32-array,
+  error: null / tstr
+}
+
+dht-recovery-result = {
+  guild_id: bytes32-array,
+  checkpoint_hash: bytes32-array,
+  generation: uint,
+  revision_id: null / uuid-text
+}
+
+snapshot-info = {
+  revision_id: uuid-text,
+  sequence: uint,
+  checkpoint_generation: uint,
+  checkpoint_hash: bytes32-array
+}
+
+wire-error = {
+  code: "invalid_request" / "unauthorized" / "not_found" / "conflict" /
+        "busy" / "locked" / "operation_failed",
+  retryable: bool,
+  message: tstr
+}
+
+uuid-text = tstr
+uint8 = 0..255
+bytes16-array = [16*16 uint8]
+bytes32-array = [32*32 uint8]

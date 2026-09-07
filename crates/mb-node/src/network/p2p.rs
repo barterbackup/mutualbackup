@@ -1129,7 +1129,7 @@ impl P2pEventLoop {
                                 match peer_error_response(
                                     &service,
                                     &request,
-                                    "peer request capacity is exhausted",
+                                    crate::WireError::busy("peer request capacity is exhausted"),
                                 ) {
                                     Ok(response) => {
                                         if self
@@ -2758,14 +2758,14 @@ fn validate_outbound_response(
     response.verify(PEER_RESPONSE_DOMAIN)?;
     if response.signer != pending.recipient
         || response.signer.libp2p_peer_id()? != pending.peer
-        || response.value.format_version != 1
+        || response.value.format_version != super::PEER_WIRE_FORMAT_VERSION
         || response.value.request_id != pending.request_id
         || response.value.recipient != pending.response_recipient
         || response.value.request_hash != pending.request_hash
     {
         bail!("libp2p peer response context mismatch");
     }
-    response.value.result.map_err(anyhow::Error::msg)
+    response.value.result.map_err(anyhow::Error::new)
 }
 
 fn add_address_to_swarm(swarm: &mut Swarm<Behaviour>, address: Multiaddr) -> Result<()> {

@@ -20,6 +20,8 @@ bip39 = { version = "=2.2.2", features = ["rand", "zeroize"] }
 blake3 = "1.8"
 chacha20 = "0.9"
 chacha20poly1305 = "0.10"
+cbor4ii = { version = "=0.3.3", features = ["serde1", "use_std"] }
+cddl-cat = "=0.7.1"
 clap = { version = "4.5", features = ["derive"] }
 data-encoding = "2.9"
 ed25519-dalek = { version = "2.2", features = ["rand_core", "serde"] }

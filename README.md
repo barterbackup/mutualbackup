@@ -56,6 +56,8 @@ The CLI and daemon use a same-user Unix control socket. Pass `--socket` when a
 configuration does not use the default location below `XDG_RUNTIME_DIR`.
 Several daemons can run under one account when every config has a distinct
 recovery string, data directory, control socket, and UDP listen address.
+The current draft JSON/CBOR schemas, signed-record field tables, and golden
+fixtures are documented in the [`protocol/` directory](protocol/README.md).
 
 ## Build and acceptance
 

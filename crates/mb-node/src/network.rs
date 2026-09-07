@@ -13,22 +13,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 #[cfg(test)]
 use futures::{StreamExt, stream::FuturesUnordered};
-use mb_core::{
-    CodingGroup, GuildGenesis, GuildInvite, KeyMaterial, Member, MemberSignature, NodeId,
-    QuorumGuildGenesis, SectorId, SectorRef, SignedRecord, StorageAcknowledgement,
-    V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, canonical_bytes,
-    decode_canonical,
-};
 #[cfg(test)]
 use mb_core::{
-    GuildCheckpoint, InformationRole, ParityRole, QuorumCheckpoint, RecoveryLocator,
-    SealedRecoveryRecord, Seed, ShardRole, UserRevision, V1_MAX_CODING_GROUPS, V1_RS_DATA_SHARDS,
-    V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, encode_3_2, open_recovery_record, reconstruct_3_2,
-    sector_root,
+    CodingGroup, GuildCheckpoint, InformationRole, ParityRole, QuorumCheckpoint, RecoveryLocator,
+    SealedRecoveryRecord, SectorRef, Seed, ShardRole, UserRevision, V1_MAX_CODING_GROUPS,
+    V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, encode_3_2, open_recovery_record,
+    reconstruct_3_2, sector_root,
 };
+use mb_core::{
+    KeyMaterial, NodeId, SignedRecord, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES,
+    V1_MAX_CATALOG_PAGES, canonical_bytes, decode_canonical,
+};
+#[cfg(test)]
 use mb_store::ParityObject;
 #[cfg(test)]
 use serde::de::DeserializeOwned;
+#[cfg(test)]
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use tokio::{
@@ -39,17 +39,19 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    BackupDescriptor, BackupJob, DhtSequenceFloors, GuildPeer, Node,
+    BackupDescriptor, BackupJob, DhtSequenceFloors, GuildPeer, Node, WireError,
     node::{NodeReader, NodeReaderConfig},
 };
 
 mod p2p;
+mod wire;
 pub(crate) use p2p::restore_snapshot_with_p2p;
 pub use p2p::{
     DhtRecord, DhtRecoveryResult, P2pClient, P2pConfig, P2pEventLoop, P2pPath, P2pPeerProfile,
     P2pPeerStatus, P2pStatus, build_p2p, endpoint_record_key, recover_from_dht,
     recovery_bundle_key, recovery_mailbox_key, run_coordinator_jobs, run_dht_publications,
 };
+use wire::*;
 
 #[cfg(test)]
 const MAX_PEER_FRAME_BYTES: usize = 600 * 1024;
@@ -93,275 +95,6 @@ pub struct NodeServerConfig {
     pub trusted_coordinator: NodeId,
     #[cfg(test)]
     pub max_connections: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct PeerProfile {
-    member: Member,
-    endpoint: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-enum PeerRequest {
-    Profile,
-    JoinGuild {
-        invite: Box<SignedRecord<GuildInvite>>,
-        peer: GuildPeer,
-    },
-    ProposeGuildGenesis {
-        genesis: Box<GuildGenesis>,
-    },
-    InstallGuildGenesis {
-        certificate: Box<QuorumGuildGenesis>,
-        peers: Vec<GuildPeer>,
-    },
-    SubmitBackup {
-        descriptor: BackupDescriptor,
-    },
-    BackupStatus {
-        guild_id: [u8; 32],
-        revision_id: Uuid,
-    },
-    GetGuildGenesis {
-        guild_id: [u8; 32],
-    },
-    #[cfg(test)]
-    BeginCommit {
-        intent_id: [u8; 16],
-        plan_hash: [u8; 32],
-    },
-    #[cfg(test)]
-    PrepareSource {
-        guild_id: [u8; 32],
-        source: String,
-        sequence: u64,
-    },
-    GetPreparedRevisionPage {
-        guild_id: [u8; 32],
-        revision_id: Uuid,
-        page_index: u32,
-    },
-    EnsureFiller {
-        guild_id: [u8; 32],
-        revision_id: Uuid,
-        ordinal: u64,
-    },
-    GetSector {
-        guild_id: [u8; 32],
-        sector_id: SectorId,
-    },
-    PublishParity {
-        operation_id: [u8; 16],
-        group: Box<CodingGroup>,
-        information: [Vec<u8>; 3],
-        object: ParityObject,
-    },
-    GetParity {
-        guild_id: [u8; 32],
-        group_id: [u8; 32],
-        shard_index: u8,
-    },
-    PutCheckpointPage {
-        object_kind: CheckpointObjectKind,
-        guild_id: [u8; 32],
-        checkpoint_hash: [u8; 32],
-        page_index: u32,
-        total_pages: u32,
-        page_hash: [u8; 32],
-        bytes: Vec<u8>,
-    },
-    SignCheckpoint {
-        guild_id: [u8; 32],
-        checkpoint_hash: [u8; 32],
-    },
-    FinalizeCheckpoint {
-        guild_id: [u8; 32],
-        checkpoint_hash: [u8; 32],
-    },
-    GetCheckpointPage {
-        guild_id: [u8; 32],
-        checkpoint_hash: [u8; 32],
-        page_index: u32,
-    },
-    #[cfg(test)]
-    BuildRecoveryRecord {
-        publication_id: [u8; 16],
-        subject: Member,
-        guild_id: [u8; 32],
-        checkpoint_hash: [u8; 32],
-        checkpoint_generation: u64,
-        expires_at_unix_seconds: u64,
-        admission: Box<SignedRecord<RecoveryPublisherAdmission>>,
-    },
-    #[cfg(test)]
-    AuthorizeRecoveryPublisher {
-        guild_id: [u8; 32],
-        publisher: NodeId,
-        expires_at_unix_seconds: u64,
-    },
-    #[cfg(test)]
-    CompleteCommit {
-        intent_id: [u8; 16],
-        plan_hash: [u8; 32],
-        guild_id: [u8; 32],
-        checkpoint_hash: [u8; 32],
-    },
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub(crate) enum CheckpointObjectKind {
-    Body,
-    Certificate,
-}
-
-impl CheckpointObjectKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Body => "body",
-            Self::Certificate => "certificate",
-        }
-    }
-}
-
-impl PeerRequest {
-    fn is_read_only(&self) -> bool {
-        matches!(
-            self,
-            Self::Profile
-                | Self::GetSector { .. }
-                | Self::GetParity { .. }
-                | Self::GetPreparedRevisionPage { .. }
-                | Self::GetCheckpointPage { .. }
-                | Self::BackupStatus { .. }
-                | Self::GetGuildGenesis { .. }
-        )
-    }
-
-    fn mutation_kind(&self) -> Option<&'static str> {
-        match self {
-            Self::Profile
-            | Self::GetSector { .. }
-            | Self::GetParity { .. }
-            | Self::GetPreparedRevisionPage { .. }
-            | Self::GetCheckpointPage { .. }
-            | Self::BackupStatus { .. } => None,
-            Self::GetGuildGenesis { .. } => None,
-            #[cfg(test)]
-            Self::BeginCommit { .. } => Some("begin-commit"),
-            Self::JoinGuild { .. } => Some("join-guild"),
-            Self::ProposeGuildGenesis { .. } => Some("propose-guild-genesis"),
-            Self::InstallGuildGenesis { .. } => Some("install-guild-genesis"),
-            Self::SubmitBackup { .. } => Some("submit-backup"),
-            #[cfg(test)]
-            Self::PrepareSource { .. } => Some("prepare-source"),
-            Self::EnsureFiller { .. } => Some("ensure-filler"),
-            Self::PublishParity { .. } => Some("publish-parity"),
-            Self::PutCheckpointPage { .. } => Some("put-checkpoint-page"),
-            Self::SignCheckpoint { .. } => Some("sign-checkpoint"),
-            Self::FinalizeCheckpoint { .. } => Some("finalize-checkpoint"),
-            #[cfg(test)]
-            Self::BuildRecoveryRecord { .. } => Some("build-recovery-record"),
-            #[cfg(test)]
-            Self::AuthorizeRecoveryPublisher { .. } => Some("authorize-recovery-publisher"),
-            #[cfg(test)]
-            Self::CompleteCommit { .. } => Some("complete-commit"),
-        }
-    }
-
-    fn guild_scope(&self) -> Option<[u8; 32]> {
-        match self {
-            Self::Profile => None,
-            #[cfg(test)]
-            Self::BeginCommit { .. } => None,
-            Self::JoinGuild { invite, .. } => Some(invite.value.guild_id),
-            Self::ProposeGuildGenesis { genesis } => Some(genesis.guild_id),
-            Self::InstallGuildGenesis { certificate, .. } => Some(certificate.genesis.guild_id),
-            Self::SubmitBackup { descriptor } => Some(descriptor.guild_id),
-            Self::GetPreparedRevisionPage { guild_id, .. }
-            | Self::EnsureFiller { guild_id, .. }
-            | Self::GetSector { guild_id, .. }
-            | Self::GetParity { guild_id, .. }
-            | Self::PutCheckpointPage { guild_id, .. }
-            | Self::SignCheckpoint { guild_id, .. }
-            | Self::FinalizeCheckpoint { guild_id, .. }
-            | Self::GetCheckpointPage { guild_id, .. }
-            | Self::BackupStatus { guild_id, .. } => Some(*guild_id),
-            #[cfg(test)]
-            Self::PrepareSource { guild_id, .. }
-            | Self::CompleteCommit { guild_id, .. }
-            | Self::BuildRecoveryRecord { guild_id, .. }
-            | Self::AuthorizeRecoveryPublisher { guild_id, .. } => Some(*guild_id),
-            Self::GetGuildGenesis { guild_id } => Some(*guild_id),
-            Self::PublishParity { object, .. } => Some(object.guild_id),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PeerRequestEnvelope {
-    format_version: u16,
-    request_id: [u8; 16],
-    caller: NodeId,
-    recipient: Option<NodeId>,
-    guild_scope: Option<[u8; 32]>,
-    issued_at_unix_seconds: u64,
-    expires_at_unix_seconds: u64,
-    request: PeerRequest,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-enum PeerResponse {
-    Profile(PeerProfile),
-    #[cfg(test)]
-    CommitStarted {
-        guild_id: [u8; 32],
-    },
-    #[cfg(test)]
-    PreparedRevision {
-        revision_id: Uuid,
-        total_pages: u32,
-        object_hash: [u8; 32],
-    },
-    PreparedRevisionPage {
-        total_pages: u32,
-        page_hash: [u8; 32],
-        bytes: Vec<u8>,
-    },
-    Filler {
-        reference: SectorRef,
-        bytes: Vec<u8>,
-    },
-    Bytes(Vec<u8>),
-    CheckpointSignature(MemberSignature),
-    GuildGenesisSignature(MemberSignature),
-    BackupJob(BackupJob),
-    StorageAcknowledgement(SignedRecord<StorageAcknowledgement>),
-    GuildGenesis(Box<QuorumGuildGenesis>),
-    CheckpointPage {
-        total_pages: u32,
-        page_hash: [u8; 32],
-        bytes: Vec<u8>,
-    },
-    #[cfg(test)]
-    RecoveryRecord(Box<SignedRecord<PublishedRecoveryRecord>>),
-    #[cfg(test)]
-    RecoveryAdmission(SignedRecord<RecoveryPublisherAdmission>),
-    Ack,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PeerResponseEnvelope {
-    format_version: u16,
-    request_id: [u8; 16],
-    recipient: NodeId,
-    request_hash: [u8; 32],
-    result: std::result::Result<PeerResponse, String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct CachedOperation {
-    request_hash: [u8; 32],
-    response: PeerResponse,
 }
 
 #[cfg(test)]
@@ -972,19 +705,15 @@ fn process_peer_request(
             bail!("request was not classified as a read or mutation")
         }
     })();
-    let error = response.map_err(|error| {
-        let mut message = format!("{error:#}");
-        message.truncate(4096);
-        message
-    });
+    let result = response.map_err(|error| WireError::operation(format!("{error:#}")));
     Ok(SignedRecord::sign(
         PEER_RESPONSE_DOMAIN,
         PeerResponseEnvelope {
-            format_version: 1,
+            format_version: PEER_WIRE_FORMAT_VERSION,
             request_id,
             recipient: caller,
             request_hash: wire_request_hash,
-            result: error,
+            result,
         },
         service.reader_config.keys(),
     )?)
@@ -993,16 +722,16 @@ fn process_peer_request(
 fn peer_error_response(
     service: &NodeService,
     signed: &SignedRecord<PeerRequestEnvelope>,
-    message: &str,
+    error: WireError,
 ) -> Result<SignedRecord<PeerResponseEnvelope>> {
     Ok(SignedRecord::sign(
         PEER_RESPONSE_DOMAIN,
         PeerResponseEnvelope {
-            format_version: 1,
+            format_version: PEER_WIRE_FORMAT_VERSION,
             request_id: signed.value.request_id,
             recipient: signed.signer,
             request_hash: *blake3::hash(&canonical_bytes(&signed.value)?).as_bytes(),
-            result: Err(message.to_owned()),
+            result: Err(error),
         },
         service.reader_config.keys(),
     )?)
@@ -1014,7 +743,7 @@ fn validate_request_envelope(
     local_node: NodeId,
 ) -> Result<()> {
     let now = unix_seconds();
-    if envelope.format_version != 1
+    if envelope.format_version != PEER_WIRE_FORMAT_VERSION
         || envelope.caller != signer
         || envelope.guild_scope != envelope.request.guild_scope()
         || envelope.expires_at_unix_seconds < envelope.issued_at_unix_seconds
@@ -2450,7 +2179,7 @@ fn make_peer_request(
     Ok(SignedRecord::sign(
         PEER_REQUEST_DOMAIN,
         PeerRequestEnvelope {
-            format_version: 1,
+            format_version: PEER_WIRE_FORMAT_VERSION,
             request_id,
             caller: keys.node_id(),
             recipient,
@@ -2477,14 +2206,14 @@ async fn send_peer_request(
         let response: SignedRecord<PeerResponseEnvelope> =
             read_frame_timed(&mut stream, MAX_PEER_FRAME_BYTES).await?;
         response.verify(PEER_RESPONSE_DOMAIN)?;
-        if response.value.format_version != 1
+        if response.value.format_version != PEER_WIRE_FORMAT_VERSION
             || response.value.request_id != request_id
             || response.value.recipient != response_recipient
             || response.value.request_hash != request_hash
         {
             bail!("peer response context mismatch");
         }
-        let body = response.value.result.map_err(anyhow::Error::msg)?;
+        let body = response.value.result.map_err(anyhow::Error::new)?;
         Ok((response.signer, body))
     };
     tokio::time::timeout(Duration::from_secs(5), call)

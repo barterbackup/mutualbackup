@@ -29,4 +29,6 @@ walkdir.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+cbor4ii.workspace = true
+cddl-cat.workspace = true
 tempfile.workspace = true

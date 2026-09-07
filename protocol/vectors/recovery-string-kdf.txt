@@ -1,0 +1,10 @@
+input=correct-horse-battery-staple-2026!
+normalized=correct-horse-battery-staple-2026!
+argon2id_version=19
+memory_kib=65536
+passes=3
+lanes=4
+root=f93c4e71aed4371a4d0791b9e4f0b777f2fed698b5a855a3001d14c579dca623
+node_id=b20d54e51cca9fb483f98e442d991dc377c8e66af65a122668547ebd4c041e5f
+libp2p_peer_id=12D3KooWMoQXfi9bGMewXQhkXDnewToBjRmLNW5fWzgfogo8AT2e
+recovery_public_key=9301d3b665b29562833b3b4ecc1557c167dfefb42065f155699bca2d8141bb07

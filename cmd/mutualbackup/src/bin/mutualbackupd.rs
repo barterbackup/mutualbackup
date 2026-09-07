@@ -6,8 +6,8 @@ use clap::Parser;
 use libp2p::Multiaddr;
 use mb_node::{
     LocalControlListener, LocalRequest, LocalResponse, LockedDataDir, Node, P2pConfig,
-    UnlockSecret, bind_local_control, build_p2p, run_coordinator_jobs, run_dht_publications,
-    run_root_watcher, serve_local_control_on,
+    UnlockSecret, WireError, bind_local_control, build_p2p, run_coordinator_jobs,
+    run_dht_publications, run_root_watcher, serve_local_control_on,
 };
 use mutualbackup::{DaemonConfig, read_config, read_seed};
 use tracing_subscriber::EnvFilter;
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
                 match start_node_runtime(&config, node) {
                     Ok(runtime) => {
                         if let Err(error) = connection
-                            .respond(&LocalResponse::Unlocked {
+                            .respond(LocalResponse::Unlocked {
                                 node_id: config.expected_node_id,
                             })
                             .await
@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
                     Err(error) => {
                         tracing::warn!(%error, "manual daemon unlock could not start node runtime");
                         if let Err(response_error) = connection
-                            .respond(&LocalResponse::Error(format!("{error:#}")))
+                            .respond_error(WireError::operation(format!("{error:#}")))
                             .await
                         {
                             tracing::warn!(%response_error, "failed unlock client disconnected");
@@ -153,7 +153,7 @@ async fn await_manual_node(
         match request {
             LocalRequest::Status => {
                 if let Err(error) = connection
-                    .respond(&LocalResponse::Locked {
+                    .respond(LocalResponse::Locked {
                         expected_node_id: config.expected_node_id,
                     })
                     .await
@@ -167,7 +167,7 @@ async fn await_manual_node(
                     Err(error) => {
                         tracing::warn!(%error, "manual daemon unlock rejected");
                         if let Err(response_error) = connection
-                            .respond(&LocalResponse::Error(format!("{error:#}")))
+                            .respond_error(WireError::operation(format!("{error:#}")))
                             .await
                         {
                             tracing::warn!(%response_error, "rejected unlock client disconnected");
@@ -176,12 +176,7 @@ async fn await_manual_node(
                 }
             }
             _ => {
-                if let Err(error) = connection
-                    .respond(&LocalResponse::Error(
-                        "daemon is locked; only status and unlock are available".to_owned(),
-                    ))
-                    .await
-                {
+                if let Err(error) = connection.respond_error(WireError::locked()).await {
                     tracing::warn!(%error, "locked control client disconnected");
                 }
             }

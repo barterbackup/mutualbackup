@@ -296,13 +296,37 @@ mod tests {
     fn recovery_string_policy_and_derivation_are_stable() {
         let compact = "correct-horse-battery-staple-2026!";
         let spaced = "correct-\u{a0}horse-\tbattery-\nstaple-2026!";
+        let vector = include_str!("../../../protocol/vectors/recovery-string-kdf.txt");
+        let vector_value = |name: &str| {
+            vector
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                .unwrap()
+        };
+        assert_eq!(vector_value("input"), compact);
+        assert_eq!(vector_value("normalized"), compact);
+        assert_eq!(vector_value("argon2id_version"), "19");
         assert_eq!(
-            Seed::from_recovery_string(compact).unwrap().expose(),
+            vector_value("memory_kib"),
+            RECOVERY_ARGON_MEMORY_KIB.to_string()
+        );
+        assert_eq!(vector_value("passes"), RECOVERY_ARGON_PASSES.to_string());
+        assert_eq!(vector_value("lanes"), RECOVERY_ARGON_LANES.to_string());
+        let compact_seed = Seed::from_recovery_string(compact).unwrap();
+        assert_eq!(
+            compact_seed.expose(),
             Seed::from_recovery_string(spaced).unwrap().expose()
         );
+        assert_eq!(hex::encode(compact_seed.expose()), vector_value("root"));
+        let keys = KeyMaterial::from_seed(&compact_seed);
+        assert_eq!(keys.node_id().to_string(), vector_value("node_id"));
         assert_eq!(
-            hex::encode(Seed::from_recovery_string(compact).unwrap().expose()),
-            "f93c4e71aed4371a4d0791b9e4f0b777f2fed698b5a855a3001d14c579dca623"
+            keys.node_id().libp2p_peer_id().unwrap().to_string(),
+            vector_value("libp2p_peer_id")
+        );
+        assert_eq!(
+            hex::encode(keys.recovery_public_key().0),
+            vector_value("recovery_public_key")
         );
         assert_eq!(
             Seed::from_recovery_bytes(b"not-utf8-\xff").unwrap_err(),

@@ -1,0 +1,187 @@
+; MutualBackup /mutualbackup/peer/1 CBOR data model.
+; libp2p request-response supplies stream framing. Both roots are signed records.
+
+signed-peer-request = {
+  signer: bytes32-array,
+  value: peer-request-envelope,
+  signature: bytes64-array
+}
+
+signed-peer-response = {
+  signer: bytes32-array,
+  value: peer-response-envelope,
+  signature: bytes64-array
+}
+
+peer-request-envelope = {
+  format_version: 1,
+  request_id: bytes16-array,
+  caller: bytes32-array,
+  recipient: null / bytes32-array,
+  guild_scope: null / bytes32-array,
+  issued_at_unix_seconds: uint,
+  expires_at_unix_seconds: uint,
+  request: peer-request
+}
+
+peer-response-envelope = {
+  format_version: 1,
+  request_id: bytes16-array,
+  recipient: bytes32-array,
+  request_hash: bytes32-array,
+  result: { "Ok": peer-response } / { "Err": wire-error }
+}
+
+peer-request =
+    "Profile"
+  / { "JoinGuild": { invite: signed-guild-invite, peer: guild-peer } }
+  / { "ProposeGuildGenesis": { genesis: guild-genesis } }
+  / { "InstallGuildGenesis": { certificate: quorum-guild-genesis, peers: [* guild-peer] } }
+  / { "SubmitBackup": { descriptor: backup-descriptor } }
+  / { "BackupStatus": { guild_id: bytes32-array, revision_id: uuid-bytes } }
+  / { "GetGuildGenesis": { guild_id: bytes32-array } }
+  / { "GetPreparedRevisionPage": { guild_id: bytes32-array, revision_id: uuid-bytes, page_index: uint } }
+  / { "EnsureFiller": { guild_id: bytes32-array, revision_id: uuid-bytes, ordinal: uint } }
+  / { "GetSector": { guild_id: bytes32-array, sector_id: bytes32-array } }
+  / { "PublishParity": {
+        operation_id: bytes16-array,
+        group: coding-group,
+        information: [3*3 byte-vector],
+        object: parity-object
+      } }
+  / { "GetParity": { guild_id: bytes32-array, group_id: bytes32-array, shard_index: uint8 } }
+  / { "PutCheckpointPage": {
+        object_kind: "Body" / "Certificate",
+        guild_id: bytes32-array,
+        checkpoint_hash: bytes32-array,
+        page_index: uint,
+        total_pages: uint,
+        page_hash: bytes32-array,
+        bytes: byte-vector
+      } }
+  / { "SignCheckpoint": { guild_id: bytes32-array, checkpoint_hash: bytes32-array } }
+  / { "FinalizeCheckpoint": { guild_id: bytes32-array, checkpoint_hash: bytes32-array } }
+  / { "GetCheckpointPage": { guild_id: bytes32-array, checkpoint_hash: bytes32-array, page_index: uint } }
+
+peer-response =
+    { "Profile": peer-profile }
+  / { "PreparedRevisionPage": { total_pages: uint, page_hash: bytes32-array, bytes: byte-vector } }
+  / { "Filler": { reference: sector-ref, bytes: byte-vector } }
+  / { "Bytes": byte-vector }
+  / { "CheckpointSignature": member-signature }
+  / { "GuildGenesisSignature": member-signature }
+  / { "BackupJob": backup-job }
+  / { "StorageAcknowledgement": signed-storage-ack }
+  / { "GuildGenesis": quorum-guild-genesis }
+  / { "CheckpointPage": { total_pages: uint, page_hash: bytes32-array, bytes: byte-vector } }
+  / "Ack"
+
+peer-profile = { member: member, endpoint: tstr }
+guild-peer = { member: member, endpoints: [* tstr] }
+
+member = {
+  node_id: bytes32-array,
+  recovery_public_key: bytes32-array,
+  failure_domain: tstr
+}
+
+guild-invite = {
+  format_version: uint,
+  guild_id: bytes32-array,
+  coordinator: member,
+  coordinator_endpoints: [* tstr],
+  nonce: bytes16-array,
+  expires_at_unix_seconds: uint
+}
+
+signed-guild-invite = {
+  signer: bytes32-array,
+  value: guild-invite,
+  signature: bytes64-array
+}
+
+guild-genesis = {
+  format_version: uint,
+  guild_id: bytes32-array,
+  coordinator: bytes32-array,
+  members: [* member]
+}
+
+quorum-guild-genesis = {
+  genesis: guild-genesis,
+  signatures: [* member-signature]
+}
+
+member-signature = { signer: bytes32-array, signature: bytes64-array }
+
+backup-descriptor = {
+  format_version: uint,
+  guild_id: bytes32-array,
+  owner: bytes32-array,
+  revision_id: uuid-bytes,
+  total_pages: uint,
+  object_hash: bytes32-array
+}
+
+backup-job = {
+  format_version: uint,
+  descriptor: backup-descriptor,
+  state: "Pending" / "Running" / "Committed" / "Failed",
+  checkpoint_hash: null / bytes32-array,
+  error: null / tstr
+}
+
+sector-ref = { id: bytes32-array, root: bytes32-array, logical_len: uint }
+information-role = { owner: bytes32-array, sector: sector-ref }
+parity-role = { holder: bytes32-array, row: uint, root: bytes32-array }
+shard-role = { "Information": information-role } / { "Parity": parity-role }
+
+coding-group = {
+  id: bytes32-array,
+  format_version: uint,
+  guild_id: bytes32-array,
+  data_shards: uint,
+  parity_shards: uint,
+  shard_size: uint,
+  roles: [5*5 shard-role]
+}
+
+parity-object = {
+  format_version: uint,
+  guild_id: bytes32-array,
+  group_id: bytes32-array,
+  shard_index: uint8,
+  root: bytes32-array,
+  bytes: byte-vector
+}
+
+storage-ack = {
+  format_version: uint,
+  operation_id: bytes16-array,
+  guild_id: bytes32-array,
+  group_id: bytes32-array,
+  shard_index: uint8,
+  row: uint,
+  root: bytes32-array,
+  holder: bytes32-array
+}
+
+signed-storage-ack = {
+  signer: bytes32-array,
+  value: storage-ack,
+  signature: bytes64-array
+}
+
+wire-error = {
+  code: "invalid_request" / "unauthorized" / "not_found" / "conflict" /
+        "busy" / "locked" / "operation_failed",
+  retryable: bool,
+  message: tstr
+}
+
+uuid-bytes = bstr .size 16
+uint8 = 0..255
+byte-vector = [* uint8]
+bytes16-array = [16*16 uint8]
+bytes32-array = [32*32 uint8]
+bytes64-array = [64*64 uint8]

@@ -9,19 +9,23 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
-use mb_core::{GuildInvite, NodeId, Seed, canonical_bytes};
+use mb_core::{GuildInvite, NodeId, canonical_bytes};
 use mb_core::{QuorumGuildGenesis, SignedRecord, decode_canonical};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::{
-    BackupJob, BackupJobState, DhtRecoveryResult, GuildSummary, Node, P2pClient, P2pStatus,
-    SnapshotInfo, network::restore_snapshot_with_p2p, recover_from_dht,
+    BackupJob, BackupJobState, Node, P2pClient, P2pStatus, WireError,
+    network::restore_snapshot_with_p2p, recover_from_dht,
 };
+
+mod wire;
+use wire::{LOCAL_WIRE_FORMAT_VERSION, LocalRequestEnvelope, LocalResponseEnvelope};
+pub use wire::{LocalRequest, LocalResponse, UnlockSecret};
 
 const MAX_LOCAL_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_CONNECTIONS: usize = 16;
@@ -47,81 +51,6 @@ pub struct NodeStatus {
     pub network: Option<P2pStatus>,
 }
 
-#[derive(Serialize, Deserialize)]
-pub enum LocalRequest {
-    Status,
-    Unlock {
-        secret: UnlockSecret,
-    },
-    AddRoot {
-        path: PathBuf,
-    },
-    GuildStatus,
-    GuildCreate,
-    GuildInvite,
-    GuildJoin {
-        token: String,
-    },
-    GuildRetry,
-    GuildCancel,
-    GuildFinalize,
-    Backup {
-        wait: bool,
-    },
-    BackupStatus {
-        revision_id: Uuid,
-    },
-    Recover {
-        target: PathBuf,
-    },
-    SnapshotList,
-    SnapshotRestore {
-        revision_id: Option<Uuid>,
-        target: PathBuf,
-    },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum LocalResponse {
-    Locked {
-        expected_node_id: NodeId,
-    },
-    Unlocked {
-        node_id: NodeId,
-    },
-    Status(NodeStatus),
-    RootAdded(ProtectedRoot),
-    Guild(Option<GuildSummary>),
-    GuildInvite {
-        token: String,
-        expires_at_unix_seconds: u64,
-    },
-    BackupJob(BackupJob),
-    Recovered(DhtRecoveryResult),
-    Snapshots(Vec<SnapshotInfo>),
-    SnapshotRestored(SnapshotInfo),
-    Error(String),
-}
-
-#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
-pub struct UnlockSecret([u8; 32]);
-
-impl UnlockSecret {
-    pub fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    pub fn seed(&self) -> Seed {
-        Seed::from_bytes(self.0)
-    }
-}
-
-impl std::fmt::Debug for UnlockSecret {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("UnlockSecret(REDACTED)")
-    }
-}
-
 pub struct LocalControlListener {
     listener: UnixListener,
     _cleanup: SocketCleanup,
@@ -129,6 +58,7 @@ pub struct LocalControlListener {
 
 pub struct LocalControlConnection {
     stream: UnixStream,
+    request_id: Option<[u8; 16]>,
 }
 
 impl LocalControlListener {
@@ -139,7 +69,10 @@ impl LocalControlListener {
                 .peer_cred()
                 .context("cannot read local control peer credentials")?;
             if credentials.uid() == unsafe { libc::geteuid() } {
-                return Ok(LocalControlConnection { stream });
+                return Ok(LocalControlConnection {
+                    stream,
+                    request_id: None,
+                });
             }
             tracing::warn!(
                 peer_uid = credentials.uid(),
@@ -151,13 +84,42 @@ impl LocalControlListener {
 
 impl LocalControlConnection {
     pub async fn read_request(&mut self) -> Result<LocalRequest> {
-        tokio::time::timeout(LOCAL_REQUEST_READ_TIMEOUT, read_frame(&mut self.stream))
-            .await
-            .context("local control request timed out")?
+        let envelope: LocalRequestEnvelope<LocalRequest> =
+            tokio::time::timeout(LOCAL_REQUEST_READ_TIMEOUT, read_frame(&mut self.stream))
+                .await
+                .context("local control request timed out")??;
+        if envelope.format_version != LOCAL_WIRE_FORMAT_VERSION || envelope.request_id == [0; 16] {
+            bail!("invalid local control envelope");
+        }
+        self.request_id = Some(envelope.request_id);
+        Ok(envelope.request)
     }
 
-    pub async fn respond(mut self, response: &LocalResponse) -> Result<()> {
-        write_frame(&mut self.stream, response).await
+    pub async fn respond(mut self, response: LocalResponse) -> Result<()> {
+        self.respond_result(Ok(response)).await
+    }
+
+    pub async fn respond_error(mut self, error: WireError) -> Result<()> {
+        self.respond_result(Err(error)).await
+    }
+
+    async fn respond_result(
+        &mut self,
+        result: std::result::Result<LocalResponse, WireError>,
+    ) -> Result<()> {
+        let request_id = self
+            .request_id
+            .take()
+            .context("cannot respond before reading a local request")?;
+        write_frame(
+            &mut self.stream,
+            &LocalResponseEnvelope {
+                format_version: LOCAL_WIRE_FORMAT_VERSION,
+                request_id,
+                result,
+            },
+        )
+        .await
     }
 }
 
@@ -246,7 +208,7 @@ pub async fn serve_local_control_on(
         let p2p = p2p.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle_connection(node, p2p, connection.stream).await {
+            if let Err(error) = handle_connection(node, p2p, connection).await {
                 tracing::warn!(%error, "local control request failed");
             }
         });
@@ -260,27 +222,37 @@ pub async fn local_control_call(
     let mut stream = UnixStream::connect(socket_path)
         .await
         .with_context(|| format!("cannot connect to daemon at {}", socket_path.display()))?;
-    write_frame(&mut stream, request).await?;
-    let response: LocalResponse = read_frame(&mut stream).await?;
-    if let LocalResponse::Error(message) = &response {
-        bail!("daemon rejected request: {message}");
+    let request_id = *Uuid::new_v4().as_bytes();
+    write_frame(
+        &mut stream,
+        &LocalRequestEnvelope {
+            format_version: LOCAL_WIRE_FORMAT_VERSION,
+            request_id,
+            request,
+        },
+    )
+    .await?;
+    let response: LocalResponseEnvelope = read_frame(&mut stream).await?;
+    if response.format_version != LOCAL_WIRE_FORMAT_VERSION || response.request_id != request_id {
+        bail!("local control response context mismatch");
     }
-    Ok(response)
+    response.result.map_err(anyhow::Error::new)
 }
 
 async fn handle_connection(
     node: Arc<Mutex<Node>>,
     p2p: P2pClient,
-    mut stream: UnixStream,
+    mut connection: LocalControlConnection,
 ) -> Result<()> {
-    let request: LocalRequest =
-        tokio::time::timeout(LOCAL_REQUEST_READ_TIMEOUT, read_frame(&mut stream))
-            .await
-            .context("local control request timed out")??;
-    let response = handle_request(node, p2p, request)
-        .await
-        .unwrap_or_else(|error| LocalResponse::Error(format!("{error:#}")));
-    write_frame(&mut stream, &response).await
+    let request = connection.read_request().await?;
+    match handle_request(node, p2p, request).await {
+        Ok(response) => connection.respond(response).await,
+        Err(error) => {
+            connection
+                .respond_error(WireError::operation(format!("{error:#}")))
+                .await
+        }
+    }
 }
 
 async fn handle_request(

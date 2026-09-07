@@ -7,6 +7,7 @@ mod network;
 mod node;
 mod snapshot;
 mod watcher;
+mod wire;
 
 pub use control::{
     LocalControlConnection, LocalControlListener, LocalRequest, LocalResponse, NodeStatus,
@@ -28,3 +29,4 @@ pub use snapshot::{
     restore_revision_from_source,
 };
 pub use watcher::run_root_watcher;
+pub use wire::{WireError, WireErrorCode};
