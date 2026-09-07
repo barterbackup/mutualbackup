@@ -2407,6 +2407,7 @@ dependencies = [
  "clap",
  "hex",
  "libp2p",
+ "libc",
  "mb-core",
  "mb-node",
  "mb-store",
