@@ -41,8 +41,8 @@ them as ADRs and test vectors before promising wire compatibility.
   a cached guild ID or peer list, rebuild its authenticated state and keys,
   retrieve any sufficient set of shards, and restore its data. No indispensable
   recovery material may live only in `control.db` or the source folder. The
-  implemented baseline demonstrates this with its legacy seed file; the next
-  milestone replaces that temporary secret format and startup flow.
+  implemented IP alpha demonstrates this from the normalized recovery string,
+  including a fresh data directory with no cached guild ID or peer list.
 - Assume social trust but verify signatures, identities, roots, and state
   transitions. The fixed-profile product must reject corrupt/replayed/forked
   inputs and resume local jobs after crashes or ordinary connection loss;
@@ -57,22 +57,25 @@ them as ADRs and test vectors before promising wire compatibility.
 
 ### Implemented baseline — first usable IP prototype
 
-The architectural prototype milestone is passed. The repository now connects
+The architectural prototype is passed and the Milestone 1 implementation run
+has reached its review gate. The repository now connects
 two real binaries and persistent local control to static five-member guild
 onboarding, reflink capture, owner encryption, actual `3+2` RS, remote SQLCipher
 parity, unanimous revisions/checkpoints, QUIC, Kademlia discovery, relay/DCUtR
 transport support, repeated backups, and DHT-assisted cold recovery. The
 five-process acceptance path launches real daemons and CLIs, removes an owner's
-state/source plus another holder, and restores bytes; focused transport tests
-exercise direct and relay/DCUtR sessions. This review is source-only and did not
-rerun those tests.
+state/source plus another holder, and restores bytes. It also exercises locked
+startup, generated and supplied recovery strings, failed-start recovery,
+endpoint changes, restart convergence, and relay authorization. Focused
+real-libp2p topology tests exercise direct, relay/DCUtR, and retained-relay
+application sessions without transport mocks.
 
-Call this a passed product slice, not a claim of production quality or of having
-met requirements added afterward. In particular, the process acceptance path
-does not yet force end-to-end backup/recovery through all three direct, punched,
-and failed-punch relay topologies, and the recovery-string/locked-daemon design
-below is new work. Both belong to the next milestone rather than being
-retroactively counted against the baseline.
+Call this a passed product slice, not a claim of production quality. The
+mandated source-only review found concrete defects and an acceptance-evidence
+gap recorded in `TODO.md`; close those and rerun both remote gates before
+selecting Milestone 2. In particular, the three route types have real-libp2p
+application coverage, but only the direct route is currently forced by the
+five-daemon process acceptance test.
 
 The baseline deliberately remains one guild and one reflink root per member,
 one parity database, Linux only, fixed 64 KiB sectors and `3+2`, unanimous
@@ -80,9 +83,11 @@ five-of-five checkpoints, full rescans, and indefinite retention. Each owner
 sector is grouped with two deterministic synthetic information fillers. This is
 inefficient but is a real committed codeword, not a storage or transport mock.
 
-### Immediate stabilization — fix before new features
+### Milestone 1 stabilization work and regression contract
 
-These are defects in the implemented slice, not postponed product features:
+The implementation addressed each target below. The source review found some
+incomplete edge enforcement, tracked separately in `TODO.md`; the targets remain
+the regression contract.
 
 1. **Restore the reproducible build gate.** Reconcile every workspace manifest
    with the committed `Cargo.lock`; the current CI unit job stops at
@@ -413,10 +418,10 @@ Proactive background repair comes later.
 
 ### Execution and local test model
 
-The asynchronous daemon/process split exists. The locked startup,
-recovery-string input, expected-identity check, bounded worker ownership, and
-formal wire contracts described here are the next milestone; today the daemon
-still requires and reads the legacy seed file before bringing up local control.
+The asynchronous daemon/process split, locked startup, recovery-string input,
+expected-identity check, bounded worker ownership, and formal wire contracts
+described here are implemented. A strictly checked recovery-string file remains
+an explicit unattended auto-unlock option rather than a daemon prerequisite.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -632,14 +637,15 @@ review at every gate before committing the next milestone's detailed scope.
 Keep the baseline described in section 1: real reflink capture, owner
 encryption, fixed `3+2`, remote SQLCipher parity, static guilds and unanimous
 checkpoints, daemon/CLI control, QUIC/Kademlia/relay/DCUtR primitives, repeated
-backup, and five-process DHT seed recovery. Its legacy seed-file format is only
-draft scaffolding; there is no compatibility promise for it.
+backup, and five-process DHT seed recovery. Milestone 1 replaced its legacy
+seed-file format; there is no compatibility promise for that draft format.
 
-### Milestone 1 — stabilized, unlockable IP product (next run; review here)
+### Milestone 1 — stabilized, unlockable IP product (implementation run complete; review gate reached)
 
-This is the complete scope of the next implementation run, in this order:
+This was the implementation scope, in order:
 
-1. Fix every item in **Immediate stabilization**. Start by restoring the locked
+1. Fix every item in **Milestone 1 stabilization work and regression contract**.
+   Start by restoring the locked
    CI build, then address recovery authority/readiness and restore correctness
    before usability or feature work. Add regression tests with each fix.
 2. Implement the recovery-string lifecycle exactly as specified above: 24-word
@@ -666,11 +672,13 @@ This is the complete scope of the next implementation run, in this order:
    path and transferred bytes, then force and assert end-to-end direct QUIC,
    successful DCUtR, and failed-punch relay transfer topologies.
 
-**Stop after this gate.** The product should then be a credible, safely
-unlockable IP-only alpha with the known urgent defects closed. Inspect the
-source boundaries, protocol vectors, threat handling, full test results, Docker
-lab ergonomics, and user workflow before selecting work from Milestone 2. Tor,
-storage redesign, and extra source backends are explicitly outside the next run.
+**The required stop/review gate is now reached.** The current commit passed the
+locked format/clippy/unit suite and the complete Btrfs acceptance suite on the
+remote Nix runner before the source-only audit. The audit results are in
+`TODO.md`. The next implementation run must fix those concrete findings and
+rerun both gates, then pause briefly to confirm the IP alpha is sound before
+selecting Milestone 2. Tor, storage redesign, and extra source backends remain
+outside that corrective run.
 
 ### Milestone 2 — Tor and robust connectivity beta
 
