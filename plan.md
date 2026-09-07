@@ -12,9 +12,10 @@ them as ADRs and test vectors before promising wire compatibility.
   and background jobs; `mutualbackup` is a thin local control and offline
   bootstrap CLI. A bootstrap, DHT, or relay role is a daemon configuration, not
   a third program.
-- The first usable prototype is Linux and **reflink-only**. Probe the complete
-  COW lifecycle when a root is added and reject the root if reflinks are not
-  safe there. Never silently fall back to an eager full copy. Guarded
+- The implemented first usable prototype baseline is Linux and
+  **reflink-only**. Probe the complete COW lifecycle when a root is added and
+  reject the root if reflinks are not safe there. Never silently fall back to
+  an eager full copy. Guarded
   link-freeze, VSS, FUSE, and other source backends come after the prototype.
 - Use a pinned SQLCipher/SQLite build as the common local storage engine, with
   per-page HMAC enabled. Keep control state separate from parity storage. The
@@ -27,17 +28,25 @@ them as ADRs and test vectors before promising wire compatibility.
   identity mapping for a later Arti onion transport, but do not implement or
   require Tor in the first usable prototype. Treat one live node as the writer
   for that identity until writer fencing is added later.
-- Make **seed-only recovery** a permanent invariant and the acceptance test for the
-  first usable prototype. Starting with the seed, an empty data directory, and
-  only generic Kademlia bootstrap multiaddresses, a node must derive its
-  identity, find its guild peers without a cached guild ID or peer list, rebuild
-  its authenticated state and keys, retrieve any sufficient set of shards, and
-  restore its data. No indispensable recovery material may live only in
-  `control.db` or the source folder.
+- Treat one normalized printable recovery string as the sole root secret. Generate
+  the recommended form as 24 English words with the maintained Rust `bip39`
+  crate and the OS CSPRNG, but use the words only as a high-entropy printable
+  string: do not parse BIP-39 entropy, require its checksum, or apply BIP-39's
+  wallet KDF. Accept a user-supplied string under the same validation policy.
+  The seed string has no prefix, embedded version, checksum, or draft-compatibility
+  parser.
+- Make **seed-only recovery** a permanent invariant. Starting with the recovery
+  string, an empty data directory, and only generic Kademlia bootstrap
+  multiaddresses, a node must derive its identity, find its guild peers without
+  a cached guild ID or peer list, rebuild its authenticated state and keys,
+  retrieve any sufficient set of shards, and restore its data. No indispensable
+  recovery material may live only in `control.db` or the source folder. The
+  implemented baseline demonstrates this with its legacy seed file; the next
+  milestone replaces that temporary secret format and startup flow.
 - Assume social trust but verify signatures, identities, roots, and state
-  transitions. The prototype rejects corrupt/replayed/forked inputs and resumes
-  local jobs after crashes or ordinary connection loss; Byzantine availability,
-  recovery takeover during a partition, and full abuse resistance come later.
+  transitions. The fixed-profile product must reject corrupt/replayed/forked
+  inputs and resume local jobs after crashes or ordinary connection loss;
+  Byzantine availability and recovery takeover during a partition come later.
 - Keep the implemented prototype profile fixed at five members, 64 KiB sectors,
   and RS `3+2`. Never place two shards of one group in the same physical failure
   domain. Variable membership, sector sizes, `k/m`, and extensible parity are
@@ -46,64 +55,90 @@ them as ADRs and test vectors before promising wire compatibility.
   checkpoints. Leave a compatible authorization interface for later quorum
   policies and FROST once membership and recovery policy are stable.
 
-### First usable prototype milestone
+### Implemented baseline — first usable IP prototype
 
-The existing reflink/encryption/RS/SQLCipher/signed-TCP recovery path is useful
-foundation, but it is a laboratory harness rather than this milestone. The
-prototype is complete only when all of the following use the real runtime path:
+The architectural prototype milestone is passed. The repository now connects
+two real binaries and persistent local control to static five-member guild
+onboarding, reflink capture, owner encryption, actual `3+2` RS, remote SQLCipher
+parity, unanimous revisions/checkpoints, QUIC, Kademlia discovery, relay/DCUtR
+transport support, repeated backups, and DHT-assisted cold recovery. The
+five-process acceptance path launches real daemons and CLIs, removes an owner's
+state/source plus another holder, and restores bytes; focused transport tests
+exercise direct and relay/DCUtR sessions. This review is source-only and did not
+rerun those tests.
 
-- Five persistent `mutualbackupd` processes form one static guild through an
-  explicit create/invite/join flow. Routine CLI commands never take five peer
-  addresses, a coordinator identity, or a seed file. The prototype supports one
-  guild and one protected root per member; both cardinalities can expand later.
-- `mutualbackup root add` performs the full reflink probe and persists the root;
-  `backup --wait`, durable job status, snapshot listing, and restore all operate
-  through the daemon. Every guild member can protect its own root.
-- The same guild supports revision and checkpoint generations 2 and later.
-  A full rescan and full new revision are acceptable; all old revisions,
-  anchors, and parity remain retained until post-prototype GC exists.
-- A basic Linux inotify watcher marks roots dirty. Manual publication is the
-  default; an opt-in quiet-period policy may start at most one backup per a
-  configured minimum interval and stops visibly when the storage budget is
-  exhausted. Startup and watcher overflow trigger a full reconciliation, so
-  filesystem events are never treated as authority.
-- Peers use real authenticated/encrypted QUIC, Identify, Kademlia discovery,
-  circuit relay v2, and AutoNAT/DCUtR hole punching. Direct, successful-punch,
-  and failed-punch relay paths exercise the same application protocol.
-- Kademlia replaces the in-memory directory. Signed, expiring recovery and
-  endpoint records are refreshed by the daemons, and backup/recovery no longer
-  depends on manually supplied guild or peer addresses. Durable publication
-  jobs distinguish a committed checkpoint from one confirmed seed-recovery
-  discoverable through records from at least three independent publishers.
-- A fresh daemon recovers from the seed plus generic IP bootstrap configuration,
-  restores the latest revision from any three valid shards, and rejoins at its
-  new endpoint after losing its old state, source, anchors, and endpoint cache.
-- Each daemon uses one SQLCipher parity database and an explicit storage budget.
-  Parity is acknowledged only after the host verifies the input roots and its
-  assigned RS row and durably stores it. A minimal signed acknowledgement stored
-  atomically with the parity object is enough for this milestone.
-- The acceptance test runs five isolated daemon processes, drives them only via
-  `mutualbackup`, survives process restarts, loses the owner and one other shard
-  holder, and restores byte-for-byte. No in-memory directory, fake peer, mock
-  transport, or injected recovery state is allowed in this acceptance path.
+Call this a passed product slice, not a claim of production quality or of having
+met requirements added afterward. In particular, the process acceptance path
+does not yet force end-to-end backup/recovery through all three direct, punched,
+and failed-punch relay topologies, and the recovery-string/locked-daemon design
+below is new work. Both belong to the next milestone rather than being
+retroactively counted against the baseline.
 
-Every prototype owner sector is grouped with two deterministic synthetic
-information fillers. This is an explicitly inefficient but real committed
-`3+2` codeword, not a transport or storage mock. Cross-user sector packing is a
-post-prototype replacement for that rule.
+The baseline deliberately remains one guild and one reflink root per member,
+one parity database, Linux only, fixed 64 KiB sectors and `3+2`, unanimous
+five-of-five checkpoints, full rescans, and indefinite retention. Each owner
+sector is grouped with two deterministic synthetic information fillers. This is
+inefficient but is a real committed codeword, not a storage or transport mock.
 
-The milestone intentionally excludes Tor/Arti/onion services, guarded
-link-freeze and non-Linux platforms, dynamic membership, writer-incarnation
-fencing, multiple parity volumes, variable RS, range-level Merkle proofs,
-cross-user packing, retention/GC, audits, repair, migration/rebalancing, and
-production-grade abuse/resource hardening. Later sections preserve their design
-direction, but none of them blocks this prototype unless stated explicitly.
+### Immediate stabilization — fix before new features
+
+These are defects in the implemented slice, not postponed product features:
+
+1. **Restore the reproducible build gate.** Reconcile every workspace manifest
+   with the committed `Cargo.lock`; the current CI unit job stops at
+   `cargo clippy --locked` because `cmd/mutualbackup` gained its `libc`
+   dependency without the corresponding lockfile update, and therefore never
+   compiles or tests the product. Keep locked dependency resolution,
+   formatting, warning-free clippy, unit tests, and the acceptance lanes green
+   for every following change.
+2. **Make DHT recovery authoritative only after validation.** Treat mailbox,
+   bundle, endpoint, and claimed-head data solely as untrusted hints. Isolate bad
+   or unreachable providers, validate guild membership and checkpoint
+   certificates before ranking heads, and fall back to the highest *certified*
+   recoverable checkpoint rather than letting three self-signed junk locators
+   suppress it. Bound candidates and surface rejected/forked evidence.
+3. **Make recovery readiness a renewable fact.** Replace the permanent
+   `seed_recovery_ready` checkpoint latch with current, expiring confirmations
+   from at least three independent valid publishers. Clear/degrade readiness
+   when refresh or lookup quorum lapses; destructive lab workflows must never
+   rely on stale DHT evidence.
+4. **Unify normal restore, repair, and cold recovery.** A healthy daemon that
+   loses a local anchor must fetch verified guild shards instead of failing
+   locally. Retry/resume each 64 KiB sector across endpoints and holders, retain
+   good shards across transient failures, and let a storage-only member recover
+   authenticated node/guild state and rejoin without requiring an owner
+   revision or plaintext restore.
+5. **Converge live endpoints after address changes and recovery.** Continuously
+   consume signed DHT/gossip endpoint records into a bounded disposable dial
+   cache; do not use the genesis-time endpoint list as permanent routing state.
+   Retry configured bootstrap peers with bounded backoff after startup failure
+   or routing-table loss, without requiring a daemon restart.
+   Prove that a recovered member at a new address remains usable after every
+   daemon restarts and a later backup begins.
+6. **Keep the peer service alive when source capture is degraded.** A missing,
+   renamed, unmounted, or temporarily unwatchable protected root must mark that
+   root unavailable/dirty and retry with backoff, not terminate the daemon and
+   its parity, relay, and DHT duties. Coalesce watcher events and make overflow
+   trigger bounded reconciliation.
+7. **Bound and authorize network-facing work.** Put hard limits and backpressure
+   ahead of peer requests, blocking CPU/SQL work, database connections, control
+   clients, watcher queues, DHT candidates, and response sizes. Until relay
+   reservations and circuits can be admitted only for certified guild peers
+   under explicit time/byte/connection caps, do not enable a publicly reachable
+   relay server by default. Every cap must be a named constant or configuration;
+   tests set deliberately small limits and prove item `N+1` is rejected or
+   backpressured without exceeding the bound or wedging later valid work.
+8. **Make onboarding and the lab resumable.** A failed join must have a durable
+   retry or cancel/restart transition instead of remaining wedged in `Joining`.
+   Reinitializing any Docker-lab node must preserve the intended relay/bootstrap
+   role. Acceptance must force and report real direct, successful-DCUtR, and
+   failed-punch relay data paths rather than infer them from enabled behaviours.
 
 ## 2. State ownership
 
 | Item | Who keeps it |
 | --- | --- |
-| Plaintext and recovery seed | Plaintext stays on the owner's selected filesystem, in the working folder or restricted source-anchor area; the seed has offline backup and never enters the DHT. The seed alone derives the stable identity and recovery-decryption roots |
+| Plaintext and recovery seed | Plaintext stays on the owner's selected filesystem, in the working folder or restricted source-anchor area. The printable recovery string is normally retained offline, entered through the CLI, never stored by the daemon, and never enters the DHT. An explicitly configured seed file is a convenience auto-unlock source. The string alone deterministically derives the stable identity and recovery-decryption roots |
 | Active source anchor | The prototype owner retains a COW reflink until every referencing revision is retired. A write-protected hard link and its sparse private copy are later backends |
 | Information sectors | Guild-specific encrypted form normally comes from its owner; after owner-disk loss it is reconstructed from the coding group |
 | Private file metadata | Encrypted as user-owned information sectors and protected by the same coding machinery |
@@ -132,11 +167,41 @@ independent ciphertext and state.
 Post-prototype schemas add multiple-volume inventory, full quota/receipt/outbox
 accounting, retention, repair, and migration state.
 
-Keep the seed format versioned and checksummed. The prototype's fixed key suite
-must derive every recovery-critical key or recover its authenticated material
-from peers; recovery must not depend on a salt, counter, key version, or manifest
-found only on the lost machine. Rotatable user/guild keys and historical key
-envelopes are post-prototype protocol work.
+Define recovery-string handling as one strict deterministic pipeline. Decode
+valid UTF-8, remove every Unicode whitespace character (including spaces, tabs,
+line endings, and non-breaking spaces), then require every remaining character
+to be an ASCII graphic character in `!` through `~`. This objective allowlist
+rejects controls, zero-width/bidirectional characters, combining marks, emoji,
+homoglyph-heavy scripts, and normalization ambiguity. Require 8 to 1024
+characters after stripping whitespace.
+
+Use a pinned `zxcvbn` 3.1 release to reject any recovery string whose estimated
+guessing work is below 64 bits. Compute the gate from its unsaturated estimate as
+`guesses_log10 * log2(10) >= 64`, not from its saturating `u64` guess count.
+Its source matches ranked dictionaries and user terms, reversed and l33t words,
+keyboard walks, repetitions, sequences, regex/year/date patterns, then finds the
+least-cost segmentation. It intentionally examines only the first 100
+characters, so characters after that limit receive no entropy credit. Keep the
+minimum-length check as an independent usability guard and describe this result
+as an estimate, not measured entropy. Its manifest calls the project passively
+maintained despite current 3.1.1/2026 maintenance, so pin its exact checksum,
+hide it behind a small estimator interface, and keep a regression corpus that
+makes replacement straightforward if maintenance or quality declines.
+
+After validation, derive a deterministic 16-byte Argon2 salt/tweak with a
+domain-separated BLAKE3 hash of the normalized UTF-8 bytes, then derive the
+32-byte root with Argon2id v1.3 and fixed, benchmarked memory/time/parallelism
+parameters. The RFC 9106 constrained profile (64 MiB, three passes, four lanes)
+is the starting candidate. The deterministic tweak and fixed parameters ensure
+that the printable string is sufficient for recovery; no salt or KDF metadata
+may exist only on the lost machine. The string has no format marker or checksum,
+but normalization, the hash domain, and Argon2 parameters are necessarily an
+identity contract: changing them changes the node. Rotatable user/guild keys and
+historical key envelopes are post-prototype protocol work.
+Publish recovery-string/KDF vectors and boundary tests covering all whitespace
+classes, invalid UTF-8, disallowed Unicode/control characters, the 8-character
+minimum, the 64-bit estimate boundary, Argon parameter stability, generated
+phrases, user input, wrong-seed identity rejection, and zeroization/redaction.
 
 ## 3. Formats and protocol objects
 
@@ -144,9 +209,22 @@ Keep canonical postcard encoding for hashed/signed peer and durable records;
 transport and local-control framing is separate and is never itself signed.
 Every durable record carries format and algorithm versions, scope, type, and
 lengths. Publish golden vectors for hashes, signatures, encryption, sector
-roots, RS, identity mapping, and DHT keys. The prototype freezes only the fixed
-profile needed for its real multi-process acceptance test; the advanced objects
-identified below remain post-prototype work.
+roots, RS, identity mapping, and DHT keys. The implemented baseline uses only its
+fixed profile; the advanced objects identified below remain later work and none
+of these draft encodings is a compatibility promise yet.
+
+Do not add gRPC, HTTP/2, or Protobuf merely to obtain an interface definition.
+Keep the libp2p request/response protocol encoded as CBOR and the local
+length-framed Unix-socket API encoded as JSON. Move both APIs out of daemon
+implementation modules into dedicated wire-only Rust types with explicit
+operation tags, field meanings, bounds, error forms, and request/response
+correlation. Commit normative CDDL schemas for the CBOR peer API and the JSON
+control API; CDDL describes both data models. CI validates golden valid/invalid
+messages against those schemas and checks that schema fixtures round-trip
+through the Rust wire types. Keep domain conversions separate so changing an
+internal `Node` type cannot silently change the wire. For signed Postcard
+records, commit field tables plus byte-exact signing and decoding vectors because
+CDDL describes their data model but not the Postcard binary representation.
 
 The protocol byte flow is owner plaintext → owner encryption → RS over the
 encrypted information sectors → root-committed information/parity sectors.
@@ -226,8 +304,9 @@ that reproduces its committed RS-level bytes using the recorded format and key
 parameters; deterministic filler roles carry their own recipe. Only file content
 and length need anchoring: directory structure, names, and desired properties
 live in authenticated metadata. If an anchor is missing, changed, or corrupt,
-refuse to serve/sign for that shard and report that recovery is needed; never
-encode new bytes under an old root. Automatic repair comes later.
+refuse to serve/sign from it, mark it unavailable, and use verified guild shards
+for restore or explicit repair; never encode new bytes under an old root.
+Proactive background repair comes later.
 
 - Use the native Linux per-file reflink/clone, leaving the working inode editable.
   `root add` performs a disposable sparse-file lifecycle probe: create and clone,
@@ -334,27 +413,50 @@ encode new bytes under an old root. Automatic repair comes later.
 
 ### Execution and local test model
 
+The asynchronous daemon/process split exists. The locked startup,
+recovery-string input, expected-identity check, bounded worker ownership, and
+formal wire contracts described here are the next milestone; today the daemon
+still requires and reads the legacy seed file before bringing up local control.
+
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
   retries, cancellation, watchers, and orchestration. Canonical encoding,
   signature and root checks, RS, authorization, and guild-state transitions
   remain ordinary synchronous functions that are easy to test deterministically.
-- Run one Tokio runtime in `mutualbackupd`. The daemon alone opens the seed,
-  `Node`, and databases and runs the peer listener and background jobs.
-  `mutualbackup` uses a versioned, length-framed local API over a mode-`0600`
-  Unix socket with peer-credential checks. Long operations return durable job
-  IDs with status/follow/cancel; only offline bootstrap and maintenance commands
-  such as `init`, `recover-init`, reflink probe, and later `db-shell` bypass it.
-- `mutualbackup init --data-dir DIR` creates a versioned nonsecret TOML config,
-  a mode-`0600` runtime seed, and the default socket location; the user keeps a
-  separate offline seed copy. Config names the QUIC listen multiaddresses,
-  failure-domain label for a new node, parity path/budget, Kademlia bootstrap and
-  optional relay multiaddresses, and root publication defaults.
-  `mutualbackupd --data-dir DIR` selects it. The CLI uses the default per-user
-  socket or explicit `--socket` for tests/multiple local daemons. `recover-init`
-  imports the offline seed into a new data directory without importing guild or
-  peer configuration and leaves the failure-domain label unset until signed
-  genesis is recovered.
+- Run one Tokio runtime in `mutualbackupd`. It first reads only nonsecret config,
+  takes the data-directory lock, binds the mode-`0600` Unix control socket, and
+  enters `Locked`. Only bounded status and unlock requests are accepted there.
+  A successful unlock transitions through `Unlocking` while the daemon derives
+  and verifies its public identity, opens SQLCipher stores, constructs `Node`,
+  and starts the libp2p swarm and background jobs; failure returns cleanly to
+  `Locked`. The normal way to clear secrets from memory is an orderly daemon
+  shutdown rather than a partially torn-down live relock.
+- `mutualbackup` uses the explicitly specified, length-framed local wire API with
+  Unix peer-credential checks. It obtains recovery strings from a no-echo TTY
+  prompt or `--seed-stdin`, never argv or an environment variable; generated
+  strings are shown once and confirmed. It strips/validates/strength-checks the
+  string, performs the BLAKE3/Argon2id derivation off the Tokio worker threads,
+  sends only the 32-byte unlock value in a secret-specific type whose diagnostic
+  formatting is redacted, and zeroizes text, KDF work buffers, and frames. Long
+  operations return durable job IDs with status/follow/cancel; offline
+  configuration, reflink probe, and later `db-shell` remain local.
+- `mutualbackup init --data-dir DIR` creates a versioned **nonsecret** TOML
+  config, default socket location, and public expected Node ID, using either a
+  newly generated 24-word recovery string or a securely prompted user string.
+  Interactive mode does not persist that string. Config names the QUIC listen
+  multiaddresses, failure-domain label, parity path/budget, Kademlia bootstrap
+  and optional relay multiaddresses, and root publication defaults. An explicit
+  file seed source lets `mutualbackupd` apply the identical validation/KDF and
+  auto-unlock for unattended use. `recover-init` needs only the recovery string,
+  an empty data directory, and generic bootstrap configuration; it imports no
+  cached guild or peer state and leaves the failure-domain label unset until
+  signed genesis is recovered.
+- Store the expected Node ID as nonsecret local identity metadata and reject a
+  wrong unlock value before opening existing databases. The CLI uses the default
+  per-user socket or explicit `--socket` for tests and multiple local daemons.
+  The unlock request gets a secret-specific wire wrapper with redacted `Debug`,
+  bounded allocation, and zeroization rather than an ordinary logged JSON
+  `String` field.
 - Put blocking SQLCipher work behind one bounded worker/actor per database,
   filesystem calls such as sparse copy/reflink/fsync in a bounded blocking
   pool, and encryption, hashing, roots, and RS work in a bounded CPU pool.
@@ -363,8 +465,8 @@ encode new bytes under an old root. Automatic repair comes later.
   or source transition guard across a network `.await`.
 - Give background tasks explicit ownership, cancellation, and shutdown/join
   rules. Deterministic in-process nodes may replace transport, time, and failure
-  sources for focused tests, but are not the prototype milestone. Acceptance
-  runs five real `mutualbackupd` processes, each with its own seed, databases,
+  sources for focused tests, but never replace real-process acceptance.
+  Acceptance runs five real `mutualbackupd` processes, each with its own seed, databases,
   guild replica, jobs, and network endpoint, controlled through `mutualbackup`.
   No nodes may share a database, peer registry, or hidden authority.
 
@@ -441,7 +543,7 @@ and requests best-effort removal.
 
 ## 6. Networking and hole punching
 
-### First usable prototype: real IP connectivity
+### Implemented IP connectivity profile and stabilization target
 
 - Use rust-libp2p rather than extending the temporary TCP stack: QUIC, Identify,
   Kademlia, request/response or stream protocols, circuit relay v2, AutoNAT, and
@@ -464,7 +566,7 @@ and requests best-effort removal.
   opaque bytes without retaining the payload or gaining storage authority, and
   enforces connection, time, and byte limits; the daemon may separately store
   its assigned parity.
-- Implement the Kademlia mailbox/provider/bundle/endpoint scheme from section 3.
+- Keep and complete the Kademlia mailbox/provider/bundle/endpoint scheme from section 3.
   Daemons refresh records before their finite TTL and gossip fresher signed
   endpoints inside the guild. Ship several replaceable generic IP bootstrap
   multiaddresses. DHT routing/cache state is disposable; the DHT is discovery,
@@ -518,79 +620,130 @@ shared inbound/outbound `TorClient`, persistent-cache/ephemeral-key split, and
 runtime supervision. Use a maintained Arti release and revalidate state handling
 instead of copying its custom fork or hard-coded cleanup paths blindly.
 
-## 8. Delivery phases
+## 8. Delivery milestones and review gates
 
-Each phase must extend the same runnable workflow. Do not build a replacement
-subsystem beside the product and integrate it later.
+Each milestone extends the same runnable product. Preserve the two-binary
+architecture and real data/network path; do not build a parallel replacement to
+integrate later. Pause for a focused source, runtime, security, and usability
+review at every gate before committing the next milestone's detailed scope.
 
-0. **Existing foundation — keep green:** retain the real reflink capture, owner
-   encryption, fixed `3+2`, SQLCipher parity, canonical signed records, durable
-   retry work, and five-process direct-TCP seed-recovery smoke test. This is the
-   protocol/storage kernel, not the usable prototype.
-1. **Daemon and control spine:** create `mutualbackupd` and turn `mutualbackup`
-   into its Unix-socket client. The daemon exclusively owns keys, `Node`, stores,
-   peer service, and durable jobs. Move the current backup/recovery workflow
-   behind this boundary first, make source capture a direct local-daemon action
-   so source paths leave the peer protocol, and keep the smoke test passing. Do
-   not redesign the data path at the same time.
-2. **Final IP network and guild substrate:** define `GuildGenesis` and its local
-   validation, then replace the request path's TCP/`SocketAddr` coupling with
-   libp2p QUIC before enabling create/invite/join across peers. The final path
-   adds Identify, Kademlia provider/bundle/endpoint records, peer exchange,
-   relay v2, AutoNAT/DCUtR, and bounded path management, while genesis persists
-   peer identity, roster, failure domains, and coordinator policy. Remove
-   `serve-directory`, global trusted-coordinator flags, and five-peer CLI
-   arguments. Extend the real-process smoke after each replacement, then delete
-   the obsolete runtime path rather than maintaining two stacks. No new remote
-   behavior is built on TCP.
-3. **Persistent usable backup lifecycle on that network:** add one persistent
-   root per member, atomic parity budget admission and acknowledgement,
-   revisions/checkpoints `N+1`, manual backup, opt-in bounded inotify scheduling
-   and startup reconciliation, durable DHT publication/readiness, snapshot
-   listing, restore, and visible status/jobs. Test two revisions from at least
-   two different members. All five signatures and all five online members are
-   required to commit.
-4. **First usable prototype acceptance:** install five isolated daemons with
-   separate seeds and databases; form the guild through CLI invites; enroll
-   reflink roots; make and list repeated backups; restart daemons and interrupt a
-   job by killing its daemon mid-backup, then restart and idempotently finish
-   without activating partial state. Restore normally. Force three network
-   topologies and assert daemon-reported path plus transferred bytes: direct
-   QUIC, successful DCUtR, and failed-punch relay fallback. Wait until status is
-   `seed-recovery-ready`; then delete one owner's state/source/anchors and one
-   additional holder, start a blank daemon with only that owner's seed and
-   generic Kademlia bootstrap configuration, discover and rejoin without an
-   injected guild ID or peer list, and restore the latest revision byte-for-byte
-   from any three valid shards. Keep this gate passing thereafter.
+### Milestone 0 — first usable IP prototype architecture (passed)
 
-After that milestone:
+Keep the baseline described in section 1: real reflink capture, owner
+encryption, fixed `3+2`, remote SQLCipher parity, static guilds and unanimous
+checkpoints, daemon/CLI control, QUIC/Kademlia/relay/DCUtR primitives, repeated
+backup, and five-process DHT seed recovery. Its legacy seed-file format is only
+draft scaffolding; there is no compatibility promise for it.
 
-5. **Tor/onion connectivity:** adapt the narrow BarterBackup `nettor` ideas to a
-   maintained Arti release; add the deterministic onion service and dialer,
-   onion endpoint publication, Tor routing policy, onion-reachable discovery,
-   and a real private-Tor seed-recovery acceptance lane. This is explicitly not
-   part of the first usable prototype.
-6. **Operational lifecycle and storage:** add writer fencing, dynamic membership,
-   cross-user sector packing, retention/GC, audits and repair, outage layouts,
-   richer quota/receipt/outbox handling, multiple parity volumes and migration,
-   incremental updates/range proofs, virtual zeros, and deeper crash/failure
-   coverage.
-7. **Additional source backends and platforms:** implement and validate guarded
-   link-freeze, then evaluate NTFS/VSS, macOS cloning, non-Linux native watchers,
-   portable metadata, ACLs, and application-consistent capture hooks.
-8. **Production hardening and compatibility freeze:** fuzz parsers and state
-   machines; property-test any-`k` and seed-only recovery; bound queue, task,
-   memory, WAL, disk, relay, and DHT resource growth; test corruption, partitions,
-   remounts, large trees, key rotation/revocation, and all incomplete lifecycle
-   transitions before promising stable wire/storage compatibility.
+### Milestone 1 — stabilized, unlockable IP product (next run; review here)
 
-The prototype freezes only the choices needed for its fixed profile: Node ID ↔
-libp2p Peer ID mapping, canonical sector/encryption/root representation, the
-`3+2` matrix, static-guild revision/checkpoint format, peer protocol IDs,
-Kademlia mailbox/provider/bundle keys and TTL/sequence behavior, relay admission,
-and DCUtR path semantics. Before a production v1 freeze, separately decide
-variable `k/m`, dynamic membership/quorum and multi-device forks, key epochs, retention
-and deletion, audit/repair policy, Tor configuration, endpoint privacy, relay
-abuse controls, portable restore metadata, virtual zeros, multiple-volume
-manifests, source-backend support, application-consistent capture, and final
-resource/headroom limits.
+This is the complete scope of the next implementation run, in this order:
+
+1. Fix every item in **Immediate stabilization**. Start by restoring the locked
+   CI build, then address recovery authority/readiness and restore correctness
+   before usability or feature work. Add regression tests with each fix.
+2. Implement the recovery-string lifecycle exactly as specified above: 24-word
+   `bip39` generation or a user string; Unicode-whitespace stripping plus the
+   ASCII/length/`zxcvbn` gate; domain-separated BLAKE3 tweak and fixed Argon2id;
+   stable vectors; redaction and zeroization. Deliberately provide no parser or
+   migration promise for the legacy draft seed format.
+3. Start the daemon locked from nonsecret configuration, and make no-echo prompt
+   or `--seed-stdin` through the CLI the primary unlock path. Send only the
+   derived root over the same-UID local socket, verify the expected Node ID, and
+   retain a strictly checked, no-symlink, owner/mode-safe seed-file auto-unlock
+   option for unattended nodes and the Docker lab.
+4. Formalize rather than replace the existing interfaces: dedicated bounded
+   wire types, correlation and structured errors for local JSON and peer CBOR;
+   normative CDDL schemas; field tables and byte-exact vectors for signed
+   Postcard records. Do not add gRPC.
+5. Extend real-process acceptance to cover generated, user-supplied, stdin, and
+   file auto-unlock; healthy restore after local-anchor loss; transient shard
+   failure; storage-only seed recovery; malicious/stale DHT hints and expiring
+   readiness; join resumption; endpoint change followed by full restart and
+   backup; bootstrap absent at startup and later restored without a daemon
+   restart; source-root loss without peer-service loss; enforced load bounds and
+   nonmember relay rejection. Add the minimum status needed to name the selected
+   path and transferred bytes, then force and assert end-to-end direct QUIC,
+   successful DCUtR, and failed-punch relay transfer topologies.
+
+**Stop after this gate.** The product should then be a credible, safely
+unlockable IP-only alpha with the known urgent defects closed. Inspect the
+source boundaries, protocol vectors, threat handling, full test results, Docker
+lab ergonomics, and user workflow before selecting work from Milestone 2. Tor,
+storage redesign, and extra source backends are explicitly outside the next run.
+
+### Milestone 2 — Tor and robust connectivity beta
+
+- Adapt the narrow, useful BarterBackup `nettor` principles to a maintained Arti
+  release: outbound onion dialing, an inbound v3 onion service, persistent Tor
+  cache, ephemeral service-key injection, and supervised readiness.
+- Bind the onion service to the same seed-derived identity, publish signed onion
+  endpoints through DHT and peer exchange, and support `auto`, `prefer-tor`,
+  `require-tor`, and `disable-tor`. Make bootstrap/discovery itself onion
+  reachable; an onion address found only through blocked IP infrastructure is
+  not sufficient.
+- Finish replaceable bootstrap deployment, detailed path/session history and
+  metrics beyond Milestone 1's acceptance status, peer exchange,
+  duplicate-session collapse, and optional PCP/NAT-PMP/UPnP mappings.
+  Gate with a private-Tor seed-recovery test in which all peer IP paths are
+  blocked and the onion identity survives restarts.
+
+### Milestone 3 — durable operations and multi-volume storage beta
+
+- Add writer-incarnation fencing before supporting concurrent loss/recovery;
+  then add retention and tombstones, safe GC, audits/scrubs, repair and emergency
+  parity, outage layouts, and explicit degraded/emergency states.
+- Add quiet-period automatic backup with rate/budget limits, startup and
+  periodic full reconciliation, durable scheduling, and clear dirty/blocked
+  status; filesystem events remain hints rather than backup authority.
+- Add one independently encrypted SQLCipher parity database per physical volume,
+  DEK wrapping, volume identity/state, budgets and headroom, durable receipts and
+  outboxes instead of cross-database transactions, drain/migrate/reconcile, and
+  the restricted `mutualbackup db-shell`.
+- Gate with crash injection at every durable transition, corruption and partial
+  DHT/network failure, parity-volume loss and replacement, repair followed by a
+  second loss, safe retention/GC, and recovery while a source volume is absent.
+
+### Milestone 4 — efficient and flexible data/guild protocol
+
+- Replace deterministic fillers with cross-user sector packing and fair
+  scheduling. Add incremental updates, hierarchical Merkle range proofs and
+  range resume, authenticated virtual-zero extents, multiple protected roots,
+  and measured sparse/large-tree efficiency.
+- Add versioned variable `k/m` and sector profiles, dynamic membership and event
+  tails, quorum policy, writer/key epochs, recovery-key envelopes, rotation and
+  revocation. Keep old committed layouts decodable until their retention ends.
+- Gate with property tests for any-`k` recovery and packing/layout invariants,
+  member add/remove/replacement during interrupted work, key rotation across
+  retained revisions, and bounded storage/network amplification.
+
+### Milestone 5 — additional source backends and platforms
+
+- Implement the guarded link-freeze backend, including its atomic sparse private
+  copy transition when the user needs to edit the original inode. Preserve file
+  IDs, paths and metadata without freezing directory names or removal.
+- Then validate native Windows NTFS capture, including VSS where appropriate,
+  macOS cloning, platform watchers, portable metadata/ACL policy, and explicit
+  application-consistent capture hooks. Each enrolled root must pass its complete
+  capture/edit/restore probe; never fall back silently to an eager full copy.
+
+### Milestone 6 — release candidate and compatibility freeze
+
+- Fuzz every parser and state machine; property-test recovery and authorization;
+  test partitions, malicious peers, corruption, remounts, clock changes, huge
+  trees, disk/WAL exhaustion, interrupted upgrades, and every incomplete object
+  transition. Measure and cap tasks, queues, memory, CPU, connections, relay/DHT
+  work, bandwidth, and storage amplification.
+- Finish migrations, observability and actionable status, install/service and
+  upgrade/rollback paths, backup/restore operator documentation, and independent
+  cryptographic/protocol/security review. Freeze wire and storage compatibility
+  only after this gate passes.
+
+Until the release-candidate gate, deterministic vectors protect the draft from
+accidental drift but do not promise backward compatibility; an intentional
+contract change may require recreating early nodes. Before the production v1
+freeze, explicitly settle Node ID/transport bindings, recovery KDF parameters,
+sector/encryption/root representation, variable coding profiles, membership and
+fork policy, key epochs, retention/deletion, audit/repair, endpoint privacy and
+Tor policy, relay abuse controls, portable metadata, volume manifests, source
+backends, application consistency, and final resource/headroom limits.
