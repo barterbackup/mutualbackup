@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::PathBuf;
 
 #[cfg(test)]
@@ -6,13 +7,18 @@ use std::fs;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mb_core::{KeyMaterial, Seed};
-use mb_node::{LocalRequest, LocalResponse, local_control_call};
+use mb_node::{LocalRequest, LocalResponse, UnlockSecret, local_control_call};
 use mb_store::probe_reflink;
+#[cfg(test)]
+use mutualbackup::read_seed;
 use mutualbackup::{
-    DaemonConfig, default_p2p_listen_addresses, read_seed, write_config, write_seed,
+    DaemonConfig, default_p2p_listen_addresses, read_recovery_string, write_config, write_seed,
 };
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+use zeroize::Zeroizing;
+
+const MAX_CLI_RECOVERY_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "mutualbackup", version, about = "Mutual P2P backup prototype")]
@@ -26,10 +32,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Generate a protected recovery-seed file and show its stable identities.
+    /// Initialize a node from a generated or user-supplied recovery string.
     Init {
         #[arg(long)]
-        seed_file: PathBuf,
+        seed_file: Option<PathBuf>,
+        /// Read a user-supplied recovery string from standard input.
+        #[arg(long, conflicts_with = "prompt_recovery")]
+        seed_stdin: bool,
+        /// Prompt without echo for a user-supplied recovery string.
+        #[arg(long, conflicts_with = "seed_stdin")]
+        prompt_recovery: bool,
         /// Also create a daemon configuration file.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -50,15 +62,24 @@ enum Command {
         #[arg(long, requires = "config")]
         enable_relay_server: bool,
     },
-    /// Derive the public identity for an existing recovery seed.
+    /// Derive public identity from a recovery string.
     Identity {
         #[arg(long)]
-        seed_file: PathBuf,
+        seed_file: Option<PathBuf>,
+        #[arg(long, conflicts_with = "seed_file")]
+        seed_stdin: bool,
     },
     /// Check whether a directory passes the complete reflink COW probe.
     ReflinkProbe { path: PathBuf },
     /// Show the persistent local daemon state.
     Status,
+    /// Unlock a running daemon using a recovery string.
+    Unlock {
+        #[arg(long)]
+        seed_file: Option<PathBuf>,
+        #[arg(long, conflicts_with = "seed_file")]
+        seed_stdin: bool,
+    },
     /// Manage the single protected root in the prototype.
     Root {
         #[command(subcommand)]
@@ -77,10 +98,12 @@ enum Command {
     },
     /// Inspect a durable backup job by revision ID.
     BackupStatus { revision_id: Uuid },
-    /// Create a blank recovery-mode daemon configuration around an existing seed.
+    /// Create a blank recovery-mode configuration from a recovery string.
     RecoverInit {
         #[arg(long)]
-        seed_file: PathBuf,
+        seed_file: Option<PathBuf>,
+        #[arg(long, conflicts_with = "seed_file")]
+        seed_stdin: bool,
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
@@ -96,7 +119,7 @@ enum Command {
         #[arg(long = "relay")]
         p2p_relay_addresses: Vec<String>,
     },
-    /// Restore this seed's latest revision through the recovery-mode daemon.
+    /// Restore this identity's latest revision through the recovery-mode daemon.
     Restore { target: PathBuf },
     /// List or restore committed snapshots owned by this node.
     Snapshot {
@@ -150,6 +173,8 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Init {
             seed_file,
+            seed_stdin,
+            prompt_recovery,
             config,
             data_dir,
             failure_domain,
@@ -160,14 +185,40 @@ async fn main() -> Result<()> {
             p2p_relay_addresses,
             enable_relay_server,
         } => {
-            let seed = Seed::generate();
-            write_seed(&seed_file, &seed)?;
-            println!("recovery seed written to: {}", seed_file.display());
+            let generated = !seed_stdin && !prompt_recovery;
+            let recovery = if seed_stdin {
+                read_recovery_stdin().await?
+            } else if prompt_recovery {
+                prompt_recovery_string("Recovery string: ").await?
+            } else {
+                Seed::generate_recovery_string()?
+            };
+            let seed = derive_seed(&recovery).await?;
+            let config_seed_file = if let Some(path) = &seed_file {
+                write_seed(path, &recovery)?;
+                println!("recovery string written to: {}", path.display());
+                Some(path.canonicalize().with_context(|| {
+                    format!("cannot resolve recovery string file {}", path.display())
+                })?)
+            } else if generated {
+                println!("recovery string (shown once): {}", recovery.as_str());
+                let confirmation =
+                    prompt_recovery_string("Re-enter the recovery string to confirm: ").await?;
+                let confirmed = derive_seed(&confirmation).await?;
+                if confirmed.expose() != seed.expose() {
+                    bail!("recovery string confirmation did not match");
+                }
+                None
+            } else {
+                None
+            };
+            let expected_node_id = KeyMaterial::from_seed(&seed).node_id();
             if let Some(config_path) = config {
                 let config = DaemonConfig {
                     format_version: 1,
                     data_dir: data_dir.context("--data-dir is required when --config is used")?,
-                    seed_file: seed_file.clone(),
+                    expected_node_id,
+                    seed_file: config_seed_file,
                     control_socket: control_socket.clone(),
                     failure_domain: failure_domain
                         .context("--failure-domain is required when --config is used")?,
@@ -186,15 +237,26 @@ async fn main() -> Result<()> {
                 write_config(&config_path, &config)?;
                 println!("daemon config written to: {}", config_path.display());
             }
-            print_identity(&seed, false);
+            print_identity(&seed);
         }
-        Command::Identity { seed_file } => print_identity(&read_seed(&seed_file)?, false),
+        Command::Identity {
+            seed_file,
+            seed_stdin,
+        } => {
+            let recovery = recovery_input(seed_file.as_deref(), seed_stdin).await?;
+            print_identity(&derive_seed(&recovery).await?);
+        }
         Command::ReflinkProbe { path } => {
             probe_reflink(&path)?;
             println!("reflink COW probe passed: {}", path.display());
         }
         Command::Status => {
             let response = local_control_call(&control_socket, &LocalRequest::Status).await?;
+            if let LocalResponse::Locked { expected_node_id } = response {
+                println!("state:         Locked");
+                println!("expected node: {expected_node_id}");
+                return Ok(());
+            }
             let LocalResponse::Status(status) = response else {
                 bail!("daemon returned the wrong response to status request");
             };
@@ -216,6 +278,22 @@ async fn main() -> Result<()> {
                     );
                 }
             }
+        }
+        Command::Unlock {
+            seed_file,
+            seed_stdin,
+        } => {
+            let recovery = recovery_input(seed_file.as_deref(), seed_stdin).await?;
+            let seed = derive_seed(&recovery).await?;
+            let request = LocalRequest::Unlock {
+                secret: UnlockSecret::new(*seed.expose()),
+            };
+            let LocalResponse::Unlocked { node_id } =
+                local_control_call(&control_socket, &request).await?
+            else {
+                bail!("daemon returned the wrong response to unlock request");
+            };
+            println!("daemon unlocked: {node_id}");
         }
         Command::Root {
             command: RootCommand::Add { path },
@@ -281,6 +359,7 @@ async fn main() -> Result<()> {
         }
         Command::RecoverInit {
             seed_file,
+            seed_stdin,
             config,
             data_dir,
             parity_budget_bytes,
@@ -289,12 +368,23 @@ async fn main() -> Result<()> {
             p2p_bootstrap_addresses,
             p2p_relay_addresses,
         } => {
-            read_seed(&seed_file).context("cannot use the supplied recovery seed")?;
+            let recovery = recovery_input(seed_file.as_deref(), seed_stdin).await?;
+            let seed = derive_seed(&recovery)
+                .await
+                .context("cannot use the supplied recovery string")?;
+            let seed_file = seed_file
+                .map(|path| {
+                    path.canonicalize().with_context(|| {
+                        format!("cannot resolve recovery string file {}", path.display())
+                    })
+                })
+                .transpose()?;
             write_config(
                 &config,
                 &DaemonConfig {
                     format_version: 1,
                     data_dir,
+                    expected_node_id: KeyMaterial::from_seed(&seed).node_id(),
                     seed_file,
                     control_socket: control_socket.clone(),
                     failure_domain: String::new(),
@@ -382,22 +472,65 @@ fn default_control_socket() -> PathBuf {
     }
 }
 
-fn print_identity(seed: &Seed, expose_seed: bool) {
+fn print_identity(seed: &Seed) {
     let keys = KeyMaterial::from_seed(seed);
-    if expose_seed {
-        println!("recovery seed: {}", seed.encode());
-    }
     println!("node id:       {}", keys.node_id());
     println!(
         "libp2p peer id: {}",
         keys.node_id()
             .libp2p_peer_id()
-            .expect("seed-derived node ID must map to libp2p")
+            .expect("recovery-derived node ID must map to libp2p")
     );
     println!(
         "recovery key:   {}",
         hex::encode(keys.recovery_public_key().0)
     );
+}
+
+async fn recovery_input(
+    seed_file: Option<&std::path::Path>,
+    seed_stdin: bool,
+) -> Result<Zeroizing<String>> {
+    match seed_file {
+        Some(path) => read_recovery_string(path),
+        None if seed_stdin => read_recovery_stdin().await,
+        None => prompt_recovery_string("Recovery string: ").await,
+    }
+}
+
+async fn read_recovery_stdin() -> Result<Zeroizing<String>> {
+    tokio::task::spawn_blocking(|| {
+        let mut bytes = Zeroizing::new(Vec::new());
+        std::io::stdin()
+            .take((MAX_CLI_RECOVERY_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_CLI_RECOVERY_BYTES {
+            bail!("recovery string on standard input exceeds size limit");
+        }
+        let value = std::str::from_utf8(&bytes).context("recovery string is not valid UTF-8")?;
+        Ok(Zeroizing::new(value.to_owned()))
+    })
+    .await
+    .context("recovery-string input worker failed")?
+}
+
+async fn prompt_recovery_string(prompt: &'static str) -> Result<Zeroizing<String>> {
+    tokio::task::spawn_blocking(move || {
+        rpassword::prompt_password(prompt)
+            .map(Zeroizing::new)
+            .context("cannot read recovery string without echo")
+    })
+    .await
+    .context("recovery-string prompt worker failed")?
+}
+
+async fn derive_seed(recovery: &Zeroizing<String>) -> Result<Seed> {
+    let recovery = recovery.clone();
+    tokio::task::spawn_blocking(move || {
+        Seed::from_recovery_string(&recovery).context("invalid recovery string")
+    })
+    .await
+    .context("recovery-string derivation worker failed")?
 }
 
 fn print_backup_job(job: &mb_node::BackupJob) {
@@ -419,10 +552,12 @@ mod tests {
     fn seed_install_is_no_replace_and_private() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("recovery.seed");
-        let first = Seed::from_bytes([31; 32]);
-        write_seed(&path, &first).unwrap();
+        let first_text = "correct-horse-battery-staple-2026!";
+        let second_text = "another-long-recovery-string-for-testing-2027!";
+        let first = Seed::from_recovery_string(first_text).unwrap();
+        write_seed(&path, first_text).unwrap();
         assert_eq!(read_seed(&path).unwrap().expose(), first.expose());
-        assert!(write_seed(&path, &Seed::from_bytes([32; 32])).is_err());
+        assert!(write_seed(&path, second_text).is_err());
         assert_eq!(read_seed(&path).unwrap().expose(), first.expose());
         assert_eq!(
             fs::read_dir(temp.path())

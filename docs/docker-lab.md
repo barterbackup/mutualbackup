@@ -19,7 +19,8 @@ By default, all retained lab material lives below `.docker-lab/`:
 | `images/nodeN.btrfs` | One sparse 1 GiB Btrfs image per node. |
 | `mounts/nodeN/` | Host mount point for that node's Btrfs image. |
 | `mounts/nodeN/exchange/` | Host-visible directory also available as `/node/exchange` inside node N. |
-| `seeds/nodeN.seed` | Automatically generated seed, outside disposable node storage. |
+| `seeds/nodeN.seed` | Automatically generated printable recovery string, outside disposable node storage. |
+| `seeds/nodeN.identity` | Cached public Node ID/libp2p identity used to render configs without repeating Argon2. |
 | `configs/nodeN.toml` | Generated daemon configuration using container-internal paths. |
 | One Docker container per node | Runs only the prebuilt `mutualbackupd`. |
 | One Docker bridge | Gives nodes stable addresses `172.30.77.10` through `.14`. |
@@ -96,7 +97,7 @@ The first run performs the complete deployment:
 
 `up` is resumable. Running it after `down` reattaches and mounts the existing
 images, recreates containers, and resumes the same identities and guild. It
-does not regenerate an existing seed or overwrite an existing config.
+does not regenerate an existing recovery string or overwrite an existing config.
 
 ## Run CLI commands
 
@@ -219,7 +220,7 @@ for test files.
 5. creates and mounts a new empty Btrfs image;
 6. retains the original seed and archives the previous config;
 7. writes a recovery-mode config bootstrapping through a surviving peer;
-8. creates a new container at the node's old IP with the same seed identity;
+8. creates a new container at the node's old IP with the same recovery-string identity;
 9. recovers guild state and the latest owned revision over the real DHT/QUIC
    data path; and
 10. restores it to `/node/exchange/recovered` by default.
@@ -320,7 +321,7 @@ also be distinct.
 - **Docker subnet overlap:** choose an unused three-octet private prefix and use
   it consistently for `up`, interaction commands, and `down`.
 - **A node will not start:** inspect `logs NODE`. Common causes are a manually
-  modified config, missing seed, or stale foreign container with the same name.
+  modified config, missing recovery string, or stale foreign container with the same name.
 - **Btrfs will not mount:** ensure both `loop` and `btrfs` kernel modules are
   available and that `btrfs-progs` is installed.
 - **Unmount says busy:** leave any shell whose current directory is inside a

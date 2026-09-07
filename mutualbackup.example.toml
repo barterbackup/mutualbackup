@@ -5,8 +5,12 @@ format_version = 1
 # Private local state. The daemon creates control.db and parity.db here.
 data_dir = ".mutualbackup/node/state"
 
-# Create this first with `mutualbackup init --seed-file ...`.
-# The daemon reads it at startup; keep it private and retain an offline copy.
+# Public identity written by `mutualbackup init`; replace this illustrative
+# value together with the recovery string.
+expected_node_id = "b20d54e51cca9fb483f98e442d991dc377c8e66af65a122668547ebd4c041e5f"
+
+# Optional unattended auto-unlock. Omit this field to start locked and unlock
+# through the CLI. Keep the file private and retain a genuinely offline copy.
 seed_file = ".mutualbackup/offline/node.seed"
 
 # Each daemon on a host needs its own Unix control socket.

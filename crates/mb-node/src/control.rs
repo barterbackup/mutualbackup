@@ -4,17 +4,19 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream as SyncUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
-use mb_core::{GuildInvite, NodeId, canonical_bytes};
+use mb_core::{GuildInvite, NodeId, Seed, canonical_bytes};
 use mb_core::{QuorumGuildGenesis, SignedRecord, decode_canonical};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::{
     BackupJob, BackupJobState, DhtRecoveryResult, GuildSummary, Node, P2pClient, P2pStatus,
@@ -23,6 +25,7 @@ use crate::{
 
 const MAX_LOCAL_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_CONNECTIONS: usize = 16;
+const LOCAL_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProtectedRoot {
@@ -44,9 +47,12 @@ pub struct NodeStatus {
     pub network: Option<P2pStatus>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub enum LocalRequest {
     Status,
+    Unlock {
+        secret: UnlockSecret,
+    },
     AddRoot {
         path: PathBuf,
     },
@@ -75,8 +81,14 @@ pub enum LocalRequest {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum LocalResponse {
+    Locked {
+        expected_node_id: NodeId,
+    },
+    Unlocked {
+        node_id: NodeId,
+    },
     Status(NodeStatus),
     RootAdded(ProtectedRoot),
     Guild(Option<GuildSummary>),
@@ -91,11 +103,74 @@ pub enum LocalResponse {
     Error(String),
 }
 
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+pub struct UnlockSecret([u8; 32]);
+
+impl UnlockSecret {
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn seed(&self) -> Seed {
+        Seed::from_bytes(self.0)
+    }
+}
+
+impl std::fmt::Debug for UnlockSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("UnlockSecret(REDACTED)")
+    }
+}
+
+pub struct LocalControlListener {
+    listener: UnixListener,
+    _cleanup: SocketCleanup,
+}
+
+pub struct LocalControlConnection {
+    stream: UnixStream,
+}
+
+impl LocalControlListener {
+    pub async fn accept(&self) -> Result<LocalControlConnection> {
+        loop {
+            let (stream, _) = self.listener.accept().await?;
+            let credentials = stream
+                .peer_cred()
+                .context("cannot read local control peer credentials")?;
+            if credentials.uid() == unsafe { libc::geteuid() } {
+                return Ok(LocalControlConnection { stream });
+            }
+            tracing::warn!(
+                peer_uid = credentials.uid(),
+                "rejected local control client owned by another user"
+            );
+        }
+    }
+}
+
+impl LocalControlConnection {
+    pub async fn read_request(&mut self) -> Result<LocalRequest> {
+        tokio::time::timeout(LOCAL_REQUEST_READ_TIMEOUT, read_frame(&mut self.stream))
+            .await
+            .context("local control request timed out")?
+    }
+
+    pub async fn respond(mut self, response: &LocalResponse) -> Result<()> {
+        write_frame(&mut self.stream, response).await
+    }
+}
+
 pub async fn serve_local_control(
     node: Arc<Mutex<Node>>,
     p2p: P2pClient,
     socket_path: &Path,
 ) -> Result<()> {
+    let listener = bind_local_control(socket_path)?;
+    serve_local_control_on(node, p2p, listener).await
+}
+
+pub fn bind_local_control(socket_path: &Path) -> Result<LocalControlListener> {
     let parent = socket_path
         .parent()
         .context("control socket must have a parent directory")?;
@@ -146,31 +221,32 @@ pub async fn serve_local_control(
         .with_context(|| format!("cannot bind control socket {}", socket_path.display()))?;
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
     let metadata = fs::symlink_metadata(socket_path)?;
-    let _cleanup = SocketCleanup {
+    let cleanup = SocketCleanup {
         path: socket_path.to_path_buf(),
         device: metadata.dev(),
         inode: metadata.ino(),
     };
 
+    Ok(LocalControlListener {
+        listener,
+        _cleanup: cleanup,
+    })
+}
+
+pub async fn serve_local_control_on(
+    node: Arc<Mutex<Node>>,
+    p2p: P2pClient,
+    listener: LocalControlListener,
+) -> Result<()> {
     let permits = Arc::new(Semaphore::new(MAX_LOCAL_CONNECTIONS));
     loop {
-        let (stream, _) = listener.accept().await?;
-        let credentials = stream
-            .peer_cred()
-            .context("cannot read local control peer credentials")?;
-        if credentials.uid() != unsafe { libc::geteuid() } {
-            tracing::warn!(
-                peer_uid = credentials.uid(),
-                "rejected local control client owned by another user"
-            );
-            continue;
-        }
+        let connection = listener.accept().await?;
         let permit = permits.clone().acquire_owned().await?;
         let node = node.clone();
         let p2p = p2p.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle_connection(node, p2p, stream).await {
+            if let Err(error) = handle_connection(node, p2p, connection.stream).await {
                 tracing::warn!(%error, "local control request failed");
             }
         });
@@ -197,7 +273,10 @@ async fn handle_connection(
     p2p: P2pClient,
     mut stream: UnixStream,
 ) -> Result<()> {
-    let request: LocalRequest = read_frame(&mut stream).await?;
+    let request: LocalRequest =
+        tokio::time::timeout(LOCAL_REQUEST_READ_TIMEOUT, read_frame(&mut stream))
+            .await
+            .context("local control request timed out")??;
     let response = handle_request(node, p2p, request)
         .await
         .unwrap_or_else(|error| LocalResponse::Error(format!("{error:#}")));
@@ -210,6 +289,7 @@ async fn handle_request(
     request: LocalRequest,
 ) -> Result<LocalResponse> {
     match request {
+        LocalRequest::Unlock { .. } => bail!("daemon is already unlocked"),
         LocalRequest::Status => {
             let mut status = blocking_node(node, |node| node.status()).await?;
             status.network = Some(p2p.status().await?);
@@ -507,7 +587,7 @@ fn unix_seconds() -> u64 {
 }
 
 async fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
-    let bytes = serde_json::to_vec(value)?;
+    let bytes = Zeroizing::new(serde_json::to_vec(value)?);
     if bytes.len() > MAX_LOCAL_FRAME_BYTES {
         bail!("local control frame exceeds size limit");
     }
@@ -522,7 +602,7 @@ async fn read_frame<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
     if length > MAX_LOCAL_FRAME_BYTES {
         bail!("local control frame exceeds size limit");
     }
-    let mut bytes = vec![0_u8; length];
+    let mut bytes = Zeroizing::new(vec![0_u8; length]);
     stream.read_exact(&mut bytes).await?;
     Ok(serde_json::from_slice(&bytes)?)
 }
@@ -560,5 +640,12 @@ mod tests {
             decoded,
             LocalRequest::AddRoot { path } if path == Path::new("/var/lib/data")
         ));
+    }
+
+    #[test]
+    fn unlock_secret_debug_is_redacted() {
+        let secret = UnlockSecret::new([0x41; 32]);
+        assert_eq!(format!("{secret:?}"), "UnlockSecret(REDACTED)");
+        assert!(!format!("{secret:?}").contains("65"));
     }
 }

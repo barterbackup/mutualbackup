@@ -184,9 +184,19 @@ struct SeedRecoveryReadiness {
 
 pub type RecoveredShards = BTreeMap<([u8; 32], u8), Vec<u8>>;
 
+/// An exclusive, process-lifetime claim on one initialized data directory.
+///
+/// The daemon acquires this before accepting an unlock secret, then moves a
+/// clone into `Node` after the secret has been verified.
+#[derive(Clone)]
+pub struct LockedDataDir {
+    path: PathBuf,
+    _lock: Arc<File>,
+}
+
 pub struct Node {
     data_dir: PathBuf,
-    _data_dir_lock: File,
+    _data_dir_lock: LockedDataDir,
     keys: Arc<KeyMaterial>,
     control: ControlStore,
     parity: ParityStore,
@@ -312,14 +322,27 @@ impl NodeReader {
 }
 
 impl Node {
-    pub fn open(data_dir: impl AsRef<Path>, seed: Seed) -> Result<Self> {
+    pub fn lock_data_dir(data_dir: impl AsRef<Path>) -> Result<LockedDataDir> {
         let data_dir = data_dir.as_ref();
         fs::create_dir_all(data_dir)?;
         let data_dir = data_dir
             .canonicalize()
             .with_context(|| format!("cannot resolve data directory {}", data_dir.display()))?;
         set_private_directory(&data_dir)?;
-        let data_dir_lock = open_data_dir_lock(&data_dir)?;
+        let lock = Arc::new(open_data_dir_lock(&data_dir)?);
+        Ok(LockedDataDir {
+            path: data_dir,
+            _lock: lock,
+        })
+    }
+
+    pub fn open(data_dir: impl AsRef<Path>, seed: Seed) -> Result<Self> {
+        let locked = Self::lock_data_dir(data_dir)?;
+        Self::open_locked(locked, seed)
+    }
+
+    pub fn open_locked(locked: LockedDataDir, seed: Seed) -> Result<Self> {
+        let data_dir = locked.path.clone();
         let keys = Arc::new(KeyMaterial::from_seed(&seed));
         let mut volume_id = [0_u8; 16];
         volume_id.copy_from_slice(&blake3::hash(&keys.node_id().0).as_bytes()[..16]);
@@ -329,7 +352,7 @@ impl Node {
         let parity = ParityStore::open(data_dir.join("parity.db"), &volume_id, &keys)?;
         Ok(Self {
             data_dir,
-            _data_dir_lock: data_dir_lock,
+            _data_dir_lock: locked,
             keys,
             control,
             parity,

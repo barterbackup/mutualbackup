@@ -57,7 +57,7 @@ Node lifecycle:
   stop NODE                  Stop one daemon container
   start NODE                 Start one stopped daemon container
   restart NODE               Restart one daemon container
-  reinit NODE [NAME] [--yes] Wipe one node, recreate it from its seed, restore to NAME
+  reinit NODE [NAME] [--yes] Wipe one node, recreate it from its recovery string, restore to NAME
 
 Interaction and inspection:
   cli NODE [ARGS...]         Run mutualbackup against NODE's private control socket
@@ -220,6 +220,10 @@ node_seed() {
     printf '%s/seeds/node%s.seed\n' "$LAB_ROOT" "$1"
 }
 
+node_identity() {
+    printf '%s/seeds/node%s.identity\n' "$LAB_ROOT" "$1"
+}
+
 node_config() {
     printf '%s/configs/node%s.toml\n' "$LAB_ROOT" "$1"
 }
@@ -349,19 +353,28 @@ unmount_filesystem() {
 
 ensure_seed() {
     local node=$1
-    local seed
+    local seed identity temporary
     seed=$(node_seed "$node")
-    if [[ -f $seed ]]; then
-        chmod 600 "$seed"
-        return
+    identity=$(node_identity "$node")
+    if [[ ! -f $seed ]]; then
+        "$CLI_BIN" init --seed-file "$seed" >/dev/null
+        say "generated and retained recovery string for node $node: $seed"
     fi
-    "$CLI_BIN" init --seed-file "$seed" >/dev/null
-    say "generated and retained seed for node $node: $seed"
+    chmod 600 "$seed"
+    if [[ ! -f $identity ]]; then
+        temporary="$identity.tmp.$$"
+        "$CLI_BIN" identity --seed-file "$seed" >"$temporary"
+        chmod 600 "$temporary"
+        mv "$temporary" "$identity"
+    fi
 }
 
 peer_id() {
-    "$CLI_BIN" identity --seed-file "$(node_seed "$1")" |
-        sed -n 's/^libp2p peer id: *//p'
+    sed -n 's/^libp2p peer id: *//p' "$(node_identity "$1")"
+}
+
+node_id() {
+    sed -n 's/^node id: *//p' "$(node_identity "$1")"
 }
 
 peer_endpoint() {
@@ -390,6 +403,7 @@ write_normal_config() {
     cat >"$config" <<EOF
 format_version = 1
 data_dir = "/node/state"
+expected_node_id = "$(node_id "$node")"
 seed_file = "/secrets/node.seed"
 control_socket = "/node/run/control.sock"
 failure_domain = "docker-lab-node-$node"
@@ -419,6 +433,7 @@ write_recovery_config() {
     cat >"$config" <<EOF
 format_version = 1
 data_dir = "/node/state"
+expected_node_id = "$(node_id "$node")"
 seed_file = "/secrets/node.seed"
 control_socket = "/node/run/control.sock"
 failure_domain = ""
@@ -691,7 +706,7 @@ command_reinit() {
     create_container "$node"
     start_node_internal "$node"
 
-    say "node $node has its original seed identity and is connected through node $bootstrap_node"
+    say "node $node has its original recovery-string identity and is connected through node $bootstrap_node"
     say "recovering guild state and latest owned revision into /node/exchange/$restore_name"
     if ! cli_raw "$node" restore "/node/exchange/$restore_name"; then
         say "recovery did not complete; the recovery-mode container remains running for inspection/retry" >&2

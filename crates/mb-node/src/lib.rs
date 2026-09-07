@@ -9,7 +9,9 @@ mod snapshot;
 mod watcher;
 
 pub use control::{
-    LocalRequest, LocalResponse, NodeStatus, ProtectedRoot, local_control_call, serve_local_control,
+    LocalControlConnection, LocalControlListener, LocalRequest, LocalResponse, NodeStatus,
+    ProtectedRoot, UnlockSecret, bind_local_control, local_control_call, serve_local_control,
+    serve_local_control_on,
 };
 pub use mb_core::{KeyMaterial, NodeId, Seed};
 pub use network::{
@@ -19,7 +21,7 @@ pub use network::{
 };
 pub use node::{
     BackupDescriptor, BackupJob, BackupJobState, DhtPublicationSet, DhtSequenceFloors, GuildPeer,
-    GuildPhase, GuildSummary, Node, RecoveredShards, SnapshotInfo,
+    GuildPhase, GuildSummary, LockedDataDir, Node, RecoveredShards, SnapshotInfo,
 };
 pub use snapshot::{
     PrivateDataExtent, PrivateEntry, PrivateMetadata, restore_revision,

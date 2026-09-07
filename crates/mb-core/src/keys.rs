@@ -1,18 +1,25 @@
 use std::fmt;
 use std::str::FromStr;
 
+use argon2::{Algorithm, Argon2, Params, Version};
+use bip39::{Language, Mnemonic};
 use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use sha3::{Digest, Sha3_256};
 use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-const SEED_PREFIX: &str = "mbseed1";
+const RECOVERY_STRING_MIN_CHARS: usize = 8;
+const RECOVERY_STRING_MAX_CHARS: usize = 1024;
+const RECOVERY_STRING_MIN_BITS: f64 = 64.0;
+const RECOVERY_ARGON_MEMORY_KIB: u32 = 64 * 1024;
+const RECOVERY_ARGON_PASSES: u32 = 3;
+const RECOVERY_ARGON_LANES: u32 = 4;
+const LOG2_10: f64 = std::f64::consts::LOG2_10;
 
 /// Stable public node identity used by every transport.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -54,29 +61,60 @@ impl RecoveryPublicKey {
     }
 }
 
-/// High-entropy recovery seed. Its textual form is versioned and checksummed.
+/// Derived high-entropy root secret used by the deterministic key hierarchy.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Seed([u8; 32]);
 
 impl Seed {
-    pub fn generate() -> Self {
-        let mut bytes = [0_u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
-        Self(bytes)
+    /// Generate a 24-word English phrase. BIP39 is used only as a well-reviewed
+    /// word generator; parsing and checksum semantics are deliberately not part
+    /// of MutualBackup's recovery-string contract.
+    pub fn generate_recovery_string() -> Result<Zeroizing<String>, SeedParseError> {
+        let mnemonic =
+            Mnemonic::generate_in(Language::English, 24).map_err(|_| SeedParseError::Generation)?;
+        let phrase = Zeroizing::new(mnemonic.to_string());
+        // Keep generation subject to the exact same policy as user input.
+        Self::from_recovery_string(&phrase)?;
+        Ok(phrase)
     }
 
+    /// Construct a raw derived root. This is for deterministic protocol tests
+    /// and for the already-derived local unlock wire value.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
-    pub fn expose(&self) -> &[u8; 32] {
-        &self.0
+    pub fn from_recovery_bytes(value: &[u8]) -> Result<Self, SeedParseError> {
+        let value = std::str::from_utf8(value).map_err(|_| SeedParseError::InvalidUtf8)?;
+        Self::from_recovery_string(value)
     }
 
-    pub fn encode(&self) -> String {
-        let payload = hex::encode(self.0);
-        let checksum = blake3::derive_key("mutualbackup seed checksum v1", &self.0);
-        format!("{SEED_PREFIX}-{payload}-{}", hex::encode(&checksum[..4]))
+    pub fn from_recovery_string(value: &str) -> Result<Self, SeedParseError> {
+        let normalized = normalize_recovery_string(value)?;
+        if !recovery_strength_is_acceptable(&normalized) {
+            return Err(SeedParseError::TooWeak);
+        }
+
+        let salt_material = Zeroizing::new(blake3::derive_key(
+            "mutualbackup recovery string argon2 salt v1",
+            normalized.as_bytes(),
+        ));
+        let params = Params::new(
+            RECOVERY_ARGON_MEMORY_KIB,
+            RECOVERY_ARGON_PASSES,
+            RECOVERY_ARGON_LANES,
+            Some(32),
+        )
+        .expect("fixed recovery Argon2 parameters are valid");
+        let mut root = [0_u8; 32];
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+            .hash_password_into(normalized.as_bytes(), &salt_material[..16], &mut root)
+            .expect("fixed recovery Argon2 output and salt lengths are valid");
+        Ok(Self(root))
+    }
+
+    pub fn expose(&self) -> &[u8; 32] {
+        &self.0
     }
 }
 
@@ -90,35 +128,51 @@ impl FromStr for Seed {
     type Err = SeedParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let mut fields = value.split('-');
-        if fields.next() != Some(SEED_PREFIX) {
-            return Err(SeedParseError::Version);
-        }
-        let payload = fields.next().ok_or(SeedParseError::Shape)?;
-        let checksum = fields.next().ok_or(SeedParseError::Shape)?;
-        if fields.next().is_some() || checksum.len() != 8 {
-            return Err(SeedParseError::Shape);
-        }
-        let mut bytes = [0_u8; 32];
-        hex::decode_to_slice(payload, &mut bytes).map_err(|_| SeedParseError::Encoding)?;
-        let expected = blake3::derive_key("mutualbackup seed checksum v1", &bytes);
-        if !constant_time_eq(checksum.as_bytes(), hex::encode(&expected[..4]).as_bytes()) {
-            return Err(SeedParseError::Checksum);
-        }
-        Ok(Self(bytes))
+        Self::from_recovery_string(value)
     }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum SeedParseError {
-    #[error("unsupported recovery-seed version")]
-    Version,
-    #[error("invalid recovery-seed shape")]
-    Shape,
-    #[error("invalid recovery-seed encoding")]
-    Encoding,
-    #[error("recovery-seed checksum mismatch")]
-    Checksum,
+    #[error("recovery string is not valid UTF-8")]
+    InvalidUtf8,
+    #[error("recovery string must contain 8 to 1024 non-whitespace characters")]
+    Length,
+    #[error("recovery string may contain only printable ASCII characters and whitespace")]
+    NonPrintable,
+    #[error("recovery string has less than 64 bits of estimated guessing resistance")]
+    TooWeak,
+    #[error("could not generate a recovery string")]
+    Generation,
+}
+
+fn normalize_recovery_string(value: &str) -> Result<Zeroizing<String>, SeedParseError> {
+    let normalized = Zeroizing::new(
+        value
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>(),
+    );
+    let length = normalized.chars().count();
+    if !(RECOVERY_STRING_MIN_CHARS..=RECOVERY_STRING_MAX_CHARS).contains(&length) {
+        return Err(SeedParseError::Length);
+    }
+    if !normalized
+        .chars()
+        .all(|character| character.is_ascii_graphic())
+    {
+        return Err(SeedParseError::NonPrintable);
+    }
+    Ok(normalized)
+}
+
+fn recovery_strength_is_acceptable(normalized: &str) -> bool {
+    strength_log10_is_acceptable(zxcvbn::zxcvbn(normalized, &[]).guesses_log10())
+}
+
+fn strength_log10_is_acceptable(guesses_log10: f64) -> bool {
+    let estimated_bits = guesses_log10 * LOG2_10;
+    estimated_bits.is_finite() && estimated_bits >= RECOVERY_STRING_MIN_BITS
 }
 
 #[derive(Debug, Error)]
@@ -234,35 +288,84 @@ fn onion_hostname_from_public_key(public_key: &[u8; 32]) -> String {
     )
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
-        == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn seed_round_trip_and_checksum() {
-        let seed = Seed::from_bytes([7; 32]);
-        let encoded = seed.encode();
-        assert_eq!(encoded.parse::<Seed>().unwrap().expose(), seed.expose());
-
-        let mut damaged = encoded.into_bytes();
-        *damaged.last_mut().unwrap() ^= 1;
+    fn recovery_string_policy_and_derivation_are_stable() {
+        let compact = "correct-horse-battery-staple-2026!";
+        let spaced = "correct-\u{a0}horse-\tbattery-\nstaple-2026!";
         assert_eq!(
-            String::from_utf8(damaged)
-                .unwrap()
-                .parse::<Seed>()
-                .unwrap_err(),
-            SeedParseError::Checksum
+            Seed::from_recovery_string(compact).unwrap().expose(),
+            Seed::from_recovery_string(spaced).unwrap().expose()
         );
+        assert_eq!(
+            hex::encode(Seed::from_recovery_string(compact).unwrap().expose()),
+            "f93c4e71aed4371a4d0791b9e4f0b777f2fed698b5a855a3001d14c579dca623"
+        );
+        assert_eq!(
+            Seed::from_recovery_bytes(b"not-utf8-\xff").unwrap_err(),
+            SeedParseError::InvalidUtf8
+        );
+        assert_eq!(
+            Seed::from_recovery_string("short").unwrap_err(),
+            SeedParseError::Length
+        );
+        assert_eq!(
+            Seed::from_recovery_string("printable-but-emoji-\u{1f512}-and-long").unwrap_err(),
+            SeedParseError::NonPrintable
+        );
+        assert_eq!(
+            Seed::from_recovery_string("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap_err(),
+            SeedParseError::TooWeak
+        );
+    }
+
+    #[test]
+    fn generated_recovery_strings_pass_the_common_policy() {
+        let phrase = Seed::generate_recovery_string().unwrap();
+        assert_eq!(phrase.split_ascii_whitespace().count(), 24);
+        Seed::from_recovery_string(&phrase).unwrap();
+    }
+
+    #[test]
+    fn normalization_removes_every_rust_unicode_whitespace_class() {
+        let whitespace = [
+            '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', '\u{0020}', '\u{0085}',
+            '\u{00a0}', '\u{1680}', '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}',
+            '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}',
+            '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}',
+        ];
+        let mut value = String::from("abcd");
+        value.extend(whitespace);
+        value.push_str("EFGH");
+        assert_eq!(
+            normalize_recovery_string(&value).unwrap().as_str(),
+            "abcdEFGH"
+        );
+        assert_eq!(
+            normalize_recovery_string("1234567").unwrap_err(),
+            SeedParseError::Length
+        );
+        assert_eq!(
+            normalize_recovery_string(&"a".repeat(1025)).unwrap_err(),
+            SeedParseError::Length
+        );
+        assert_eq!(
+            normalize_recovery_string("abcdefgh\u{200b}").unwrap_err(),
+            SeedParseError::NonPrintable
+        );
+    }
+
+    #[test]
+    fn strength_threshold_is_exactly_sixty_four_bits() {
+        let boundary = RECOVERY_STRING_MIN_BITS / LOG2_10;
+        assert!(strength_log10_is_acceptable(boundary));
+        assert!(!strength_log10_is_acceptable(f64::from_bits(
+            boundary.to_bits() - 1
+        )));
+        assert!(!strength_log10_is_acceptable(f64::NAN));
     }
 
     #[test]

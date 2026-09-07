@@ -2,6 +2,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::net::UdpSocket;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -70,6 +71,78 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+#[test]
+fn daemon_starts_locked_and_rejects_the_wrong_identity_before_opening_storage() {
+    let temp = tempfile::tempdir().unwrap();
+    set_private(temp.path());
+    let data_dir = temp.path().join("state");
+    let run_dir = temp.path().join("run");
+    fs::create_dir(&run_dir).unwrap();
+    set_private(&run_dir);
+    let socket = run_dir.join("control.sock");
+    let config_path = temp.path().join("node.toml");
+    let recovery = "correct-horse-battery-staple-2026!";
+    let initialized = run_cli_with_input(
+        &[
+            os("--socket"),
+            socket.as_os_str().to_owned(),
+            os("init"),
+            os("--seed-stdin"),
+            os("--config"),
+            config_path.as_os_str().to_owned(),
+            os("--data-dir"),
+            data_dir.as_os_str().to_owned(),
+            os("--failure-domain"),
+            os("locked-daemon-test"),
+        ],
+        recovery.as_bytes(),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    let expected_node_id = value_after(&initialized, "node id:       ");
+    let mut daemon = Daemon::new(config_path, temp.path().join("daemon.log"));
+    daemon.start();
+    let locked = wait_for_status(&socket, &mut daemon, Duration::from_secs(30));
+    assert!(locked.contains("state:         Locked"));
+    assert!(!data_dir.join("control.db").exists());
+
+    let wrong = run_cli_with_input(
+        &[
+            os("--socket"),
+            socket.as_os_str().to_owned(),
+            os("unlock"),
+            os("--seed-stdin"),
+        ],
+        b"another-long-recovery-string-for-testing-2027!",
+        Duration::from_secs(30),
+    )
+    .unwrap_err();
+    assert!(wrong.contains("expected"));
+    assert!(!data_dir.join("control.db").exists());
+    assert!(wait_for_status(&socket, &mut daemon, Duration::from_secs(10)).contains("Locked"));
+
+    run_cli_with_input(
+        &[
+            os("--socket"),
+            socket.as_os_str().to_owned(),
+            os("unlock"),
+            os("--seed-stdin"),
+        ],
+        recovery.as_bytes(),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = wait_for_status(&socket, &mut daemon, Duration::from_secs(5));
+        if status.contains(&expected_node_id) && !status.contains("Locked") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "daemon did not finish unlocking");
+    }
+    assert!(data_dir.join("control.db").exists());
 }
 
 #[test]
@@ -339,14 +412,49 @@ fn run_cli(args: &[OsString], timeout: Duration) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|error| error.to_string())
 }
 
+fn run_cli_with_input(
+    args: &[OsString],
+    input: &[u8],
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mutualbackup"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input)
+        .map_err(|error| error.to_string())?;
+    let output = wait_for_output(child, timeout)?;
+    if !output.status.success() {
+        return Err(format!(
+            "mutualbackup {:?} failed with {}\nstdout:\n{}\nstderr:\n{}",
+            args,
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|error| error.to_string())
+}
+
 fn run_output(program: &str, args: &[OsString], timeout: Duration) -> Result<Output, String> {
-    let mut child = Command::new(program)
+    let child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| error.to_string())?;
+    wait_for_output(child, timeout)
+}
+
+fn wait_for_output(mut child: Child, timeout: Duration) -> Result<Output, String> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait().map_err(|error| error.to_string())? {

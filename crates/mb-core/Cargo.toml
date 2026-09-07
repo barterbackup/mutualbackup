@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+argon2.workspace = true
+bip39.workspace = true
 blake3.workspace = true
 chacha20.workspace = true
 chacha20poly1305.workspace = true
@@ -24,3 +26,4 @@ thiserror.workspace = true
 uuid.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true
+zxcvbn.workspace = true
