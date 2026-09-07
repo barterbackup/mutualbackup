@@ -2,6 +2,7 @@
 /result
 /dist/
 /.mutualbackup/
+/.docker-lab/
 *.db
 *.db-shm
 *.db-wal
