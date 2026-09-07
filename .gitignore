@@ -1,6 +1,7 @@
 /target/
 /result
 /dist/
+/.mutualbackup/
 *.db
 *.db-shm
 *.db-wal

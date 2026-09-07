@@ -19,10 +19,16 @@ unique data to this prototype.
 - `mutualbackup` is the local control and offline bootstrap CLI. Run
   `mutualbackup --help` and its subcommand help for the complete interface.
 
+For a no-build, step-by-step walkthrough using the packaged Linux binaries,
+including a five-daemon lab and seed-only recovery, see
+[`docs/getting-started.md`](docs/getting-started.md). A commented daemon config
+is available as [`mutualbackup.example.toml`](mutualbackup.example.toml).
+
 A new node starts with `mutualbackup init --seed-file SEED --config NODE.toml
---data-dir DATA --failure-domain LABEL`. Keep the generated seed offline: a
-fresh recovery-mode daemon can be initialized with `mutualbackup recover-init`
-using only that seed and generic bootstrap multiaddresses.
+--data-dir DATA --failure-domain LABEL`. Protect the generated seed and retain
+an offline copy: a fresh recovery-mode daemon can be initialized with
+`mutualbackup recover-init` using only that seed and generic bootstrap
+multiaddresses.
 
 Routine operations go through the daemon:
 
@@ -38,6 +44,8 @@ mutualbackup restore TARGET
 
 The CLI and daemon use a same-user Unix control socket. Pass `--socket` when a
 configuration does not use the default location below `XDG_RUNTIME_DIR`.
+Several daemons can run under one account when every config has a distinct
+seed, data directory, control socket, and UDP listen address.
 
 ## Build and acceptance
 
