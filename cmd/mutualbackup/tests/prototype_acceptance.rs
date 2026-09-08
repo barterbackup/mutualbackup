@@ -932,8 +932,10 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     );
 
     let direct_before = peer_path_transfer(&sockets[0], &mut daemons[0], &peer_ids[1], "Direct");
-    let punched_before =
+    let punched_before_on_coordinator =
         peer_path_transfer(&sockets[0], &mut daemons[0], &peer_ids[3], "HolePunched");
+    let punched_before_on_peer =
+        peer_path_transfer(&sockets[3], &mut daemons[3], &peer_ids[0], "HolePunched");
     let final_owner_two = deterministic_bytes(512_031, 83);
     fs::write(
         owner_two_source.join("documents/data.bin"),
@@ -950,12 +952,21 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         direct_before,
         Duration::from_secs(30),
     );
-    wait_for_peer_transfer(
-        &sockets[0],
-        &mut daemons[0],
-        &peer_ids[3],
+    let (coordinator, remaining) = daemons.split_at_mut(1);
+    wait_for_peer_transfer_on_either_endpoint(
+        (
+            &sockets[0],
+            &mut coordinator[0],
+            &peer_ids[3],
+            punched_before_on_coordinator,
+        ),
+        (
+            &sockets[3],
+            &mut remaining[2],
+            &peer_ids[0],
+            punched_before_on_peer,
+        ),
         "HolePunched",
-        punched_before,
         Duration::from_secs(30),
     );
 
@@ -1417,6 +1428,51 @@ fn wait_for_peer_transfer(
         );
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+type TransferEndpoint<'a> = (&'a Path, &'a mut Daemon, &'a str, (u64, u64));
+
+fn wait_for_peer_transfer_on_either_endpoint(
+    left: TransferEndpoint<'_>,
+    right: TransferEndpoint<'_>,
+    path: &str,
+    timeout: Duration,
+) {
+    let (left_socket, left_daemon, left_peer, left_baseline) = left;
+    let (right_socket, right_daemon, right_peer, right_baseline) = right;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left_status = wait_for_status(left_socket, left_daemon, Duration::from_secs(5));
+        if status_has_bulk_transfer(&left_status, left_peer, path, left_baseline) {
+            return;
+        }
+        let right_status = wait_for_status(right_socket, right_daemon, Duration::from_secs(5));
+        if status_has_bulk_transfer(&right_status, right_peer, path, right_baseline) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "transfer was not attributed to {path} at either endpoint:\nleft:\n{left_status}\nright:\n{right_status}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn status_has_bulk_transfer(status: &str, peer_id: &str, path: &str, baseline: (u64, u64)) -> bool {
+    let Some(line) = path_transfer_line(status, peer_id, path) else {
+        return false;
+    };
+    let (Some(sent), Some(received)) = (
+        numeric_status_field(line, "sent="),
+        numeric_status_field(line, "received="),
+    ) else {
+        return false;
+    };
+    let sent_delta = sent.saturating_sub(baseline.0);
+    let received_delta = received.saturating_sub(baseline.1);
+    sent > baseline.0
+        && received > baseline.1
+        && sent_delta.max(received_delta) >= MIN_BULK_TRANSFER_BYTES
 }
 
 fn peer_path_transfer(socket: &Path, daemon: &mut Daemon, peer_id: &str, path: &str) -> (u64, u64) {
