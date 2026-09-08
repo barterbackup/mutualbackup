@@ -395,8 +395,9 @@ verified_mounted_loop() {
     filesystem=$(findmnt -rn -o FSTYPE --target "$mount_dir")
     [[ $filesystem == btrfs ]] ||
         die "$mount_dir is mounted, but it is not Btrfs"
-    [[ -f $image ]] ||
+    [[ -e $image || -L $image ]] ||
         die "$mount_dir is mounted, but node $node's image is missing: $image"
+    validate_regular_image "$image"
     source=$(findmnt -rn -o SOURCE --target "$mount_dir")
     [[ $source =~ ^/dev/loop[0-9]+$ ]] ||
         die "$mount_dir is mounted from unexpected source $source"
@@ -424,6 +425,11 @@ validate_regular_image() {
     [[ -f $image && ! -L $image ]] ||
         die "Btrfs image must be a regular non-symlink file: $image"
     [[ -O $image ]] || die "Btrfs image must be owned by the current user: $image"
+    # Images contain the node's plaintext exchange/source tree as well as its
+    # encrypted databases. Interrupted staging files may have been created
+    # under a permissive umask, so normalize both staged and completed images
+    # before attaching them.
+    chmod 600 "$image"
 }
 
 detach_image_loops() {

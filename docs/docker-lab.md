@@ -111,11 +111,20 @@ images, recreates containers, and resumes the same identities and guild. It
 does not regenerate an existing recovery string or identity manifest. If a
 first-time `up` stopped after writing a seed but before writing its manifest,
 the next `up` resumes ordinary new-node initialization. `reinit` records its
-recovery intent before removing state, so only that explicit destructive path
-can create a recovery-intent manifest after an interruption. Guild formation
+recovery intent, original guild, bootstrap member, restore target, and current
+phase before removing state. A later `up` or the same `reinit` command resumes
+that transaction without another wipe and does not clear it until restore has
+succeeded and the node has rejoined the original active guild. Guild formation
 likewise resumes when some members installed the final certificate before the
 coordinator. The controller rewrites its own lab configs from the selected
 environment settings; do not hand-edit them.
+
+New filesystem images are formatted under a `.creating` name and published
+only after formatting and device sync complete. A later `up` safely restarts an
+interrupted staged creation; it rejects an ambiguous completed-plus-staged pair
+or an existing image that is not Btrfs. Every node `start`, `restart`, `up`, and
+`down` verifies that the mount is a loop device attached to that node's exact
+image.
 
 If retained identity state exists but its corresponding file under `seeds/` is
 missing, `up` refuses to invent a replacement. Restore that recovery string
@@ -236,7 +245,8 @@ for test files.
 `reinit` is the destructive failure/recovery exercise. It:
 
 1. verifies that the node has published seed-recovery material to the DHT;
-2. verifies that at least three other nodes are healthy;
+2. verifies that at least three responsive survivors report the same active
+   guild;
 3. removes the old container;
 4. unmounts, detaches, and permanently deletes that node's Btrfs image;
 5. creates and mounts a new empty Btrfs image;
@@ -288,14 +298,20 @@ To continue backing it up, register it explicitly:
 ./scripts/docker-lab.sh cli 1 root add /node/exchange/recovered
 ```
 
-If network recovery fails, `reinit` returns an error but deliberately leaves
-the recovery identity's container running. Inspect its logs and retry without
-another wipe:
+If network recovery fails, `reinit` returns an error but deliberately retains
+the recovery transaction and recovery identity's container. Inspect its logs,
+restore enough same-guild survivors, and resume without another wipe using
+either command:
 
 ```sh
 ./scripts/docker-lab.sh logs 1 --tail 200
-./scripts/docker-lab.sh cli 1 restore /node/exchange/recovered
+./scripts/docker-lab.sh reinit 1 recovered --yes
+# or simply:
+./scripts/docker-lab.sh up
 ```
+
+While a recovery transaction is pending, keep using its original restore name;
+the controller rejects a different name instead of changing the durable target.
 
 ## Shut down and resume
 
