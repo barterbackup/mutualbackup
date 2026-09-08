@@ -914,16 +914,25 @@ fn discover_anchor_area(area: &StableAnchorAreaLocator) -> Result<PathBuf, Ancho
 
 fn anchor_discovery_roots(area: &StableAnchorAreaLocator) -> Vec<PathBuf> {
     #[allow(unused_mut)]
-    let mut roots = vec![area.volume_root_hint.clone()];
+    let mut roots = Vec::new();
     #[cfg(target_os = "linux")]
     {
-        let mut seen = BTreeSet::from([area.volume_root_hint.clone()]);
-        for root in linux_data_mount_points() {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut seen = BTreeSet::new();
+        for root in std::iter::once(area.volume_root_hint.clone()).chain(linux_data_mount_points())
+        {
+            if fs::symlink_metadata(&root).map(|metadata| metadata.dev()) != Ok(area.volume_device)
+            {
+                continue;
+            }
             if seen.insert(root.clone()) {
                 roots.push(root);
             }
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    roots.push(area.volume_root_hint.clone());
     roots
 }
 
@@ -1589,6 +1598,28 @@ mod tests {
             decode_mount_path("/media/a\\040b\\134c").unwrap(),
             PathBuf::from("/media/a b\\c")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn anchor_discovery_never_scans_another_filesystem() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let device = fs::symlink_metadata(temp.path()).unwrap().dev();
+        let area = StableAnchorAreaLocator {
+            area_id: Uuid::new_v4(),
+            path_hint: temp.path().join("missing-area"),
+            volume_device: device,
+            volume_root_hint: temp.path().to_path_buf(),
+        };
+        let roots = anchor_discovery_roots(&area);
+        assert!(roots.contains(&temp.path().to_path_buf()));
+        assert!(roots.iter().all(|root| {
+            fs::symlink_metadata(root)
+                .map(|metadata| metadata.dev() == device)
+                .unwrap_or(false)
+        }));
     }
 
     #[cfg(target_os = "linux")]
