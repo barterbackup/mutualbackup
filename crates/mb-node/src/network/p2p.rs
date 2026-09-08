@@ -93,12 +93,20 @@ pub enum P2pPath {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct P2pPathTransfer {
+    pub path: P2pPath,
+    pub application_bytes_sent: u64,
+    pub application_bytes_received: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct P2pPeerStatus {
     pub peer_id: String,
     pub active_paths: Vec<P2pPath>,
     pub last_application_path: Option<P2pPath>,
     pub application_bytes_sent: u64,
     pub application_bytes_received: u64,
+    pub path_transfers: Vec<P2pPathTransfer>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -144,7 +152,8 @@ pub struct P2pEventLoop {
     inbound_permits: Arc<Semaphore>,
     pending_requests: HashMap<request_response::OutboundRequestId, PendingRequest>,
     active_inbound_requests: HashMap<request_response::InboundRequestId, PeerId>,
-    pending_response_bytes: HashMap<request_response::InboundRequestId, (PeerId, u64)>,
+    pending_response_bytes:
+        HashMap<request_response::InboundRequestId, (PeerId, Option<P2pPath>, u64)>,
     pending_dht: HashMap<kad::QueryId, PendingDht>,
     service: Arc<NodeService>,
     server_config: NodeServerConfig,
@@ -168,6 +177,7 @@ pub struct P2pEventLoop {
     connection_paths: HashMap<ConnectionId, (PeerId, P2pPath)>,
     last_application_paths: HashMap<PeerId, P2pPath>,
     transfer_counters: HashMap<PeerId, TransferCounters>,
+    path_transfer_counters: HashMap<PeerId, BTreeMap<P2pPath, TransferCounters>>,
     startup_sender: Option<oneshot::Sender<std::result::Result<P2pStartup, String>>>,
     startup_receiver: Option<P2pStartupReceiver>,
     fatal_error: Option<String>,
@@ -246,6 +256,7 @@ struct PendingRequest {
 
 struct InboundResult {
     peer: PeerId,
+    path: Option<P2pPath>,
     request_id: request_response::InboundRequestId,
     channel: request_response::ResponseChannel<SignedRecord<PeerResponseEnvelope>>,
     response: Result<SignedRecord<PeerResponseEnvelope>>,
@@ -307,13 +318,9 @@ fn retry_interval(period: Duration) -> tokio::time::Interval {
     tokio::time::interval_at(tokio::time::Instant::now() + period, period)
 }
 
-fn merge_established_path(
-    recorded: Option<P2pPath>,
-    generic: P2pPath,
-    peer_has_hole_punch: bool,
-) -> P2pPath {
-    match (recorded, generic, peer_has_hole_punch) {
-        (Some(P2pPath::HolePunched), _, _) | (_, P2pPath::Direct, true) => P2pPath::HolePunched,
+fn merge_established_path(recorded: Option<P2pPath>, generic: P2pPath) -> P2pPath {
+    match (recorded, generic) {
+        (Some(P2pPath::HolePunched), _) => P2pPath::HolePunched,
         _ => generic,
     }
 }
@@ -528,6 +535,7 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
             connection_paths: HashMap::new(),
             last_application_paths: HashMap::new(),
             transfer_counters: HashMap::new(),
+            path_transfer_counters: HashMap::new(),
             startup_sender: Some(startup_sender),
             startup_receiver: Some(startup_receiver),
             fatal_error: None,
@@ -1024,6 +1032,31 @@ impl P2pEventLoop {
         result
     }
 
+    fn application_path(&self, connection_id: ConnectionId) -> Option<P2pPath> {
+        self.connection_paths
+            .get(&connection_id)
+            .map(|(_, path)| match path {
+                P2pPath::Relayed => P2pPath::RelayFallback,
+                path => *path,
+            })
+    }
+
+    fn record_transfer(&mut self, peer: PeerId, path: Option<P2pPath>, sent: u64, received: u64) {
+        let total = self.transfer_counters.entry(peer).or_default();
+        total.sent = total.sent.saturating_add(sent);
+        total.received = total.received.saturating_add(received);
+        if let Some(path) = path {
+            let by_path = self
+                .path_transfer_counters
+                .entry(peer)
+                .or_default()
+                .entry(path)
+                .or_default();
+            by_path.sent = by_path.sent.saturating_add(sent);
+            by_path.received = by_path.received.saturating_add(received);
+        }
+    }
+
     async fn run_inner(&mut self) -> Result<()> {
         loop {
             tokio::select! {
@@ -1048,7 +1081,7 @@ impl P2pEventLoop {
                             } else if let Some(response_bytes) = response_bytes {
                                 self.pending_response_bytes.insert(
                                     result.request_id,
-                                    (result.peer, response_bytes),
+                                    (result.peer, result.path, response_bytes),
                                 );
                             }
                         }
@@ -1351,31 +1384,48 @@ impl P2pEventLoop {
                 };
                 advertised_addresses.sort();
                 advertised_addresses.dedup();
-                let mut peers = self
+                let mut known_peers = self
                     .swarm
                     .connected_peers()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                known_peers.extend(self.transfer_counters.keys().copied());
+                let mut peers = known_peers
+                    .into_iter()
                     .map(|peer| {
                         let mut active_paths = self
                             .connection_paths
                             .values()
                             .filter_map(|(connected_peer, path)| {
-                                (connected_peer == peer).then_some(*path)
+                                (*connected_peer == peer).then_some(*path)
                             })
                             .collect::<Vec<_>>();
                         active_paths.sort();
                         active_paths.dedup();
+                        let path_transfers = self
+                            .path_transfer_counters
+                            .get(&peer)
+                            .into_iter()
+                            .flat_map(|counters| counters.iter())
+                            .map(|(path, counter)| P2pPathTransfer {
+                                path: *path,
+                                application_bytes_sent: counter.sent,
+                                application_bytes_received: counter.received,
+                            })
+                            .collect();
                         P2pPeerStatus {
                             peer_id: peer.to_string(),
                             active_paths,
-                            last_application_path: self.last_application_paths.get(peer).copied(),
+                            last_application_path: self.last_application_paths.get(&peer).copied(),
                             application_bytes_sent: self
                                 .transfer_counters
-                                .get(peer)
+                                .get(&peer)
                                 .map_or(0, |counter| counter.sent),
                             application_bytes_received: self
                                 .transfer_counters
-                                .get(peer)
+                                .get(&peer)
                                 .map_or(0, |counter| counter.received),
+                            path_transfers,
                         }
                     })
                     .collect::<Vec<_>>();
@@ -1486,21 +1536,6 @@ impl P2pEventLoop {
                     Ok(connection_id) => {
                         self.connection_paths
                             .insert(*connection_id, (event.remote_peer_id, P2pPath::HolePunched));
-                        // Simultaneous QUIC punching can establish a sibling
-                        // inbound connection whose generic swarm event carries
-                        // no DCUtR marker. Once the peer-level upgrade succeeds,
-                        // both direct sides belong to the same punched session.
-                        for (peer, path) in self.connection_paths.values_mut() {
-                            if *peer == event.remote_peer_id && *path == P2pPath::Direct {
-                                *path = P2pPath::HolePunched;
-                            }
-                        }
-                        if self.last_application_paths.get(&event.remote_peer_id)
-                            == Some(&P2pPath::Direct)
-                        {
-                            self.last_application_paths
-                                .insert(event.remote_peer_id, P2pPath::HolePunched);
-                        }
                         // request-response does not expose per-request
                         // connection selection and may otherwise keep using
                         // the older relay circuit indefinitely. Schedule only
@@ -1604,16 +1639,9 @@ impl P2pEventLoop {
                     .connection_paths
                     .get(&connection_id)
                     .map(|(_, path)| *path);
-                let peer_has_hole_punch =
-                    self.connection_paths.values().any(|(connected, path)| {
-                        *connected == peer_id && *path == P2pPath::HolePunched
-                    });
                 self.connection_paths.insert(
                     connection_id,
-                    (
-                        peer_id,
-                        merge_established_path(recorded, path, peer_has_hole_punch),
-                    ),
+                    (peer_id, merge_established_path(recorded, path)),
                 );
                 tracing::info!(peer = %peer_id, ?endpoint, "libp2p connection established");
             }
@@ -1657,15 +1685,9 @@ impl P2pEventLoop {
                 connection_id,
                 message,
             } => {
-                if let Some((_, path)) = self.connection_paths.get(&connection_id) {
-                    self.last_application_paths.insert(
-                        peer,
-                        if *path == P2pPath::Relayed {
-                            P2pPath::RelayFallback
-                        } else {
-                            *path
-                        },
-                    );
+                let path = self.application_path(connection_id);
+                if let Some(path) = path {
+                    self.last_application_paths.insert(peer, path);
                 }
                 match message {
                     request_response::Message::Request {
@@ -1674,8 +1696,7 @@ impl P2pEventLoop {
                         request_id,
                     } => {
                         if let Ok(bytes) = cbor_wire_len(&request) {
-                            let counter = self.transfer_counters.entry(peer).or_default();
-                            counter.received = counter.received.saturating_add(bytes);
+                            self.record_transfer(peer, path, 0, bytes);
                         }
                         if request.signer.libp2p_peer_id().ok() != Some(peer) {
                             tracing::warn!(%peer, "application signer does not match libp2p peer");
@@ -1707,7 +1728,7 @@ impl P2pEventLoop {
                                         } else if let Some(response_bytes) = response_bytes {
                                             self.active_inbound_requests.insert(request_id, peer);
                                             self.pending_response_bytes
-                                                .insert(request_id, (peer, response_bytes));
+                                                .insert(request_id, (peer, path, response_bytes));
                                         }
                                     }
                                     Err(error) => {
@@ -1726,6 +1747,7 @@ impl P2pEventLoop {
                             let response = process_peer_request(service, &config, request);
                             let _ = sender.blocking_send(InboundResult {
                                 peer,
+                                path,
                                 request_id,
                                 channel,
                                 response,
@@ -1739,12 +1761,12 @@ impl P2pEventLoop {
                         let response_bytes = cbor_wire_len(&response).ok();
                         if let Some(pending) = self.pending_requests.remove(&request_id) {
                             if pending.peer == peer {
-                                let counter = self.transfer_counters.entry(peer).or_default();
-                                counter.sent = counter.sent.saturating_add(pending.request_bytes);
-                                if let Some(response_bytes) = response_bytes {
-                                    counter.received =
-                                        counter.received.saturating_add(response_bytes);
-                                }
+                                self.record_transfer(
+                                    peer,
+                                    path,
+                                    pending.request_bytes,
+                                    response_bytes.unwrap_or(0),
+                                );
                             }
                             let result = if pending.peer == peer {
                                 validate_outbound_response(response, &pending)
@@ -1779,12 +1801,11 @@ impl P2pEventLoop {
                 peer, request_id, ..
             } => {
                 self.active_inbound_requests.remove(&request_id);
-                if let Some((expected_peer, bytes)) =
+                if let Some((expected_peer, path, bytes)) =
                     self.pending_response_bytes.remove(&request_id)
                     && expected_peer == peer
                 {
-                    let counter = self.transfer_counters.entry(peer).or_default();
-                    counter.sent = counter.sent.saturating_add(bytes);
+                    self.record_transfer(peer, path, bytes, 0);
                 }
             }
         }
@@ -3569,15 +3590,11 @@ mod tests {
     #[test]
     fn generic_connection_event_does_not_erase_dcutr_classification() {
         assert_eq!(
-            merge_established_path(Some(P2pPath::HolePunched), P2pPath::Direct, false),
+            merge_established_path(Some(P2pPath::HolePunched), P2pPath::Direct),
             P2pPath::HolePunched
         );
         assert_eq!(
-            merge_established_path(Some(P2pPath::Relayed), P2pPath::Direct, true),
-            P2pPath::HolePunched
-        );
-        assert_eq!(
-            merge_established_path(Some(P2pPath::Relayed), P2pPath::Direct, false),
+            merge_established_path(Some(P2pPath::Relayed), P2pPath::Direct),
             P2pPath::Direct,
         );
     }
@@ -3925,6 +3942,13 @@ mod tests {
         assert_eq!(connection.last_application_path, Some(P2pPath::Direct));
         assert!(connection.application_bytes_sent > 0);
         assert!(connection.application_bytes_received > 0);
+        let direct = connection
+            .path_transfers
+            .iter()
+            .find(|transfer| transfer.path == P2pPath::Direct)
+            .unwrap();
+        assert!(direct.application_bytes_sent > 0);
+        assert!(direct.application_bytes_received > 0);
 
         let record_key = b"mutualbackup-test-record".to_vec();
         first_client
@@ -4100,6 +4124,11 @@ mod tests {
                 && peer.last_application_path == Some(P2pPath::HolePunched)
                 && peer.application_bytes_sent > 0
                 && peer.application_bytes_received > 0
+                && peer.path_transfers.iter().any(|transfer| {
+                    transfer.path == P2pPath::HolePunched
+                        && transfer.application_bytes_sent > 0
+                        && transfer.application_bytes_received > 0
+                })
         }));
 
         let fallback_id = fallback_node.keys().node_id();
@@ -4124,6 +4153,11 @@ mod tests {
                     && peer.last_application_path == Some(P2pPath::RelayFallback)
                     && peer.application_bytes_sent > 0
                     && peer.application_bytes_received > 0
+                    && peer.path_transfers.iter().any(|transfer| {
+                        transfer.path == P2pPath::RelayFallback
+                            && transfer.application_bytes_sent > 0
+                            && transfer.application_bytes_received > 0
+                    })
             }),
             "fallback request did not use the relay circuit: {status:?}"
         );

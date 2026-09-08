@@ -411,7 +411,7 @@ fn write_new_private(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
             path.display()
         );
     }
-    let temporary = private_temporary_path(path, bytes);
+    let temporary = private_temporary_path(path);
     let mut temporary_guard = TemporaryPrivateFile::new(temporary.clone());
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -483,10 +483,12 @@ fn previous_private_temporary_prefix(path: &Path) -> String {
     format!(".mutualbackup-{target}-")
 }
 
-fn private_temporary_prefix(path: &Path, bytes: &[u8]) -> String {
+fn private_temporary_prefix(path: &Path) -> String {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
 
+    // Bind cleanup to the exact target name without putting a fast verifier
+    // for private contents (especially the recovery string) in the directory.
     let mut hasher = blake3::Hasher::new_derive_key("mutualbackup private temporary v1");
     #[cfg(unix)]
     hasher.update(path.file_name().unwrap_or(path.as_os_str()).as_bytes());
@@ -497,15 +499,13 @@ fn private_temporary_prefix(path: &Path, bytes: &[u8]) -> String {
             .to_string_lossy()
             .as_bytes(),
     );
-    hasher.update(&[0]);
-    hasher.update(bytes);
     format!(".mutualbackup-private-{}-", hasher.finalize().to_hex())
 }
 
-fn private_temporary_path(path: &Path, bytes: &[u8]) -> PathBuf {
+fn private_temporary_path(path: &Path) -> PathBuf {
     containing_directory(path).join(format!(
         "{}{}.tmp",
-        private_temporary_prefix(path, bytes),
+        private_temporary_prefix(path),
         Uuid::new_v4()
     ))
 }
@@ -516,13 +516,13 @@ enum PrivateTemporaryKind {
     Previous,
 }
 
-fn private_temporary_kind(name: &str, path: &Path, bytes: &[u8]) -> Option<PrivateTemporaryKind> {
+fn private_temporary_kind(name: &str, path: &Path) -> Option<PrivateTemporaryKind> {
     let has_uuid_suffix = |prefix: &str| {
         name.strip_prefix(prefix)
             .and_then(|suffix| suffix.strip_suffix(".tmp"))
             .is_some_and(|uuid| Uuid::parse_str(uuid).is_ok())
     };
-    if has_uuid_suffix(&private_temporary_prefix(path, bytes)) {
+    if has_uuid_suffix(&private_temporary_prefix(path)) {
         return Some(PrivateTemporaryKind::Current);
     }
     if has_uuid_suffix(&previous_private_temporary_prefix(path)) {
@@ -579,7 +579,7 @@ fn cleanup_verified_private_temporaries(path: &Path, bytes: &[u8]) -> Result<()>
         let Some(name) = name.to_str() else {
             continue;
         };
-        let Some(kind) = private_temporary_kind(name, path, bytes) else {
+        let Some(kind) = private_temporary_kind(name, path) else {
             continue;
         };
         if verified_private_temporary(&entry.path(), kind, bytes)? {
@@ -705,7 +705,7 @@ fn ensure_initializable_private_data_dir(path: &Path, manifest: &[u8]) -> Result
         let name = entry.file_name();
         let verified_temporary = name
             .to_str()
-            .and_then(|name| private_temporary_kind(name, &manifest_path, manifest))
+            .and_then(|name| private_temporary_kind(name, &manifest_path))
             .map(|kind| verified_private_temporary(&entry.path(), kind, manifest))
             .transpose()?
             .unwrap_or(false);
@@ -942,8 +942,7 @@ misspelled_budget = 1024
             intent: InitializationIntent::New,
         };
         let manifest_bytes = toml::to_string_pretty(&manifest).unwrap().into_bytes();
-        let interrupted_temporary =
-            private_temporary_path(&identity_manifest_path(&data_dir), &manifest_bytes);
+        let interrupted_temporary = private_temporary_path(&identity_manifest_path(&data_dir));
         fs::write(&interrupted_temporary, &manifest_bytes[..8]).unwrap();
         fs::set_permissions(&interrupted_temporary, fs::Permissions::from_mode(0o600)).unwrap();
         fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o750)).unwrap();
@@ -1009,7 +1008,7 @@ misspelled_budget = 1024
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("recovery.txt");
         let recovery = "correct-horse-battery-staple-2026!";
-        let interrupted = private_temporary_path(&path, recovery.as_bytes());
+        let interrupted = private_temporary_path(&path);
         let matching = temp
             .path()
             .join(format!(".mutualbackup-{}.tmp", Uuid::new_v4()));

@@ -159,6 +159,8 @@ prepare_host() {
     command -v truncate >/dev/null || die "truncate is required"
     command -v findmnt >/dev/null || die "findmnt is required"
     command -v mountpoint >/dev/null || die "mountpoint is required"
+    command -v readlink >/dev/null || die "readlink is required"
+    command -v sync >/dev/null || die "sync is required"
     command -v flock >/dev/null || die "flock is required"
     LOSETUP=$(find_tool losetup /usr/sbin/losetup) || die "losetup is required"
     MKFS_BTRFS=$(find_tool mkfs.btrfs /usr/sbin/mkfs.btrfs) || die "btrfs-progs is required"
@@ -172,6 +174,7 @@ prepare_cleanup_host() {
     validate_layout
     command -v findmnt >/dev/null || die "findmnt is required"
     command -v mountpoint >/dev/null || die "mountpoint is required"
+    command -v readlink >/dev/null || die "readlink is required"
     command -v flock >/dev/null || die "flock is required"
     LOSETUP=$(find_tool losetup /usr/sbin/losetup) || die "losetup is required"
     MOUNT=$(find_tool mount /usr/bin/mount /bin/mount) || die "mount is required"
@@ -222,6 +225,20 @@ node_seed() {
 
 node_identity() {
     printf '%s/seeds/node%s.identity\n' "$LAB_ROOT" "$1"
+}
+
+node_recovery_intent() {
+    printf '%s/seeds/node%s.recovery-intent\n' "$LAB_ROOT" "$1"
+}
+
+has_recovery_intent() {
+    local path=$1
+    if [[ ! -e $path && ! -L $path ]]; then
+        return 1
+    fi
+    [[ -f $path && ! -L $path ]] ||
+        die "recovery intent must be a regular non-symlink file: $path"
+    [[ $(<"$path") == recovery ]] || die "invalid recovery intent marker: $path"
 }
 
 node_config() {
@@ -291,6 +308,31 @@ associated_loops() {
         awk 'NF {print $1}'
 }
 
+verified_mounted_loop() {
+    local node=$1
+    local image mount_dir filesystem source candidate source_real candidate_real
+    image=$(node_image "$node")
+    mount_dir=$(node_mount "$node")
+    filesystem=$(findmnt -rn -o FSTYPE --target "$mount_dir")
+    [[ $filesystem == btrfs ]] ||
+        die "$mount_dir is mounted, but it is not Btrfs"
+    [[ -f $image ]] ||
+        die "$mount_dir is mounted, but node $node's image is missing: $image"
+    source=$(findmnt -rn -o SOURCE --target "$mount_dir")
+    [[ $source =~ ^/dev/loop[0-9]+$ ]] ||
+        die "$mount_dir is mounted from unexpected source $source"
+    source_real=$(readlink -f -- "$source")
+    while IFS= read -r candidate; do
+        [[ -z $candidate ]] && continue
+        candidate_real=$(readlink -f -- "$candidate")
+        if [[ $candidate_real == "$source_real" ]]; then
+            printf '%s\n' "$source"
+            return
+        fi
+    done < <(associated_loops "$image")
+    die "$mount_dir is mounted from $source, which is not attached to node $node's image $image"
+}
+
 ensure_filesystem() {
     local node=$1
     local image mount_dir record loop new_image=false
@@ -300,9 +342,8 @@ ensure_filesystem() {
     mkdir -p "$(dirname "$image")" "$mount_dir" "$(dirname "$record")"
 
     if mountpoint -q "$mount_dir"; then
-        [[ $(findmnt -rn -o FSTYPE --target "$mount_dir") == btrfs ]] ||
-            die "$mount_dir is mounted, but it is not Btrfs"
-        findmnt -rn -o SOURCE --target "$mount_dir" >"$record"
+        loop=$(verified_mounted_loop "$node")
+        printf '%s\n' "$loop" >"$record"
         mkdir -p "$(node_exchange "$node")"
         return
     fi
@@ -338,6 +379,7 @@ unmount_filesystem() {
     mount_dir=$(node_mount "$node")
     record=$(loop_record "$node")
     if mountpoint -q "$mount_dir"; then
+        verified_mounted_loop "$node" >/dev/null
         "${SUDO[@]}" "$UMOUNT" "$mount_dir" ||
             die "cannot unmount $mount_dir; close shells and files using it, then retry"
     fi
@@ -353,17 +395,49 @@ unmount_filesystem() {
 
 ensure_seed() {
     local node=$1
-    local seed identity state manifest temporary
+    local seed identity recovery_intent state manifest temporary recovering=false seed_exists=false manifest_exists=false
     seed=$(node_seed "$node")
     identity=$(node_identity "$node")
+    recovery_intent=$(node_recovery_intent "$node")
     state=$(node_mount "$node")/state
     manifest=$state/identity.toml
-    if [[ ! -f $seed ]]; then
+    if [[ -e $seed || -L $seed ]]; then
+        [[ -f $seed && ! -L $seed ]] ||
+            die "recovery string must be a regular non-symlink file: $seed"
+        seed_exists=true
+    fi
+    if [[ -e $manifest || -L $manifest ]]; then
+        [[ -f $manifest && ! -L $manifest ]] ||
+            die "identity manifest must be a regular non-symlink file: $manifest"
+        manifest_exists=true
+    fi
+    if has_recovery_intent "$recovery_intent"; then
+        recovering=true
+    fi
+    if [[ $seed_exists == false ]]; then
+        [[ $recovering == false ]] ||
+            die "node $node has recovery intent but no recovery string: $seed"
+        [[ $manifest_exists == false ]] ||
+            die "node $node has identity state but no recovery string; restore $seed before running up"
         "$CLI_BIN" init --seed-file "$seed" --data-dir "$state" >/dev/null
         say "generated and retained recovery string for node $node: $seed"
-    elif [[ ! -f $manifest ]]; then
-        "$CLI_BIN" recover-init --seed-file "$seed" --data-dir "$state" >/dev/null
-        say "initialized recovery state for node $node from: $seed"
+    elif [[ $manifest_exists == false ]]; then
+        if [[ $recovering == true ]]; then
+            "$CLI_BIN" recover-init --seed-file "$seed" --data-dir "$state" >/dev/null
+            rm -f "$recovery_intent"
+            say "resumed explicit recovery initialization for node $node from: $seed"
+        else
+            "$CLI_BIN" init --seed-file "$seed" --data-dir "$state" >/dev/null
+            say "resumed new-node initialization for node $node from: $seed"
+        fi
+    elif [[ $recovering == true ]]; then
+        if grep -Fqx 'intent = "recovery"' "$manifest"; then
+            rm -f "$recovery_intent"
+        elif grep -Fqx 'intent = "new"' "$manifest"; then
+            say "node $node still has its original state; explicit reinit remains pending"
+        else
+            die "node $node has recovery intent but an unrecognized identity manifest"
+        fi
     fi
     chmod 600 "$seed"
     if [[ ! -f $identity ]]; then
@@ -515,18 +589,24 @@ guild_phase() {
     cli_raw "$1" guild status 2>/dev/null | sed -n 's/^phase: *//p'
 }
 
+guild_id() {
+    cli_raw "$1" guild status 2>/dev/null | sed -n 's/^guild id: *//p'
+}
+
 ensure_guild() {
-    local phase
+    local phase expected_guild
     phase=$(guild_phase 0)
     if [[ -z $phase ]]; then
         say "creating the fixed five-member guild"
         cli_raw 0 guild create >/dev/null
         phase=Draft
     fi
+    expected_guild=$(guild_id 0)
+    [[ -n $expected_guild ]] || die "node 0 did not report its guild ID"
     if [[ $phase == Active ]]; then
         local node
         for node in 1 2 3 4; do
-            [[ $(guild_phase "$node") == Active ]] ||
+            [[ $(guild_phase "$node") == Active && $(guild_id "$node") == "$expected_guild" ]] ||
                 die "node $node does not have node 0's active guild; use reinit or choose a fresh lab root"
         done
         return
@@ -542,12 +622,20 @@ ensure_guild() {
         elif [[ $node_phase == Joining ]]; then
             say "retrying the pending guild join for node $node"
             cli_raw "$node" guild retry >/dev/null
+        elif [[ $node_phase == Active ]]; then
+            [[ $(guild_id "$node") == "$expected_guild" ]] ||
+                die "node $node has a different active guild"
+            say "node $node already installed the pending guild; resuming finalization"
         else
             die "node $node is in unexpected guild phase $node_phase"
         fi
     done
     cli_raw 0 guild finalize >/dev/null
     [[ $(guild_phase 0) == Active ]] || die "guild finalization did not become active"
+    for node in 1 2 3 4; do
+        [[ $(guild_phase "$node") == Active && $(guild_id "$node") == "$expected_guild" ]] ||
+            die "node $node did not converge on the finalized guild"
+    done
     say "five-member guild is active"
 }
 
@@ -685,6 +773,14 @@ command_reinit() {
     confirm_reinit "$node" "$assume_yes"
 
     say "removing node $node container and disposable Btrfs state; preserving $(node_seed "$node")"
+    local recovery_intent temporary_intent
+    recovery_intent=$(node_recovery_intent "$node")
+    has_recovery_intent "$recovery_intent" || true
+    temporary_intent=$recovery_intent.tmp.$$
+    printf 'recovery\n' >"$temporary_intent"
+    chmod 600 "$temporary_intent"
+    mv "$temporary_intent" "$recovery_intent"
+    sync "$recovery_intent"
     remove_container "$node"
     unmount_filesystem "$node"
     rm -f "$(node_image "$node")"
@@ -692,6 +788,7 @@ command_reinit() {
     "$CLI_BIN" recover-init \
         --seed-file "$(node_seed "$node")" \
         --data-dir "$(node_mount "$node")/state" >/dev/null
+    rm -f "$recovery_intent"
 
     local config previous timestamp
     config=$(node_config "$node")

@@ -58,6 +58,9 @@ The CLI and daemon use a same-user Unix control socket. Pass `--socket` when a
 configuration does not use the default location below `XDG_RUNTIME_DIR`.
 Several daemons can run under one account when every config has a distinct
 recovery string, data directory, control socket, and UDP listen address.
+`status` reports process-lifetime application byte counters separately for
+each observed direct, hole-punched, and relay-fallback path; compare a baseline
+before and after an operation when diagnosing the route that operation used.
 The current draft JSON/CBOR schemas, signed-record field tables, and golden
 fixtures are documented in the [`protocol/` directory](protocol/README.md).
 
@@ -69,7 +72,12 @@ the bundled SQLCipher/OpenSSL build:
 ```sh
 nix develop -c cargo test --workspace
 nix build
+nix build .#lab-artifacts -o dist
 ```
+
+The `lab-artifacts` output gives the CLI and daemon the exact static x86-64
+filenames consumed by the no-build guides and Docker lab. Building that output
+is a release-machine or CI step; the lab itself never builds the programs.
 
 The destructive acceptance tests need a disposable directory on a filesystem
 that supports reflinks. They start real daemons and use real QUIC, relay,

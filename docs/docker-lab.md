@@ -64,6 +64,16 @@ dist/mutualbackup-x86_64-linux
 dist/mutualbackupd-x86_64-linux
 ```
 
+They are the direct output contract of the source-defined Nix release target.
+On a build machine or in CI, create the handoff directory with:
+
+```sh
+nix build .#lab-artifacts -o dist
+```
+
+Copy that output to the lab host with symlinks dereferenced (or use your normal
+Nix artifact transfer). Starting the lab still performs no build.
+
 `up` exits with a useful error if either artifact is absent. It never invokes
 Cargo, Nix, a compiler, `docker build`, or a Dockerfile. On its first run it may
 download the configured `debian:bookworm-slim` base image. If Nix artifacts are
@@ -98,9 +108,18 @@ The first run performs the complete deployment:
 
 `up` is resumable. Running it after `down` reattaches and mounts the existing
 images, recreates containers, and resumes the same identities and guild. It
-does not regenerate an existing recovery string or identity manifest. The
-controller rewrites its own lab configs from the selected environment settings;
-do not hand-edit them.
+does not regenerate an existing recovery string or identity manifest. If a
+first-time `up` stopped after writing a seed but before writing its manifest,
+the next `up` resumes ordinary new-node initialization. `reinit` records its
+recovery intent before removing state, so only that explicit destructive path
+can create a recovery-intent manifest after an interruption. Guild formation
+likewise resumes when some members installed the final certificate before the
+coordinator. The controller rewrites its own lab configs from the selected
+environment settings; do not hand-edit them.
+
+If retained identity state exists but its corresponding file under `seeds/` is
+missing, `up` refuses to invent a replacement. Restore that recovery string
+from its offline copy before continuing.
 
 ## Run CLI commands
 
@@ -290,6 +309,9 @@ The controller first stops and removes its containers and bridge. It then
 unmounts all five Btrfs filesystems and detaches every loop device associated
 with the five image files. It never uses a lazy or forced unmount; if a host
 shell or process is holding a mount busy, it tells you to close it and retry.
+Before reusing or unmounting a mount point, it verifies that the mounted Btrfs
+source is a loop device attached to that node's exact retained image. A foreign
+mount at a lab path is rejected and left untouched.
 
 `down` retains image files, configs, and seeds under `.docker-lab/`, so a later
 `up` resumes the same data and identities. While down, the host mount-point

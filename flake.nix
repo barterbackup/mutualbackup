@@ -16,9 +16,21 @@
         nativeBuildInputs = with pkgs; [ perl pkg-config ];
         doCheck = true;
       };
+      labArtifacts = pkgs.runCommandNoCC "mutualbackup-lab-artifacts-0.1.0" { } ''
+        install -Dm755 ${staticBinary}/bin/mutualbackup \
+          $out/mutualbackup-x86_64-linux
+        install -Dm755 ${staticBinary}/bin/mutualbackupd \
+          $out/mutualbackupd-x86_64-linux
+      '';
     in {
-      packages.${system}.default = staticBinary;
-      checks.${system}.default = staticBinary;
+      packages.${system} = {
+        default = staticBinary;
+        lab-artifacts = labArtifacts;
+      };
+      checks.${system} = {
+        default = staticBinary;
+        lab-artifacts = labArtifacts;
+      };
 
       devShells.${system} = {
         default = pkgs.mkShell {

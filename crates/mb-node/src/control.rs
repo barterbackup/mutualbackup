@@ -364,6 +364,16 @@ async fn handle_request(
                 p2p.install_guild_genesis(peer.member.node_id, certificate.clone(), peers.clone())
                     .await?;
             }
+            #[cfg(debug_assertions)]
+            {
+                static FAIL_ONCE: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(true);
+                if std::env::var_os("MUTUALBACKUP_TEST_FAIL_BEFORE_LOCAL_GUILD_INSTALL").is_some()
+                    && FAIL_ONCE.swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    bail!("test interruption before coordinator guild installation");
+                }
+            }
             blocking_node(node, move |node| {
                 node.install_guild_genesis(certificate, peers)?;
                 node.guild_summary().map(LocalResponse::Guild)

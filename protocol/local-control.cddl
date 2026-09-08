@@ -78,6 +78,13 @@ p2p-peer-status = {
   active_paths: [* p2p-path],
   last_application_path: null / p2p-path,
   application_bytes_sent: uint,
+  application_bytes_received: uint,
+  path_transfers: [* p2p-path-transfer]
+}
+
+p2p-path-transfer = {
+  path: p2p-path,
+  application_bytes_sent: uint,
   application_bytes_received: uint
 }
 

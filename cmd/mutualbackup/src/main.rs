@@ -256,6 +256,15 @@ async fn main() -> Result<()> {
                         peer.application_bytes_sent,
                         peer.application_bytes_received
                     );
+                    for transfer in peer.path_transfers {
+                        println!(
+                            "peer path transfer: {} path={:?} sent={} received={}",
+                            peer.peer_id,
+                            transfer.path,
+                            transfer.application_bytes_sent,
+                            transfer.application_bytes_received
+                        );
+                    }
                 }
             }
         }

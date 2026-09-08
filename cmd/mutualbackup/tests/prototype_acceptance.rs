@@ -23,9 +23,11 @@ use mutualbackup::{DaemonOptions, read_daemon_options, read_identity_manifest};
 use uuid::Uuid;
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
+const MIN_BULK_TRANSFER_BYTES: u64 = 64 * 1024;
 
 struct Daemon {
     args: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
     log: PathBuf,
     child: Option<Child>,
 }
@@ -38,9 +40,16 @@ impl Daemon {
     fn with_args(args: Vec<OsString>, log: PathBuf) -> Self {
         Self {
             args,
+            environment: Vec::new(),
             log,
             child: None,
         }
+    }
+
+    fn set_env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) {
+        let key = os(key);
+        self.environment.retain(|(candidate, _)| candidate != &key);
+        self.environment.push((key, os(value)));
     }
 
     fn start(&mut self) {
@@ -53,6 +62,7 @@ impl Daemon {
         let stderr = log.try_clone().unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_mutualbackupd"))
             .args(&self.args)
+            .envs(self.environment.iter().cloned())
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))
@@ -448,7 +458,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     fs::create_dir(&seed_dir).unwrap();
     set_private(&seed_dir);
 
-    let reserved_ports = (0..9)
+    let reserved_ports = (0..10)
         .map(|_| UdpSocket::bind("127.0.0.1:0").unwrap())
         .collect::<Vec<_>>();
     let ports = reserved_ports
@@ -528,6 +538,10 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         .enumerate()
         .map(|(index, config)| {
             let mut daemon = Daemon::new(config.clone(), run_root.join(format!("p{index}.log")));
+            daemon.set_env("RUST_LOG", "warn");
+            if index == 0 {
+                daemon.set_env("MUTUALBACKUP_TEST_FAIL_BEFORE_LOCAL_GUILD_INSTALL", "1");
+            }
             daemon.start();
             daemon
         })
@@ -577,6 +591,24 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         let token = value_after(&invite, "invitation: ");
         join_guild_with_retry(&sockets[index], token.as_str(), Duration::from_secs(90));
     }
+    let interrupted_finalize = run_cli(
+        &[
+            os("--socket"),
+            sockets[0].as_os_str().to_owned(),
+            os("guild"),
+            os("finalize"),
+        ],
+        Duration::from_secs(60),
+    )
+    .unwrap_err();
+    assert!(
+        interrupted_finalize.contains("test interruption"),
+        "unexpected interrupted-finalize result: {interrupted_finalize}"
+    );
+    assert!(cli(&sockets[0], ["guild", "status"], CLI_TIMEOUT).contains("Draft"));
+    for socket in &sockets[1..] {
+        assert!(cli(socket, ["guild", "status"], CLI_TIMEOUT).contains("Active"));
+    }
     let finalized = cli(&sockets[0], ["guild", "finalize"], Duration::from_secs(60));
     assert!(finalized.contains("members:     5 of 5"));
 
@@ -615,13 +647,6 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     daemons[0].start();
     wait_for_status(&sockets[0], &mut daemons[0], Duration::from_secs(30));
     wait_for_backup(&sockets[1], &interrupted_revision, Duration::from_secs(180));
-    wait_for_peer_transfer(
-        &sockets[0],
-        &mut daemons[0],
-        &peer_ids[1],
-        "Direct",
-        Duration::from_secs(30),
-    );
 
     let snapshots = cli(&sockets[1], ["snapshot", "list"], CLI_TIMEOUT);
     assert_eq!(snapshots.lines().count(), 2);
@@ -833,7 +858,6 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     storage_recovered_daemon.stop();
 
     let relay = format!("{}/p2p/{}", transports[5], peer_ids[1]);
-    let coordinator_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[0]);
     let punched_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[3]);
     let fallback_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[4]);
     update_config(&recovered_config, |config| {
@@ -907,6 +931,9 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         Duration::from_secs(45),
     );
 
+    let direct_before = peer_path_transfer(&sockets[0], &mut daemons[0], &peer_ids[1], "Direct");
+    let punched_before =
+        peer_path_transfer(&sockets[0], &mut daemons[0], &peer_ids[3], "HolePunched");
     let final_owner_two = deterministic_bytes(512_031, 83);
     fs::write(
         owner_two_source.join("documents/data.bin"),
@@ -920,6 +947,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         &mut daemons[0],
         &peer_ids[1],
         "Direct",
+        direct_before,
         Duration::from_secs(30),
     );
     wait_for_peer_transfer(
@@ -927,13 +955,39 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         &mut daemons[0],
         &peer_ids[3],
         "HolePunched",
+        punched_before,
         Duration::from_secs(30),
     );
 
     // A no-listener node can still establish a direct outbound QUIC session.
     // Restart both ends without direct listeners to make the retained circuit
-    // the only viable transport for the relay-fallback assertion.
+    // the only viable transport for the relay-fallback assertion. Restart the
+    // relay and its clients between coordinator sessions so old reservations
+    // cannot race replacement connections from the same peer identities.
     daemons[0].stop();
+    daemons[3].stop();
+    storage_recovered_daemon.stop();
+    recovered_daemon.stop();
+    let relay = format!("{}/p2p/{}", transports[9], peer_ids[1]);
+    let coordinator_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[0]);
+    let punched_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[3]);
+    let fallback_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[4]);
+    update_config(&recovered_config, |config| {
+        config.p2p_listen_addresses = vec![transports[9].clone()];
+        config.p2p_external_addresses = vec![transports[9].clone()];
+    });
+    update_config(&configs[3], |config| {
+        config.p2p_relay_addresses = vec![relay.clone()];
+    });
+    update_config(&storage_recovered_config, |config| {
+        config.p2p_relay_addresses = vec![relay.clone()];
+    });
+    recovered_daemon.start();
+    wait_for_status(
+        &recovered_socket,
+        &mut recovered_daemon,
+        Duration::from_secs(30),
+    );
     update_config(&configs[0], |config| {
         config.p2p_listen_addresses.clear();
         config.p2p_external_addresses.clear();
@@ -945,6 +999,20 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     wait_for_status_text(
         &sockets[0],
         &mut daemons[0],
+        "/p2p-circuit",
+        Duration::from_secs(45),
+    );
+    daemons[3].start();
+    storage_recovered_daemon.start();
+    wait_for_status_text(
+        &sockets[3],
+        &mut daemons[3],
+        "/p2p-circuit",
+        Duration::from_secs(45),
+    );
+    wait_for_status_text(
+        &storage_recovered_socket,
+        &mut storage_recovered_daemon,
         "/p2p-circuit",
         Duration::from_secs(45),
     );
@@ -969,6 +1037,8 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         &peer_ids[0],
         Duration::from_secs(45),
     );
+    let relay_before =
+        peer_path_transfer(&sockets[0], &mut daemons[0], &peer_ids[4], "RelayFallback");
     fs::write(
         owner_two_source.join("documents/data.bin"),
         deterministic_bytes(512_047, 89),
@@ -981,6 +1051,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         &mut daemons[0],
         &peer_ids[4],
         "RelayFallback",
+        relay_before,
         Duration::from_secs(30),
     );
 
@@ -1297,8 +1368,8 @@ fn wait_for_status_text(
     timeout: Duration,
 ) -> String {
     let deadline = Instant::now() + timeout;
+    let mut status = wait_for_status(socket, daemon, timeout);
     loop {
-        let status = wait_for_status(socket, daemon, Duration::from_secs(5));
         if status.contains(expected) {
             return status;
         }
@@ -1307,6 +1378,11 @@ fn wait_for_status_text(
             "status never contained {expected:?}:\n{status}"
         );
         thread::sleep(Duration::from_millis(100));
+        status = wait_for_status(
+            socket,
+            daemon,
+            deadline.saturating_duration_since(Instant::now()),
+        );
     }
 }
 
@@ -1315,22 +1391,24 @@ fn wait_for_peer_transfer(
     daemon: &mut Daemon,
     peer_id: &str,
     path: &str,
+    baseline: (u64, u64),
     timeout: Duration,
 ) {
     let deadline = Instant::now() + timeout;
     loop {
         let status = wait_for_status(socket, daemon, Duration::from_secs(5));
-        if let Some(line) = status.lines().find(|line| {
-            line.strip_prefix("peer connection: ")
-                .is_some_and(|tail| tail.starts_with(peer_id))
-        }) {
+        if let Some(line) = path_transfer_line(&status, peer_id, path) {
             let sent = numeric_status_field(line, "sent=");
             let received = numeric_status_field(line, "received=");
-            if line.contains(&format!("last-application=Some({path})"))
-                && sent.is_some_and(|bytes| bytes > 0)
-                && received.is_some_and(|bytes| bytes > 0)
-            {
-                return;
+            if let (Some(sent), Some(received)) = (sent, received) {
+                let sent_delta = sent.saturating_sub(baseline.0);
+                let received_delta = received.saturating_sub(baseline.1);
+                if sent > baseline.0
+                    && received > baseline.1
+                    && sent_delta.max(received_delta) >= MIN_BULK_TRANSFER_BYTES
+                {
+                    return;
+                }
             }
         }
         assert!(
@@ -1339,6 +1417,28 @@ fn wait_for_peer_transfer(
         );
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn peer_path_transfer(socket: &Path, daemon: &mut Daemon, peer_id: &str, path: &str) -> (u64, u64) {
+    let status = wait_for_status(socket, daemon, Duration::from_secs(5));
+    path_transfer_line(&status, peer_id, path).map_or((0, 0), |line| {
+        (
+            numeric_status_field(line, "sent=").unwrap(),
+            numeric_status_field(line, "received=").unwrap(),
+        )
+    })
+}
+
+fn path_transfer_line<'a>(status: &'a str, peer_id: &str, path: &str) -> Option<&'a str> {
+    status.lines().find(|line| {
+        line.strip_prefix("peer path transfer: ")
+            .is_some_and(|tail| {
+                tail.starts_with(peer_id)
+                    && tail
+                        .strip_prefix(peer_id)
+                        .is_some_and(|fields| fields.starts_with(&format!(" path={path} ")))
+            })
+    })
 }
 
 fn numeric_status_field(line: &str, prefix: &str) -> Option<u64> {

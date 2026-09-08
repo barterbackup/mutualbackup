@@ -27,6 +27,11 @@ Both files should report version 0.1.0:
 "$DAEMON" --version
 ```
 
+The repository defines the exact artifact layout as `.#lab-artifacts`. A build
+machine or CI runner can create it with `nix build .#lab-artifacts -o dist`;
+copy the resulting files to this host with symlinks dereferenced. None of the
+steps below builds the programs.
+
 The current prototype has these practical constraints:
 
 - It runs on Linux, and the supplied binaries require an x86-64 machine.
