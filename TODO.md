@@ -1,5 +1,59 @@
 # Product TODO
 
+## Milestone 2 corrective follow-up
+
+The latest source-only closure review found the current defects below. They are
+mistakes in implemented behavior or its regression gate, not deferred product
+features. Fix and remove them before beginning Milestone 3.
+
+- Preflight the seed and identity-manifest pair before installing a missing seed
+  output. `init --seed-file` currently writes a new seed and only afterwards
+  discovers that an existing `identity.toml` belongs to another identity. The
+  rejected command therefore mutates disk and leaves a seed that makes every
+  retry fail. Preserve valid seed-first interruption recovery, but cover absent
+  seed plus matching and conflicting manifests for generated and supplied
+  recovery strings.
+- Return a manually unlocked daemon to `Locked` when asynchronous libp2p startup
+  fails. Synchronous runtime-construction errors already retry, but listener or
+  relay failure and the startup timeout respond to the CLI and then terminate
+  `mutualbackupd`. Tear down the failed node/network attempt while retaining the
+  data-directory lock and control listener, and prove that status plus a later
+  unlock still work. Auto-unlock may continue to fail the process.
+- Make cold recovery accumulate its durable progress. Verified recovered shards
+  are written to `recovery_shards`, but every later recovery attempt downloads
+  all preceding coding groups again. Validate and reuse matching staged shards
+  so disjoint peer-availability windows and daemon restarts can converge; reject
+  conflicting staged state and add an alternating-availability regression.
+- Allow the durable recovery-restore state machine to handle its own target.
+  `recover_from_dht` currently rejects any existing target before
+  `restore_recovered_revision` can verify the native ID and ownership marker of
+  a target published by the same job. Remove that contradictory outer check,
+  retain rejection of foreign targets, and inject interruption after the atomic
+  publish and during finalization.
+- Separate truly persistent operator addresses from bounded, replaceable network
+  hints. Recovery candidates and changing guild endpoints currently pass through
+  `AddAddress`, which permanently accumulates peers and addresses without an
+  aggregate cap—even before recovery authority is established—and also exempts
+  their telemetry from eviction. Give attempt-scoped and signed endpoints an
+  expiring/replacement lifecycle, promote only validated bounded state, and
+  cover repeated churn and hostile recovery candidates.
+- Make Docker-lab filesystem provisioning interruption-safe and enforce mount
+  provenance on every node start. Image existence currently stands in for
+  completed `mkfs.btrfs`, so interruption after `truncate` leaves an image that
+  no later `up` can repair. In addition, `start` and `restart` bypass the exact
+  image/loop/mount check used by `up` and `down`. Record or atomically publish
+  completed lab-owned images, reject ambiguous existing files, and test partial
+  creation, missing mounts, and foreign mounts.
+- Make Docker `reinit` one durable, resumable transaction through successful
+  recovery. Its intent is removed immediately after `recover-init`, before the
+  recovery config, container, guild recovery, and restore; a later `up` then
+  overwrites the config and follows normal guild setup. Durably persist the
+  stage, bootstrap choice, and restore target—including containing-directory
+  sync—before erasing the image; keep them until success; and make
+  `up`/`reinit` resume each boundary. Before wiping, require at least three
+  responsive members of the same active guild, not merely three daemons that
+  answer `status`.
+
 ## Later guild geometry and coding protocol
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
