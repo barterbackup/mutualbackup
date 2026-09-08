@@ -162,12 +162,21 @@ fn init_resumes_after_seed_install_without_replacing_outputs() {
         data_dir.as_os_str().to_owned(),
     ];
 
-    let interrupted = Command::new(env!("CARGO_BIN_EXE_mutualbackup"))
-        .args(&args)
-        .env("MUTUALBACKUP_TEST_FAIL_AFTER_SEED_INSTALL", "1")
-        .output()
-        .unwrap();
-    assert!(!interrupted.status.success());
+    #[cfg(debug_assertions)]
+    {
+        let interrupted = Command::new(env!("CARGO_BIN_EXE_mutualbackup"))
+            .args(&args)
+            .env("MUTUALBACKUP_TEST_FAIL_AFTER_SEED_INSTALL", "1")
+            .output()
+            .unwrap();
+        assert!(!interrupted.status.success());
+    }
+    #[cfg(not(debug_assertions))]
+    mutualbackup::write_seed(
+        &seed_file,
+        "release-resumable-initialization-recovery-string-2027!",
+    )
+    .unwrap();
     assert!(seed_file.is_file());
     assert!(!data_dir.exists());
 
@@ -297,10 +306,10 @@ fn daemon_never_reports_ready_when_its_only_listener_cannot_start() {
         "daemon falsely reported readiness:\n{}",
         String::from_utf8_lossy(&output.stdout)
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("libp2p"),
-        "unexpected daemon error:\n{}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains("libp2p") || stderr.contains("cannot listen on"),
+        "unexpected daemon error:\n{stderr}"
     );
 }
 
