@@ -233,14 +233,91 @@ node_recovery_intent() {
     printf '%s/seeds/node%s.recovery-intent\n' "$LAB_ROOT" "$1"
 }
 
-has_recovery_intent() {
+RECOVERY_PHASE=
+RECOVERY_BOOTSTRAP_NODE=
+RECOVERY_RESTORE_NAME=
+RECOVERY_GUILD_ID=
+
+load_recovery_intent() {
     local path=$1
+    local key value format_seen=false phase_seen=false bootstrap_seen=false restore_seen=false guild_seen=false
     if [[ ! -e $path && ! -L $path ]]; then
         return 1
     fi
     [[ -f $path && ! -L $path ]] ||
         die "recovery intent must be a regular non-symlink file: $path"
-    [[ $(<"$path") == recovery ]] || die "invalid recovery intent marker: $path"
+    [[ -O $path ]] || die "recovery intent must be owned by the current user: $path"
+    RECOVERY_PHASE=
+    RECOVERY_BOOTSTRAP_NODE=
+    RECOVERY_RESTORE_NAME=
+    RECOVERY_GUILD_ID=
+    while IFS='=' read -r key value; do
+        case $key in
+            format)
+                [[ $format_seen == false ]] || die "duplicate recovery format in $path"
+                [[ $value == 1 ]] || die "unsupported recovery intent format in $path"
+                format_seen=true
+                ;;
+            phase)
+                [[ $phase_seen == false ]] || die "duplicate recovery phase in $path"
+                RECOVERY_PHASE=$value
+                phase_seen=true
+                ;;
+            bootstrap_node)
+                [[ $bootstrap_seen == false ]] || die "duplicate recovery bootstrap in $path"
+                RECOVERY_BOOTSTRAP_NODE=$value
+                bootstrap_seen=true
+                ;;
+            restore_name)
+                [[ $restore_seen == false ]] || die "duplicate recovery target in $path"
+                RECOVERY_RESTORE_NAME=$value
+                restore_seen=true
+                ;;
+            guild_id)
+                [[ $guild_seen == false ]] || die "duplicate recovery guild in $path"
+                RECOVERY_GUILD_ID=$value
+                guild_seen=true
+                ;;
+            *) die "invalid recovery intent field in $path: $key" ;;
+        esac
+    done <"$path"
+    [[ $format_seen == true && $phase_seen == true && $bootstrap_seen == true && $restore_seen == true && $guild_seen == true ]] ||
+        die "incomplete recovery intent: $path"
+    [[ $RECOVERY_PHASE =~ ^(prepared|erasing|erased|initialized|container_created|restoring)$ ]] ||
+        die "invalid recovery phase in $path: $RECOVERY_PHASE"
+    validate_node "$RECOVERY_BOOTSTRAP_NODE"
+    [[ $RECOVERY_RESTORE_NAME =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+        die "invalid recovery target in $path"
+    [[ $RECOVERY_GUILD_ID =~ ^[0-9a-fA-F]{64}$ ]] || die "invalid recovery guild in $path"
+}
+
+write_recovery_intent() {
+    local node=$1 phase=$2 bootstrap_node=$3 restore_name=$4 expected_guild=$5
+    local path temporary parent
+    path=$(node_recovery_intent "$node")
+    parent=$(dirname "$path")
+    mkdir -p "$parent"
+    temporary=$path.tmp.$$
+    (umask 077 && printf 'format=1\nphase=%s\nbootstrap_node=%s\nrestore_name=%s\nguild_id=%s\n' \
+        "$phase" "$bootstrap_node" "$restore_name" "$expected_guild" >"$temporary")
+    sync "$temporary"
+    mv "$temporary" "$path"
+    sync "$parent"
+}
+
+advance_recovery_intent() {
+    local node=$1 phase=$2
+    write_recovery_intent "$node" "$phase" "$RECOVERY_BOOTSTRAP_NODE" \
+        "$RECOVERY_RESTORE_NAME" "$RECOVERY_GUILD_ID"
+    RECOVERY_PHASE=$phase
+}
+
+clear_recovery_intent() {
+    local node=$1 path parent
+    path=$(node_recovery_intent "$node")
+    parent=$(dirname "$path")
+    rm -f "$path"
+    sync "$parent"
 }
 
 node_config() {
@@ -452,7 +529,7 @@ unmount_filesystem() {
 
 ensure_seed() {
     local node=$1
-    local seed identity recovery_intent state manifest temporary recovering=false seed_exists=false manifest_exists=false
+    local seed identity recovery_intent state manifest temporary seed_exists=false manifest_exists=false
     seed=$(node_seed "$node")
     identity=$(node_identity "$node")
     recovery_intent=$(node_recovery_intent "$node")
@@ -468,33 +545,17 @@ ensure_seed() {
             die "identity manifest must be a regular non-symlink file: $manifest"
         manifest_exists=true
     fi
-    if has_recovery_intent "$recovery_intent"; then
-        recovering=true
+    if load_recovery_intent "$recovery_intent"; then
+        die "node $node has a pending recovery transaction; resume it through up or reinit"
     fi
     if [[ $seed_exists == false ]]; then
-        [[ $recovering == false ]] ||
-            die "node $node has recovery intent but no recovery string: $seed"
         [[ $manifest_exists == false ]] ||
             die "node $node has identity state but no recovery string; restore $seed before running up"
         "$CLI_BIN" init --seed-file "$seed" --data-dir "$state" >/dev/null
         say "generated and retained recovery string for node $node: $seed"
     elif [[ $manifest_exists == false ]]; then
-        if [[ $recovering == true ]]; then
-            "$CLI_BIN" recover-init --seed-file "$seed" --data-dir "$state" >/dev/null
-            rm -f "$recovery_intent"
-            say "resumed explicit recovery initialization for node $node from: $seed"
-        else
-            "$CLI_BIN" init --seed-file "$seed" --data-dir "$state" >/dev/null
-            say "resumed new-node initialization for node $node from: $seed"
-        fi
-    elif [[ $recovering == true ]]; then
-        if grep -Fqx 'intent = "recovery"' "$manifest"; then
-            rm -f "$recovery_intent"
-        elif grep -Fqx 'intent = "new"' "$manifest"; then
-            say "node $node still has its original state; explicit reinit remains pending"
-        else
-            die "node $node has recovery intent but an unrecognized identity manifest"
-        fi
+        "$CLI_BIN" init --seed-file "$seed" --data-dir "$state" >/dev/null
+        say "resumed new-node initialization for node $node from: $seed"
     fi
     chmod 600 "$seed"
     if [[ ! -f $identity ]]; then
@@ -517,8 +578,9 @@ peer_endpoint() {
 
 write_normal_config() {
     local node=$1
-    local config bootstrap relay relay_server
+    local config temporary bootstrap relay relay_server
     config=$(node_config "$node")
+    temporary=$config.tmp.$$
     bootstrap='[]'
     relay='[]'
     relay_server=false
@@ -529,7 +591,7 @@ write_normal_config() {
         relay=$bootstrap
     fi
     umask 077
-    cat >"$config" <<EOF
+    cat >"$temporary" <<EOF
 data_dir = "/node/state"
 seed_file = "/secrets/node.seed"
 control_socket = "/node/run/control.sock"
@@ -544,13 +606,17 @@ enable_hole_punching = true
 enable_dht_maintenance = true
 max_connections = 32
 EOF
+    sync "$temporary"
+    mv "$temporary" "$config"
+    sync "$(dirname "$config")"
 }
 
 write_recovery_config() {
     local node=$1
     local bootstrap_node=$2
-    local config relay relay_server
+    local config temporary relay relay_server
     config=$(node_config "$node")
+    temporary=$config.tmp.$$
     relay='[]'
     relay_server=false
     if ((node == 0)); then
@@ -559,7 +625,7 @@ write_recovery_config() {
         relay="[\"$(peer_endpoint 0)\"]"
     fi
     umask 077
-    cat >"$config" <<EOF
+    cat >"$temporary" <<EOF
 data_dir = "/node/state"
 seed_file = "/secrets/node.seed"
 control_socket = "/node/run/control.sock"
@@ -573,6 +639,9 @@ enable_hole_punching = true
 enable_dht_maintenance = true
 max_connections = 32
 EOF
+    sync "$temporary"
+    mv "$temporary" "$config"
+    sync "$(dirname "$config")"
 }
 
 create_container() {
@@ -650,6 +719,139 @@ guild_id() {
     cli_raw "$1" guild status 2>/dev/null | sed -n 's/^guild id: *//p'
 }
 
+validate_recovery_survivors() {
+    local recovering_node=$1
+    local expected_guild=$2
+    local count=0 candidate first=
+    for candidate in 0 1 2 3 4; do
+        if ((candidate != recovering_node)) && container_running "$candidate" &&
+            cli_raw "$candidate" status >/dev/null 2>&1 &&
+            [[ $(guild_phase "$candidate") == Active ]] &&
+            [[ $(guild_id "$candidate") == "$expected_guild" ]]; then
+            ((count += 1))
+            [[ -n $first ]] || first=$candidate
+        fi
+    done
+    ((count >= 3)) ||
+        die "reinit requires at least three responsive members of guild $expected_guild"
+    if [[ $RECOVERY_BOOTSTRAP_NODE == "$recovering_node" ]] ||
+        ! container_running "$RECOVERY_BOOTSTRAP_NODE" ||
+        [[ $(guild_phase "$RECOVERY_BOOTSTRAP_NODE") != Active ]] ||
+        [[ $(guild_id "$RECOVERY_BOOTSTRAP_NODE") != "$expected_guild" ]]; then
+        RECOVERY_BOOTSTRAP_NODE=$first
+        if [[ -e "$(node_recovery_intent "$recovering_node")" ]]; then
+            remove_container "$recovering_node"
+            write_recovery_intent "$recovering_node" "$RECOVERY_PHASE" \
+                "$RECOVERY_BOOTSTRAP_NODE" "$RECOVERY_RESTORE_NAME" "$RECOVERY_GUILD_ID"
+        fi
+    fi
+}
+
+archive_reinit_config() {
+    local node=$1
+    local config previous timestamp
+    config=$(node_config "$node")
+    if [[ -f $config && ! -L $config ]]; then
+        timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+        previous=$config.before-reinit-$timestamp-$$
+        [[ ! -e $previous ]] || die "refusing to overwrite previous config $previous"
+        mv "$config" "$previous"
+        sync "$(dirname "$config")"
+        say "previous config retained at: $previous"
+    elif [[ -e $config || -L $config ]]; then
+        die "node config is not a regular file: $config"
+    fi
+}
+
+prepare_recovery_container() {
+    local node=$1
+    local image staging manifest config seed
+    image=$(node_image "$node")
+    staging=$image.creating
+    manifest=$(node_mount "$node")/state/identity.toml
+    config=$(node_config "$node")
+    seed=$(node_seed "$node")
+    [[ -f $seed && ! -L $seed && -O $seed ]] ||
+        die "cannot resume reinit without the retained recovery string: $seed"
+
+    if [[ $RECOVERY_PHASE == prepared ]]; then
+        advance_recovery_intent "$node" erasing
+    fi
+    if [[ $RECOVERY_PHASE == erasing ]]; then
+        archive_reinit_config "$node"
+        remove_container "$node"
+        unmount_filesystem "$node"
+        if [[ -e $image || -L $image ]]; then
+            validate_regular_image "$image"
+            detach_image_loops "$image"
+            rm "$image"
+        fi
+        if [[ -e $staging || -L $staging ]]; then
+            validate_regular_image "$staging"
+            detach_image_loops "$staging"
+            rm "$staging"
+        fi
+        sync "$(dirname "$image")"
+        advance_recovery_intent "$node" erased
+    fi
+    if [[ $RECOVERY_PHASE == erased ]]; then
+        ensure_filesystem "$node"
+        if [[ ! -e $manifest && ! -L $manifest ]]; then
+            "$CLI_BIN" recover-init \
+                --seed-file "$(node_seed "$node")" \
+                --data-dir "$(node_mount "$node")/state" >/dev/null
+        fi
+        [[ -f $manifest && ! -L $manifest ]] ||
+            die "recovery initialization did not create a safe identity manifest for node $node"
+        grep -Fqx 'intent = "recovery"' "$manifest" ||
+            die "node $node recovery filesystem contains a non-recovery identity"
+        advance_recovery_intent "$node" initialized
+    fi
+    if [[ $RECOVERY_PHASE =~ ^(initialized|container_created|restoring)$ ]]; then
+        ensure_filesystem "$node"
+        [[ -f $manifest && ! -L $manifest ]] ||
+            die "node $node recovery identity disappeared"
+        grep -Fqx 'intent = "recovery"' "$manifest" ||
+            die "node $node recovery filesystem contains a non-recovery identity"
+        if container_exists "$node"; then
+            container_owned "$node" || die "container name collision: $(node_name "$node")"
+            grep -Fq "p2p_bootstrap_addresses = [\"$(peer_endpoint "$RECOVERY_BOOTSTRAP_NODE")\"]" "$config" ||
+                die "existing recovery container has an unexpected bootstrap config"
+        else
+            write_recovery_config "$node" "$RECOVERY_BOOTSTRAP_NODE"
+            create_container "$node"
+        fi
+        if [[ $RECOVERY_PHASE == initialized ]]; then
+            advance_recovery_intent "$node" container_created
+        fi
+    fi
+}
+
+resume_recovery_transaction() {
+    local node=$1
+    local intent expected_guild restore_name
+    intent=$(node_recovery_intent "$node")
+    load_recovery_intent "$intent" || die "node $node has no recovery transaction to resume"
+    expected_guild=$RECOVERY_GUILD_ID
+    restore_name=$RECOVERY_RESTORE_NAME
+    validate_recovery_survivors "$node" "$expected_guild"
+    prepare_recovery_container "$node"
+    start_node_internal "$node"
+    if [[ $RECOVERY_PHASE == container_created ]]; then
+        advance_recovery_intent "$node" restoring
+    fi
+    say "recovering guild state and latest owned revision into /node/exchange/$restore_name"
+    if ! cli_raw "$node" restore "/node/exchange/$restore_name"; then
+        say "recovery did not complete; its durable transaction remains at: $intent" >&2
+        say "retry with: $0 reinit $node $restore_name --yes (or run up)" >&2
+        return 1
+    fi
+    [[ $(guild_phase "$node") == Active && $(guild_id "$node") == "$expected_guild" ]] ||
+        die "recovered node $node did not rejoin its original active guild"
+    clear_recovery_intent "$node"
+    say "host-visible restored tree: $(node_exchange "$node")/$restore_name"
+}
+
 ensure_guild() {
     local phase expected_guild
     phase=$(guild_phase 0)
@@ -708,20 +910,42 @@ command_up() {
     fi
     ensure_network
 
-    local node
+    local node pending_node=
     for node in 0 1 2 3 4; do
+        if load_recovery_intent "$(node_recovery_intent "$node")"; then
+            [[ -z $pending_node ]] ||
+                die "multiple pending reinit transactions require manual recovery"
+            pending_node=$node
+        fi
+    done
+    for node in 0 1 2 3 4; do
+        if [[ $node == "$pending_node" ]]; then
+            continue
+        fi
         ensure_filesystem "$node"
     done
     for node in 0 1 2 3 4; do
+        if [[ $node == "$pending_node" ]]; then
+            continue
+        fi
         ensure_seed "$node"
     done
     for node in 0 1 2 3 4; do
+        if [[ $node == "$pending_node" ]]; then
+            continue
+        fi
         write_normal_config "$node"
         create_container "$node"
     done
     for node in 0 1 2 3 4; do
+        if [[ $node == "$pending_node" ]]; then
+            continue
+        fi
         start_node_internal "$node"
     done
+    if [[ -n $pending_node ]]; then
+        resume_recovery_transaction "$pending_node"
+    fi
     ensure_guild
     command_info
 }
@@ -814,62 +1038,40 @@ command_reinit() {
 
     prepare_host
     acquire_lock
+    local recovery_intent expected_guild bootstrap_node='' candidate
+    recovery_intent=$(node_recovery_intent "$node")
+    if load_recovery_intent "$recovery_intent"; then
+        if [[ $restore_name_seen == true && $restore_name != "$RECOVERY_RESTORE_NAME" ]]; then
+            die "pending reinit target is $RECOVERY_RESTORE_NAME, not $restore_name"
+        fi
+        resume_recovery_transaction "$node"
+        return
+    fi
     container_running "$node" || die "node $node must be running before reinit"
     cli_raw "$node" status | grep -q '^recovery ready: true$' ||
         die "node $node is not seed-recovery-ready; wait for DHT publication before reinit"
-
-    local bootstrap_node='' bootstrap_count=0 candidate
+    [[ $(guild_phase "$node") == Active ]] || die "node $node is not in an active guild"
+    expected_guild=$(guild_id "$node")
+    [[ $expected_guild =~ ^[0-9a-fA-F]{64}$ ]] || die "node $node reported an invalid guild ID"
     for candidate in 0 1 2 3 4; do
         if ((candidate != node)) && container_running "$candidate" &&
-            cli_raw "$candidate" status >/dev/null 2>&1; then
-            ((bootstrap_count += 1))
-            if [[ -z $bootstrap_node ]]; then
-                bootstrap_node=$candidate
-            fi
+            cli_raw "$candidate" status >/dev/null 2>&1 &&
+            [[ $(guild_phase "$candidate") == Active ]] &&
+            [[ $(guild_id "$candidate") == "$expected_guild" ]]; then
+            bootstrap_node=$candidate
+            break
         fi
     done
-    ((bootstrap_count >= 3)) || die "reinit requires at least three other healthy nodes"
+    [[ -n $bootstrap_node ]] || die "no responsive bootstrap member belongs to the same guild"
+    RECOVERY_PHASE=prepared
+    RECOVERY_BOOTSTRAP_NODE=$bootstrap_node
+    RECOVERY_RESTORE_NAME=$restore_name
+    RECOVERY_GUILD_ID=$expected_guild
+    validate_recovery_survivors "$node" "$expected_guild"
     confirm_reinit "$node" "$assume_yes"
-
-    say "removing node $node container and disposable Btrfs state; preserving $(node_seed "$node")"
-    local recovery_intent temporary_intent
-    recovery_intent=$(node_recovery_intent "$node")
-    has_recovery_intent "$recovery_intent" || true
-    temporary_intent=$recovery_intent.tmp.$$
-    printf 'recovery\n' >"$temporary_intent"
-    chmod 600 "$temporary_intent"
-    mv "$temporary_intent" "$recovery_intent"
-    sync "$recovery_intent"
-    remove_container "$node"
-    unmount_filesystem "$node"
-    rm -f "$(node_image "$node")"
-    ensure_filesystem "$node"
-    "$CLI_BIN" recover-init \
-        --seed-file "$(node_seed "$node")" \
-        --data-dir "$(node_mount "$node")/state" >/dev/null
-    rm -f "$recovery_intent"
-
-    local config previous timestamp
-    config=$(node_config "$node")
-    if [[ -f $config ]]; then
-        timestamp=$(date -u +%Y%m%dT%H%M%SZ)
-        previous=$config.before-reinit-$timestamp-$$
-        [[ ! -e $previous ]] || die "refusing to overwrite previous config $previous"
-        mv "$config" "$previous"
-        say "previous config retained at: $previous"
-    fi
-    write_recovery_config "$node" "$bootstrap_node"
-    create_container "$node"
-    start_node_internal "$node"
-
-    say "node $node has its original recovery-string identity and is connected through node $bootstrap_node"
-    say "recovering guild state and latest owned revision into /node/exchange/$restore_name"
-    if ! cli_raw "$node" restore "/node/exchange/$restore_name"; then
-        say "recovery did not complete; the recovery-mode container remains running for inspection/retry" >&2
-        say "retry with: $0 cli $node restore /node/exchange/$restore_name" >&2
-        return 1
-    fi
-    say "host-visible restored tree: $(node_exchange "$node")/$restore_name"
+    write_recovery_intent "$node" prepared "$RECOVERY_BOOTSTRAP_NODE" "$restore_name" "$expected_guild"
+    say "recorded durable recovery intent; preserving $(node_seed "$node")"
+    resume_recovery_transaction "$node"
 }
 
 command_cli() {
