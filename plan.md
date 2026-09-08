@@ -57,11 +57,10 @@ them as ADRs and test vectors before promising wire compatibility.
 
 ### Implemented baseline — first usable IP prototype
 
-The architectural prototype is implemented. A later Milestone 2 source review
-reopened parts of its Milestone 1 stabilization assurance; those bounded
-corrections are now part of the current exit gate below. The repository connects
-two real binaries and persistent local control to static five-member guild
-onboarding, reflink capture, owner encryption, actual `3+2` RS, remote SQLCipher
+The architectural prototype and the Milestone 2 corrective gate are
+implemented. The repository connects two real binaries and persistent local
+control to static five-member guild onboarding, reflink capture, owner
+encryption, actual `3+2` RS, remote SQLCipher
 parity, unanimous revisions/checkpoints, QUIC, Kademlia discovery, relay/DCUtR
 transport support, repeated backups, and DHT-assisted cold recovery. The
 five-process acceptance path launches real daemons and CLIs, removes an owner's
@@ -71,11 +70,12 @@ endpoint changes, restart convergence, and relay authorization. Focused
 real-libp2p topology tests exercise direct, relay/DCUtR, and retained-relay
 application sessions without transport mocks.
 
-Call this a runnable product slice, not a claim of production quality. The
-later source-only review found that recovery retry, network readiness, lab
-resumption, and path attribution are weaker than the passing suite implied.
-The corrective gate below must close before claiming that complete application
-transfers are proven over direct, successful-DCUtR, and relay-fallback paths.
+Call this a runnable product slice, not a claim of production quality. A later
+source-only review found initialization edge cases, unsafe lab resumption,
+unbounded telemetry, and untrustworthy path attribution that the earlier suite
+did not expose. Those defects are corrected and covered at the Milestone 2
+gate. Application-transfer acceptance now attributes post-baseline bulk bytes
+to the exact direct, DCUtR, or relay-fallback connection used.
 
 The baseline deliberately remains one guild and one reflink root per member,
 one parity database, Linux only, fixed 64 KiB sectors and `3+2`, unanimous
@@ -421,9 +421,10 @@ expected-identity check, bounded worker ownership, and formal wire contracts are
 implemented. Human configuration and application-owned identity state are also
 separate. A strictly checked recovery-string file remains an explicit
 unattended auto-unlock option rather than a daemon prerequisite. The Milestone 2
-follow-up review nevertheless reopened the exit gate because of the
-initialization, override, readiness, and recovery-resumption defects listed in
-`TODO.md`; the architectural boundary itself remains the intended one.
+follow-up review reopened the exit gate because of initialization, override,
+readiness, and recovery-resumption defects. Those findings and the subsequent
+corrective review findings are now fixed; the architectural boundary remains
+the intended one.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -637,14 +638,12 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** The Milestone 0 runnable baseline, Milestone 1
-stabilization implementation, and main Milestone 2 configuration/identity work
-all exist. Their current exit assurance is nevertheless reopened by the
-high-confidence source findings in `TODO.md`. The next implementation slice is
-only the bounded Milestone 2 corrective work below. Re-run its source review,
-static Nix package, Btrfs tests, real-network tests, five-process acceptance,
-and Docker recovery lab, then pause again. Begin Milestone 3 only if that gate
-closes with no high-priority finding.
+**Current position:** Milestones 0, 1, and 2 are passed. The configuration and
+identity-state separation, corrective source review, static Nix artifact,
+Btrfs tests, real-network tests, five-process acceptance, and Docker recovery
+lab all close together at the Milestone 2 gate. No high-confidence Milestone 2
+defect remains in `TODO.md`. Pause here; Milestone 3, Tor and robust
+connectivity, is the next implementation slice.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
 
@@ -654,7 +653,7 @@ checkpoints, daemon/CLI control, QUIC/Kademlia/relay/DCUtR primitives, repeated
 backup, and five-process DHT seed recovery. Milestone 1 replaced its legacy
 seed-file format; there is no compatibility promise for that draft format.
 
-### Milestone 1 — stabilized, unlockable IP product (implemented; assurance reopened)
+### Milestone 1 — stabilized, unlockable IP product (passed)
 
 This was the implementation scope, in order:
 
@@ -687,12 +686,12 @@ This was the implementation scope, in order:
    successful DCUtR, and failed-punch relay transfer topologies.
 
 The corrective implementation passed the then-current locked
-format/clippy/unit suite plus the Btrfs and five-process acceptance gates. The
+format/clippy/unit suite plus the Btrfs and five-process acceptance gates. A
 later source-only review exposed stabilization behavior those checks did not
-cover. The current Milestone 2 corrective gate includes those inherited
-regressions and supersedes this historical pass.
+cover; the now-passed Milestone 2 corrective gate includes those inherited
+regressions and supersedes that historical pass.
 
-### Milestone 2 — operator configuration and identity-state separation (gate open)
+### Milestone 2 — operator configuration and identity-state separation (passed)
 
 - Replace duplicated daemon parsing with one typed options model consumed by
   optional TOML and equivalent nonsecret command-line flags. Test flag-over-file
@@ -710,36 +709,27 @@ regressions and supersedes this historical pass.
   mixed-precedence process cases. Pause here before beginning Tor or changing
   guild geometry.
 
-The first implementation established one derived `DaemonOptions` model and the
-separate no-replace public identity manifest, and it passed the then-current
-remote suite. The later source-only gate review found behaviors that those tests
-do not cover, so “tests passed” is not sufficient to close this milestone.
+The implementation has one derived `DaemonOptions` model, a separate
+no-replace public identity manifest, explicit command-line clear/unset behavior,
+the documented symlink path policy, a mutable endpoint cache outside certified
+membership, and supervised network startup. The corrective slice also makes
+private initialization durable and resumable without secret-derived temporary
+filenames; distinguishes Docker new-node and recovery intent; rejects missing
+seeds and foreign mounts; resumes partial guild finalization; bounds retained
+network telemetry; attributes operation bytes per connection path; and defines
+the exact Nix artifact handoff used by the no-build lab.
 
-Complete this corrective slice before Milestone 3:
-
-1. Make rejected and interrupted initialization non-mutating, unambiguous, and
-   resumable across the seed, manifest, and app-owned temporary files; fix the
-   Docker interpretation of partial initialization and add command-level fault
-   and no-replace coverage.
-2. Finish equivalent mixed configuration with explicit unset/clear operations,
-   and make symlinked-config relative-path behavior match the documented base.
-3. Separate immutable recovered membership from changing endpoint hints so cold
-   recovery can resume after any pre-checkpoint failure.
-4. Add an explicit network startup/readiness contract and propagate listener or
-   reservation failure instead of acknowledging a merely constructed swarm.
-5. Harden Docker mount provenance and resume Draft/Active partial finalization.
-6. Replace cumulative/latest-label connectivity assertions with
-   operation-scoped byte/path evidence, and add a reproducible Nix-to-runnable-
-   artifact handoff for the documented CLI, daemon, and Docker lab.
-7. Run the complete source-only review and remote gate named above. Remove the
-   corresponding current-defect TODOs and mark Milestone 2 passed only after
-   their regressions and failure injections succeed.
+The exit gate is the complete source-only review plus the locked format,
+warnings-as-errors, workspace, Btrfs, real-network, five-process recovery, Nix
+static-artifact, and real Docker/Btrfs recovery checks. It passes before work
+begins on Milestone 3.
 
 ### Milestone 3 — Tor and robust connectivity beta
 
-Entry condition: the reopened Milestone 2 gate above is closed. In particular,
-IP listener/relay readiness and failure supervision must be trustworthy before
-the same lifecycle is generalized to Arti and onion services.
+Entry condition: satisfied by the passed Milestone 2 gate above. IP
+listener/relay readiness and failure supervision are established before the
+same lifecycle is generalized to Arti and onion services. This is the next
+implementation milestone.
 
 - Adapt the narrow, useful BarterBackup `nettor` principles to a maintained Arti
   release: outbound onion dialing, an inbound v3 onion service, persistent Tor
