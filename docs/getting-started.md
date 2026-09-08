@@ -78,6 +78,13 @@ from flags are relative to the current directory. Unknown TOML fields are
 rejected. The config is not a CLI profile: routine CLI commands still select a
 daemon with `--socket`, permitting several daemons under one Unix account.
 
+When mixing a file with flags, `--locked` suppresses its `seed_file` for this
+run. `--clear-listen`, `--clear-external-addresses`, `--clear-bootstrap`, and
+`--clear-relay` similarly replace the corresponding configured list with an
+empty list. A clear flag wins if the same invocation also supplies values for
+that list. Relative paths stay relative to the pathname the operator supplied,
+including when that pathname is a symbolic link to a packaged configuration.
+
 ## Recovery strings and locked startup
 
 The recovery string is the sole root secret. By default `init` generates 24
@@ -154,6 +161,11 @@ P0_PEER=$("$CLI" identity --seed-file "$LAB/offline/p0.seed" |
   sed -n 's/^libp2p peer id: *//p')
 P0_ENDPOINT="/ip4/127.0.0.1/udp/44000/quic-v1/p2p/$P0_PEER"
 ```
+
+`init --seed-file` is restartable: it creates the seed without replacement and,
+if interrupted before installing `identity.toml`, the identical command reads
+that protected seed and completes the same identity. Repeating a completed
+command is also safe; different existing seed or identity contents are rejected.
 
 Write the human-owned daemon configs. Node 0 is the initial Kademlia bootstrap
 and relay; every node gets its own UDP port, socket, and failure-domain label:

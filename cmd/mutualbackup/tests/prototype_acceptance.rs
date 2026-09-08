@@ -111,6 +111,101 @@ fn daemon_requires_an_initialized_identity_without_creating_state() {
 }
 
 #[test]
+fn init_rejection_does_not_mutate_an_existing_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("existing-state");
+    fs::create_dir(&data_dir).unwrap();
+    fs::write(data_dir.join("user-file"), b"must survive").unwrap();
+    fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o750)).unwrap();
+    let result = run_cli_with_input(
+        &[
+            os("init"),
+            os("--seed-stdin"),
+            os("--data-dir"),
+            data_dir.as_os_str().to_owned(),
+        ],
+        b"non-mutating-initialization-recovery-string-2027!",
+        CLI_TIMEOUT,
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+    assert_eq!(
+        fs::read(data_dir.join("user-file")).unwrap(),
+        b"must survive"
+    );
+}
+
+#[test]
+fn init_resumes_after_seed_install_without_replacing_outputs() {
+    let temp = tempfile::tempdir().unwrap();
+    set_private(temp.path());
+    let data_dir = temp.path().join("state");
+    let seed_file = temp.path().join("node.seed");
+    let args = [
+        os("init"),
+        os("--seed-file"),
+        seed_file.as_os_str().to_owned(),
+        os("--data-dir"),
+        data_dir.as_os_str().to_owned(),
+    ];
+
+    let interrupted = Command::new(env!("CARGO_BIN_EXE_mutualbackup"))
+        .args(&args)
+        .env("MUTUALBACKUP_TEST_FAIL_AFTER_SEED_INSTALL", "1")
+        .output()
+        .unwrap();
+    assert!(!interrupted.status.success());
+    assert!(seed_file.is_file());
+    assert!(!data_dir.exists());
+
+    run_cli(&args, CLI_TIMEOUT).unwrap();
+    let installed = read_identity_manifest(&data_dir).unwrap();
+    let seed_before = fs::read(&seed_file).unwrap();
+    let manifest_before = fs::read(data_dir.join("identity.toml")).unwrap();
+
+    run_cli(&args, CLI_TIMEOUT).unwrap();
+    assert_eq!(fs::read(&seed_file).unwrap(), seed_before);
+    assert_eq!(
+        fs::read(data_dir.join("identity.toml")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(
+        installed.expected_node_id,
+        KeyMaterial::from_seed(&mutualbackup::read_seed(&seed_file).unwrap()).node_id()
+    );
+
+    let conflict = run_cli_with_input(
+        &[
+            os("init"),
+            os("--seed-stdin"),
+            os("--seed-file"),
+            seed_file.as_os_str().to_owned(),
+            os("--data-dir"),
+            data_dir.as_os_str().to_owned(),
+        ],
+        b"different-strong-recovery-string-for-no-replace-2027!",
+        CLI_TIMEOUT,
+    );
+    assert!(conflict.is_err());
+    assert_eq!(fs::read(&seed_file).unwrap(), seed_before);
+    assert_eq!(
+        fs::read(data_dir.join("identity.toml")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(
+        fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn daemon_accepts_config_only_and_flag_overrides() {
     let temp = tempfile::tempdir().unwrap();
     set_private(temp.path());
@@ -135,13 +230,18 @@ fn daemon_accepts_config_only_and_flag_overrides() {
             config_file: None,
             data_dir,
             seed_file: None,
+            start_locked: false,
             control_socket: config_socket.clone(),
             failure_domain: Some("config-precedence-test".to_owned()),
             parity_budget_bytes: 10 * 1024 * 1024 * 1024,
             p2p_listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".to_owned()],
+            clear_p2p_listen_addresses: false,
             p2p_external_addresses: Vec::new(),
+            clear_p2p_external_addresses: false,
             p2p_bootstrap_addresses: Vec::new(),
+            clear_p2p_bootstrap_addresses: false,
             p2p_relay_addresses: Vec::new(),
+            clear_p2p_relay_addresses: false,
             enable_relay_server: false,
             enable_hole_punching: true,
             enable_dht_maintenance: true,
@@ -311,13 +411,18 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
                 config_file: None,
                 data_dir: peer_dir.join("state"),
                 seed_file: Some(seed),
+                start_locked: false,
                 control_socket: socket.clone(),
                 failure_domain: Some(format!("disk-{index}")),
                 parity_budget_bytes: 10 * 1024 * 1024 * 1024,
                 p2p_listen_addresses: vec![transports[index].clone()],
+                clear_p2p_listen_addresses: false,
                 p2p_external_addresses: vec![transports[index].clone()],
+                clear_p2p_external_addresses: false,
                 p2p_bootstrap_addresses: bootstrap_addresses,
+                clear_p2p_bootstrap_addresses: false,
                 p2p_relay_addresses: Vec::new(),
+                clear_p2p_relay_addresses: false,
                 enable_relay_server: index == 0,
                 enable_hole_punching: true,
                 enable_dht_maintenance: true,
@@ -503,13 +608,18 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
             config_file: None,
             data_dir: recovered_dir.join("state"),
             seed_file: Some(seed_dir.join("p1.seed")),
+            start_locked: false,
             control_socket: recovered_socket.clone(),
             failure_domain: None,
             parity_budget_bytes: 10 * 1024 * 1024 * 1024,
             p2p_listen_addresses: vec![transports[5].clone()],
+            clear_p2p_listen_addresses: false,
             p2p_external_addresses: vec![transports[5].clone()],
+            clear_p2p_external_addresses: false,
             p2p_bootstrap_addresses: vec![bootstrap.clone()],
+            clear_p2p_bootstrap_addresses: false,
             p2p_relay_addresses: Vec::new(),
+            clear_p2p_relay_addresses: false,
             enable_relay_server: false,
             enable_hole_punching: true,
             enable_dht_maintenance: true,
@@ -589,13 +699,18 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
             config_file: None,
             data_dir: storage_recovered_dir.join("state"),
             seed_file: Some(seed_dir.join("p4.seed")),
+            start_locked: false,
             control_socket: storage_recovered_socket.clone(),
             failure_domain: None,
             parity_budget_bytes: 10 * 1024 * 1024 * 1024,
             p2p_listen_addresses: vec![transports[7].clone()],
+            clear_p2p_listen_addresses: false,
             p2p_external_addresses: vec![transports[7].clone()],
+            clear_p2p_external_addresses: false,
             p2p_bootstrap_addresses: vec![bootstrap.clone()],
+            clear_p2p_bootstrap_addresses: false,
             p2p_relay_addresses: Vec::new(),
+            clear_p2p_relay_addresses: false,
             enable_relay_server: false,
             enable_hole_punching: true,
             enable_dht_maintenance: true,
@@ -804,13 +919,18 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
             config_file: None,
             data_dir: outsider_dir.join("state"),
             seed_file: Some(seed_dir.join("outsider.seed")),
+            start_locked: false,
             control_socket: outsider_socket.clone(),
             failure_domain: Some("outsider".to_owned()),
             parity_budget_bytes: 10 * 1024 * 1024 * 1024,
             p2p_listen_addresses: vec![transports[8].clone()],
+            clear_p2p_listen_addresses: false,
             p2p_external_addresses: vec![transports[8].clone()],
+            clear_p2p_external_addresses: false,
             p2p_bootstrap_addresses: vec![bootstrap],
+            clear_p2p_bootstrap_addresses: false,
             p2p_relay_addresses: vec![relay],
+            clear_p2p_relay_addresses: false,
             enable_relay_server: false,
             enable_hole_punching: true,
             enable_dht_maintenance: true,

@@ -34,6 +34,11 @@ pub struct DaemonOptions {
     #[conf(parameter, long)]
     pub seed_file: Option<PathBuf>,
 
+    /// Ignore a configured seed file and start locked.
+    #[conf(flag, long = "locked", serde(skip))]
+    #[serde(skip)]
+    pub start_locked: bool,
+
     /// Unix socket used by the local CLI.
     #[conf(
         parameter,
@@ -55,6 +60,11 @@ pub struct DaemonOptions {
     #[conf(repeat, long = "listen", serde(rename = "p2p_listen_addresses"))]
     pub p2p_listen_addresses: Vec<String>,
 
+    /// Clear every listen address inherited from the configuration file.
+    #[conf(flag, long = "clear-listen", serde(skip))]
+    #[serde(skip)]
+    pub clear_p2p_listen_addresses: bool,
+
     /// Public QUIC multiaddress; repeat for multiple advertised addresses.
     #[conf(
         repeat,
@@ -63,13 +73,28 @@ pub struct DaemonOptions {
     )]
     pub p2p_external_addresses: Vec<String>,
 
+    /// Clear every external address inherited from the configuration file.
+    #[conf(flag, long = "clear-external-addresses", serde(skip))]
+    #[serde(skip)]
+    pub clear_p2p_external_addresses: bool,
+
     /// Bootstrap multiaddress ending in /p2p/PEER_ID; repeat as needed.
     #[conf(repeat, long = "bootstrap", serde(rename = "p2p_bootstrap_addresses"))]
     pub p2p_bootstrap_addresses: Vec<String>,
 
+    /// Clear every bootstrap address inherited from the configuration file.
+    #[conf(flag, long = "clear-bootstrap", serde(skip))]
+    #[serde(skip)]
+    pub clear_p2p_bootstrap_addresses: bool,
+
     /// Relay multiaddress ending in /p2p/PEER_ID; repeat as needed.
     #[conf(repeat, long = "relay", serde(rename = "p2p_relay_addresses"))]
     pub p2p_relay_addresses: Vec<String>,
+
+    /// Clear every relay address inherited from the configuration file.
+    #[conf(flag, long = "clear-relay", serde(skip))]
+    #[serde(skip)]
+    pub clear_p2p_relay_addresses: bool,
 
     /// Whether this daemon accepts bounded relay reservations and circuits.
     #[conf(parameter, long, default(false))]
@@ -89,6 +114,24 @@ pub struct DaemonOptions {
 }
 
 impl DaemonOptions {
+    fn apply_cli_clears(&mut self) {
+        if self.start_locked {
+            self.seed_file = None;
+        }
+        if self.clear_p2p_listen_addresses {
+            self.p2p_listen_addresses.clear();
+        }
+        if self.clear_p2p_external_addresses {
+            self.p2p_external_addresses.clear();
+        }
+        if self.clear_p2p_bootstrap_addresses {
+            self.p2p_bootstrap_addresses.clear();
+        }
+        if self.clear_p2p_relay_addresses {
+            self.p2p_relay_addresses.clear();
+        }
+    }
+
     pub fn validate(&self, identity: &IdentityManifest) -> Result<()> {
         if identity.intent == InitializationIntent::New
             && self.failure_domain.as_deref().is_none_or(str::is_empty)
@@ -190,15 +233,21 @@ pub fn read_daemon_options(
             })?;
             resolve_document_paths(
                 &mut document,
-                canonical_path.parent().unwrap_or_else(|| Path::new(".")),
+                path.parent().unwrap_or_else(|| Path::new(".")),
             )
             .map_err(DaemonOptionsError::Load)?;
-            builder
+            let mut options = builder
                 .doc(canonical_path.display().to_string(), document)
                 .try_parse()
-                .map_err(DaemonOptionsError::Parse)
+                .map_err(DaemonOptionsError::Parse)?;
+            options.apply_cli_clears();
+            Ok(options)
         }
-        None => builder.try_parse().map_err(DaemonOptionsError::Parse),
+        None => {
+            let mut options = builder.try_parse().map_err(DaemonOptionsError::Parse)?;
+            options.apply_cli_clears();
+            Ok(options)
+        }
     }
 }
 
@@ -221,7 +270,6 @@ pub fn initialize_identity(
     seed: &Seed,
     intent: InitializationIntent,
 ) -> Result<IdentityManifest> {
-    ensure_empty_private_data_dir(data_dir)?;
     let manifest = IdentityManifest {
         format_version: 1,
         expected_node_id: mb_core::KeyMaterial::from_seed(seed).node_id(),
@@ -229,6 +277,7 @@ pub fn initialize_identity(
     };
     manifest.validate()?;
     let encoded = toml::to_string_pretty(&manifest)?;
+    ensure_initializable_private_data_dir(data_dir, encoded.as_bytes())?;
     write_new_private(
         &identity_manifest_path(data_dir),
         encoded.as_bytes(),
@@ -351,7 +400,18 @@ fn write_new_private(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
     if !parent.is_dir() {
         bail!("{label} parent directory does not exist");
     }
-    let temporary = parent.join(format!(".mutualbackup-{}.tmp", Uuid::new_v4()));
+    cleanup_verified_private_temporaries(path, bytes)?;
+    if existing_private_file_matches(path, bytes)? == Some(true) {
+        return Ok(());
+    }
+    if fs::symlink_metadata(path).is_ok() {
+        bail!(
+            "cannot install {label} {}: target already exists with different contents",
+            path.display()
+        );
+    }
+    let temporary = private_temporary_path(path);
+    let mut temporary_guard = TemporaryPrivateFile::new(temporary.clone());
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -365,13 +425,136 @@ fn write_new_private(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     if let Err(error) = fs::hard_link(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        sync_directory(parent).ok();
+        if error.kind() == std::io::ErrorKind::AlreadyExists
+            && existing_private_file_matches(path, bytes)? == Some(true)
+        {
+            return Ok(());
+        }
         return Err(error).with_context(|| format!("cannot install {label} {}", path.display()));
     }
-    fs::remove_file(&temporary)?;
+    sync_directory(parent)?;
+    fs::remove_file(&temporary)
+        .with_context(|| format!("cannot remove installed {label} temporary file"))?;
+    temporary_guard.disarm();
     sync_directory(parent)?;
     Ok(())
+}
+
+struct TemporaryPrivateFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TemporaryPrivateFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TemporaryPrivateFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+            if let Some(parent) = self.path.parent() {
+                let _ = sync_directory(parent);
+            }
+        }
+    }
+}
+
+fn private_temporary_prefix(path: &Path) -> String {
+    let target = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("private-file");
+    format!(".mutualbackup-{target}-")
+}
+
+fn private_temporary_path(path: &Path) -> PathBuf {
+    path.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(
+            "{}{}.tmp",
+            private_temporary_prefix(path),
+            Uuid::new_v4()
+        ))
+}
+
+fn cleanup_verified_private_temporaries(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        return Ok(());
+    }
+    let prefix = private_temporary_prefix(path);
+    let mut removed = false;
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let legacy_temporary = name
+            .strip_prefix(".mutualbackup-")
+            .and_then(|name| name.strip_suffix(".tmp"))
+            .is_some_and(|name| Uuid::parse_str(name).is_ok());
+        if !(name.starts_with(&prefix) && name.ends_with(".tmp")) && !legacy_temporary {
+            continue;
+        }
+        if existing_private_file_matches(&entry.path(), bytes)
+            .is_ok_and(|matches| matches == Some(true))
+        {
+            fs::remove_file(entry.path())?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn existing_private_file_matches(path: &Path, bytes: &[u8]) -> Result<Option<bool>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        bail!("private output {} must be a regular file", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            bail!(
+                "private output {} must be owned by the current user",
+                path.display()
+            );
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "private output {} must not be accessible by group or others",
+                path.display()
+            );
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    let mut actual = Vec::new();
+    Read::by_ref(&mut file)
+        .take((bytes.len() + 1) as u64)
+        .read_to_end(&mut actual)?;
+    Ok(Some(actual == bytes))
 }
 
 fn resolve_document_paths(document: &mut toml::Value, base: &Path) -> Result<()> {
@@ -399,29 +582,63 @@ fn resolve_document_paths(document: &mut toml::Value, base: &Path) -> Result<()>
     Ok(())
 }
 
-fn ensure_empty_private_data_dir(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
+fn ensure_initializable_private_data_dir(path: &Path, manifest: &[u8]) -> Result<()> {
+    let created = match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.file_type().is_dir() => {
             bail!("data directory path must be a directory, not a symlink or file")
         }
-        Ok(_) => {}
+        Ok(metadata) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.uid() != unsafe { libc::geteuid() } {
+                    bail!("data directory must be owned by the current user");
+                }
+            }
+            false
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(path)
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            fs::create_dir_all(parent).with_context(|| {
+                format!("cannot create data directory parent {}", parent.display())
+            })?;
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder
+                .create(path)
                 .with_context(|| format!("cannot create data directory {}", path.display()))?;
+            sync_directory(parent)?;
+            true
         }
         Err(error) => return Err(error.into()),
+    };
+
+    let manifest_path = identity_manifest_path(path);
+    cleanup_verified_private_temporaries(&manifest_path, manifest)?;
+    let mut entries = fs::read_dir(path)?;
+    while let Some(entry) = entries.next().transpose()? {
+        if entry.path() != manifest_path {
+            bail!(
+                "data directory {} must be empty before initialization",
+                path.display()
+            );
+        }
+        if existing_private_file_matches(&manifest_path, manifest)? != Some(true) {
+            bail!("data directory already contains a different identity manifest");
+        }
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        if !created {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
     }
-    if fs::read_dir(path)?.next().transpose()?.is_some() {
-        bail!(
-            "data directory {} must be empty before initialization",
-            path.display()
-        );
-    }
+    sync_directory(path)?;
     Ok(())
 }
 
@@ -472,6 +689,73 @@ enable_hole_punching = true
             loaded.p2p_listen_addresses,
             ["/ip4/127.0.0.1/udp/1/quic-v1"]
         );
+    }
+
+    #[test]
+    fn command_line_can_clear_optional_and_repeat_config_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("node.toml");
+        fs::write(
+            &config_path,
+            r#"
+data_dir = "state"
+seed_file = "node.seed"
+control_socket = "run/control.sock"
+failure_domain = "disk-a"
+p2p_listen_addresses = ["/ip4/127.0.0.1/udp/1/quic-v1"]
+p2p_external_addresses = ["/ip4/127.0.0.1/udp/2/quic-v1"]
+p2p_bootstrap_addresses = ["/ip4/127.0.0.1/udp/3/quic-v1"]
+p2p_relay_addresses = ["/ip4/127.0.0.1/udp/4/quic-v1"]
+"#,
+        )
+        .unwrap();
+        let loaded = read_daemon_options([
+            OsString::from("mutualbackupd"),
+            OsString::from("--config"),
+            config_path.into_os_string(),
+            OsString::from("--locked"),
+            OsString::from("--clear-listen"),
+            OsString::from("--clear-external-addresses"),
+            OsString::from("--clear-bootstrap"),
+            OsString::from("--clear-relay"),
+        ])
+        .unwrap();
+        assert_eq!(loaded.seed_file, None);
+        assert!(loaded.p2p_listen_addresses.is_empty());
+        assert!(loaded.p2p_external_addresses.is_empty());
+        assert!(loaded.p2p_bootstrap_addresses.is_empty());
+        assert!(loaded.p2p_relay_addresses.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_config_paths_are_relative_to_the_operator_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target_dir = temp.path().join("package");
+        let operator_dir = temp.path().join("etc");
+        fs::create_dir(&target_dir).unwrap();
+        fs::create_dir(&operator_dir).unwrap();
+        let target = target_dir.join("node.toml");
+        fs::write(
+            &target,
+            r#"
+data_dir = "state"
+failure_domain = "disk-a"
+p2p_listen_addresses = ["/ip4/127.0.0.1/udp/1/quic-v1"]
+"#,
+        )
+        .unwrap();
+        let operator_path = operator_dir.join("node.toml");
+        symlink(&target, &operator_path).unwrap();
+        let loaded = read_daemon_options([
+            OsString::from("mutualbackupd"),
+            OsString::from("--config"),
+            operator_path.into_os_string(),
+        ])
+        .unwrap();
+        assert_eq!(loaded.data_dir, operator_dir.join("state"));
     }
 
     #[test]
@@ -537,6 +821,10 @@ misspelled_budget = 1024
         let seed = Seed::from_recovery_string("correct-horse-battery-staple-2026!").unwrap();
         let expected = initialize_identity(&data_dir, &seed, InitializationIntent::New).unwrap();
         assert_eq!(read_identity_manifest(&data_dir).unwrap(), expected);
+        assert_eq!(
+            initialize_identity(&data_dir, &seed, InitializationIntent::New).unwrap(),
+            expected
+        );
         assert!(initialize_identity(&data_dir, &seed, InitializationIntent::Recovery).is_err());
         #[cfg(unix)]
         {
@@ -550,6 +838,25 @@ misspelled_budget = 1024
                 0o600
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_nonempty_data_directory_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("state");
+        fs::create_dir(&data_dir).unwrap();
+        fs::write(data_dir.join("belongs-to-user"), b"keep").unwrap();
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o750)).unwrap();
+        let seed = Seed::from_recovery_string("correct-horse-battery-staple-2026!").unwrap();
+        assert!(initialize_identity(&data_dir, &seed, InitializationIntent::New).is_err());
+        assert_eq!(
+            fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        assert_eq!(fs::read(data_dir.join("belongs-to-user")).unwrap(), b"keep");
     }
 
     #[test]
@@ -592,5 +899,29 @@ misspelled_budget = 1024
         let link = temp.path().join("recovery-link.txt");
         symlink(&path, &link).unwrap();
         assert!(read_seed(&link).is_err());
+    }
+
+    #[test]
+    fn private_write_removes_only_matching_app_temporaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("recovery.txt");
+        let recovery = "correct-horse-battery-staple-2026!";
+        let matching = temp
+            .path()
+            .join(format!(".mutualbackup-{}.tmp", Uuid::new_v4()));
+        let different = temp
+            .path()
+            .join(format!(".mutualbackup-{}.tmp", Uuid::new_v4()));
+        fs::write(&matching, recovery).unwrap();
+        fs::write(&different, "different-private-content").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&matching, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(&different, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        write_seed(&path, recovery).unwrap();
+        assert!(!matching.exists());
+        assert!(different.exists());
     }
 }

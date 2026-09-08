@@ -1,8 +1,6 @@
+use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
-
-#[cfg(test)]
-use std::fs;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -151,11 +149,27 @@ async fn main() -> Result<()> {
             seed_stdin,
             prompt_recovery,
         } => {
-            let generated = !seed_stdin && !prompt_recovery;
+            let existing_seed = if !seed_stdin && !prompt_recovery {
+                match seed_file.as_deref() {
+                    Some(path) => match fs::symlink_metadata(path) {
+                        Ok(_) => Some(read_recovery_string(path).with_context(|| {
+                            format!("cannot resume initialization from {}", path.display())
+                        })?),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => return Err(error.into()),
+                    },
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let generated = existing_seed.is_none() && !seed_stdin && !prompt_recovery;
             let recovery = if seed_stdin {
                 read_recovery_stdin().await?
             } else if prompt_recovery {
                 prompt_recovery_string("Recovery string: ").await?
+            } else if let Some(existing_seed) = existing_seed {
+                existing_seed
             } else {
                 Seed::generate_recovery_string()?
             };
@@ -163,6 +177,10 @@ async fn main() -> Result<()> {
             if let Some(path) = &seed_file {
                 write_seed(path, &recovery)?;
                 println!("recovery string written to: {}", path.display());
+                #[cfg(debug_assertions)]
+                if std::env::var_os("MUTUALBACKUP_TEST_FAIL_AFTER_SEED_INSTALL").is_some() {
+                    bail!("test interruption after recovery-string installation");
+                }
             } else if generated {
                 println!("recovery string (shown once): {}", recovery.as_str());
                 let confirmation =
