@@ -7,3 +7,6 @@
 *.db-shm
 *.db-wal
 .mutualbackup-anchors/
+
+# Text editors.
+*.swp
