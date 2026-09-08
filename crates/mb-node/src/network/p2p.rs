@@ -2894,15 +2894,29 @@ async fn reconstruct_shard_from_peers(
                 } else {
                     client.parity(holder, guild_id, group_id, index as u8).await
                 };
-                (index, root, result)
+                (index, holder, root, result)
             });
         }
-        while let Some((index, root, result)) = requests.next().await {
-            if let Ok(bytes) = result
-                && bytes.len() == group.shard_size as usize
-                && sector_root(&bytes) == root
-            {
-                shards[index] = Some(bytes);
+        while let Some((index, holder, root, result)) = requests.next().await {
+            match result {
+                Ok(bytes)
+                    if bytes.len() == group.shard_size as usize && sector_root(&bytes) == root =>
+                {
+                    shards[index] = Some(bytes);
+                }
+                Ok(_) => tracing::warn!(
+                    group = %hex::encode(group.id),
+                    shard_index = index,
+                    %holder,
+                    "peer returned an invalid recovery shard"
+                ),
+                Err(error) => tracing::warn!(
+                    group = %hex::encode(group.id),
+                    shard_index = index,
+                    %holder,
+                    %error,
+                    "could not fetch a recovery shard"
+                ),
             }
             // Reconstruction needs any three valid shards. Do not wait for an
             // unrelated offline holder once that threshold has been reached;
