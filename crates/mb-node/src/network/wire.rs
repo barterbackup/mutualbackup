@@ -284,7 +284,10 @@ pub(super) struct CachedOperation {
 
 #[cfg(test)]
 mod tests {
-    use mb_core::{EndpointRecord, KeyMaterial, Seed, canonical_bytes};
+    use mb_core::{
+        EndpointRecord, KeyMaterial, RECOVERY_LOCATOR_DOMAIN, RecoveryLocator,
+        STORAGE_ACKNOWLEDGEMENT_DOMAIN, Seed, StorageAcknowledgement, canonical_bytes,
+    };
 
     use super::*;
     use crate::network::PEER_REQUEST_DOMAIN;
@@ -296,6 +299,10 @@ mod tests {
         include_str!("../../../../protocol/vectors/peer-invalid-version.cbor.hex");
     const ENDPOINT_RECORD: &str =
         include_str!("../../../../protocol/vectors/endpoint-record.postcard.hex");
+    const STORAGE_ACKNOWLEDGEMENT: &str =
+        include_str!("../../../../protocol/vectors/storage-acknowledgement.postcard.hex");
+    const RECOVERY_LOCATOR: &str =
+        include_str!("../../../../protocol/vectors/recovery-locator.postcard.hex");
 
     fn profile_request(format_version: u16) -> SignedRecord<PeerRequestEnvelope> {
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([7; 32]));
@@ -362,5 +369,58 @@ mod tests {
         record.verify(b"mutualbackup/endpoint-record/v1").unwrap();
         let actual = canonical_bytes(&record).unwrap();
         assert_eq!(actual, decode_hex_fixture(ENDPOINT_RECORD));
+    }
+
+    #[test]
+    fn storage_acknowledgement_domain_and_vector_are_byte_exact() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([7; 32]));
+        let record = SignedRecord::sign(
+            STORAGE_ACKNOWLEDGEMENT_DOMAIN,
+            StorageAcknowledgement {
+                format_version: 1,
+                operation_id: [1; 16],
+                guild_id: [2; 32],
+                group_id: [3; 32],
+                shard_index: 3,
+                row: 0,
+                root: [4; 32],
+                holder: keys.node_id(),
+            },
+            &keys,
+        )
+        .unwrap();
+        record.verify(STORAGE_ACKNOWLEDGEMENT_DOMAIN).unwrap();
+        assert!(record.verify(b"mutualbackup/storage-ack/v1").is_err());
+        assert_eq!(
+            hex::encode(canonical_bytes(&record).unwrap()),
+            STORAGE_ACKNOWLEDGEMENT.trim()
+        );
+    }
+
+    #[test]
+    fn recovery_locator_domain_and_vector_are_byte_exact() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([7; 32]));
+        let peer_id = keys.node_id().libp2p_peer_id().unwrap();
+        let record = SignedRecord::sign(
+            RECOVERY_LOCATOR_DOMAIN,
+            RecoveryLocator {
+                format_version: 1,
+                subject: keys.node_id(),
+                publisher: keys.node_id(),
+                guild_id: [5; 32],
+                checkpoint_hash: [6; 32],
+                checkpoint_generation: 7,
+                endpoints: vec![format!("/ip4/192.0.2.7/udp/4400/quic-v1/p2p/{peer_id}")],
+                expires_at_unix_seconds: 1_700_000_000,
+            },
+            &keys,
+        )
+        .unwrap();
+        record.verify(RECOVERY_LOCATOR_DOMAIN).unwrap();
+        assert!(record.verify(b"mutualbackup/recovery-location/v1").is_err());
+        assert_eq!(
+            hex::encode(canonical_bytes(&record).unwrap()),
+            RECOVERY_LOCATOR.trim()
+        );
     }
 }

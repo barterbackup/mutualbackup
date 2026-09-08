@@ -372,7 +372,7 @@ impl PrototypeGuild {
                 expires_at_unix_seconds: u64::MAX,
             };
             let signed =
-                SignedRecord::sign(b"mutualbackup/recovery-locator/v1", locator, node.keys())?;
+                SignedRecord::sign(mb_core::RECOVERY_LOCATOR_DOMAIN, locator, node.keys())?;
             let sealed =
                 seal_recovery_record(subject.recovery_public_key, &canonical_bytes(&signed)?)?;
             self.directory
@@ -397,7 +397,7 @@ fn recover_checkpoint(
             Ok(signed) => signed,
             Err(_) => continue,
         };
-        if signed.verify(b"mutualbackup/recovery-locator/v1").is_err()
+        if signed.verify(mb_core::RECOVERY_LOCATOR_DOMAIN).is_err()
             || signed.signer != signed.value.publisher
             || signed.value.publisher != published_by
             || signed.value.subject != keys.node_id()

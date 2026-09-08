@@ -37,6 +37,7 @@ pub struct ProtectedRoot {
     pub root_id: Uuid,
     pub path: PathBuf,
     pub filesystem_device: u64,
+    pub filesystem_mount_id: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

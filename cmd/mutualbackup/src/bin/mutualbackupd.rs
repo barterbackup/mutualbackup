@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
     tokio::select! {
         result = serve_local_control_on(node.clone(), p2p_client.clone(), listener) => result,
         result = run_coordinator_jobs(node.clone(), p2p_client.clone()) => result,
-        result = run_dht_publications(node.clone(), p2p_client.clone()) => result,
+        result = run_dht_publications(node.clone(), p2p_client.clone()), if config.enable_dht_maintenance => result,
         result = run_root_watcher(node.clone()) => result,
         result = p2p_event_loop.run() => result,
         result = tokio::signal::ctrl_c() => {
@@ -116,6 +116,7 @@ fn start_node_runtime(
         external_addresses: parse_addresses(&config.p2p_external_addresses)?,
         bootstrap_addresses: parse_addresses(&config.p2p_bootstrap_addresses)?,
         relay_reservation_addresses: parse_addresses(&config.p2p_relay_addresses)?,
+        enable_dht_maintenance: config.enable_dht_maintenance,
         enable_relay_server: config.enable_relay_server,
         enable_hole_punching: config.enable_hole_punching,
         public_endpoint,

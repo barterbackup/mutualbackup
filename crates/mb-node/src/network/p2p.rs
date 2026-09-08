@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -8,6 +8,7 @@ use futures::{StreamExt, stream::FuturesUnordered};
 use libp2p::core::transport::ListenerId;
 use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::behaviour::toggle::Toggle;
+use libp2p::swarm::behaviour::{FromSwarm, NewExternalAddrCandidate};
 use libp2p::swarm::{ConnectionId, NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder, autonat, dcutr, identify, kad, noise, ping, relay,
@@ -17,8 +18,9 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use mb_core::{
     CodingGroup, GuildCheckpoint, GuildGenesis, GuildInvite, InformationRole, Member,
-    MemberSignature, NodeId, ParityRole, QuorumCheckpoint, QuorumGuildGenesis, SectorId, SectorRef,
-    ShardRole, SignedRecord, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
+    MemberSignature, NodeId, ParityRole, QuorumCheckpoint, QuorumGuildGenesis,
+    RECOVERY_LOCATOR_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole,
+    SignedRecord, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
     V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_RS_DATA_SHARDS,
     V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, canonical_bytes, decode_canonical, encode_3_2,
     open_recovery_record, sector_root,
@@ -29,10 +31,10 @@ use uuid::Uuid;
 use crate::node::{GuildPhase, SnapshotInfo};
 
 use super::{
-    BackupDescriptor, BackupJob, CheckpointObjectKind, DhtSequenceFloors, GuildPeer, Node,
-    NodeServerConfig, NodeService, PEER_RESPONSE_DOMAIN, PeerRequest, PeerRequestEnvelope,
-    PeerResponse, PeerResponseEnvelope, checked_catalog_page_count, make_peer_request,
-    peer_error_response, process_peer_request, storage_operation_id,
+    BackupDescriptor, BackupJob, CheckpointObjectKind, DhtSequenceFloors, GuildPeer,
+    MAX_PEER_FRAME_BYTES, Node, NodeServerConfig, NodeService, PEER_RESPONSE_DOMAIN, PeerRequest,
+    PeerRequestEnvelope, PeerResponse, PeerResponseEnvelope, checked_catalog_page_count,
+    make_peer_request, peer_error_response, process_peer_request, storage_operation_id,
 };
 
 const P2P_PROTOCOL: StreamProtocol = StreamProtocol::new("/mutualbackup/peer/1");
@@ -44,12 +46,19 @@ const DHT_REPUBLISH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DHT_MAX_PACKET_BYTES: usize = 128 * 1024;
 const BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const RELAY_RESERVATION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const RELAY_RETIREMENT_GRACE: Duration = Duration::from_millis(500);
+const RELAY_RETIREMENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const LEARNED_ENDPOINT_EXPIRY_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_DHT_RECORDS_PER_QUERY: usize = 64;
 const MAX_DHT_PROVIDERS_PER_QUERY: usize = 64;
+const MAX_LEARNED_ENDPOINT_PEERS: usize = 1_024;
+const MAX_ENDPOINTS_PER_PEER: usize = 8;
 const MAX_RELAY_RESERVATIONS: usize = 5;
 const MAX_RELAY_CIRCUITS: usize = 8;
 const MAX_RELAY_CIRCUIT_BYTES: u64 = 8 * 1024 * 1024;
 const SHARD_FETCH_ATTEMPTS: usize = 3;
+
+type RelayMembers = Arc<RwLock<BTreeSet<PeerId>>>;
 
 #[derive(Clone, Debug)]
 pub struct P2pConfig {
@@ -57,6 +66,7 @@ pub struct P2pConfig {
     pub external_addresses: Vec<Multiaddr>,
     pub bootstrap_addresses: Vec<Multiaddr>,
     pub relay_reservation_addresses: Vec<Multiaddr>,
+    pub enable_dht_maintenance: bool,
     pub enable_relay_server: bool,
     pub enable_hole_punching: bool,
     pub public_endpoint: String,
@@ -118,15 +128,24 @@ pub struct P2pEventLoop {
     inbound_sender: mpsc::Sender<InboundResult>,
     inbound_permits: Arc<Semaphore>,
     pending_requests: HashMap<request_response::OutboundRequestId, PendingRequest>,
+    active_inbound_requests: HashMap<request_response::InboundRequestId, PeerId>,
+    pending_response_bytes: HashMap<request_response::InboundRequestId, (PeerId, u64)>,
     pending_dht: HashMap<kad::QueryId, PendingDht>,
     service: Arc<NodeService>,
     server_config: NodeServerConfig,
     advertised_addresses: Vec<Multiaddr>,
     bootstrap_addresses: Vec<Multiaddr>,
+    enable_dht_maintenance: bool,
     bootstrap_retry: tokio::time::Interval,
     relay_reservations: Vec<Multiaddr>,
     relay_listeners: HashMap<ListenerId, Multiaddr>,
     relay_retry: tokio::time::Interval,
+    relay_retirement: HashMap<ConnectionId, (PeerId, tokio::time::Instant)>,
+    relay_retirement_tick: tokio::time::Interval,
+    relay_members: RelayMembers,
+    persistent_addresses: HashMap<PeerId, BTreeSet<Multiaddr>>,
+    learned_addresses: HashMap<PeerId, LearnedAddresses>,
+    learned_endpoint_expiry: tokio::time::Interval,
     connection_paths: HashMap<ConnectionId, (PeerId, P2pPath)>,
     last_application_paths: HashMap<PeerId, P2pPath>,
     transfer_counters: HashMap<PeerId, TransferCounters>,
@@ -152,6 +171,16 @@ enum Command {
     AddAddress {
         peer: PeerId,
         address: Multiaddr,
+        response: oneshot::Sender<Result<()>>,
+    },
+    ReplaceLearnedAddresses {
+        peer: PeerId,
+        addresses: Vec<Multiaddr>,
+        expires_at_unix_seconds: u64,
+        response: oneshot::Sender<Result<()>>,
+    },
+    SetRelayMembers {
+        members: BTreeSet<PeerId>,
         response: oneshot::Sender<Result<()>>,
     },
     Request {
@@ -189,13 +218,20 @@ struct PendingRequest {
     response_recipient: NodeId,
     request_id: [u8; 16],
     request_hash: [u8; 32],
+    request_bytes: u64,
     response: oneshot::Sender<Result<PeerResponse>>,
 }
 
 struct InboundResult {
     peer: PeerId,
+    request_id: request_response::InboundRequestId,
     channel: request_response::ResponseChannel<SignedRecord<PeerResponseEnvelope>>,
     response: Result<SignedRecord<PeerResponseEnvelope>>,
+}
+
+struct LearnedAddresses {
+    addresses: BTreeSet<Multiaddr>,
+    expires_at: tokio::time::Instant,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -217,24 +253,26 @@ enum PendingDht {
     },
 }
 
-fn guild_relay_admission(node: Arc<Mutex<Node>>) -> Box<dyn relay::RateLimiter> {
+fn guild_relay_admission(members: RelayMembers) -> Box<dyn relay::RateLimiter> {
     Box::new(
         move |peer: PeerId, _address: &Multiaddr, _now: std::time::Instant| {
-            let Ok(node) = node.lock() else {
+            let Ok(members) = members.read() else {
                 return false;
             };
-            let Ok(Some(guild)) = node.guild_summary() else {
-                return false;
-            };
-            let admitted = guild.phase == GuildPhase::Active
-                && guild
-                    .peers
-                    .iter()
-                    .any(|candidate| candidate.member.node_id.libp2p_peer_id().ok() == Some(peer));
+            let admitted = members.contains(&peer);
             tracing::debug!(%peer, admitted, "relay guild admission decision");
             admitted
         },
     )
+}
+
+fn peer_codec() -> request_response::cbor::codec::Codec<
+    SignedRecord<PeerRequestEnvelope>,
+    SignedRecord<PeerResponseEnvelope>,
+> {
+    request_response::cbor::codec::Codec::default()
+        .set_request_size_maximum(MAX_PEER_FRAME_BYTES as u64)
+        .set_response_size_maximum(MAX_PEER_FRAME_BYTES as u64)
 }
 
 fn cbor_wire_len<T: serde::Serialize>(value: &T) -> Result<u64> {
@@ -247,6 +285,17 @@ fn retry_interval(period: Duration) -> tokio::time::Interval {
     tokio::time::interval_at(tokio::time::Instant::now() + period, period)
 }
 
+fn merge_established_path(
+    recorded: Option<P2pPath>,
+    generic: P2pPath,
+    peer_has_hole_punch: bool,
+) -> P2pPath {
+    match (recorded, generic, peer_has_hole_punch) {
+        (Some(P2pPath::HolePunched), _, _) | (_, P2pPath::Direct, true) => P2pPath::HolePunched,
+        _ => generic,
+    }
+}
+
 pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient, P2pEventLoop)> {
     if config.listen_addresses.is_empty() && config.relay_reservation_addresses.is_empty()
         || config.configure_failure_domain && config.failure_domain.is_empty()
@@ -254,15 +303,27 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
     {
         bail!("invalid libp2p configuration");
     }
-    let (identity, reader_config) = {
+    let (identity, reader_config, relay_member_ids) = {
         let mut node = node
             .lock()
             .map_err(|_| anyhow::anyhow!("node state lock is poisoned"))?;
         if config.configure_failure_domain {
             node.configure_failure_domain(&config.failure_domain)?;
         }
-        (node.keys().libp2p_keypair(), node.reader_config())
+        let relay_member_ids = node
+            .guild_summary()?
+            .filter(|guild| guild.phase == GuildPhase::Active)
+            .into_iter()
+            .flat_map(|guild| guild.peers)
+            .filter_map(|peer| peer.member.node_id.libp2p_peer_id().ok())
+            .collect();
+        (
+            node.keys().libp2p_keypair(),
+            node.reader_config(),
+            relay_member_ids,
+        )
     };
+    let relay_members = Arc::new(RwLock::new(relay_member_ids));
     let local_peer_id = identity.public().to_peer_id();
     let relay_server_enabled = config.enable_relay_server;
     let hole_punching_enabled = config.enable_hole_punching;
@@ -280,10 +341,10 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
     };
     relay_config
         .reservation_rate_limiters
-        .push(guild_relay_admission(node.clone()));
+        .push(guild_relay_admission(relay_members.clone()));
     relay_config
         .circuit_src_rate_limiters
-        .push(guild_relay_admission(node.clone()));
+        .push(guild_relay_admission(relay_members.clone()));
     let mut swarm = SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_quic()
@@ -303,7 +364,8 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
                 kad::Behaviour::with_config(peer_id, MemoryStore::new(peer_id), kad_config);
             kademlia.set_mode(Some(kad::Mode::Server));
             Behaviour {
-                peer: request_response::cbor::Behaviour::new(
+                peer: request_response::cbor::Behaviour::with_codec(
+                    peer_codec(),
                     [(P2P_PROTOCOL, request_response::ProtocolSupport::Full)],
                     request_response::Config::default()
                         .with_request_timeout(Duration::from_secs(20)),
@@ -339,10 +401,24 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
             .with_context(|| format!("cannot listen on {address}"))?;
     }
     for address in &config.external_addresses {
+        // DCUtR currently learns dial candidates from
+        // `NewExternalAddrCandidate`, not `ExternalAddrConfirmed`. Feeding the
+        // configured address through that lifecycle first also avoids Swarm's
+        // suppression of a later, identical Identify observation.
+        swarm
+            .behaviour_mut()
+            .on_swarm_event(FromSwarm::NewExternalAddrCandidate(
+                NewExternalAddrCandidate { addr: address },
+            ));
         swarm.add_external_address(address.clone());
     }
+    let mut persistent_addresses = HashMap::<PeerId, BTreeSet<Multiaddr>>::new();
     for address in &config.bootstrap_addresses {
-        add_address_to_swarm(&mut swarm, address.clone())?;
+        let (peer, normalized) = add_address_to_swarm(&mut swarm, address.clone())?;
+        persistent_addresses
+            .entry(peer)
+            .or_default()
+            .insert(normalized);
         if let Err(error) = swarm.dial(address.clone()) {
             tracing::warn!(%address, %error, "initial libp2p dial was rejected");
         }
@@ -350,7 +426,11 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
     let mut relay_reservations = Vec::new();
     let mut relay_listeners = HashMap::new();
     for address in &config.relay_reservation_addresses {
-        add_address_to_swarm(&mut swarm, address.clone())?;
+        let (peer, normalized) = add_address_to_swarm(&mut swarm, address.clone())?;
+        persistent_addresses
+            .entry(peer)
+            .or_default()
+            .insert(normalized);
         let reservation = address
             .clone()
             .with(libp2p::multiaddr::Protocol::P2pCircuit);
@@ -360,7 +440,8 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
         relay_reservations.push(reservation.clone());
         relay_listeners.insert(listener, reservation);
     }
-    if !config.bootstrap_addresses.is_empty()
+    if config.enable_dht_maintenance
+        && !config.bootstrap_addresses.is_empty()
         && let Err(error) = swarm.behaviour_mut().kademlia.bootstrap()
     {
         tracing::warn!(%error, "initial Kademlia bootstrap could not start");
@@ -397,15 +478,24 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
             inbound_sender,
             inbound_permits: Arc::new(Semaphore::new(config.max_connections)),
             pending_requests: HashMap::new(),
+            active_inbound_requests: HashMap::new(),
+            pending_response_bytes: HashMap::new(),
             pending_dht: HashMap::new(),
             service,
             server_config,
             advertised_addresses: config.external_addresses,
             bootstrap_addresses: config.bootstrap_addresses,
+            enable_dht_maintenance: config.enable_dht_maintenance,
             bootstrap_retry: retry_interval(BOOTSTRAP_RETRY_INTERVAL),
             relay_reservations,
             relay_listeners,
             relay_retry: retry_interval(RELAY_RESERVATION_RETRY_INTERVAL),
+            relay_retirement: HashMap::new(),
+            relay_retirement_tick: retry_interval(RELAY_RETIREMENT_POLL_INTERVAL),
+            relay_members,
+            persistent_addresses,
+            learned_addresses: HashMap::new(),
+            learned_endpoint_expiry: retry_interval(LEARNED_ENDPOINT_EXPIRY_INTERVAL),
             connection_paths: HashMap::new(),
             last_application_paths: HashMap::new(),
             transfer_counters: HashMap::new(),
@@ -430,6 +520,39 @@ impl P2pClient {
             .await
             .context("libp2p event loop stopped")?;
         receiver.await.context("libp2p address command was lost")?
+    }
+
+    async fn replace_learned_peer_addresses(
+        &self,
+        peer: NodeId,
+        addresses: Vec<Multiaddr>,
+        expires_at_unix_seconds: u64,
+    ) -> Result<()> {
+        let peer = peer.libp2p_peer_id()?;
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(Command::ReplaceLearnedAddresses {
+                peer,
+                addresses,
+                expires_at_unix_seconds,
+                response,
+            })
+            .await
+            .context("libp2p event loop stopped")?;
+        receiver
+            .await
+            .context("libp2p learned-address command was lost")?
+    }
+
+    async fn set_relay_members(&self, members: BTreeSet<PeerId>) -> Result<()> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(Command::SetRelayMembers { members, response })
+            .await
+            .context("libp2p event loop stopped")?;
+        receiver
+            .await
+            .context("libp2p relay-membership command was lost")?
     }
 
     pub async fn profile(&self, peer: NodeId) -> Result<P2pPeerProfile> {
@@ -699,7 +822,7 @@ impl P2pClient {
         let PeerResponse::StorageAcknowledgement(acknowledgement) = response else {
             bail!("peer returned the wrong parity publication response");
         };
-        acknowledgement.verify(b"mutualbackup/storage-acknowledgement/v1")?;
+        acknowledgement.verify(STORAGE_ACKNOWLEDGEMENT_DOMAIN)?;
         acknowledgement.value.validate()?;
         if acknowledgement.value.operation_id != operation_id {
             bail!("parity acknowledgement has the wrong operation identity");
@@ -865,16 +988,27 @@ impl P2pEventLoop {
                 Some(result) = self.inbound_results.recv() => {
                     match result.response {
                         Ok(response) => {
-                            if let Ok(bytes) = cbor_wire_len(&response) {
-                                let counter =
-                                    self.transfer_counters.entry(result.peer).or_default();
-                                counter.sent = counter.sent.saturating_add(bytes);
-                            }
-                            if self.swarm.behaviour_mut().peer.send_response(result.channel, response).is_err() {
+                            let response_bytes = cbor_wire_len(&response).ok();
+                            if self
+                                .swarm
+                                .behaviour_mut()
+                                .peer
+                                .send_response(result.channel, response)
+                                .is_err()
+                            {
+                                self.active_inbound_requests.remove(&result.request_id);
                                 tracing::warn!("peer disconnected before its response was ready");
+                            } else if let Some(response_bytes) = response_bytes {
+                                self.pending_response_bytes.insert(
+                                    result.request_id,
+                                    (result.peer, response_bytes),
+                                );
                             }
                         }
-                        Err(error) => tracing::warn!(%error, "peer request worker failed"),
+                        Err(error) => {
+                            self.active_inbound_requests.remove(&result.request_id);
+                            tracing::warn!(%error, "peer request worker failed");
+                        }
                     }
                 }
                 _ = self.bootstrap_retry.tick(), if !self.bootstrap_addresses.is_empty() => {
@@ -883,6 +1017,12 @@ impl P2pEventLoop {
                 _ = self.relay_retry.tick(), if !self.relay_reservations.is_empty() => {
                     self.retry_relay_reservations();
                 }
+                _ = self.relay_retirement_tick.tick(), if !self.relay_retirement.is_empty() => {
+                    self.retire_idle_relay_connections();
+                }
+                _ = self.learned_endpoint_expiry.tick(), if !self.learned_addresses.is_empty() => {
+                    self.expire_learned_addresses();
+                }
                 event = self.swarm.select_next_some() => self.handle_swarm_event(event),
             }
         }
@@ -890,10 +1030,10 @@ impl P2pEventLoop {
 
     fn retry_bootstrap(&mut self) {
         for address in &self.bootstrap_addresses {
-            let peer = address.iter().find_map(|protocol| match protocol {
-                libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
-                _ => None,
-            });
+            // A circuit address contains both the relay and destination peer
+            // IDs. Connectivity to the relay does not mean the destination is
+            // connected, so retries must key off the terminal identity.
+            let peer = terminal_peer_id(address).ok();
             if peer.is_some_and(|peer| self.swarm.is_connected(&peer)) {
                 continue;
             }
@@ -901,7 +1041,9 @@ impl P2pEventLoop {
                 tracing::debug!(%address, %error, "libp2p bootstrap retry was rejected");
             }
         }
-        if let Err(error) = self.swarm.behaviour_mut().kademlia.bootstrap() {
+        if self.enable_dht_maintenance
+            && let Err(error) = self.swarm.behaviour_mut().kademlia.bootstrap()
+        {
             tracing::debug!(%error, "Kademlia bootstrap retry could not start");
         }
     }
@@ -926,6 +1068,90 @@ impl P2pEventLoop {
         }
     }
 
+    fn replace_learned_addresses(
+        &mut self,
+        peer: PeerId,
+        addresses: Vec<Multiaddr>,
+        expires_at_unix_seconds: u64,
+    ) -> Result<()> {
+        if addresses.len() > MAX_ENDPOINTS_PER_PEER {
+            bail!("peer published too many endpoints");
+        }
+        let now_unix = unix_seconds();
+        if !addresses.is_empty() && expires_at_unix_seconds <= now_unix {
+            bail!("peer endpoints are already expired");
+        }
+        if !self.learned_addresses.contains_key(&peer)
+            && !addresses.is_empty()
+            && self.learned_addresses.len() >= MAX_LEARNED_ENDPOINT_PEERS
+        {
+            bail!("learned endpoint cache is full");
+        }
+
+        let mut normalized = BTreeSet::new();
+        for address in addresses {
+            normalized.insert(normalize_known_address(peer, address)?);
+        }
+        for address in &normalized {
+            self.swarm.add_peer_address(peer, address.clone());
+            self.swarm
+                .behaviour_mut()
+                .kademlia
+                .add_address(&peer, address.clone());
+        }
+
+        let previous = self.learned_addresses.remove(&peer);
+        if let Some(previous) = previous {
+            for address in previous.addresses.difference(&normalized) {
+                let persistent = self
+                    .persistent_addresses
+                    .get(&peer)
+                    .is_some_and(|addresses| addresses.contains(address));
+                if !persistent {
+                    remove_known_address(&mut self.swarm, peer, address);
+                }
+            }
+        }
+        if !normalized.is_empty() {
+            let lifetime = Duration::from_secs(
+                expires_at_unix_seconds
+                    .saturating_sub(now_unix)
+                    .min(DHT_TTL.as_secs()),
+            );
+            self.learned_addresses.insert(
+                peer,
+                LearnedAddresses {
+                    addresses: normalized,
+                    expires_at: tokio::time::Instant::now() + lifetime,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn expire_learned_addresses(&mut self) {
+        let now = tokio::time::Instant::now();
+        let expired = self
+            .learned_addresses
+            .iter()
+            .filter_map(|(peer, addresses)| (addresses.expires_at <= now).then_some(*peer))
+            .collect::<Vec<_>>();
+        for peer in expired {
+            let Some(addresses) = self.learned_addresses.remove(&peer) else {
+                continue;
+            };
+            for address in addresses.addresses {
+                let persistent = self
+                    .persistent_addresses
+                    .get(&peer)
+                    .is_some_and(|addresses| addresses.contains(&address));
+                if !persistent {
+                    remove_known_address(&mut self.swarm, peer, &address);
+                }
+            }
+        }
+    }
+
     fn handle_command(&mut self, command: Command) -> Result<bool> {
         match command {
             Command::AddAddress {
@@ -933,7 +1159,30 @@ impl P2pEventLoop {
                 address,
                 response,
             } => {
-                let result = add_known_address(&mut self.swarm, peer, address);
+                let result = add_known_address(&mut self.swarm, peer, address).map(|address| {
+                    self.persistent_addresses
+                        .entry(peer)
+                        .or_default()
+                        .insert(address);
+                });
+                let _ = response.send(result);
+            }
+            Command::ReplaceLearnedAddresses {
+                peer,
+                addresses,
+                expires_at_unix_seconds,
+                response,
+            } => {
+                let result =
+                    self.replace_learned_addresses(peer, addresses, expires_at_unix_seconds);
+                let _ = response.send(result);
+            }
+            Command::SetRelayMembers { members, response } => {
+                let result = self
+                    .relay_members
+                    .write()
+                    .map_err(|_| anyhow::anyhow!("relay membership lock is poisoned"))
+                    .map(|mut current| *current = members);
                 let _ = response.send(result);
             }
             Command::Request {
@@ -953,10 +1202,7 @@ impl P2pEventLoop {
                             .map(|bytes| *blake3::hash(&bytes).as_bytes());
                         match request_hash {
                             Ok(request_hash) => {
-                                if let Ok(bytes) = cbor_wire_len(&request) {
-                                    let counter = self.transfer_counters.entry(peer).or_default();
-                                    counter.sent = counter.sent.saturating_add(bytes);
-                                }
+                                let request_bytes = cbor_wire_len(&request).unwrap_or(0);
                                 let outbound_id =
                                     self.swarm.behaviour_mut().peer.send_request(&peer, request);
                                 self.pending_requests.insert(
@@ -971,6 +1217,7 @@ impl P2pEventLoop {
                                             .node_id(),
                                         request_id,
                                         request_hash,
+                                        request_bytes,
                                         response,
                                     },
                                 );
@@ -1139,6 +1386,46 @@ impl P2pEventLoop {
                     Ok(connection_id) => {
                         self.connection_paths
                             .insert(*connection_id, (event.remote_peer_id, P2pPath::HolePunched));
+                        // Simultaneous QUIC punching can establish a sibling
+                        // inbound connection whose generic swarm event carries
+                        // no DCUtR marker. Once the peer-level upgrade succeeds,
+                        // both direct sides belong to the same punched session.
+                        for (peer, path) in self.connection_paths.values_mut() {
+                            if *peer == event.remote_peer_id && *path == P2pPath::Direct {
+                                *path = P2pPath::HolePunched;
+                            }
+                        }
+                        if self.last_application_paths.get(&event.remote_peer_id)
+                            == Some(&P2pPath::Direct)
+                        {
+                            self.last_application_paths
+                                .insert(event.remote_peer_id, P2pPath::HolePunched);
+                        }
+                        // request-response does not expose per-request
+                        // connection selection and may otherwise keep using
+                        // the older relay circuit indefinitely. Schedule only
+                        // duplicate relayed sessions for retirement after
+                        // DCUtR has produced a direct one. A grace period and
+                        // in-flight tracking avoid cutting off the request
+                        // which caused the peers to meet over the relay.
+                        let relayed_connections = self
+                            .connection_paths
+                            .iter()
+                            .filter_map(|(candidate, (peer, path))| {
+                                (*peer == event.remote_peer_id
+                                    && matches!(path, P2pPath::Relayed | P2pPath::RelayFallback))
+                                .then_some(*candidate)
+                            })
+                            .collect::<Vec<_>>();
+                        for relayed_connection in relayed_connections {
+                            self.relay_retirement.insert(
+                                relayed_connection,
+                                (
+                                    event.remote_peer_id,
+                                    tokio::time::Instant::now() + RELAY_RETIREMENT_GRACE,
+                                ),
+                            );
+                        }
                     }
                     Err(_) => {
                         for (peer, path) in self.connection_paths.values_mut() {
@@ -1184,7 +1471,24 @@ impl P2pEventLoop {
                 } else {
                     P2pPath::Direct
                 };
-                self.connection_paths.insert(connection_id, (peer_id, path));
+                // DCUtR may report the upgraded connection before or after the
+                // generic swarm event. Do not let the latter erase the more
+                // specific classification when it arrives second.
+                let recorded = self
+                    .connection_paths
+                    .get(&connection_id)
+                    .map(|(_, path)| *path);
+                let peer_has_hole_punch =
+                    self.connection_paths.values().any(|(connected, path)| {
+                        *connected == peer_id && *path == P2pPath::HolePunched
+                    });
+                self.connection_paths.insert(
+                    connection_id,
+                    (
+                        peer_id,
+                        merge_established_path(recorded, path, peer_has_hole_punch),
+                    ),
+                );
                 tracing::info!(peer = %peer_id, ?endpoint, "libp2p connection established");
             }
             SwarmEvent::ConnectionClosed {
@@ -1194,6 +1498,15 @@ impl P2pEventLoop {
                 ..
             } => {
                 self.connection_paths.remove(&connection_id);
+                self.relay_retirement.remove(&connection_id);
+                if !self
+                    .connection_paths
+                    .values()
+                    .any(|(connected, path)| *connected == peer_id && *path == P2pPath::HolePunched)
+                {
+                    self.relay_retirement
+                        .retain(|_, (candidate, _)| *candidate != peer_id);
+                }
                 if num_established == 0 {
                     self.last_application_paths.remove(&peer_id);
                 }
@@ -1230,7 +1543,9 @@ impl P2pEventLoop {
                 }
                 match message {
                     request_response::Message::Request {
-                        request, channel, ..
+                        request,
+                        channel,
+                        request_id,
                     } => {
                         if let Ok(bytes) = cbor_wire_len(&request) {
                             let counter = self.transfer_counters.entry(peer).or_default();
@@ -1252,11 +1567,7 @@ impl P2pEventLoop {
                                     crate::WireError::busy("peer request capacity is exhausted"),
                                 ) {
                                     Ok(response) => {
-                                        if let Ok(bytes) = cbor_wire_len(&response) {
-                                            let counter =
-                                                self.transfer_counters.entry(peer).or_default();
-                                            counter.sent = counter.sent.saturating_add(bytes);
-                                        }
+                                        let response_bytes = cbor_wire_len(&response).ok();
                                         if self
                                             .swarm
                                             .behaviour_mut()
@@ -1267,6 +1578,10 @@ impl P2pEventLoop {
                                             tracing::warn!(
                                                 "overloaded peer disconnected before rejection"
                                             );
+                                        } else if let Some(response_bytes) = response_bytes {
+                                            self.active_inbound_requests.insert(request_id, peer);
+                                            self.pending_response_bytes
+                                                .insert(request_id, (peer, response_bytes));
                                         }
                                     }
                                     Err(error) => {
@@ -1279,11 +1594,13 @@ impl P2pEventLoop {
                                 return;
                             }
                         };
+                        self.active_inbound_requests.insert(request_id, peer);
                         tokio::task::spawn_blocking(move || {
                             let _permit = permit;
                             let response = process_peer_request(service, &config, request);
                             let _ = sender.blocking_send(InboundResult {
                                 peer,
+                                request_id,
                                 channel,
                                 response,
                             });
@@ -1293,11 +1610,16 @@ impl P2pEventLoop {
                         request_id,
                         response,
                     } => {
-                        if let Ok(bytes) = cbor_wire_len(&response) {
-                            let counter = self.transfer_counters.entry(peer).or_default();
-                            counter.received = counter.received.saturating_add(bytes);
-                        }
+                        let response_bytes = cbor_wire_len(&response).ok();
                         if let Some(pending) = self.pending_requests.remove(&request_id) {
+                            if pending.peer == peer {
+                                let counter = self.transfer_counters.entry(peer).or_default();
+                                counter.sent = counter.sent.saturating_add(pending.request_bytes);
+                                if let Some(response_bytes) = response_bytes {
+                                    counter.received =
+                                        counter.received.saturating_add(response_bytes);
+                                }
+                            }
                             let result = if pending.peer == peer {
                                 validate_outbound_response(response, &pending)
                             } else {
@@ -1317,10 +1639,63 @@ impl P2pEventLoop {
                         .send(Err(anyhow::anyhow!("libp2p request failed: {error}")));
                 }
             }
-            request_response::Event::InboundFailure { peer, error, .. } => {
+            request_response::Event::InboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            } => {
+                self.active_inbound_requests.remove(&request_id);
+                self.pending_response_bytes.remove(&request_id);
                 tracing::warn!(%peer, %error, "libp2p inbound request failed");
             }
-            request_response::Event::ResponseSent { .. } => {}
+            request_response::Event::ResponseSent {
+                peer, request_id, ..
+            } => {
+                self.active_inbound_requests.remove(&request_id);
+                if let Some((expected_peer, bytes)) =
+                    self.pending_response_bytes.remove(&request_id)
+                    && expected_peer == peer
+                {
+                    let counter = self.transfer_counters.entry(peer).or_default();
+                    counter.sent = counter.sent.saturating_add(bytes);
+                }
+            }
+        }
+    }
+
+    fn retire_idle_relay_connections(&mut self) {
+        let now = tokio::time::Instant::now();
+        let finished =
+            self.relay_retirement
+                .iter()
+                .filter_map(|(connection_id, (peer, deadline))| {
+                    let still_punched = self.connection_paths.values().any(|(candidate, path)| {
+                        candidate == peer && *path == P2pPath::HolePunched
+                    });
+                    if !still_punched {
+                        return Some((*connection_id, *peer, false));
+                    }
+                    let busy = self
+                        .pending_requests
+                        .values()
+                        .any(|pending| pending.peer == *peer)
+                        || self
+                            .active_inbound_requests
+                            .values()
+                            .any(|candidate| *candidate == *peer);
+                    (*deadline <= now && !busy).then_some((*connection_id, *peer, true))
+                })
+                .collect::<Vec<_>>();
+        for (connection_id, peer, should_close) in finished {
+            self.relay_retirement.remove(&connection_id);
+            if should_close && self.swarm.close_connection(connection_id) {
+                tracing::debug!(
+                    %peer,
+                    ?connection_id,
+                    "retiring idle relay connection after successful DCUtR"
+                );
+            }
         }
     }
 
@@ -1471,11 +1846,19 @@ async fn refresh_guild_endpoints(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Res
     })
     .await?;
     let Some(guild) = guild else {
+        p2p.set_relay_members(BTreeSet::new()).await?;
         return Ok(());
     };
     if !matches!(guild.phase, GuildPhase::Active) {
+        p2p.set_relay_members(BTreeSet::new()).await?;
         return Ok(());
     }
+    let relay_members = guild
+        .peers
+        .iter()
+        .filter_map(|peer| peer.member.node_id.libp2p_peer_id().ok())
+        .collect();
+    p2p.set_relay_members(relay_members).await?;
     let mut queries = FuturesUnordered::new();
     for peer in guild.peers {
         if peer.member.node_id == local_id {
@@ -1495,12 +1878,18 @@ async fn refresh_guild_endpoints(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Res
         };
         let endpoint = match select_endpoint_record(member, records) {
             Ok(Some(endpoint)) => endpoint,
-            Ok(None) => continue,
+            Ok(None) => {
+                p2p.replace_learned_peer_addresses(member, Vec::new(), 0)
+                    .await?;
+                continue;
+            }
             Err(error) => {
                 tracing::warn!(%member, %error, "guild member published conflicting endpoints");
                 continue;
             }
         };
+        let expires_at_unix_seconds = endpoint.value.expires_at_unix_seconds;
+        let mut addresses = Vec::with_capacity(endpoint.value.endpoints.len());
         for value in endpoint.value.endpoints {
             let Ok(address) = value.parse::<Multiaddr>() else {
                 tracing::warn!(%member, endpoint = %value, "ignored malformed signed endpoint");
@@ -1512,9 +1901,13 @@ async fn refresh_guild_endpoints(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Res
                 tracing::warn!(%member, endpoint = %value, "ignored endpoint bound to another peer");
                 continue;
             }
-            if let Err(error) = p2p.add_peer_address(member, address).await {
-                tracing::debug!(%member, endpoint = %value, %error, "could not cache signed endpoint");
-            }
+            addresses.push(address);
+        }
+        if let Err(error) = p2p
+            .replace_learned_peer_addresses(member, addresses, expires_at_unix_seconds)
+            .await
+        {
+            tracing::debug!(%member, %error, "could not replace signed endpoints");
         }
     }
     Ok(())
@@ -1638,7 +2031,7 @@ async fn validate_ready_bundle(
         }
         let plaintext = open_recovery_record(node.keys(), &bundle.value.sealed)?;
         let locator: SignedRecord<mb_core::RecoveryLocator> = decode_canonical(&plaintext)?;
-        locator.verify(b"mutualbackup/recovery-locator/v1")?;
+        locator.verify(RECOVERY_LOCATOR_DOMAIN)?;
         if locator.signer != bundle.value.publisher
             || locator.value.publisher != bundle.value.publisher
             || locator.value.subject != bundle.value.subject
@@ -2006,7 +2399,7 @@ fn decode_recovery_candidate(
     }
     let plaintext = open_recovery_record(node.keys(), &bundle.value.sealed)?;
     let locator: SignedRecord<mb_core::RecoveryLocator> = decode_canonical(&plaintext)?;
-    locator.verify(b"mutualbackup/recovery-locator/v1")?;
+    locator.verify(RECOVERY_LOCATOR_DOMAIN)?;
     if locator.signer != bundle.value.publisher
         || locator.value.format_version != 1
         || locator.value.subject != bundle.value.subject
@@ -2093,7 +2486,7 @@ fn select_endpoint_record(
 }
 
 fn valid_endpoint_values(publisher: NodeId, endpoints: &[String]) -> bool {
-    if endpoints.is_empty() || endpoints.len() > 8 {
+    if endpoints.is_empty() || endpoints.len() > MAX_ENDPOINTS_PER_PEER {
         return false;
     }
     let Ok(expected) = publisher.libp2p_peer_id() else {
@@ -2792,7 +3185,7 @@ async fn publish_p2p_parity(
     } else {
         p2p.publish_parity(peer, group, information, object).await?
     };
-    acknowledgement.verify(b"mutualbackup/storage-acknowledgement/v1")?;
+    acknowledgement.verify(STORAGE_ACKNOWLEDGEMENT_DOMAIN)?;
     if acknowledgement.signer != peer
         || acknowledgement.value.holder != peer
         || acknowledgement.value.operation_id != storage_operation_id(&group_id, shard_index)
@@ -2901,37 +3294,64 @@ fn validate_outbound_response(
     response.value.result.map_err(anyhow::Error::new)
 }
 
-fn add_address_to_swarm(swarm: &mut Swarm<Behaviour>, address: Multiaddr) -> Result<()> {
-    let peer = address
+fn add_address_to_swarm(
+    swarm: &mut Swarm<Behaviour>,
+    address: Multiaddr,
+) -> Result<(PeerId, Multiaddr)> {
+    let peer = terminal_peer_id(&address)?;
+    let address = add_known_address(swarm, peer, address)?;
+    Ok((peer, address))
+}
+
+fn terminal_peer_id(address: &Multiaddr) -> Result<PeerId> {
+    address
         .iter()
-        .find_map(|protocol| match protocol {
+        .filter_map(|protocol| match protocol {
             libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
             _ => None,
         })
-        .context("peer multiaddress has no /p2p identity")?;
-    add_known_address(swarm, peer, address)
+        .last()
+        .context("peer multiaddress has no /p2p identity")
 }
 
 fn add_known_address(
     swarm: &mut Swarm<Behaviour>,
     peer: PeerId,
-    mut address: Multiaddr,
-) -> Result<()> {
+    address: Multiaddr,
+) -> Result<Multiaddr> {
+    let address = normalize_known_address(peer, address)?;
+    swarm.add_peer_address(peer, address.clone());
+    swarm
+        .behaviour_mut()
+        .kademlia
+        .add_address(&peer, address.clone());
+    Ok(address)
+}
+
+fn normalize_known_address(peer: PeerId, mut address: Multiaddr) -> Result<Multiaddr> {
     if address.iter().last() == Some(libp2p::multiaddr::Protocol::P2p(peer)) {
         address.pop();
     }
     if address.is_empty() {
         bail!("peer address has no transport components");
     }
-    swarm.add_peer_address(peer, address.clone());
-    swarm.behaviour_mut().kademlia.add_address(&peer, address);
-    Ok(())
+    Ok(address)
+}
+
+#[allow(deprecated)]
+fn remove_known_address(swarm: &mut Swarm<Behaviour>, peer: PeerId, address: &Multiaddr) {
+    swarm.behaviour_mut().peer.remove_address(&peer, address);
+    swarm
+        .behaviour_mut()
+        .kademlia
+        .remove_address(&peer, address);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use mb_core::Seed;
+    use request_response::Codec as _;
 
     fn config(node_id: NodeId) -> P2pConfig {
         P2pConfig {
@@ -2939,6 +3359,7 @@ mod tests {
             external_addresses: Vec::new(),
             bootstrap_addresses: Vec::new(),
             relay_reservation_addresses: Vec::new(),
+            enable_dht_maintenance: true,
             enable_relay_server: true,
             enable_hole_punching: true,
             public_endpoint: "/ip4/127.0.0.1/udp/0/quic-v1".into(),
@@ -2946,6 +3367,154 @@ mod tests {
             configure_failure_domain: true,
             max_connections: 8,
         }
+    }
+
+    #[tokio::test]
+    async fn production_peer_codec_rejects_oversized_frames() {
+        let keys = mb_core::KeyMaterial::from_seed(&Seed::from_bytes([76; 32]));
+        let request = make_peer_request(
+            &keys,
+            None,
+            PeerRequest::PutCheckpointPage {
+                object_kind: CheckpointObjectKind::Body,
+                guild_id: [1; 32],
+                checkpoint_hash: [2; 32],
+                page_index: 0,
+                total_pages: 1,
+                page_hash: [3; 32],
+                bytes: vec![0; MAX_PEER_FRAME_BYTES],
+            },
+        )
+        .unwrap();
+        let encoded = cbor4ii::serde::to_vec(Vec::new(), &request).unwrap();
+        assert!(encoded.len() > MAX_PEER_FRAME_BYTES);
+        let mut request_reader = futures::io::Cursor::new(encoded);
+        assert!(
+            peer_codec()
+                .read_request(&P2P_PROTOCOL, &mut request_reader)
+                .await
+                .is_err()
+        );
+
+        let response = SignedRecord::sign(
+            PEER_RESPONSE_DOMAIN,
+            PeerResponseEnvelope {
+                format_version: super::super::PEER_WIRE_FORMAT_VERSION,
+                request_id: [4; 16],
+                recipient: keys.node_id(),
+                request_hash: [5; 32],
+                result: Ok(PeerResponse::Bytes(vec![0; MAX_PEER_FRAME_BYTES])),
+            },
+            &keys,
+        )
+        .unwrap();
+        let encoded = cbor4ii::serde::to_vec(Vec::new(), &response).unwrap();
+        assert!(encoded.len() > MAX_PEER_FRAME_BYTES);
+        let mut response_reader = futures::io::Cursor::new(encoded);
+        assert!(
+            peer_codec()
+                .read_response(&P2P_PROTOCOL, &mut response_reader)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn relay_admission_uses_replaceable_membership_snapshot() {
+        let allowed = mb_core::KeyMaterial::from_seed(&Seed::from_bytes([74; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let denied = mb_core::KeyMaterial::from_seed(&Seed::from_bytes([75; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let members = Arc::new(RwLock::new(BTreeSet::from([allowed])));
+        let mut admission = guild_relay_admission(members.clone());
+        let address: Multiaddr = "/ip4/127.0.0.1/udp/1234/quic-v1".parse().unwrap();
+        assert!(admission.try_next(allowed, &address, std::time::Instant::now()));
+        assert!(!admission.try_next(denied, &address, std::time::Instant::now()));
+
+        *members.write().unwrap() = BTreeSet::from([denied]);
+        assert!(!admission.try_next(allowed, &address, std::time::Instant::now()));
+        assert!(admission.try_next(denied, &address, std::time::Instant::now()));
+    }
+
+    #[test]
+    fn generic_connection_event_does_not_erase_dcutr_classification() {
+        assert_eq!(
+            merge_established_path(Some(P2pPath::HolePunched), P2pPath::Direct, false),
+            P2pPath::HolePunched
+        );
+        assert_eq!(
+            merge_established_path(Some(P2pPath::Relayed), P2pPath::Direct, true),
+            P2pPath::HolePunched
+        );
+        assert_eq!(
+            merge_established_path(Some(P2pPath::Relayed), P2pPath::Direct, false),
+            P2pPath::Direct,
+        );
+    }
+
+    #[test]
+    fn circuit_address_is_associated_with_its_destination() {
+        let relay = mb_core::KeyMaterial::from_seed(&Seed::from_bytes([70; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let destination = mb_core::KeyMaterial::from_seed(&Seed::from_bytes([71; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let address: Multiaddr =
+            format!("/ip4/127.0.0.1/udp/4100/quic-v1/p2p/{relay}/p2p-circuit/p2p/{destination}")
+                .parse()
+                .unwrap();
+        assert_eq!(terminal_peer_id(&address).unwrap(), destination);
+    }
+
+    #[tokio::test]
+    async fn learned_endpoint_cache_replaces_and_expires_addresses() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::open(temp.path(), Seed::from_bytes([73; 32])).unwrap();
+        let local_id = node.keys().node_id();
+        let (_client, mut event_loop) =
+            build_p2p(Arc::new(Mutex::new(node)), config(local_id)).unwrap();
+        let peer = mb_core::KeyMaterial::from_seed(&Seed::from_bytes([72; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let first: Multiaddr = format!("/ip4/127.0.0.1/udp/4101/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+        let second: Multiaddr = format!("/ip4/127.0.0.1/udp/4102/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+
+        event_loop
+            .replace_learned_addresses(peer, vec![first], unix_seconds() + 300)
+            .unwrap();
+        assert_eq!(event_loop.learned_addresses[&peer].addresses.len(), 1);
+        event_loop
+            .replace_learned_addresses(peer, vec![second], unix_seconds() + 300)
+            .unwrap();
+        assert_eq!(
+            event_loop.learned_addresses[&peer]
+                .addresses
+                .iter()
+                .next()
+                .unwrap()
+                .to_string(),
+            "/ip4/127.0.0.1/udp/4102/quic-v1"
+        );
+
+        event_loop
+            .learned_addresses
+            .get_mut(&peer)
+            .unwrap()
+            .expires_at = tokio::time::Instant::now();
+        event_loop.expire_learned_addresses();
+        assert!(!event_loop.learned_addresses.contains_key(&peer));
     }
 
     async fn listening_address(client: &P2pClient) -> Multiaddr {
@@ -3330,9 +3899,29 @@ mod tests {
         let first_id = first_node.keys().node_id();
         let second_id = second_node.keys().node_id();
         let mut first_config = config(first_id);
+        let first_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let first_transport: Multiaddr = format!(
+            "/ip4/127.0.0.1/udp/{}/quic-v1",
+            first_socket.local_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap();
+        drop(first_socket);
+        first_config.listen_addresses = vec![first_transport.clone()];
+        first_config.external_addresses = vec![first_transport];
         first_config.enable_relay_server = false;
         first_config.relay_reservation_addresses = vec![relay_address.clone()];
         let mut second_config = config(second_id);
+        let second_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let second_transport: Multiaddr = format!(
+            "/ip4/127.0.0.1/udp/{}/quic-v1",
+            second_socket.local_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap();
+        drop(second_socket);
+        second_config.listen_addresses = vec![second_transport.clone()];
+        second_config.external_addresses = vec![second_transport];
         second_config.enable_relay_server = false;
         second_config.relay_reservation_addresses = vec![relay_address.clone()];
         let (first_client, first_loop) =
@@ -3355,13 +3944,20 @@ mod tests {
             saw_hole_punch = status.peers.iter().any(|peer| {
                 peer.peer_id == second_client.local_peer_id()
                     && peer.active_paths.contains(&P2pPath::HolePunched)
+                    && !peer
+                        .active_paths
+                        .iter()
+                        .any(|path| matches!(path, P2pPath::Relayed | P2pPath::RelayFallback))
             });
             if saw_hole_punch {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(saw_hole_punch, "DCUtR did not establish a direct QUIC path");
+        assert!(
+            saw_hole_punch,
+            "DCUtR did not replace the relay circuit with a direct QUIC path"
+        );
         for _ in 0..10 {
             first_client.profile(second_id).await.unwrap();
             let status = first_client.status().await.unwrap();

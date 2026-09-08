@@ -37,6 +37,10 @@ pub enum AnchorError {
     InvalidRoot,
     #[error("the source root needs a writable parent on the same filesystem")]
     NoExternalAnchorLocation,
+    #[error("the protected root crosses into another filesystem mount at {0}")]
+    NestedFilesystem(PathBuf),
+    #[error("the protected root filesystem changed while it was being probed")]
+    FilesystemChanged,
     #[error("non-UTF-8 paths are not supported by the v1 prototype")]
     NonUtf8Path,
     #[error("symlinks are not supported by the v1 reflink prototype: {0}")]
@@ -59,6 +63,12 @@ pub enum AnchorError {
     Io(#[from] std::io::Error),
     #[error("directory walk failed: {0}")]
     Walk(#[from] walkdir::Error),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FilesystemIdentity {
+    pub device: u64,
+    pub mount_id: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -400,15 +410,63 @@ impl ReflinkAnchor {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub fn filesystem_identity(path: impl AsRef<Path>) -> Result<FilesystemIdentity, AnchorError> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let path = path.as_ref();
+    let encoded =
+        CString::new(path.as_os_str().as_bytes()).map_err(|_| AnchorError::InvalidRoot)?;
+    let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let result = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            encoded.as_ptr(),
+            libc::AT_NO_AUTOMOUNT,
+            libc::STATX_TYPE | libc::STATX_MNT_ID,
+            stat.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.stx_mask & libc::STATX_MNT_ID == 0 {
+        return Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "filesystem mount identity is unavailable",
+        )));
+    }
+    Ok(FilesystemIdentity {
+        device: fs::metadata(path)?.dev(),
+        mount_id: stat.stx_mnt_id,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn filesystem_identity(_path: impl AsRef<Path>) -> Result<FilesystemIdentity, AnchorError> {
+    Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "filesystem mount identity is currently implemented only on Linux",
+    )))
+}
+
 pub fn probe_reflink(root: impl AsRef<Path>) -> Result<(), AnchorError> {
     let root = root.as_ref();
     if !root.is_dir() {
         return Err(AnchorError::InvalidRoot);
     }
+    let root_identity = filesystem_identity(root)?;
     let parent = root.parent().ok_or(AnchorError::NoExternalAnchorLocation)?;
+    if filesystem_identity(parent)? != root_identity {
+        return Err(AnchorError::NoExternalAnchorLocation);
+    }
+    reject_nested_filesystems(root, root_identity)?;
     let probe_dir = parent.join(format!(".mutualbackup-probe-{}", Uuid::new_v4()));
     create_private_dir_new(&probe_dir)?;
     let source_path = probe_dir.join("source");
+    let removed_source_path = probe_dir.join("source-removed");
     let clone_path = probe_dir.join("clone");
     let result = (|| {
         let mut source = OpenOptions::new()
@@ -416,13 +474,28 @@ pub fn probe_reflink(root: impl AsRef<Path>) -> Result<(), AnchorError> {
             .read(true)
             .write(true)
             .open(&source_path)?;
-        source.set_len(1024 * 1024)?;
-        source.seek(SeekFrom::Start(4096))?;
+        const PROBE_LENGTH: u64 = 4 * 1024 * 1024;
+        const PROBE_OFFSET: u64 = 1024 * 1024;
+        source.set_len(PROBE_LENGTH)?;
+        source.seek(SeekFrom::Start(PROBE_OFFSET))?;
         source.write_all(b"source-before-clone")?;
         source.sync_all()?;
+        let source_extents = file_data_extents(&source, PROBE_LENGTH)?;
+        validate_sparse_probe_extents(&source_extents, PROBE_LENGTH)?;
 
         reflink_open_file(&source, &clone_path).map_err(AnchorError::ReflinkUnavailable)?;
-        source.seek(SeekFrom::Start(4096))?;
+        let cloned_read = File::open(&clone_path)?;
+        let cloned_extents = file_data_extents(&cloned_read, PROBE_LENGTH)?;
+        if cloned_extents != source_extents {
+            return Err(AnchorError::ReflinkUnavailable(std::io::Error::other(
+                "clone did not preserve sparse extents",
+            )));
+        }
+        drop(cloned_read);
+
+        fs::rename(&source_path, &removed_source_path)?;
+        fs::remove_file(&removed_source_path)?;
+        source.seek(SeekFrom::Start(PROBE_OFFSET))?;
         source.write_all(b"source-after-clone!")?;
         source.sync_all()?;
 
@@ -430,7 +503,7 @@ pub fn probe_reflink(root: impl AsRef<Path>) -> Result<(), AnchorError> {
             .read(true)
             .write(true)
             .open(&clone_path)?;
-        cloned.seek(SeekFrom::Start(4096))?;
+        cloned.seek(SeekFrom::Start(PROBE_OFFSET))?;
         let mut bytes = [0_u8; 19];
         cloned.read_exact(&mut bytes)?;
         if &bytes != b"source-before-clone" {
@@ -438,22 +511,67 @@ pub fn probe_reflink(root: impl AsRef<Path>) -> Result<(), AnchorError> {
                 "clone changed when source was edited",
             )));
         }
-        cloned.seek(SeekFrom::Start(4096))?;
+        cloned.seek(SeekFrom::Start(PROBE_OFFSET))?;
         cloned.write_all(b"clone-independent!!")?;
         cloned.sync_all()?;
-        source.seek(SeekFrom::Start(4096))?;
+        source.seek(SeekFrom::Start(PROBE_OFFSET))?;
         source.read_exact(&mut bytes)?;
         if &bytes != b"source-after-clone!" {
             return Err(AnchorError::ReflinkUnavailable(std::io::Error::other(
                 "source changed when clone was edited",
             )));
         }
+        validate_sparse_probe_extents(&file_data_extents(&source, PROBE_LENGTH)?, PROBE_LENGTH)?;
+        validate_sparse_probe_extents(&file_data_extents(&cloned, PROBE_LENGTH)?, PROBE_LENGTH)?;
+        if filesystem_identity(root)? != root_identity
+            || filesystem_identity(&probe_dir)? != root_identity
+        {
+            return Err(AnchorError::FilesystemChanged);
+        }
         Ok(())
     })();
     let cleanup = fs::remove_dir_all(&probe_dir);
-    result?;
     cleanup?;
     sync_directory(parent)?;
+    result
+}
+
+fn validate_sparse_probe_extents(
+    extents: &[FileExtent],
+    logical_len: u64,
+) -> Result<(), AnchorError> {
+    let Some(first) = extents.first() else {
+        return Err(AnchorError::ReflinkUnavailable(std::io::Error::other(
+            "SEEK_DATA did not find probe data",
+        )));
+    };
+    let last = extents.last().expect("first extent exists");
+    if first.offset == 0
+        || last.offset.saturating_add(last.logical_len) >= logical_len
+        || extents
+            .iter()
+            .any(|extent| extent.logical_len == 0 || extent.offset >= logical_len)
+    {
+        return Err(AnchorError::ReflinkUnavailable(std::io::Error::other(
+            "SEEK_DATA/SEEK_HOLE did not preserve the probe holes",
+        )));
+    }
+    Ok(())
+}
+
+fn reject_nested_filesystems(
+    root: &Path,
+    root_identity: FilesystemIdentity,
+) -> Result<(), AnchorError> {
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_symlink() {
+            continue;
+        }
+        if filesystem_identity(entry.path())? != root_identity {
+            return Err(AnchorError::NestedFilesystem(entry.path().to_path_buf()));
+        }
+    }
     Ok(())
 }
 
@@ -1382,6 +1500,35 @@ mod tests {
             system_time_parts(UNIX_EPOCH - Duration::new(1, 1)),
             (-2, 999_999_999)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn filesystem_identity_tracks_the_mount() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("child");
+        fs::create_dir(&child).unwrap();
+        let parent = filesystem_identity(temp.path()).unwrap();
+        let child = filesystem_identity(&child).unwrap();
+        assert_eq!(parent, child);
+        assert_ne!(parent.device, 0);
+        assert_ne!(parent.mount_id, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reflink_probe_always_removes_its_temporary_area() {
+        let parent = tempfile::tempdir().unwrap();
+        let protected = parent.path().join("protected");
+        fs::create_dir(&protected).unwrap();
+
+        let _ = probe_reflink(&protected);
+
+        let remaining = fs::read_dir(parent.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec![std::ffi::OsString::from("protected")]);
     }
 
     #[test]

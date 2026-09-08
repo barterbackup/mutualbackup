@@ -15,10 +15,11 @@ use anyhow::{Context, Result, bail};
 use futures::{StreamExt, stream::FuturesUnordered};
 #[cfg(test)]
 use mb_core::{
-    CodingGroup, GuildCheckpoint, InformationRole, ParityRole, QuorumCheckpoint, RecoveryLocator,
-    SealedRecoveryRecord, SectorRef, Seed, ShardRole, UserRevision, V1_MAX_CODING_GROUPS,
-    V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, encode_3_2, open_recovery_record,
-    reconstruct_3_2, sector_root,
+    CodingGroup, GuildCheckpoint, InformationRole, ParityRole, QuorumCheckpoint,
+    RECOVERY_LOCATOR_DOMAIN, RecoveryLocator, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SealedRecoveryRecord,
+    SectorRef, Seed, ShardRole, UserRevision, V1_MAX_CODING_GROUPS, V1_RS_DATA_SHARDS,
+    V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, encode_3_2, open_recovery_record, reconstruct_3_2,
+    sector_root,
 };
 use mb_core::{
     KeyMaterial, NodeId, SignedRecord, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES,
@@ -53,8 +54,7 @@ pub use p2p::{
 };
 use wire::*;
 
-#[cfg(test)]
-const MAX_PEER_FRAME_BYTES: usize = 600 * 1024;
+pub(super) const MAX_PEER_FRAME_BYTES: usize = 600 * 1024;
 #[cfg(test)]
 const MAX_DIRECTORY_FRAME_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(test)]
@@ -1729,7 +1729,7 @@ async fn recover_member_state(
             Ok(signed) => signed,
             Err(_) => continue,
         };
-        if signed.verify(b"mutualbackup/recovery-locator/v1").is_err()
+        if signed.verify(RECOVERY_LOCATOR_DOMAIN).is_err()
             || signed.signer != signed.value.publisher
             || signed.value.subject != local_node_id
             || signed.value.format_version != 1
@@ -2254,7 +2254,7 @@ fn expect_storage_ack(response: PeerResponse, holder: NodeId, object: &ParityObj
     let PeerResponse::StorageAcknowledgement(acknowledgement) = response else {
         bail!("peer returned the wrong storage acknowledgement response");
     };
-    acknowledgement.verify(b"mutualbackup/storage-acknowledgement/v1")?;
+    acknowledgement.verify(STORAGE_ACKNOWLEDGEMENT_DOMAIN)?;
     acknowledgement.value.validate()?;
     if acknowledgement.signer != holder
         || acknowledgement.value.holder != holder

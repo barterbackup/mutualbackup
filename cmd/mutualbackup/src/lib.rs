@@ -35,6 +35,8 @@ pub struct DaemonConfig {
     pub enable_relay_server: bool,
     #[serde(default = "default_enable_hole_punching")]
     pub enable_hole_punching: bool,
+    #[serde(default = "default_enable_dht_maintenance")]
+    pub enable_dht_maintenance: bool,
 }
 
 impl DaemonConfig {
@@ -67,6 +69,10 @@ pub fn default_p2p_listen_addresses() -> Vec<String> {
 }
 
 fn default_enable_hole_punching() -> bool {
+    true
+}
+
+fn default_enable_dht_maintenance() -> bool {
     true
 }
 
@@ -244,6 +250,7 @@ mod tests {
                 p2p_relay_addresses: Vec::new(),
                 enable_relay_server: false,
                 enable_hole_punching: true,
+                enable_dht_maintenance: true,
             },
         )
         .unwrap();

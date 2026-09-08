@@ -20,9 +20,9 @@ Postcard's variable-length representation. A `SignedRecord<T>` is ordered as
 | `GuildCheckpoint` | `format_version`, `guild_id`, `genesis_hash`, `generation`, `parent`, `members`, `revisions`, `coding_groups` | `mutualbackup/guild-checkpoint/v1`; hash is BLAKE3 of canonical bytes |
 | `QuorumCheckpoint` | `checkpoint`, `signatures` | certificate of checkpoint signatures |
 | `MemberSignature` | `signer`, `signature` | signature domain belongs to containing certificate |
-| `StorageAcknowledgement` | `format_version`, `operation_id`, `guild_id`, `group_id`, `shard_index`, `row`, `root`, `holder` | `mutualbackup/storage-ack/v1` |
+| `StorageAcknowledgement` | `format_version`, `operation_id`, `guild_id`, `group_id`, `shard_index`, `row`, `root`, `holder` | `mutualbackup/storage-acknowledgement/v1` |
 | `EndpointRecord` | `format_version`, `publisher`, `sequence`, `expires_at_unix_seconds`, `endpoints` | `mutualbackup/endpoint-record/v1` |
-| `RecoveryLocator` | `format_version`, `subject`, `publisher`, `guild_id`, `checkpoint_hash`, `checkpoint_generation`, `endpoints`, `expires_at_unix_seconds` | encrypted inside a recovery bundle |
+| `RecoveryLocator` | `format_version`, `subject`, `publisher`, `guild_id`, `checkpoint_hash`, `checkpoint_generation`, `endpoints`, `expires_at_unix_seconds` | `mutualbackup/recovery-locator/v1`, then encrypted inside a recovery bundle |
 | `SealedRecoveryRecord` | `format_version`, `ephemeral_public_key`, `nonce`, `ciphertext` | XChaCha20-Poly1305 with `mutualbackup/recovery-record/v1` associated context |
 | `RecoveryBundle` | `format_version`, `subject`, `publisher`, `sequence`, `expires_at_unix_seconds`, `sealed` | `mutualbackup/recovery-bundle/v1` |
 | peer request envelope | `format_version`, `request_id`, `caller`, `recipient`, `guild_scope`, `issued_at_unix_seconds`, `expires_at_unix_seconds`, `request` | `mutualbackup/direct-request/v2` |

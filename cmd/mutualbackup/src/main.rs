@@ -241,6 +241,7 @@ async fn main() -> Result<()> {
                     p2p_relay_addresses,
                     enable_relay_server,
                     enable_hole_punching: !disable_hole_punching,
+                    enable_dht_maintenance: true,
                 };
                 write_config(&config_path, &config)?;
                 println!("daemon config written to: {}", config_path.display());
@@ -419,6 +420,7 @@ async fn main() -> Result<()> {
                     p2p_relay_addresses,
                     enable_relay_server: false,
                     enable_hole_punching: !disable_hole_punching,
+                    enable_dht_maintenance: true,
                 },
             )?;
             println!("recovery daemon config written to: {}", config.display());

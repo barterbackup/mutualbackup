@@ -70,6 +70,7 @@ Paths may be absolute or relative to the TOML file containing them.
 | `p2p_relay_addresses` | Relay nodes on which this node should reserve a circuit, also including `/p2p/PEER_ID`. |
 | `enable_relay_server` | Whether this node accepts rate-, byte-, and connection-limited circuit-relay reservations from active guild members. |
 | `enable_hole_punching` | Whether DCUtR should try to upgrade a relay circuit to direct QUIC. Disabling it does not prohibit independent direct connections. |
+| `enable_dht_maintenance` | Whether the daemon performs outbound Kademlia bootstrap, publication, and refresh work. Keep this enabled normally; static/server-only peers may disable it while still serving DHT, application, and relayed requests. |
 
 The config is not a CLI profile: routine CLI commands still select a daemon
 with `--socket`. This permits several daemons under the same Unix account.

@@ -7,12 +7,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use mb_core::{
     EndpointRecord, GuildCheckpoint, GuildGenesis, GuildInvite, KeyMaterial, Member,
-    MemberSignature, NodeId, QuorumCheckpoint, QuorumGuildGenesis, RecoveryBundle, RecoveryLocator,
-    SectorId, SectorRef, Seed, ShardRole, SignedRecord, StorageAcknowledgement, UserRevision,
-    V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_PAGES, canonical_bytes, decode_canonical,
-    seal_recovery_record, sector_root, synthetic_filler_sector,
+    MemberSignature, NodeId, QuorumCheckpoint, QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN,
+    RecoveryBundle, RecoveryLocator, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, Seed,
+    ShardRole, SignedRecord, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
+    V1_MAX_CATALOG_PAGES, canonical_bytes, decode_canonical, seal_recovery_record, sector_root,
+    synthetic_filler_sector,
 };
-use mb_store::{ControlStore, ParityObject, ParityStore, probe_reflink};
+use mb_store::{ControlStore, ParityObject, ParityStore, filesystem_identity, probe_reflink};
 use rand::RngCore;
 use uuid::Uuid;
 
@@ -382,10 +383,19 @@ impl Node {
     }
 
     pub fn protected_root(&self) -> Result<Option<ProtectedRoot>> {
-        self.control
+        let root: Option<ProtectedRoot> = self
+            .control
             .get_record("node-config", b"protected-root")?
-            .map(|bytes| decode_canonical(&bytes).map_err(Into::into))
-            .transpose()
+            .map(|bytes| decode_canonical::<ProtectedRoot>(&bytes).map_err(anyhow::Error::from))
+            .transpose()?;
+        if let Some(root) = &root
+            && (root.format_version != 2
+                || root.filesystem_device == 0
+                || root.filesystem_mount_id == 0)
+        {
+            anyhow::bail!("invalid protected-root record");
+        }
+        Ok(root)
     }
 
     pub fn add_protected_root(&mut self, source_root: &Path) -> Result<ProtectedRoot> {
@@ -398,32 +408,29 @@ impl Node {
         if source_root.starts_with(&self.data_dir) || self.data_dir.starts_with(&source_root) {
             anyhow::bail!("protected root and daemon data directory must not overlap");
         }
-        #[cfg(unix)]
-        let filesystem_device = {
-            use std::os::unix::fs::MetadataExt;
-            fs::metadata(&source_root)?.dev()
-        };
-        #[cfg(not(unix))]
-        let filesystem_device = 0;
+        let filesystem = filesystem_identity(&source_root)?;
 
         let configured = self.protected_root()?;
         if let Some(configured) = &configured {
             if configured.path != source_root {
                 anyhow::bail!("the prototype supports exactly one protected root");
             }
-            if configured.filesystem_device == filesystem_device {
+            if configured.filesystem_device == filesystem.device
+                && configured.filesystem_mount_id == filesystem.mount_id
+            {
                 return Ok(configured.clone());
             }
         }
 
         probe_reflink(&source_root).context("protected root failed the reflink COW probe")?;
         let root = ProtectedRoot {
-            format_version: 1,
+            format_version: 2,
             root_id: configured
                 .map(|configured| configured.root_id)
                 .unwrap_or_else(Uuid::new_v4),
             path: source_root,
-            filesystem_device,
+            filesystem_device: filesystem.device,
+            filesystem_mount_id: filesystem.mount_id,
         };
         self.control
             .put_record("node-config", b"protected-root", &canonical_bytes(&root)?)?;
@@ -952,6 +959,12 @@ impl Node {
         let root = self
             .protected_root()?
             .context("this node has no protected root")?;
+        let current_filesystem = filesystem_identity(&root.path)?;
+        if current_filesystem.device != root.filesystem_device
+            || current_filesystem.mount_id != root.filesystem_mount_id
+        {
+            anyhow::bail!("protected root filesystem identity changed");
+        }
         let local_head = self
             .control
             .get_record("user-revision-head", &guild_id)?
@@ -1363,11 +1376,8 @@ impl Node {
             holder: self.keys.node_id(),
         };
         acknowledgement.validate()?;
-        let acknowledgement = SignedRecord::sign(
-            b"mutualbackup/storage-acknowledgement/v1",
-            acknowledgement,
-            &self.keys,
-        )?;
+        let acknowledgement =
+            SignedRecord::sign(STORAGE_ACKNOWLEDGEMENT_DOMAIN, acknowledgement, &self.keys)?;
         self.parity.stage_and_publish_ack(
             object,
             &canonical_bytes(&acknowledgement)?,
@@ -1729,7 +1739,7 @@ impl Node {
             endpoints,
             expires_at_unix_seconds,
         };
-        let signed = SignedRecord::sign(b"mutualbackup/recovery-locator/v1", locator, &self.keys)?;
+        let signed = SignedRecord::sign(RECOVERY_LOCATOR_DOMAIN, locator, &self.keys)?;
         Ok(seal_recovery_record(
             subject.recovery_public_key,
             &canonical_bytes(&signed)?,

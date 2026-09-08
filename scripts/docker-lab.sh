@@ -414,6 +414,7 @@ p2p_external_addresses = ["/ip4/$(node_ip "$node")/udp/$(node_port "$node")/quic
 p2p_bootstrap_addresses = $bootstrap
 p2p_relay_addresses = $relay
 enable_relay_server = $relay_server
+enable_dht_maintenance = true
 EOF
 }
 
@@ -444,6 +445,7 @@ p2p_external_addresses = ["/ip4/$(node_ip "$node")/udp/$(node_port "$node")/quic
 p2p_bootstrap_addresses = ["$(peer_endpoint "$bootstrap_node")"]
 p2p_relay_addresses = $relay
 enable_relay_server = $relay_server
+enable_dht_maintenance = true
 EOF
 }
 

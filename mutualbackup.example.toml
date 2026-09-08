@@ -38,3 +38,8 @@ enable_relay_server = false
 
 # DCUtR upgrades relay circuits to direct QUIC when both peers can punch through.
 enable_hole_punching = true
+
+# Disable only for static/server-only deployments which deliberately do not
+# bootstrap, publish, or refresh through the DHT. The node still serves DHT
+# and application requests. Normal nodes should leave this true.
+enable_dht_maintenance = true

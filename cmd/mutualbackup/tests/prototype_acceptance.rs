@@ -188,7 +188,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         set_private(&peer_dir);
         let seed = seed_dir.join(format!("p{index}.seed"));
         let config = peer_dir.join("node.toml");
-        let socket = peer_dir.join("control.sock");
+        let socket = peer_dir.join("c");
         let mut args = vec![
             os("--socket"),
             socket.as_os_str().to_owned(),
@@ -378,7 +378,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     let recovered_dir = run_root.join("recovered");
     fs::create_dir(&recovered_dir).unwrap();
     set_private(&recovered_dir);
-    let recovered_socket = recovered_dir.join("control.sock");
+    let recovered_socket = recovered_dir.join("c");
     let recovered_config = recovered_dir.join("node.toml");
     let bootstrap = format!("{}/p2p/{}", transports[0], peer_ids[0]);
     run_cli(
@@ -454,7 +454,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     let storage_recovered_dir = run_root.join("storage-recovered");
     fs::create_dir(&storage_recovered_dir).unwrap();
     set_private(&storage_recovered_dir);
-    let storage_recovered_socket = storage_recovered_dir.join("control.sock");
+    let storage_recovered_socket = storage_recovered_dir.join("c");
     let storage_recovered_config = storage_recovered_dir.join("node.toml");
     run_cli(
         &[
@@ -504,29 +504,50 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     storage_recovered_daemon.stop();
 
     let relay = format!("{}/p2p/{}", transports[5], peer_ids[1]);
+    let coordinator_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[0]);
+    let punched_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[3]);
+    let fallback_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[4]);
     update_config(&recovered_config, |config| {
         config.enable_relay_server = true
     });
+    update_config(&configs[0], |config| {
+        config.p2p_bootstrap_addresses = vec![punched_circuit.clone(), fallback_circuit.clone()];
+        config.p2p_relay_addresses = vec![relay.clone()];
+        config.enable_dht_maintenance = false;
+    });
     update_config(&configs[3], |config| {
         config.p2p_listen_addresses = vec![transports[6].clone()];
-        config.p2p_external_addresses = vec![transports[3].clone()];
+        config.p2p_external_addresses.clear();
+        config.p2p_bootstrap_addresses.clear();
         config.p2p_relay_addresses = vec![relay.clone()];
         config.enable_hole_punching = true;
+        config.enable_dht_maintenance = false;
     });
     update_config(&storage_recovered_config, |config| {
         config.p2p_listen_addresses.clear();
         config.p2p_external_addresses.clear();
+        config.p2p_bootstrap_addresses.clear();
         config.p2p_relay_addresses = vec![relay.clone()];
         config.enable_hole_punching = false;
+        config.enable_dht_maintenance = false;
     });
 
-    daemons[0].start();
-    wait_for_status(&sockets[0], &mut daemons[0], Duration::from_secs(30));
+    // Bring the relay up first, then let the dialing peer obtain its own
+    // reservation before the remote circuit endpoints appear. DCUtR requires
+    // both peers to have a live reservation; dialing all five daemons at once
+    // turns that protocol precondition into a startup race.
     recovered_daemon.start();
     wait_for_status(
         &recovered_socket,
         &mut recovered_daemon,
         Duration::from_secs(30),
+    );
+    daemons[0].start();
+    wait_for_status_text(
+        &sockets[0],
+        &mut daemons[0],
+        "/p2p-circuit",
+        Duration::from_secs(45),
     );
     daemons[2].start();
     daemons[3].start();
@@ -550,6 +571,12 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         "/p2p-circuit",
         Duration::from_secs(45),
     );
+    wait_for_status_text(
+        &sockets[0],
+        &mut daemons[0],
+        "HolePunched",
+        Duration::from_secs(45),
+    );
 
     let final_owner_two = deterministic_bytes(512_031, 83);
     fs::write(
@@ -566,23 +593,72 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         "Direct",
         Duration::from_secs(30),
     );
-    wait_for_peer_bytes(
+    wait_for_peer_transfer(
         &sockets[0],
         &mut daemons[0],
         &peer_ids[3],
+        "HolePunched",
         Duration::from_secs(30),
     );
-    wait_for_peer_bytes(
+
+    // A no-listener node can still establish a direct outbound QUIC session.
+    // Restart both ends without direct listeners to make the retained circuit
+    // the only viable transport for the relay-fallback assertion.
+    daemons[0].stop();
+    update_config(&configs[0], |config| {
+        config.p2p_listen_addresses.clear();
+        config.p2p_external_addresses.clear();
+        config.p2p_bootstrap_addresses = vec![punched_circuit.clone(), fallback_circuit.clone()];
+        config.p2p_relay_addresses = vec![relay.clone()];
+        config.enable_hole_punching = false;
+    });
+    daemons[0].start();
+    wait_for_status_text(
+        &sockets[0],
+        &mut daemons[0],
+        "/p2p-circuit",
+        Duration::from_secs(45),
+    );
+    wait_for_status_text(
+        &storage_recovered_socket,
+        &mut storage_recovered_daemon,
+        &peer_ids[0],
+        Duration::from_secs(45),
+    );
+    // The owner learned the coordinator's old direct endpoint before this
+    // topology change. Restart it with the coordinator's circuit address so
+    // job submission itself does not fail before the parity route is tested.
+    daemons[2].stop();
+    update_config(&configs[2], |config| {
+        config.p2p_bootstrap_addresses = vec![coordinator_circuit];
+        config.enable_dht_maintenance = false;
+    });
+    daemons[2].start();
+    wait_for_status_text(
+        &sockets[2],
+        &mut daemons[2],
+        &peer_ids[0],
+        Duration::from_secs(45),
+    );
+    fs::write(
+        owner_two_source.join("documents/data.bin"),
+        deterministic_bytes(512_047, 89),
+    )
+    .unwrap();
+    let relay_backup = cli(&sockets[2], ["backup", "--wait"], Duration::from_secs(180));
+    assert!(relay_backup.contains("state:      Committed"));
+    wait_for_peer_transfer(
         &sockets[0],
         &mut daemons[0],
         &peer_ids[4],
+        "RelayFallback",
         Duration::from_secs(30),
     );
 
     let outsider_dir = run_root.join("outsider");
     fs::create_dir(&outsider_dir).unwrap();
     set_private(&outsider_dir);
-    let outsider_socket = outsider_dir.join("control.sock");
+    let outsider_socket = outsider_dir.join("c");
     let outsider_config = outsider_dir.join("node.toml");
     run_cli(
         &[
@@ -662,6 +738,7 @@ impl DhtNoise {
                         external_addresses: Vec::new(),
                         bootstrap_addresses: vec![bootstrap.parse().unwrap()],
                         relay_reservation_addresses: Vec::new(),
+                        enable_dht_maintenance: true,
                         enable_relay_server: false,
                         enable_hole_punching: true,
                         public_endpoint: "/ip4/127.0.0.1/udp/0/quic-v1".into(),
@@ -907,28 +984,6 @@ fn wait_for_peer_transfer(
         assert!(
             Instant::now() < deadline,
             "peer {peer_id} never transferred over {path}:\n{status}"
-        );
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn wait_for_peer_bytes(socket: &Path, daemon: &mut Daemon, peer_id: &str, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let status = wait_for_status(socket, daemon, Duration::from_secs(5));
-        if let Some(line) = status.lines().find(|line| {
-            line.strip_prefix("peer connection: ")
-                .is_some_and(|tail| tail.starts_with(peer_id))
-        }) {
-            let sent = numeric_status_field(line, "sent=");
-            let received = numeric_status_field(line, "received=");
-            if sent.is_some_and(|bytes| bytes > 0) && received.is_some_and(|bytes| bytes > 0) {
-                return;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "peer {peer_id} never transferred application bytes:\n{status}"
         );
         thread::sleep(Duration::from_millis(100));
     }
