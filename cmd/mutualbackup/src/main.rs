@@ -229,6 +229,18 @@ async fn main() -> Result<()> {
             }
             if let Some(network) = status.network {
                 println!("libp2p peer id: {}", network.peer_id);
+                println!("network ready:  {}", network.network_ready);
+                println!(
+                    "direct listeners: {}/{}",
+                    network.direct_listeners_active, network.direct_listeners_configured
+                );
+                println!(
+                    "relay reservations: {}/{}",
+                    network.relay_reservations_active, network.relay_reservations_configured
+                );
+                for reason in network.degraded {
+                    println!("network degraded: {reason}");
+                }
                 for address in network.listen_addresses {
                     println!("listen address: {address}");
                 }

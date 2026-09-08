@@ -165,7 +165,13 @@ struct GenesisSignatureLock {
 struct InstalledGuild {
     format_version: u16,
     certificate: QuorumGuildGenesis,
-    peers: Vec<GuildPeer>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct GuildEndpointCache {
+    format_version: u16,
+    guild_id: [u8; 32],
+    endpoints: Vec<(NodeId, Vec<String>)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -256,13 +262,12 @@ impl NodeReader {
         &self,
         guild_id: [u8; 32],
     ) -> Result<QuorumGuildGenesis> {
-        let installed: InstalledGuild = decode_canonical(
+        let installed = decode_installed_guild(
             &self
                 .control
                 .get_record("guild-installed", b"primary")?
                 .context("this node has no installed guild")?,
         )?;
-        installed.certificate.verify()?;
         if installed.certificate.genesis.guild_id != guild_id {
             anyhow::bail!("requested guild differs from installed guild");
         }
@@ -616,8 +621,8 @@ impl Node {
         }
         if let Some(installed) = self.installed_guild()? {
             if installed.certificate.genesis.guild_id == invite.value.guild_id {
-                return installed
-                    .peers
+                return self
+                    .guild_peers(&installed)?
                     .into_iter()
                     .find(|peer| peer.member.node_id == self.keys.node_id())
                     .context("installed guild omits the local peer");
@@ -800,18 +805,34 @@ impl Node {
             anyhow::bail!("guild certificate does not contain the locked local signature");
         }
         let installed = InstalledGuild {
-            format_version: 1,
+            format_version: 2,
             certificate,
-            peers,
         };
         if let Some(existing) = self.installed_guild()? {
-            if existing == installed {
-                return Ok(());
+            if existing != installed {
+                anyhow::bail!("this node already has a different installed guild");
             }
-            anyhow::bail!("this node already has a different installed guild");
+            let endpoint_cache = self.merged_guild_endpoint_cache(&installed, peers)?;
+            self.control.put_record(
+                "guild-endpoints",
+                b"primary",
+                &canonical_bytes(&endpoint_cache)?,
+            )?;
+            return Ok(());
         }
-        self.control
-            .put_record("guild-installed", b"primary", &canonical_bytes(&installed)?)?;
+        let endpoint_cache = self.merged_guild_endpoint_cache(&installed, peers)?;
+        self.control.put_records(&[
+            (
+                "guild-installed".to_owned(),
+                b"primary".to_vec(),
+                canonical_bytes(&installed)?,
+            ),
+            (
+                "guild-endpoints".to_owned(),
+                b"primary".to_vec(),
+                canonical_bytes(&endpoint_cache)?,
+            ),
+        ])?;
         Ok(())
     }
 
@@ -858,14 +879,12 @@ impl Node {
             signature: local_signature,
         };
         let installed = InstalledGuild {
-            format_version: 1,
+            format_version: 2,
             certificate,
-            peers,
         };
-        if let Some(existing) = self.installed_guild()? {
-            if existing == installed {
-                return Ok(());
-            }
+        if let Some(existing) = self.installed_guild()?
+            && existing != installed
+        {
             anyhow::bail!("this node already has different guild state");
         }
         if let Some(bytes) = self.control.get_record("node-config", b"member")? {
@@ -874,6 +893,7 @@ impl Node {
                 anyhow::bail!("configured member conflicts with recovered guild membership");
             }
         }
+        let endpoint_cache = self.merged_guild_endpoint_cache(&installed, peers)?;
         self.control.put_records(&[
             (
                 "node-config".to_owned(),
@@ -891,6 +911,11 @@ impl Node {
                 canonical_bytes(&installed)?,
             ),
             (
+                "guild-endpoints".to_owned(),
+                b"primary".to_vec(),
+                canonical_bytes(&endpoint_cache)?,
+            ),
+            (
                 "dht-recovery-sequence-probe".to_owned(),
                 b"primary".to_vec(),
                 canonical_bytes(&true)?,
@@ -906,7 +931,7 @@ impl Node {
                 guild_id: installed.certificate.genesis.guild_id,
                 coordinator: installed.certificate.genesis.coordinator,
                 phase: GuildPhase::Active,
-                peers: installed.peers,
+                peers: self.guild_peers(&installed)?,
             }));
         }
         if let Some(draft) = self.guild_draft()? {
@@ -1204,8 +1229,101 @@ impl Node {
     fn installed_guild(&self) -> Result<Option<InstalledGuild>> {
         self.control
             .get_record("guild-installed", b"primary")?
+            .map(|bytes| decode_installed_guild(&bytes))
+            .transpose()
+    }
+
+    fn guild_endpoint_cache(&self) -> Result<Option<GuildEndpointCache>> {
+        self.control
+            .get_record("guild-endpoints", b"primary")?
             .map(|bytes| decode_canonical(&bytes).map_err(Into::into))
             .transpose()
+    }
+
+    fn merged_guild_endpoint_cache(
+        &self,
+        installed: &InstalledGuild,
+        peers: Vec<GuildPeer>,
+    ) -> Result<GuildEndpointCache> {
+        let guild_id = installed.certificate.genesis.guild_id;
+        let mut endpoints = match self.guild_endpoint_cache()? {
+            Some(cache) => {
+                if cache.format_version != 1 || cache.guild_id != guild_id {
+                    anyhow::bail!("cached guild endpoints belong to different guild state");
+                }
+                cache.endpoints.into_iter().collect::<BTreeMap<_, _>>()
+            }
+            None => BTreeMap::new(),
+        };
+        for peer in peers {
+            if !installed
+                .certificate
+                .genesis
+                .members
+                .iter()
+                .any(|member| member.node_id == peer.member.node_id)
+            {
+                anyhow::bail!("endpoint cache contains a nonmember");
+            }
+            if !peer.endpoints.is_empty() {
+                endpoints.insert(peer.member.node_id, peer.endpoints);
+            } else {
+                endpoints.entry(peer.member.node_id).or_default();
+            }
+        }
+        Ok(GuildEndpointCache {
+            format_version: 1,
+            guild_id,
+            endpoints: installed
+                .certificate
+                .genesis
+                .members
+                .iter()
+                .map(|member| {
+                    (
+                        member.node_id,
+                        endpoints.remove(&member.node_id).unwrap_or_default(),
+                    )
+                })
+                .collect(),
+        })
+    }
+
+    fn guild_peers(&self, installed: &InstalledGuild) -> Result<Vec<GuildPeer>> {
+        if installed.format_version != 2 {
+            anyhow::bail!("unsupported installed guild format version");
+        }
+        let cache = self
+            .guild_endpoint_cache()?
+            .context("installed guild has no endpoint cache")?;
+        if cache.format_version != 1
+            || cache.guild_id != installed.certificate.genesis.guild_id
+            || cache.endpoints.len() != installed.certificate.genesis.members.len()
+        {
+            anyhow::bail!("installed guild endpoint cache is inconsistent");
+        }
+        let mut endpoints = cache.endpoints.into_iter().collect::<BTreeMap<_, _>>();
+        if endpoints.len() != installed.certificate.genesis.members.len() {
+            anyhow::bail!("installed guild endpoint cache contains duplicate members");
+        }
+        installed
+            .certificate
+            .genesis
+            .members
+            .iter()
+            .map(|member| {
+                let endpoints = endpoints
+                    .remove(&member.node_id)
+                    .context("installed guild endpoint cache omits a member")?;
+                if !endpoints.is_empty() {
+                    validate_endpoint_set(member.node_id, &endpoints)?;
+                }
+                Ok(GuildPeer {
+                    member: member.clone(),
+                    endpoints,
+                })
+            })
+            .collect()
     }
 
     fn ensure_no_guild_state(&self) -> Result<()> {
@@ -2051,7 +2169,7 @@ impl Node {
         }
         .cloned()
         .context("requested snapshot is unavailable for this node")?;
-        Ok((checkpoint, revision, installed.peers))
+        Ok((checkpoint, revision, self.guild_peers(&installed)?))
     }
 
     pub(crate) fn install_repaired_information_sector(
@@ -2421,10 +2539,18 @@ impl Node {
     }
 }
 
+fn decode_installed_guild(bytes: &[u8]) -> Result<InstalledGuild> {
+    let installed: InstalledGuild = decode_canonical(bytes)?;
+    if installed.format_version != 2 {
+        anyhow::bail!("unsupported installed guild format version");
+    }
+    installed.certificate.verify()?;
+    Ok(installed)
+}
+
 fn authorize_member(control: &ControlStore, guild_id: &[u8; 32], caller: NodeId) -> Result<()> {
     if let Some(bytes) = control.get_record("guild-installed", b"primary")? {
-        let installed: InstalledGuild = decode_canonical(&bytes)?;
-        installed.certificate.verify()?;
+        let installed = decode_installed_guild(&bytes)?;
         if installed.certificate.genesis.guild_id != *guild_id
             || !installed
                 .certificate
@@ -2458,8 +2584,7 @@ fn guild_coordinator(control: &ControlStore, guild_id: &[u8; 32]) -> Result<Opti
     let Some(bytes) = control.get_record("guild-installed", b"primary")? else {
         return Ok(None);
     };
-    let installed: InstalledGuild = decode_canonical(&bytes)?;
-    installed.certificate.verify()?;
+    let installed = decode_installed_guild(&bytes)?;
     if installed.certificate.genesis.guild_id != *guild_id {
         anyhow::bail!("requested guild differs from installed guild");
     }
@@ -2629,6 +2754,58 @@ fn set_private_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn recovery_guild_fixture() -> (Seed, QuorumGuildGenesis, Vec<GuildPeer>) {
+        let mut identities = (0_u8..5)
+            .map(|index| {
+                let seed = Seed::from_bytes([index + 120; 32]);
+                let keys = KeyMaterial::from_seed(&seed);
+                (keys.node_id(), seed, keys.recovery_public_key())
+            })
+            .collect::<Vec<_>>();
+        identities.sort_by_key(|(node_id, _, _)| *node_id);
+        let members = identities
+            .iter()
+            .enumerate()
+            .map(|(index, (node_id, _, recovery_public_key))| Member {
+                node_id: *node_id,
+                recovery_public_key: *recovery_public_key,
+                failure_domain: format!("recovery-domain-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let genesis = GuildGenesis {
+            format_version: 1,
+            guild_id: [121; 32],
+            coordinator: members[0].node_id,
+            members: members.clone(),
+        };
+        let signatures = identities
+            .iter()
+            .map(|(_, seed, _)| {
+                genesis
+                    .member_signature(&KeyMaterial::from_seed(seed))
+                    .unwrap()
+            })
+            .collect();
+        let certificate = QuorumGuildGenesis {
+            genesis,
+            signatures,
+        };
+        certificate.verify().unwrap();
+        let peers = members
+            .into_iter()
+            .enumerate()
+            .map(|(index, member)| GuildPeer {
+                endpoints: vec![format!(
+                    "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}",
+                    41_000 + index,
+                    member.node_id.libp2p_peer_id().unwrap()
+                )],
+                member,
+            })
+            .collect();
+        (identities[2].1.clone(), certificate, peers)
+    }
+
     #[test]
     fn data_directory_has_one_live_owner() {
         let temp = tempfile::tempdir().unwrap();
@@ -2659,6 +2836,57 @@ mod tests {
         node.configure_failure_domain("host-a").unwrap();
         node.configure_failure_domain("host-a").unwrap();
         assert!(node.configure_failure_domain("host-b").is_err());
+    }
+
+    #[test]
+    fn recovered_guild_retry_merges_endpoint_churn() {
+        let temp = tempfile::tempdir().unwrap();
+        let (local_seed, certificate, first_peers) = recovery_guild_fixture();
+        let mut node = Node::open(temp.path(), local_seed).unwrap();
+        node.adopt_recovered_guild(certificate.clone(), first_peers.clone())
+            .unwrap();
+
+        let mut changed_peers = first_peers.clone();
+        let changed_member = changed_peers[0].member.node_id;
+        let changed_endpoint = format!(
+            "/ip4/127.0.0.1/udp/42000/quic-v1/p2p/{}",
+            changed_member.libp2p_peer_id().unwrap()
+        );
+        changed_peers[0].endpoints = vec![changed_endpoint.clone()];
+        node.adopt_recovered_guild(certificate.clone(), changed_peers)
+            .unwrap();
+        let changed_summary = node.guild_summary().unwrap().unwrap();
+        assert_eq!(
+            changed_summary
+                .peers
+                .iter()
+                .find(|peer| peer.member.node_id == changed_member)
+                .unwrap()
+                .endpoints
+                .as_slice(),
+            std::slice::from_ref(&changed_endpoint)
+        );
+
+        let unavailable_peers = first_peers
+            .into_iter()
+            .map(|mut peer| {
+                peer.endpoints.clear();
+                peer
+            })
+            .collect();
+        node.adopt_recovered_guild(certificate, unavailable_peers)
+            .unwrap();
+        let resumed_summary = node.guild_summary().unwrap().unwrap();
+        assert_eq!(
+            resumed_summary
+                .peers
+                .iter()
+                .find(|peer| peer.member.node_id == changed_member)
+                .unwrap()
+                .endpoints
+                .as_slice(),
+            std::slice::from_ref(&changed_endpoint)
+        );
     }
 
     #[test]

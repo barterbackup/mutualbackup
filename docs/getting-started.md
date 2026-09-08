@@ -233,6 +233,11 @@ for i in 0 1 2 3 4; do
 done
 ```
 
+The daemon prints `ready` only after at least one configured direct listener or
+relay reservation is active. `status` reports configured and active counts for
+both ingress types and names degraded transports. Loss of the last direct-only
+listener terminates the daemon; relay reservations are supervised and retried.
+
 If one fails, inspect its `daemon.log`. Common causes are a reused UDP port, a
 second process using the same `data_dir`, or a non-private control-socket
 directory.

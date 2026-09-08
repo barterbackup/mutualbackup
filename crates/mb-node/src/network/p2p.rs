@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -104,10 +104,25 @@ pub struct P2pPeerStatus {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct P2pStatus {
     pub peer_id: String,
+    pub network_ready: bool,
+    pub direct_listeners_configured: usize,
+    pub direct_listeners_active: usize,
+    pub relay_reservations_configured: usize,
+    pub relay_reservations_active: usize,
+    pub degraded: Vec<String>,
     pub listen_addresses: Vec<String>,
     pub advertised_addresses: Vec<String>,
     pub peers: Vec<P2pPeerStatus>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct P2pStartup {
+    pub direct_listeners_active: usize,
+    pub relay_reservations_active: usize,
+    pub degraded: Vec<String>,
+}
+
+pub type P2pStartupReceiver = oneshot::Receiver<std::result::Result<P2pStartup, String>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DhtRecord {
@@ -134,11 +149,15 @@ pub struct P2pEventLoop {
     service: Arc<NodeService>,
     server_config: NodeServerConfig,
     advertised_addresses: Vec<Multiaddr>,
+    direct_listeners: HashMap<ListenerId, Multiaddr>,
+    active_direct_listeners: HashSet<ListenerId>,
+    closed_direct_listeners: HashSet<ListenerId>,
     bootstrap_addresses: Vec<Multiaddr>,
     enable_dht_maintenance: bool,
     bootstrap_retry: tokio::time::Interval,
     relay_reservations: Vec<Multiaddr>,
     relay_listeners: HashMap<ListenerId, Multiaddr>,
+    active_relay_listeners: HashSet<ListenerId>,
     relay_retry: tokio::time::Interval,
     relay_retirement: HashMap<ConnectionId, (PeerId, tokio::time::Instant)>,
     relay_retirement_tick: tokio::time::Interval,
@@ -149,6 +168,9 @@ pub struct P2pEventLoop {
     connection_paths: HashMap<ConnectionId, (PeerId, P2pPath)>,
     last_application_paths: HashMap<PeerId, P2pPath>,
     transfer_counters: HashMap<PeerId, TransferCounters>,
+    startup_sender: Option<oneshot::Sender<std::result::Result<P2pStartup, String>>>,
+    startup_receiver: Option<P2pStartupReceiver>,
+    fatal_error: Option<String>,
 }
 
 #[derive(NetworkBehaviour)]
@@ -395,10 +417,12 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(120)))
         .build();
 
+    let mut direct_listeners = HashMap::new();
     for address in &config.listen_addresses {
-        swarm
+        let listener = swarm
             .listen_on(address.clone())
             .with_context(|| format!("cannot listen on {address}"))?;
+        direct_listeners.insert(listener, address.clone());
     }
     for address in &config.external_addresses {
         // DCUtR currently learns dial candidates from
@@ -466,6 +490,7 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
     };
     let (command_sender, command_receiver) = mpsc::channel(COMMAND_CAPACITY);
     let (inbound_sender, inbound_results) = mpsc::channel(COMMAND_CAPACITY);
+    let (startup_sender, startup_receiver) = oneshot::channel();
     Ok((
         P2pClient {
             local_peer_id,
@@ -484,11 +509,15 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
             service,
             server_config,
             advertised_addresses: config.external_addresses,
+            direct_listeners,
+            active_direct_listeners: HashSet::new(),
+            closed_direct_listeners: HashSet::new(),
             bootstrap_addresses: config.bootstrap_addresses,
             enable_dht_maintenance: config.enable_dht_maintenance,
             bootstrap_retry: retry_interval(BOOTSTRAP_RETRY_INTERVAL),
             relay_reservations,
             relay_listeners,
+            active_relay_listeners: HashSet::new(),
             relay_retry: retry_interval(RELAY_RESERVATION_RETRY_INTERVAL),
             relay_retirement: HashMap::new(),
             relay_retirement_tick: retry_interval(RELAY_RETIREMENT_POLL_INTERVAL),
@@ -499,6 +528,9 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
             connection_paths: HashMap::new(),
             last_application_paths: HashMap::new(),
             transfer_counters: HashMap::new(),
+            startup_sender: Some(startup_sender),
+            startup_receiver: Some(startup_receiver),
+            fatal_error: None,
         },
     ))
 }
@@ -977,7 +1009,22 @@ impl P2pClient {
 }
 
 impl P2pEventLoop {
+    pub fn take_startup_receiver(&mut self) -> Result<P2pStartupReceiver> {
+        self.startup_receiver
+            .take()
+            .context("libp2p startup receiver was already taken")
+    }
+
     pub async fn run(mut self) -> Result<()> {
+        drop(self.startup_receiver.take());
+        let result = self.run_inner().await;
+        if let Err(error) = &result {
+            self.fail_startup(format!("{error:#}"));
+        }
+        result
+    }
+
+    async fn run_inner(&mut self) -> Result<()> {
         loop {
             tokio::select! {
                 Some(command) = self.commands.recv() => {
@@ -1023,8 +1070,55 @@ impl P2pEventLoop {
                 _ = self.learned_endpoint_expiry.tick(), if !self.learned_addresses.is_empty() => {
                     self.expire_learned_addresses();
                 }
-                event = self.swarm.select_next_some() => self.handle_swarm_event(event),
+                event = self.swarm.select_next_some() => {
+                    self.handle_swarm_event(event);
+                    if let Some(error) = self.fatal_error.take() {
+                        bail!(error);
+                    }
+                },
             }
+        }
+    }
+
+    fn network_ready(&self) -> bool {
+        !self.active_direct_listeners.is_empty() || !self.active_relay_listeners.is_empty()
+    }
+
+    fn transport_degradation(&self) -> Vec<String> {
+        let mut degraded = Vec::new();
+        if self.active_direct_listeners.len() < self.direct_listeners.len() {
+            degraded.push(format!(
+                "direct listeners active {}/{}",
+                self.active_direct_listeners.len(),
+                self.direct_listeners.len()
+            ));
+        }
+        if self.active_relay_listeners.len() < self.relay_reservations.len() {
+            degraded.push(format!(
+                "relay reservations active {}/{}",
+                self.active_relay_listeners.len(),
+                self.relay_reservations.len()
+            ));
+        }
+        degraded
+    }
+
+    fn complete_startup_if_ready(&mut self) {
+        if !self.network_ready() {
+            return;
+        }
+        if let Some(sender) = self.startup_sender.take() {
+            let _ = sender.send(Ok(P2pStartup {
+                direct_listeners_active: self.active_direct_listeners.len(),
+                relay_reservations_active: self.active_relay_listeners.len(),
+                degraded: self.transport_degradation(),
+            }));
+        }
+    }
+
+    fn fail_startup(&mut self, error: String) {
+        if let Some(sender) = self.startup_sender.take() {
+            let _ = sender.send(Err(error));
         }
     }
 
@@ -1288,6 +1382,12 @@ impl P2pEventLoop {
                 peers.sort_by(|left, right| left.peer_id.cmp(&right.peer_id));
                 let _ = response.send(P2pStatus {
                     peer_id: self.swarm.local_peer_id().to_string(),
+                    network_ready: self.network_ready(),
+                    direct_listeners_configured: self.direct_listeners.len(),
+                    direct_listeners_active: self.active_direct_listeners.len(),
+                    relay_reservations_configured: self.relay_reservations.len(),
+                    relay_reservations_active: self.active_relay_listeners.len(),
+                    degraded: self.transport_degradation(),
                     listen_addresses,
                     advertised_addresses,
                     peers,
@@ -1446,7 +1546,17 @@ impl P2pEventLoop {
             SwarmEvent::Behaviour(BehaviourEvent::Autonat(event)) => {
                 tracing::debug!(?event, "AutoNAT event");
             }
-            SwarmEvent::NewListenAddr { address, .. } => {
+            SwarmEvent::NewListenAddr {
+                listener_id,
+                address,
+            } => {
+                if self.direct_listeners.contains_key(&listener_id) {
+                    self.active_direct_listeners.insert(listener_id);
+                }
+                if self.relay_listeners.contains_key(&listener_id) {
+                    self.active_relay_listeners.insert(listener_id);
+                }
+                self.complete_startup_if_ready();
                 tracing::info!(%address, "libp2p listening");
             }
             event @ SwarmEvent::ListenerError { .. } => {
@@ -1457,7 +1567,23 @@ impl P2pEventLoop {
                 addresses,
                 reason,
             } => {
-                self.relay_listeners.remove(&listener_id);
+                let direct = self.direct_listeners.contains_key(&listener_id);
+                if direct {
+                    self.active_direct_listeners.remove(&listener_id);
+                    self.closed_direct_listeners.insert(listener_id);
+                }
+                if self.relay_listeners.remove(&listener_id).is_some() {
+                    self.active_relay_listeners.remove(&listener_id);
+                }
+                let direct_exhausted = !self.direct_listeners.is_empty()
+                    && self.active_direct_listeners.is_empty()
+                    && self.closed_direct_listeners.len() == self.direct_listeners.len();
+                if direct_exhausted && self.relay_reservations.is_empty() {
+                    let error =
+                        format!("all configured direct libp2p listeners closed: {reason:?}");
+                    self.fail_startup(error.clone());
+                    self.fatal_error = Some(error);
+                }
                 tracing::warn!(?listener_id, ?addresses, ?reason, "libp2p listener closed");
             }
             SwarmEvent::ConnectionEstablished {

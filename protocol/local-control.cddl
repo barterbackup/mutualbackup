@@ -62,6 +62,12 @@ protected-root = {
 
 p2p-status = {
   peer_id: tstr,
+  network_ready: bool,
+  direct_listeners_configured: uint,
+  direct_listeners_active: uint,
+  relay_reservations_configured: uint,
+  relay_reservations_active: uint,
+  degraded: [* tstr],
   listen_addresses: [* tstr],
   advertised_addresses: [* tstr],
   peers: [* p2p-peer-status]

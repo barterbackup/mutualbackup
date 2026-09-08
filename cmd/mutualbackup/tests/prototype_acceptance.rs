@@ -206,6 +206,60 @@ fn init_resumes_after_seed_install_without_replacing_outputs() {
 }
 
 #[test]
+fn daemon_never_reports_ready_when_its_only_listener_cannot_start() {
+    let temp = tempfile::tempdir().unwrap();
+    set_private(temp.path());
+    let data_dir = temp.path().join("state");
+    let seed_file = temp.path().join("node.seed");
+    run_cli_with_input(
+        &[
+            os("init"),
+            os("--seed-stdin"),
+            os("--seed-file"),
+            seed_file.as_os_str().to_owned(),
+            os("--data-dir"),
+            data_dir.as_os_str().to_owned(),
+        ],
+        b"listener-readiness-recovery-string-2027!",
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+    let occupied = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = format!(
+        "/ip4/127.0.0.1/udp/{}/quic-v1",
+        occupied.local_addr().unwrap().port()
+    );
+    let output = run_output(
+        env!("CARGO_BIN_EXE_mutualbackupd"),
+        &[
+            os("--data-dir"),
+            data_dir.as_os_str().to_owned(),
+            os("--seed-file"),
+            seed_file.as_os_str().to_owned(),
+            os("--control-socket"),
+            temp.path().join("control.sock").into_os_string(),
+            os("--failure-domain"),
+            os("listener-readiness-test"),
+            os("--listen"),
+            os(address),
+        ],
+        Duration::from_secs(40),
+    )
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains(" ready"),
+        "daemon falsely reported readiness:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("libp2p"),
+        "unexpected daemon error:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn daemon_accepts_config_only_and_flag_overrides() {
     let temp = tempfile::tempdir().unwrap();
     set_private(temp.path());

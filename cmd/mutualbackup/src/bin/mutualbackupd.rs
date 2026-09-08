@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use libp2p::Multiaddr;
@@ -33,7 +34,7 @@ async fn main() -> Result<()> {
     }
     let locked_data_dir = Node::lock_data_dir(&config.data_dir)?;
     let listener = bind_local_control(&config.control_socket)?;
-    let (node, p2p_client, p2p_event_loop) = match &config.seed_file {
+    let (node, p2p_client, mut p2p_event_loop, unlock_connection) = match &config.seed_file {
         Some(seed_file) => {
             let seed_file = seed_file.clone();
             let open_config = config.clone();
@@ -45,7 +46,8 @@ async fn main() -> Result<()> {
             })
             .await
             .context("automatic unlock worker failed")??;
-            start_node_runtime(&config, &identity, node)?
+            let (node, client, event_loop) = start_node_runtime(&config, &identity, node)?;
+            (node, client, event_loop, None)
         }
         None => {
             println!("node {} locked", identity.expected_node_id);
@@ -56,15 +58,7 @@ async fn main() -> Result<()> {
                         .await?;
                 match start_node_runtime(&config, &identity, node) {
                     Ok(runtime) => {
-                        if let Err(error) = connection
-                            .respond(LocalResponse::Unlocked {
-                                node_id: identity.expected_node_id,
-                            })
-                            .await
-                        {
-                            tracing::warn!(%error, "unlocking client disconnected before acknowledgement");
-                        }
-                        break runtime;
+                        break (runtime.0, runtime.1, runtime.2, Some(connection));
                     }
                     Err(error) => {
                         tracing::warn!(%error, "manual daemon unlock could not start node runtime");
@@ -79,8 +73,48 @@ async fn main() -> Result<()> {
             }
         }
     };
+    let startup_receiver = p2p_event_loop.take_startup_receiver()?;
+    let mut p2p_task = tokio::spawn(p2p_event_loop.run());
+    let startup = match tokio::time::timeout(Duration::from_secs(30), startup_receiver).await {
+        Ok(Ok(Ok(startup))) => startup,
+        Ok(Ok(Err(error))) => {
+            p2p_task.abort();
+            let error = anyhow::anyhow!("libp2p startup failed: {error}");
+            respond_unlock_failure(unlock_connection, &error).await;
+            return Err(error);
+        }
+        Ok(Err(_)) => {
+            let result = p2p_task
+                .await
+                .context("libp2p event-loop task failed before startup")?;
+            let error = result
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("libp2p event loop stopped before startup"));
+            respond_unlock_failure(unlock_connection, &error).await;
+            return Err(error);
+        }
+        Err(_) => {
+            p2p_task.abort();
+            let error = anyhow::anyhow!("libp2p startup timed out after 30 seconds");
+            respond_unlock_failure(unlock_connection, &error).await;
+            return Err(error);
+        }
+    };
+    if let Some(connection) = unlock_connection
+        && let Err(error) = connection
+            .respond(LocalResponse::Unlocked {
+                node_id: identity.expected_node_id,
+            })
+            .await
+    {
+        tracing::warn!(%error, "unlocking client disconnected before acknowledgement");
+    }
     let node_id = identity.expected_node_id;
     println!("node {node_id} ready");
+    println!(
+        "network ingress: direct={} relay={} degraded={:?}",
+        startup.direct_listeners_active, startup.relay_reservations_active, startup.degraded
+    );
     println!("libp2p peer id: {}", p2p_client.local_peer_id());
     println!("control socket: {}", config.control_socket.display());
 
@@ -89,11 +123,24 @@ async fn main() -> Result<()> {
         result = run_coordinator_jobs(node.clone(), p2p_client.clone()) => result,
         result = run_dht_publications(node.clone(), p2p_client.clone()), if config.enable_dht_maintenance => result,
         result = run_root_watcher(node.clone()) => result,
-        result = p2p_event_loop.run() => result,
+        result = &mut p2p_task => result.context("libp2p event-loop task failed")?,
         result = tokio::signal::ctrl_c() => {
             result?;
             Ok(())
         }
+    }
+}
+
+async fn respond_unlock_failure(
+    connection: Option<mb_node::LocalControlConnection>,
+    error: &anyhow::Error,
+) {
+    if let Some(connection) = connection
+        && let Err(response_error) = connection
+            .respond_error(WireError::operation(format!("{error:#}")))
+            .await
+    {
+        tracing::warn!(%response_error, "failed unlock client disconnected");
     }
 }
 
