@@ -1,50 +1,10 @@
-# Source-review TODO
+# Product TODO
 
-These are high-confidence defects in the implemented Milestone 1 slice. They
-are not a list of deferred product features.
+The source-review defects in the Milestone 1 slice are fixed and removed. The
+remaining items are accepted design and usability work, not claims about
+already implemented behavior.
 
-## Urgent before Milestone 2
-
-- Enforce the peer frame limit in the actual libp2p CBOR codec. The production
-  behaviour uses the dependency defaults (1 MiB requests and 10 MiB responses),
-  while the normative protocol and tests claim a 600 KiB application limit.
-  Configure both codec bounds explicitly and test rejection on the real path.
-- Make the learned endpoint cache replaceable, expiring, and bounded. Each DHT
-  refresh currently appends the selected signed addresses to both the swarm and
-  Kademlia, but never removes addresses from superseded or expired records; a
-  long-lived peer can therefore accumulate stale dial targets without limit.
-- Re-arm filesystem watching after a protected root is removed and recreated.
-  The callback collapses every event and watcher error to the same dirty hint,
-  while `watch_once` has no root-health check that ends the stale watch. After a
-  successful reconciliation clears `dirty`, later edits to the replacement
-  directory can be missed.
-- Remove the blocking `Node` mutex acquisition from relay admission. The relay
-  rate-limiter callback runs synchronously while the swarm is being polled, but
-  it calls `node.lock()`; source capture and database operations can hold that
-  mutex on a blocking worker, pausing all peer networking and relay decisions.
-
-## Correctness and acceptance follow-ups
-
-- Make application byte counters report completed I/O, or rename them to state
-  that they count attempts. Outbound requests and responses are added before
-  `send_request`/`send_response` succeeds, so a failed or disconnected send is
-  currently reported as transferred data.
-- Correct the signed-record contract: `protocol/signed-records.md` specifies
-  `mutualbackup/storage-ack/v1`, but every signer and verifier uses
-  `mutualbackup/storage-acknowledgement/v1`. Add the recovery-locator signing
-  domain to the same normative table and make vectors pin both strings.
-- Make `root add` perform the complete probe promised by the plan and user docs.
-  The current probe checks basic `FICLONE` COW independence only; it does not
-  exercise `SEEK_DATA`/`SEEK_HOLE`, verify hole preservation, survive
-  rename/unlink, detect a mount-identity change, or reject nested filesystems.
-- Close the process-level route evidence gap. The focused test uses real
-  libp2p and proves application requests over direct, successful DCUtR, and
-  retained-relay paths, but the five-daemon acceptance test only forces the
-  direct path. Give its punched and relay-only peers topologies with no
-  independently established direct session and assert the reported route plus
-  successful backup/restore bytes.
-
-## Accepted design and usability work
+## Next milestone: configuration and local identity state
 
 These are accepted follow-ups from design critique, not defects in the current
 fixed-five profile.
@@ -65,6 +25,9 @@ fixed-five profile.
   reports its identity while locked, and checks the derived Node ID before
   opening SQLCipher. Unlock never creates or overwrites it. It remains fully
   seed-recoverable and is an accidental-mismatch guard, not protocol authority.
+
+## Later guild geometry and coding protocol
+
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
   to a shared disk, host, site, power source, operator, or provider—and no
@@ -96,8 +59,10 @@ fixed-five profile.
   input and output paths, strongly preferring a member of the coding group with
   proven direct connectivity to all sources and destinations; an information
   or parity participant saves one complete transfer, and a parity holder can
-  store one output locally. Direct and hole-punched paths are preferred, but
-  relay or onion fallback must retain availability. Candidate choice and
+  store one output locally. For a `k+m` group this reduces bulk shard transfers
+  from holder-side recomputation's `k*m` to `k+m`, or `k+m-1` when the
+  coordinator is a participant. Direct and hole-punched paths are preferred,
+  but relay or onion fallback must retain availability. Candidate choice and
   retries never affect group IDs, roots, or checkpoint bytes.
 - Give that coding coordinator a narrow, expiring, plan-scoped delegation. It
   streams each owner-encrypted information range exactly once, verifies its
@@ -109,16 +74,15 @@ fixed-five profile.
   input traffic.
 - Replace holder-side full parity recomputation with a durable two-role coding
   attempt. The certified checkpoint coordinator delegates one immutable plan to
-  distinct ephemeral encoder and verification coordinators; prefer a different
-  failure domain for the verifier, while weighting reachability less because its
-  traffic is small. Before encoding, the verifier commits to hidden random
-  challenge material. The encoder then receives every information range once,
-  signs the ordered input and output roots, and sends only each parity row to its
-  holder. Holders persist the root-bound bytes as genuinely `STAGED` and sign
-  storage receipts; only then may the verifier reveal a challenge derived from
-  its nonce and the frozen plan, roots, and receipts. Precommit fallback
-  verifiers so a timeout can inspect the same staged output without permitting
-  challenge or retry grinding.
+  distinct ephemeral coding and verification coordinators. The verifier may be
+  any reachable guild member except that attempt's coding coordinator;
+  reachability has low weight because verification traffic is small. Before
+  encoding, the verifier commits to hidden random challenge material. The coding
+  coordinator then receives every information range once, signs the ordered
+  input and output roots, and sends only each parity row to its holder. Holders
+  persist the root-bound bytes as genuinely `STAGED` and sign storage receipts;
+  only then may the verifier reveal a challenge derived from its nonce and the
+  frozen plan, roots, and receipts.
 - Add a canonical range commitment and sampled-RS transcript. The current flat
   `BLAKE3(bytes)` sector root cannot prove a 16-byte range. Specify a
   domain-separated Merkle/root suite, aligned sampling and proof-leaf sizes,
@@ -127,11 +91,15 @@ fixed-five profile.
   authenticate a bare substring that the tree did not separately commit. Every
   information and parity holder returns the same challenged range with a signed
   Merkle opening bound to the plan, attempt, root, shard index, verifier, and
-  challenge. The verifier checks the openings and computes only the challenged
-  RS symbols, never the complete parity rows, then publishes all openings in a
-  signed, replayable audit report. Every checkpoint signer verifies that
-  transcript rather than trusting a pass/fail bit. Keep staged-storage receipts,
-  sampled-coding evidence, and final activation as separate protocol facts.
+  challenge. Use one uniformly selected aligned 16-byte offset across every
+  shard, with 16-byte Merkle leaves, so each holder sends exactly that piece and
+  its path. The verifier receives no complete shard: it checks only those
+  openings and evaluates the 16-byte RS equation for each parity row
+  independently, never recomputing a parity sector. It then publishes all
+  openings in a signed, replayable audit report. Every checkpoint signer
+  verifies that transcript rather than trusting a pass/fail bit. Keep
+  staged-storage receipts, sampled-coding evidence, and final activation as
+  separate protocol facts.
 - State the sampling guarantee accurately. Among the 4,096 aligned 16-byte
   ranges in a 64 KiB shard, one uniformly random sample catches one bad range
   with probability only `1/4096`; its Merkle proof authenticates that sample but
@@ -141,16 +109,17 @@ fixed-five profile.
   threat model in protocol tests, retain independently challenged periodic
   audits, and choose a stronger audit policy or separately reviewed proof if
   sparse adversarial corruption must be excluded.
-- Make audit failure and cleanup evidence-driven. A valid opening that violates
-  the RS equation attributes the committed bad row to the encoder; an invalid
-  signed opening attributes the bad response to that shard holder; and a false
-  verifier report is exposed by replaying its transcript. Silence or a timeout
-  establishes only unavailability. After a reproducible RS mismatch, abort the
-  attempt, retain the compact evidence, remove its uncommitted staged parity, and
-  repeat with a fresh attempt, verifier challenge, and different encoder.
-  Missing responses retry the route, holder, or verifier without needlessly
-  re-encoding. Never delete already active protection until a verified
-  replacement is committed.
+- Make audit failure and cleanup evidence-driven. If all information openings
+  and a parity opening are valid but that parity row's RS equation fails, the
+  coding coordinator signed a bad output root; an invalid signed opening
+  attributes the bad response to that shard holder; and a false verifier report
+  is exposed by replaying its transcript. Silence or a timeout establishes only
+  unavailability. Any missing confirmation aborts the complete attempt: retain
+  compact attributable evidence where it exists, remove every uncommitted
+  staged parity sector from that attempt, and repeat the full information upload
+  with a fresh operation ID, coding coordinator, verifier, and hidden challenge.
+  Never delete already active protection until a verified replacement is
+  committed.
 - Decouple the signed guild roster from coding geometry. Membership epochs may
   admit more than five members, but each old group retains its explicit profile,
   ordered holders, and at-placement domain binding. Choose the profile and

@@ -57,8 +57,8 @@ them as ADRs and test vectors before promising wire compatibility.
 
 ### Implemented baseline — first usable IP prototype
 
-The architectural prototype is passed and the Milestone 1 implementation run
-has reached its review gate. The repository now connects
+The architectural prototype and its Milestone 1 stabilization gate are passed.
+The repository now connects
 two real binaries and persistent local control to static five-member guild
 onboarding, reflink capture, owner encryption, actual `3+2` RS, remote SQLCipher
 parity, unanimous revisions/checkpoints, QUIC, Kademlia discovery, relay/DCUtR
@@ -71,11 +71,10 @@ real-libp2p topology tests exercise direct, relay/DCUtR, and retained-relay
 application sessions without transport mocks.
 
 Call this a passed product slice, not a claim of production quality. The
-mandated source-only review found concrete defects and an acceptance-evidence
-gap recorded in `TODO.md`; close those and rerun both remote gates before
-selecting Milestone 2. In particular, the three route types have real-libp2p
-application coverage, but only the direct route is currently forced by the
-five-daemon process acceptance test.
+mandated source-only review found concrete defects; those defects are fixed and
+their source and Btrfs regression gates pass on the remote Nix runner. Both the
+focused real-libp2p test and the five-daemon process acceptance now force and
+verify direct, successful-DCUtR, and relay-fallback application traffic.
 
 The baseline deliberately remains one guild and one reflink root per member,
 one parity database, Linux only, fixed 64 KiB sectors and `3+2`, unanimous
@@ -85,9 +84,8 @@ inefficient but is a real committed codeword, not a storage or transport mock.
 
 ### Milestone 1 stabilization work and regression contract
 
-The implementation addressed each target below. The source review found some
-incomplete edge enforcement, tracked separately in `TODO.md`; the targets remain
-the regression contract.
+The implementation and corrective source-review run addressed each target
+below; the targets remain the regression contract.
 
 1. **Restore the reproducible build gate.** Reconcile every workspace manifest
    with the committed `Cargo.lock`; the current CI unit job stops at
@@ -273,15 +271,13 @@ Later partial-range transfer must supply proofs to that same authority.
   signatures. This deliberately grows until GC exists, ensuring historical
   snapshots remain seed-recoverable. Membership events, tombstone compaction,
   writer epochs/incarnation keys, and dynamic membership come later.
-- **Prototype storage acknowledgement:** operation ID, canonical complete
+- **Current storage acknowledgement:** operation ID, canonical complete
   `CodingGroup` ID/algorithm, assigned row and root, holder, and signature. The
-  parity holder first verifies all three information roots and recomputes its
-  assigned RS row. Its parity-database transaction then checks the configured
-  budget and atomically stores the verified READY object plus acknowledgement
-  before replying. Pre-activation acknowledgements therefore survive either
-  daemon's restart; retain them with the object for the prototype. Rich
-  reservations, retention promises, quota ledgers, and repair/audit receipts
-  come later.
+  fixed prototype makes each parity holder recompute its row before atomically
+  storing a READY object. Replace that traffic-heavy draft with the Milestone 5
+  coding attempt below: parity holders persist only root-bound `STAGED` output,
+  and a distinct verifier checks one hidden random 16-byte RS sample from every
+  information and parity shard using canonical Merkle openings before activation.
 - **Prototype Kademlia discovery:** every guild publisher announces itself as a
   provider of `mailbox(subject)`. Recovery obtains several provider Peer IDs;
   each publisher owns `recovery-bundle(subject,publisher)`, a bounded sealed set
@@ -377,10 +373,11 @@ Proactive background repair comes later.
 - Keep blocking SQLite work behind its bounded daemon worker. Store bounded
   full-sector BLOBs and never hold a transaction, BLOB handle, or state lock
   across a network await.
-- For each bounded request, verify the three information roots and assigned RS
-  row as above, then use one parity-DB transaction to check the configured budget
-  and atomically store the READY parity bytes plus signed acknowledgement before
-  replying. Checkpoint activation consumes only those acknowledgements.
+- For the current fixed prototype request, verify the three information roots
+  and assigned RS row as above, then use one parity-DB transaction to check the
+  configured budget and atomically store the READY parity bytes plus signed
+  acknowledgement before replying. Milestone 5 replaces this with `STAGED`
+  writes plus the distinct sampled-verifier transcript before activation.
   Idempotent restart/retry adopts the same operation or rejects a conflict
   without cross-database atomicity.
 - Retain every active/historical object and committed anchor, but idempotently
@@ -419,9 +416,10 @@ Proactive background repair comes later.
 ### Execution and local test model
 
 The asynchronous daemon/process split, locked startup, recovery-string input,
-expected-identity check, bounded worker ownership, and formal wire contracts
-described here are implemented. A strictly checked recovery-string file remains
-an explicit unattended auto-unlock option rather than a daemon prerequisite.
+expected-identity check, bounded worker ownership, and formal wire contracts are
+implemented. Separating human configuration from application-owned identity
+state is the next milestone. A strictly checked recovery-string file remains an
+explicit unattended auto-unlock option rather than a daemon prerequisite.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -445,19 +443,22 @@ an explicit unattended auto-unlock option rather than a daemon prerequisite.
   formatting is redacted, and zeroizes text, KDF work buffers, and frames. Long
   operations return durable job IDs with status/follow/cancel; offline
   configuration, reflink probe, and later `db-shell` remain local.
-- `mutualbackup init --data-dir DIR` creates a versioned **nonsecret** TOML
-  config, default socket location, and public expected Node ID, using either a
-  newly generated 24-word recovery string or a securely prompted user string.
-  Interactive mode does not persist that string. Config names the QUIC listen
-  multiaddresses, failure-domain label, parity path/budget, Kademlia bootstrap
-  and optional relay multiaddresses, and root publication defaults. An explicit
-  file seed source lets `mutualbackupd` apply the identical validation/KDF and
-  auto-unlock for unattended use. `recover-init` needs only the recovery string,
-  an empty data directory, and generic bootstrap configuration; it imports no
-  cached guild or peer state and leaves the failure-domain label unset until
-  signed genesis is recovered.
-- Store the expected Node ID as nonsecret local identity metadata and reject a
-  wrong unlock value before opening existing databases. The CLI uses the default
+- Keep one resolved daemon-options model for human TOML and command-line flags;
+  the config file is optional, flags override it, and neither form contains
+  generated identity state. Paths written in TOML are relative to that file;
+  paths passed as flags are relative to the working directory. The sample
+  configuration documents network policy, storage paths/budgets, and the
+  operator's initial failure-domain claim. The CLI never edits either source.
+- `mutualbackup init --data-dir DIR` and `recover-init` atomically create, without
+  replacement, a versioned **nonsecret** application-owned identity manifest
+  under `data_dir`. It records the expected Node ID and new-versus-recovery
+  intent, but no deployment options or secret. `init` uses either a newly
+  generated 24-word string or a securely prompted user string; interactive mode
+  does not persist it. `recover-init` needs only that string, an empty data
+  directory, and separately supplied generic bootstrap options; it imports no
+  cached guild or peer state.
+- Require the identity manifest before unlock and reject a wrong unlock value
+  before opening existing databases. The CLI uses the default
   per-user socket or explicit `--socket` for tests and multiple local daemons.
   The unlock request gets a secret-specific wire wrapper with redacted `Debug`,
   bounded allocation, and zeroization rather than an ordinary logged JSON
@@ -640,7 +641,7 @@ checkpoints, daemon/CLI control, QUIC/Kademlia/relay/DCUtR primitives, repeated
 backup, and five-process DHT seed recovery. Milestone 1 replaced its legacy
 seed-file format; there is no compatibility promise for that draft format.
 
-### Milestone 1 — stabilized, unlockable IP product (implementation run complete; review gate reached)
+### Milestone 1 — stabilized, unlockable IP product (passed)
 
 This was the implementation scope, in order:
 
@@ -672,15 +673,29 @@ This was the implementation scope, in order:
    path and transferred bytes, then force and assert end-to-end direct QUIC,
    successful DCUtR, and failed-punch relay transfer topologies.
 
-**The required stop/review gate is now reached.** The current commit passed the
-locked format/clippy/unit suite and the complete Btrfs acceptance suite on the
-remote Nix runner before the source-only audit. The audit results are in
-`TODO.md`. The next implementation run must fix those concrete findings and
-rerun both gates, then pause briefly to confirm the IP alpha is sound before
-selecting Milestone 2. Tor, storage redesign, and extra source backends remain
-outside that corrective run.
+**This review gate is passed.** The corrective implementation closes the
+source-only audit findings and passes the locked format/clippy/unit suite plus
+the Btrfs and five-process acceptance gates on the remote Nix runner.
 
-### Milestone 2 — Tor and robust connectivity beta
+### Milestone 2 — operator configuration and identity-state separation
+
+- Replace duplicated daemon parsing with one typed options model consumed by
+  optional TOML and equivalent nonsecret command-line flags. Test flag-over-file
+  precedence, unknown fields, repeatable multiaddresses, explicit booleans, and
+  config-relative versus working-directory-relative paths.
+- Remove generated `expected_node_id` and initialization intent from operator
+  configuration. Have `init` and `recover-init` create the application-owned
+  public identity manifest under `data_dir` without replacing an existing one;
+  neither command edits a config file.
+- Require and expose that manifest while locked, reject a mismatched recovery
+  string before SQLCipher opens, and adapt unattended unlock, documentation,
+  sample configuration, the Docker lab, and process acceptance.
+- Gate with source-only review and the full locked remote suite, including new,
+  recovery, missing-manifest, no-replace, wrong-seed, config-only, flag-only, and
+  mixed-precedence process cases. Pause here before beginning Tor or changing
+  guild geometry.
+
+### Milestone 3 — Tor and robust connectivity beta
 
 - Adapt the narrow, useful BarterBackup `nettor` principles to a maintained Arti
   release: outbound onion dialing, an inbound v3 onion service, persistent Tor
@@ -696,7 +711,7 @@ outside that corrective run.
   Gate with a private-Tor seed-recovery test in which all peer IP paths are
   blocked and the onion identity survives restarts.
 
-### Milestone 3 — durable operations and multi-volume storage beta
+### Milestone 4 — durable operations and multi-volume storage beta
 
 - Add writer-incarnation fencing before supporting concurrent loss/recovery;
   then add retention and tombstones, safe GC, audits/scrubs, repair and emergency
@@ -712,12 +727,25 @@ outside that corrective run.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 4 — efficient and flexible data/guild protocol
+### Milestone 5 — efficient and flexible data/guild protocol
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and
   range resume, authenticated virtual-zero extents, multiple protected roots,
   and measured sparse/large-tree efficiency.
+- Delegate each deterministic geometry lane to a directly reachable coding
+  coordinator, preferably one of its participants, so every information range
+  is uploaded once and only parity rows travel onward: `k+m` bulk shard
+  transfers, or `k+m-1` for a participating coordinator, instead of `k*m`
+  holder-side input transfers. Use a separate reachable verifier that is never
+  that attempt's coding coordinator. It precommits a
+  hidden random challenge, then after all parity is durably `STAGED` requests the
+  same aligned 16-byte leaf and canonical Merkle proof from every information
+  and parity holder. It checks only those RS symbols and publishes a signed,
+  replayable transcript; it never recomputes a full parity sector. Any failure
+  to confirm deletes all parity staged by that attempt and restarts the complete
+  upload with fresh coordinators and challenge. Signed invalid openings and a
+  valid-proof RS mismatch are attributable; timeouts prove only unavailability.
 - Add versioned variable `k/m` and sector profiles, dynamic membership and event
   tails, quorum policy, writer/key epochs, recovery-key envelopes, rotation and
   revocation. Keep old committed layouts decodable until their retention ends.
@@ -725,7 +753,7 @@ outside that corrective run.
   member add/remove/replacement during interrupted work, key rotation across
   retained revisions, and bounded storage/network amplification.
 
-### Milestone 5 — additional source backends and platforms
+### Milestone 6 — additional source backends and platforms
 
 - Implement the guarded link-freeze backend, including its atomic sparse private
   copy transition when the user needs to edit the original inode. Preserve file
@@ -735,7 +763,7 @@ outside that corrective run.
   application-consistent capture hooks. Each enrolled root must pass its complete
   capture/edit/restore probe; never fall back silently to an eager full copy.
 
-### Milestone 6 — release candidate and compatibility freeze
+### Milestone 7 — release candidate and compatibility freeze
 
 - Fuzz every parser and state machine; property-test recovery and authorization;
   test partitions, malicious peers, corruption, remounts, clock changes, huge
