@@ -13,7 +13,9 @@ use mb_core::{
     V1_MAX_CATALOG_PAGES, canonical_bytes, decode_canonical, seal_recovery_record, sector_root,
     synthetic_filler_sector,
 };
-use mb_store::{ControlStore, ParityObject, ParityStore, filesystem_identity, probe_reflink};
+use mb_store::{
+    ControlStore, DatabaseError, ParityObject, ParityStore, filesystem_identity, probe_reflink,
+};
 use rand::RngCore;
 use uuid::Uuid;
 
@@ -2344,6 +2346,37 @@ impl Node {
         Ok(())
     }
 
+    pub fn recovered_shard_is_staged(
+        &self,
+        checkpoint_hash: &[u8; 32],
+        guild_id: &[u8; 32],
+        group: &mb_core::CodingGroup,
+        shard_index: u8,
+    ) -> Result<bool> {
+        let role = group
+            .roles
+            .get(shard_index as usize)
+            .context("recovered shard index is out of range")?;
+        let root = match role {
+            ShardRole::Information(information) if information.owner == self.keys.node_id() => {
+                information.sector.root
+            }
+            ShardRole::Parity(parity) if parity.holder == self.keys.node_id() => parity.root,
+            _ => anyhow::bail!("recovered shard is not assigned to the local node"),
+        };
+        if group.guild_id != *guild_id {
+            anyhow::bail!("recovered shard has the wrong guild context");
+        }
+        match self
+            .control
+            .recovery_shard(checkpoint_hash, guild_id, &group.id, shard_index, &root)
+        {
+            Ok(_) => Ok(true),
+            Err(DatabaseError::NotReady) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn restore_recovered_revision(
         &mut self,
         checkpoint_hash: &[u8; 32],
@@ -3031,6 +3064,51 @@ mod tests {
             root: sector_root(&invalid_parity),
             bytes: invalid_parity,
         };
+        let checkpoint_hash = [8; 32];
+        assert!(
+            !node
+                .recovered_shard_is_staged(
+                    &checkpoint_hash,
+                    &group.guild_id,
+                    &group,
+                    object.shard_index,
+                )
+                .unwrap()
+        );
+        node.stage_recovered_shard(
+            &checkpoint_hash,
+            &group.guild_id,
+            &group,
+            object.shard_index,
+            &object.bytes,
+        )
+        .unwrap();
+        assert!(
+            node.recovered_shard_is_staged(
+                &checkpoint_hash,
+                &group.guild_id,
+                &group,
+                object.shard_index,
+            )
+            .unwrap()
+        );
+        let mut conflicting_group = group.clone();
+        let mut conflicting_bytes = object.bytes.clone();
+        conflicting_bytes[0] ^= 2;
+        let ShardRole::Parity(conflicting_role) = &mut conflicting_group.roles[3] else {
+            unreachable!();
+        };
+        conflicting_role.root = sector_root(&conflicting_bytes);
+        assert!(
+            node.stage_recovered_shard(
+                &checkpoint_hash,
+                &group.guild_id,
+                &conflicting_group,
+                object.shard_index,
+                &conflicting_bytes,
+            )
+            .is_err()
+        );
         assert!(
             node.publish_verified_parity(&group, &information, &object)
                 .is_err()
@@ -3103,5 +3181,24 @@ mod tests {
             .unwrap();
         let completed: RecoveryJob = decode_canonical(&bytes).unwrap();
         assert_eq!(completed.state, RecoveryJobState::Complete);
+
+        let mut interrupted_finalization = completed;
+        interrupted_finalization.state = RecoveryJobState::Published;
+        node.control
+            .put_record(
+                "recovery-job",
+                &checkpoint_hash,
+                &canonical_bytes(&interrupted_finalization).unwrap(),
+            )
+            .unwrap();
+        node.restore_recovered_revision(&checkpoint_hash, guild_id, &revision, &target)
+            .unwrap();
+        let bytes = node
+            .control
+            .get_record("recovery-job", &checkpoint_hash)
+            .unwrap()
+            .unwrap();
+        let completed_again: RecoveryJob = decode_canonical(&bytes).unwrap();
+        assert_eq!(completed_again.state, RecoveryJobState::Complete);
     }
 }

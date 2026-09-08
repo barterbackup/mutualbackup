@@ -2468,9 +2468,6 @@ pub async fn recover_from_dht(
         .cloned();
     let revision_id = revision.as_ref().map(|revision| revision.value.revision_id);
     if let Some(revision) = revision {
-        if restore_target.exists() {
-            bail!("restore target must not already exist");
-        }
         let target = restore_target.to_path_buf();
         node_blocking(node, move |node| {
             node.restore_recovered_revision(&checkpoint_hash, guild_id, &revision, &target)
@@ -2797,12 +2794,25 @@ async fn recover_p2p_local_shards(
         let Some((target_index, target_root)) = target else {
             continue;
         };
+        let staged_group = group.clone();
+        let guild_id = checkpoint.checkpoint.guild_id;
+        let already_staged = node_blocking(node.clone(), move |node| {
+            node.recovered_shard_is_staged(
+                &checkpoint_hash,
+                &guild_id,
+                &staged_group,
+                target_index as u8,
+            )
+        })
+        .await?;
+        if already_staged {
+            continue;
+        }
         let bytes = reconstruct_shard_from_peers(p2p, group, target_index, roster).await?;
         if sector_root(&bytes) != target_root {
             bail!("reconstructed target shard failed its certified root");
         }
         let group = group.clone();
-        let guild_id = checkpoint.checkpoint.guild_id;
         node_blocking(node.clone(), move |node| {
             node.stage_recovered_shard(
                 &checkpoint_hash,

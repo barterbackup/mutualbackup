@@ -114,7 +114,7 @@ async fn start_ready_runtime(
 )> {
     let (node, client, mut event_loop) = start_node_runtime(config, identity, node)?;
     let startup_receiver = event_loop.take_startup_receiver()?;
-    let mut task = tokio::spawn(event_loop.run());
+    let task = tokio::spawn(event_loop.run());
     let startup = match tokio::time::timeout(Duration::from_secs(30), startup_receiver).await {
         Ok(Ok(Ok(startup))) => startup,
         Ok(Ok(Err(error))) => {
