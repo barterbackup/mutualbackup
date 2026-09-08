@@ -415,32 +415,55 @@ pub fn filesystem_identity(path: impl AsRef<Path>) -> Result<FilesystemIdentity,
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
 
+    // Linux's statx UAPI is a fixed 256-byte record. libc deliberately omits
+    // its statx wrapper for musl targets whose configured headers predate musl
+    // 1.2.3, even though the kernel syscall and ABI are available. Keep the
+    // tiny ABI surface we need local so the packaged static build has the same
+    // mount-ID protection as the glibc build.
+    const STATX_TYPE: u32 = 0x0001;
+    const STATX_MNT_ID: u32 = 0x1000;
+    const STATX_BUFFER_BYTES: usize = 256;
+    const STATX_MASK_OFFSET: usize = 0;
+    const STATX_MNT_ID_OFFSET: usize = 144;
+    #[repr(C, align(8))]
+    struct StatxBuffer([u8; STATX_BUFFER_BYTES]);
+
     let path = path.as_ref();
     let encoded =
         CString::new(path.as_os_str().as_bytes()).map_err(|_| AnchorError::InvalidRoot)?;
-    let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let mut stat = StatxBuffer([0; STATX_BUFFER_BYTES]);
     let result = unsafe {
-        libc::statx(
+        libc::syscall(
+            libc::SYS_statx,
             libc::AT_FDCWD,
             encoded.as_ptr(),
             libc::AT_NO_AUTOMOUNT,
-            libc::STATX_TYPE | libc::STATX_MNT_ID,
-            stat.as_mut_ptr(),
+            STATX_TYPE | STATX_MNT_ID,
+            stat.0.as_mut_ptr(),
         )
     };
     if result != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    let stat = unsafe { stat.assume_init() };
-    if stat.stx_mask & libc::STATX_MNT_ID == 0 {
+    let mask = u32::from_ne_bytes(
+        stat.0[STATX_MASK_OFFSET..STATX_MASK_OFFSET + std::mem::size_of::<u32>()]
+            .try_into()
+            .expect("fixed statx mask range"),
+    );
+    if mask & STATX_MNT_ID == 0 {
         return Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "filesystem mount identity is unavailable",
         )));
     }
+    let mount_id = u64::from_ne_bytes(
+        stat.0[STATX_MNT_ID_OFFSET..STATX_MNT_ID_OFFSET + std::mem::size_of::<u64>()]
+            .try_into()
+            .expect("fixed statx mount-ID range"),
+    );
     Ok(FilesystemIdentity {
         device: fs::metadata(path)?.dev(),
-        mount_id: stat.stx_mnt_id,
+        mount_id,
     })
 }
 

@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -64,7 +65,7 @@ pub async fn run_root_watcher(node: Arc<Mutex<Node>>) -> Result<()> {
 }
 
 async fn watch_once(node: Arc<Mutex<Node>>, root: &ProtectedRoot) -> Result<()> {
-    let expected = watched_root_identity(root)?;
+    let (_root_handle, expected) = open_watched_root(root)?;
     let (sender, mut receiver) = tokio::sync::mpsc::channel(WATCH_EVENT_CAPACITY);
     let watcher_failure = Arc::new(Mutex::new(None::<String>));
     let callback_failure = watcher_failure.clone();
@@ -110,6 +111,18 @@ async fn watch_once(node: Arc<Mutex<Node>>, root: &ProtectedRoot) -> Result<()> 
             }
         }
     }
+}
+
+fn open_watched_root(root: &ProtectedRoot) -> Result<(File, WatchedRootIdentity)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let handle = File::open(&root.path)?;
+    let held = handle.metadata()?;
+    let identity = watched_root_identity(root)?;
+    if !held.is_dir() || held.dev() != identity.device || held.ino() != identity.inode {
+        anyhow::bail!("protected root changed while its watcher was being attached");
+    }
+    Ok((handle, identity))
 }
 
 fn watched_root_identity(root: &ProtectedRoot) -> Result<WatchedRootIdentity> {
@@ -184,7 +197,7 @@ mod tests {
             filesystem_device: filesystem.device,
             filesystem_mount_id: filesystem.mount_id,
         };
-        let before = watched_root_identity(&root).unwrap();
+        let (_held_root, before) = open_watched_root(&root).unwrap();
         std::fs::remove_dir(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         let after = watched_root_identity(&root).unwrap();
