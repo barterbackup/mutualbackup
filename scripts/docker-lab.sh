@@ -35,6 +35,7 @@ LOSETUP=
 MKFS_BTRFS=
 MOUNT=
 UMOUNT=
+BLKID=
 
 say() {
     printf '%s\n' "$*"
@@ -162,6 +163,7 @@ prepare_host() {
     command -v readlink >/dev/null || die "readlink is required"
     command -v sync >/dev/null || die "sync is required"
     command -v flock >/dev/null || die "flock is required"
+    BLKID=$(find_tool blkid /usr/sbin/blkid) || die "blkid is required"
     LOSETUP=$(find_tool losetup /usr/sbin/losetup) || die "losetup is required"
     MKFS_BTRFS=$(find_tool mkfs.btrfs /usr/sbin/mkfs.btrfs) || die "btrfs-progs is required"
     MOUNT=$(find_tool mount /usr/bin/mount /bin/mount) || die "mount is required"
@@ -333,9 +335,60 @@ verified_mounted_loop() {
     die "$mount_dir is mounted from $source, which is not attached to node $node's image $image"
 }
 
+require_mounted_filesystem() {
+    local node=$1
+    mountpoint -q "$(node_mount "$node")" ||
+        die "node $node Btrfs filesystem is not mounted; run 'up' to restore it"
+    verified_mounted_loop "$node" >/dev/null
+}
+
+validate_regular_image() {
+    local image=$1
+    [[ -f $image && ! -L $image ]] ||
+        die "Btrfs image must be a regular non-symlink file: $image"
+    [[ -O $image ]] || die "Btrfs image must be owned by the current user: $image"
+}
+
+detach_image_loops() {
+    local image=$1
+    local loop
+    while IFS= read -r loop; do
+        [[ -z $loop ]] && continue
+        [[ $loop =~ ^/dev/loop[0-9]+$ ]] || die "refusing unexpected loop device: $loop"
+        if findmnt -rn --source "$loop" >/dev/null; then
+            die "cannot resume image creation while $loop is mounted"
+        fi
+        "${SUDO[@]}" "$LOSETUP" --detach "$loop"
+    done < <(associated_loops "$image")
+}
+
+publish_new_filesystem_image() {
+    local node=$1
+    local image=$2
+    local staging=$image.creating
+    local loop
+    if [[ -e $staging || -L $staging ]]; then
+        validate_regular_image "$staging"
+        detach_image_loops "$staging"
+    else
+        (umask 077 && : >"$staging")
+    fi
+    truncate -s "$DISK_SIZE" "$staging"
+    loop=$("${SUDO[@]}" "$LOSETUP" --find --show "$staging")
+    [[ $loop =~ ^/dev/loop[0-9]+$ ]] || die "unexpected loop device returned for $staging: $loop"
+    if ! "${SUDO[@]}" "$MKFS_BTRFS" --quiet --force --label "mb-lab-node$node" "$loop"; then
+        "${SUDO[@]}" "$LOSETUP" --detach "$loop" || true
+        die "cannot format node $node's staged Btrfs image"
+    fi
+    "${SUDO[@]}" sync "$loop"
+    "${SUDO[@]}" "$LOSETUP" --detach "$loop"
+    mv "$staging" "$image"
+    sync "$(dirname "$image")"
+}
+
 ensure_filesystem() {
     local node=$1
-    local image mount_dir record loop new_image=false
+    local image mount_dir record loop filesystem staging
     image=$(node_image "$node")
     mount_dir=$(node_mount "$node")
     record=$(loop_record "$node")
@@ -348,21 +401,25 @@ ensure_filesystem() {
         return
     fi
 
-    if [[ ! -f $image ]]; then
-        truncate -s "$DISK_SIZE" "$image"
-        new_image=true
+    staging=$image.creating
+    if [[ -e $image || -L $image ]]; then
+        validate_regular_image "$image"
+        [[ ! -e $staging && ! -L $staging ]] ||
+            die "both completed and staged images exist for node $node; inspect $image and $staging"
+    else
+        publish_new_filesystem_image "$node" "$image"
     fi
 
-    loop=$(associated_loops "$image" | head -n 1)
-    if [[ -z $loop ]]; then
-        loop=$("${SUDO[@]}" "$LOSETUP" --find --show "$image")
-    fi
+    detach_image_loops "$image"
+    loop=$("${SUDO[@]}" "$LOSETUP" --find --show "$image")
     [[ $loop =~ ^/dev/loop[0-9]+$ ]] || die "unexpected loop device returned for $image: $loop"
+    filesystem=$("${SUDO[@]}" "$BLKID" -p -s TYPE -o value "$loop" 2>/dev/null || true)
+    if [[ $filesystem != btrfs ]]; then
+        "${SUDO[@]}" "$LOSETUP" --detach "$loop" || true
+        die "existing node $node image is not a completed Btrfs filesystem: $image"
+    fi
     printf '%s\n' "$loop" >"$record"
 
-    if [[ $new_image == true ]]; then
-        "${SUDO[@]}" "$MKFS_BTRFS" --quiet --force --label "mb-lab-node$node" "$loop"
-    fi
     if ! "${SUDO[@]}" "$MOUNT" -t btrfs -o noatime,compress=zstd "$loop" "$mount_dir"; then
         "${SUDO[@]}" "$LOSETUP" --detach "$loop" || true
         die "cannot mount node $node Btrfs image; is the kernel btrfs module available?"
@@ -699,18 +756,20 @@ command_stop() {
 
 command_start() {
     local node=$1
-    prepare_docker_only
+    prepare_host
     validate_node "$node"
     acquire_lock
+    require_mounted_filesystem "$node"
     start_node_internal "$node"
     say "node $node is running"
 }
 
 command_restart() {
     local node=$1
-    prepare_docker_only
+    prepare_host
     validate_node "$node"
     acquire_lock
+    require_mounted_filesystem "$node"
     container_exists "$node" || die "node $node container does not exist; run 'up' first"
     container_owned "$node" || die "node $node container is not owned by this lab"
     "${DOCKER[@]}" restart --time 20 "$(node_name "$node")" >/dev/null
