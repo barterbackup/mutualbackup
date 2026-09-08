@@ -1326,7 +1326,7 @@ where
     if target.exists() {
         bail!("restore target already exists: {}", target.display());
     }
-    let parent = target.parent().context("restore target has no parent")?;
+    let parent = containing_directory(target);
     fs::create_dir_all(parent)?;
     let staging = parent.join(format!(".mutualbackup-restore-{}", Uuid::new_v4()));
     build_revision_restore(
@@ -1388,10 +1388,16 @@ where
 }
 
 pub(crate) fn publish_restore(staging: &Path, target: &Path) -> Result<()> {
-    let parent = target.parent().context("restore target has no parent")?;
+    let parent = containing_directory(target);
     rename_no_replace(staging, target)?;
     sync_directory(parent)?;
     Ok(())
+}
+
+fn containing_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 pub(crate) fn install_recovery_marker(
@@ -1816,6 +1822,11 @@ fn hex_id(id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod metadata_compatibility_tests {
     use super::*;
+
+    #[test]
+    fn bare_restore_target_uses_the_current_directory() {
+        assert_eq!(containing_directory(Path::new("restored")), Path::new("."));
+    }
 
     #[test]
     fn decodes_immutable_native_id_v2_fixture() {

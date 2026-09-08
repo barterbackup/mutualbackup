@@ -396,12 +396,13 @@ mod node_id_text {
 }
 
 fn write_new_private(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = containing_directory(path);
     if !parent.is_dir() {
         bail!("{label} parent directory does not exist");
     }
     cleanup_verified_private_temporaries(path, bytes)?;
     if existing_private_file_matches(path, bytes)? == Some(true) {
+        sync_directory(parent)?;
         return Ok(());
     }
     if fs::symlink_metadata(path).is_ok() {
@@ -410,7 +411,7 @@ fn write_new_private(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
             path.display()
         );
     }
-    let temporary = private_temporary_path(path);
+    let temporary = private_temporary_path(path, bytes);
     let mut temporary_guard = TemporaryPrivateFile::new(temporary.clone());
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -428,6 +429,10 @@ fn write_new_private(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
         if error.kind() == std::io::ErrorKind::AlreadyExists
             && existing_private_file_matches(path, bytes)? == Some(true)
         {
+            fs::remove_file(&temporary)
+                .with_context(|| format!("cannot remove redundant {label} temporary file"))?;
+            temporary_guard.disarm();
+            sync_directory(parent)?;
             return Ok(());
         }
         return Err(error).with_context(|| format!("cannot install {label} {}", path.display()));
@@ -459,14 +464,18 @@ impl Drop for TemporaryPrivateFile {
     fn drop(&mut self) {
         if self.armed {
             let _ = fs::remove_file(&self.path);
-            if let Some(parent) = self.path.parent() {
-                let _ = sync_directory(parent);
-            }
+            let _ = sync_directory(containing_directory(&self.path));
         }
     }
 }
 
-fn private_temporary_prefix(path: &Path) -> String {
+fn containing_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn previous_private_temporary_prefix(path: &Path) -> String {
     let target = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -474,22 +483,95 @@ fn private_temporary_prefix(path: &Path) -> String {
     format!(".mutualbackup-{target}-")
 }
 
-fn private_temporary_path(path: &Path) -> PathBuf {
-    path.parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!(
-            "{}{}.tmp",
-            private_temporary_prefix(path),
-            Uuid::new_v4()
-        ))
+fn private_temporary_prefix(path: &Path, bytes: &[u8]) -> String {
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut hasher = blake3::Hasher::new_derive_key("mutualbackup private temporary v1");
+    #[cfg(unix)]
+    hasher.update(path.file_name().unwrap_or(path.as_os_str()).as_bytes());
+    #[cfg(not(unix))]
+    hasher.update(
+        path.file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .as_bytes(),
+    );
+    hasher.update(&[0]);
+    hasher.update(bytes);
+    format!(".mutualbackup-private-{}-", hasher.finalize().to_hex())
+}
+
+fn private_temporary_path(path: &Path, bytes: &[u8]) -> PathBuf {
+    containing_directory(path).join(format!(
+        "{}{}.tmp",
+        private_temporary_prefix(path, bytes),
+        Uuid::new_v4()
+    ))
+}
+
+#[derive(Clone, Copy)]
+enum PrivateTemporaryKind {
+    Current,
+    Previous,
+}
+
+fn private_temporary_kind(name: &str, path: &Path, bytes: &[u8]) -> Option<PrivateTemporaryKind> {
+    let has_uuid_suffix = |prefix: &str| {
+        name.strip_prefix(prefix)
+            .and_then(|suffix| suffix.strip_suffix(".tmp"))
+            .is_some_and(|uuid| Uuid::parse_str(uuid).is_ok())
+    };
+    if has_uuid_suffix(&private_temporary_prefix(path, bytes)) {
+        return Some(PrivateTemporaryKind::Current);
+    }
+    if has_uuid_suffix(&previous_private_temporary_prefix(path)) {
+        return Some(PrivateTemporaryKind::Previous);
+    }
+    let legacy = name
+        .strip_prefix(".mutualbackup-")
+        .and_then(|suffix| suffix.strip_suffix(".tmp"))
+        .is_some_and(|uuid| Uuid::parse_str(uuid).is_ok());
+    legacy.then_some(PrivateTemporaryKind::Previous)
+}
+
+fn verified_private_temporary(
+    path: &Path,
+    kind: PrivateTemporaryKind,
+    bytes: &[u8],
+) -> Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "private temporary {} must be a regular file",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            bail!(
+                "private temporary {} must be private and owned by the current user",
+                path.display()
+            );
+        }
+    }
+    match kind {
+        PrivateTemporaryKind::Current => Ok(true),
+        PrivateTemporaryKind::Previous => {
+            Ok(existing_private_file_matches(path, bytes)? == Some(true))
+        }
+    }
 }
 
 fn cleanup_verified_private_temporaries(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = containing_directory(path);
     if !parent.is_dir() {
         return Ok(());
     }
-    let prefix = private_temporary_prefix(path);
     let mut removed = false;
     for entry in fs::read_dir(parent)? {
         let entry = entry?;
@@ -497,16 +579,10 @@ fn cleanup_verified_private_temporaries(path: &Path, bytes: &[u8]) -> Result<()>
         let Some(name) = name.to_str() else {
             continue;
         };
-        let legacy_temporary = name
-            .strip_prefix(".mutualbackup-")
-            .and_then(|name| name.strip_suffix(".tmp"))
-            .is_some_and(|name| Uuid::parse_str(name).is_ok());
-        if !(name.starts_with(&prefix) && name.ends_with(".tmp")) && !legacy_temporary {
+        let Some(kind) = private_temporary_kind(name, path, bytes) else {
             continue;
-        }
-        if existing_private_file_matches(&entry.path(), bytes)
-            .is_ok_and(|matches| matches == Some(true))
-        {
+        };
+        if verified_private_temporary(&entry.path(), kind, bytes)? {
             fs::remove_file(entry.path())?;
             removed = true;
         }
@@ -598,7 +674,7 @@ fn ensure_initializable_private_data_dir(path: &Path, manifest: &[u8]) -> Result
             false
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let parent = containing_directory(path);
             fs::create_dir_all(parent).with_context(|| {
                 format!("cannot create data directory parent {}", parent.display())
             })?;
@@ -618,19 +694,29 @@ fn ensure_initializable_private_data_dir(path: &Path, manifest: &[u8]) -> Result
     };
 
     let manifest_path = identity_manifest_path(path);
-    cleanup_verified_private_temporaries(&manifest_path, manifest)?;
-    let mut entries = fs::read_dir(path)?;
-    while let Some(entry) = entries.next().transpose()? {
-        if entry.path() != manifest_path {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.path() == manifest_path {
+            if existing_private_file_matches(&manifest_path, manifest)? != Some(true) {
+                bail!("data directory already contains a different identity manifest");
+            }
+            continue;
+        }
+        let name = entry.file_name();
+        let verified_temporary = name
+            .to_str()
+            .and_then(|name| private_temporary_kind(name, &manifest_path, manifest))
+            .map(|kind| verified_private_temporary(&entry.path(), kind, manifest))
+            .transpose()?
+            .unwrap_or(false);
+        if !verified_temporary {
             bail!(
                 "data directory {} must be empty before initialization",
                 path.display()
             );
         }
-        if existing_private_file_matches(&manifest_path, manifest)? != Some(true) {
-            bail!("data directory already contains a different identity manifest");
-        }
     }
+    cleanup_verified_private_temporaries(&manifest_path, manifest)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -849,14 +935,31 @@ misspelled_budget = 1024
         let data_dir = temp.path().join("state");
         fs::create_dir(&data_dir).unwrap();
         fs::write(data_dir.join("belongs-to-user"), b"keep").unwrap();
-        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o750)).unwrap();
         let seed = Seed::from_recovery_string("correct-horse-battery-staple-2026!").unwrap();
+        let manifest = IdentityManifest {
+            format_version: 1,
+            expected_node_id: mb_core::KeyMaterial::from_seed(&seed).node_id(),
+            intent: InitializationIntent::New,
+        };
+        let manifest_bytes = toml::to_string_pretty(&manifest).unwrap().into_bytes();
+        let interrupted_temporary =
+            private_temporary_path(&identity_manifest_path(&data_dir), &manifest_bytes);
+        fs::write(&interrupted_temporary, &manifest_bytes[..8]).unwrap();
+        fs::set_permissions(&interrupted_temporary, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o750)).unwrap();
         assert!(initialize_identity(&data_dir, &seed, InitializationIntent::New).is_err());
         assert_eq!(
             fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777,
             0o750
         );
         assert_eq!(fs::read(data_dir.join("belongs-to-user")).unwrap(), b"keep");
+        assert!(interrupted_temporary.exists());
+    }
+
+    #[test]
+    fn bare_private_output_uses_the_current_directory() {
+        assert_eq!(containing_directory(Path::new("node.seed")), Path::new("."));
+        assert_eq!(containing_directory(Path::new("state")), Path::new("."));
     }
 
     #[test]
@@ -906,21 +1009,25 @@ misspelled_budget = 1024
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("recovery.txt");
         let recovery = "correct-horse-battery-staple-2026!";
+        let interrupted = private_temporary_path(&path, recovery.as_bytes());
         let matching = temp
             .path()
             .join(format!(".mutualbackup-{}.tmp", Uuid::new_v4()));
         let different = temp
             .path()
             .join(format!(".mutualbackup-{}.tmp", Uuid::new_v4()));
+        fs::write(&interrupted, &recovery.as_bytes()[..8]).unwrap();
         fs::write(&matching, recovery).unwrap();
         fs::write(&different, "different-private-content").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&interrupted, fs::Permissions::from_mode(0o600)).unwrap();
             fs::set_permissions(&matching, fs::Permissions::from_mode(0o600)).unwrap();
             fs::set_permissions(&different, fs::Permissions::from_mode(0o600)).unwrap();
         }
         write_seed(&path, recovery).unwrap();
+        assert!(!interrupted.exists());
         assert!(!matching.exists());
         assert!(different.exists());
     }

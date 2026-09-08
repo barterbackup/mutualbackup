@@ -206,6 +206,41 @@ fn init_resumes_after_seed_install_without_replacing_outputs() {
 }
 
 #[test]
+fn init_accepts_bare_relative_seed_and_data_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    set_private(temp.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mutualbackup"))
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "--seed-stdin",
+            "--seed-file",
+            "node.seed",
+            "--data-dir",
+            "state",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"bare-relative-initialization-recovery-string-2027!")
+        .unwrap();
+    let output = wait_for_output(child, CLI_TIMEOUT).unwrap();
+    assert!(
+        output.status.success(),
+        "relative init failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(temp.path().join("node.seed").is_file());
+    assert!(temp.path().join("state/identity.toml").is_file());
+}
+
+#[test]
 fn daemon_never_reports_ready_when_its_only_listener_cannot_start() {
     let temp = tempfile::tempdir().unwrap();
     set_private(temp.path());

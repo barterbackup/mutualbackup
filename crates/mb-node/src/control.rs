@@ -134,9 +134,7 @@ pub async fn serve_local_control(
 }
 
 pub fn bind_local_control(socket_path: &Path) -> Result<LocalControlListener> {
-    let parent = socket_path
-        .parent()
-        .context("control socket must have a parent directory")?;
+    let parent = containing_directory(socket_path);
     let parent_existed = parent.exists();
     fs::create_dir_all(parent).with_context(|| {
         format!(
@@ -194,6 +192,12 @@ pub fn bind_local_control(socket_path: &Path) -> Result<LocalControlListener> {
         listener,
         _cleanup: cleanup,
     })
+}
+
+fn containing_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 pub async fn serve_local_control_on(
@@ -620,5 +624,13 @@ mod tests {
         let secret = UnlockSecret::new([0x41; 32]);
         assert_eq!(format!("{secret:?}"), "UnlockSecret(REDACTED)");
         assert!(!format!("{secret:?}").contains("65"));
+    }
+
+    #[test]
+    fn bare_control_socket_uses_the_current_directory() {
+        assert_eq!(
+            containing_directory(Path::new("control.sock")),
+            Path::new(".")
+        );
     }
 }

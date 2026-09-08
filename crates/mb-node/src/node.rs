@@ -2351,7 +2351,7 @@ impl Node {
         revision: &SignedRecord<UserRevision>,
         target: &Path,
     ) -> Result<()> {
-        let parent = target.parent().context("restore target has no parent")?;
+        let parent = containing_directory(target);
         fs::create_dir_all(parent)?;
         let existing = self.control.get_record("recovery-job", checkpoint_hash)?;
         let mut job = match existing {
@@ -2546,6 +2546,12 @@ fn decode_installed_guild(bytes: &[u8]) -> Result<InstalledGuild> {
     }
     installed.certificate.verify()?;
     Ok(installed)
+}
+
+fn containing_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 fn authorize_member(control: &ControlStore, guild_id: &[u8; 32], caller: NodeId) -> Result<()> {
