@@ -1041,14 +1041,25 @@ impl P2pEventLoop {
             })
     }
 
-    fn record_transfer(&mut self, peer: PeerId, path: Option<P2pPath>, sent: u64, received: u64) {
-        let retain_history = self.persistent_addresses.contains_key(&peer)
+    fn retains_transfer_history(&self, peer: PeerId) -> bool {
+        self.persistent_addresses.contains_key(&peer)
             || self.learned_addresses.contains_key(&peer)
             || self
                 .relay_members
                 .read()
-                .is_ok_and(|members| members.contains(&peer));
-        if !retain_history {
+                .is_ok_and(|members| members.contains(&peer))
+    }
+
+    fn forget_transfer_history_if_unretained(&mut self, peer: PeerId) {
+        if self.retains_transfer_history(peer) {
+            return;
+        }
+        self.transfer_counters.remove(&peer);
+        self.path_transfer_counters.remove(&peer);
+    }
+
+    fn record_transfer(&mut self, peer: PeerId, path: Option<P2pPath>, sent: u64, received: u64) {
+        if !self.retains_transfer_history(peer) {
             return;
         }
         let total = self.transfer_counters.entry(peer).or_default();
@@ -1261,6 +1272,8 @@ impl P2pEventLoop {
                     expires_at: tokio::time::Instant::now() + lifetime,
                 },
             );
+        } else {
+            self.forget_transfer_history_if_unretained(peer);
         }
         Ok(())
     }
@@ -1285,6 +1298,7 @@ impl P2pEventLoop {
                     remove_known_address(&mut self.swarm, peer, &address);
                 }
             }
+            self.forget_transfer_history_if_unretained(peer);
         }
     }
 
@@ -1319,6 +1333,17 @@ impl P2pEventLoop {
                     .write()
                     .map_err(|_| anyhow::anyhow!("relay membership lock is poisoned"))
                     .map(|mut current| *current = members);
+                if result.is_ok() {
+                    let recorded_peers = self
+                        .transfer_counters
+                        .keys()
+                        .chain(self.path_transfer_counters.keys())
+                        .copied()
+                        .collect::<BTreeSet<_>>();
+                    for peer in recorded_peers {
+                        self.forget_transfer_history_if_unretained(peer);
+                    }
+                }
                 let _ = response.send(result);
             }
             Command::Request {
@@ -3674,6 +3699,9 @@ mod tests {
             .replace_learned_addresses(peer, vec![first], unix_seconds() + 300)
             .unwrap();
         assert_eq!(event_loop.learned_addresses[&peer].addresses.len(), 1);
+        event_loop.record_transfer(peer, Some(P2pPath::Direct), 10, 20);
+        assert!(event_loop.transfer_counters.contains_key(&peer));
+        assert!(event_loop.path_transfer_counters.contains_key(&peer));
         event_loop
             .replace_learned_addresses(peer, vec![second], unix_seconds() + 300)
             .unwrap();
@@ -3694,6 +3722,8 @@ mod tests {
             .expires_at = tokio::time::Instant::now();
         event_loop.expire_learned_addresses();
         assert!(!event_loop.learned_addresses.contains_key(&peer));
+        assert!(!event_loop.transfer_counters.contains_key(&peer));
+        assert!(!event_loop.path_transfer_counters.contains_key(&peer));
     }
 
     async fn listening_address(client: &P2pClient) -> Multiaddr {
