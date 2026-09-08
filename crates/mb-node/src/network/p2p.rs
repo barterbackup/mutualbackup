@@ -200,7 +200,7 @@ struct Behaviour {
 }
 
 enum Command {
-    AddAddress {
+    AddLearnedAddress {
         peer: PeerId,
         address: Multiaddr,
         response: oneshot::Sender<Result<()>>,
@@ -552,7 +552,7 @@ impl P2pClient {
         let peer = peer.libp2p_peer_id()?;
         let (response, receiver) = oneshot::channel();
         self.commands
-            .send(Command::AddAddress {
+            .send(Command::AddLearnedAddress {
                 peer,
                 address,
                 response,
@@ -1278,6 +1278,34 @@ impl P2pEventLoop {
         Ok(())
     }
 
+    fn add_learned_address(&mut self, peer: PeerId, address: Multiaddr) -> Result<()> {
+        let address = normalize_known_address(peer, address)?;
+        let existing = self.learned_addresses.get(&peer);
+        if existing.is_none() && self.learned_addresses.len() >= MAX_LEARNED_ENDPOINT_PEERS {
+            bail!("learned endpoint cache is full");
+        }
+        if existing.is_some_and(|known| {
+            !known.addresses.contains(&address) && known.addresses.len() >= MAX_ENDPOINTS_PER_PEER
+        }) {
+            bail!("peer has too many learned endpoints");
+        }
+        self.swarm.add_peer_address(peer, address.clone());
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .add_address(&peer, address.clone());
+        let learned = self
+            .learned_addresses
+            .entry(peer)
+            .or_insert_with(|| LearnedAddresses {
+                addresses: BTreeSet::new(),
+                expires_at: tokio::time::Instant::now() + DHT_TTL,
+            });
+        learned.addresses.insert(address);
+        learned.expires_at = tokio::time::Instant::now() + DHT_TTL;
+        Ok(())
+    }
+
     fn expire_learned_addresses(&mut self) {
         let now = tokio::time::Instant::now();
         let expired = self
@@ -1304,17 +1332,12 @@ impl P2pEventLoop {
 
     fn handle_command(&mut self, command: Command) -> Result<bool> {
         match command {
-            Command::AddAddress {
+            Command::AddLearnedAddress {
                 peer,
                 address,
                 response,
             } => {
-                let result = add_known_address(&mut self.swarm, peer, address).map(|address| {
-                    self.persistent_addresses
-                        .entry(peer)
-                        .or_default()
-                        .insert(address);
-                });
+                let result = self.add_learned_address(peer, address);
                 let _ = response.send(result);
             }
             Command::ReplaceLearnedAddresses {
@@ -3705,6 +3728,9 @@ mod tests {
             .parse()
             .unwrap();
 
+        event_loop.add_learned_address(peer, first.clone()).unwrap();
+        assert!(!event_loop.persistent_addresses.contains_key(&peer));
+        assert_eq!(event_loop.learned_addresses[&peer].addresses.len(), 1);
         event_loop
             .replace_learned_addresses(peer, vec![first], unix_seconds() + 300)
             .unwrap();
@@ -3734,6 +3760,57 @@ mod tests {
         assert!(!event_loop.learned_addresses.contains_key(&peer));
         assert!(!event_loop.transfer_counters.contains_key(&peer));
         assert!(!event_loop.path_transfer_counters.contains_key(&peer));
+
+        for port in 4200..4200 + MAX_ENDPOINTS_PER_PEER {
+            let address = format!("/ip4/127.0.0.1/udp/{port}/quic-v1/p2p/{peer}")
+                .parse()
+                .unwrap();
+            event_loop.add_learned_address(peer, address).unwrap();
+        }
+        let excess = format!("/ip4/127.0.0.1/udp/4300/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+        assert!(event_loop.add_learned_address(peer, excess).is_err());
+        assert_eq!(
+            event_loop.learned_addresses[&peer].addresses.len(),
+            MAX_ENDPOINTS_PER_PEER
+        );
+    }
+
+    #[tokio::test]
+    async fn learned_endpoint_cache_rejects_unbounded_peer_churn() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::open(temp.path(), Seed::from_bytes([77; 32])).unwrap();
+        let local_id = node.keys().node_id();
+        let (_client, mut event_loop) =
+            build_p2p(Arc::new(Mutex::new(node)), config(local_id)).unwrap();
+        for index in 0..MAX_LEARNED_ENDPOINT_PEERS {
+            let mut seed = [0_u8; 32];
+            seed[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            let peer = mb_core::KeyMaterial::from_seed(&Seed::from_bytes(seed))
+                .node_id()
+                .libp2p_peer_id()
+                .unwrap();
+            event_loop.learned_addresses.insert(
+                peer,
+                LearnedAddresses {
+                    addresses: BTreeSet::new(),
+                    expires_at: tokio::time::Instant::now() + DHT_TTL,
+                },
+            );
+        }
+        let peer = mb_core::KeyMaterial::from_seed(&Seed::from_bytes([78; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let address = format!("/ip4/127.0.0.1/udp/4400/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+        assert!(event_loop.add_learned_address(peer, address).is_err());
+        assert_eq!(
+            event_loop.learned_addresses.len(),
+            MAX_LEARNED_ENDPOINT_PEERS
+        );
     }
 
     async fn listening_address(client: &P2pClient) -> Multiaddr {
