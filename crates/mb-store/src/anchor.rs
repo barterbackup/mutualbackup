@@ -922,7 +922,8 @@ fn anchor_discovery_roots(area: &StableAnchorAreaLocator) -> Vec<PathBuf> {
         let mut seen = BTreeSet::new();
         for root in std::iter::once(area.volume_root_hint.clone()).chain(linux_data_mount_points())
         {
-            if fs::symlink_metadata(&root).map(|metadata| metadata.dev()) != Ok(area.volume_device)
+            if !fs::symlink_metadata(&root)
+                .is_ok_and(|metadata| metadata.dev() == area.volume_device)
             {
                 continue;
             }
