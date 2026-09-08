@@ -11,7 +11,7 @@ use mb_store::probe_reflink;
 use mutualbackup::read_seed;
 use mutualbackup::{
     InitializationIntent, default_control_socket, identity_manifest_path, initialize_identity,
-    read_recovery_string, write_seed,
+    preflight_identity_initialization, read_recovery_string, write_seed,
 };
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -174,6 +174,7 @@ async fn main() -> Result<()> {
                 Seed::generate_recovery_string()?
             };
             let seed = derive_seed(&recovery).await?;
+            preflight_identity_initialization(&data_dir, &seed, InitializationIntent::New)?;
             if let Some(path) = &seed_file {
                 write_seed(path, &recovery)?;
                 println!("recovery string written to: {}", path.display());

@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use libp2p::Multiaddr;
 use mb_node::{
-    LocalControlListener, LocalRequest, LocalResponse, LockedDataDir, Node, P2pConfig,
+    LocalControlListener, LocalRequest, LocalResponse, LockedDataDir, Node, P2pConfig, P2pStartup,
     UnlockSecret, WireError, bind_local_control, build_p2p, run_coordinator_jobs,
     run_dht_publications, run_root_watcher, serve_local_control_on,
 };
@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
     }
     let locked_data_dir = Node::lock_data_dir(&config.data_dir)?;
     let listener = bind_local_control(&config.control_socket)?;
-    let (node, p2p_client, mut p2p_event_loop, unlock_connection) = match &config.seed_file {
+    let (node, p2p_client, mut p2p_task, startup) = match &config.seed_file {
         Some(seed_file) => {
             let seed_file = seed_file.clone();
             let open_config = config.clone();
@@ -46,8 +46,7 @@ async fn main() -> Result<()> {
             })
             .await
             .context("automatic unlock worker failed")??;
-            let (node, client, event_loop) = start_node_runtime(&config, &identity, node)?;
-            (node, client, event_loop, None)
+            start_ready_runtime(&config, &identity, node).await?
         }
         None => {
             println!("node {} locked", identity.expected_node_id);
@@ -56,12 +55,20 @@ async fn main() -> Result<()> {
                 let (node, connection) =
                     await_manual_node(&config, &identity, locked_data_dir.clone(), &listener)
                         .await?;
-                match start_node_runtime(&config, &identity, node) {
+                match start_ready_runtime(&config, &identity, node).await {
                     Ok(runtime) => {
-                        break (runtime.0, runtime.1, runtime.2, Some(connection));
+                        if let Err(error) = connection
+                            .respond(LocalResponse::Unlocked {
+                                node_id: identity.expected_node_id,
+                            })
+                            .await
+                        {
+                            tracing::warn!(%error, "unlocking client disconnected before acknowledgement");
+                        }
+                        break runtime;
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "manual daemon unlock could not start node runtime");
+                        tracing::warn!(%error, "manual daemon unlock could not reach network readiness");
                         if let Err(response_error) = connection
                             .respond_error(WireError::operation(format!("{error:#}")))
                             .await
@@ -73,42 +80,6 @@ async fn main() -> Result<()> {
             }
         }
     };
-    let startup_receiver = p2p_event_loop.take_startup_receiver()?;
-    let mut p2p_task = tokio::spawn(p2p_event_loop.run());
-    let startup = match tokio::time::timeout(Duration::from_secs(30), startup_receiver).await {
-        Ok(Ok(Ok(startup))) => startup,
-        Ok(Ok(Err(error))) => {
-            p2p_task.abort();
-            let error = anyhow::anyhow!("libp2p startup failed: {error}");
-            respond_unlock_failure(unlock_connection, &error).await;
-            return Err(error);
-        }
-        Ok(Err(_)) => {
-            let result = p2p_task
-                .await
-                .context("libp2p event-loop task failed before startup")?;
-            let error = result
-                .err()
-                .unwrap_or_else(|| anyhow::anyhow!("libp2p event loop stopped before startup"));
-            respond_unlock_failure(unlock_connection, &error).await;
-            return Err(error);
-        }
-        Err(_) => {
-            p2p_task.abort();
-            let error = anyhow::anyhow!("libp2p startup timed out after 30 seconds");
-            respond_unlock_failure(unlock_connection, &error).await;
-            return Err(error);
-        }
-    };
-    if let Some(connection) = unlock_connection
-        && let Err(error) = connection
-            .respond(LocalResponse::Unlocked {
-                node_id: identity.expected_node_id,
-            })
-            .await
-    {
-        tracing::warn!(%error, "unlocking client disconnected before acknowledgement");
-    }
     let node_id = identity.expected_node_id;
     println!("node {node_id} ready");
     println!(
@@ -131,17 +102,41 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn respond_unlock_failure(
-    connection: Option<mb_node::LocalControlConnection>,
-    error: &anyhow::Error,
-) {
-    if let Some(connection) = connection
-        && let Err(response_error) = connection
-            .respond_error(WireError::operation(format!("{error:#}")))
-            .await
-    {
-        tracing::warn!(%response_error, "failed unlock client disconnected");
-    }
+async fn start_ready_runtime(
+    config: &DaemonOptions,
+    identity: &IdentityManifest,
+    node: Node,
+) -> Result<(
+    Arc<Mutex<Node>>,
+    mb_node::P2pClient,
+    tokio::task::JoinHandle<Result<()>>,
+    P2pStartup,
+)> {
+    let (node, client, mut event_loop) = start_node_runtime(config, identity, node)?;
+    let startup_receiver = event_loop.take_startup_receiver()?;
+    let mut task = tokio::spawn(event_loop.run());
+    let startup = match tokio::time::timeout(Duration::from_secs(30), startup_receiver).await {
+        Ok(Ok(Ok(startup))) => startup,
+        Ok(Ok(Err(error))) => {
+            task.abort();
+            let _ = task.await;
+            anyhow::bail!("libp2p startup failed: {error}");
+        }
+        Ok(Err(_)) => {
+            let result = task
+                .await
+                .context("libp2p event-loop task failed before startup")?;
+            return Err(result
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("libp2p event loop stopped before startup")));
+        }
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            anyhow::bail!("libp2p startup timed out after 30 seconds");
+        }
+    };
+    Ok((node, client, task, startup))
 }
 
 fn start_node_runtime(

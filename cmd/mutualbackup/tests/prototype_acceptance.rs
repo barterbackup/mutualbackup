@@ -19,7 +19,9 @@ use mb_core::{
 use mb_node::{
     Node, P2pConfig, build_p2p, endpoint_record_key, recovery_bundle_key, recovery_mailbox_key,
 };
-use mutualbackup::{DaemonOptions, read_daemon_options, read_identity_manifest};
+use mutualbackup::{
+    DaemonOptions, InitializationIntent, read_daemon_options, read_identity_manifest,
+};
 use uuid::Uuid;
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
@@ -225,6 +227,80 @@ fn init_resumes_after_seed_install_without_replacing_outputs() {
 }
 
 #[test]
+fn init_preflights_an_existing_manifest_before_installing_a_seed() {
+    let temp = tempfile::tempdir().unwrap();
+    set_private(temp.path());
+    let matching_recovery = "matching-existing-manifest-recovery-string-2027!";
+
+    let matching_data = temp.path().join("matching-state");
+    let matching_seed_file = temp.path().join("matching.seed");
+    let matching_seed = Seed::from_recovery_string(matching_recovery).unwrap();
+    mutualbackup::initialize_identity(&matching_data, &matching_seed, InitializationIntent::New)
+        .unwrap();
+    let matching_manifest = fs::read(matching_data.join("identity.toml")).unwrap();
+    run_cli_with_input(
+        &[
+            os("init"),
+            os("--seed-stdin"),
+            os("--seed-file"),
+            matching_seed_file.as_os_str().to_owned(),
+            os("--data-dir"),
+            matching_data.as_os_str().to_owned(),
+        ],
+        matching_recovery.as_bytes(),
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+    assert!(matching_seed_file.is_file());
+    assert_eq!(
+        fs::read(matching_data.join("identity.toml")).unwrap(),
+        matching_manifest
+    );
+
+    let conflicting_data = temp.path().join("conflicting-state");
+    let conflicting_seed_file = temp.path().join("conflicting.seed");
+    mutualbackup::initialize_identity(&conflicting_data, &matching_seed, InitializationIntent::New)
+        .unwrap();
+    let conflicting_manifest = fs::read(conflicting_data.join("identity.toml")).unwrap();
+    let conflict = run_cli_with_input(
+        &[
+            os("init"),
+            os("--seed-stdin"),
+            os("--seed-file"),
+            conflicting_seed_file.as_os_str().to_owned(),
+            os("--data-dir"),
+            conflicting_data.as_os_str().to_owned(),
+        ],
+        b"different-existing-manifest-recovery-string-2027!",
+        CLI_TIMEOUT,
+    );
+    assert!(conflict.is_err());
+    assert!(!conflicting_seed_file.exists());
+    assert_eq!(
+        fs::read(conflicting_data.join("identity.toml")).unwrap(),
+        conflicting_manifest
+    );
+
+    let generated_seed_file = temp.path().join("generated.seed");
+    let generated = run_cli(
+        &[
+            os("init"),
+            os("--seed-file"),
+            generated_seed_file.as_os_str().to_owned(),
+            os("--data-dir"),
+            conflicting_data.as_os_str().to_owned(),
+        ],
+        CLI_TIMEOUT,
+    );
+    assert!(generated.is_err());
+    assert!(!generated_seed_file.exists());
+    assert_eq!(
+        fs::read(conflicting_data.join("identity.toml")).unwrap(),
+        conflicting_manifest
+    );
+}
+
+#[test]
 fn init_accepts_bare_relative_seed_and_data_paths() {
     let temp = tempfile::tempdir().unwrap();
     set_private(temp.path());
@@ -310,6 +386,80 @@ fn daemon_never_reports_ready_when_its_only_listener_cannot_start() {
     assert!(
         stderr.contains("libp2p") || stderr.contains("cannot listen on"),
         "unexpected daemon error:\n{stderr}"
+    );
+}
+
+#[test]
+fn manual_unlock_returns_to_locked_after_network_startup_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    set_private(temp.path());
+    let data_dir = temp.path().join("state");
+    let socket = temp.path().join("control.sock");
+    let recovery = "manual-network-retry-recovery-string-2027!";
+    run_cli_with_input(
+        &[
+            os("init"),
+            os("--seed-stdin"),
+            os("--data-dir"),
+            data_dir.as_os_str().to_owned(),
+        ],
+        recovery.as_bytes(),
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+
+    let occupied = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = format!(
+        "/ip4/127.0.0.1/udp/{}/quic-v1",
+        occupied.local_addr().unwrap().port()
+    );
+    let mut daemon = Daemon::with_args(
+        vec![
+            os("--data-dir"),
+            data_dir.as_os_str().to_owned(),
+            os("--control-socket"),
+            socket.as_os_str().to_owned(),
+            os("--failure-domain"),
+            os("manual-network-retry-test"),
+            os("--listen"),
+            os(address.clone()),
+        ],
+        temp.path().join("daemon.log"),
+    );
+    daemon.start();
+    assert!(wait_for_status(&socket, &mut daemon, CLI_TIMEOUT).contains("Locked"));
+
+    let first_unlock = run_cli_with_input(
+        &[
+            os("--socket"),
+            socket.as_os_str().to_owned(),
+            os("unlock"),
+            os("--seed-stdin"),
+        ],
+        recovery.as_bytes(),
+        Duration::from_secs(40),
+    );
+    assert!(first_unlock.is_err());
+    daemon.assert_running();
+    assert!(wait_for_status(&socket, &mut daemon, CLI_TIMEOUT).contains("Locked"));
+
+    drop(occupied);
+    run_cli_with_input(
+        &[
+            os("--socket"),
+            socket.as_os_str().to_owned(),
+            os("unlock"),
+            os("--seed-stdin"),
+        ],
+        recovery.as_bytes(),
+        Duration::from_secs(40),
+    )
+    .unwrap();
+    daemon.assert_running();
+    let status = wait_for_status(&socket, &mut daemon, CLI_TIMEOUT);
+    assert!(
+        !status.contains("Locked"),
+        "daemon stayed locked:\n{status}"
     );
 }
 

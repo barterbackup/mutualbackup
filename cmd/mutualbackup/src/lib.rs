@@ -270,13 +270,7 @@ pub fn initialize_identity(
     seed: &Seed,
     intent: InitializationIntent,
 ) -> Result<IdentityManifest> {
-    let manifest = IdentityManifest {
-        format_version: 1,
-        expected_node_id: mb_core::KeyMaterial::from_seed(seed).node_id(),
-        intent,
-    };
-    manifest.validate()?;
-    let encoded = toml::to_string_pretty(&manifest)?;
+    let (manifest, encoded) = encoded_identity_manifest(seed, intent)?;
     ensure_initializable_private_data_dir(data_dir, encoded.as_bytes())?;
     write_new_private(
         &identity_manifest_path(data_dir),
@@ -284,6 +278,39 @@ pub fn initialize_identity(
         "identity manifest",
     )?;
     Ok(manifest)
+}
+
+/// Check whether identity initialization can use `data_dir` without changing it.
+///
+/// `init --seed-file` uses this before installing a new recovery-string file so
+/// a conflicting existing manifest cannot leave a newly written, unusable seed.
+pub fn preflight_identity_initialization(
+    data_dir: &Path,
+    seed: &Seed,
+    intent: InitializationIntent,
+) -> Result<()> {
+    let (_, encoded) = encoded_identity_manifest(seed, intent)?;
+    match fs::symlink_metadata(data_dir) {
+        Ok(metadata) => {
+            validate_existing_initializable_data_dir(data_dir, &metadata, encoded.as_bytes())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn encoded_identity_manifest(
+    seed: &Seed,
+    intent: InitializationIntent,
+) -> Result<(IdentityManifest, String)> {
+    let manifest = IdentityManifest {
+        format_version: 1,
+        expected_node_id: mb_core::KeyMaterial::from_seed(seed).node_id(),
+        intent,
+    };
+    manifest.validate()?;
+    let encoded = toml::to_string_pretty(&manifest)?;
+    Ok((manifest, encoded))
 }
 
 pub fn read_identity_manifest(data_dir: &Path) -> Result<IdentityManifest> {
@@ -660,17 +687,8 @@ fn resolve_document_paths(document: &mut toml::Value, base: &Path) -> Result<()>
 
 fn ensure_initializable_private_data_dir(path: &Path, manifest: &[u8]) -> Result<()> {
     let created = match fs::symlink_metadata(path) {
-        Ok(metadata) if !metadata.file_type().is_dir() => {
-            bail!("data directory path must be a directory, not a symlink or file")
-        }
         Ok(metadata) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if metadata.uid() != unsafe { libc::geteuid() } {
-                    bail!("data directory must be owned by the current user");
-                }
-            }
+            validate_existing_initializable_data_dir(path, &metadata, manifest)?;
             false
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -692,6 +710,34 @@ fn ensure_initializable_private_data_dir(path: &Path, manifest: &[u8]) -> Result
         }
         Err(error) => return Err(error.into()),
     };
+    let manifest_path = identity_manifest_path(path);
+    cleanup_verified_private_temporaries(&manifest_path, manifest)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if !created {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    sync_directory(path)?;
+    Ok(())
+}
+
+fn validate_existing_initializable_data_dir(
+    path: &Path,
+    metadata: &fs::Metadata,
+    manifest: &[u8],
+) -> Result<()> {
+    if !metadata.file_type().is_dir() {
+        bail!("data directory path must be a directory, not a symlink or file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            bail!("data directory must be owned by the current user");
+        }
+    }
 
     let manifest_path = identity_manifest_path(path);
     for entry in fs::read_dir(path)? {
@@ -716,15 +762,6 @@ fn ensure_initializable_private_data_dir(path: &Path, manifest: &[u8]) -> Result
             );
         }
     }
-    cleanup_verified_private_temporaries(&manifest_path, manifest)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if !created {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-        }
-    }
-    sync_directory(path)?;
     Ok(())
 }
 
