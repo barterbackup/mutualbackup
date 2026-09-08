@@ -1,30 +1,8 @@
 # Product TODO
 
-The source-review defects in the Milestone 1 slice are fixed and removed. The
+The source-review defects through Milestone 2 are fixed and removed. The
 remaining items are accepted design and usability work, not claims about
 already implemented behavior.
-
-## Next milestone: configuration and local identity state
-
-These are accepted follow-ups from design critique, not defects in the current
-fixed-five profile.
-
-- Separate human-owned daemon configuration from application-generated state.
-  Keep one resolved `DaemonOptions` model for TOML and `mutualbackupd` flags,
-  containing only operator choices such as paths, budgets, network policy, and
-  the initial failure-domain claim. Make the config file optional, expose the
-  same nonsecret options as flags, and define tested flag-over-file precedence;
-  TOML paths are file-relative and flag paths are working-directory-relative.
-  `mutualbackup init` and `recover-init` must not create or edit this TOML or
-  mirror its deployment options. Recovery strings and derived secrets never
-  enter argv.
-- Move `expected_node_id` and new-versus-recovery initialization intent out of
-  TOML and daemon flags into a fixed, versioned, application-owned public
-  manifest under `data_dir`. `init`/`recover-init` atomically create it without
-  replacement from the recovery string; the daemon requires it before unlock,
-  reports its identity while locked, and checks the derived Node ID before
-  opening SQLCipher. Unlock never creates or overwrites it. It remains fully
-  seed-recoverable and is an accidental-mismatch guard, not protocol authority.
 
 ## Later guild geometry and coding protocol
 

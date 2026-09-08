@@ -353,12 +353,17 @@ unmount_filesystem() {
 
 ensure_seed() {
     local node=$1
-    local seed identity temporary
+    local seed identity state manifest temporary
     seed=$(node_seed "$node")
     identity=$(node_identity "$node")
+    state=$(node_mount "$node")/state
+    manifest=$state/identity.toml
     if [[ ! -f $seed ]]; then
-        "$CLI_BIN" init --seed-file "$seed" >/dev/null
+        "$CLI_BIN" init --seed-file "$seed" --data-dir "$state" >/dev/null
         say "generated and retained recovery string for node $node: $seed"
+    elif [[ ! -f $manifest ]]; then
+        "$CLI_BIN" recover-init --seed-file "$seed" --data-dir "$state" >/dev/null
+        say "initialized recovery state for node $node from: $seed"
     fi
     chmod 600 "$seed"
     if [[ ! -f $identity ]]; then
@@ -373,10 +378,6 @@ peer_id() {
     sed -n 's/^libp2p peer id: *//p' "$(node_identity "$1")"
 }
 
-node_id() {
-    sed -n 's/^node id: *//p' "$(node_identity "$1")"
-}
-
 peer_endpoint() {
     local node=$1
     printf '/ip4/%s/udp/%s/quic-v1/p2p/%s\n' \
@@ -387,9 +388,6 @@ write_normal_config() {
     local node=$1
     local config bootstrap relay relay_server
     config=$(node_config "$node")
-    if [[ -f $config ]]; then
-        return
-    fi
     bootstrap='[]'
     relay='[]'
     relay_server=false
@@ -401,20 +399,19 @@ write_normal_config() {
     fi
     umask 077
     cat >"$config" <<EOF
-format_version = 1
 data_dir = "/node/state"
-expected_node_id = "$(node_id "$node")"
 seed_file = "/secrets/node.seed"
 control_socket = "/node/run/control.sock"
 failure_domain = "docker-lab-node-$node"
-recovery_mode = false
 parity_budget_bytes = $PARITY_BUDGET_BYTES
 p2p_listen_addresses = ["/ip4/0.0.0.0/udp/$(node_port "$node")/quic-v1"]
 p2p_external_addresses = ["/ip4/$(node_ip "$node")/udp/$(node_port "$node")/quic-v1"]
 p2p_bootstrap_addresses = $bootstrap
 p2p_relay_addresses = $relay
 enable_relay_server = $relay_server
+enable_hole_punching = true
 enable_dht_maintenance = true
+max_connections = 32
 EOF
 }
 
@@ -432,20 +429,18 @@ write_recovery_config() {
     fi
     umask 077
     cat >"$config" <<EOF
-format_version = 1
 data_dir = "/node/state"
-expected_node_id = "$(node_id "$node")"
 seed_file = "/secrets/node.seed"
 control_socket = "/node/run/control.sock"
-failure_domain = ""
-recovery_mode = true
 parity_budget_bytes = $PARITY_BUDGET_BYTES
 p2p_listen_addresses = ["/ip4/0.0.0.0/udp/$(node_port "$node")/quic-v1"]
 p2p_external_addresses = ["/ip4/$(node_ip "$node")/udp/$(node_port "$node")/quic-v1"]
 p2p_bootstrap_addresses = ["$(peer_endpoint "$bootstrap_node")"]
 p2p_relay_addresses = $relay
 enable_relay_server = $relay_server
+enable_hole_punching = true
 enable_dht_maintenance = true
+max_connections = 32
 EOF
 }
 
@@ -694,6 +689,9 @@ command_reinit() {
     unmount_filesystem "$node"
     rm -f "$(node_image "$node")"
     ensure_filesystem "$node"
+    "$CLI_BIN" recover-init \
+        --seed-file "$(node_seed "$node")" \
+        --data-dir "$(node_mount "$node")/state" >/dev/null
 
     local config previous timestamp
     config=$(node_config "$node")

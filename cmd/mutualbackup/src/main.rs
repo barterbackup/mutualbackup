@@ -12,7 +12,8 @@ use mb_store::probe_reflink;
 #[cfg(test)]
 use mutualbackup::read_seed;
 use mutualbackup::{
-    DaemonConfig, default_p2p_listen_addresses, read_recovery_string, write_config, write_seed,
+    InitializationIntent, default_control_socket, identity_manifest_path, initialize_identity,
+    read_recovery_string, write_seed,
 };
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -34,6 +35,9 @@ struct Cli {
 enum Command {
     /// Initialize a node from a generated or user-supplied recovery string.
     Init {
+        /// New, empty application state directory.
+        #[arg(long)]
+        data_dir: PathBuf,
         #[arg(long)]
         seed_file: Option<PathBuf>,
         /// Read a user-supplied recovery string from standard input.
@@ -42,28 +46,6 @@ enum Command {
         /// Prompt without echo for a user-supplied recovery string.
         #[arg(long, conflicts_with = "seed_stdin")]
         prompt_recovery: bool,
-        /// Also create a daemon configuration file.
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long, requires = "config")]
-        data_dir: Option<PathBuf>,
-        #[arg(long, requires = "config")]
-        failure_domain: Option<String>,
-        #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024_u64, requires = "config")]
-        parity_budget_bytes: u64,
-        #[arg(long = "listen", requires = "config")]
-        p2p_listen_addresses: Vec<String>,
-        #[arg(long = "external-address", requires = "config")]
-        p2p_external_addresses: Vec<String>,
-        #[arg(long = "bootstrap", requires = "config")]
-        p2p_bootstrap_addresses: Vec<String>,
-        #[arg(long = "relay", requires = "config")]
-        p2p_relay_addresses: Vec<String>,
-        #[arg(long, requires = "config")]
-        enable_relay_server: bool,
-        /// Do not attempt DCUtR upgrades of relay connections.
-        #[arg(long, requires = "config")]
-        disable_hole_punching: bool,
     },
     /// Derive public identity from a recovery string.
     Identity {
@@ -101,29 +83,15 @@ enum Command {
     },
     /// Inspect a durable backup job by revision ID.
     BackupStatus { revision_id: Uuid },
-    /// Create a blank recovery-mode configuration from a recovery string.
+    /// Create blank application identity state from a recovery string.
     RecoverInit {
+        /// New, empty application state directory.
+        #[arg(long)]
+        data_dir: PathBuf,
         #[arg(long)]
         seed_file: Option<PathBuf>,
         #[arg(long, conflicts_with = "seed_file")]
         seed_stdin: bool,
-        #[arg(long)]
-        config: PathBuf,
-        #[arg(long)]
-        data_dir: PathBuf,
-        #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024_u64)]
-        parity_budget_bytes: u64,
-        #[arg(long = "listen")]
-        p2p_listen_addresses: Vec<String>,
-        #[arg(long = "external-address")]
-        p2p_external_addresses: Vec<String>,
-        #[arg(long = "bootstrap", required = true)]
-        p2p_bootstrap_addresses: Vec<String>,
-        #[arg(long = "relay")]
-        p2p_relay_addresses: Vec<String>,
-        /// Do not attempt DCUtR upgrades of relay connections.
-        #[arg(long)]
-        disable_hole_punching: bool,
     },
     /// Restore this identity's latest revision through the recovery-mode daemon.
     Restore { target: PathBuf },
@@ -178,19 +146,10 @@ async fn main() -> Result<()> {
     let control_socket = cli.socket.clone().unwrap_or_else(default_control_socket);
     match cli.command {
         Command::Init {
+            data_dir,
             seed_file,
             seed_stdin,
             prompt_recovery,
-            config,
-            data_dir,
-            failure_domain,
-            parity_budget_bytes,
-            p2p_listen_addresses,
-            p2p_external_addresses,
-            p2p_bootstrap_addresses,
-            p2p_relay_addresses,
-            enable_relay_server,
-            disable_hole_punching,
         } => {
             let generated = !seed_stdin && !prompt_recovery;
             let recovery = if seed_stdin {
@@ -201,12 +160,9 @@ async fn main() -> Result<()> {
                 Seed::generate_recovery_string()?
             };
             let seed = derive_seed(&recovery).await?;
-            let config_seed_file = if let Some(path) = &seed_file {
+            if let Some(path) = &seed_file {
                 write_seed(path, &recovery)?;
                 println!("recovery string written to: {}", path.display());
-                Some(path.canonicalize().with_context(|| {
-                    format!("cannot resolve recovery string file {}", path.display())
-                })?)
             } else if generated {
                 println!("recovery string (shown once): {}", recovery.as_str());
                 let confirmation =
@@ -215,37 +171,12 @@ async fn main() -> Result<()> {
                 if confirmed.expose() != seed.expose() {
                     bail!("recovery string confirmation did not match");
                 }
-                None
-            } else {
-                None
-            };
-            let expected_node_id = KeyMaterial::from_seed(&seed).node_id();
-            if let Some(config_path) = config {
-                let config = DaemonConfig {
-                    format_version: 1,
-                    data_dir: data_dir.context("--data-dir is required when --config is used")?,
-                    expected_node_id,
-                    seed_file: config_seed_file,
-                    control_socket: control_socket.clone(),
-                    failure_domain: failure_domain
-                        .context("--failure-domain is required when --config is used")?,
-                    recovery_mode: false,
-                    parity_budget_bytes,
-                    p2p_listen_addresses: if p2p_listen_addresses.is_empty() {
-                        default_p2p_listen_addresses()
-                    } else {
-                        p2p_listen_addresses
-                    },
-                    p2p_external_addresses,
-                    p2p_bootstrap_addresses,
-                    p2p_relay_addresses,
-                    enable_relay_server,
-                    enable_hole_punching: !disable_hole_punching,
-                    enable_dht_maintenance: true,
-                };
-                write_config(&config_path, &config)?;
-                println!("daemon config written to: {}", config_path.display());
             }
+            initialize_identity(&data_dir, &seed, InitializationIntent::New)?;
+            println!(
+                "identity manifest written to: {}",
+                identity_manifest_path(&data_dir).display()
+            );
             print_identity(&seed);
         }
         Command::Identity {
@@ -377,53 +308,19 @@ async fn main() -> Result<()> {
             print_backup_job(&job);
         }
         Command::RecoverInit {
+            data_dir,
             seed_file,
             seed_stdin,
-            config,
-            data_dir,
-            parity_budget_bytes,
-            p2p_listen_addresses,
-            p2p_external_addresses,
-            p2p_bootstrap_addresses,
-            p2p_relay_addresses,
-            disable_hole_punching,
         } => {
             let recovery = recovery_input(seed_file.as_deref(), seed_stdin).await?;
             let seed = derive_seed(&recovery)
                 .await
                 .context("cannot use the supplied recovery string")?;
-            let seed_file = seed_file
-                .map(|path| {
-                    path.canonicalize().with_context(|| {
-                        format!("cannot resolve recovery string file {}", path.display())
-                    })
-                })
-                .transpose()?;
-            write_config(
-                &config,
-                &DaemonConfig {
-                    format_version: 1,
-                    data_dir,
-                    expected_node_id: KeyMaterial::from_seed(&seed).node_id(),
-                    seed_file,
-                    control_socket: control_socket.clone(),
-                    failure_domain: String::new(),
-                    recovery_mode: true,
-                    parity_budget_bytes,
-                    p2p_listen_addresses: if p2p_listen_addresses.is_empty() {
-                        default_p2p_listen_addresses()
-                    } else {
-                        p2p_listen_addresses
-                    },
-                    p2p_external_addresses,
-                    p2p_bootstrap_addresses,
-                    p2p_relay_addresses,
-                    enable_relay_server: false,
-                    enable_hole_punching: !disable_hole_punching,
-                    enable_dht_maintenance: true,
-                },
-            )?;
-            println!("recovery daemon config written to: {}", config.display());
+            initialize_identity(&data_dir, &seed, InitializationIntent::Recovery)?;
+            println!(
+                "recovery identity manifest written to: {}",
+                identity_manifest_path(&data_dir).display()
+            );
         }
         Command::Restore { target } => {
             let response = local_control_call(
@@ -482,16 +379,6 @@ async fn main() -> Result<()> {
         },
     }
     Ok(())
-}
-
-fn default_control_socket() -> PathBuf {
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(runtime).join("mutualbackup/control.sock")
-    } else {
-        std::env::temp_dir()
-            .join(format!("mutualbackup-{}", unsafe { libc::geteuid() }))
-            .join("control.sock")
-    }
 }
 
 fn print_identity(seed: &Seed) {

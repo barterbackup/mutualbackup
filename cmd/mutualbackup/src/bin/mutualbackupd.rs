@@ -1,23 +1,17 @@
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use clap::Parser;
 use libp2p::Multiaddr;
 use mb_node::{
     LocalControlListener, LocalRequest, LocalResponse, LockedDataDir, Node, P2pConfig,
     UnlockSecret, WireError, bind_local_control, build_p2p, run_coordinator_jobs,
     run_dht_publications, run_root_watcher, serve_local_control_on,
 };
-use mutualbackup::{DaemonConfig, read_config, read_seed};
+use mutualbackup::{
+    DaemonOptions, DaemonOptionsError, IdentityManifest, InitializationIntent, read_daemon_options,
+    read_identity_manifest, read_seed,
+};
 use tracing_subscriber::EnvFilter;
-
-#[derive(Debug, Parser)]
-#[command(name = "mutualbackupd", version, about = "MutualBackup node daemon")]
-struct Cli {
-    #[arg(long)]
-    config: PathBuf,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -25,33 +19,46 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .try_init()
         .ok();
-    let config = read_config(&Cli::parse().config)?;
+    let config = match read_daemon_options(std::env::args_os()) {
+        Ok(config) => config,
+        Err(DaemonOptionsError::Parse(error)) => error.exit(),
+        Err(DaemonOptionsError::Load(error)) => return Err(error),
+    };
+    let identity = read_identity_manifest(&config.data_dir)?;
+    config.validate(&identity)?;
+    if identity.intent == InitializationIntent::Recovery && config.failure_domain.is_some() {
+        tracing::warn!(
+            "ignoring configured failure domain while recovering authenticated guild state"
+        );
+    }
     let locked_data_dir = Node::lock_data_dir(&config.data_dir)?;
     let listener = bind_local_control(&config.control_socket)?;
     let (node, p2p_client, p2p_event_loop) = match &config.seed_file {
         Some(seed_file) => {
             let seed_file = seed_file.clone();
             let open_config = config.clone();
+            let open_identity = identity.clone();
             let node = tokio::task::spawn_blocking(move || {
                 let seed =
                     read_seed(&seed_file).context("automatic recovery-string unlock failed")?;
-                open_configured_node(&open_config, locked_data_dir, seed)
+                open_configured_node(&open_config, &open_identity, locked_data_dir, seed)
             })
             .await
             .context("automatic unlock worker failed")??;
-            start_node_runtime(&config, node)?
+            start_node_runtime(&config, &identity, node)?
         }
         None => {
-            println!("node {} locked", config.expected_node_id);
+            println!("node {} locked", identity.expected_node_id);
             println!("control socket: {}", config.control_socket.display());
             loop {
                 let (node, connection) =
-                    await_manual_node(&config, locked_data_dir.clone(), &listener).await?;
-                match start_node_runtime(&config, node) {
+                    await_manual_node(&config, &identity, locked_data_dir.clone(), &listener)
+                        .await?;
+                match start_node_runtime(&config, &identity, node) {
                     Ok(runtime) => {
                         if let Err(error) = connection
                             .respond(LocalResponse::Unlocked {
-                                node_id: config.expected_node_id,
+                                node_id: identity.expected_node_id,
                             })
                             .await
                         {
@@ -72,7 +79,7 @@ async fn main() -> Result<()> {
             }
         }
     };
-    let node_id = config.expected_node_id;
+    let node_id = identity.expected_node_id;
     println!("node {node_id} ready");
     println!("libp2p peer id: {}", p2p_client.local_peer_id());
     println!("control socket: {}", config.control_socket.display());
@@ -91,7 +98,8 @@ async fn main() -> Result<()> {
 }
 
 fn start_node_runtime(
-    config: &DaemonConfig,
+    config: &DaemonOptions,
+    identity: &IdentityManifest,
     node: Node,
 ) -> Result<(Arc<Mutex<Node>>, mb_node::P2pClient, mb_node::P2pEventLoop)> {
     let direct_endpoint = config
@@ -107,9 +115,10 @@ fn start_node_runtime(
                 .p2p_relay_addresses
                 .first()
                 .context("validated config has no relay address")?,
-            config.expected_node_id.libp2p_peer_id()?
+            identity.expected_node_id.libp2p_peer_id()?
         ),
     };
+    let failure_domain = config.effective_failure_domain(identity);
     let node = Arc::new(Mutex::new(node));
     let p2p_config = P2pConfig {
         listen_addresses: parse_addresses(&config.p2p_listen_addresses)?,
@@ -120,36 +129,38 @@ fn start_node_runtime(
         enable_relay_server: config.enable_relay_server,
         enable_hole_punching: config.enable_hole_punching,
         public_endpoint,
-        failure_domain: config.failure_domain.clone(),
-        configure_failure_domain: !config.recovery_mode,
-        max_connections: 32,
+        failure_domain,
+        configure_failure_domain: identity.intent == InitializationIntent::New,
+        max_connections: config.max_connections,
     };
     let (p2p_client, p2p_event_loop) = build_p2p(node.clone(), p2p_config)?;
     Ok((node, p2p_client, p2p_event_loop))
 }
 
 fn open_configured_node(
-    config: &DaemonConfig,
+    config: &DaemonOptions,
+    identity: &IdentityManifest,
     locked_data_dir: LockedDataDir,
     seed: mb_core::Seed,
 ) -> Result<Node> {
     let actual = mb_core::KeyMaterial::from_seed(&seed).node_id();
-    if actual != config.expected_node_id {
+    if actual != identity.expected_node_id {
         anyhow::bail!(
             "recovery string derives node {actual}, expected {}",
-            config.expected_node_id
+            identity.expected_node_id
         );
     }
     let mut node = Node::open_locked(locked_data_dir, seed)?;
-    if !config.recovery_mode {
-        node.configure_failure_domain(&config.failure_domain)?;
+    if identity.intent == InitializationIntent::New {
+        node.configure_failure_domain(&config.effective_failure_domain(identity))?;
     }
     node.configure_parity_budget(config.parity_budget_bytes)?;
     Ok(node)
 }
 
 async fn await_manual_node(
-    config: &DaemonConfig,
+    config: &DaemonOptions,
+    identity: &IdentityManifest,
     locked_data_dir: LockedDataDir,
     listener: &LocalControlListener,
 ) -> Result<(Node, mb_node::LocalControlConnection)> {
@@ -166,7 +177,7 @@ async fn await_manual_node(
             LocalRequest::Status => {
                 if let Err(error) = connection
                     .respond(LocalResponse::Locked {
-                        expected_node_id: config.expected_node_id,
+                        expected_node_id: identity.expected_node_id,
                     })
                     .await
                 {
@@ -174,7 +185,7 @@ async fn await_manual_node(
                 }
             }
             LocalRequest::Unlock { secret } => {
-                match try_manual_unlock(config, locked_data_dir.clone(), secret).await {
+                match try_manual_unlock(config, identity, locked_data_dir.clone(), secret).await {
                     Ok(node) => return Ok((node, connection)),
                     Err(error) => {
                         tracing::warn!(%error, "manual daemon unlock rejected");
@@ -197,13 +208,15 @@ async fn await_manual_node(
 }
 
 async fn try_manual_unlock(
-    config: &DaemonConfig,
+    config: &DaemonOptions,
+    identity: &IdentityManifest,
     locked_data_dir: LockedDataDir,
     secret: UnlockSecret,
 ) -> Result<Node> {
     let config = config.clone();
+    let identity = identity.clone();
     tokio::task::spawn_blocking(move || {
-        open_configured_node(&config, locked_data_dir, secret.seed())
+        open_configured_node(&config, &identity, locked_data_dir, secret.seed())
     })
     .await
     .context("unlock worker failed")?

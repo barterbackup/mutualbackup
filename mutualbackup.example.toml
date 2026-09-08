@@ -1,13 +1,10 @@
 # Example configuration for one normal MutualBackup node.
+# This file is human-owned; MutualBackup never creates or edits it.
 # Relative paths are resolved relative to this file.
-format_version = 1
 
-# Private local state. The daemon creates control.db and parity.db here.
+# Private local state. `mutualbackup init --data-dir ...` creates its public
+# identity manifest; the daemon later creates control.db and parity.db here.
 data_dir = ".mutualbackup/node/state"
-
-# Public identity written by `mutualbackup init`; replace this illustrative
-# value together with the recovery string.
-expected_node_id = "b20d54e51cca9fb483f98e442d991dc377c8e66af65a122668547ebd4c041e5f"
 
 # Optional unattended auto-unlock. Omit this field to start locked and unlock
 # through the CLI. Keep the file private and retain a genuinely offline copy.
@@ -18,7 +15,6 @@ control_socket = ".mutualbackup/node/run/control.sock"
 
 # Guild members must use distinct, truthful failure-domain labels.
 failure_domain = "host-a/disk-a"
-recovery_mode = false
 
 # Maximum locally stored parity: 10 GiB.
 parity_budget_bytes = 10737418240
@@ -43,3 +39,6 @@ enable_hole_punching = true
 # bootstrap, publish, or refresh through the DHT. The node still serves DHT
 # and application requests. Normal nodes should leave this true.
 enable_dht_maintenance = true
+
+# Bound established libp2p sessions and concurrent peer workers.
+max_connections = 32

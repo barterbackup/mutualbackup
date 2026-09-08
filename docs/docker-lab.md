@@ -21,7 +21,7 @@ By default, all retained lab material lives below `.docker-lab/`:
 | `mounts/nodeN/exchange/` | Host-visible directory also available as `/node/exchange` inside node N. |
 | `seeds/nodeN.seed` | Automatically generated printable recovery string, outside disposable node storage. |
 | `seeds/nodeN.identity` | Cached public Node ID/libp2p identity used to render configs without repeating Argon2. |
-| `configs/nodeN.toml` | Generated daemon configuration using container-internal paths. |
+| `configs/nodeN.toml` | Lab-managed daemon configuration using container-internal paths. |
 | One Docker container per node | Runs only the prebuilt `mutualbackupd`. |
 | One Docker bridge | Gives nodes stable addresses `172.30.77.10` through `.14`. |
 
@@ -90,14 +90,17 @@ The first run performs the complete deployment:
 3. creates the private Docker bridge;
 4. creates five sparse image files and attaches five loop devices;
 5. formats and mounts a distinct Btrfs filesystem for each node;
-6. generates and retains five distinct seeds and five configs;
+6. generates five distinct seeds, initializes each application-owned identity
+   manifest, and writes five lab-managed configs;
 7. creates and starts five daemon containers;
 8. creates, joins, and finalizes the real fixed five-member guild; and
 9. prints container state, IP addresses, ports, loop devices, and host paths.
 
 `up` is resumable. Running it after `down` reattaches and mounts the existing
 images, recreates containers, and resumes the same identities and guild. It
-does not regenerate an existing recovery string or overwrite an existing config.
+does not regenerate an existing recovery string or identity manifest. The
+controller rewrites its own lab configs from the selected environment settings;
+do not hand-edit them.
 
 ## Run CLI commands
 
@@ -218,8 +221,9 @@ for test files.
 3. removes the old container;
 4. unmounts, detaches, and permanently deletes that node's Btrfs image;
 5. creates and mounts a new empty Btrfs image;
-6. retains the original seed and archives the previous config;
-7. writes a recovery-mode config bootstrapping through a surviving peer;
+6. retains the original seed, creates a new recovery identity manifest, and
+   archives the previous config;
+7. writes daemon options bootstrapping through a surviving peer;
 8. creates a new container at the node's old IP with the same recovery-string identity;
 9. recovers guild state and the latest owned revision over the real DHT/QUIC
    data path; and
@@ -266,7 +270,7 @@ To continue backing it up, register it explicitly:
 ```
 
 If network recovery fails, `reinit` returns an error but deliberately leaves
-the recovery-mode container running. Inspect its logs and retry without
+the recovery identity's container running. Inspect its logs and retry without
 another wipe:
 
 ```sh

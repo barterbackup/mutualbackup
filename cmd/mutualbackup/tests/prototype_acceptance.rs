@@ -19,21 +19,25 @@ use mb_core::{
 use mb_node::{
     Node, P2pConfig, build_p2p, endpoint_record_key, recovery_bundle_key, recovery_mailbox_key,
 };
-use mutualbackup::{DaemonConfig, read_config};
+use mutualbackup::{DaemonOptions, read_daemon_options, read_identity_manifest};
 use uuid::Uuid;
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct Daemon {
-    config: PathBuf,
+    args: Vec<OsString>,
     log: PathBuf,
     child: Option<Child>,
 }
 
 impl Daemon {
     fn new(config: PathBuf, log: PathBuf) -> Self {
+        Self::with_args(vec![os("--config"), config.into_os_string()], log)
+    }
+
+    fn with_args(args: Vec<OsString>, log: PathBuf) -> Self {
         Self {
-            config,
+            args,
             log,
             child: None,
         }
@@ -48,8 +52,7 @@ impl Daemon {
             .unwrap();
         let stderr = log.try_clone().unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_mutualbackupd"))
-            .arg("--config")
-            .arg(&self.config)
+            .args(&self.args)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))
@@ -84,6 +87,89 @@ impl Drop for Daemon {
 }
 
 #[test]
+fn daemon_requires_an_initialized_identity_without_creating_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("missing-state");
+    let output = Command::new(env!("CARGO_BIN_EXE_mutualbackupd"))
+        .args([
+            os("--data-dir"),
+            data_dir.as_os_str().to_owned(),
+            os("--failure-domain"),
+            os("missing-manifest-test"),
+            os("--listen"),
+            os("/ip4/127.0.0.1/udp/0/quic-v1"),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!data_dir.exists());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("identity manifest"),
+        "unexpected daemon error:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn daemon_accepts_config_only_and_flag_overrides() {
+    let temp = tempfile::tempdir().unwrap();
+    set_private(temp.path());
+    let data_dir = temp.path().join("state");
+    run_cli_with_input(
+        &[
+            os("init"),
+            os("--seed-stdin"),
+            os("--data-dir"),
+            data_dir.as_os_str().to_owned(),
+        ],
+        b"config-precedence-recovery-string-2027!",
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+    let config_socket = temp.path().join("from-config.sock");
+    let override_socket = temp.path().join("from-flag.sock");
+    let config_path = temp.path().join("node.toml");
+    write_test_config(
+        &config_path,
+        &DaemonOptions {
+            config_file: None,
+            data_dir,
+            seed_file: None,
+            control_socket: config_socket.clone(),
+            failure_domain: Some("config-precedence-test".to_owned()),
+            parity_budget_bytes: 10 * 1024 * 1024 * 1024,
+            p2p_listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".to_owned()],
+            p2p_external_addresses: Vec::new(),
+            p2p_bootstrap_addresses: Vec::new(),
+            p2p_relay_addresses: Vec::new(),
+            enable_relay_server: false,
+            enable_hole_punching: true,
+            enable_dht_maintenance: true,
+            max_connections: 32,
+        },
+    );
+
+    let mut config_daemon = Daemon::new(config_path.clone(), temp.path().join("config.log"));
+    config_daemon.start();
+    assert!(wait_for_status(&config_socket, &mut config_daemon, CLI_TIMEOUT).contains("Locked"));
+    config_daemon.stop();
+
+    let mut override_daemon = Daemon::with_args(
+        vec![
+            os("--config"),
+            config_path.into_os_string(),
+            os("--control-socket"),
+            override_socket.as_os_str().to_owned(),
+        ],
+        temp.path().join("override.log"),
+    );
+    override_daemon.start();
+    assert!(
+        wait_for_status(&override_socket, &mut override_daemon, CLI_TIMEOUT).contains("Locked")
+    );
+}
+
+#[test]
 fn daemon_starts_locked_and_rejects_the_wrong_identity_before_opening_storage() {
     let temp = tempfile::tempdir().unwrap();
     set_private(temp.path());
@@ -92,7 +178,6 @@ fn daemon_starts_locked_and_rejects_the_wrong_identity_before_opening_storage() 
     fs::create_dir(&run_dir).unwrap();
     set_private(&run_dir);
     let socket = run_dir.join("control.sock");
-    let config_path = temp.path().join("node.toml");
     let recovery = "correct-horse-battery-staple-2026!";
     let initialized = run_cli_with_input(
         &[
@@ -100,19 +185,27 @@ fn daemon_starts_locked_and_rejects_the_wrong_identity_before_opening_storage() 
             socket.as_os_str().to_owned(),
             os("init"),
             os("--seed-stdin"),
-            os("--config"),
-            config_path.as_os_str().to_owned(),
             os("--data-dir"),
             data_dir.as_os_str().to_owned(),
-            os("--failure-domain"),
-            os("locked-daemon-test"),
         ],
         recovery.as_bytes(),
         Duration::from_secs(30),
     )
     .unwrap();
     let expected_node_id = value_after(&initialized, "node id:       ");
-    let mut daemon = Daemon::new(config_path, temp.path().join("daemon.log"));
+    let mut daemon = Daemon::with_args(
+        vec![
+            os("--data-dir"),
+            data_dir.as_os_str().to_owned(),
+            os("--control-socket"),
+            socket.as_os_str().to_owned(),
+            os("--failure-domain"),
+            os("locked-daemon-test"),
+            os("--listen"),
+            os("/ip4/127.0.0.1/udp/0/quic-v1"),
+        ],
+        temp.path().join("daemon.log"),
+    );
     daemon.start();
     let locked = wait_for_status(&socket, &mut daemon, Duration::from_secs(30));
     assert!(locked.contains("state:         Locked"));
@@ -189,29 +282,15 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         let seed = seed_dir.join(format!("p{index}.seed"));
         let config = peer_dir.join("node.toml");
         let socket = peer_dir.join("c");
-        let mut args = vec![
+        let args = vec![
             os("--socket"),
             socket.as_os_str().to_owned(),
             os("init"),
             os("--seed-file"),
             seed.as_os_str().to_owned(),
-            os("--config"),
-            config.as_os_str().to_owned(),
             os("--data-dir"),
             peer_dir.join("state").into_os_string(),
-            os("--failure-domain"),
-            os(format!("disk-{index}")),
-            os("--listen"),
-            os(&transports[index]),
-            os("--external-address"),
-            os(&transports[index]),
         ];
-        if index == 0 {
-            args.push(os("--enable-relay-server"));
-        } else {
-            let bootstrap = format!("{}/p2p/{}", transports[0], peer_ids[0]);
-            args.extend([os("--bootstrap"), os(&bootstrap)]);
-        }
         let output = run_cli(&args, CLI_TIMEOUT).unwrap();
         let recovery_string = fs::read_to_string(&seed).unwrap();
         assert_eq!(recovery_string.split_whitespace().count(), 24);
@@ -220,6 +299,30 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
             value_after(&output, "node id:       ")
                 .parse::<NodeId>()
                 .unwrap(),
+        );
+        let bootstrap_addresses = if index == 0 {
+            Vec::new()
+        } else {
+            vec![format!("{}/p2p/{}", transports[0], peer_ids[0])]
+        };
+        write_test_config(
+            &config,
+            &DaemonOptions {
+                config_file: None,
+                data_dir: peer_dir.join("state"),
+                seed_file: Some(seed),
+                control_socket: socket.clone(),
+                failure_domain: Some(format!("disk-{index}")),
+                parity_budget_bytes: 10 * 1024 * 1024 * 1024,
+                p2p_listen_addresses: vec![transports[index].clone()],
+                p2p_external_addresses: vec![transports[index].clone()],
+                p2p_bootstrap_addresses: bootstrap_addresses,
+                p2p_relay_addresses: Vec::new(),
+                enable_relay_server: index == 0,
+                enable_hole_punching: true,
+                enable_dht_maintenance: true,
+                max_connections: 32,
+            },
         );
         sockets.push(socket);
         configs.push(config);
@@ -388,20 +491,31 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
             os("recover-init"),
             os("--seed-file"),
             seed_dir.join("p1.seed").into_os_string(),
-            os("--config"),
-            recovered_config.as_os_str().to_owned(),
             os("--data-dir"),
             recovered_dir.join("state").into_os_string(),
-            os("--listen"),
-            os(&transports[5]),
-            os("--external-address"),
-            os(&transports[5]),
-            os("--bootstrap"),
-            os(&bootstrap),
         ],
         CLI_TIMEOUT,
     )
     .unwrap();
+    write_test_config(
+        &recovered_config,
+        &DaemonOptions {
+            config_file: None,
+            data_dir: recovered_dir.join("state"),
+            seed_file: Some(seed_dir.join("p1.seed")),
+            control_socket: recovered_socket.clone(),
+            failure_domain: None,
+            parity_budget_bytes: 10 * 1024 * 1024 * 1024,
+            p2p_listen_addresses: vec![transports[5].clone()],
+            p2p_external_addresses: vec![transports[5].clone()],
+            p2p_bootstrap_addresses: vec![bootstrap.clone()],
+            p2p_relay_addresses: Vec::new(),
+            enable_relay_server: false,
+            enable_hole_punching: true,
+            enable_dht_maintenance: true,
+            max_connections: 32,
+        },
+    );
     let mut recovered_daemon =
         Daemon::new(recovered_config.clone(), run_root.join("recovered.log"));
     recovered_daemon.start();
@@ -463,20 +577,31 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
             os("recover-init"),
             os("--seed-file"),
             seed_dir.join("p4.seed").into_os_string(),
-            os("--config"),
-            storage_recovered_config.as_os_str().to_owned(),
             os("--data-dir"),
             storage_recovered_dir.join("state").into_os_string(),
-            os("--listen"),
-            os(&transports[7]),
-            os("--external-address"),
-            os(&transports[7]),
-            os("--bootstrap"),
-            os(&bootstrap),
         ],
         CLI_TIMEOUT,
     )
     .unwrap();
+    write_test_config(
+        &storage_recovered_config,
+        &DaemonOptions {
+            config_file: None,
+            data_dir: storage_recovered_dir.join("state"),
+            seed_file: Some(seed_dir.join("p4.seed")),
+            control_socket: storage_recovered_socket.clone(),
+            failure_domain: None,
+            parity_budget_bytes: 10 * 1024 * 1024 * 1024,
+            p2p_listen_addresses: vec![transports[7].clone()],
+            p2p_external_addresses: vec![transports[7].clone()],
+            p2p_bootstrap_addresses: vec![bootstrap.clone()],
+            p2p_relay_addresses: Vec::new(),
+            enable_relay_server: false,
+            enable_hole_punching: true,
+            enable_dht_maintenance: true,
+            max_connections: 32,
+        },
+    );
     let mut storage_recovered_daemon = Daemon::new(
         storage_recovered_config.clone(),
         run_root.join("storage-recovered.log"),
@@ -667,24 +792,31 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
             os("init"),
             os("--seed-file"),
             seed_dir.join("outsider.seed").into_os_string(),
-            os("--config"),
-            outsider_config.as_os_str().to_owned(),
             os("--data-dir"),
             outsider_dir.join("state").into_os_string(),
-            os("--failure-domain"),
-            os("outsider"),
-            os("--listen"),
-            os(&transports[8]),
-            os("--external-address"),
-            os(&transports[8]),
-            os("--bootstrap"),
-            os(&bootstrap),
-            os("--relay"),
-            os(&relay),
         ],
         CLI_TIMEOUT,
     )
     .unwrap();
+    write_test_config(
+        &outsider_config,
+        &DaemonOptions {
+            config_file: None,
+            data_dir: outsider_dir.join("state"),
+            seed_file: Some(seed_dir.join("outsider.seed")),
+            control_socket: outsider_socket.clone(),
+            failure_domain: Some("outsider".to_owned()),
+            parity_budget_bytes: 10 * 1024 * 1024 * 1024,
+            p2p_listen_addresses: vec![transports[8].clone()],
+            p2p_external_addresses: vec![transports[8].clone()],
+            p2p_bootstrap_addresses: vec![bootstrap],
+            p2p_relay_addresses: vec![relay],
+            enable_relay_server: false,
+            enable_hole_punching: true,
+            enable_dht_maintenance: true,
+            max_connections: 32,
+        },
+    );
     let mut outsider_daemon = Daemon::new(outsider_config, run_root.join("outsider.log"));
     outsider_daemon.start();
     wait_for_status(
@@ -924,11 +1056,10 @@ fn remove_anchor_areas(node_dir: &Path) {
     }
 }
 
-fn update_config(path: &Path, update: impl FnOnce(&mut DaemonConfig)) {
-    let mut config = read_config(path).unwrap();
-    update(&mut config);
-    config.validate().unwrap();
-    fs::write(path, toml::to_string_pretty(&config).unwrap()).unwrap();
+fn write_test_config(path: &Path, config: &DaemonOptions) {
+    let identity = read_identity_manifest(&config.data_dir).unwrap();
+    config.validate(&identity).unwrap();
+    fs::write(path, toml::to_string_pretty(config).unwrap()).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     OpenOptions::new()
         .read(true)
@@ -936,6 +1067,18 @@ fn update_config(path: &Path, update: impl FnOnce(&mut DaemonConfig)) {
         .unwrap()
         .sync_all()
         .unwrap();
+}
+
+fn update_config(path: &Path, update: impl FnOnce(&mut DaemonOptions)) {
+    let mut config = read_daemon_options([
+        OsString::from("mutualbackupd"),
+        OsString::from("--config"),
+        path.as_os_str().to_owned(),
+    ])
+    .unwrap();
+    update(&mut config);
+    config.config_file = None;
+    write_test_config(path, &config);
 }
 
 fn wait_for_status_text(

@@ -584,7 +584,7 @@ checksum = "7b48fea5a88e9ae728a2dcbedbfc0e730f7d60da42e1cb049a83c9fb8b789889"
 dependencies = [
  "anstream",
  "anstyle",
- "clap_lex",
+ "clap_lex 1.1.0",
  "strsim",
 ]
 
@@ -599,6 +599,12 @@ dependencies = [
  "quote",
  "syn 3.0.5",
 ]
+
+[[package]]
+name = "clap_lex"
+version = "0.7.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
 
 [[package]]
 name = "clap_lex"
@@ -628,6 +634,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
+]
+
+[[package]]
+name = "conf"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f37e148dbc927d8aa1d7f07fc6c06db98d2f102485a14239da7f3d8441ed1f46"
+dependencies = [
+ "anstyle",
+ "clap",
+ "clap_lex 0.7.7",
+ "conf_derive",
+ "serde",
+]
+
+[[package]]
+name = "conf_derive"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "def1cc7b12095ba8d2b9b04e27d7524d4b117795a9f1f232d962ea53f1c6b81b"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2606,6 +2637,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "conf",
  "hex",
  "libc",
  "libp2p",
@@ -2616,6 +2648,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "toml",
  "tracing",

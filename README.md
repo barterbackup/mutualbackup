@@ -14,8 +14,8 @@ unique data to this prototype.
 
 ## Programs
 
-- `mutualbackupd --config NODE.toml` owns one node's databases, source anchors,
-  peer network, DHT publication, watcher, and durable jobs.
+- `mutualbackupd [--config NODE.toml] [OPTIONS]` owns one node's databases,
+  source anchors, peer network, DHT publication, watcher, and durable jobs.
 - `mutualbackup` is the local control and offline bootstrap CLI. Run
   `mutualbackup --help` and its subcommand help for the complete interface.
 
@@ -31,13 +31,15 @@ exchange directories, and node reinitialization from its recovery string, see th
 with `nix develop .#docker-lab`; this supplies the host-side commands without
 building MutualBackup.
 
-A new node starts with `mutualbackup init --config NODE.toml --data-dir DATA
---failure-domain LABEL`. Its generated printable recovery string is shown once;
-retain an offline copy. The daemon starts locked and is unlocked through the
-same-user CLI prompt. For unattended labs, `--seed-file FILE` stores the string
-in a strictly private auto-unlock file. A fresh recovery-mode daemon can be
-initialized with `mutualbackup recover-init` using only that string and generic
-bootstrap multiaddresses.
+A new identity starts with `mutualbackup init --data-dir DATA`. Its generated
+printable recovery string is shown once; retain an offline copy. The command
+creates an application-owned public identity manifest but never edits daemon
+configuration. Supply daemon options through human-owned TOML, equivalent
+flags, or both with flags taking precedence. Without a configured `seed_file`,
+the daemon starts locked and is unlocked through the same-user CLI prompt. For
+unattended labs, `init --seed-file FILE` stores the string in a strictly private
+auto-unlock file. `mutualbackup recover-init` recreates blank identity state
+from only that string; generic network options are still supplied to the daemon.
 
 Routine operations go through the daemon:
 

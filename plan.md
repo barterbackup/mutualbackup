@@ -417,9 +417,9 @@ Proactive background repair comes later.
 
 The asynchronous daemon/process split, locked startup, recovery-string input,
 expected-identity check, bounded worker ownership, and formal wire contracts are
-implemented. Separating human configuration from application-owned identity
-state is the next milestone. A strictly checked recovery-string file remains an
-explicit unattended auto-unlock option rather than a daemon prerequisite.
+implemented. Human configuration and application-owned identity state are also
+separate. A strictly checked recovery-string file remains an explicit
+unattended auto-unlock option rather than a daemon prerequisite.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -694,6 +694,12 @@ the Btrfs and five-process acceptance gates on the remote Nix runner.
   recovery, missing-manifest, no-replace, wrong-seed, config-only, flag-only, and
   mixed-precedence process cases. Pause here before beginning Tor or changing
   guild geometry.
+
+**This review gate is passed.** One derived `DaemonOptions` model now composes
+optional human TOML with equivalent daemon flags, while `init` and
+`recover-init` create only the no-replace public identity manifest. The sample,
+guides, Docker lab, parser tests, locked process tests, static Nix package, and
+full Btrfs/five-process acceptance suite cover the new boundary.
 
 ### Milestone 3 — Tor and robust connectivity beta
 
