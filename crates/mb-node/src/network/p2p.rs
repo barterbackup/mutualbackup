@@ -2798,6 +2798,21 @@ async fn recover_p2p_local_shards(
     checkpoint: &QuorumCheckpoint,
     roster: &[GuildPeer],
 ) -> Result<()> {
+    recover_local_shards_with(node, checkpoint, |group, target_index| async move {
+        reconstruct_shard_from_peers(p2p, &group, target_index, roster).await
+    })
+    .await
+}
+
+async fn recover_local_shards_with<F, Fut>(
+    node: Arc<Mutex<Node>>,
+    checkpoint: &QuorumCheckpoint,
+    mut reconstruct: F,
+) -> Result<()>
+where
+    F: FnMut(CodingGroup, usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
     let recovering = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
     let checkpoint_hash = checkpoint.hash()?;
     for group in &checkpoint.checkpoint.coding_groups {
@@ -2831,7 +2846,7 @@ async fn recover_p2p_local_shards(
         if already_staged {
             continue;
         }
-        let bytes = reconstruct_shard_from_peers(p2p, group, target_index, roster).await?;
+        let bytes = reconstruct(group.clone(), target_index).await?;
         if sector_root(&bytes) != target_root {
             bail!("reconstructed target shard failed its certified root");
         }
@@ -3594,6 +3609,143 @@ mod tests {
             failure_domain: node_id.to_string(),
             configure_failure_domain: true,
             max_connections: 8,
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_accumulates_shards_across_alternating_availability_and_restart() {
+        fn group_for(
+            guild_id: [u8; 32],
+            local_id: NodeId,
+            other_ids: [NodeId; 4],
+            byte: u8,
+        ) -> (CodingGroup, Vec<u8>) {
+            let information = [
+                vec![byte; V1_SECTOR_SIZE],
+                vec![byte.wrapping_add(1); V1_SECTOR_SIZE],
+                vec![byte.wrapping_add(2); V1_SECTOR_SIZE],
+            ];
+            let shards = encode_3_2(information.clone()).unwrap();
+            let roles = [
+                ShardRole::Information(InformationRole {
+                    owner: other_ids[0],
+                    sector: SectorRef {
+                        id: [byte; 32],
+                        root: sector_root(&information[0]),
+                        logical_len: V1_SECTOR_SIZE as u32,
+                    },
+                }),
+                ShardRole::Information(InformationRole {
+                    owner: other_ids[1],
+                    sector: SectorRef {
+                        id: [byte.wrapping_add(1); 32],
+                        root: sector_root(&information[1]),
+                        logical_len: V1_SECTOR_SIZE as u32,
+                    },
+                }),
+                ShardRole::Information(InformationRole {
+                    owner: other_ids[2],
+                    sector: SectorRef {
+                        id: [byte.wrapping_add(2); 32],
+                        root: sector_root(&information[2]),
+                        logical_len: V1_SECTOR_SIZE as u32,
+                    },
+                }),
+                ShardRole::Parity(ParityRole {
+                    holder: local_id,
+                    row: 0,
+                    root: sector_root(&shards[3]),
+                }),
+                ShardRole::Parity(ParityRole {
+                    holder: other_ids[3],
+                    row: 1,
+                    root: sector_root(&shards[4]),
+                }),
+            ];
+            let mut group = CodingGroup {
+                id: [0; 32],
+                format_version: 1,
+                guild_id,
+                data_shards: V1_RS_DATA_SHARDS,
+                parity_shards: V1_RS_PARITY_SHARDS,
+                shard_size: V1_SECTOR_SIZE as u32,
+                roles,
+            };
+            group.id = group.calculate_id().unwrap();
+            (group, shards[3].clone())
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([120; 32]);
+        let local_id = mb_core::KeyMaterial::from_seed(&seed).node_id();
+        let other_ids = [121_u8, 122, 123, 124]
+            .map(|value| mb_core::KeyMaterial::from_seed(&Seed::from_bytes([value; 32])).node_id());
+        let guild_id = [125; 32];
+        let (first_group, first_bytes) = group_for(guild_id, local_id, other_ids, 31);
+        let (second_group, second_bytes) = group_for(guild_id, local_id, other_ids, 47);
+        let checkpoint = QuorumCheckpoint {
+            checkpoint: GuildCheckpoint {
+                format_version: 1,
+                guild_id,
+                genesis_hash: [126; 32],
+                generation: 1,
+                parent: None,
+                members: Vec::new(),
+                revisions: Vec::new(),
+                coding_groups: vec![first_group.clone(), second_group.clone()],
+            },
+            signatures: Vec::new(),
+        };
+        let checkpoint_hash = checkpoint.hash().unwrap();
+
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), seed.clone()).unwrap()));
+        let first_id = first_group.id;
+        let first_window =
+            recover_local_shards_with(node.clone(), &checkpoint, move |group, index| {
+                assert_eq!(index, 3);
+                std::future::ready(if group.id == first_id {
+                    Ok(first_bytes.clone())
+                } else {
+                    Err(anyhow::anyhow!("second coding group is unavailable"))
+                })
+            })
+            .await;
+        assert!(first_window.is_err());
+        assert!(
+            node.lock()
+                .unwrap()
+                .recovered_shard_is_staged(&checkpoint_hash, &guild_id, &first_group, 3)
+                .unwrap()
+        );
+        assert!(
+            !node
+                .lock()
+                .unwrap()
+                .recovered_shard_is_staged(&checkpoint_hash, &guild_id, &second_group, 3)
+                .unwrap()
+        );
+
+        drop(node);
+        let reopened = Arc::new(Mutex::new(Node::open(temp.path(), seed).unwrap()));
+        let second_id = second_group.id;
+        recover_local_shards_with(reopened.clone(), &checkpoint, move |group, index| {
+            assert_eq!(index, 3);
+            assert_eq!(
+                group.id, second_id,
+                "the durable first shard was fetched again"
+            );
+            std::future::ready(Ok(second_bytes.clone()))
+        })
+        .await
+        .unwrap();
+        for group in [&first_group, &second_group] {
+            assert!(
+                reopened
+                    .lock()
+                    .unwrap()
+                    .recovered_shard_is_staged(&checkpoint_hash, &guild_id, group, 3)
+                    .unwrap()
+            );
         }
     }
 
