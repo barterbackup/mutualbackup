@@ -1042,6 +1042,15 @@ impl P2pEventLoop {
     }
 
     fn record_transfer(&mut self, peer: PeerId, path: Option<P2pPath>, sent: u64, received: u64) {
+        let retain_history = self.persistent_addresses.contains_key(&peer)
+            || self.learned_addresses.contains_key(&peer)
+            || self
+                .relay_members
+                .read()
+                .is_ok_and(|members| members.contains(&peer));
+        if !retain_history {
+            return;
+        }
         let total = self.transfer_counters.entry(peer).or_default();
         total.sent = total.sent.saturating_add(sent);
         total.received = total.received.saturating_add(received);
@@ -3596,6 +3605,33 @@ mod tests {
         assert_eq!(
             merge_established_path(Some(P2pPath::Relayed), P2pPath::Direct),
             P2pPath::Direct,
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_history_does_not_retain_unknown_peers() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::open(temp.path(), Seed::from_bytes([75; 32])).unwrap();
+        let local_id = node.keys().node_id();
+        let (_client, mut event_loop) =
+            build_p2p(Arc::new(Mutex::new(node)), config(local_id)).unwrap();
+        let peer = mb_core::KeyMaterial::from_seed(&Seed::from_bytes([76; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+
+        event_loop.record_transfer(peer, Some(P2pPath::Direct), 10, 20);
+        assert!(!event_loop.transfer_counters.contains_key(&peer));
+        assert!(!event_loop.path_transfer_counters.contains_key(&peer));
+
+        event_loop
+            .persistent_addresses
+            .insert(peer, BTreeSet::new());
+        event_loop.record_transfer(peer, Some(P2pPath::Direct), 10, 20);
+        assert_eq!(event_loop.transfer_counters[&peer].sent, 10);
+        assert_eq!(
+            event_loop.path_transfer_counters[&peer][&P2pPath::Direct].received,
+            20
         );
     }
 
