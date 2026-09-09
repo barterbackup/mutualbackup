@@ -609,9 +609,8 @@ fn stable_filesystem_id(file: &File, filesystem_type: i64) -> Result<u64, Anchor
 }
 
 #[cfg(target_os = "linux")]
-pub fn filesystem_identity(path: impl AsRef<Path>) -> Result<FilesystemIdentity, AnchorError> {
+fn linux_mount_id(path: &Path) -> Result<u64, AnchorError> {
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
 
     // Linux's statx UAPI is a fixed 256-byte record. libc deliberately omits
     // its statx wrapper for musl targets whose configured headers predate musl
@@ -626,7 +625,6 @@ pub fn filesystem_identity(path: impl AsRef<Path>) -> Result<FilesystemIdentity,
     #[repr(C, align(8))]
     struct StatxBuffer([u8; STATX_BUFFER_BYTES]);
 
-    let path = path.as_ref();
     let encoded =
         CString::new(path.as_os_str().as_bytes()).map_err(|_| AnchorError::InvalidRoot)?;
     let mut stat = StatxBuffer([0; STATX_BUFFER_BYTES]);
@@ -654,11 +652,22 @@ pub fn filesystem_identity(path: impl AsRef<Path>) -> Result<FilesystemIdentity,
             "filesystem mount identity is unavailable",
         )));
     }
-    let mount_id = u64::from_ne_bytes(
+    Ok(u64::from_ne_bytes(
         stat.0[STATX_MNT_ID_OFFSET..STATX_MNT_ID_OFFSET + std::mem::size_of::<u64>()]
             .try_into()
             .expect("fixed statx mount-ID range"),
-    );
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub fn filesystem_identity(path: impl AsRef<Path>) -> Result<FilesystemIdentity, AnchorError> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let path = path.as_ref();
+    let encoded =
+        CString::new(path.as_os_str().as_bytes()).map_err(|_| AnchorError::InvalidRoot)?;
+    let mount_id = linux_mount_id(path)?;
     let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
     let result = unsafe { libc::statfs(encoded.as_ptr(), filesystem.as_mut_ptr()) };
     if result != 0 {
@@ -666,7 +675,7 @@ pub fn filesystem_identity(path: impl AsRef<Path>) -> Result<FilesystemIdentity,
     }
     let filesystem = unsafe { filesystem.assume_init() };
     let file = File::open(path)?;
-    let stable_id = stable_filesystem_id(&file, filesystem.f_type as i64)?;
+    let stable_id = stable_filesystem_id(&file, filesystem.f_type)?;
     Ok(FilesystemIdentity {
         stable_id,
         device: fs::metadata(path)?.dev(),
@@ -970,7 +979,7 @@ fn volume_root(source_root: &Path) -> Result<(u64, PathBuf), AnchorError> {
     let identity = filesystem_identity(source_root)?;
     let mut current = source_root.to_path_buf();
     while let Some(parent) = current.parent() {
-        if filesystem_identity(parent)?.mount_id != identity.mount_id {
+        if linux_mount_id(parent)? != identity.mount_id {
             break;
         }
         current = parent.to_path_buf();

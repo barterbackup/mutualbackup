@@ -445,13 +445,12 @@ impl Node {
             .get_record("node-config", b"protected-root")?
             .map(|bytes| decode_canonical::<ProtectedRoot>(&bytes).map_err(anyhow::Error::from))
             .transpose()?;
-        if let Some(root) = &root {
-            if !matches!(root.format_version, 2 | 3)
+        if let Some(root) = &root
+            && (!matches!(root.format_version, 2 | 3)
                 || root.filesystem_id == 0
-                || root.root_inode == 0
-            {
-                anyhow::bail!("invalid protected-root record");
-            }
+                || root.root_inode == 0)
+        {
+            anyhow::bail!("invalid protected-root record");
         }
         Ok(root)
     }
@@ -2440,6 +2439,7 @@ impl Node {
             anyhow::bail!("checkpoint is not authorized by the recovering seed");
         }
         let checkpoint_hash = checkpoint.hash()?;
+        self.require_active_recovery_attempt(checkpoint.checkpoint.guild_id, checkpoint_hash)?;
         for group in &checkpoint.checkpoint.coding_groups {
             for (index, role) in group.roles.iter().enumerate() {
                 match role {
@@ -2548,6 +2548,14 @@ impl Node {
         checkpoint.verify()?;
         self.validate_local_member(&checkpoint.checkpoint)?;
         let checkpoint_hash = checkpoint.hash()?;
+        if let Some(active) = self.active_recovery_attempt()?
+            && (active.guild_id != checkpoint.checkpoint.guild_id
+                || active.generation > checkpoint.checkpoint.generation
+                || (active.generation == checkpoint.checkpoint.generation
+                    && active.checkpoint_hash != checkpoint_hash))
+        {
+            anyhow::bail!("recovery attempt would roll back or fork durable recovery state");
+        }
         for (record_id, bytes) in self.control.records("recovery-job")? {
             if record_id.as_slice() == checkpoint_hash {
                 continue;
@@ -2569,8 +2577,38 @@ impl Node {
         Ok(())
     }
 
+    fn active_recovery_attempt(&self) -> Result<Option<RecoveryAttempt>> {
+        let attempt = self
+            .control
+            .get_record("recovery-attempt", b"active")?
+            .map(|bytes| decode_canonical::<RecoveryAttempt>(&bytes))
+            .transpose()?;
+        if let Some(attempt) = &attempt
+            && (attempt.format_version != 1
+                || attempt.guild_id == [0; 32]
+                || attempt.checkpoint_hash == [0; 32]
+                || attempt.generation == 0)
+        {
+            anyhow::bail!("invalid durable recovery attempt");
+        }
+        Ok(attempt)
+    }
+
+    fn require_active_recovery_attempt(
+        &self,
+        guild_id: [u8; 32],
+        checkpoint_hash: [u8; 32],
+    ) -> Result<()> {
+        if let Some(active) = self.active_recovery_attempt()?
+            && (active.guild_id != guild_id || active.checkpoint_hash != checkpoint_hash)
+        {
+            anyhow::bail!("operation belongs to a superseded recovery attempt");
+        }
+        Ok(())
+    }
+
     fn remove_superseded_recovery_job(&mut self, job: &RecoveryJob) -> Result<()> {
-        if !matches!(job.format_version, 2 | 3 | 4 | 5) {
+        if !matches!(job.format_version, 2..=5) {
             anyhow::bail!("unsupported durable recovery job version");
         }
         let parent = containing_directory(&job.target);
@@ -2606,6 +2644,7 @@ impl Node {
         shard_index: u8,
         bytes: &[u8],
     ) -> Result<()> {
+        self.require_active_recovery_attempt(*guild_id, *checkpoint_hash)?;
         let role = group
             .roles
             .get(shard_index as usize)
@@ -2638,6 +2677,7 @@ impl Node {
         group: &mb_core::CodingGroup,
         shard_index: u8,
     ) -> Result<bool> {
+        self.require_active_recovery_attempt(*guild_id, *checkpoint_hash)?;
         let role = group
             .roles
             .get(shard_index as usize)
@@ -2669,13 +2709,14 @@ impl Node {
         revision: &SignedRecord<UserRevision>,
         target: &Path,
     ) -> Result<()> {
+        self.require_active_recovery_attempt(guild_id, *checkpoint_hash)?;
         let parent = containing_directory(target);
         fs::create_dir_all(parent)?;
         let existing = self.control.get_record("recovery-job", checkpoint_hash)?;
         let mut job = match existing {
             Some(bytes) => {
                 let mut job: RecoveryJob = decode_canonical(&bytes)?;
-                if !matches!(job.format_version, 2 | 3 | 4 | 5)
+                if !matches!(job.format_version, 2..=5)
                     || job.guild_id != guild_id
                     || job.revision_id != revision.value.revision_id
                     || job.target != target
@@ -2683,10 +2724,8 @@ impl Node {
                 {
                     anyhow::bail!("recovery job conflicts with durable local state");
                 }
-                if job.format_version == 2 {
-                    if job.state == RecoveryJobState::Complete {
-                        job.state = RecoveryJobState::Published;
-                    }
+                if job.format_version == 2 && job.state == RecoveryJobState::Complete {
+                    job.state = RecoveryJobState::Published;
                 }
                 if job.format_version < 4 {
                     let owned_path = if target.exists() {
@@ -2869,7 +2908,7 @@ impl Node {
         }
         job.state = RecoveryJobState::Complete;
         self.control
-            .put_record("recovery-job", checkpoint_hash, &canonical_bytes(job)?)?;
+            .complete_recovery_attempt(checkpoint_hash, &canonical_bytes(job)?)?;
         Ok(())
     }
 
@@ -3752,5 +3791,37 @@ mod tests {
         assert!(!staging.exists());
         assert!(!temp.path().join(marker_name).exists());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn durable_recovery_attempt_rejects_superseded_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::open(temp.path(), Seed::from_bytes([123; 32])).unwrap();
+        let guild_id = [124; 32];
+        let checkpoint_hash = [125; 32];
+        node.control
+            .put_record(
+                "recovery-attempt",
+                b"active",
+                &canonical_bytes(&RecoveryAttempt {
+                    format_version: 1,
+                    guild_id,
+                    checkpoint_hash,
+                    generation: 7,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+        node.require_active_recovery_attempt(guild_id, checkpoint_hash)
+            .unwrap();
+        assert!(
+            node.require_active_recovery_attempt(guild_id, [126; 32])
+                .is_err()
+        );
+        assert!(
+            node.require_active_recovery_attempt([127; 32], checkpoint_hash)
+                .is_err()
+        );
     }
 }

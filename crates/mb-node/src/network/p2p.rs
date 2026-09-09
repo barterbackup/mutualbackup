@@ -145,6 +145,7 @@ pub struct P2pClient {
     local_peer_id: PeerId,
     commands: mpsc::Sender<Command>,
     outbound_permits: Arc<Semaphore>,
+    cold_recovery_permit: Arc<Semaphore>,
 }
 
 pub struct P2pEventLoop {
@@ -525,6 +526,7 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
             local_peer_id,
             commands: command_sender,
             outbound_permits: Arc::new(Semaphore::new(config.max_connections)),
+            cold_recovery_permit: Arc::new(Semaphore::new(1)),
         },
         P2pEventLoop {
             swarm,
@@ -2517,6 +2519,12 @@ pub async fn recover_from_dht(
     p2p: &P2pClient,
     restore_target: &std::path::Path,
 ) -> Result<DhtRecoveryResult> {
+    let _recovery_permit = p2p
+        .cold_recovery_permit
+        .clone()
+        .acquire_owned()
+        .await
+        .context("libp2p event loop stopped")?;
     let local_target = restore_target.to_path_buf();
     if let Some(local) = node_blocking(node.clone(), move |node| {
         node.resume_local_recovery(&local_target)
@@ -4046,6 +4054,7 @@ mod tests {
             local_peer_id: peer.libp2p_peer_id().unwrap(),
             commands,
             outbound_permits: permits.clone(),
+            cold_recovery_permit: Arc::new(Semaphore::new(1)),
         };
         let first = tokio::spawn({
             let client = client.clone();

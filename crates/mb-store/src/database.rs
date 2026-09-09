@@ -381,6 +381,27 @@ impl ControlStore {
         Ok(())
     }
 
+    pub fn complete_recovery_attempt(
+        &mut self,
+        checkpoint_hash: &[u8; 32],
+        job: &[u8],
+    ) -> Result<(), DatabaseError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO protocol_records(kind, record_id, bytes)
+             VALUES ('recovery-job', ?1, ?2)
+             ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+            params![checkpoint_hash.as_slice(), job],
+        )?;
+        transaction.execute(
+            "DELETE FROM protocol_records
+             WHERE kind = 'recovery-attempt' AND record_id = ?1",
+            [b"active".as_slice()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn stage_checkpoint_page(
         &mut self,
@@ -1695,6 +1716,23 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             b"active-attempt"
+        );
+
+        store
+            .complete_recovery_attempt(&active_checkpoint, b"complete-job")
+            .unwrap();
+        assert_eq!(
+            store
+                .get_record("recovery-job", &active_checkpoint)
+                .unwrap()
+                .unwrap(),
+            b"complete-job"
+        );
+        assert!(
+            store
+                .get_record("recovery-attempt", b"active")
+                .unwrap()
+                .is_none()
         );
     }
 
