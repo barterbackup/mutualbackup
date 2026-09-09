@@ -1,28 +1,5 @@
 # Product TODO
 
-## Milestone 2 corrective follow-up
-
-The source-only review of `e363bc7..6abcfcc` confirms that the previous ten
-corrective items are fixed. It found the two implemented defects below. Fix and
-remove them before beginning Milestone 3.
-
-- Reclaim and authority-partition durable recovery-bundle observations. A new
-  `(subject, provider)` row consumes one of 64 slots before the sealed locator
-  or checkpoint authority is validated. Expired rows stop producing candidates
-  but are never deleted, so 64 expired or unauthorized self-signed providers
-  can permanently prevent a legitimate provider from being observed, including
-  after restart. Prune expired scopes transactionally and prevent uncertified
-  providers from consuming permanent trusted capacity; cover a valid guild
-  provider arriving after a full hostile/expired set and after restart.
-- Reject nested Btrfs subvolumes without reopening arbitrary special files.
-  The nested-filesystem check compares only live mount ID and device, which are
-  shared by subvolumes, while capture assigns the root subvolume's stable ID to
-  every descendant. Inodes are scoped to a Btrfs subvolume, so equal inode
-  numbers in two subvolumes can be mistaken for hard links and capture the wrong
-  bytes. Check each directory's stable subvolume identity, or use an equivalent
-  nonblocking boundary test, before capture. Add a real nested-subvolume inode
-  collision regression while retaining the FIFO/nonblocking regression.
-
 ## Later guild geometry and coding protocol
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
