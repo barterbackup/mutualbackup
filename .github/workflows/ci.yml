@@ -32,7 +32,7 @@ jobs:
           truncate -s 2G /tmp/mutualbackup-ci.btrfs
           sudo mkfs.btrfs -q -f /tmp/mutualbackup-ci.btrfs
           sudo mkdir -p /mnt/mutualbackup-ci
-          sudo mount -o loop /tmp/mutualbackup-ci.btrfs /mnt/mutualbackup-ci
+          sudo mount -o loop,user_subvol_rm_allowed /tmp/mutualbackup-ci.btrfs /mnt/mutualbackup-ci
           sudo chown "$USER":"$USER" /mnt/mutualbackup-ci
       - name: Run mandatory reflink acceptance suite
         env:

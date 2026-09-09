@@ -441,6 +441,20 @@ const fn read_ioctl<T>(kind: u8, number: u8) -> libc::c_ulong {
 }
 
 #[cfg(target_os = "linux")]
+const fn read_write_ioctl<T>(kind: u8, number: u8) -> libc::c_ulong {
+    const IOC_NRSHIFT: u32 = 0;
+    const IOC_TYPESHIFT: u32 = 8;
+    const IOC_SIZESHIFT: u32 = 16;
+    const IOC_DIRSHIFT: u32 = 30;
+    const IOC_WRITE: u32 = 1;
+    const IOC_READ: u32 = 2;
+    (((IOC_READ | IOC_WRITE) << IOC_DIRSHIFT)
+        | ((kind as u32) << IOC_TYPESHIFT)
+        | ((number as u32) << IOC_NRSHIFT)
+        | ((std::mem::size_of::<T>() as u32) << IOC_SIZESHIFT)) as libc::c_ulong
+}
+
+#[cfg(target_os = "linux")]
 unsafe fn ioctl_read<T>(file: &File, kind: u8, number: u8, value: *mut T) -> libc::c_long {
     use std::os::fd::AsRawFd;
 
@@ -452,6 +466,20 @@ unsafe fn ioctl_read<T>(file: &File, kind: u8, number: u8, value: *mut T) -> lib
             libc::SYS_ioctl,
             file.as_raw_fd(),
             read_ioctl::<T>(kind, number),
+            value,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn ioctl_read_write<T>(file: &File, kind: u8, number: u8, value: *mut T) -> libc::c_long {
+    use std::os::fd::AsRawFd;
+
+    unsafe {
+        libc::syscall(
+            libc::SYS_ioctl,
+            file.as_raw_fd(),
+            read_write_ioctl::<T>(kind, number),
             value,
         )
     }
@@ -487,36 +515,13 @@ const _: () = assert!(std::mem::size_of::<BtrfsFsInfo>() == 1024);
 
 #[cfg(target_os = "linux")]
 #[repr(C)]
-struct BtrfsTimespec {
-    sec: u64,
-    nsec: u32,
-    padding: u32,
-}
-
-#[cfg(target_os = "linux")]
-#[repr(C)]
-struct BtrfsSubvolumeInfo {
+struct BtrfsInodeLookup {
     tree_id: u64,
-    name: [u8; 256],
-    parent_id: u64,
-    dir_id: u64,
-    generation: u64,
-    flags: u64,
-    uuid: [u8; 16],
-    parent_uuid: [u8; 16],
-    received_uuid: [u8; 16],
-    creation_transaction_id: u64,
-    origin_transaction_id: u64,
-    sent_transaction_id: u64,
-    received_transaction_id: u64,
-    creation_time: BtrfsTimespec,
-    origin_time: BtrfsTimespec,
-    sent_time: BtrfsTimespec,
-    received_time: BtrfsTimespec,
-    reserved: [u64; 8],
+    object_id: u64,
+    name: [u8; 4080],
 }
 #[cfg(target_os = "linux")]
-const _: () = assert!(std::mem::size_of::<BtrfsSubvolumeInfo>() == 504);
+const _: () = assert!(std::mem::size_of::<BtrfsInodeLookup>() == 4096);
 
 #[cfg(target_os = "linux")]
 fn ioctl_external_filesystem_uuid(file: &File) -> Result<Option<(u8, [u8; 16])>, AnchorError> {
@@ -556,21 +561,28 @@ fn btrfs_filesystem_uuid(file: &File) -> Result<[u8; 16], AnchorError> {
 
 #[cfg(target_os = "linux")]
 fn btrfs_subvolume_tree_id(file: &File) -> Result<u64, AnchorError> {
-    let mut info = std::mem::MaybeUninit::<BtrfsSubvolumeInfo>::zeroed();
-    let result = unsafe { ioctl_read(file, 0x94, 60, info.as_mut_ptr()) };
+    // BTRFS_IOC_INO_LOOKUP permits this exact unprivileged query when tree ID
+    // is zero and object ID names the subvolume root. Unlike GET_SUBVOL_INFO,
+    // it also works on the descriptor returned by openat2 beneath our root.
+    const BTRFS_FIRST_FREE_OBJECT_ID: u64 = 256;
+    let mut lookup = BtrfsInodeLookup {
+        tree_id: 0,
+        object_id: BTRFS_FIRST_FREE_OBJECT_ID,
+        name: [0; 4080],
+    };
+    let result = unsafe { ioctl_read_write(file, 0x94, 18, &mut lookup) };
     if result != 0 {
         return Err(AnchorError::ReflinkUnavailable(
             std::io::Error::last_os_error(),
         ));
     }
-    let tree_id = unsafe { info.assume_init() }.tree_id;
-    if tree_id == 0 {
+    if lookup.tree_id == 0 {
         return Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "Btrfs returned an invalid subvolume tree ID",
         )));
     }
-    Ok(tree_id)
+    Ok(lookup.tree_id)
 }
 
 #[cfg(target_os = "linux")]
@@ -605,6 +617,19 @@ fn stable_filesystem_id(file: &File, filesystem_type: u32) -> Result<u64, Anchor
         )));
     }
     Ok(stable_id)
+}
+
+#[cfg(target_os = "linux")]
+fn stable_filesystem_id_for_file(file: &File) -> Result<u64, AnchorError> {
+    use std::os::fd::AsRawFd;
+
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    let result = unsafe { libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let filesystem = unsafe { filesystem.assume_init() };
+    stable_filesystem_id(file, filesystem.f_type as u32)
 }
 
 #[cfg(target_os = "linux")]
@@ -660,28 +685,15 @@ fn linux_mount_id(path: &Path) -> Result<u64, AnchorError> {
 
 #[cfg(target_os = "linux")]
 pub fn filesystem_identity(path: impl AsRef<Path>) -> Result<FilesystemIdentity, AnchorError> {
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
 
     let path = path.as_ref();
-    let encoded =
-        CString::new(path.as_os_str().as_bytes()).map_err(|_| AnchorError::InvalidRoot)?;
     let mount_id = linux_mount_id(path)?;
-    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
-    let result = unsafe { libc::statfs(encoded.as_ptr(), filesystem.as_mut_ptr()) };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let filesystem = unsafe { filesystem.assume_init() };
     let file = File::open(path)?;
-    // `libc::statfs::f_type` is signed under glibc and unsigned under musl.
-    // Linux filesystem magic values occupy 32 bits, so normalize the ABI field
-    // before comparing or hashing it. This also keeps identities stable across
-    // libc implementations and machine word sizes.
-    let stable_id = stable_filesystem_id(&file, filesystem.f_type as u32)?;
+    let stable_id = stable_filesystem_id_for_file(&file)?;
     Ok(FilesystemIdentity {
         stable_id,
-        device: fs::metadata(path)?.dev(),
+        device: file.metadata()?.dev(),
         mount_id,
     })
 }
@@ -815,7 +827,9 @@ fn reject_nested_filesystems(
         }
         #[cfg(target_os = "linux")]
         let same_filesystem = linux_mount_id(entry.path())? == root_identity.mount_id
-            && fs::metadata(entry.path())?.dev() == root_identity.device;
+            && fs::metadata(entry.path())?.dev() == root_identity.device
+            && (!entry.file_type().is_dir()
+                || filesystem_identity(entry.path())?.stable_id == root_identity.stable_id);
         #[cfg(not(target_os = "linux"))]
         let same_filesystem = filesystem_identity(entry.path())? == root_identity;
         if !same_filesystem {
@@ -868,6 +882,10 @@ fn capture_entries(
         }
         let destination = staging.join(relative);
         if before.is_dir() {
+            #[cfg(target_os = "linux")]
+            if stable_filesystem_id_for_file(&file)? != filesystem_id {
+                return Err(AnchorError::NestedFilesystem(entry.path().to_path_buf()));
+            }
             create_private_dir_new(&destination)?;
             let (modified_secs, modified_nanos) = modified_parts(&before);
             entries.push(CapturedEntry::Directory {
@@ -1465,6 +1483,7 @@ fn open_source_beneath(root: &File, relative: &Path, directory: bool) -> Result<
     let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
     if directory {
         flags |= libc::O_DIRECTORY;
+        flags &= !libc::O_NONBLOCK;
     }
     let how = OpenHow {
         flags: flags as u64,
@@ -1786,6 +1805,71 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
         assert_eq!(remaining, vec![std::ffi::OsString::from("protected")]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn nested_btrfs_subvolumes_are_rejected_before_and_during_capture() {
+        use std::os::unix::fs::MetadataExt;
+        use std::process::Command;
+
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT");
+        let run_root =
+            PathBuf::from(test_root).join(format!("nested-subvolume-{}", Uuid::new_v4()));
+        let protected = run_root.join("protected");
+        let container = protected.join("container");
+        fs::create_dir_all(&container).unwrap();
+        fs::write(protected.join("ordinary"), b"ordinary").unwrap();
+        let plan = ReflinkAnchor::plan(&protected).unwrap();
+
+        let first = container.join("first");
+        let second = container.join("second");
+        for subvolume in [&first, &second] {
+            let output = Command::new("btrfs")
+                .args(["subvolume", "create"])
+                .arg(subvolume)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "cannot create Btrfs test subvolume: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fs::write(first.join("payload"), b"first subvolume").unwrap();
+        fs::write(second.join("payload"), b"second subvolume").unwrap();
+        assert_eq!(
+            fs::metadata(first.join("payload")).unwrap().ino(),
+            fs::metadata(second.join("payload")).unwrap().ino(),
+            "the regression requires equal inode numbers in distinct subvolumes"
+        );
+        let probe_error = probe_reflink(&protected).unwrap_err();
+        assert!(matches!(
+            probe_error,
+            AnchorError::NestedFilesystem(path) if path == first || path == second
+        ));
+        let capture_error = ReflinkAnchor::capture_plan(&plan).unwrap_err();
+        assert!(
+            matches!(
+                &capture_error,
+                AnchorError::NestedFilesystem(path) if path == &first || path == &second
+            ),
+            "unexpected capture error: {capture_error:?}"
+        );
+
+        let output = Command::new("btrfs")
+            .args(["subvolume", "delete"])
+            .args([&first, &second])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cannot delete Btrfs test subvolumes: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(run_root).unwrap();
     }
 
     #[test]
