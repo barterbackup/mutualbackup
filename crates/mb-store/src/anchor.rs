@@ -801,12 +801,20 @@ fn reject_nested_filesystems(
     root: &Path,
     root_identity: FilesystemIdentity,
 ) -> Result<(), AnchorError> {
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::MetadataExt;
+
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry?;
         if entry.file_type().is_symlink() {
             continue;
         }
-        if filesystem_identity(entry.path())? != root_identity {
+        #[cfg(target_os = "linux")]
+        let same_filesystem = linux_mount_id(entry.path())? == root_identity.mount_id
+            && fs::metadata(entry.path())?.dev() == root_identity.device;
+        #[cfg(not(target_os = "linux"))]
+        let same_filesystem = filesystem_identity(entry.path())? == root_identity;
+        if !same_filesystem {
             return Err(AnchorError::NestedFilesystem(entry.path().to_path_buf()));
         }
     }
