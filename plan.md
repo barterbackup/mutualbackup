@@ -57,11 +57,10 @@ them as ADRs and test vectors before promising wire compatibility.
 
 ### Implemented baseline — first usable IP prototype
 
-The architectural prototype and the Milestone 2 feature slice are implemented,
-but the Milestone 2 corrective review gate is open. The repository connects two
-real binaries and persistent local control to static five-member
-guild onboarding, reflink capture, owner
-encryption, actual `3+2` RS, remote SQLCipher
+The architectural prototype and Milestone 2 are implemented and have passed
+their corrective review gate. The repository connects two real binaries and
+persistent local control to static five-member guild onboarding, reflink
+capture, owner encryption, actual `3+2` RS, remote SQLCipher
 parity, unanimous revisions/checkpoints, QUIC, Kademlia discovery, relay/DCUtR
 transport support, repeated backups, and DHT-assisted cold recovery. The
 five-process acceptance path launches real daemons and CLIs, removes an owner's
@@ -73,14 +72,12 @@ application sessions without transport mocks.
 
 Call this a runnable product slice, not a claim of production quality. Repeated
 source-only reviews found initialization, startup rollback, recovery resumption,
-address-lifetime, path-attribution, and Docker crash-safety defects that the
-original suite did not expose. Corrective work through `00773c2` and its focused
-and complete runtime gates addressed that known list. A fresh source-only audit
-at `8426910` nevertheless found additional recovery-state, capture-safety,
-quota, and lab-path defects recorded in `TODO.md`. Milestone 2 is therefore not
-closed, and Milestone 3 work must wait for that corrective slice and another
-review. Application-transfer acceptance attributes post-baseline bulk bytes to
-the exact direct, DCUtR, or relay-fallback connection used.
+address-lifetime, path-attribution, capture, quota, and Docker crash-safety
+defects that the original suite did not expose. Corrective work through
+`52af408`, its focused regressions, the complete remote runtime gates, and a
+final source-only audit closed that list. Application-transfer acceptance
+attributes post-baseline bulk bytes to the exact direct, DCUtR, or
+relay-fallback connection used.
 
 The baseline deliberately remains one guild and one reflink root per member,
 one parity database, Linux only, fixed 64 KiB sectors and `3+2`, unanimous
@@ -425,11 +422,10 @@ The asynchronous daemon/process split, locked startup, recovery-string input,
 expected-identity check, bounded worker ownership, and formal wire contracts are
 implemented. Human configuration and application-owned identity state are also
 separate. A strictly checked recovery-string file remains an explicit
-unattended auto-unlock option rather than a daemon prerequisite. The first
-Milestone 2 corrective list and its second-order follow-up are fixed, but the
-fresh audit listed under the Milestone 2 gate found further concrete defects.
-Keep this architectural boundary frozen while those corrections are made; it
-is not yet the accepted base for Milestone 3.
+unattended auto-unlock option rather than a daemon prerequisite. The Milestone
+2 corrective lists and their second-order follow-ups are fixed. The resulting
+architecture is the accepted base for Milestone 3; change its wire and
+durable-state boundaries only through that milestone's reviewed ADRs.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -643,20 +639,18 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestone 0 is a runnable baseline and Milestone 1 is
-implemented. The Milestone 2 feature work and corrective commits through
-`00773c2` are present, and their locked workspace, Btrfs/reflink, real-network,
-five-process recovery, static Nix artifact, and destructive/retained Docker
-lifecycle gates passed. A fresh source-only audit of `e9fafc2..8426910` reopened
-the Milestone 2 gate with high-confidence defects in recoverable endpoint
-sequencing, recovery finalization and fork continuity, recovery parity quotas,
-reflink capture/cleanup crash safety, and Docker child-path ownership. The exact
-list is in `TODO.md`.
+**Current position:** Milestones 0, 1, and 2 are passed. Corrective commits
+`896db36`, `02108c3`, `9bde0e9`, and `52af408` preserve endpoint sequence
+continuity through seed recovery; make checkpoint recovery atomic, branch
+pinned, quota bounded, and storage-only complete; harden reflink capture and
+cleanup across path, mount, retry, and crash boundaries; and confine Docker-lab
+operations to marked child namespaces. Their focused regressions, locked
+workspace tests, Btrfs/reflink and real-network acceptance, static Nix artifact,
+interrupted/resumed real Docker lifecycle, and final source-only audit passed.
+No high-confidence Milestone 2 defect remains in `TODO.md`.
 
-The next run is a bounded Milestone 2 corrective slice: fix those TODOs with a
-focused regression per failure, then rerun the complete Milestone 2 gates and
-perform another source-only review. Do not begin Arti/Tor or Milestone 3 work
-until that review finds no remaining high-confidence Milestone 2 defect.
+The next run may begin Milestone 3. Start with the Arti version/key/transport
+ADR and a private-Tor test topology before changing production endpoint types.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
 
@@ -698,10 +692,11 @@ This was the implementation scope, in order:
    path and transferred bytes, then force and assert end-to-end direct QUIC,
    successful DCUtR, and failed-punch relay transfer topologies.
 
-The Milestone 2 gate includes inherited stabilization regressions that the first
-acceptance pass did not expose; they remain mandatory for the reopened gate.
+The Milestone 2 gate included inherited stabilization regressions that the first
+acceptance pass did not expose; they remain part of the mandatory regression
+contract.
 
-### Milestone 2 — operator configuration and identity-state separation (corrective gate open)
+### Milestone 2 — operator configuration and identity-state separation (passed)
 
 - Replace duplicated daemon parsing with one typed options model consumed by
   optional TOML and equivalent nonsecret command-line flags. Test flag-over-file
@@ -767,26 +762,28 @@ capturable entry before deduplication. Its focused tests, complete remote gates,
 static artifact handoff, and destructive/restart/remount Docker lifecycle all
 passed for that bounded follow-up.
 
-The fresh audit at `8426910` then found the remaining high-confidence defects in
-`TODO.md`. Address them in this order so later tests build on sound state:
+The final corrective slice through `52af408` closes the defects found at
+`8426910`:
 
-1. Restore seed-only endpoint continuity, recovery-attempt/checkpoint
-   finalization, and pinned-branch ancestry.
-2. Enforce the configured parity budget on the cold-recovery path.
-3. Make capture enumeration, intent retry, anchor initialization, special-file
-   admission, and cleanup safe across crashes and mount/path substitution.
-4. Constrain Docker-lab destructive paths to an owned, non-symlink managed
-   namespace.
-5. Add the focused fault/process regressions, rerun every inherited Milestone 2
-   gate, and repeat the source-only audit. Close Milestone 2 only after both the
-   runtime gates and that audit pass.
+1. Recovery locators carry the subject's observed endpoint floor, recovered
+   checkpoint state is one SQL transaction, attempts pin an exact checkpoint,
+   storage-only recovery completes, and parity imports obey the configured
+   budget.
+2. Capture walks the pinned root descriptor, safely abandons failed intents,
+   publishes first-use anchor areas from durable staging, rejects special files
+   through non-I/O handles, and removes owned trees without crossing mounts.
+3. The Docker lab requires marked, owned direct namespaces, atomically creates
+   new children, validates per-node mount paths, and refuses symlink, mount, or
+   unmarked-directory substitution before destructive work.
+4. The focused fault tests and every inherited Milestone 2 gate passed on the
+   GCP runner; the closing source-only review found no remaining
+   high-confidence Milestone 2 defect.
 
 ### Milestone 3 — Tor and robust connectivity beta
 
-Entry condition: not satisfied. No Milestone 3 implementation has begun. After
-the reopened Milestone 2 gate closes, start by pinning and reviewing the
-maintained Arti version and writing the transport/key lifecycle ADR before
-integrating it with the bounded IP endpoint lifecycle.
+Entry condition: satisfied. No Milestone 3 implementation has begun. Start by
+pinning and reviewing the maintained Arti version and writing the transport/key
+lifecycle ADR before integrating it with the bounded IP endpoint lifecycle.
 
 - Adapt the narrow, useful BarterBackup `nettor` principles to a maintained Arti
   release: outbound onion dialing, an inbound v3 onion service, persistent Tor
