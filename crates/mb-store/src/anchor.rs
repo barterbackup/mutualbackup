@@ -334,12 +334,11 @@ impl ReflinkAnchor {
         let root_metadata = root_file.metadata()?;
         let filesystem = filesystem_identity(&source_root)?;
         if !root_metadata.is_dir()
-            || filesystem.stable_id != plan.area.filesystem_id
             || capture_version(filesystem.stable_id, &root_metadata) != plan.root_version
         {
             return Err(AnchorError::SourceChanged(PathBuf::new()));
         }
-        if filesystem_identity(&plan.area.path_hint)? != filesystem {
+        if filesystem_identity(&plan.area.path_hint)?.stable_id != plan.area.filesystem_id {
             return Err(AnchorError::FilesystemChanged);
         }
         create_private_dir_new(&staging)?;
@@ -931,10 +930,11 @@ fn ensure_anchor_area(
     let parent = source_root
         .parent()
         .ok_or(AnchorError::NoExternalAnchorLocation)?;
-    let (filesystem_id, volume_root_hint) = volume_root(source_root)?;
+    let source_filesystem_id = filesystem_identity(source_root)?.stable_id;
+    let (filesystem_id, volume_root_hint) = volume_root(parent)?;
     let area_path = parent.join(format!(
         "{AREA_PREFIX}-{}",
-        source_identity_name(filesystem_id, root_metadata)
+        source_identity_name(source_filesystem_id, root_metadata)
     ));
     match fs::create_dir(&area_path) {
         Ok(()) => {
@@ -980,6 +980,9 @@ fn volume_root(source_root: &Path) -> Result<(u64, PathBuf), AnchorError> {
     let mut current = source_root.to_path_buf();
     while let Some(parent) = current.parent() {
         if linux_mount_id(parent)? != identity.mount_id {
+            break;
+        }
+        if filesystem_identity(parent)?.stable_id != identity.stable_id {
             break;
         }
         current = parent.to_path_buf();

@@ -1375,6 +1375,59 @@ impl P2pEventLoop {
         Ok(())
     }
 
+    fn add_identified_address(&mut self, peer: PeerId, address: Multiaddr) -> Result<()> {
+        let address = normalize_known_address(peer, address)?;
+        if address.to_string().len() > 512
+            || address
+                .iter()
+                .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2p(_)))
+        {
+            bail!("Identify supplied an invalid peer address");
+        }
+        let authorized = self.persistent_addresses.contains_key(&peer)
+            || self
+                .relay_members
+                .read()
+                .is_ok_and(|members| members.contains(&peer));
+        if authorized {
+            return self.add_learned_address(peer, address);
+        }
+
+        let scopes = self
+            .recovery_addresses
+            .iter()
+            .filter_map(|(scope_id, scope)| {
+                scope.addresses.contains_key(&peer).then_some(*scope_id)
+            })
+            .collect::<Vec<_>>();
+        if scopes.is_empty() {
+            return Ok(());
+        }
+        for scope_id in &scopes {
+            let addresses = self
+                .recovery_addresses
+                .get(scope_id)
+                .and_then(|scope| scope.addresses.get(&peer))
+                .context("recovery address scope changed during Identify handling")?;
+            if !addresses.contains(&address) && addresses.len() >= MAX_ENDPOINTS_PER_PEER {
+                bail!("Identify supplied too many attempt-scoped recovery endpoints");
+            }
+        }
+        self.swarm.add_peer_address(peer, address.clone());
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .add_address(&peer, address.clone());
+        for scope_id in scopes {
+            self.recovery_addresses
+                .get_mut(&scope_id)
+                .and_then(|scope| scope.addresses.get_mut(&peer))
+                .context("recovery address scope changed during Identify handling")?
+                .insert(address.clone());
+        }
+        Ok(())
+    }
+
     fn add_recovery_addresses(
         &mut self,
         scope_id: Uuid,
@@ -1759,10 +1812,9 @@ impl P2pEventLoop {
                 ..
             })) => {
                 for address in info.listen_addrs {
-                    self.swarm
-                        .behaviour_mut()
-                        .kademlia
-                        .add_address(&peer_id, address);
+                    if let Err(error) = self.add_identified_address(peer_id, address.clone()) {
+                        tracing::debug!(%peer_id, %address, %error, "ignored unusable Identify address");
+                    }
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kademlia(
@@ -4473,14 +4525,19 @@ mod tests {
         let address: Multiaddr = format!("/ip4/127.0.0.1/udp/4300/quic-v1/p2p/{peer}")
             .parse()
             .unwrap();
+        let identified: Multiaddr = "/ip4/127.0.0.1/udp/4301/quic-v1".parse().unwrap();
         let scope = Uuid::new_v4();
 
         event_loop
             .add_recovery_addresses(scope, peer, vec![address], unix_seconds() + 300)
             .unwrap();
+        event_loop
+            .add_identified_address(peer, identified.clone())
+            .unwrap();
 
         assert!(event_loop.recovery_addresses.contains_key(&scope));
         assert!(!event_loop.learned_addresses.contains_key(&peer));
+        assert!(event_loop.recovery_addresses[&scope].addresses[&peer].contains(&identified));
         event_loop.clear_recovery_addresses(scope);
         assert!(!event_loop.recovery_addresses.contains_key(&scope));
         assert!(!event_loop.retains_transfer_history(peer));
