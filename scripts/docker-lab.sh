@@ -23,6 +23,8 @@ PARITY_BUDGET_BYTES=${MUTUALBACKUP_LAB_PARITY_BUDGET_BYTES:-536870912}
 IP_PREFIX=${MUTUALBACKUP_LAB_IP_PREFIX:-172.30.77}
 P2P_BASE_PORT=${MUTUALBACKUP_LAB_P2P_BASE_PORT:-44000}
 NODE_COUNT=5
+NAMESPACE_MARKER=.mutualbackup-docker-lab-directory-v1
+NAMESPACE_ROLES=(images mounts loops seeds configs)
 
 LAB_CHECKSUM=
 NAME_PREFIX=
@@ -91,6 +93,7 @@ validate_layout() {
     NAME_PREFIX=mutualbackup-lab-$LAB_CHECKSUM
     NETWORK_NAME=$NAME_PREFIX
     LAB_LABEL=io.mutualbackup.lab=$LAB_CHECKSUM
+    validate_existing_namespace_shape
 
     [[ $IP_PREFIX =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] ||
         die "MUTUALBACKUP_LAB_IP_PREFIX must contain three IPv4 octets"
@@ -106,6 +109,131 @@ validate_layout() {
     if [[ ! $PARITY_BUDGET_BYTES =~ ^[0-9]+$ ]] || ((10#$PARITY_BUDGET_BYTES == 0)); then
         die "parity budget must be a positive byte count"
     fi
+}
+
+validate_directory_shape() {
+    local path=$1 label=$2 resolved
+    [[ -d $path && ! -L $path ]] || die "$label must be a non-symlink directory: $path"
+    resolved=$(readlink -e -- "$path") || die "cannot resolve $label: $path"
+    [[ $resolved == "$path" ]] || die "$label resolves outside its managed path: $path"
+}
+
+validate_owned_directory() {
+    local path=$1 label=$2
+    validate_directory_shape "$path" "$label"
+    [[ -O $path ]] || die "$label must be owned by the current user: $path"
+}
+
+validate_existing_namespace_shape() {
+    local role path node mount_path
+    if [[ ! -e $LAB_ROOT && ! -L $LAB_ROOT ]]; then
+        return
+    fi
+    validate_owned_directory "$LAB_ROOT" "Docker lab root"
+    for role in "${NAMESPACE_ROLES[@]}"; do
+        path=$LAB_ROOT/$role
+        if [[ -e $path || -L $path ]]; then
+            validate_owned_directory "$path" "Docker lab $role namespace"
+        fi
+    done
+    if [[ -d $LAB_ROOT/mounts && ! -L $LAB_ROOT/mounts ]]; then
+        for node in 0 1 2 3 4; do
+            mount_path=$LAB_ROOT/mounts/node$node
+            if [[ -e $mount_path || -L $mount_path ]]; then
+                validate_directory_shape "$mount_path" "Docker lab node $node mount path"
+            fi
+        done
+    fi
+}
+
+namespace_marker_contents() {
+    local role=$1
+    printf 'mutualbackup-docker-lab-directory-v1\nlab=%s\nrole=%s' "$LAB_CHECKSUM" "$role"
+}
+
+validate_namespace_marker() {
+    local directory=$1 role=$2 marker expected actual
+    marker=$directory/$NAMESPACE_MARKER
+    [[ -f $marker && ! -L $marker && -O $marker ]] ||
+        die "Docker lab $role namespace has no owned marker: $marker"
+    expected=$(namespace_marker_contents "$role")
+    actual=$(<"$marker")
+    [[ $actual == "$expected" ]] || die "Docker lab $role namespace marker is invalid: $marker"
+}
+
+write_namespace_marker() {
+    local directory=$1 role=$2 marker temporary
+    marker=$directory/$NAMESPACE_MARKER
+    if [[ -e $marker || -L $marker ]]; then
+        validate_namespace_marker "$directory" "$role"
+        return
+    fi
+    temporary=$directory/.$NAMESPACE_MARKER.tmp.$$.$RANDOM
+    (umask 077 && namespace_marker_contents "$role" >"$temporary")
+    sync "$temporary"
+    mv -T -- "$temporary" "$marker"
+    sync "$directory"
+    validate_namespace_marker "$directory" "$role"
+}
+
+ensure_namespace_directory() {
+    local role=$1 path
+    path=$LAB_ROOT/$role
+    if [[ -e $path || -L $path ]]; then
+        validate_owned_directory "$path" "Docker lab $role namespace"
+    else
+        (umask 077 && mkdir -- "$path")
+        validate_owned_directory "$path" "Docker lab $role namespace"
+    fi
+    if mountpoint -q "$path"; then
+        die "Docker lab $role namespace must not be a mount point: $path"
+    fi
+    write_namespace_marker "$path" "$role"
+}
+
+ensure_node_mount_directory() {
+    local node=$1 path
+    path=$(node_mount "$node")
+    if [[ -e $path || -L $path ]]; then
+        if mountpoint -q "$path"; then
+            validate_directory_shape "$path" "Docker lab node $node mount path"
+        else
+            validate_owned_directory "$path" "Docker lab node $node mount path"
+        fi
+    else
+        (umask 077 && mkdir -- "$path")
+        validate_owned_directory "$path" "Docker lab node $node mount path"
+    fi
+}
+
+ensure_lab_namespace() {
+    local parent role
+    parent=$(dirname "$LAB_ROOT")
+    [[ -d $parent && ! -L $parent ]] ||
+        die "Docker lab root parent must already be a non-symlink directory: $parent"
+    if [[ -e $LAB_ROOT || -L $LAB_ROOT ]]; then
+        validate_owned_directory "$LAB_ROOT" "Docker lab root"
+    else
+        (umask 077 && mkdir -- "$LAB_ROOT")
+        validate_owned_directory "$LAB_ROOT" "Docker lab root"
+    fi
+    write_namespace_marker "$LAB_ROOT" root
+
+    local lock=$LAB_ROOT/controller.lock
+    if [[ -e $lock || -L $lock ]]; then
+        [[ -f $lock && ! -L $lock && -O $lock ]] ||
+            die "Docker lab lock must be an owned non-symlink file: $lock"
+    else
+        (umask 077 && : >"$lock")
+    fi
+    exec 9<>"$lock"
+    flock -n 9 || die "another Docker lab operation is in progress"
+
+    for role in "${NAMESPACE_ROLES[@]}"; do
+        ensure_namespace_directory "$role"
+    done
+    validate_existing_namespace_shape
+    validate_namespace_marker "$LAB_ROOT" root
 }
 
 validate_node() {
@@ -201,9 +329,8 @@ prepare_docker_only() {
 }
 
 acquire_lock() {
-    mkdir -p "$LAB_ROOT"
-    exec 9>"$LAB_ROOT/controller.lock"
-    flock -n 9 || die "another Docker lab operation is in progress"
+    command -v mountpoint >/dev/null || die "mountpoint is required"
+    ensure_lab_namespace
 }
 
 node_name() {
@@ -492,7 +619,7 @@ ensure_filesystem() {
     image=$(node_image "$node")
     mount_dir=$(node_mount "$node")
     record=$(loop_record "$node")
-    mkdir -p "$(dirname "$image")" "$mount_dir" "$(dirname "$record")"
+    ensure_node_mount_directory "$node"
 
     if mountpoint -q "$mount_dir"; then
         loop=$(verified_mounted_loop "$node")
@@ -927,8 +1054,7 @@ ensure_guild() {
 command_up() {
     prepare_host
     acquire_lock
-    mkdir -p "$LAB_ROOT"/{images,mounts,loops,seeds,configs}
-    chmod 700 "$LAB_ROOT" "$LAB_ROOT/seeds" "$LAB_ROOT/configs"
+    chmod 700 "$LAB_ROOT" "$LAB_ROOT"/{images,mounts,loops,seeds,configs}
 
     if ! "${DOCKER[@]}" image inspect "$CONTAINER_IMAGE" >/dev/null 2>&1; then
         say "pulling container base image $CONTAINER_IMAGE (no image build)"

@@ -329,6 +329,13 @@ Before reusing or unmounting a mount point, it verifies that the mounted Btrfs
 source is a loop device attached to that node's exact retained image. A foreign
 mount at a lab path is rejected and left untouched.
 
+The controller also marks and validates its `images`, `mounts`, `loops`,
+`seeds`, and `configs` namespaces. It refuses every mutating command if one of
+those directories, or a per-node mount path, has been replaced by a symlink or
+foreign mount. Do not remove the `.mutualbackup-docker-lab-directory-v1`
+marker files; an existing safe pre-marker lab is adopted on its first mutating
+command.
+
 `down` retains image files, configs, and seeds under `.docker-lab/`, so a later
 `up` resumes the same data and identities. While down, the host mount-point
 directories are present but the Btrfs contents are not mounted.
