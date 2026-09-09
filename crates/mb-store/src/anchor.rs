@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -292,6 +292,9 @@ impl ReflinkAnchor {
         probe_reflink(&source_root)?;
 
         let area = ensure_anchor_area(&source_root, &root_metadata)?;
+        #[cfg(target_os = "linux")]
+        let filesystem = filesystem_identity_for_file(&root_file)?;
+        #[cfg(not(target_os = "linux"))]
         let filesystem = filesystem_identity(&source_root)?;
         let (root_modified_secs, root_modified_nanos) = modified_parts(&root_metadata);
         Ok(ReflinkCapturePlan {
@@ -332,6 +335,9 @@ impl ReflinkAnchor {
         }
         let root_file = open_source_root(&source_root)?;
         let root_metadata = root_file.metadata()?;
+        #[cfg(target_os = "linux")]
+        let filesystem = filesystem_identity_for_file(&root_file)?;
+        #[cfg(not(target_os = "linux"))]
         let filesystem = filesystem_identity(&source_root)?;
         if !root_metadata.is_dir()
             || capture_version(filesystem.stable_id, &root_metadata) != plan.root_version
@@ -348,7 +354,7 @@ impl ReflinkAnchor {
                 &source_root,
                 &root_file,
                 &root_metadata,
-                filesystem.stable_id,
+                filesystem,
                 &staging,
             )?;
             let manifest = StableAnchorManifest {
@@ -633,9 +639,11 @@ fn stable_filesystem_id_for_file(file: &File) -> Result<u64, AnchorError> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_mount_id(path: &Path) -> Result<u64, AnchorError> {
-    use std::os::unix::ffi::OsStrExt;
-
+fn linux_mount_id_at(
+    directory: libc::c_int,
+    path: &CStr,
+    flags: libc::c_int,
+) -> Result<u64, AnchorError> {
     // Linux's statx UAPI is a fixed 256-byte record. libc deliberately omits
     // its statx wrapper for musl targets whose configured headers predate musl
     // 1.2.3, even though the kernel syscall and ABI are available. Keep the
@@ -649,15 +657,13 @@ fn linux_mount_id(path: &Path) -> Result<u64, AnchorError> {
     #[repr(C, align(8))]
     struct StatxBuffer([u8; STATX_BUFFER_BYTES]);
 
-    let encoded =
-        CString::new(path.as_os_str().as_bytes()).map_err(|_| AnchorError::InvalidRoot)?;
     let mut stat = StatxBuffer([0; STATX_BUFFER_BYTES]);
     let result = unsafe {
         libc::syscall(
             libc::SYS_statx,
-            libc::AT_FDCWD,
-            encoded.as_ptr(),
-            libc::AT_NO_AUTOMOUNT,
+            directory,
+            path.as_ptr(),
+            flags,
             STATX_TYPE | STATX_MNT_ID,
             stat.0.as_mut_ptr(),
         )
@@ -684,18 +690,44 @@ fn linux_mount_id(path: &Path) -> Result<u64, AnchorError> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn filesystem_identity(path: impl AsRef<Path>) -> Result<FilesystemIdentity, AnchorError> {
+fn linux_mount_id(path: &Path) -> Result<u64, AnchorError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let encoded =
+        CString::new(path.as_os_str().as_bytes()).map_err(|_| AnchorError::InvalidRoot)?;
+    linux_mount_id_at(libc::AT_FDCWD, &encoded, libc::AT_NO_AUTOMOUNT)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mount_id_for_file(file: &File) -> Result<u64, AnchorError> {
+    use std::os::fd::AsRawFd;
+
+    const AT_EMPTY_PATH: libc::c_int = 0x1000;
+    let empty = CString::new("").expect("an empty C string is valid");
+    linux_mount_id_at(
+        file.as_raw_fd(),
+        &empty,
+        libc::AT_NO_AUTOMOUNT | AT_EMPTY_PATH,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn filesystem_identity_for_file(file: &File) -> Result<FilesystemIdentity, AnchorError> {
     use std::os::unix::fs::MetadataExt;
 
-    let path = path.as_ref();
-    let mount_id = linux_mount_id(path)?;
-    let file = File::open(path)?;
-    let stable_id = stable_filesystem_id_for_file(&file)?;
+    let mount_id = linux_mount_id_for_file(file)?;
+    let stable_id = stable_filesystem_id_for_file(file)?;
     Ok(FilesystemIdentity {
         stable_id,
         device: file.metadata()?.dev(),
         mount_id,
     })
+}
+
+#[cfg(target_os = "linux")]
+pub fn filesystem_identity(path: impl AsRef<Path>) -> Result<FilesystemIdentity, AnchorError> {
+    let file = open_source_root(path.as_ref())?;
+    filesystem_identity_for_file(&file)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -819,6 +851,8 @@ fn reject_nested_filesystems(
 ) -> Result<(), AnchorError> {
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::MetadataExt;
+    #[cfg(target_os = "linux")]
+    let root_file = open_source_root(root)?;
 
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry?;
@@ -826,10 +860,13 @@ fn reject_nested_filesystems(
             continue;
         }
         #[cfg(target_os = "linux")]
-        let same_filesystem = linux_mount_id(entry.path())? == root_identity.mount_id
-            && fs::metadata(entry.path())?.dev() == root_identity.device
-            && (!entry.file_type().is_dir()
-                || filesystem_identity(entry.path())?.stable_id == root_identity.stable_id);
+        let same_filesystem = if let Some(file) = open_walk_entry_beneath(root, &root_file, &entry)?
+        {
+            filesystem_identity_for_file(&file)? == root_identity
+        } else {
+            linux_mount_id(entry.path())? == root_identity.mount_id
+                && fs::metadata(entry.path())?.dev() == root_identity.device
+        };
         #[cfg(not(target_os = "linux"))]
         let same_filesystem = filesystem_identity(entry.path())? == root_identity;
         if !same_filesystem {
@@ -839,11 +876,35 @@ fn reject_nested_filesystems(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn open_walk_entry_beneath(
+    root: &Path,
+    root_file: &File,
+    entry: &walkdir::DirEntry,
+) -> Result<Option<File>, AnchorError> {
+    if !entry.file_type().is_dir() && !entry.file_type().is_file() {
+        return Ok(None);
+    }
+    let relative = entry
+        .path()
+        .strip_prefix(root)
+        .map_err(|_| AnchorError::UnsafePath)?;
+    if relative.as_os_str().is_empty() {
+        Ok(Some(root_file.try_clone()?))
+    } else {
+        Ok(Some(open_source_beneath(
+            root_file,
+            relative,
+            entry.file_type().is_dir(),
+        )?))
+    }
+}
+
 fn capture_entries(
     source_root: &Path,
     root_file: &File,
     root_metadata: &fs::Metadata,
-    filesystem_id: u64,
+    filesystem: FilesystemIdentity,
     staging: &Path,
 ) -> Result<Vec<CapturedEntry>, AnchorError> {
     let mut entries = Vec::new();
@@ -883,7 +944,7 @@ fn capture_entries(
         let destination = staging.join(relative);
         if before.is_dir() {
             #[cfg(target_os = "linux")]
-            if stable_filesystem_id_for_file(&file)? != filesystem_id {
+            if filesystem_identity_for_file(&file)? != filesystem {
                 return Err(AnchorError::NestedFilesystem(entry.path().to_path_buf()));
             }
             create_private_dir_new(&destination)?;
@@ -896,10 +957,14 @@ fn capture_entries(
             });
             directory_versions.push((relative.to_path_buf(), file, before));
         } else if before.is_file() {
+            #[cfg(target_os = "linux")]
+            if filesystem_identity_for_file(&file)? != filesystem {
+                return Err(AnchorError::NestedFilesystem(entry.path().to_path_buf()));
+            }
             if let Some(parent) = destination.parent() {
                 create_private_dir(parent)?;
             }
-            let native_id = native_file_id(filesystem_id, &before);
+            let native_id = native_file_id(filesystem.stable_id, &before);
             if let Some(first_destination) = captured_links.get(&native_id) {
                 fs::hard_link(first_destination, &destination)?;
             } else {
@@ -1809,6 +1874,32 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn cached_directory_entry_cannot_turn_into_a_blocking_fifo_open() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let entry_path = temp.path().join("entry");
+        fs::create_dir(&entry_path).unwrap();
+        let cached_entry = WalkDir::new(temp.path())
+            .min_depth(1)
+            .max_depth(1)
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(cached_entry.file_type().is_dir());
+        fs::remove_dir(&entry_path).unwrap();
+        let encoded = CString::new(entry_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+
+        let root_file = open_source_root(temp.path()).unwrap();
+        let started = Instant::now();
+        assert!(open_walk_entry_beneath(temp.path(), &root_file, &cached_entry).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn nested_btrfs_subvolumes_are_rejected_before_and_during_capture() {
         use std::os::unix::fs::MetadataExt;
@@ -1868,6 +1959,79 @@ mod tests {
             output.status.success(),
             "cannot delete Btrfs test subvolumes: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+
+        let bind_owner = run_root.join("bind-owner");
+        let bind_external = run_root.join("bind-external");
+        for subvolume in [&bind_owner, &bind_external] {
+            let output = Command::new("btrfs")
+                .args(["subvolume", "create"])
+                .arg(subvolume)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "cannot create Btrfs bind-mount test subvolume: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let bind_protected = bind_owner.join("protected");
+        fs::create_dir(&bind_protected).unwrap();
+        let first_file = bind_protected.join("a-first");
+        let mount_target = bind_protected.join("z-mounted");
+        fs::write(&first_file, b"root-subvolume-bytes").unwrap();
+        fs::write(&mount_target, b"original-target-data").unwrap();
+        let bind_plan = ReflinkAnchor::plan(&bind_protected).unwrap();
+
+        fs::create_dir(bind_external.join("inode-slot")).unwrap();
+        let mounted_file = bind_external.join("payload");
+        fs::write(&mounted_file, b"foreign-subvolume!!!").unwrap();
+        assert_eq!(
+            fs::metadata(&first_file).unwrap().ino(),
+            fs::metadata(&mounted_file).unwrap().ino()
+        );
+        assert_eq!(
+            fs::metadata(&first_file).unwrap().len(),
+            fs::metadata(&mounted_file).unwrap().len()
+        );
+        let output = Command::new("sudo")
+            .args(["-n", "mount", "--bind"])
+            .arg(&mounted_file)
+            .arg(&mount_target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cannot create Btrfs file bind mount: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bind_capture_error = ReflinkAnchor::capture_plan(&bind_plan).unwrap_err();
+        let output = Command::new("sudo")
+            .args(["-n", "umount"])
+            .arg(&mount_target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cannot remove Btrfs file bind mount: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new("btrfs")
+            .args(["subvolume", "delete"])
+            .args([&bind_owner, &bind_external])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cannot delete Btrfs bind-mount test subvolumes: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            matches!(
+                &bind_capture_error,
+                AnchorError::NestedFilesystem(path) if path == &mount_target
+            ),
+            "unexpected bind-mount capture error: {bind_capture_error:?}"
         );
         fs::remove_dir_all(run_root).unwrap();
     }
