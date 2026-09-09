@@ -10,8 +10,8 @@ use mb_core::{
     MemberSignature, NodeId, QuorumCheckpoint, QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN,
     RecoveryBundle, RecoveryLocator, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, Seed,
     ShardRole, SignedRecord, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
-    V1_MAX_CATALOG_PAGES, canonical_bytes, decode_canonical, seal_recovery_record, sector_root,
-    synthetic_filler_sector,
+    V1_MAX_CATALOG_PAGES, canonical_bytes, decode_canonical, open_recovery_record,
+    seal_recovery_record, sector_root, synthetic_filler_sector,
 };
 use mb_store::{
     ControlStore, DatabaseError, ParityObject, ParityStore, filesystem_identity, probe_reflink,
@@ -156,6 +156,13 @@ pub(crate) struct DhtRecordObservation {
     pub sequence: u64,
     pub expires_at_unix_seconds: u64,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CheckpointRecoveryObservation {
+    pub provider_peer_id: String,
+    pub selected: SignedRecord<RecoveryBundle>,
+    pub observations: Vec<DhtRecordObservation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -2096,7 +2103,7 @@ impl Node {
         record_id: &[u8],
         incoming: Vec<DhtRecordObservation>,
     ) -> Result<Option<Vec<u8>>> {
-        if !matches!(kind, "dht-observed-endpoint" | "dht-observed-recovery")
+        if kind != "dht-observed-endpoint"
             || record_id.is_empty()
             || record_id.len() > 64
             || incoming.len() > MAX_DHT_OBSERVED_SEQUENCES
@@ -2105,97 +2112,179 @@ impl Node {
         }
         let now = unix_seconds();
         let stored = self.control.get_record(kind, record_id)?;
-        if stored.is_none() && !incoming.is_empty() {
-            let maximum = match kind {
-                "dht-observed-endpoint" => MAX_DHT_OBSERVED_ENDPOINT_SCOPES,
-                "dht-observed-recovery" => MAX_DHT_OBSERVED_RECOVERY_SCOPES,
-                _ => unreachable!("kind was validated above"),
-            };
-            if self.control.records(kind)?.len() >= maximum {
-                anyhow::bail!("durable DHT observation scope limit reached");
-            }
+        if stored.is_none()
+            && !incoming.is_empty()
+            && self.control.records(kind)?.len() >= MAX_DHT_OBSERVED_ENDPOINT_SCOPES
+        {
+            anyhow::bail!("durable DHT observation scope limit reached");
         }
-        let mut hashes = BTreeMap::<u64, [u8; 32]>::new();
-        let mut current = None;
-        if let Some(bytes) = stored {
-            let state: DhtObservationState = decode_canonical(&bytes)?;
-            validate_dht_observation_state(&state)?;
-            for observed in state.hashes {
-                hashes.insert(observed.sequence, observed.hash);
-            }
-            current = Some(state.current);
-        }
-
-        let mut incoming_by_sequence = BTreeMap::<u64, DhtObservedRecord>::new();
-        for record in incoming {
-            if record.sequence == 0
-                || record.expires_at_unix_seconds <= now
-                || record.bytes.is_empty()
-                || record.bytes.len() > MAX_DHT_OBSERVED_RECORD_BYTES
-            {
-                anyhow::bail!("invalid accepted DHT observation");
-            }
-            let observed = DhtObservedRecord {
-                sequence: record.sequence,
-                hash: *blake3::hash(&record.bytes).as_bytes(),
-                expires_at_unix_seconds: record.expires_at_unix_seconds,
-                bytes: record.bytes,
-            };
-            if let Some(existing) = incoming_by_sequence.get(&observed.sequence) {
-                if existing.hash != observed.hash {
-                    anyhow::bail!("DHT publisher forked an observed sequence");
-                }
-            } else {
-                incoming_by_sequence.insert(observed.sequence, observed);
-            }
-        }
-
-        for observed in incoming_by_sequence.into_values() {
-            if let Some(existing_hash) = hashes.get(&observed.sequence) {
-                if *existing_hash != observed.hash {
-                    anyhow::bail!("DHT publisher forked an observed sequence");
-                }
-                continue;
-            }
-            if hashes
-                .last_key_value()
-                .is_some_and(|(highest, _)| observed.sequence < *highest)
-            {
-                continue;
-            }
-            hashes.insert(observed.sequence, observed.hash);
-            current = Some(observed);
-        }
-
-        while hashes.len() > MAX_DHT_OBSERVED_SEQUENCES {
-            let oldest = *hashes
-                .keys()
-                .next()
-                .context("nonempty DHT observation set has no first key")?;
-            hashes.remove(&oldest);
-        }
-        let Some((highest_sequence, _)) = hashes.last_key_value() else {
+        let Some(state) = merge_dht_observation_state(stored.as_deref(), incoming, now)? else {
             return Ok(None);
         };
-        let current = current.context("durable DHT high-water mark has no current record")?;
-        if current.sequence != *highest_sequence {
-            anyhow::bail!("durable DHT current record is not the high-water mark");
-        }
-        let selected = (current.expires_at_unix_seconds > now).then(|| current.bytes.clone());
-        self.control.put_record(
-            kind,
-            record_id,
-            &canonical_bytes(&DhtObservationState {
-                format_version: 1,
-                highest_sequence: *highest_sequence,
-                hashes: hashes
-                    .into_iter()
-                    .map(|(sequence, hash)| DhtObservedHash { sequence, hash })
-                    .collect(),
-                current,
-            })?,
-        )?;
+        let selected =
+            (state.current.expires_at_unix_seconds > now).then(|| state.current.bytes.clone());
+        self.control
+            .put_record(kind, record_id, &canonical_bytes(&state)?)?;
         Ok(selected)
+    }
+
+    pub(crate) fn select_recovery_dht_records(
+        &self,
+        record_id: &[u8],
+        incoming: Vec<DhtRecordObservation>,
+    ) -> Result<Option<Vec<u8>>> {
+        if record_id.len() != 64
+            || record_id[..32] != self.keys.node_id().0
+            || incoming.len() > MAX_DHT_OBSERVED_SEQUENCES
+        {
+            anyhow::bail!("invalid recovery DHT observation scope");
+        }
+        let now = unix_seconds();
+        let stored = self
+            .control
+            .get_record("dht-observed-recovery", record_id)?;
+        let active_stored = match stored.as_deref() {
+            Some(bytes) => {
+                let state: DhtObservationState = decode_canonical(bytes)?;
+                validate_dht_observation_state(&state)?;
+                (state.current.expires_at_unix_seconds > now).then_some(bytes)
+            }
+            None => None,
+        };
+        Ok(merge_dht_observation_state(active_stored, incoming, now)?
+            .map(|state| state.current.bytes))
+    }
+
+    pub(crate) fn retain_checkpoint_recovery_records(
+        &mut self,
+        checkpoint: &QuorumCheckpoint,
+        observations: Vec<CheckpointRecoveryObservation>,
+    ) -> Result<()> {
+        checkpoint.verify()?;
+        let subject = self.keys.node_id();
+        if !checkpoint
+            .checkpoint
+            .members
+            .iter()
+            .any(|member| member.node_id == subject)
+        {
+            anyhow::bail!("recovery checkpoint does not contain this node");
+        }
+
+        let mut allowed = BTreeMap::new();
+        for member in &checkpoint.checkpoint.members {
+            let peer_id = member.node_id.libp2p_peer_id()?.to_string();
+            allowed.insert(
+                recovery_observation_record_id(subject, &peer_id).to_vec(),
+                member.node_id,
+            );
+        }
+
+        let now = unix_seconds();
+        let records = self.control.records("dht-observed-recovery")?;
+        let mut retained = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+        let mut delete_record_ids = Vec::new();
+        for (record_id, bytes) in records {
+            if record_id.len() != 64 {
+                anyhow::bail!("invalid durable recovery observation scope");
+            }
+            let state: DhtObservationState = decode_canonical(&bytes)?;
+            validate_dht_observation_state(&state)?;
+            if record_id[..32] != subject.0
+                || !allowed.contains_key(&record_id)
+                || state.current.expires_at_unix_seconds <= now
+            {
+                delete_record_ids.push(record_id);
+            } else {
+                retained.insert(record_id, bytes);
+            }
+        }
+
+        let mut seen_publishers = BTreeMap::new();
+        let mut replacements = Vec::new();
+        for observation in observations {
+            let publisher =
+                self.validate_checkpoint_recovery_observation(checkpoint, &observation, now)?;
+            if seen_publishers.insert(publisher, ()).is_some() {
+                anyhow::bail!("duplicate certified recovery publisher");
+            }
+            if observation.observations.is_empty() {
+                continue;
+            }
+            let record_id =
+                recovery_observation_record_id(subject, &observation.provider_peer_id).to_vec();
+            let state = merge_dht_observation_state(
+                retained.get(&record_id).map(Vec::as_slice),
+                observation.observations,
+                now,
+            )?
+            .context("certified recovery observation has no current record")?;
+            let bytes = canonical_bytes(&state)?;
+            retained.insert(record_id.clone(), bytes.clone());
+            replacements.push((record_id, bytes));
+        }
+        if retained.len() > MAX_DHT_OBSERVED_RECOVERY_SCOPES {
+            anyhow::bail!("durable recovery observation scope limit reached");
+        }
+        self.control.reconcile_records(
+            "dht-observed-recovery",
+            &delete_record_ids,
+            &replacements,
+        )?;
+        Ok(())
+    }
+
+    fn validate_checkpoint_recovery_observation(
+        &self,
+        checkpoint: &QuorumCheckpoint,
+        observation: &CheckpointRecoveryObservation,
+        now: u64,
+    ) -> Result<NodeId> {
+        let bundle = &observation.selected;
+        bundle.verify(b"mutualbackup/recovery-bundle/v1")?;
+        if bundle.value.format_version != 1
+            || bundle.value.subject != self.keys.node_id()
+            || bundle.value.publisher != bundle.signer
+            || bundle.value.sequence == 0
+            || bundle.value.expires_at_unix_seconds <= now
+            || bundle.value.publisher.libp2p_peer_id()?.to_string() != observation.provider_peer_id
+        {
+            anyhow::bail!("invalid certified recovery bundle");
+        }
+        let plaintext = open_recovery_record(self.keys(), &bundle.value.sealed)?;
+        let locator: SignedRecord<RecoveryLocator> = decode_canonical(&plaintext)?;
+        locator.verify(RECOVERY_LOCATOR_DOMAIN)?;
+        if locator.signer != bundle.value.publisher
+            || locator.value.format_version != 1
+            || locator.value.subject != bundle.value.subject
+            || locator.value.publisher != bundle.value.publisher
+            || locator.value.expires_at_unix_seconds != bundle.value.expires_at_unix_seconds
+            || locator.value.expires_at_unix_seconds <= now
+        {
+            anyhow::bail!("certified recovery locator differs from its bundle");
+        }
+        validate_endpoint_set(locator.value.publisher, &locator.value.endpoints)?;
+        checkpoint.validate_recovery_authority(
+            self.keys(),
+            &locator.value,
+            bundle.value.publisher,
+        )?;
+        for record in &observation.observations {
+            let observed: SignedRecord<RecoveryBundle> = decode_canonical(&record.bytes)?;
+            observed.verify(b"mutualbackup/recovery-bundle/v1")?;
+            if record.sequence != observed.value.sequence
+                || record.expires_at_unix_seconds != observed.value.expires_at_unix_seconds
+                || observed.value.format_version != 1
+                || observed.value.subject != bundle.value.subject
+                || observed.value.publisher != bundle.value.publisher
+                || observed.value.publisher != observed.signer
+                || observed.value.publisher.libp2p_peer_id()?.to_string()
+                    != observation.provider_peer_id
+            {
+                anyhow::bail!("invalid certified recovery observation history");
+            }
+        }
+        Ok(bundle.value.publisher)
     }
 
     pub(crate) fn observed_recovery_records(
@@ -2204,18 +2293,24 @@ impl Node {
     ) -> Result<Vec<([u8; 32], Vec<u8>)>> {
         let records = self.control.records("dht-observed-recovery")?;
         let mut selected = Vec::new();
-        for (record_id, _) in records {
-            if record_id.len() != 64 || record_id[..32] != subject.0 {
+        let now = unix_seconds();
+        let mut delete_record_ids = Vec::new();
+        for (record_id, bytes) in records {
+            if record_id.len() != 64 {
+                anyhow::bail!("invalid durable recovery observation scope");
+            }
+            let state: DhtObservationState = decode_canonical(&bytes)?;
+            validate_dht_observation_state(&state)?;
+            if record_id[..32] != subject.0 || state.current.expires_at_unix_seconds <= now {
+                delete_record_ids.push(record_id);
                 continue;
             }
-            if let Some(bytes) =
-                self.observe_dht_records("dht-observed-recovery", &record_id, Vec::new())?
-            {
-                let mut provider_hash = [0_u8; 32];
-                provider_hash.copy_from_slice(&record_id[32..]);
-                selected.push((provider_hash, bytes));
-            }
+            let mut provider_hash = [0_u8; 32];
+            provider_hash.copy_from_slice(&record_id[32..]);
+            selected.push((provider_hash, state.current.bytes));
         }
+        self.control
+            .reconcile_records("dht-observed-recovery", &delete_record_ids, &[])?;
         Ok(selected)
     }
 
@@ -3081,6 +3176,95 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
+fn recovery_observation_record_id(subject: NodeId, provider_peer_id: &str) -> [u8; 64] {
+    let mut record_id = [0_u8; 64];
+    record_id[..32].copy_from_slice(&subject.0);
+    record_id[32..].copy_from_slice(blake3::hash(provider_peer_id.as_bytes()).as_bytes());
+    record_id
+}
+
+fn merge_dht_observation_state(
+    stored: Option<&[u8]>,
+    incoming: Vec<DhtRecordObservation>,
+    now: u64,
+) -> Result<Option<DhtObservationState>> {
+    let mut hashes = BTreeMap::<u64, [u8; 32]>::new();
+    let mut current = None;
+    if let Some(bytes) = stored {
+        let state: DhtObservationState = decode_canonical(bytes)?;
+        validate_dht_observation_state(&state)?;
+        for observed in state.hashes {
+            hashes.insert(observed.sequence, observed.hash);
+        }
+        current = Some(state.current);
+    }
+
+    let mut incoming_by_sequence = BTreeMap::<u64, DhtObservedRecord>::new();
+    for record in incoming {
+        if record.sequence == 0
+            || record.expires_at_unix_seconds <= now
+            || record.bytes.is_empty()
+            || record.bytes.len() > MAX_DHT_OBSERVED_RECORD_BYTES
+        {
+            anyhow::bail!("invalid accepted DHT observation");
+        }
+        let observed = DhtObservedRecord {
+            sequence: record.sequence,
+            hash: *blake3::hash(&record.bytes).as_bytes(),
+            expires_at_unix_seconds: record.expires_at_unix_seconds,
+            bytes: record.bytes,
+        };
+        if let Some(existing) = incoming_by_sequence.get(&observed.sequence) {
+            if existing.hash != observed.hash {
+                anyhow::bail!("DHT publisher forked an observed sequence");
+            }
+        } else {
+            incoming_by_sequence.insert(observed.sequence, observed);
+        }
+    }
+
+    for observed in incoming_by_sequence.into_values() {
+        if let Some(existing_hash) = hashes.get(&observed.sequence) {
+            if *existing_hash != observed.hash {
+                anyhow::bail!("DHT publisher forked an observed sequence");
+            }
+            continue;
+        }
+        if hashes
+            .last_key_value()
+            .is_some_and(|(highest, _)| observed.sequence < *highest)
+        {
+            continue;
+        }
+        hashes.insert(observed.sequence, observed.hash);
+        current = Some(observed);
+    }
+
+    while hashes.len() > MAX_DHT_OBSERVED_SEQUENCES {
+        let oldest = *hashes
+            .keys()
+            .next()
+            .context("nonempty DHT observation set has no first key")?;
+        hashes.remove(&oldest);
+    }
+    let Some((highest_sequence, _)) = hashes.last_key_value() else {
+        return Ok(None);
+    };
+    let current = current.context("durable DHT high-water mark has no current record")?;
+    if current.sequence != *highest_sequence {
+        anyhow::bail!("durable DHT current record is not the high-water mark");
+    }
+    Ok(Some(DhtObservationState {
+        format_version: 1,
+        highest_sequence: *highest_sequence,
+        hashes: hashes
+            .into_iter()
+            .map(|(sequence, hash)| DhtObservedHash { sequence, hash })
+            .collect(),
+        current,
+    }))
+}
+
 fn validate_dht_observation(record: &DhtObservedRecord) -> Result<()> {
     if record.sequence == 0
         || record.bytes.is_empty()
@@ -3546,6 +3730,57 @@ mod tests {
                 )
                 .unwrap(),
             Some(b"third".to_vec())
+        );
+    }
+
+    #[test]
+    fn expired_recovery_observation_scopes_are_reclaimed_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([80; 32]);
+        let node = Node::open(temp.path(), seed.clone()).unwrap();
+        let subject = node.keys().node_id();
+        let expires_at_unix_seconds = unix_seconds().saturating_sub(1);
+        for index in 0_u8..64 {
+            let bytes = vec![index; 8];
+            let hash = *blake3::hash(&bytes).as_bytes();
+            let state = DhtObservationState {
+                format_version: 1,
+                highest_sequence: 1,
+                hashes: vec![DhtObservedHash { sequence: 1, hash }],
+                current: DhtObservedRecord {
+                    sequence: 1,
+                    hash,
+                    expires_at_unix_seconds,
+                    bytes,
+                },
+            };
+            let mut record_id = [0_u8; 64];
+            record_id[..32].copy_from_slice(&subject.0);
+            record_id[32] = index;
+            record_id[63] = !index;
+            node.control
+                .put_record(
+                    "dht-observed-recovery",
+                    &record_id,
+                    &canonical_bytes(&state).unwrap(),
+                )
+                .unwrap();
+        }
+        drop(node);
+
+        let mut reopened = Node::open(temp.path(), seed).unwrap();
+        assert!(
+            reopened
+                .observed_recovery_records(subject)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .control
+                .records("dht-observed-recovery")
+                .unwrap()
+                .is_empty()
         );
     }
 

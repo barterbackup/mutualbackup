@@ -28,7 +28,7 @@ use mb_core::{
 use mb_store::ParityObject;
 use uuid::Uuid;
 
-use crate::node::{DhtRecordObservation, GuildPhase, SnapshotInfo};
+use crate::node::{CheckpointRecoveryObservation, DhtRecordObservation, GuildPhase, SnapshotInfo};
 
 use super::{
     BackupDescriptor, BackupJob, CheckpointObjectKind, DhtSequenceFloors, GuildPeer,
@@ -2441,6 +2441,7 @@ async fn publish_dht_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()>
         bundle_queries.push(async move { (provider, p2p.get_record(key).await) });
     }
     let mut confirmations = Vec::new();
+    let mut certified_observations = Vec::new();
     let mut rejected_providers = HashSet::new();
     let mut considered_publishers = HashSet::new();
     while let Some((provider, records)) = bundle_queries.next().await {
@@ -2448,7 +2449,7 @@ async fn publish_dht_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()>
             tracing::warn!(%provider, "DHT readiness provider lookup failed");
             continue;
         };
-        let bundle = match select_durable_recovery_bundle(
+        let observation = match select_recovery_bundle_candidate(
             node.clone(),
             &provider,
             local_id,
@@ -2456,7 +2457,7 @@ async fn publish_dht_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()>
         )
         .await
         {
-            Ok(Some(bundle)) => bundle,
+            Ok(Some(observation)) => observation,
             Ok(None) => continue,
             Err(error) => {
                 rejected_providers.insert(provider.clone());
@@ -2464,19 +2465,20 @@ async fn publish_dht_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()>
                 continue;
             }
         };
-        let publisher = bundle.value.publisher;
-        let expires_at = bundle.value.expires_at_unix_seconds;
+        let publisher = observation.selected.value.publisher;
+        let expires_at = observation.selected.value.expires_at_unix_seconds;
         if validate_ready_bundle(
             node.clone(),
             &provider,
             publications.checkpoint_hash,
-            bundle,
+            observation.selected.clone(),
         )
         .await
         .is_ok()
         {
             considered_publishers.insert(publisher);
             confirmations.push((publisher, expires_at));
+            certified_observations.push(observation);
         }
     }
     for (provider, bundle) in retained_recovery_bundles(node.clone(), local_id).await? {
@@ -2500,6 +2502,8 @@ async fn publish_dht_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()>
     }
     let hash = publications.checkpoint_hash;
     node_blocking(node, move |node| {
+        let checkpoint = node.checkpoint(&hash)?;
+        node.retain_checkpoint_recovery_records(&checkpoint, certified_observations)?;
         node.update_seed_recovery_readiness(hash, confirmations)
     })
     .await?;
@@ -2574,6 +2578,7 @@ pub struct DhtRecoveryResult {
 struct RecoveryCandidate {
     publisher: NodeId,
     locator: mb_core::RecoveryLocator,
+    observation: CheckpointRecoveryObservation,
 }
 
 struct ValidatedRecoveryHead {
@@ -2623,10 +2628,15 @@ pub async fn recover_from_dht(
             tracing::warn!(%provider, "recovery provider lookup failed");
             continue;
         };
-        let bundle = match select_durable_recovery_bundle(node.clone(), &provider, subject, records)
-            .await
+        let observation = match select_recovery_bundle_candidate(
+            node.clone(),
+            &provider,
+            subject,
+            records,
+        )
+        .await
         {
-            Ok(Some(bundle)) => bundle,
+            Ok(Some(observation)) => observation,
             Ok(None) => continue,
             Err(error) => {
                 rejected_providers.insert(provider.clone());
@@ -2636,7 +2646,7 @@ pub async fn recover_from_dht(
         };
         let provider_for_check = provider.clone();
         match node_blocking(node.clone(), move |node| {
-            decode_recovery_candidate(node, &provider_for_check, bundle)
+            decode_recovery_candidate(node, &provider_for_check, observation)
         })
         .await
         {
@@ -2655,7 +2665,15 @@ pub async fn recover_from_dht(
             continue;
         }
         match node_blocking(node.clone(), move |node| {
-            decode_recovery_candidate(node, &provider, bundle)
+            decode_recovery_candidate(
+                node,
+                &provider,
+                CheckpointRecoveryObservation {
+                    provider_peer_id: provider.clone(),
+                    selected: bundle,
+                    observations: Vec::new(),
+                },
+            )
         })
         .await
         {
@@ -2729,8 +2747,13 @@ pub async fn recover_from_dht(
         checkpoint,
         candidates,
     } = selected.context("no advertised recovery head could be certified")?;
+    let recovery_observations = candidates
+        .iter()
+        .map(|candidate| candidate.observation.clone())
+        .collect();
     let checkpoint_for_attempt = checkpoint.clone();
     node_blocking(node.clone(), move |node| {
+        node.retain_checkpoint_recovery_records(&checkpoint_for_attempt, recovery_observations)?;
         node.pin_recovery_attempt(&checkpoint_for_attempt)
     })
     .await?;
@@ -2962,8 +2985,9 @@ async fn validate_recovery_head(
 fn decode_recovery_candidate(
     node: &Node,
     provider_peer_id: &str,
-    bundle: SignedRecord<mb_core::RecoveryBundle>,
+    observation: CheckpointRecoveryObservation,
 ) -> Result<RecoveryCandidate> {
+    let bundle = &observation.selected;
     bundle.verify(b"mutualbackup/recovery-bundle/v1")?;
     if bundle.value.format_version != 1
         || bundle.value.subject != node.keys().node_id()
@@ -2990,6 +3014,7 @@ fn decode_recovery_candidate(
     Ok(RecoveryCandidate {
         publisher: bundle.value.publisher,
         locator: locator.value,
+        observation,
     })
 }
 
@@ -3069,29 +3094,35 @@ async fn select_durable_endpoint_record(
     }
 }
 
-async fn select_durable_recovery_bundle(
+async fn select_recovery_bundle_candidate(
     node: Arc<Mutex<Node>>,
     provider_peer_id: &str,
     subject: NodeId,
     records: Vec<DhtRecord>,
-) -> Result<Option<SignedRecord<mb_core::RecoveryBundle>>> {
+) -> Result<Option<CheckpointRecoveryObservation>> {
     let observations = recovery_bundle_observations(provider_peer_id, subject, records)?;
     let mut record_id = [0_u8; 64];
     record_id[..32].copy_from_slice(&subject.0);
     record_id[32..].copy_from_slice(blake3::hash(provider_peer_id.as_bytes()).as_bytes());
+    let observations_for_selection = observations.clone();
     let selected = node_blocking(node, move |node| {
-        node.observe_dht_records("dht-observed-recovery", &record_id, observations)
+        node.select_recovery_dht_records(&record_id, observations_for_selection)
     })
     .await?;
     match selected {
-        Some(bytes) => select_recovery_bundle(
+        Some(bytes) => Ok(select_recovery_bundle(
             provider_peer_id,
             subject,
             vec![DhtRecord {
                 publisher: None,
                 value: bytes,
             }],
-        ),
+        )?
+        .map(|selected| CheckpointRecoveryObservation {
+            provider_peer_id: provider_peer_id.to_owned(),
+            selected,
+            observations,
+        })),
         None => Ok(None),
     }
 }
@@ -4115,6 +4146,92 @@ mod tests {
         }
     }
 
+    fn install_legacy_recovery_observation_poison(data_dir: &std::path::Path, subject_seed: &Seed) {
+        #[derive(serde::Serialize)]
+        struct StoredHash {
+            sequence: u64,
+            hash: [u8; 32],
+        }
+
+        #[derive(serde::Serialize)]
+        struct StoredRecord {
+            sequence: u64,
+            hash: [u8; 32],
+            expires_at_unix_seconds: u64,
+            bytes: Vec<u8>,
+        }
+
+        #[derive(serde::Serialize)]
+        struct StoredState {
+            format_version: u16,
+            highest_sequence: u64,
+            hashes: Vec<StoredHash>,
+            current: StoredRecord,
+        }
+
+        std::fs::create_dir_all(data_dir).unwrap();
+        let subject_keys = KeyMaterial::from_seed(subject_seed);
+        let subject = subject_keys.node_id();
+        let control =
+            mb_store::ControlStore::open(data_dir.join("control.db"), &subject_keys).unwrap();
+        let now = unix_seconds();
+        for index in 0_u8..64 {
+            let mut fake_seed = [0xe7; 32];
+            fake_seed[0] = index;
+            fake_seed[31] = !index;
+            let publisher_keys = KeyMaterial::from_seed(&Seed::from_bytes(fake_seed));
+            let publisher = publisher_keys.node_id();
+            let provider = publisher.libp2p_peer_id().unwrap().to_string();
+            let expires_at_unix_seconds = if index < 32 {
+                now.saturating_sub(1)
+            } else {
+                now + 300
+            };
+            let bundle = SignedRecord::sign(
+                b"mutualbackup/recovery-bundle/v1",
+                mb_core::RecoveryBundle {
+                    format_version: 1,
+                    subject,
+                    publisher,
+                    sequence: 1,
+                    expires_at_unix_seconds,
+                    sealed: mb_core::SealedRecoveryRecord {
+                        format_version: 1,
+                        ephemeral_public_key: [index.wrapping_add(1); 32],
+                        nonce: [index.wrapping_add(1); 24],
+                        ciphertext: vec![index; 64],
+                    },
+                },
+                &publisher_keys,
+            )
+            .unwrap();
+            let bytes = canonical_bytes(&bundle).unwrap();
+            let hash = *blake3::hash(&bytes).as_bytes();
+            let state = StoredState {
+                format_version: 1,
+                highest_sequence: 1,
+                hashes: vec![StoredHash { sequence: 1, hash }],
+                current: StoredRecord {
+                    sequence: 1,
+                    hash,
+                    expires_at_unix_seconds,
+                    bytes,
+                },
+            };
+            let mut record_id = [0_u8; 64];
+            record_id[..32].copy_from_slice(&subject.0);
+            record_id[32..].copy_from_slice(blake3::hash(provider.as_bytes()).as_bytes());
+            control
+                .put_record(
+                    "dht-observed-recovery",
+                    &record_id,
+                    &canonical_bytes(&state).unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(control.records("dht-observed-recovery").unwrap().len(), 64);
+    }
+
     #[tokio::test]
     async fn abandoned_callers_cannot_exceed_the_outbound_request_bound() {
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([79; 32]));
@@ -4611,7 +4728,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_recovery_bundle_survives_empty_queries_and_restart() {
+    async fn uncertified_recovery_bundle_is_never_made_durable() {
         let temp = tempfile::tempdir().unwrap();
         let subject_seed = Seed::from_bytes([76; 32]);
         let subject = KeyMaterial::from_seed(&subject_seed).node_id();
@@ -4644,7 +4761,7 @@ mod tests {
         let node = Arc::new(Mutex::new(
             Node::open(temp.path(), subject_seed.clone()).unwrap(),
         ));
-        let selected = select_durable_recovery_bundle(
+        let selected = select_recovery_bundle_candidate(
             node.clone(),
             &provider,
             subject,
@@ -4653,25 +4770,33 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(selected.value.sequence, 2);
+        assert_eq!(selected.selected.value.sequence, 2);
+        assert_eq!(selected.observations.len(), 2);
+        assert!(
+            node.lock()
+                .unwrap()
+                .observed_recovery_records(subject)
+                .unwrap()
+                .is_empty()
+        );
         drop(node);
 
         let reopened = Arc::new(Mutex::new(Node::open(temp.path(), subject_seed).unwrap()));
-        let selected =
-            select_durable_recovery_bundle(reopened.clone(), &provider, subject, Vec::new())
+        assert!(
+            select_recovery_bundle_candidate(reopened.clone(), &provider, subject, Vec::new())
                 .await
                 .unwrap()
-                .unwrap();
-        assert_eq!(selected.value.sequence, 2);
-        let retained = retained_recovery_bundles(reopened.clone(), subject)
-            .await
-            .unwrap();
-        assert_eq!(retained.len(), 1);
-        assert_eq!(retained[0].1.value.sequence, 2);
+                .is_none()
+        );
         assert!(
-            select_durable_recovery_bundle(reopened, &provider, subject, vec![make(1, 9)],)
-                .await
-                .is_err()
+            select_recovery_bundle_candidate(
+                reopened,
+                &provider,
+                subject,
+                vec![make(3, 3), make(3, 9)],
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -5449,6 +5574,7 @@ mod tests {
         std::fs::remove_dir_all(&lost_source).unwrap();
         let recovered_state = run_root.join("recovered-node-1");
         let restored = run_root.join("restored-node-1");
+        install_legacy_recovery_observation_poison(&recovered_state, &seeds[1]);
         let recovered_node = Node::open(&recovered_state, seeds[1].clone()).unwrap();
         let recovered_id = recovered_node.keys().node_id();
         let recovered_node = Arc::new(Mutex::new(recovered_node));
@@ -5501,6 +5627,27 @@ mod tests {
         recovery_client.shutdown().await.unwrap();
         recovery_task.await.unwrap().unwrap();
         drop(recovered_node);
+        let mut reopened_recovery = Node::open(&recovered_state, seeds[1].clone()).unwrap();
+        let retained = reopened_recovery
+            .observed_recovery_records(recovered_id)
+            .unwrap();
+        let allowed_provider_hashes = final_checkpoint
+            .checkpoint
+            .members
+            .iter()
+            .map(|member| {
+                let peer_id = member.node_id.libp2p_peer_id().unwrap().to_string();
+                *blake3::hash(peer_id.as_bytes()).as_bytes()
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(retained.len() >= 3);
+        assert!(retained.len() <= 4);
+        assert!(
+            retained
+                .iter()
+                .all(|(provider_hash, _)| allowed_provider_hashes.contains(provider_hash))
+        );
+        drop(reopened_recovery);
 
         for client in &clients {
             let _ = client.shutdown().await;

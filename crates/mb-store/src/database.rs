@@ -88,6 +88,34 @@ impl ControlStore {
         Ok(())
     }
 
+    pub fn reconcile_records(
+        &mut self,
+        kind: &str,
+        delete_record_ids: &[Vec<u8>],
+        replacements: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), DatabaseError> {
+        let transaction = self.connection.transaction()?;
+        {
+            let mut delete = transaction.prepare_cached(
+                "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
+            )?;
+            for record_id in delete_record_ids {
+                delete.execute(params![kind, record_id])?;
+            }
+        }
+        {
+            let mut replace = transaction.prepare_cached(
+                "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+            )?;
+            for (record_id, bytes) in replacements {
+                replace.execute(params![kind, record_id, bytes])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn get_record(
         &self,
         kind: &str,
