@@ -55,6 +55,8 @@ const MAX_LEARNED_ENDPOINT_PEERS: usize = 1_024;
 const MAX_ENDPOINTS_PER_PEER: usize = 8;
 const MAX_RECOVERY_ADDRESS_SCOPES: usize = 4;
 const MAX_RECOVERY_ADDRESS_PEERS: usize = 64;
+const MAX_RECOVERY_QUARANTINED_PEERS: usize =
+    MAX_RECOVERY_ADDRESS_SCOPES * MAX_RECOVERY_ADDRESS_PEERS;
 const MAX_RELAY_RESERVATIONS: usize = 5;
 const MAX_RELAY_CIRCUITS: usize = 8;
 const MAX_RELAY_CIRCUIT_BYTES: u64 = 8 * 1024 * 1024;
@@ -178,6 +180,7 @@ pub struct P2pEventLoop {
     persistent_addresses: HashMap<PeerId, BTreeSet<Multiaddr>>,
     learned_addresses: HashMap<PeerId, LearnedAddresses>,
     recovery_addresses: HashMap<Uuid, RecoveryAddresses>,
+    recovery_quarantine: HashMap<PeerId, tokio::time::Instant>,
     learned_endpoint_expiry: tokio::time::Interval,
     connection_paths: HashMap<ConnectionId, (PeerId, P2pPath)>,
     last_application_paths: HashMap<PeerId, P2pPath>,
@@ -557,6 +560,7 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
             persistent_addresses,
             learned_addresses: HashMap::new(),
             recovery_addresses: HashMap::new(),
+            recovery_quarantine: HashMap::new(),
             learned_endpoint_expiry: retry_interval(LEARNED_ENDPOINT_EXPIRY_INTERVAL),
             connection_paths: HashMap::new(),
             last_application_paths: HashMap::new(),
@@ -1192,7 +1196,7 @@ impl P2pEventLoop {
                 _ = self.relay_retirement_tick.tick(), if !self.relay_retirement.is_empty() => {
                     self.retire_idle_relay_connections();
                 }
-                _ = self.learned_endpoint_expiry.tick(), if !self.learned_addresses.is_empty() || !self.recovery_addresses.is_empty() => {
+                _ = self.learned_endpoint_expiry.tick(), if !self.learned_addresses.is_empty() || !self.recovery_addresses.is_empty() || !self.recovery_quarantine.is_empty() => {
                     self.expire_learned_addresses();
                     self.expire_recovery_addresses();
                 }
@@ -1401,7 +1405,10 @@ impl P2pEventLoop {
             })
             .collect::<Vec<_>>();
         if scopes.is_empty() {
-            return Ok(());
+            if self.recovery_quarantine.contains_key(&peer) {
+                return Ok(());
+            }
+            return self.add_learned_address(peer, address);
         }
         for scope_id in &scopes {
             let addresses = self
@@ -1464,7 +1471,17 @@ impl P2pEventLoop {
                 .saturating_sub(now_unix)
                 .min(DHT_TTL.as_secs()),
         );
-        scope.expires_at = scope.expires_at.min(tokio::time::Instant::now() + lifetime);
+        let expires_at = tokio::time::Instant::now() + lifetime;
+        if !self.recovery_quarantine.contains_key(&peer)
+            && self.recovery_quarantine.len() >= MAX_RECOVERY_QUARANTINED_PEERS
+        {
+            bail!("too many quarantined recovery peers");
+        }
+        self.recovery_quarantine
+            .entry(peer)
+            .and_modify(|current| *current = (*current).max(expires_at))
+            .or_insert(expires_at);
+        scope.expires_at = scope.expires_at.min(expires_at);
         let peer_addresses = scope.addresses.entry(peer).or_default();
         for address in addresses {
             let address = normalize_known_address(peer, address)?;
@@ -1506,6 +1523,8 @@ impl P2pEventLoop {
         for scope in expired {
             self.clear_recovery_addresses(scope);
         }
+        self.recovery_quarantine
+            .retain(|_, expires_at| *expires_at > now);
     }
 
     fn address_retained_outside_learned(&self, peer: PeerId, address: &Multiaddr) -> bool {
@@ -4539,7 +4558,10 @@ mod tests {
         assert!(!event_loop.learned_addresses.contains_key(&peer));
         assert!(event_loop.recovery_addresses[&scope].addresses[&peer].contains(&identified));
         event_loop.clear_recovery_addresses(scope);
+        event_loop.add_identified_address(peer, identified).unwrap();
         assert!(!event_loop.recovery_addresses.contains_key(&scope));
+        assert!(event_loop.recovery_quarantine.contains_key(&peer));
+        assert!(!event_loop.learned_addresses.contains_key(&peer));
         assert!(!event_loop.retains_transfer_history(peer));
     }
 
