@@ -67,6 +67,8 @@ pub enum AnchorError {
     UnsafePath,
     #[error("an unrecognized or unsafe source-anchor area already exists: {0}")]
     AnchorAreaCollision(PathBuf),
+    #[error("owned directory is missing, replaced, mounted, or unsafe to remove: {0}")]
+    UnsafeOwnedDirectory(PathBuf),
     #[error("the in-process anchor-area index is unavailable")]
     AnchorAreaIndexUnavailable,
     #[error("source changed while it was being captured: {0}")]
@@ -282,6 +284,66 @@ impl AnchorManifest {
 }
 
 pub struct ReflinkAnchor;
+
+#[cfg(target_os = "linux")]
+pub fn directory_identity(path: impl AsRef<Path>) -> Result<NativeFileId, AnchorError> {
+    let directory = open_source_root(path.as_ref())?;
+    let metadata = directory.metadata()?;
+    Ok(native_file_id(
+        filesystem_identity_for_file(&directory)?.stable_id,
+        &metadata,
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn directory_identity(_path: impl AsRef<Path>) -> Result<NativeFileId, AnchorError> {
+    Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "safe directory identity is currently implemented only on Linux",
+    )))
+}
+
+#[cfg(target_os = "linux")]
+pub fn remove_owned_directory_tree(
+    path: impl AsRef<Path>,
+    expected: NativeFileId,
+) -> Result<(), AnchorError> {
+    let path = path.as_ref();
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let relative = path
+        .file_name()
+        .map(Path::new)
+        .ok_or(AnchorError::UnsafePath)?;
+    if relative.components().count() != 1 {
+        return Err(AnchorError::UnsafePath);
+    }
+    let parent_file = open_source_root(parent)?;
+    remove_directory_at_expected(&parent_file, relative, path, Some(expected)).map_err(
+        |error| {
+            if let AnchorError::AnchorAreaCollision(path) = error {
+                AnchorError::UnsafeOwnedDirectory(path)
+            } else {
+                error
+            }
+        },
+    )?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn remove_owned_directory_tree(
+    _path: impl AsRef<Path>,
+    _expected: NativeFileId,
+) -> Result<(), AnchorError> {
+    Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "safe directory cleanup is currently implemented only on Linux",
+    )))
+}
 
 impl ReflinkAnchor {
     pub fn capture(source_root: impl AsRef<Path>) -> Result<StableAnchorManifest, AnchorError> {
@@ -626,12 +688,27 @@ fn stable_filesystem_id(file: &File, filesystem_type: u32) -> Result<u64, Anchor
             )));
         }
     };
+    let subvolume = if filesystem_type == BTRFS_SUPER_MAGIC {
+        Some(btrfs_subvolume_tree_id(file)?)
+    } else {
+        None
+    };
+    derive_stable_filesystem_id(filesystem_type, uuid_len, &uuid, subvolume)
+}
+
+#[cfg(target_os = "linux")]
+fn derive_stable_filesystem_id(
+    filesystem_type: u32,
+    uuid_len: u8,
+    uuid: &[u8; 16],
+    subvolume: Option<u64>,
+) -> Result<u64, AnchorError> {
     let mut hasher = blake3::Hasher::new_derive_key("mutualbackup stable filesystem identity v1");
     hasher.update(&filesystem_type.to_le_bytes());
     hasher.update(&[uuid_len]);
     hasher.update(&uuid[..usize::from(uuid_len)]);
-    if filesystem_type == BTRFS_SUPER_MAGIC {
-        hasher.update(&btrfs_subvolume_tree_id(file)?.to_le_bytes());
+    if let Some(subvolume) = subvolume {
+        hasher.update(&subvolume.to_le_bytes());
     }
     let mut encoded = [0_u8; 8];
     encoded.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
@@ -646,7 +723,7 @@ fn stable_filesystem_id(file: &File, filesystem_type: u32) -> Result<u64, Anchor
 }
 
 #[cfg(target_os = "linux")]
-fn stable_filesystem_id_for_file(file: &File) -> Result<u64, AnchorError> {
+fn filesystem_type_for_file(file: &File) -> Result<u32, AnchorError> {
     use std::os::fd::AsRawFd;
 
     let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
@@ -655,7 +732,40 @@ fn stable_filesystem_id_for_file(file: &File) -> Result<u64, AnchorError> {
         return Err(std::io::Error::last_os_error().into());
     }
     let filesystem = unsafe { filesystem.assume_init() };
-    stable_filesystem_id(file, filesystem.f_type as u32)
+    Ok(filesystem.f_type as u32)
+}
+
+#[cfg(target_os = "linux")]
+fn stable_filesystem_id_for_file(file: &File) -> Result<u64, AnchorError> {
+    stable_filesystem_id(file, filesystem_type_for_file(file)?)
+}
+
+#[cfg(target_os = "linux")]
+fn stable_filesystem_id_for_pinned_path(
+    pinned: &File,
+    readable_parent: &File,
+) -> Result<u64, AnchorError> {
+    use std::os::unix::fs::MetadataExt;
+
+    const BTRFS_SUPER_MAGIC: u32 = 0x9123_683e;
+    const BTRFS_FIRST_FREE_OBJECT_ID: u64 = 256;
+
+    let filesystem_type = filesystem_type_for_file(pinned)?;
+    if filesystem_type != filesystem_type_for_file(readable_parent)? {
+        return Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "pinned path is on a different filesystem",
+        )));
+    }
+    if filesystem_type == BTRFS_SUPER_MAGIC
+        && pinned.metadata()?.ino() == BTRFS_FIRST_FREE_OBJECT_ID
+    {
+        return Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "refuse to treat a Btrfs subvolume root as an owned directory",
+        )));
+    }
+    stable_filesystem_id_for_file(readable_parent)
 }
 
 #[cfg(target_os = "linux")]
@@ -1637,6 +1747,16 @@ fn validate_area_marker_file(
 #[cfg(target_os = "linux")]
 fn remove_directory_at(parent: &File, name: &str, display: &Path) -> Result<(), AnchorError> {
     let relative = Path::new(name);
+    remove_directory_at_expected(parent, relative, display, None)
+}
+
+#[cfg(target_os = "linux")]
+fn remove_directory_at_expected(
+    parent: &File,
+    relative: &Path,
+    display: &Path,
+    expected: Option<NativeFileId>,
+) -> Result<(), AnchorError> {
     if relative.components().count() != 1 {
         return Err(AnchorError::UnsafePath);
     }
@@ -1645,12 +1765,22 @@ fn remove_directory_at(parent: &File, name: &str, display: &Path) -> Result<(), 
         Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
         Err(_) => return Err(AnchorError::AnchorAreaCollision(display.to_path_buf())),
     };
-    if !handle.metadata()?.is_dir() {
+    let metadata = handle.metadata()?;
+    if !metadata.is_dir() {
         return Err(AnchorError::AnchorAreaCollision(display.to_path_buf()));
     }
+    let stable_filesystem_id = stable_filesystem_id_for_pinned_path(&handle, parent)
+        .map_err(|_| AnchorError::AnchorAreaCollision(display.to_path_buf()))?;
+    if let Some(expected) = expected {
+        let actual = native_file_id(stable_filesystem_id, &metadata);
+        if actual != expected {
+            return Err(AnchorError::AnchorAreaCollision(display.to_path_buf()));
+        }
+    }
+    make_pinned_directory_private(&handle)?;
     let directory = reopen_pinned_file(&handle, true, relative)?;
     let mut remaining = MAX_CAPTURE_ENTRIES + 1;
-    remove_directory_contents(&directory, display, 0, &mut remaining)?;
+    remove_directory_contents(&directory, display, 0, &mut remaining, stable_filesystem_id)?;
     unlink_pinned_name(parent, relative, &handle, true, display)
 }
 
@@ -1660,6 +1790,7 @@ fn remove_directory_contents(
     display: &Path,
     depth: usize,
     remaining: &mut usize,
+    expected_filesystem_id: u64,
 ) -> Result<(), AnchorError> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -1683,15 +1814,39 @@ fn remove_directory_contents(
                 Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
                 Err(_) => return Err(AnchorError::AnchorAreaCollision(child_display)),
             };
+            let child_filesystem_id = stable_filesystem_id_for_pinned_path(&handle, directory)
+                .map_err(|_| AnchorError::AnchorAreaCollision(child_display.clone()))?;
+            if child_filesystem_id != expected_filesystem_id {
+                return Err(AnchorError::AnchorAreaCollision(child_display));
+            }
             if handle.metadata()?.is_dir() {
+                make_pinned_directory_private(&handle)?;
                 let child = reopen_pinned_file(&handle, true, relative)?;
-                remove_directory_contents(&child, &child_display, depth + 1, remaining)?;
+                remove_directory_contents(
+                    &child,
+                    &child_display,
+                    depth + 1,
+                    remaining,
+                    expected_filesystem_id,
+                )?;
                 unlink_pinned_name(directory, relative, &handle, true, &child_display)?;
             } else {
                 unlink_pinned_name(directory, relative, &handle, false, &child_display)?;
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn make_pinned_directory_private(directory: &File) -> Result<(), AnchorError> {
+    use std::os::fd::AsRawFd;
+
+    let path = CString::new(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+        .expect("a numeric proc descriptor path has no NUL");
+    if unsafe { libc::chmod(path.as_ptr(), 0o700) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2620,6 +2775,86 @@ mod tests {
         assert!(removal.is_err());
         assert_eq!(fs::read(&sentinel).unwrap(), b"external bytes");
         manifest.remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_tree_cleanup_enforces_entry_budget_in_batches() {
+        let parent = tempfile::tempdir().unwrap();
+        let owned = parent.path().join("owned");
+        fs::create_dir(&owned).unwrap();
+        for index in 0..=(MAX_CAPTURE_ENTRIES + 1) {
+            fs::write(owned.join(format!("entry-{index:05}")), b"").unwrap();
+        }
+        let identity = directory_identity(&owned).unwrap();
+
+        assert!(remove_owned_directory_tree(&owned, identity).is_err());
+        assert!(owned.is_dir());
+        fs::remove_dir_all(&owned).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn owned_tree_cleanup_refuses_child_mounts_and_handles_read_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("owned-cleanup-{}", Uuid::new_v4()));
+        let owned = run_root.join("owned");
+        let nested = owned.join("nested");
+        let external = run_root.join("external");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir(&external).unwrap();
+        fs::write(nested.join("payload"), b"owned payload").unwrap();
+        let sentinel = external.join("must-survive");
+        fs::write(&sentinel, b"external bytes").unwrap();
+        let identity = directory_identity(&owned).unwrap();
+
+        bind_mount(&external, &nested);
+        assert!(remove_owned_directory_tree(&owned, identity).is_err());
+        unmount(&nested);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"external bytes");
+
+        fs::remove_file(nested.join("payload")).unwrap();
+        fs::remove_dir(&nested).unwrap();
+        let output = Command::new("btrfs")
+            .args(["subvolume", "create"])
+            .arg(&nested)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cannot create cleanup-test subvolume: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::write(nested.join("must-survive"), b"subvolume bytes").unwrap();
+        assert!(remove_owned_directory_tree(&owned, identity).is_err());
+        assert_eq!(
+            fs::read(nested.join("must-survive")).unwrap(),
+            b"subvolume bytes"
+        );
+        let output = Command::new("btrfs")
+            .args(["subvolume", "delete"])
+            .arg(&nested)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cannot delete cleanup-test subvolume: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::create_dir(&nested).unwrap();
+
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(&owned, fs::Permissions::from_mode(0o000)).unwrap();
+        remove_owned_directory_tree(&owned, identity).unwrap();
+        assert!(!owned.exists());
         fs::remove_dir_all(run_root).unwrap();
     }
 

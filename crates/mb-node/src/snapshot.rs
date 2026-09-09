@@ -11,15 +11,23 @@ use mb_core::{
 };
 use mb_store::{
     AnchorFileLocator, CapturedEntry, ControlStore, FileExtent, NativeFileId, ReflinkAnchor,
-    ReflinkCapturePlan, StableAnchorFileLocator, filesystem_identity,
+    ReflinkCapturePlan, StableAnchorFileLocator, directory_identity, remove_owned_directory_tree,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 type RecordWrite = (String, Vec<u8>, Vec<u8>);
 const ANCHOR_AREA_LOCATION_KIND: &str = "anchor-area-location";
+const RECOVERY_ANCHOR_INTENT_KIND: &str = "recovery-anchor-intent";
+const ANCHOR_RETIREMENT_KIND: &str = "anchor-retirement";
 const MAX_METADATA_SECTORS: usize = V1_MAX_CATALOG_BYTES.div_ceil(V1_SECTOR_SIZE);
 const MAX_DATA_SECTORS: usize = V1_MAX_CODING_GROUPS - MAX_METADATA_SECTORS;
+
+#[cfg(test)]
+thread_local! {
+    static INTERRUPT_RECOVERY_ANCHOR_AFTER_CAPTURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PrivateEntry {
@@ -183,6 +191,16 @@ struct CaptureIntent {
     plan: ReflinkCapturePlan,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct RecoveryAnchorIntent {
+    format_version: u16,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    source_root: PathBuf,
+    plan: ReflinkCapturePlan,
+    replaced_anchor: Option<mb_store::StableAnchorManifest>,
+}
+
 pub(crate) fn reconcile_pending_captures(control: &ControlStore) -> Result<()> {
     for (record_id, bytes) in control.records("capture-intent")? {
         let intent: CaptureIntent = decode_canonical(&bytes)?;
@@ -192,6 +210,51 @@ pub(crate) fn reconcile_pending_captures(control: &ControlStore) -> Result<()> {
         // An offline source volume must not prevent unrelated guilds from
         // starting. The exact plan remains durable for a later explicit retry.
         let _ = ReflinkAnchor::reconcile_capture(&intent.plan);
+    }
+    for (record_id, bytes) in control.records(RECOVERY_ANCHOR_INTENT_KIND)? {
+        let intent: RecoveryAnchorIntent = decode_canonical(&bytes)?;
+        if intent.format_version != 1 || record_id.as_slice() != intent.revision_id.as_bytes() {
+            bail!("pending recovered-anchor capture is inconsistent");
+        }
+        let _ = ReflinkAnchor::reconcile_capture(&intent.plan);
+    }
+    reconcile_anchor_retirements(control)?;
+    Ok(())
+}
+
+fn reconcile_anchor_retirements(control: &ControlStore) -> Result<()> {
+    for (record_id, bytes) in control.records(ANCHOR_RETIREMENT_KIND)? {
+        let manifest: mb_store::StableAnchorManifest = decode_canonical(&bytes)?;
+        if record_id.as_slice() != manifest.anchor_id.as_bytes() {
+            bail!("durable anchor retirement is inconsistent");
+        }
+        if manifest.remove().is_ok() {
+            let _ = control.delete_record(ANCHOR_RETIREMENT_KIND, &record_id)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn abandon_recovered_anchor_capture(
+    control: &ControlStore,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+) -> Result<()> {
+    let Some(bytes) = control.get_record(RECOVERY_ANCHOR_INTENT_KIND, revision_id.as_bytes())?
+    else {
+        return Ok(());
+    };
+    let intent: RecoveryAnchorIntent = decode_canonical(&bytes)?;
+    if intent.format_version != 1
+        || intent.guild_id != guild_id
+        || intent.revision_id != revision_id
+    {
+        bail!("pending recovered-anchor capture conflicts with the recovery job");
+    }
+    ReflinkAnchor::discard_capture(&intent.plan)
+        .context("discard recovered-anchor capture whose restored source was lost")?;
+    if !control.delete_record(RECOVERY_ANCHOR_INTENT_KIND, revision_id.as_bytes())? {
+        bail!("pending recovered-anchor capture disappeared");
     }
     Ok(())
 }
@@ -717,6 +780,7 @@ pub(crate) fn reanchor_recovered_revision(
     if revision.value.data_sectors.is_empty() {
         return Ok(());
     }
+    reconcile_anchor_retirements(control)?;
     let metadata = load_private_metadata(control, keys, guild_id, revision)?;
     let existing = control.get_record("anchor-manifest", revision.value.revision_id.as_bytes())?;
     let old_manifest = existing
@@ -725,22 +789,99 @@ pub(crate) fn reanchor_recovered_revision(
     if let Some(manifest) = old_manifest.as_ref()
         && let Ok(records) = recovered_anchor_records(keys, guild_id, revision, &metadata, manifest)
     {
+        if let Some(bytes) = control.get_record(
+            RECOVERY_ANCHOR_INTENT_KIND,
+            revision.value.revision_id.as_bytes(),
+        )? {
+            let intent: RecoveryAnchorIntent = decode_canonical(&bytes)?;
+            if intent.format_version != 1
+                || intent.guild_id != guild_id
+                || intent.revision_id != revision.value.revision_id
+            {
+                bail!("pending recovered-anchor capture conflicts with the revision");
+            }
+            ReflinkAnchor::discard_capture(&intent.plan)
+                .context("discard redundant recovered-anchor capture")?;
+            if !control.delete_record(
+                RECOVERY_ANCHOR_INTENT_KIND,
+                revision.value.revision_id.as_bytes(),
+            )? {
+                bail!("pending recovered-anchor capture disappeared");
+            }
+        }
         control.put_records(&records)?;
         return Ok(());
     }
+
+    let canonical_source = restored_root
+        .canonicalize()
+        .context("resolve recovered source before anchoring")?;
+    let (intent, intent_bytes) = match control.get_record(
+        RECOVERY_ANCHOR_INTENT_KIND,
+        revision.value.revision_id.as_bytes(),
+    )? {
+        Some(bytes) => {
+            let intent: RecoveryAnchorIntent = decode_canonical(&bytes)?;
+            if intent.format_version != 1
+                || intent.guild_id != guild_id
+                || intent.revision_id != revision.value.revision_id
+                || intent.source_root != canonical_source
+                || intent.replaced_anchor != old_manifest
+            {
+                bail!("pending recovered-anchor capture conflicts with the revision");
+            }
+            (intent, bytes)
+        }
+        None => {
+            let plan =
+                ReflinkAnchor::plan(&canonical_source).context("plan recovered source anchor")?;
+            let intent = RecoveryAnchorIntent {
+                format_version: 1,
+                guild_id,
+                revision_id: revision.value.revision_id,
+                source_root: canonical_source,
+                plan,
+                replaced_anchor: old_manifest.clone(),
+            };
+            let bytes = canonical_bytes(&intent)?;
+            control.put_record(
+                RECOVERY_ANCHOR_INTENT_KIND,
+                revision.value.revision_id.as_bytes(),
+                &bytes,
+            )?;
+            (intent, bytes)
+        }
+    };
     let mut anchor = PendingAnchor {
-        manifest: ReflinkAnchor::capture(restored_root)
+        manifest: ReflinkAnchor::capture_plan(&intent.plan)
             .context("capture recovered source anchor")?,
         committed: false,
     };
-    let records = recovered_anchor_records(keys, guild_id, revision, &metadata, &anchor.manifest)?;
-    control.put_records(&records)?;
-    anchor.commit();
-    if let Some(old) = old_manifest
+    #[cfg(test)]
+    if INTERRUPT_RECOVERY_ANCHOR_AFTER_CAPTURE.with(|interrupt| interrupt.replace(false)) {
+        anchor.commit();
+        bail!("injected interruption after recovered-anchor capture");
+    }
+    let mut records =
+        recovered_anchor_records(keys, guild_id, revision, &metadata, &anchor.manifest)?;
+    if let Some(old) = intent.replaced_anchor.as_ref()
         && old.anchor_id != anchor.manifest.anchor_id
     {
-        let _ = old.remove();
+        records.push((
+            ANCHOR_RETIREMENT_KIND.to_owned(),
+            old.anchor_id.as_bytes().to_vec(),
+            canonical_bytes(old)?,
+        ));
     }
+    // The durable intent now owns this completed anchor. Keep it for an exact
+    // retry if the following SQL transaction fails or the process stops.
+    anchor.commit();
+    control.finalize_recovery_anchor_records(
+        revision.value.revision_id.as_bytes(),
+        &intent_bytes,
+        &records,
+    )?;
+    reconcile_anchor_retirements(control)?;
     Ok(())
 }
 
@@ -1387,6 +1528,7 @@ where
     let metadata = decode_private_metadata(&metadata_bytes)?;
 
     create_private_dir(staging)?;
+    let staging_identity = native_directory_id(staging)?;
     let result = restore_entries(
         staging,
         &metadata,
@@ -1395,7 +1537,13 @@ where
         apply_root_metadata,
     );
     if let Err(error) = result {
-        let _ = fs::remove_dir_all(staging);
+        if let Err(cleanup_error) = remove_owned_restore_directory(staging, staging_identity) {
+            return Err(error).with_context(|| {
+                format!(
+                    "restore failed and its owned staging directory could not be removed safely: {cleanup_error}"
+                )
+            });
+        }
         return Err(error);
     }
     sync_tree_bottom_up(staging)?;
@@ -1433,6 +1581,88 @@ pub(crate) fn install_recovery_marker(
     file.write_all(marker)?;
     file.sync_all()?;
     sync_directory(root)?;
+    Ok(())
+}
+
+pub(crate) fn create_owned_restore_staging(
+    parent: &Path,
+    staging: &Path,
+    marker_name: &str,
+    marker: &[u8; 32],
+) -> Result<()> {
+    if staging.parent() != Some(parent) {
+        bail!("restore staging directory is outside its expected parent");
+    }
+    match fs::symlink_metadata(staging) {
+        Ok(_) => {
+            verify_owned_restore_initializer(staging, marker_name, marker)?;
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let prefix = recovery_initializer_prefix(staging)?;
+    let mut initialized = None;
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path();
+        if verify_owned_restore_initializer(&path, marker_name, marker).is_ok()
+            && initialized.replace(path).is_some()
+        {
+            bail!("multiple owned restore initializers exist");
+        }
+    }
+
+    let initialized = match initialized {
+        Some(path) => path,
+        None => {
+            let path = parent.join(format!("{prefix}{}", Uuid::new_v4()));
+            fs::create_dir(&path)?;
+            make_restore_root_private(&path)?;
+            install_recovery_marker(&path, marker_name, marker)?;
+            path
+        }
+    };
+    rename_no_replace(&initialized, staging)?;
+    sync_directory(parent)?;
+    verify_owned_restore_initializer(staging, marker_name, marker)
+}
+
+pub(crate) fn remove_owned_restore_initializers(
+    parent: &Path,
+    staging: &Path,
+    marker_name: &str,
+    marker: &[u8; 32],
+) -> Result<()> {
+    let prefix = recovery_initializer_prefix(staging)?;
+    let mut initialized = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path();
+        if verify_owned_restore_initializer(&path, marker_name, marker).is_ok() {
+            initialized.push(path);
+            if initialized.len() > 1 {
+                bail!("multiple owned restore initializers exist");
+            }
+        }
+    }
+    for path in initialized {
+        let identity = native_directory_id(&path)?;
+        remove_owned_restore_directory(&path, identity)?;
+    }
     Ok(())
 }
 
@@ -1481,6 +1711,29 @@ fn recovery_marker_path(root: &Path, marker_name: &str) -> Result<PathBuf> {
     Ok(root.join(relative))
 }
 
+fn recovery_initializer_prefix(staging: &Path) -> Result<String> {
+    let name = staging
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("restore staging path has no portable file name")?;
+    if !name.starts_with(".mutualbackup-restore-") {
+        bail!("restore staging path has an invalid name");
+    }
+    Ok(format!(".{name}.initializing-"))
+}
+
+fn verify_owned_restore_initializer(
+    path: &Path,
+    marker_name: &str,
+    marker: &[u8; 32],
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("restore initializer is not a safe directory");
+    }
+    verify_recovery_marker(path, marker_name, marker)
+}
+
 #[cfg(unix)]
 fn open_file_no_follow(path: &Path) -> Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -1497,12 +1750,19 @@ fn open_file_no_follow(path: &Path) -> Result<File> {
 
 #[cfg(unix)]
 pub(crate) fn native_directory_id(path: &Path) -> Result<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        bail!("restore object is not a directory");
-    }
-    Ok((filesystem_identity(path)?.stable_id, metadata.ino()))
+    let identity = directory_identity(path)?;
+    Ok((identity.filesystem_id, identity.inode))
+}
+
+pub(crate) fn remove_owned_restore_directory(path: &Path, expected: (u64, u64)) -> Result<()> {
+    remove_owned_directory_tree(
+        path,
+        NativeFileId {
+            filesystem_id: expected.0,
+            inode: expected.1,
+        },
+    )
+    .with_context(|| format!("refuse unsafe restore cleanup at {}", path.display()))
 }
 
 #[cfg(unix)]
@@ -1854,6 +2114,35 @@ mod metadata_compatibility_tests {
     use super::*;
 
     #[cfg(target_os = "linux")]
+    fn bind_mount_for_recovery_test(source: &Path, target: &Path) {
+        let output = std::process::Command::new("sudo")
+            .args(["-n", "mount", "--bind"])
+            .arg(source)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cannot create recovery-test bind mount: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unmount_for_recovery_test(target: &Path) {
+        let output = std::process::Command::new("sudo")
+            .args(["-n", "umount"])
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cannot remove recovery-test bind mount: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn rejected_capture_can_be_repaired_and_replanned() {
@@ -1898,6 +2187,175 @@ mod metadata_compatibility_tests {
         )
         .unwrap();
         manifest.remove().unwrap();
+        drop(control);
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn marked_restore_initializer_resumes_without_trusting_unmarked_siblings() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let staging = parent.path().join(format!(
+            ".mutualbackup-restore-{}",
+            Uuid::from_bytes([44; 16])
+        ));
+        let marker_name = format!(
+            ".mutualbackup-recovery-ownership-{}",
+            Uuid::from_bytes([45; 16])
+        );
+        let marker = [46; 32];
+        let prefix = recovery_initializer_prefix(&staging).unwrap();
+        let unmarked = parent.path().join(format!("{prefix}untrusted"));
+        fs::create_dir(&unmarked).unwrap();
+
+        create_owned_restore_staging(parent.path(), &staging, &marker_name, &marker).unwrap();
+        verify_recovery_marker(&staging, &marker_name, &marker).unwrap();
+        assert!(unmarked.is_dir());
+        let identity = native_directory_id(&staging).unwrap();
+        remove_owned_restore_directory(&staging, identity).unwrap();
+
+        let external = parent.path().join("external");
+        fs::create_dir(&external).unwrap();
+        install_recovery_marker(&external, &marker_name, &marker).unwrap();
+        symlink(&external, &staging).unwrap();
+        assert!(
+            create_owned_restore_staging(parent.path(), &staging, &marker_name, &marker).is_err()
+        );
+        fs::remove_file(&staging).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn recovered_anchor_resumes_after_capture_before_database_commit() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("reanchor-resume-{}", Uuid::new_v4()));
+        let source = run_root.join("source");
+        let restored = run_root.join("restored");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("payload"), b"recovered anchor payload").unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([47; 32]));
+        let mut control = ControlStore::open(run_root.join("control.db"), &keys).unwrap();
+        let guild_id = [48; 32];
+        let revision = prepare_revision(&mut control, &keys, guild_id, &source, 1, None).unwrap();
+        restore_revision_from_source(&keys, guild_id, &revision, &restored, |sector_id| {
+            render_sector(&control, &keys, sector_id, Some(&guild_id))
+        })
+        .unwrap();
+        let old: mb_store::StableAnchorManifest = decode_canonical(
+            &control
+                .get_record("anchor-manifest", revision.value.revision_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        old.remove().unwrap();
+
+        INTERRUPT_RECOVERY_ANCHOR_AFTER_CAPTURE.with(|interrupt| interrupt.set(true));
+        assert!(
+            reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &restored)
+                .is_err()
+        );
+        assert!(
+            control
+                .get_record(
+                    RECOVERY_ANCHOR_INTENT_KIND,
+                    revision.value.revision_id.as_bytes(),
+                )
+                .unwrap()
+                .is_some()
+        );
+
+        reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &restored).unwrap();
+        assert!(
+            control
+                .get_record(
+                    RECOVERY_ANCHOR_INTENT_KIND,
+                    revision.value.revision_id.as_bytes(),
+                )
+                .unwrap()
+                .is_none()
+        );
+        let current: mb_store::StableAnchorManifest = decode_canonical(
+            &control
+                .get_record("anchor-manifest", revision.value.revision_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(current.anchor_id, old.anchor_id);
+        assert!(control.records(ANCHOR_RETIREMENT_KIND).unwrap().is_empty());
+        let mut payload = String::new();
+        current
+            .file_locator("payload".to_owned())
+            .unwrap()
+            .open()
+            .unwrap()
+            .read_to_string(&mut payload)
+            .unwrap();
+        assert_eq!(payload, "recovered anchor payload");
+
+        current.remove().unwrap();
+        drop(control);
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn failed_old_anchor_removal_remains_a_durable_retirement() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("reanchor-retire-{}", Uuid::new_v4()));
+        let source = run_root.join("source");
+        let restored = run_root.join("restored");
+        let external = run_root.join("external");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir(&external).unwrap();
+        fs::write(source.join("payload"), b"retirement payload").unwrap();
+        let sentinel = external.join("must-survive");
+        fs::write(&sentinel, b"external bytes").unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([49; 32]));
+        let mut control = ControlStore::open(run_root.join("control.db"), &keys).unwrap();
+        let guild_id = [50; 32];
+        let revision = prepare_revision(&mut control, &keys, guild_id, &source, 1, None).unwrap();
+        restore_revision_from_source(&keys, guild_id, &revision, &restored, |sector_id| {
+            render_sector(&control, &keys, sector_id, Some(&guild_id))
+        })
+        .unwrap();
+        let old: mb_store::StableAnchorManifest = decode_canonical(
+            &control
+                .get_record("anchor-manifest", revision.value.revision_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let old_root = old.area.path_hint.join(old.anchor_id.to_string());
+        bind_mount_for_recovery_test(&external, &old_root);
+
+        reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &restored).unwrap();
+        assert_eq!(control.records(ANCHOR_RETIREMENT_KIND).unwrap().len(), 1);
+        unmount_for_recovery_test(&old_root);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"external bytes");
+
+        reconcile_pending_captures(&control).unwrap();
+        assert!(control.records(ANCHOR_RETIREMENT_KIND).unwrap().is_empty());
+        assert!(!old_root.exists());
+        let current: mb_store::StableAnchorManifest = decode_canonical(
+            &control
+                .get_record("anchor-manifest", revision.value.revision_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        current.remove().unwrap();
         drop(control);
         fs::remove_dir_all(run_root).unwrap();
     }

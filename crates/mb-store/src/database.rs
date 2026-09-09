@@ -189,6 +189,34 @@ impl ControlStore {
         Ok(())
     }
 
+    pub fn finalize_recovery_anchor_records(
+        &mut self,
+        revision_id: &[u8; 16],
+        expected_intent: &[u8],
+        records: &[(String, Vec<u8>, Vec<u8>)],
+    ) -> Result<(), DatabaseError> {
+        let transaction = self.connection.transaction()?;
+        {
+            let mut statement = transaction.prepare_cached(
+                "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+            )?;
+            for (kind, record_id, bytes) in records {
+                statement.execute(params![kind, record_id, bytes])?;
+            }
+        }
+        let removed = transaction.execute(
+            "DELETE FROM protocol_records
+             WHERE kind = 'recovery-anchor-intent' AND record_id = ?1 AND bytes = ?2",
+            params![revision_id.as_slice(), expected_intent],
+        )?;
+        if removed != 1 {
+            return Err(DatabaseError::Conflict);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn put_operation_result(
         &mut self,
         operation_id: &[u8; 16],
@@ -1984,6 +2012,68 @@ mod tests {
                 .get_record("user-revision", b"other")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn recovered_anchor_finalization_is_compare_and_atomic() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([32; 32]));
+        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let revision_id = [33; 16];
+        store
+            .put_record("recovery-anchor-intent", &revision_id, b"current")
+            .unwrap();
+
+        assert!(matches!(
+            store.finalize_recovery_anchor_records(
+                &revision_id,
+                b"stale",
+                &[(
+                    "anchor-manifest".to_owned(),
+                    revision_id.to_vec(),
+                    b"not-committed".to_vec(),
+                )],
+            ),
+            Err(DatabaseError::Conflict)
+        ));
+        assert!(
+            store
+                .get_record("anchor-manifest", &revision_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_record("recovery-anchor-intent", &revision_id)
+                .unwrap()
+                .unwrap(),
+            b"current"
+        );
+
+        store
+            .finalize_recovery_anchor_records(
+                &revision_id,
+                b"current",
+                &[(
+                    "anchor-manifest".to_owned(),
+                    revision_id.to_vec(),
+                    b"committed".to_vec(),
+                )],
+            )
+            .unwrap();
+        assert!(
+            store
+                .get_record("recovery-anchor-intent", &revision_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_record("anchor-manifest", &revision_id)
+                .unwrap()
+                .unwrap(),
+            b"committed"
         );
     }
 

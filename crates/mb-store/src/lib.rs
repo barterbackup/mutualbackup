@@ -10,7 +10,8 @@ mod database;
 pub use anchor::{
     AnchorAreaLocator, AnchorError, AnchorFileLocator, AnchorManifest, CapturedEntry, FileExtent,
     FilesystemIdentity, NativeFileId, ReflinkAnchor, ReflinkCapturePlan, StableAnchorAreaLocator,
-    StableAnchorFileLocator, StableAnchorManifest, filesystem_identity, probe_reflink,
+    StableAnchorFileLocator, StableAnchorManifest, directory_identity, filesystem_identity,
+    probe_reflink, remove_owned_directory_tree,
 };
 pub use database::{
     CheckpointRow, ControlStore, DatabaseError, ParityObject, ParityStore, ProtocolRecordRow,
