@@ -11,7 +11,7 @@ use mb_core::{
 };
 use mb_store::{
     AnchorFileLocator, CapturedEntry, ControlStore, FileExtent, NativeFileId, ReflinkAnchor,
-    ReflinkCapturePlan, StableAnchorFileLocator,
+    ReflinkCapturePlan, StableAnchorFileLocator, filesystem_identity,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -1487,11 +1487,26 @@ pub(crate) fn native_directory_id(path: &Path) -> Result<(u64, u64)> {
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         bail!("restore object is not a directory");
     }
+    Ok((filesystem_identity(path)?.stable_id, metadata.ino()))
+}
+
+#[cfg(unix)]
+pub(crate) fn legacy_native_directory_id(path: &Path) -> Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("restore object is not a directory");
+    }
     Ok((metadata.dev(), metadata.ino()))
 }
 
 #[cfg(not(unix))]
 pub(crate) fn native_directory_id(_path: &Path) -> Result<(u64, u64)> {
+    bail!("native restore identity is not implemented on this platform")
+}
+
+#[cfg(not(unix))]
+pub(crate) fn legacy_native_directory_id(_path: &Path) -> Result<(u64, u64)> {
     bail!("native restore identity is not implemented on this platform")
 }
 

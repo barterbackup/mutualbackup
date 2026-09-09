@@ -67,6 +67,10 @@ pub enum AnchorError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FilesystemIdentity {
+    /// A domain-separated digest of the filesystem's external UUID and, on
+    /// Btrfs, its subvolume tree ID. Unlike `device` and `mount_id`, this
+    /// remains stable when the same filesystem is remounted.
+    pub stable_id: u64,
     pub device: u64,
     pub mount_id: u64,
 }
@@ -99,7 +103,7 @@ pub enum CapturedEntry {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct NativeFileId {
-    pub device: u64,
+    pub filesystem_id: u64,
     pub inode: u64,
 }
 
@@ -126,7 +130,7 @@ pub struct AnchorFileLocator {
 pub struct StableAnchorAreaLocator {
     pub area_id: Uuid,
     pub path_hint: PathBuf,
-    pub volume_device: u64,
+    pub filesystem_id: u64,
     pub volume_root_hint: PathBuf,
 }
 
@@ -157,7 +161,7 @@ impl ReflinkCapturePlan {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct CaptureVersion {
-    device: u64,
+    filesystem_id: u64,
     inode: u64,
     logical_len: u64,
     modified_secs: i64,
@@ -288,13 +292,14 @@ impl ReflinkAnchor {
         probe_reflink(&source_root)?;
 
         let area = ensure_anchor_area(&source_root, &root_metadata)?;
+        let filesystem = filesystem_identity(&source_root)?;
         let (root_modified_secs, root_modified_nanos) = modified_parts(&root_metadata);
         Ok(ReflinkCapturePlan {
             format_version: 1,
             anchor_id: Uuid::new_v4(),
             source_root,
             area,
-            root_version: capture_version(&root_metadata),
+            root_version: capture_version(filesystem.stable_id, &root_metadata),
             root_mode: unix_mode(&root_metadata),
             root_modified_secs,
             root_modified_nanos,
@@ -327,13 +332,26 @@ impl ReflinkAnchor {
         }
         let root_file = open_source_root(&source_root)?;
         let root_metadata = root_file.metadata()?;
-        if !root_metadata.is_dir() || capture_version(&root_metadata) != plan.root_version {
+        let filesystem = filesystem_identity(&source_root)?;
+        if !root_metadata.is_dir()
+            || filesystem.stable_id != plan.area.filesystem_id
+            || capture_version(filesystem.stable_id, &root_metadata) != plan.root_version
+        {
             return Err(AnchorError::SourceChanged(PathBuf::new()));
+        }
+        if filesystem_identity(&plan.area.path_hint)? != filesystem {
+            return Err(AnchorError::FilesystemChanged);
         }
         create_private_dir_new(&staging)?;
 
         let capture_result = (|| {
-            let entries = capture_entries(&source_root, &root_file, &root_metadata, &staging)?;
+            let entries = capture_entries(
+                &source_root,
+                &root_file,
+                &root_metadata,
+                filesystem.stable_id,
+                &staging,
+            )?;
             let manifest = StableAnchorManifest {
                 format_version: 2,
                 anchor_id: plan.anchor_id,
@@ -411,6 +429,186 @@ impl ReflinkAnchor {
 }
 
 #[cfg(target_os = "linux")]
+const fn read_ioctl<T>(kind: u8, number: u8) -> libc::c_ulong {
+    const IOC_NRSHIFT: u32 = 0;
+    const IOC_TYPESHIFT: u32 = 8;
+    const IOC_SIZESHIFT: u32 = 16;
+    const IOC_DIRSHIFT: u32 = 30;
+    const IOC_READ: u32 = 2;
+    ((IOC_READ << IOC_DIRSHIFT)
+        | ((kind as u32) << IOC_TYPESHIFT)
+        | ((number as u32) << IOC_NRSHIFT)
+        | ((std::mem::size_of::<T>() as u32) << IOC_SIZESHIFT)) as libc::c_ulong
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn ioctl_read<T>(file: &File, kind: u8, number: u8, value: *mut T) -> libc::c_long {
+    use std::os::fd::AsRawFd;
+
+    // `libc::ioctl` exposes a target-libc-specific request type (`c_ulong` on
+    // glibc, `c_int` on musl). The Linux syscall ABI accepts the same unsigned
+    // 32-bit encoded request on both, so keep this small UAPI shim portable.
+    unsafe {
+        libc::syscall(
+            libc::SYS_ioctl,
+            file.as_raw_fd(),
+            read_ioctl::<T>(kind, number),
+            value,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct FsUuid {
+    len: u8,
+    uuid: [u8; 16],
+}
+#[cfg(target_os = "linux")]
+const _: () = assert!(std::mem::size_of::<FsUuid>() == 17);
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct BtrfsFsInfo {
+    max_id: u64,
+    num_devices: u64,
+    fsid: [u8; 16],
+    nodesize: u32,
+    sectorsize: u32,
+    clone_alignment: u32,
+    csum_type: u16,
+    csum_size: u16,
+    flags: u64,
+    generation: u64,
+    metadata_uuid: [u8; 16],
+    reserved: [u8; 944],
+}
+#[cfg(target_os = "linux")]
+const _: () = assert!(std::mem::size_of::<BtrfsFsInfo>() == 1024);
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct BtrfsTimespec {
+    sec: u64,
+    nsec: u32,
+    padding: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct BtrfsSubvolumeInfo {
+    tree_id: u64,
+    name: [u8; 256],
+    parent_id: u64,
+    dir_id: u64,
+    generation: u64,
+    flags: u64,
+    uuid: [u8; 16],
+    parent_uuid: [u8; 16],
+    received_uuid: [u8; 16],
+    creation_transaction_id: u64,
+    origin_transaction_id: u64,
+    sent_transaction_id: u64,
+    received_transaction_id: u64,
+    creation_time: BtrfsTimespec,
+    origin_time: BtrfsTimespec,
+    sent_time: BtrfsTimespec,
+    received_time: BtrfsTimespec,
+    reserved: [u64; 8],
+}
+#[cfg(target_os = "linux")]
+const _: () = assert!(std::mem::size_of::<BtrfsSubvolumeInfo>() == 504);
+
+#[cfg(target_os = "linux")]
+fn ioctl_external_filesystem_uuid(file: &File) -> Result<Option<(u8, [u8; 16])>, AnchorError> {
+    let mut uuid = std::mem::MaybeUninit::<FsUuid>::zeroed();
+    let result = unsafe { ioctl_read(file, 0x15, 0, uuid.as_mut_ptr()) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ENOTTY) | Some(libc::EOPNOTSUPP)
+        ) {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    let uuid = unsafe { uuid.assume_init() };
+    if uuid.len == 0 || usize::from(uuid.len) > uuid.uuid.len() {
+        return Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "filesystem returned an invalid external UUID",
+        )));
+    }
+    Ok(Some((uuid.len, uuid.uuid)))
+}
+
+#[cfg(target_os = "linux")]
+fn btrfs_filesystem_uuid(file: &File) -> Result<[u8; 16], AnchorError> {
+    let mut info = std::mem::MaybeUninit::<BtrfsFsInfo>::zeroed();
+    let result = unsafe { ioctl_read(file, 0x94, 31, info.as_mut_ptr()) };
+    if result != 0 {
+        return Err(AnchorError::ReflinkUnavailable(
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(unsafe { info.assume_init() }.fsid)
+}
+
+#[cfg(target_os = "linux")]
+fn btrfs_subvolume_tree_id(file: &File) -> Result<u64, AnchorError> {
+    let mut info = std::mem::MaybeUninit::<BtrfsSubvolumeInfo>::zeroed();
+    let result = unsafe { ioctl_read(file, 0x94, 60, info.as_mut_ptr()) };
+    if result != 0 {
+        return Err(AnchorError::ReflinkUnavailable(
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let tree_id = unsafe { info.assume_init() }.tree_id;
+    if tree_id == 0 {
+        return Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Btrfs returned an invalid subvolume tree ID",
+        )));
+    }
+    Ok(tree_id)
+}
+
+#[cfg(target_os = "linux")]
+fn stable_filesystem_id(file: &File, filesystem_type: i64) -> Result<u64, AnchorError> {
+    const BTRFS_SUPER_MAGIC: i64 = 0x9123_683e;
+
+    let external = ioctl_external_filesystem_uuid(file)?;
+    let (uuid_len, uuid) = match external {
+        Some(uuid) => uuid,
+        None if filesystem_type == BTRFS_SUPER_MAGIC => (16, btrfs_filesystem_uuid(file)?),
+        None => {
+            return Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "filesystem does not expose a remount-stable external UUID",
+            )));
+        }
+    };
+    let mut hasher = blake3::Hasher::new_derive_key("mutualbackup stable filesystem identity v1");
+    hasher.update(&filesystem_type.to_le_bytes());
+    hasher.update(&[uuid_len]);
+    hasher.update(&uuid[..usize::from(uuid_len)]);
+    if filesystem_type == BTRFS_SUPER_MAGIC {
+        hasher.update(&btrfs_subvolume_tree_id(file)?.to_le_bytes());
+    }
+    let mut encoded = [0_u8; 8];
+    encoded.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    let stable_id = u64::from_le_bytes(encoded);
+    if stable_id == 0 {
+        return Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "derived filesystem identity is invalid",
+        )));
+    }
+    Ok(stable_id)
+}
+
+#[cfg(target_os = "linux")]
 pub fn filesystem_identity(path: impl AsRef<Path>) -> Result<FilesystemIdentity, AnchorError> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
@@ -461,7 +659,16 @@ pub fn filesystem_identity(path: impl AsRef<Path>) -> Result<FilesystemIdentity,
             .try_into()
             .expect("fixed statx mount-ID range"),
     );
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    let result = unsafe { libc::statfs(encoded.as_ptr(), filesystem.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let filesystem = unsafe { filesystem.assume_init() };
+    let file = File::open(path)?;
+    let stable_id = stable_filesystem_id(&file, filesystem.f_type as i64)?;
     Ok(FilesystemIdentity {
+        stable_id,
         device: fs::metadata(path)?.dev(),
         mount_id,
     })
@@ -602,6 +809,7 @@ fn capture_entries(
     source_root: &Path,
     root_file: &File,
     root_metadata: &fs::Metadata,
+    filesystem_id: u64,
     staging: &Path,
 ) -> Result<Vec<CapturedEntry>, AnchorError> {
     let mut entries = Vec::new();
@@ -653,7 +861,7 @@ fn capture_entries(
             if let Some(parent) = destination.parent() {
                 create_private_dir(parent)?;
             }
-            let native_id = native_file_id(&before);
+            let native_id = native_file_id(filesystem_id, &before);
             if let Some(first_destination) = captured_links.get(&native_id) {
                 fs::hard_link(first_destination, &destination)?;
             } else {
@@ -714,10 +922,10 @@ fn ensure_anchor_area(
     let parent = source_root
         .parent()
         .ok_or(AnchorError::NoExternalAnchorLocation)?;
-    let (volume_device, volume_root_hint) = volume_root(source_root, root_metadata)?;
+    let (filesystem_id, volume_root_hint) = volume_root(source_root)?;
     let area_path = parent.join(format!(
         "{AREA_PREFIX}-{}",
-        source_identity_name(root_metadata)
+        source_identity_name(filesystem_id, root_metadata)
     ));
     match fs::create_dir(&area_path) {
         Ok(()) => {
@@ -737,7 +945,7 @@ fn ensure_anchor_area(
             Ok(StableAnchorAreaLocator {
                 area_id,
                 path_hint: area_path,
-                volume_device,
+                filesystem_id,
                 volume_root_hint,
             })
         }
@@ -747,7 +955,7 @@ fn ensure_anchor_area(
             let locator = StableAnchorAreaLocator {
                 area_id,
                 path_hint: area_path,
-                volume_device,
+                filesystem_id,
                 volume_root_hint,
             };
             validate_stable_anchor_area(&locator.path_hint, locator.area_id)?;
@@ -757,30 +965,21 @@ fn ensure_anchor_area(
     }
 }
 
-#[cfg(unix)]
-fn volume_root(
-    source_root: &Path,
-    root_metadata: &fs::Metadata,
-) -> Result<(u64, PathBuf), AnchorError> {
-    use std::os::unix::fs::MetadataExt;
-
-    let device = root_metadata.dev();
+#[cfg(target_os = "linux")]
+fn volume_root(source_root: &Path) -> Result<(u64, PathBuf), AnchorError> {
+    let identity = filesystem_identity(source_root)?;
     let mut current = source_root.to_path_buf();
     while let Some(parent) = current.parent() {
-        let metadata = fs::symlink_metadata(parent)?;
-        if metadata.dev() != device {
+        if filesystem_identity(parent)?.mount_id != identity.mount_id {
             break;
         }
         current = parent.to_path_buf();
     }
-    Ok((device, current))
+    Ok((identity.stable_id, current))
 }
 
-#[cfg(not(unix))]
-fn volume_root(
-    _source_root: &Path,
-    _root_metadata: &fs::Metadata,
-) -> Result<(u64, PathBuf), AnchorError> {
+#[cfg(not(target_os = "linux"))]
+fn volume_root(_source_root: &Path) -> Result<(u64, PathBuf), AnchorError> {
     Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "stable volume discovery is currently implemented only on Unix",
@@ -892,7 +1091,9 @@ fn discover_anchor_area(area: &StableAnchorAreaLocator) -> Result<PathBuf, Ancho
             if validate_stable_anchor_area(entry.path(), area.area_id).is_err() {
                 continue;
             }
-            let identity = native_file_id(&entry.metadata()?);
+            let metadata = entry.metadata()?;
+            let filesystem_id = filesystem_identity(entry.path())?.stable_id;
+            let identity = native_file_id(filesystem_id, &metadata);
             matches
                 .entry(identity)
                 .or_insert_with(|| entry.path().to_path_buf());
@@ -917,13 +1118,11 @@ fn anchor_discovery_roots(area: &StableAnchorAreaLocator) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::fs::MetadataExt;
-
         let mut seen = BTreeSet::new();
         for root in std::iter::once(area.volume_root_hint.clone()).chain(linux_data_mount_points())
         {
-            if !fs::symlink_metadata(&root)
-                .is_ok_and(|metadata| metadata.dev() == area.volume_device)
+            if !filesystem_identity(&root)
+                .is_ok_and(|identity| identity.stable_id == area.filesystem_id)
             {
                 continue;
             }
@@ -1094,10 +1293,10 @@ fn capture_manifest_name(anchor_id: Uuid) -> String {
 }
 
 #[cfg(unix)]
-fn capture_version(metadata: &fs::Metadata) -> CaptureVersion {
+fn capture_version(filesystem_id: u64, metadata: &fs::Metadata) -> CaptureVersion {
     use std::os::unix::fs::MetadataExt;
     CaptureVersion {
-        device: metadata.dev(),
+        filesystem_id,
         inode: metadata.ino(),
         logical_len: metadata.len(),
         modified_secs: metadata.mtime(),
@@ -1108,10 +1307,10 @@ fn capture_version(metadata: &fs::Metadata) -> CaptureVersion {
 }
 
 #[cfg(not(unix))]
-fn capture_version(metadata: &fs::Metadata) -> CaptureVersion {
+fn capture_version(_filesystem_id: u64, metadata: &fs::Metadata) -> CaptureVersion {
     let (modified_secs, modified_nanos) = modified_parts(metadata);
     CaptureVersion {
-        device: 0,
+        filesystem_id: 0,
         inode: 0,
         logical_len: metadata.len(),
         modified_secs,
@@ -1122,18 +1321,18 @@ fn capture_version(metadata: &fs::Metadata) -> CaptureVersion {
 }
 
 #[cfg(unix)]
-fn native_file_id(metadata: &fs::Metadata) -> NativeFileId {
+fn native_file_id(filesystem_id: u64, metadata: &fs::Metadata) -> NativeFileId {
     use std::os::unix::fs::MetadataExt;
     NativeFileId {
-        device: metadata.dev(),
+        filesystem_id,
         inode: metadata.ino(),
     }
 }
 
 #[cfg(not(unix))]
-fn native_file_id(_metadata: &fs::Metadata) -> NativeFileId {
+fn native_file_id(_filesystem_id: u64, _metadata: &fs::Metadata) -> NativeFileId {
     NativeFileId {
-        device: 0,
+        filesystem_id: 0,
         inode: 0,
     }
 }
@@ -1382,13 +1581,13 @@ fn same_capture_version(before: &fs::Metadata, after: &fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
-fn source_identity_name(metadata: &fs::Metadata) -> String {
+fn source_identity_name(filesystem_id: u64, metadata: &fs::Metadata) -> String {
     use std::os::unix::fs::MetadataExt;
-    format!("{:x}-{:x}", metadata.dev(), metadata.ino())
+    format!("{filesystem_id:x}-{:x}", metadata.ino())
 }
 
 #[cfg(not(unix))]
-fn source_identity_name(metadata: &fs::Metadata) -> String {
+fn source_identity_name(_filesystem_id: u64, metadata: &fs::Metadata) -> String {
     format!("{:x}", metadata.len())
 }
 
@@ -1544,6 +1743,7 @@ mod tests {
         let parent = filesystem_identity(temp.path()).unwrap();
         let child = filesystem_identity(&child).unwrap();
         assert_eq!(parent, child);
+        assert_ne!(parent.stable_id, 0);
         assert_ne!(parent.device, 0);
         assert_ne!(parent.mount_id, 0);
     }
@@ -1594,6 +1794,90 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires an externally remounted test filesystem and identity record"]
+    fn filesystem_identity_survives_external_remount() {
+        let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT");
+        let record = std::env::var_os("MUTUALBACKUP_FILESYSTEM_ID_RECORD")
+            .expect("the remount harness must set MUTUALBACKUP_FILESYSTEM_ID_RECORD");
+        let identity = filesystem_identity(PathBuf::from(test_root)).unwrap();
+        let expected = format!("{:016x}\n", identity.stable_id);
+        match fs::read_to_string(&record) {
+            Ok(recorded) => assert_eq!(recorded, expected),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(record)
+                    .unwrap();
+                file.write_all(expected.as_bytes()).unwrap();
+                file.sync_all().unwrap();
+            }
+            Err(error) => panic!("cannot read filesystem identity record: {error}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an externally remounted reflink filesystem"]
+    fn moved_anchor_discovery_survives_external_remount() {
+        #[derive(Serialize, Deserialize)]
+        struct RemountState {
+            root: PathBuf,
+            moved_parent: PathBuf,
+            locator: StableAnchorFileLocator,
+        }
+
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let record = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_ANCHOR_REMOUNT_RECORD")
+                .expect("the remount harness must set MUTUALBACKUP_ANCHOR_REMOUNT_RECORD"),
+        );
+        match fs::read(&record) {
+            Ok(bytes) => {
+                let state: RemountState = decode_canonical(&bytes).unwrap();
+                let (mut file, resolved_area) = state.locator.open_with_area_hint(None).unwrap();
+                let mut payload = String::new();
+                file.read_to_string(&mut payload).unwrap();
+                assert_eq!(payload, "stable anchor across remount");
+                assert!(resolved_area.starts_with(&state.moved_parent));
+                fs::remove_dir_all(&state.root).unwrap();
+                fs::remove_file(record).unwrap();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let root = test_root.join("anchor-remount-discovery");
+                let original_parent = root.join("original");
+                let moved_parent = root.join("moved");
+                let source = original_parent.join("source");
+                fs::create_dir_all(&source).unwrap();
+                fs::write(source.join("payload"), b"stable anchor across remount").unwrap();
+                let manifest = ReflinkAnchor::capture(&source).unwrap();
+                let locator = manifest.file_locator("payload".to_owned()).unwrap();
+                fs::rename(&original_parent, &moved_parent).unwrap();
+                sync_directory(&root).unwrap();
+                let bytes = canonical_bytes(&RemountState {
+                    root,
+                    moved_parent,
+                    locator,
+                })
+                .unwrap();
+                let mut file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(record)
+                    .unwrap();
+                file.write_all(&bytes).unwrap();
+                file.sync_all().unwrap();
+            }
+            Err(error) => panic!("cannot read anchor remount record: {error}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn mountinfo_paths_are_decoded_without_a_shell() {
         assert_eq!(
             decode_mount_path("/media/a\\040b\\134c").unwrap(),
@@ -1604,21 +1888,19 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn anchor_discovery_never_scans_another_filesystem() {
-        use std::os::unix::fs::MetadataExt;
-
         let temp = tempfile::tempdir().unwrap();
-        let device = fs::symlink_metadata(temp.path()).unwrap().dev();
+        let filesystem_id = filesystem_identity(temp.path()).unwrap().stable_id;
         let area = StableAnchorAreaLocator {
             area_id: Uuid::new_v4(),
             path_hint: temp.path().join("missing-area"),
-            volume_device: device,
+            filesystem_id,
             volume_root_hint: temp.path().to_path_buf(),
         };
         let roots = anchor_discovery_roots(&area);
         assert!(roots.contains(&temp.path().to_path_buf()));
         assert!(roots.iter().all(|root| {
-            fs::symlink_metadata(root)
-                .map(|metadata| metadata.dev() == device)
+            filesystem_identity(root)
+                .map(|identity| identity.stable_id == filesystem_id)
                 .unwrap_or(false)
         }));
     }
@@ -1638,7 +1920,7 @@ mod tests {
             area: StableAnchorAreaLocator {
                 area_id,
                 path_hint: temp.path().join("stale-area"),
-                volume_device: u64::MAX,
+                filesystem_id: u64::MAX,
                 volume_root_hint: temp.path().join("stale-volume"),
             },
             anchor_id,

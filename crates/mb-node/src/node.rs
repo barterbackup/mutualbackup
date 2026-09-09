@@ -22,10 +22,10 @@ use uuid::Uuid;
 use crate::control::{NodeStatus, ProtectedRoot};
 use crate::snapshot::{
     build_revision_restore, install_inline_recipe, install_recovered_sector_recipe,
-    install_recovery_marker, make_restore_root_private, native_directory_id, prepare_revision,
-    publish_restore, reanchor_recovered_revision, reconcile_pending_captures,
-    remove_recovery_marker, render_sector, restore_revision_from_source,
-    restore_signed_root_metadata, verify_recovery_marker,
+    install_recovery_marker, legacy_native_directory_id, make_restore_root_private,
+    native_directory_id, prepare_revision, publish_restore, reanchor_recovered_revision,
+    reconcile_pending_captures, remove_recovery_marker, render_sector,
+    restore_revision_from_source, restore_signed_root_metadata, verify_recovery_marker,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -395,12 +395,13 @@ impl Node {
             .get_record("node-config", b"protected-root")?
             .map(|bytes| decode_canonical::<ProtectedRoot>(&bytes).map_err(anyhow::Error::from))
             .transpose()?;
-        if let Some(root) = &root
-            && (root.format_version != 2
-                || root.filesystem_device == 0
-                || root.filesystem_mount_id == 0)
-        {
-            anyhow::bail!("invalid protected-root record");
+        if let Some(root) = &root {
+            if !matches!(root.format_version, 2 | 3)
+                || root.filesystem_id == 0
+                || root.root_inode == 0
+            {
+                anyhow::bail!("invalid protected-root record");
+            }
         }
         Ok(root)
     }
@@ -416,14 +417,23 @@ impl Node {
             anyhow::bail!("protected root and daemon data directory must not overlap");
         }
         let filesystem = filesystem_identity(&source_root)?;
+        let root_metadata = fs::symlink_metadata(&source_root)?;
+        #[cfg(unix)]
+        let root_inode = {
+            use std::os::unix::fs::MetadataExt;
+            root_metadata.ino()
+        };
+        #[cfg(not(unix))]
+        let root_inode = 0;
 
         let configured = self.protected_root()?;
         if let Some(configured) = &configured {
             if configured.path != source_root {
                 anyhow::bail!("the prototype supports exactly one protected root");
             }
-            if configured.filesystem_device == filesystem.device
-                && configured.filesystem_mount_id == filesystem.mount_id
+            if configured.format_version == 3
+                && configured.filesystem_id == filesystem.stable_id
+                && configured.root_inode == root_inode
             {
                 return Ok(configured.clone());
             }
@@ -431,13 +441,13 @@ impl Node {
 
         probe_reflink(&source_root).context("protected root failed the reflink COW probe")?;
         let root = ProtectedRoot {
-            format_version: 2,
+            format_version: 3,
             root_id: configured
                 .map(|configured| configured.root_id)
                 .unwrap_or_else(Uuid::new_v4),
             path: source_root,
-            filesystem_device: filesystem.device,
-            filesystem_mount_id: filesystem.mount_id,
+            filesystem_id: filesystem.stable_id,
+            root_inode,
         };
         self.control
             .put_record("node-config", b"protected-root", &canonical_bytes(&root)?)?;
@@ -987,10 +997,19 @@ impl Node {
             .protected_root()?
             .context("this node has no protected root")?;
         let current_filesystem = filesystem_identity(&root.path)?;
-        if current_filesystem.device != root.filesystem_device
-            || current_filesystem.mount_id != root.filesystem_mount_id
+        let root_metadata = fs::symlink_metadata(&root.path)?;
+        #[cfg(unix)]
+        let root_inode = {
+            use std::os::unix::fs::MetadataExt;
+            root_metadata.ino()
+        };
+        #[cfg(not(unix))]
+        let root_inode = 0;
+        if !root_metadata.is_dir()
+            || root_metadata.file_type().is_symlink()
+            || !root.matches_identity(current_filesystem, root_inode)
         {
-            anyhow::bail!("protected root filesystem identity changed");
+            anyhow::bail!("protected root identity changed");
         }
         let local_head = self
             .control
@@ -2390,7 +2409,7 @@ impl Node {
         let mut job = match existing {
             Some(bytes) => {
                 let mut job: RecoveryJob = decode_canonical(&bytes)?;
-                if !matches!(job.format_version, 2 | 3)
+                if !matches!(job.format_version, 2 | 3 | 4)
                     || job.guild_id != guild_id
                     || job.revision_id != revision.value.revision_id
                     || job.target != target
@@ -2402,7 +2421,29 @@ impl Node {
                     if job.state == RecoveryJobState::Complete {
                         job.state = RecoveryJobState::Published;
                     }
-                    job.format_version = 3;
+                }
+                if job.format_version < 4 {
+                    let owned_path = if target.exists() {
+                        Some(target)
+                    } else if job.staging.exists() {
+                        Some(job.staging.as_path())
+                    } else {
+                        None
+                    };
+                    if let (Some(expected), Some(owned_path)) = (job.staged_native_id, owned_path) {
+                        if legacy_native_directory_id(owned_path)? != expected {
+                            anyhow::bail!("legacy recovery object changed unexpectedly");
+                        }
+                        job.staged_native_id = Some(native_directory_id(owned_path)?);
+                    } else if owned_path.is_none() {
+                        job.staged_native_id = None;
+                    }
+                    job.format_version = 4;
+                    self.control.put_record(
+                        "recovery-job",
+                        checkpoint_hash,
+                        &canonical_bytes(&job)?,
+                    )?;
                 }
                 job
             }
@@ -2411,7 +2452,7 @@ impl Node {
                 let mut ownership_marker = [0_u8; 32];
                 rand::thread_rng().fill_bytes(&mut ownership_marker);
                 RecoveryJob {
-                    format_version: 3,
+                    format_version: 4,
                     guild_id,
                     revision_id: revision.value.revision_id,
                     target: target.to_path_buf(),
@@ -3137,7 +3178,7 @@ mod tests {
             revision_id,
             target: target.clone(),
             staging: temp.path().join("staging"),
-            staged_native_id: Some(native_directory_id(&target).unwrap()),
+            staged_native_id: Some(legacy_native_directory_id(&target).unwrap()),
             marker_name: marker_name.clone(),
             ownership_marker,
             state: RecoveryJobState::Ready,

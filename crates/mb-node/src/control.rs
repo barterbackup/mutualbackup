@@ -11,6 +11,7 @@ use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 use mb_core::{GuildInvite, NodeId, canonical_bytes};
 use mb_core::{QuorumGuildGenesis, SignedRecord, decode_canonical};
+use mb_store::FilesystemIdentity;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -36,8 +37,18 @@ pub struct ProtectedRoot {
     pub format_version: u16,
     pub root_id: Uuid,
     pub path: PathBuf,
-    pub filesystem_device: u64,
-    pub filesystem_mount_id: u64,
+    pub filesystem_id: u64,
+    pub root_inode: u64,
+}
+
+impl ProtectedRoot {
+    pub(crate) fn matches_identity(&self, filesystem: FilesystemIdentity, root_inode: u64) -> bool {
+        match self.format_version {
+            2 => filesystem.device == self.filesystem_id && filesystem.mount_id == self.root_inode,
+            3 => filesystem.stable_id == self.filesystem_id && root_inode == self.root_inode,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -642,5 +653,48 @@ mod tests {
             containing_directory(Path::new("control.sock")),
             Path::new(".")
         );
+    }
+
+    #[test]
+    fn durable_root_identity_ignores_remount_instance_numbers() {
+        let root = ProtectedRoot {
+            format_version: 3,
+            root_id: Uuid::new_v4(),
+            path: PathBuf::from("/protected"),
+            filesystem_id: 41,
+            root_inode: 43,
+        };
+        assert!(root.matches_identity(
+            FilesystemIdentity {
+                stable_id: 41,
+                device: 47,
+                mount_id: 53,
+            },
+            43,
+        ));
+        assert!(root.matches_identity(
+            FilesystemIdentity {
+                stable_id: 41,
+                device: 59,
+                mount_id: 61,
+            },
+            43,
+        ));
+        assert!(!root.matches_identity(
+            FilesystemIdentity {
+                stable_id: 67,
+                device: 59,
+                mount_id: 61,
+            },
+            43,
+        ));
+        assert!(!root.matches_identity(
+            FilesystemIdentity {
+                stable_id: 41,
+                device: 59,
+                mount_id: 61,
+            },
+            71,
+        ));
     }
 }

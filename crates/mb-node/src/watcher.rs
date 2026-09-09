@@ -133,10 +133,8 @@ fn watched_root_identity(root: &ProtectedRoot) -> Result<WatchedRootIdentity> {
         anyhow::bail!("protected root is not a safe directory");
     }
     let filesystem = filesystem_identity(&root.path)?;
-    if filesystem.device != root.filesystem_device
-        || filesystem.mount_id != root.filesystem_mount_id
-    {
-        anyhow::bail!("protected root filesystem identity changed");
+    if !root.matches_identity(filesystem, metadata.ino()) {
+        anyhow::bail!("protected root identity changed");
     }
     Ok(WatchedRootIdentity {
         device: metadata.dev(),
@@ -173,6 +171,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
 
     #[test]
     fn watcher_retry_is_bounded() {
@@ -191,16 +191,16 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         let filesystem = filesystem_identity(&path).unwrap();
         let root = ProtectedRoot {
-            format_version: 2,
+            format_version: 3,
             root_id: uuid::Uuid::new_v4(),
             path: path.clone(),
-            filesystem_device: filesystem.device,
-            filesystem_mount_id: filesystem.mount_id,
+            filesystem_id: filesystem.stable_id,
+            root_inode: std::fs::symlink_metadata(&path).unwrap().ino(),
         };
         let (_held_root, before) = open_watched_root(&root).unwrap();
         std::fs::remove_dir(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
-        let after = watched_root_identity(&root).unwrap();
-        assert_ne!(before, after);
+        assert!(watched_root_identity(&root).is_err());
+        assert_eq!(before.inode, root.root_inode);
     }
 }
