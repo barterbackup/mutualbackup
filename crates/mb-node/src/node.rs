@@ -50,6 +50,22 @@ struct RecoveryJob {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct RecoveryAttempt {
+    format_version: u16,
+    guild_id: [u8; 32],
+    checkpoint_hash: [u8; 32],
+    generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalRecoveryResume {
+    pub guild_id: [u8; 32],
+    pub checkpoint_hash: [u8; 32],
+    pub generation: u64,
+    pub revision_id: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct CoordinatorCommitJournal {
     format_version: u16,
     intent_id: [u8; 16],
@@ -2332,6 +2348,93 @@ impl Node {
         Ok(checkpoint_hash)
     }
 
+    pub(crate) fn resume_local_recovery(
+        &mut self,
+        target: &Path,
+    ) -> Result<Option<LocalRecoveryResume>> {
+        let Some(installed) = self.installed_guild()? else {
+            return Ok(None);
+        };
+        let guild_id = installed.certificate.genesis.guild_id;
+        let Some(checkpoint) = self.current_checkpoint(guild_id)? else {
+            return Ok(None);
+        };
+        checkpoint.verify()?;
+        self.validate_local_member(&checkpoint.checkpoint)?;
+        let checkpoint_hash = checkpoint.hash()?;
+        let revision = checkpoint
+            .checkpoint
+            .revisions
+            .iter()
+            .filter(|revision| revision.value.owner == self.keys.node_id())
+            .max_by_key(|revision| revision.value.sequence)
+            .cloned();
+        let revision_id = revision.as_ref().map(|revision| revision.value.revision_id);
+        if let Some(revision) = revision {
+            self.restore_recovered_revision(&checkpoint_hash, guild_id, &revision, target)?;
+        }
+        Ok(Some(LocalRecoveryResume {
+            guild_id,
+            checkpoint_hash,
+            generation: checkpoint.checkpoint.generation,
+            revision_id,
+        }))
+    }
+
+    pub(crate) fn pin_recovery_attempt(&mut self, checkpoint: &QuorumCheckpoint) -> Result<()> {
+        checkpoint.verify()?;
+        self.validate_local_member(&checkpoint.checkpoint)?;
+        let checkpoint_hash = checkpoint.hash()?;
+        for (record_id, bytes) in self.control.records("recovery-job")? {
+            if record_id.as_slice() == checkpoint_hash {
+                continue;
+            }
+            if record_id.len() != checkpoint_hash.len() {
+                anyhow::bail!("durable recovery job has an invalid checkpoint key");
+            }
+            let job: RecoveryJob = decode_canonical(&bytes)?;
+            self.remove_superseded_recovery_job(&job)?;
+        }
+        let attempt = RecoveryAttempt {
+            format_version: 1,
+            guild_id: checkpoint.checkpoint.guild_id,
+            checkpoint_hash,
+            generation: checkpoint.checkpoint.generation,
+        };
+        self.control
+            .pin_recovery_attempt(&checkpoint_hash, &canonical_bytes(&attempt)?)?;
+        Ok(())
+    }
+
+    fn remove_superseded_recovery_job(&mut self, job: &RecoveryJob) -> Result<()> {
+        if !matches!(job.format_version, 2 | 3 | 4 | 5) {
+            anyhow::bail!("unsupported durable recovery job version");
+        }
+        let parent = containing_directory(&job.target);
+        if job.staging.parent() != Some(parent)
+            || !job
+                .staging
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".mutualbackup-restore-"))
+        {
+            anyhow::bail!("durable recovery job contains an unsafe staging path");
+        }
+        if job.target.exists() && job.state != RecoveryJobState::Complete {
+            anyhow::bail!("superseded recovery still owns an unfinished published target");
+        }
+        if job.staging.exists() {
+            verify_recovery_job_staging(job, parent)?;
+            make_restore_root_private(&job.staging)?;
+            fs::remove_dir_all(&job.staging)?;
+            sync_directory(parent)?;
+        }
+        if job.format_version >= 5 {
+            remove_recovery_marker(parent, &job.marker_name, &job.ownership_marker)?;
+        }
+        Ok(())
+    }
+
     pub fn stage_recovered_shard(
         &mut self,
         checkpoint_hash: &[u8; 32],
@@ -2409,7 +2512,7 @@ impl Node {
         let mut job = match existing {
             Some(bytes) => {
                 let mut job: RecoveryJob = decode_canonical(&bytes)?;
-                if !matches!(job.format_version, 2 | 3 | 4)
+                if !matches!(job.format_version, 2 | 3 | 4 | 5)
                     || job.guild_id != guild_id
                     || job.revision_id != revision.value.revision_id
                     || job.target != target
@@ -2452,7 +2555,7 @@ impl Node {
                 let mut ownership_marker = [0_u8; 32];
                 rand::thread_rng().fill_bytes(&mut ownership_marker);
                 RecoveryJob {
-                    format_version: 4,
+                    format_version: 5,
                     guild_id,
                     revision_id: revision.value.revision_id,
                     target: target.to_path_buf(),
@@ -2484,7 +2587,7 @@ impl Node {
                     return Ok(());
                 }
                 RecoveryJobState::Ready => {
-                    verify_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
+                    verify_recovery_job_marker(&job, target, parent)?;
                     sync_directory(parent)?;
                     job.state = RecoveryJobState::Published;
                     self.control.put_record(
@@ -2510,7 +2613,7 @@ impl Node {
             if native_directory_id(&job.staging)? != expected {
                 anyhow::bail!("ready recovery staging directory changed unexpectedly");
             }
-            verify_recovery_marker(&job.staging, &job.marker_name, &job.ownership_marker)?;
+            verify_recovery_job_marker(&job, &job.staging, parent)?;
             publish_restore(&job.staging, target)?;
             job.state = RecoveryJobState::Published;
             self.control
@@ -2526,14 +2629,27 @@ impl Node {
         }
 
         if job.staging.exists() {
+            verify_recovery_job_staging(&job, parent)?;
             make_restore_root_private(&job.staging)?;
             fs::remove_dir_all(&job.staging)?;
             sync_directory(parent)?;
+        }
+        if job.format_version >= 5 {
+            remove_recovery_marker(parent, &job.marker_name, &job.ownership_marker)?;
         }
         job.state = RecoveryJobState::Building;
         job.staged_native_id = None;
         self.control
             .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
+        if job.format_version >= 5 {
+            install_recovery_marker(parent, &job.marker_name, &job.ownership_marker)?;
+            fs::create_dir(&job.staging)?;
+            make_restore_root_private(&job.staging)?;
+            sync_directory(parent)?;
+            job.staged_native_id = Some(native_directory_id(&job.staging)?);
+            self.control
+                .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
+        }
         build_revision_restore(
             &self.keys,
             guild_id,
@@ -2551,7 +2667,9 @@ impl Node {
             &job.staging,
         )?;
         make_restore_root_private(&job.staging)?;
-        install_recovery_marker(&job.staging, &job.marker_name, &job.ownership_marker)?;
+        if job.format_version < 5 {
+            install_recovery_marker(&job.staging, &job.marker_name, &job.ownership_marker)?;
+        }
         job.staged_native_id = Some(native_directory_id(&job.staging)?);
         job.state = RecoveryJobState::Ready;
         self.control
@@ -2571,7 +2689,12 @@ impl Node {
         target: &Path,
     ) -> Result<()> {
         make_restore_root_private(target)?;
-        remove_recovery_marker(target, &job.marker_name, &job.ownership_marker)?;
+        let marker_root = if job.format_version >= 5 {
+            containing_directory(target)
+        } else {
+            target
+        };
+        remove_recovery_marker(marker_root, &job.marker_name, &job.ownership_marker)?;
         if !revision.value.metadata_sectors.is_empty() {
             restore_signed_root_metadata(
                 &self.control,
@@ -2626,6 +2749,40 @@ fn containing_directory(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
+}
+
+fn verify_recovery_job_marker(job: &RecoveryJob, owned_path: &Path, parent: &Path) -> Result<()> {
+    let marker_root = if job.format_version >= 5 {
+        parent
+    } else {
+        owned_path
+    };
+    verify_recovery_marker(marker_root, &job.marker_name, &job.ownership_marker)
+}
+
+fn verify_recovery_job_staging(job: &RecoveryJob, parent: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(&job.staging)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        anyhow::bail!("recovery staging path is not a safe directory");
+    }
+    if let Some(expected) = job.staged_native_id {
+        let actual = if job.format_version >= 4 {
+            native_directory_id(&job.staging)?
+        } else {
+            legacy_native_directory_id(&job.staging)?
+        };
+        if actual != expected {
+            anyhow::bail!("recovery staging directory changed unexpectedly");
+        }
+    } else if job.format_version >= 5 {
+        // The external marker makes the short mkdir-to-ID-persist window
+        // recognizable without trusting an attacker-replaceable path alone.
+        verify_recovery_job_marker(job, &job.staging, parent)?;
+    }
+    if job.format_version >= 5 || job.state == RecoveryJobState::Ready {
+        verify_recovery_job_marker(job, &job.staging, parent)?;
+    }
+    Ok(())
 }
 
 fn authorize_member(control: &ControlStore, guild_id: &[u8; 32], caller: NodeId) -> Result<()> {
@@ -3241,5 +3398,41 @@ mod tests {
             .unwrap();
         let completed_again: RecoveryJob = decode_canonical(&bytes).unwrap();
         assert_eq!(completed_again.state, RecoveryJobState::Complete);
+    }
+
+    #[test]
+    fn superseded_recovery_removes_only_its_owned_hidden_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut node = Node::open(temp.path().join("node"), Seed::from_bytes([117; 32])).unwrap();
+        let target = temp.path().join("restored");
+        let staging = temp.path().join(format!(
+            ".mutualbackup-restore-{}",
+            Uuid::from_bytes([118; 16])
+        ));
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("partial"), b"partial restore").unwrap();
+        let marker_name = format!(
+            ".mutualbackup-recovery-ownership-{}",
+            Uuid::from_bytes([119; 16])
+        );
+        let ownership_marker = [120; 32];
+        install_recovery_marker(temp.path(), &marker_name, &ownership_marker).unwrap();
+        let job = RecoveryJob {
+            format_version: 5,
+            guild_id: [121; 32],
+            revision_id: Uuid::from_bytes([122; 16]),
+            target: target.clone(),
+            staging: staging.clone(),
+            staged_native_id: Some(native_directory_id(&staging).unwrap()),
+            marker_name: marker_name.clone(),
+            ownership_marker,
+            state: RecoveryJobState::Building,
+        };
+
+        node.remove_superseded_recovery_job(&job).unwrap();
+
+        assert!(!staging.exists());
+        assert!(!temp.path().join(marker_name).exists());
+        assert!(!target.exists());
     }
 }

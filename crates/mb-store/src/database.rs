@@ -356,6 +356,31 @@ impl ControlStore {
         Ok(())
     }
 
+    pub fn pin_recovery_attempt(
+        &mut self,
+        checkpoint_hash: &[u8; 32],
+        attempt: &[u8],
+    ) -> Result<(), DatabaseError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO protocol_records(kind, record_id, bytes)
+             VALUES ('recovery-attempt', ?1, ?2)
+             ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+            params![b"active".as_slice(), attempt],
+        )?;
+        transaction.execute(
+            "DELETE FROM recovery_shards WHERE checkpoint_hash <> ?1",
+            [checkpoint_hash.as_slice()],
+        )?;
+        transaction.execute(
+            "DELETE FROM protocol_records
+             WHERE kind = 'recovery-job' AND record_id <> ?1",
+            [checkpoint_hash.as_slice()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn stage_checkpoint_page(
         &mut self,
@@ -1607,6 +1632,69 @@ mod tests {
             store
                 .protocol_record_page("user-revision", b"revision", 2)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn pinning_recovery_attempt_atomically_bounds_durable_work() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([61; 32]));
+        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let old_checkpoint = [62; 32];
+        let active_checkpoint = [63; 32];
+        let guild_id = [64; 32];
+        let old_bytes = vec![65; V1_SECTOR_SIZE];
+        let active_bytes = vec![66; V1_SECTOR_SIZE];
+        let old_root = sector_root(&old_bytes);
+        let active_root = sector_root(&active_bytes);
+        store
+            .stage_recovery_shard(
+                &old_checkpoint,
+                &guild_id,
+                &[67; 32],
+                0,
+                &old_root,
+                &old_bytes,
+            )
+            .unwrap();
+        store
+            .stage_recovery_shard(
+                &active_checkpoint,
+                &guild_id,
+                &[68; 32],
+                0,
+                &active_root,
+                &active_bytes,
+            )
+            .unwrap();
+        store
+            .put_record("recovery-job", &old_checkpoint, b"old-job")
+            .unwrap();
+        store
+            .put_record("recovery-job", &active_checkpoint, b"active-job")
+            .unwrap();
+
+        store
+            .pin_recovery_attempt(&active_checkpoint, b"active-attempt")
+            .unwrap();
+
+        assert!(matches!(
+            store.recovery_shard(&old_checkpoint, &guild_id, &[67; 32], 0, &old_root),
+            Err(DatabaseError::NotReady)
+        ));
+        assert_eq!(
+            store
+                .recovery_shard(&active_checkpoint, &guild_id, &[68; 32], 0, &active_root,)
+                .unwrap(),
+            active_bytes
+        );
+        assert_eq!(store.records("recovery-job").unwrap().len(), 1);
+        assert_eq!(
+            store
+                .get_record("recovery-attempt", b"active")
+                .unwrap()
+                .unwrap(),
+            b"active-attempt"
         );
     }
 

@@ -14,7 +14,7 @@ use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder, autonat, dcutr, identify, kad, noise, ping, relay,
     request_response, yamux,
 };
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use mb_core::{
     CodingGroup, GuildCheckpoint, GuildGenesis, GuildInvite, InformationRole, Member,
@@ -142,6 +142,7 @@ pub struct DhtRecord {
 pub struct P2pClient {
     local_peer_id: PeerId,
     commands: mpsc::Sender<Command>,
+    outbound_permits: Arc<Semaphore>,
 }
 
 pub struct P2pEventLoop {
@@ -220,6 +221,7 @@ enum Command {
         recipient: NodeId,
         request: Box<PeerRequest>,
         response: oneshot::Sender<Result<PeerResponse>>,
+        permit: OwnedSemaphorePermit,
     },
     Status {
         response: oneshot::Sender<P2pStatus>,
@@ -252,6 +254,7 @@ struct PendingRequest {
     request_hash: [u8; 32],
     request_bytes: u64,
     response: oneshot::Sender<Result<PeerResponse>>,
+    _permit: OwnedSemaphorePermit,
 }
 
 struct InboundResult {
@@ -502,6 +505,7 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
         P2pClient {
             local_peer_id,
             commands: command_sender,
+            outbound_permits: Arc::new(Semaphore::new(config.max_connections)),
         },
         P2pEventLoop {
             swarm,
@@ -1002,6 +1006,12 @@ impl P2pClient {
 
     async fn call(&self, peer: NodeId, request: PeerRequest) -> Result<PeerResponse> {
         let expected_peer_id = peer.libp2p_peer_id()?;
+        let permit = self
+            .outbound_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .context("libp2p event loop stopped")?;
         let (response, receiver) = oneshot::channel();
         self.commands
             .send(Command::Request {
@@ -1009,6 +1019,7 @@ impl P2pClient {
                 recipient: peer,
                 request: Box::new(request),
                 response,
+                permit,
             })
             .await
             .context("libp2p event loop stopped")?;
@@ -1374,6 +1385,7 @@ impl P2pEventLoop {
                 recipient,
                 request,
                 response,
+                permit,
             } => {
                 match make_peer_request(
                     self.service.reader_config.keys(),
@@ -1403,6 +1415,7 @@ impl P2pEventLoop {
                                         request_hash,
                                         request_bytes,
                                         response,
+                                        _permit: permit,
                                     },
                                 );
                             }
@@ -2299,6 +2312,19 @@ pub async fn recover_from_dht(
     p2p: &P2pClient,
     restore_target: &std::path::Path,
 ) -> Result<DhtRecoveryResult> {
+    let local_target = restore_target.to_path_buf();
+    if let Some(local) = node_blocking(node.clone(), move |node| {
+        node.resume_local_recovery(&local_target)
+    })
+    .await?
+    {
+        return Ok(DhtRecoveryResult {
+            guild_id: local.guild_id,
+            checkpoint_hash: local.checkpoint_hash,
+            generation: local.generation,
+            revision_id: local.revision_id,
+        });
+    }
     let subject = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
     let providers = p2p.get_providers(recovery_mailbox_key(subject)).await?;
     let mut bundle_queries = FuturesUnordered::new();
@@ -2398,6 +2424,11 @@ pub async fn recover_from_dht(
         checkpoint,
         candidates,
     } = selected.context("no advertised recovery head could be certified")?;
+    let checkpoint_for_attempt = checkpoint.clone();
+    node_blocking(node.clone(), move |node| {
+        node.pin_recovery_attempt(&checkpoint_for_attempt)
+    })
+    .await?;
 
     let local_endpoints = advertised_p2p_endpoints(p2p).await?;
     let mut roster = genesis
@@ -3593,7 +3624,7 @@ fn remove_known_address(swarm: &mut Swarm<Behaviour>, peer: PeerId, address: &Mu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mb_core::Seed;
+    use mb_core::{KeyMaterial, Seed};
     use request_response::Codec as _;
 
     fn config(node_id: NodeId) -> P2pConfig {
@@ -3610,6 +3641,53 @@ mod tests {
             configure_failure_domain: true,
             max_connections: 8,
         }
+    }
+
+    #[tokio::test]
+    async fn abandoned_callers_cannot_exceed_the_outbound_request_bound() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([79; 32]));
+        let peer = keys.node_id();
+        let (commands, mut receiver) = mpsc::channel(COMMAND_CAPACITY);
+        let permits = Arc::new(Semaphore::new(2));
+        let client = P2pClient {
+            local_peer_id: peer.libp2p_peer_id().unwrap(),
+            commands,
+            outbound_permits: permits.clone(),
+        };
+        let first = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(peer, PeerRequest::Profile).await }
+        });
+        let second = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(peer, PeerRequest::Profile).await }
+        });
+        let held = vec![
+            receiver.recv().await.unwrap(),
+            receiver.recv().await.unwrap(),
+        ];
+        first.abort();
+        second.abort();
+        assert_eq!(permits.available_permits(), 0);
+
+        let third = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(peer, PeerRequest::Profile).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), receiver.recv())
+                .await
+                .is_err()
+        );
+        drop(held);
+        let third_command = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(permits.available_permits(), 1);
+        drop(third_command);
+        assert_eq!(permits.available_permits(), 2);
+        assert!(third.await.unwrap().is_err());
     }
 
     #[tokio::test]
@@ -4783,6 +4861,18 @@ mod tests {
             endpoint.value.endpoints,
             advertised_p2p_endpoints(&recovery_client).await.unwrap()
         );
+        for index in [0_usize, 2, 3] {
+            clients[index].shutdown().await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let local_resume = tokio::time::timeout(
+            Duration::from_secs(1),
+            recover_from_dht(recovered_node.clone(), &recovery_client, &restored),
+        )
+        .await
+        .expect("installed recovery must not wait for a DHT quorum")
+        .unwrap();
+        assert_eq!(local_resume, recovered);
         recovery_client.shutdown().await.unwrap();
         recovery_task.await.unwrap().unwrap();
         drop(recovered_node);

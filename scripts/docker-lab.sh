@@ -858,7 +858,9 @@ resume_recovery_transaction() {
     load_recovery_intent "$intent" || die "node $node has no recovery transaction to resume"
     expected_guild=$RECOVERY_GUILD_ID
     restore_name=$RECOVERY_RESTORE_NAME
-    validate_recovery_survivors "$node" "$expected_guild"
+    if [[ $RECOVERY_PHASE != restoring ]]; then
+        validate_recovery_survivors "$node" "$expected_guild"
+    fi
     prepare_recovery_container "$node"
     start_node_internal "$node"
     if [[ $RECOVERY_PHASE == container_created ]]; then
