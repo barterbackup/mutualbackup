@@ -20,10 +20,17 @@ const AREA_MAGIC: &str = "mutualbackup-anchor-area-v1";
 const CAPTURE_MANIFEST_PREFIX: &str = ".mutualbackup-capture-manifest-v1-";
 const MAX_CAPTURE_ENTRIES: usize = 8_192;
 const MAX_CAPTURE_EXTENTS: usize = 65_536;
+const MAX_CAPTURE_DEPTH: usize = 256;
 const MAX_RELATIVE_PATH_BYTES: usize = 4_096;
 const FAILED_AREA_SCAN_RETRY: Duration = Duration::from_secs(60);
 
 static ANCHOR_AREA_INDEX: OnceLock<Mutex<BTreeMap<Uuid, AnchorAreaIndexEntry>>> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_CAPTURE_WALK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
 
 #[derive(Clone)]
 enum AnchorAreaIndexEntry {
@@ -237,12 +244,7 @@ impl StableAnchorManifest {
 
     pub fn remove(&self) -> Result<(), AnchorError> {
         let area = resolve_anchor_area(&self.area)?;
-        let anchor_root = area.join(self.anchor_id.to_string());
-        let metadata = fs::symlink_metadata(&anchor_root)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(AnchorError::AnchorAreaCollision(anchor_root));
-        }
-        fs::remove_dir_all(anchor_root)?;
+        remove_stable_capture_directory(&area, &self.area, &self.anchor_id.to_string())?;
         sync_directory(&area)?;
         Ok(())
     }
@@ -260,12 +262,11 @@ impl AnchorManifest {
 
     pub fn remove(&self) -> Result<(), AnchorError> {
         validate_anchor_area(&self.area)?;
-        let anchor_root = self.area.path_hint.join(self.anchor_id.to_string());
-        let metadata = fs::symlink_metadata(&anchor_root)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(AnchorError::AnchorAreaCollision(anchor_root));
-        }
-        fs::remove_dir_all(anchor_root)?;
+        remove_legacy_capture_directory(
+            &self.area.path_hint,
+            self.area.area_id,
+            &self.anchor_id.to_string(),
+        )?;
         sync_directory(&self.area.path_hint)?;
         Ok(())
     }
@@ -323,7 +324,7 @@ impl ReflinkAnchor {
                 Err(_) => Self::discard_capture(plan)?,
             }
         }
-        remove_capture_directory(&staging)?;
+        remove_stable_capture_directory(&plan.area.path_hint, &plan.area, &staging_name)?;
         sync_directory(&plan.area.path_hint)?;
 
         let source_root = plan
@@ -384,13 +385,21 @@ impl ReflinkAnchor {
         let manifest = match capture_result {
             Ok(manifest) => manifest,
             Err(error) => {
-                let _ = fs::remove_dir_all(&staging);
+                let _ = remove_stable_capture_directory(
+                    &plan.area.path_hint,
+                    &plan.area,
+                    &staging_name,
+                );
                 let _ = sync_directory(&plan.area.path_hint);
                 return Err(error);
             }
         };
         if let Err(error) = sync_directory(&plan.area.path_hint) {
-            let _ = fs::remove_dir_all(&anchor_root);
+            let _ = remove_stable_capture_directory(
+                &plan.area.path_hint,
+                &plan.area,
+                &plan.anchor_id.to_string(),
+            );
             let _ = sync_directory(&plan.area.path_hint);
             return Err(error.into());
         }
@@ -402,13 +411,16 @@ impl ReflinkAnchor {
             return Err(AnchorError::InvalidRoot);
         }
         validate_stable_anchor_area(&plan.area.path_hint, plan.area.area_id)?;
-        remove_capture_directory(
-            &plan
-                .area
-                .path_hint
-                .join(format!(".staging-{}", plan.anchor_id)),
+        remove_stable_capture_directory(
+            &plan.area.path_hint,
+            &plan.area,
+            &format!(".staging-{}", plan.anchor_id),
         )?;
-        remove_capture_directory(&plan.area.path_hint.join(plan.anchor_id.to_string()))?;
+        remove_stable_capture_directory(
+            &plan.area.path_hint,
+            &plan.area,
+            &plan.anchor_id.to_string(),
+        )?;
         sync_directory(&plan.area.path_hint)?;
         Ok(())
     }
@@ -422,11 +434,10 @@ impl ReflinkAnchor {
         if anchor_root.exists() {
             read_planned_manifest(&anchor_root, plan)?;
         }
-        remove_capture_directory(
-            &plan
-                .area
-                .path_hint
-                .join(format!(".staging-{}", plan.anchor_id)),
+        remove_stable_capture_directory(
+            &plan.area.path_hint,
+            &plan.area,
+            &format!(".staging-{}", plan.anchor_id),
         )?;
         sync_directory(&plan.area.path_hint)?;
         Ok(())
@@ -749,7 +760,8 @@ pub fn probe_reflink(root: impl AsRef<Path>) -> Result<(), AnchorError> {
         return Err(AnchorError::NoExternalAnchorLocation);
     }
     reject_nested_filesystems(root, root_identity)?;
-    let probe_dir = parent.join(format!(".mutualbackup-probe-{}", Uuid::new_v4()));
+    let probe_name = format!(".mutualbackup-probe-{}", Uuid::new_v4());
+    let probe_dir = parent.join(&probe_name);
     create_private_dir_new(&probe_dir)?;
     let source_path = probe_dir.join("source");
     let removed_source_path = probe_dir.join("source-removed");
@@ -816,7 +828,7 @@ pub fn probe_reflink(root: impl AsRef<Path>) -> Result<(), AnchorError> {
         }
         Ok(())
     })();
-    let cleanup = fs::remove_dir_all(&probe_dir);
+    let cleanup = remove_owned_directory(parent, &probe_name);
     cleanup?;
     sync_directory(parent)?;
     result
@@ -916,17 +928,33 @@ fn capture_entries(
     let mut file_versions = Vec::new();
     let mut captured_links = BTreeMap::<NativeFileId, PathBuf>::new();
     let mut captured_extent_count = 0_usize;
-    for entry in WalkDir::new(source_root).follow_links(false) {
+    #[cfg(target_os = "linux")]
+    let walk_root = proc_fd_path(root_file);
+    #[cfg(not(target_os = "linux"))]
+    let walk_root = source_root.to_path_buf();
+    #[cfg(test)]
+    BEFORE_CAPTURE_WALK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    for entry in WalkDir::new(&walk_root)
+        .follow_root_links(true)
+        .follow_links(false)
+    {
         let entry = entry?;
-        if entry.path() == source_root {
+        if entry.depth() == 0 {
             continue;
+        }
+        if entry.depth() > MAX_CAPTURE_DEPTH {
+            return Err(AnchorError::CatalogTooLarge);
         }
         if entries.len() >= MAX_CAPTURE_ENTRIES {
             return Err(AnchorError::CatalogTooLarge);
         }
         let relative = entry
             .path()
-            .strip_prefix(source_root)
+            .strip_prefix(&walk_root)
             .map_err(|_| AnchorError::UnsafePath)?;
         validate_relative(relative)?;
         let relative_string = relative
@@ -945,7 +973,7 @@ fn capture_entries(
         if before.is_dir() {
             #[cfg(target_os = "linux")]
             if filesystem_identity_for_file(&file)? != filesystem {
-                return Err(AnchorError::NestedFilesystem(entry.path().to_path_buf()));
+                return Err(AnchorError::NestedFilesystem(source_root.join(relative)));
             }
             create_private_dir_new(&destination)?;
             let (modified_secs, modified_nanos) = modified_parts(&before);
@@ -959,7 +987,7 @@ fn capture_entries(
         } else if before.is_file() {
             #[cfg(target_os = "linux")]
             if filesystem_identity_for_file(&file)? != filesystem {
-                return Err(AnchorError::NestedFilesystem(entry.path().to_path_buf()));
+                return Err(AnchorError::NestedFilesystem(source_root.join(relative)));
             }
             if let Some(parent) = destination.parent() {
                 create_private_dir(parent)?;
@@ -1027,46 +1055,111 @@ fn ensure_anchor_area(
         .ok_or(AnchorError::NoExternalAnchorLocation)?;
     let source_filesystem_id = filesystem_identity(source_root)?.stable_id;
     let (filesystem_id, volume_root_hint) = volume_root(parent)?;
-    let area_path = parent.join(format!(
+    let area_name = format!(
         "{AREA_PREFIX}-{}",
         source_identity_name(source_filesystem_id, root_metadata)
-    ));
-    match fs::create_dir(&area_path) {
-        Ok(()) => {
-            set_private_directory(&area_path)?;
-            let area_id = Uuid::new_v4();
-            let marker_path = area_path.join(AREA_MARKER);
-            let mut marker = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&marker_path)?;
-            writeln!(marker, "{AREA_MAGIC}")?;
-            writeln!(marker, "{area_id}")?;
-            marker.sync_all()?;
-            seal_anchor_file(&marker_path)?;
-            sync_directory(&area_path)?;
-            sync_directory(parent)?;
-            Ok(StableAnchorAreaLocator {
-                area_id,
-                path_hint: area_path,
-                filesystem_id,
-                volume_root_hint,
-            })
+    );
+    let area_path = parent.join(&area_name);
+    let area_id = match read_area_marker(&area_path) {
+        Ok(area_id) => area_id,
+        Err(AnchorError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(area_id) = resume_staged_anchor_area(parent, &area_name, &area_path)? {
+                area_id
+            } else {
+                publish_anchor_area(parent, &area_name, &area_path)?
+            }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let area_id = read_area_marker(&area_path)
-                .map_err(|_| AnchorError::AnchorAreaCollision(area_path.clone()))?;
-            let locator = StableAnchorAreaLocator {
-                area_id,
-                path_hint: area_path,
-                filesystem_id,
-                volume_root_hint,
-            };
-            validate_stable_anchor_area(&locator.path_hint, locator.area_id)?;
-            Ok(locator)
+        Err(_) => return Err(AnchorError::AnchorAreaCollision(area_path)),
+    };
+    let locator = StableAnchorAreaLocator {
+        area_id,
+        path_hint: area_path,
+        filesystem_id,
+        volume_root_hint,
+    };
+    validate_stable_anchor_area(&locator.path_hint, locator.area_id)?;
+    Ok(locator)
+}
+
+fn publish_anchor_area(
+    parent: &Path,
+    area_name: &str,
+    area_path: &Path,
+) -> Result<Uuid, AnchorError> {
+    let area_id = Uuid::new_v4();
+    let staging_name = format!(".{area_name}.init-{}", Uuid::new_v4());
+    let staging = parent.join(&staging_name);
+    create_private_dir_new(&staging)?;
+    let result = (|| {
+        write_anchor_area_marker(&staging, area_id)?;
+        sync_directory(&staging)?;
+        rename_no_replace(&staging, area_path)?;
+        sync_directory(parent)?;
+        Ok::<_, AnchorError>(area_id)
+    })();
+    match result {
+        Ok(area_id) => Ok(area_id),
+        Err(AnchorError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = remove_owned_directory(parent, &staging_name);
+            read_area_marker(area_path)
+                .map_err(|_| AnchorError::AnchorAreaCollision(area_path.to_path_buf()))
         }
-        Err(error) => Err(error.into()),
+        Err(error) => {
+            let _ = remove_owned_directory(parent, &staging_name);
+            Err(error)
+        }
     }
+}
+
+fn write_anchor_area_marker(area: &Path, area_id: Uuid) -> Result<(), AnchorError> {
+    let marker_path = area.join(AREA_MARKER);
+    let mut marker = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&marker_path)?;
+    writeln!(marker, "{AREA_MAGIC}")?;
+    writeln!(marker, "{area_id}")?;
+    marker.sync_all()?;
+    seal_anchor_file(&marker_path)?;
+    Ok(())
+}
+
+fn resume_staged_anchor_area(
+    parent: &Path,
+    area_name: &str,
+    area_path: &Path,
+) -> Result<Option<Uuid>, AnchorError> {
+    let prefix = format!(".{area_name}.init-");
+    let mut candidates = fs::read_dir(parent)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|entry| entry.file_name());
+    for entry in candidates {
+        let staging = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&staging) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(area_id) = read_area_marker(&staging) else {
+            continue;
+        };
+        match rename_no_replace(&staging, area_path) {
+            Ok(()) => {
+                sync_directory(parent)?;
+                return Ok(Some(area_id));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return read_area_marker(area_path)
+                    .map(Some)
+                    .map_err(|_| AnchorError::AnchorAreaCollision(area_path.to_path_buf()));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(target_os = "linux")]
@@ -1329,7 +1422,15 @@ fn read_area_marker(area: &Path) -> Result<Uuid, AnchorError> {
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 128 {
         return Err(AnchorError::AnchorAreaCollision(area.to_path_buf()));
     }
-    let bytes = fs::read_to_string(marker)?;
+    read_area_marker_contents(File::open(marker)?, area)
+}
+
+fn read_area_marker_contents(mut marker: File, area: &Path) -> Result<Uuid, AnchorError> {
+    if marker.metadata()?.len() > 128 {
+        return Err(AnchorError::AnchorAreaCollision(area.to_path_buf()));
+    }
+    let mut bytes = String::new();
+    marker.read_to_string(&mut bytes)?;
     let mut lines = bytes.lines();
     if lines.next() != Some(AREA_MAGIC) {
         return Err(AnchorError::AnchorAreaCollision(area.to_path_buf()));
@@ -1353,16 +1454,258 @@ fn entry_path(entry: &CapturedEntry) -> &str {
     }
 }
 
-fn remove_capture_directory(path: &Path) -> Result<(), AnchorError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(AnchorError::AnchorAreaCollision(path.to_path_buf()));
+#[cfg(target_os = "linux")]
+fn remove_stable_capture_directory(
+    area_path: &Path,
+    area: &StableAnchorAreaLocator,
+    name: &str,
+) -> Result<(), AnchorError> {
+    let area_file = open_source_root(area_path)?;
+    if filesystem_identity_for_file(&area_file)?.stable_id != area.filesystem_id {
+        return Err(AnchorError::AnchorAreaCollision(area_path.to_path_buf()));
     }
-    fs::remove_dir_all(path)?;
+    validate_area_marker_file(&area_file, area_path, area.area_id)?;
+    remove_directory_at(&area_file, name, &area_path.join(name))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_stable_capture_directory(
+    _area_path: &Path,
+    _area: &StableAnchorAreaLocator,
+    _name: &str,
+) -> Result<(), AnchorError> {
+    Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "safe anchor cleanup is currently implemented only on Linux",
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn remove_legacy_capture_directory(
+    area_path: &Path,
+    area_id: Uuid,
+    name: &str,
+) -> Result<(), AnchorError> {
+    let area_file = open_source_root(area_path)?;
+    validate_area_marker_file(&area_file, area_path, area_id)?;
+    remove_directory_at(&area_file, name, &area_path.join(name))
+}
+
+#[cfg(target_os = "linux")]
+fn remove_owned_directory(parent: &Path, name: &str) -> Result<(), AnchorError> {
+    let parent_file = open_source_root(parent)?;
+    remove_directory_at(&parent_file, name, &parent.join(name))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_owned_directory(_parent: &Path, _name: &str) -> Result<(), AnchorError> {
+    Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "safe directory cleanup is currently implemented only on Linux",
+    )))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_legacy_capture_directory(
+    _area_path: &Path,
+    _area_id: Uuid,
+    _name: &str,
+) -> Result<(), AnchorError> {
+    Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "safe anchor cleanup is currently implemented only on Linux",
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_area_marker_file(
+    area: &File,
+    area_path: &Path,
+    expected_id: Uuid,
+) -> Result<(), AnchorError> {
+    let marker_handle = open_path_no_xdev_beneath(area, Path::new(AREA_MARKER))
+        .map_err(|_| AnchorError::AnchorAreaCollision(area_path.to_path_buf()))?;
+    let metadata = marker_handle.metadata()?;
+    if !metadata.is_file() {
+        return Err(AnchorError::AnchorAreaCollision(area_path.to_path_buf()));
+    }
+    let marker = reopen_pinned_file(&marker_handle, false, Path::new(AREA_MARKER))?;
+    let actual = read_area_marker_contents(marker, area_path)?;
+    if actual != expected_id {
+        return Err(AnchorError::AnchorAreaCollision(area_path.to_path_buf()));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remove_directory_at(parent: &File, name: &str, display: &Path) -> Result<(), AnchorError> {
+    let relative = Path::new(name);
+    if relative.components().count() != 1 {
+        return Err(AnchorError::UnsafePath);
+    }
+    let handle = match open_path_no_xdev_beneath(parent, relative) {
+        Ok(handle) => handle,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
+        Err(_) => return Err(AnchorError::AnchorAreaCollision(display.to_path_buf())),
+    };
+    if !handle.metadata()?.is_dir() {
+        return Err(AnchorError::AnchorAreaCollision(display.to_path_buf()));
+    }
+    let directory = reopen_pinned_file(&handle, true, relative)?;
+    let mut remaining = MAX_CAPTURE_ENTRIES + 1;
+    remove_directory_contents(&directory, display, 0, &mut remaining)?;
+    unlink_pinned_name(parent, relative, &handle, true, display)
+}
+
+#[cfg(target_os = "linux")]
+fn remove_directory_contents(
+    directory: &File,
+    display: &Path,
+    depth: usize,
+    remaining: &mut usize,
+) -> Result<(), AnchorError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if depth > MAX_CAPTURE_DEPTH {
+        return Err(AnchorError::AnchorAreaCollision(display.to_path_buf()));
+    }
+    for name in directory_entry_names(directory)? {
+        if *remaining == 0 {
+            return Err(AnchorError::AnchorAreaCollision(display.to_path_buf()));
+        }
+        *remaining -= 1;
+        let relative = Path::new(std::ffi::OsStr::from_bytes(name.as_bytes()));
+        let child_display = display.join(relative);
+        let handle = match open_path_no_xdev_beneath(directory, relative) {
+            Ok(handle) => handle,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
+            Err(_) => return Err(AnchorError::AnchorAreaCollision(child_display)),
+        };
+        if handle.metadata()?.is_dir() {
+            let child = reopen_pinned_file(&handle, true, relative)?;
+            remove_directory_contents(&child, &child_display, depth + 1, remaining)?;
+            unlink_pinned_name(directory, relative, &handle, true, &child_display)?;
+        } else {
+            unlink_pinned_name(directory, relative, &handle, false, &child_display)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn directory_entry_names(directory: &File) -> Result<Vec<CString>, AnchorError> {
+    use std::os::fd::AsRawFd;
+
+    struct DirectoryStream(*mut libc::DIR);
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+
+    let descriptor = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stream = unsafe { libc::fdopendir(descriptor) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(descriptor);
+        }
+        return Err(error.into());
+    }
+    let stream = DirectoryStream(stream);
+    let mut names = Vec::new();
+    loop {
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error().unwrap_or(0) == 0 {
+                break;
+            }
+            return Err(error.into());
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        names.push(name.to_owned());
+    }
+    Ok(names)
+}
+
+#[cfg(target_os = "linux")]
+fn open_path_no_xdev_beneath(parent: &File, relative: &Path) -> std::io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    const RESOLVE_NO_XDEV: u64 = 0x01;
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const RESOLVE_BENEATH: u64 = 0x08;
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+
+    let path = CString::new(relative.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let how = OpenHow {
+        flags: (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
+        mode: 0,
+        resolve: RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
+    };
+    let descriptor = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            parent.as_raw_fd(),
+            path.as_ptr(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor as i32) })
+}
+
+#[cfg(target_os = "linux")]
+fn unlink_pinned_name(
+    parent: &File,
+    relative: &Path,
+    pinned: &File,
+    directory: bool,
+    display: &Path,
+) -> Result<(), AnchorError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let current = open_path_no_xdev_beneath(parent, relative)
+        .map_err(|_| AnchorError::AnchorAreaCollision(display.to_path_buf()))?;
+    let expected = pinned.metadata()?;
+    let current = current.metadata()?;
+    if expected.dev() != current.dev()
+        || expected.ino() != current.ino()
+        || expected.file_type() != current.file_type()
+    {
+        return Err(AnchorError::AnchorAreaCollision(display.to_path_buf()));
+    }
+    let path =
+        CString::new(relative.as_os_str().as_bytes()).map_err(|_| AnchorError::UnsafePath)?;
+    let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), path.as_ptr(), flags) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     Ok(())
 }
 
@@ -1530,6 +1873,19 @@ fn open_source_root(_path: &Path) -> Result<File, AnchorError> {
 
 #[cfg(target_os = "linux")]
 fn open_source_beneath(root: &File, relative: &Path, directory: bool) -> Result<File, AnchorError> {
+    let pinned = open_path_beneath(root, relative)?;
+    let metadata = pinned.metadata()?;
+    if metadata.file_type().is_symlink() {
+        return Err(AnchorError::Symlink(relative.to_path_buf()));
+    }
+    if (directory && !metadata.is_dir()) || (!directory && !metadata.is_file()) {
+        return Err(AnchorError::UnsupportedObject(relative.to_path_buf()));
+    }
+    reopen_pinned_file(&pinned, directory, relative)
+}
+
+#[cfg(target_os = "linux")]
+fn open_path_beneath(root: &File, relative: &Path) -> Result<File, AnchorError> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
 
@@ -1545,13 +1901,8 @@ fn open_source_beneath(root: &File, relative: &Path, directory: bool) -> Result<
 
     let path =
         CString::new(relative.as_os_str().as_bytes()).map_err(|_| AnchorError::UnsafePath)?;
-    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
-    if directory {
-        flags |= libc::O_DIRECTORY;
-        flags &= !libc::O_NONBLOCK;
-    }
     let how = OpenHow {
-        flags: flags as u64,
+        flags: (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
         mode: 0,
         resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
     };
@@ -1572,6 +1923,45 @@ fn open_source_beneath(root: &File, relative: &Path, directory: bool) -> Result<
         return Err(error.into());
     }
     Ok(unsafe { File::from_raw_fd(descriptor as i32) })
+}
+
+#[cfg(target_os = "linux")]
+fn proc_fd_path(file: &File) -> PathBuf {
+    use std::os::fd::AsRawFd;
+
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+#[cfg(target_os = "linux")]
+fn reopen_pinned_file(
+    pinned: &File,
+    directory: bool,
+    relative: &Path,
+) -> Result<File, AnchorError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+
+    let path = CString::new(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+        .expect("a numeric proc descriptor path has no NUL");
+    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    if directory {
+        flags |= libc::O_DIRECTORY;
+        flags &= !libc::O_NONBLOCK;
+    }
+    let descriptor = unsafe { libc::open(path.as_ptr(), flags) };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let reopened = unsafe { File::from_raw_fd(descriptor) };
+    let pinned_metadata = pinned.metadata()?;
+    let reopened_metadata = reopened.metadata()?;
+    if pinned_metadata.dev() != reopened_metadata.dev()
+        || pinned_metadata.ino() != reopened_metadata.ino()
+        || pinned_metadata.file_type() != reopened_metadata.file_type()
+    {
+        return Err(AnchorError::SourceChanged(relative.to_path_buf()));
+    }
+    Ok(reopened)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1808,6 +2198,35 @@ fn unix_mode(_metadata: &fs::Metadata) -> u32 {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    fn bind_mount(source: &Path, target: &Path) {
+        let output = std::process::Command::new("sudo")
+            .args(["-n", "mount", "--bind"])
+            .arg(source)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cannot create bind mount: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unmount(target: &Path) {
+        let output = std::process::Command::new("sudo")
+            .args(["-n", "umount"])
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cannot remove bind mount: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn rejects_unsafe_relative_paths() {
         assert!(validate_relative(Path::new("good/file")).is_ok());
@@ -1896,6 +2315,129 @@ mod tests {
         let started = Instant::now();
         assert!(open_walk_entry_beneath(temp.path(), &root_file, &cached_entry).is_err());
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn capture_walk_remains_bound_to_the_open_root() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("root-swap-{}", Uuid::new_v4()));
+        let protected = run_root.join("protected");
+        let replacement = run_root.join("replacement");
+        fs::create_dir_all(&protected).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        fs::write(protected.join("payload"), b"pinned-root-payload").unwrap();
+        let plan = ReflinkAnchor::plan(&protected).unwrap();
+
+        let hook_source = replacement.clone();
+        let hook_target = protected.clone();
+        BEFORE_CAPTURE_WALK.with(|hook| {
+            assert!(
+                hook.borrow_mut()
+                    .replace(Box::new(move || bind_mount(&hook_source, &hook_target)))
+                    .is_none()
+            );
+        });
+        let captured = ReflinkAnchor::capture_plan(&plan);
+        unmount(&protected);
+
+        let manifest = captured.unwrap();
+        assert!(manifest.entries.iter().any(|entry| {
+            matches!(entry, CapturedEntry::FileV2 { path, .. } if path == "payload")
+        }));
+        let mut payload = String::new();
+        manifest
+            .file_locator("payload".to_owned())
+            .unwrap()
+            .open()
+            .unwrap()
+            .read_to_string(&mut payload)
+            .unwrap();
+        assert_eq!(payload, "pinned-root-payload");
+        manifest.remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn anchor_cleanup_refuses_to_cross_a_child_mount() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("cleanup-mount-{}", Uuid::new_v4()));
+        let protected = run_root.join("protected");
+        let external = run_root.join("external");
+        fs::create_dir_all(&protected).unwrap();
+        fs::create_dir(&external).unwrap();
+        fs::write(protected.join("payload"), b"anchor payload").unwrap();
+        let sentinel = external.join("must-survive");
+        fs::write(&sentinel, b"external bytes").unwrap();
+        let manifest = ReflinkAnchor::capture(&protected).unwrap();
+        let anchor_root = manifest.area.path_hint.join(manifest.anchor_id.to_string());
+
+        bind_mount(&external, &anchor_root);
+        let removal = manifest.remove();
+        unmount(&anchor_root);
+
+        assert!(removal.is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"external bytes");
+        manifest.remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn anchor_area_initialization_recovers_staged_publication() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("area-init-{}", Uuid::new_v4()));
+        let complete_source = run_root.join("complete-source");
+        fs::create_dir_all(&complete_source).unwrap();
+        let complete_metadata = fs::metadata(&complete_source).unwrap();
+        let filesystem_id = filesystem_identity(&complete_source).unwrap().stable_id;
+        let complete_area_name = format!(
+            "{AREA_PREFIX}-{}",
+            source_identity_name(filesystem_id, &complete_metadata)
+        );
+        let complete_staging_name = format!(".{complete_area_name}.init-test");
+        let complete_staging = run_root.join(&complete_staging_name);
+        create_private_dir_new(&complete_staging).unwrap();
+        let expected_id = Uuid::new_v4();
+        write_anchor_area_marker(&complete_staging, expected_id).unwrap();
+        sync_directory(&complete_staging).unwrap();
+
+        let complete = ensure_anchor_area(&complete_source, &complete_metadata).unwrap();
+        assert_eq!(complete.area_id, expected_id);
+        assert!(!complete_staging.exists());
+        validate_stable_anchor_area(&complete.path_hint, expected_id).unwrap();
+
+        let partial_source = run_root.join("partial-source");
+        fs::create_dir(&partial_source).unwrap();
+        let partial_metadata = fs::metadata(&partial_source).unwrap();
+        let partial_area_name = format!(
+            "{AREA_PREFIX}-{}",
+            source_identity_name(filesystem_id, &partial_metadata)
+        );
+        let partial_staging_name = format!(".{partial_area_name}.init-interrupted");
+        create_private_dir_new(&run_root.join(&partial_staging_name)).unwrap();
+
+        let partial = ensure_anchor_area(&partial_source, &partial_metadata).unwrap();
+        validate_stable_anchor_area(&partial.path_hint, partial.area_id).unwrap();
+        assert!(run_root.join(&partial_staging_name).is_dir());
+
+        remove_owned_directory(&run_root, &complete_area_name).unwrap();
+        remove_owned_directory(&run_root, &partial_area_name).unwrap();
+        remove_owned_directory(&run_root, &partial_staging_name).unwrap();
+        fs::remove_dir_all(run_root).unwrap();
     }
 
     #[cfg(target_os = "linux")]

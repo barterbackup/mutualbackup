@@ -138,6 +138,22 @@ impl ControlStore {
         )? == 1)
     }
 
+    pub fn abandon_capture_intent(
+        &self,
+        capture_id: &[u8; 16],
+        expected_intent: &[u8],
+    ) -> Result<(), DatabaseError> {
+        let removed = self.connection.execute(
+            "DELETE FROM protocol_records
+             WHERE kind = 'capture-intent' AND record_id = ?1 AND bytes = ?2",
+            params![capture_id.as_slice(), expected_intent],
+        )?;
+        if removed != 1 {
+            return Err(DatabaseError::Conflict);
+        }
+        Ok(())
+    }
+
     pub fn records(&self, kind: &str) -> Result<Vec<ProtocolRecordRow>, DatabaseError> {
         let mut statement = self.connection.prepare(
             "SELECT record_id, bytes FROM protocol_records WHERE kind = ?1 ORDER BY record_id",
@@ -1966,6 +1982,39 @@ mod tests {
         assert!(
             store
                 .get_record("user-revision", b"other")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn capture_intent_abandon_is_compare_and_delete() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([30; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let capture_id = [31; 16];
+        store
+            .put_record("capture-intent", &capture_id, b"current-intent")
+            .unwrap();
+
+        assert!(matches!(
+            store.abandon_capture_intent(&capture_id, b"stale-intent"),
+            Err(DatabaseError::Conflict)
+        ));
+        assert_eq!(
+            store
+                .get_record("capture-intent", &capture_id)
+                .unwrap()
+                .unwrap(),
+            b"current-intent"
+        );
+
+        store
+            .abandon_capture_intent(&capture_id, b"current-intent")
+            .unwrap();
+        assert!(
+            store
+                .get_record("capture-intent", &capture_id)
                 .unwrap()
                 .is_none()
         );

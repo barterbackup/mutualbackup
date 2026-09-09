@@ -249,245 +249,260 @@ pub(crate) fn prepare_revision(
         None if sequence == 1 => None,
         None => bail!("the first local revision must have sequence one"),
     };
-    let intent = match control.get_record("capture-intent", revision_id.as_bytes())? {
-        Some(bytes) => {
-            let intent: CaptureIntent = decode_canonical(&bytes)?;
-            if intent.format_version != 1
-                || intent.guild_id != guild_id
-                || intent.revision_id != revision_id
-                || intent.sequence != sequence
-                || intent.parent != parent
-                || intent.requested_source != source_root
-            {
-                bail!("pending source capture conflicts with the retried operation");
-            }
-            intent
-        }
-        None => {
-            let intent = CaptureIntent {
-                format_version: 1,
-                guild_id,
-                revision_id,
-                sequence,
-                parent,
-                requested_source: source_root.to_path_buf(),
-                plan: ReflinkAnchor::plan(source_root).context("plan reflink source anchor")?,
-            };
-            control.put_record(
-                "capture-intent",
-                revision_id.as_bytes(),
-                &canonical_bytes(&intent)?,
-            )?;
-            intent
-        }
-    };
-    let mut anchor = PendingAnchor {
-        manifest: ReflinkAnchor::capture_plan(&intent.plan)
-            .context("capture reflink source anchor")?,
-        committed: false,
-    };
-    if canonical_bytes(&anchor.manifest)?.len() > V1_MAX_CATALOG_BYTES / 2 {
-        bail!("captured source catalog exceeds the v1 bounded-object limit");
-    }
-    validate_capture_sector_budget(&anchor.manifest)?;
-    let encryption_key = keys.guild_data_key(&guild_id);
-    let mut data_references = Vec::new();
-    let mut private_entries = Vec::new();
-    let mut recipe_records = Vec::with_capacity(256);
-    let mut ordinal = 0_u64;
-    let mut prepared_links = BTreeMap::<NativeFileId, u64>::new();
-    let mut next_link_group = 0_u64;
-
-    for entry in &anchor.manifest.entries {
-        match entry {
-            CapturedEntry::Directory {
-                path,
-                mode,
-                modified_secs,
-                modified_nanos,
-            } => {
-                private_entries.push(PrivateEntry::Directory {
-                    path: path.clone(),
-                    mode: *mode,
-                    modified_secs: *modified_secs,
-                    modified_nanos: *modified_nanos,
-                });
-            }
-            CapturedEntry::File {
-                path,
-                mode,
-                logical_len,
-                modified_secs,
-                modified_nanos,
-            } => {
-                let locator = anchor.manifest.file_locator(path.clone())?;
-                let mut file = locator.open().context("open captured anchor file")?;
-                let mut remaining = *logical_len;
-                let mut offset = 0_u64;
-                let mut file_references = Vec::new();
-                while remaining > 0 {
-                    let logical_len = remaining.min(V1_SECTOR_SIZE as u64) as usize;
-                    let mut plaintext = vec![0_u8; logical_len];
-                    file.read_exact(&mut plaintext)?;
-                    let id =
-                        make_sector_id(keys.node_id(), revision_id, SectorPurpose::Data, ordinal);
-                    ordinal += 1;
-                    let (reference, _) = encrypted_sector(&encryption_key, id, &plaintext)?;
-                    push_data_reference(&mut data_references, reference.clone())?;
-                    file_references.push(reference.clone());
-                    queue_recipe(
-                        &mut recipe_records,
-                        LocalSectorRecipe {
-                            guild_id,
-                            reference,
-                            source: LocalPlaintextSource::StableAnchorFile {
-                                locator: locator.clone(),
-                                offset,
-                            },
-                        },
-                    )?;
-                    offset += logical_len as u64;
-                    remaining -= logical_len as u64;
+    let (intent, intent_bytes) =
+        match control.get_record("capture-intent", revision_id.as_bytes())? {
+            Some(bytes) => {
+                let intent: CaptureIntent = decode_canonical(&bytes)?;
+                if intent.format_version != 1
+                    || intent.guild_id != guild_id
+                    || intent.revision_id != revision_id
+                    || intent.sequence != sequence
+                    || intent.parent != parent
+                    || intent.requested_source != source_root
+                {
+                    bail!("pending source capture conflicts with the retried operation");
                 }
-                private_entries.push(PrivateEntry::File {
-                    path: path.clone(),
-                    mode: *mode,
-                    logical_len: *logical_len,
-                    modified_secs: *modified_secs,
-                    modified_nanos: *modified_nanos,
-                    sectors: file_references,
-                });
+                (intent, bytes)
             }
-            CapturedEntry::FileV2 {
-                path,
-                mode,
-                logical_len,
-                modified_secs,
-                modified_nanos,
-                native_id,
-                data_extents,
-            } => {
-                if let Some(link_group) = prepared_links.get(native_id) {
-                    private_entries.push(PrivateEntry::HardLinkV3 {
+            None => {
+                let intent = CaptureIntent {
+                    format_version: 1,
+                    guild_id,
+                    revision_id,
+                    sequence,
+                    parent,
+                    requested_source: source_root.to_path_buf(),
+                    plan: ReflinkAnchor::plan(source_root).context("plan reflink source anchor")?,
+                };
+                let bytes = canonical_bytes(&intent)?;
+                control.put_record("capture-intent", revision_id.as_bytes(), &bytes)?;
+                (intent, bytes)
+            }
+        };
+    let result = (|| {
+        let mut anchor = PendingAnchor {
+            manifest: ReflinkAnchor::capture_plan(&intent.plan)
+                .context("capture reflink source anchor")?,
+            committed: false,
+        };
+        if canonical_bytes(&anchor.manifest)?.len() > V1_MAX_CATALOG_BYTES / 2 {
+            bail!("captured source catalog exceeds the v1 bounded-object limit");
+        }
+        validate_capture_sector_budget(&anchor.manifest)?;
+        let encryption_key = keys.guild_data_key(&guild_id);
+        let mut data_references = Vec::new();
+        let mut private_entries = Vec::new();
+        let mut recipe_records = Vec::with_capacity(256);
+        let mut ordinal = 0_u64;
+        let mut prepared_links = BTreeMap::<NativeFileId, u64>::new();
+        let mut next_link_group = 0_u64;
+
+        for entry in &anchor.manifest.entries {
+            match entry {
+                CapturedEntry::Directory {
+                    path,
+                    mode,
+                    modified_secs,
+                    modified_nanos,
+                } => {
+                    private_entries.push(PrivateEntry::Directory {
+                        path: path.clone(),
+                        mode: *mode,
+                        modified_secs: *modified_secs,
+                        modified_nanos: *modified_nanos,
+                    });
+                }
+                CapturedEntry::File {
+                    path,
+                    mode,
+                    logical_len,
+                    modified_secs,
+                    modified_nanos,
+                } => {
+                    let locator = anchor.manifest.file_locator(path.clone())?;
+                    let mut file = locator.open().context("open captured anchor file")?;
+                    let mut remaining = *logical_len;
+                    let mut offset = 0_u64;
+                    let mut file_references = Vec::new();
+                    while remaining > 0 {
+                        let logical_len = remaining.min(V1_SECTOR_SIZE as u64) as usize;
+                        let mut plaintext = vec![0_u8; logical_len];
+                        file.read_exact(&mut plaintext)?;
+                        let id = make_sector_id(
+                            keys.node_id(),
+                            revision_id,
+                            SectorPurpose::Data,
+                            ordinal,
+                        );
+                        ordinal += 1;
+                        let (reference, _) = encrypted_sector(&encryption_key, id, &plaintext)?;
+                        push_data_reference(&mut data_references, reference.clone())?;
+                        file_references.push(reference.clone());
+                        queue_recipe(
+                            &mut recipe_records,
+                            LocalSectorRecipe {
+                                guild_id,
+                                reference,
+                                source: LocalPlaintextSource::StableAnchorFile {
+                                    locator: locator.clone(),
+                                    offset,
+                                },
+                            },
+                        )?;
+                        offset += logical_len as u64;
+                        remaining -= logical_len as u64;
+                    }
+                    private_entries.push(PrivateEntry::File {
                         path: path.clone(),
                         mode: *mode,
                         logical_len: *logical_len,
                         modified_secs: *modified_secs,
                         modified_nanos: *modified_nanos,
-                        link_group: *link_group,
+                        sectors: file_references,
                     });
-                    continue;
                 }
-                let locator = anchor.manifest.file_locator(path.clone())?;
-                let private_extents = prepare_sparse_file(
-                    &mut recipe_records,
-                    keys,
-                    guild_id,
-                    revision_id,
-                    &mut ordinal,
-                    &locator,
-                    *logical_len,
+                CapturedEntry::FileV2 {
+                    path,
+                    mode,
+                    logical_len,
+                    modified_secs,
+                    modified_nanos,
+                    native_id,
                     data_extents,
-                )?;
-                for reference in private_extents
-                    .iter()
-                    .flat_map(|extent| extent.sectors.iter())
-                {
-                    push_data_reference(&mut data_references, reference.clone())?;
+                } => {
+                    if let Some(link_group) = prepared_links.get(native_id) {
+                        private_entries.push(PrivateEntry::HardLinkV3 {
+                            path: path.clone(),
+                            mode: *mode,
+                            logical_len: *logical_len,
+                            modified_secs: *modified_secs,
+                            modified_nanos: *modified_nanos,
+                            link_group: *link_group,
+                        });
+                        continue;
+                    }
+                    let locator = anchor.manifest.file_locator(path.clone())?;
+                    let private_extents = prepare_sparse_file(
+                        &mut recipe_records,
+                        keys,
+                        guild_id,
+                        revision_id,
+                        &mut ordinal,
+                        &locator,
+                        *logical_len,
+                        data_extents,
+                    )?;
+                    for reference in private_extents
+                        .iter()
+                        .flat_map(|extent| extent.sectors.iter())
+                    {
+                        push_data_reference(&mut data_references, reference.clone())?;
+                    }
+                    let link_group = next_link_group;
+                    next_link_group = next_link_group
+                        .checked_add(1)
+                        .context("too many hard-link groups in one revision")?;
+                    prepared_links.insert(*native_id, link_group);
+                    private_entries.push(PrivateEntry::FileV2 {
+                        path: path.clone(),
+                        mode: *mode,
+                        logical_len: *logical_len,
+                        modified_secs: *modified_secs,
+                        modified_nanos: *modified_nanos,
+                        link_group,
+                        data_extents: private_extents,
+                    });
                 }
-                let link_group = next_link_group;
-                next_link_group = next_link_group
-                    .checked_add(1)
-                    .context("too many hard-link groups in one revision")?;
-                prepared_links.insert(*native_id, link_group);
-                private_entries.push(PrivateEntry::FileV2 {
-                    path: path.clone(),
-                    mode: *mode,
-                    logical_len: *logical_len,
-                    modified_secs: *modified_secs,
-                    modified_nanos: *modified_nanos,
-                    link_group,
-                    data_extents: private_extents,
-                });
             }
         }
-    }
 
-    let metadata = PrivateMetadata {
-        format_version: 3,
-        root_mode: anchor.manifest.root_mode,
-        root_modified_secs: anchor.manifest.root_modified_secs,
-        root_modified_nanos: anchor.manifest.root_modified_nanos,
-        entries: private_entries,
-    };
-    let metadata_bytes = canonical_bytes(&metadata)?;
-    if metadata_bytes.is_empty() || metadata_bytes.len() > V1_MAX_CATALOG_BYTES {
-        bail!("private metadata exceeds the v1 bounded-object limit");
-    }
-    let mut metadata_references = Vec::new();
-    for (metadata_ordinal, plaintext) in metadata_bytes.chunks(V1_SECTOR_SIZE).enumerate() {
-        let id = make_sector_id(
-            keys.node_id(),
-            revision_id,
-            SectorPurpose::Metadata,
-            metadata_ordinal as u64,
-        );
-        let (reference, _) = encrypted_sector(&encryption_key, id, plaintext)?;
-        metadata_references.push(reference.clone());
-        queue_recipe(
-            &mut recipe_records,
-            LocalSectorRecipe {
+        let metadata = PrivateMetadata {
+            format_version: 3,
+            root_mode: anchor.manifest.root_mode,
+            root_modified_secs: anchor.manifest.root_modified_secs,
+            root_modified_nanos: anchor.manifest.root_modified_nanos,
+            entries: private_entries,
+        };
+        let metadata_bytes = canonical_bytes(&metadata)?;
+        if metadata_bytes.is_empty() || metadata_bytes.len() > V1_MAX_CATALOG_BYTES {
+            bail!("private metadata exceeds the v1 bounded-object limit");
+        }
+        let mut metadata_references = Vec::new();
+        for (metadata_ordinal, plaintext) in metadata_bytes.chunks(V1_SECTOR_SIZE).enumerate() {
+            let id = make_sector_id(
+                keys.node_id(),
+                revision_id,
+                SectorPurpose::Metadata,
+                metadata_ordinal as u64,
+            );
+            let (reference, _) = encrypted_sector(&encryption_key, id, plaintext)?;
+            metadata_references.push(reference.clone());
+            queue_recipe(
+                &mut recipe_records,
+                LocalSectorRecipe {
+                    guild_id,
+                    reference,
+                    source: LocalPlaintextSource::Inline(plaintext.to_vec()),
+                },
+            )?;
+        }
+
+        let revision = SignedRecord::sign(
+            b"mutualbackup/user-revision/v1",
+            UserRevision {
+                format_version: 1,
                 guild_id,
-                reference,
-                source: LocalPlaintextSource::Inline(plaintext.to_vec()),
+                cipher_profile: V1_CIPHER_PROFILE,
+                revision_id,
+                owner: keys.node_id(),
+                sequence,
+                parent,
+                metadata_sectors: metadata_references,
+                data_sectors: data_references,
             },
+            keys,
         )?;
+        if canonical_bytes(&revision)?.len() > V1_MAX_CATALOG_BYTES {
+            bail!("revision catalog exceeds the v1 bounded-object limit");
+        }
+        let mut records = recipe_records;
+        records.extend([
+            (
+                ANCHOR_AREA_LOCATION_KIND.to_owned(),
+                anchor.manifest.area.area_id.as_bytes().to_vec(),
+                canonical_bytes(&anchor.manifest.area.path_hint)?,
+            ),
+            (
+                "anchor-manifest".to_owned(),
+                revision_id.as_bytes().to_vec(),
+                canonical_bytes(&anchor.manifest)?,
+            ),
+            (
+                "user-revision".to_owned(),
+                revision_id.as_bytes().to_vec(),
+                canonical_bytes(&revision)?,
+            ),
+            (
+                "user-revision-head".to_owned(),
+                guild_id.to_vec(),
+                canonical_bytes(&revision)?,
+            ),
+        ]);
+        control.finalize_capture_records(revision_id.as_bytes(), &records)?;
+        anchor.commit();
+        Ok(revision)
+    })();
+    match result {
+        Ok(revision) => Ok(revision),
+        Err(error) => {
+            ReflinkAnchor::discard_capture(&intent.plan)
+                .context("discard failed reflink source capture")?;
+            control
+                .abandon_capture_intent(revision_id.as_bytes(), &intent_bytes)
+                .context("retire failed source-capture intent")?;
+            Err(error)
+        }
     }
-
-    let revision = SignedRecord::sign(
-        b"mutualbackup/user-revision/v1",
-        UserRevision {
-            format_version: 1,
-            guild_id,
-            cipher_profile: V1_CIPHER_PROFILE,
-            revision_id,
-            owner: keys.node_id(),
-            sequence,
-            parent,
-            metadata_sectors: metadata_references,
-            data_sectors: data_references,
-        },
-        keys,
-    )?;
-    if canonical_bytes(&revision)?.len() > V1_MAX_CATALOG_BYTES {
-        bail!("revision catalog exceeds the v1 bounded-object limit");
-    }
-    let mut records = recipe_records;
-    records.extend([
-        (
-            ANCHOR_AREA_LOCATION_KIND.to_owned(),
-            anchor.manifest.area.area_id.as_bytes().to_vec(),
-            canonical_bytes(&anchor.manifest.area.path_hint)?,
-        ),
-        (
-            "anchor-manifest".to_owned(),
-            revision_id.as_bytes().to_vec(),
-            canonical_bytes(&anchor.manifest)?,
-        ),
-        (
-            "user-revision".to_owned(),
-            revision_id.as_bytes().to_vec(),
-            canonical_bytes(&revision)?,
-        ),
-        (
-            "user-revision-head".to_owned(),
-            guild_id.to_vec(),
-            canonical_bytes(&revision)?,
-        ),
-    ]);
-    control.finalize_capture_records(revision_id.as_bytes(), &records)?;
-    anchor.commit();
-    Ok(revision)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1837,6 +1852,55 @@ fn hex_id(id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod metadata_compatibility_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn rejected_capture_can_be_repaired_and_replanned() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("capture-replan-{}", Uuid::new_v4()));
+        let source = run_root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("payload"), b"recoverable capture").unwrap();
+        let fifo = source.join("unsupported");
+        let encoded = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([41; 32]));
+        let mut control =
+            ControlStore::open(run_root.join("control.db"), &keys).expect("open control store");
+        let guild_id = [42; 32];
+        let revision_id = Uuid::from_bytes([43; 16]);
+        let first = prepare_revision(&mut control, &keys, guild_id, &source, 1, Some(revision_id));
+        assert!(first.is_err());
+        assert!(
+            control
+                .get_record("capture-intent", revision_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_file(&fifo).unwrap();
+        let revision =
+            prepare_revision(&mut control, &keys, guild_id, &source, 1, Some(revision_id)).unwrap();
+        assert_eq!(revision.value.revision_id, revision_id);
+        let manifest: mb_store::StableAnchorManifest = decode_canonical(
+            &control
+                .get_record("anchor-manifest", revision_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        manifest.remove().unwrap();
+        drop(control);
+        fs::remove_dir_all(run_root).unwrap();
+    }
 
     #[test]
     fn bare_restore_target_uses_the_current_directory() {

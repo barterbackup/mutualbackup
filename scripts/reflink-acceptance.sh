@@ -8,6 +8,10 @@ fi
 
 cargo test -p mb-store anchor::tests::stable_locator_survives_parent_rename --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::nested_btrfs_subvolumes_are_rejected_before_and_during_capture --locked -- --ignored --exact
+cargo test -p mb-store anchor::tests::capture_walk_remains_bound_to_the_open_root --locked -- --ignored --exact
+cargo test -p mb-store anchor::tests::anchor_cleanup_refuses_to_cross_a_child_mount --locked -- --ignored --exact
+cargo test -p mb-store anchor::tests::anchor_area_initialization_recovers_staged_publication --locked -- --ignored --exact
+cargo test -p mb-node snapshot::metadata_compatibility_tests::rejected_capture_can_be_repaired_and_replanned --locked -- --ignored --exact
 cargo test -p mb-node lab::tests::seed_only_recovery_over_five_active_nodes --locked -- --ignored --exact
 cargo test -p mb-node network::tests::signed_network_commit_and_seed_recovery --locked -- --ignored --exact
 cargo test -p mb-node network::p2p::tests::repeated_multi_owner_backups_commit_over_quic --locked -- --ignored --exact
