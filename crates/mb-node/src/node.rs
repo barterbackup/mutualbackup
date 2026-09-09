@@ -146,6 +146,40 @@ struct DhtPublicationState {
     expires_at_unix_seconds: u64,
 }
 
+const MAX_DHT_OBSERVED_SEQUENCES: usize = 64;
+const MAX_DHT_OBSERVED_RECORD_BYTES: usize = 16 * 1024;
+const MAX_DHT_OBSERVED_ENDPOINT_SCOPES: usize = 1_024;
+const MAX_DHT_OBSERVED_RECOVERY_SCOPES: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DhtRecordObservation {
+    pub sequence: u64,
+    pub expires_at_unix_seconds: u64,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct DhtObservationState {
+    format_version: u16,
+    highest_sequence: u64,
+    hashes: Vec<DhtObservedHash>,
+    current: DhtObservedRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct DhtObservedHash {
+    sequence: u64,
+    hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct DhtObservedRecord {
+    sequence: u64,
+    hash: [u8; 32],
+    expires_at_unix_seconds: u64,
+    bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotInfo {
     pub revision_id: Uuid,
@@ -2057,6 +2091,135 @@ impl Node {
             .collect())
     }
 
+    pub(crate) fn observe_dht_records(
+        &mut self,
+        kind: &str,
+        record_id: &[u8],
+        incoming: Vec<DhtRecordObservation>,
+    ) -> Result<Option<Vec<u8>>> {
+        if !matches!(kind, "dht-observed-endpoint" | "dht-observed-recovery")
+            || record_id.is_empty()
+            || record_id.len() > 64
+            || incoming.len() > MAX_DHT_OBSERVED_SEQUENCES
+        {
+            anyhow::bail!("invalid durable DHT observation scope");
+        }
+        let now = unix_seconds();
+        let stored = self.control.get_record(kind, record_id)?;
+        if stored.is_none() && !incoming.is_empty() {
+            let maximum = match kind {
+                "dht-observed-endpoint" => MAX_DHT_OBSERVED_ENDPOINT_SCOPES,
+                "dht-observed-recovery" => MAX_DHT_OBSERVED_RECOVERY_SCOPES,
+                _ => unreachable!("kind was validated above"),
+            };
+            if self.control.records(kind)?.len() >= maximum {
+                anyhow::bail!("durable DHT observation scope limit reached");
+            }
+        }
+        let mut hashes = BTreeMap::<u64, [u8; 32]>::new();
+        let mut current = None;
+        if let Some(bytes) = stored {
+            let state: DhtObservationState = decode_canonical(&bytes)?;
+            validate_dht_observation_state(&state)?;
+            for observed in state.hashes {
+                hashes.insert(observed.sequence, observed.hash);
+            }
+            current = Some(state.current);
+        }
+
+        let mut incoming_by_sequence = BTreeMap::<u64, DhtObservedRecord>::new();
+        for record in incoming {
+            if record.sequence == 0
+                || record.expires_at_unix_seconds <= now
+                || record.bytes.is_empty()
+                || record.bytes.len() > MAX_DHT_OBSERVED_RECORD_BYTES
+            {
+                anyhow::bail!("invalid accepted DHT observation");
+            }
+            let observed = DhtObservedRecord {
+                sequence: record.sequence,
+                hash: *blake3::hash(&record.bytes).as_bytes(),
+                expires_at_unix_seconds: record.expires_at_unix_seconds,
+                bytes: record.bytes,
+            };
+            if let Some(existing) = incoming_by_sequence.get(&observed.sequence) {
+                if existing.hash != observed.hash {
+                    anyhow::bail!("DHT publisher forked an observed sequence");
+                }
+            } else {
+                incoming_by_sequence.insert(observed.sequence, observed);
+            }
+        }
+
+        for observed in incoming_by_sequence.into_values() {
+            if let Some(existing_hash) = hashes.get(&observed.sequence) {
+                if *existing_hash != observed.hash {
+                    anyhow::bail!("DHT publisher forked an observed sequence");
+                }
+                continue;
+            }
+            if hashes
+                .last_key_value()
+                .is_some_and(|(highest, _)| observed.sequence < *highest)
+            {
+                continue;
+            }
+            hashes.insert(observed.sequence, observed.hash);
+            current = Some(observed);
+        }
+
+        while hashes.len() > MAX_DHT_OBSERVED_SEQUENCES {
+            let oldest = *hashes
+                .keys()
+                .next()
+                .context("nonempty DHT observation set has no first key")?;
+            hashes.remove(&oldest);
+        }
+        let Some((highest_sequence, _)) = hashes.last_key_value() else {
+            return Ok(None);
+        };
+        let current = current.context("durable DHT high-water mark has no current record")?;
+        if current.sequence != *highest_sequence {
+            anyhow::bail!("durable DHT current record is not the high-water mark");
+        }
+        let selected = (current.expires_at_unix_seconds > now).then(|| current.bytes.clone());
+        self.control.put_record(
+            kind,
+            record_id,
+            &canonical_bytes(&DhtObservationState {
+                format_version: 1,
+                highest_sequence: *highest_sequence,
+                hashes: hashes
+                    .into_iter()
+                    .map(|(sequence, hash)| DhtObservedHash { sequence, hash })
+                    .collect(),
+                current,
+            })?,
+        )?;
+        Ok(selected)
+    }
+
+    pub(crate) fn observed_recovery_records(
+        &mut self,
+        subject: NodeId,
+    ) -> Result<Vec<([u8; 32], Vec<u8>)>> {
+        let records = self.control.records("dht-observed-recovery")?;
+        let mut selected = Vec::new();
+        for (record_id, _) in records {
+            if record_id.len() != 64 || record_id[..32] != subject.0 {
+                continue;
+            }
+            if let Some(bytes) =
+                self.observe_dht_records("dht-observed-recovery", &record_id, Vec::new())?
+            {
+                let mut provider_hash = [0_u8; 32];
+                provider_hash.copy_from_slice(&record_id[32..]);
+                selected.push((provider_hash, bytes));
+            }
+        }
+        Ok(selected)
+    }
+
     pub fn update_seed_recovery_readiness(
         &mut self,
         checkpoint_hash: [u8; 32],
@@ -2879,6 +3042,45 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
+fn validate_dht_observation(record: &DhtObservedRecord) -> Result<()> {
+    if record.sequence == 0
+        || record.bytes.is_empty()
+        || record.bytes.len() > MAX_DHT_OBSERVED_RECORD_BYTES
+        || blake3::hash(&record.bytes).as_bytes() != &record.hash
+    {
+        anyhow::bail!("invalid durable DHT observation");
+    }
+    Ok(())
+}
+
+fn validate_dht_observation_state(state: &DhtObservationState) -> Result<()> {
+    if state.format_version != 1
+        || state.highest_sequence == 0
+        || state.hashes.is_empty()
+        || state.hashes.len() > MAX_DHT_OBSERVED_SEQUENCES
+    {
+        anyhow::bail!("invalid durable DHT observation state");
+    }
+    validate_dht_observation(&state.current)?;
+    let mut previous = 0;
+    for observed in &state.hashes {
+        if observed.sequence <= previous {
+            anyhow::bail!("invalid durable DHT observation ordering");
+        }
+        previous = observed.sequence;
+    }
+    if previous != state.highest_sequence
+        || state.current.sequence != state.highest_sequence
+        || state
+            .hashes
+            .last()
+            .is_none_or(|observed| observed.hash != state.current.hash)
+    {
+        anyhow::bail!("invalid durable DHT observation high-water mark");
+    }
+    Ok(())
+}
+
 fn deterministic_revision_id(guild_id: [u8; 32], owner: NodeId, sequence: u64) -> Uuid {
     let mut hasher = blake3::Hasher::new_derive_key("mutualbackup revision operation v1");
     hasher.update(&guild_id);
@@ -3189,6 +3391,122 @@ mod tests {
                 .next_recovery_publication_sequence(&slot, 9)
                 .unwrap(),
             9
+        );
+    }
+
+    #[test]
+    fn accepted_dht_sequences_reject_rollback_and_forks_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([82; 32]);
+        let record_id = [81; 32];
+        let expires = unix_seconds() + 300;
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        assert_eq!(
+            node.observe_dht_records(
+                "dht-observed-endpoint",
+                &record_id,
+                vec![
+                    DhtRecordObservation {
+                        sequence: 1,
+                        expires_at_unix_seconds: expires,
+                        bytes: b"first".to_vec(),
+                    },
+                    DhtRecordObservation {
+                        sequence: 2,
+                        expires_at_unix_seconds: expires,
+                        bytes: b"second".to_vec(),
+                    },
+                ],
+            )
+            .unwrap(),
+            Some(b"second".to_vec())
+        );
+        assert_eq!(
+            node.observe_dht_records("dht-observed-endpoint", &record_id, Vec::new())
+                .unwrap(),
+            Some(b"second".to_vec())
+        );
+        drop(node);
+
+        let mut reopened = Node::open(temp.path(), seed).unwrap();
+        assert_eq!(
+            reopened
+                .observe_dht_records(
+                    "dht-observed-endpoint",
+                    &record_id,
+                    vec![DhtRecordObservation {
+                        sequence: 1,
+                        expires_at_unix_seconds: expires,
+                        bytes: b"first".to_vec(),
+                    }],
+                )
+                .unwrap(),
+            Some(b"second".to_vec())
+        );
+        assert!(
+            reopened
+                .observe_dht_records(
+                    "dht-observed-endpoint",
+                    &record_id,
+                    vec![DhtRecordObservation {
+                        sequence: 1,
+                        expires_at_unix_seconds: expires,
+                        bytes: b"fork".to_vec(),
+                    }],
+                )
+                .is_err()
+        );
+
+        let mut state: DhtObservationState = decode_canonical(
+            &reopened
+                .control
+                .get_record("dht-observed-endpoint", &record_id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        state.current.expires_at_unix_seconds = unix_seconds().saturating_sub(1);
+        reopened
+            .control
+            .put_record(
+                "dht-observed-endpoint",
+                &record_id,
+                &canonical_bytes(&state).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            reopened
+                .observe_dht_records("dht-observed-endpoint", &record_id, Vec::new())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            reopened
+                .observe_dht_records(
+                    "dht-observed-endpoint",
+                    &record_id,
+                    vec![DhtRecordObservation {
+                        sequence: 1,
+                        expires_at_unix_seconds: expires,
+                        bytes: b"first".to_vec(),
+                    }],
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            reopened
+                .observe_dht_records(
+                    "dht-observed-endpoint",
+                    &record_id,
+                    vec![DhtRecordObservation {
+                        sequence: 3,
+                        expires_at_unix_seconds: expires,
+                        bytes: b"third".to_vec(),
+                    }],
+                )
+                .unwrap(),
+            Some(b"third".to_vec())
         );
     }
 

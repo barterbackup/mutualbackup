@@ -6,7 +6,7 @@ use libp2p::Multiaddr;
 use mb_node::{
     LocalControlListener, LocalRequest, LocalResponse, LockedDataDir, Node, P2pConfig, P2pStartup,
     UnlockSecret, WireError, bind_local_control, build_p2p, run_coordinator_jobs,
-    run_dht_publications, run_root_watcher, serve_local_control_on,
+    run_dht_publications, run_relay_membership_sync, run_root_watcher, serve_local_control_on,
 };
 use mutualbackup::{
     DaemonOptions, DaemonOptionsError, IdentityManifest, InitializationIntent, read_daemon_options,
@@ -93,6 +93,7 @@ async fn main() -> Result<()> {
         result = serve_local_control_on(node.clone(), p2p_client.clone(), listener) => result,
         result = run_coordinator_jobs(node.clone(), p2p_client.clone()) => result,
         result = run_dht_publications(node.clone(), p2p_client.clone()), if config.enable_dht_maintenance => result,
+        result = run_relay_membership_sync(node.clone(), p2p_client.clone()) => result,
         result = run_root_watcher(node.clone()) => result,
         result = &mut p2p_task => result.context("libp2p event-loop task failed")?,
         result = tokio::signal::ctrl_c() => {

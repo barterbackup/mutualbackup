@@ -28,7 +28,7 @@ use mb_core::{
 use mb_store::ParityObject;
 use uuid::Uuid;
 
-use crate::node::{GuildPhase, SnapshotInfo};
+use crate::node::{DhtRecordObservation, GuildPhase, SnapshotInfo};
 
 use super::{
     BackupDescriptor, BackupJob, CheckpointObjectKind, DhtSequenceFloors, GuildPeer,
@@ -53,6 +53,8 @@ const MAX_DHT_RECORDS_PER_QUERY: usize = 64;
 const MAX_DHT_PROVIDERS_PER_QUERY: usize = 64;
 const MAX_LEARNED_ENDPOINT_PEERS: usize = 1_024;
 const MAX_ENDPOINTS_PER_PEER: usize = 8;
+const MAX_RECOVERY_ADDRESS_SCOPES: usize = 4;
+const MAX_RECOVERY_ADDRESS_PEERS: usize = 64;
 const MAX_RELAY_RESERVATIONS: usize = 5;
 const MAX_RELAY_CIRCUITS: usize = 8;
 const MAX_RELAY_CIRCUIT_BYTES: u64 = 8 * 1024 * 1024;
@@ -174,6 +176,7 @@ pub struct P2pEventLoop {
     relay_members: RelayMembers,
     persistent_addresses: HashMap<PeerId, BTreeSet<Multiaddr>>,
     learned_addresses: HashMap<PeerId, LearnedAddresses>,
+    recovery_addresses: HashMap<Uuid, RecoveryAddresses>,
     learned_endpoint_expiry: tokio::time::Interval,
     connection_paths: HashMap<ConnectionId, (PeerId, P2pPath)>,
     last_application_paths: HashMap<PeerId, P2pPath>,
@@ -204,6 +207,17 @@ enum Command {
     AddLearnedAddress {
         peer: PeerId,
         address: Multiaddr,
+        response: oneshot::Sender<Result<()>>,
+    },
+    AddRecoveryAddresses {
+        scope: Uuid,
+        peer: PeerId,
+        addresses: Vec<Multiaddr>,
+        expires_at_unix_seconds: u64,
+        response: oneshot::Sender<Result<()>>,
+    },
+    ClearRecoveryAddresses {
+        scope: Uuid,
         response: oneshot::Sender<Result<()>>,
     },
     ReplaceLearnedAddresses {
@@ -267,6 +281,11 @@ struct InboundResult {
 
 struct LearnedAddresses {
     addresses: BTreeSet<Multiaddr>,
+    expires_at: tokio::time::Instant,
+}
+
+struct RecoveryAddresses {
+    addresses: HashMap<PeerId, BTreeSet<Multiaddr>>,
     expires_at: tokio::time::Instant,
 }
 
@@ -535,6 +554,7 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
             relay_members,
             persistent_addresses,
             learned_addresses: HashMap::new(),
+            recovery_addresses: HashMap::new(),
             learned_endpoint_expiry: retry_interval(LEARNED_ENDPOINT_EXPIRY_INTERVAL),
             connection_paths: HashMap::new(),
             last_application_paths: HashMap::new(),
@@ -564,6 +584,41 @@ impl P2pClient {
             .await
             .context("libp2p event loop stopped")?;
         receiver.await.context("libp2p address command was lost")?
+    }
+
+    async fn add_recovery_addresses(
+        &self,
+        scope: Uuid,
+        peer: NodeId,
+        addresses: Vec<Multiaddr>,
+        expires_at_unix_seconds: u64,
+    ) -> Result<()> {
+        let peer = peer.libp2p_peer_id()?;
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(Command::AddRecoveryAddresses {
+                scope,
+                peer,
+                addresses,
+                expires_at_unix_seconds,
+                response,
+            })
+            .await
+            .context("libp2p event loop stopped")?;
+        receiver
+            .await
+            .context("libp2p recovery-address command was lost")?
+    }
+
+    async fn clear_recovery_addresses(&self, scope: Uuid) -> Result<()> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(Command::ClearRecoveryAddresses { scope, response })
+            .await
+            .context("libp2p event loop stopped")?;
+        receiver
+            .await
+            .context("libp2p recovery-address cleanup was lost")?
     }
 
     async fn replace_learned_peer_addresses(
@@ -1056,6 +1111,10 @@ impl P2pEventLoop {
         self.persistent_addresses.contains_key(&peer)
             || self.learned_addresses.contains_key(&peer)
             || self
+                .recovery_addresses
+                .values()
+                .any(|scope| scope.addresses.contains_key(&peer))
+            || self
                 .relay_members
                 .read()
                 .is_ok_and(|members| members.contains(&peer))
@@ -1131,8 +1190,9 @@ impl P2pEventLoop {
                 _ = self.relay_retirement_tick.tick(), if !self.relay_retirement.is_empty() => {
                     self.retire_idle_relay_connections();
                 }
-                _ = self.learned_endpoint_expiry.tick(), if !self.learned_addresses.is_empty() => {
+                _ = self.learned_endpoint_expiry.tick(), if !self.learned_addresses.is_empty() || !self.recovery_addresses.is_empty() => {
                     self.expire_learned_addresses();
+                    self.expire_recovery_addresses();
                 }
                 event = self.swarm.select_next_some() => {
                     self.handle_swarm_event(event);
@@ -1261,11 +1321,7 @@ impl P2pEventLoop {
         let previous = self.learned_addresses.remove(&peer);
         if let Some(previous) = previous {
             for address in previous.addresses.difference(&normalized) {
-                let persistent = self
-                    .persistent_addresses
-                    .get(&peer)
-                    .is_some_and(|addresses| addresses.contains(address));
-                if !persistent {
+                if !self.address_retained_outside_learned(peer, address) {
                     remove_known_address(&mut self.swarm, peer, address);
                 }
             }
@@ -1317,6 +1373,106 @@ impl P2pEventLoop {
         Ok(())
     }
 
+    fn add_recovery_addresses(
+        &mut self,
+        scope_id: Uuid,
+        peer: PeerId,
+        addresses: Vec<Multiaddr>,
+        expires_at_unix_seconds: u64,
+    ) -> Result<()> {
+        let now_unix = unix_seconds();
+        if addresses.is_empty()
+            || addresses.len() > MAX_ENDPOINTS_PER_PEER
+            || expires_at_unix_seconds <= now_unix
+        {
+            bail!("invalid attempt-scoped recovery endpoints");
+        }
+        if !self.recovery_addresses.contains_key(&scope_id)
+            && self.recovery_addresses.len() >= MAX_RECOVERY_ADDRESS_SCOPES
+        {
+            bail!("too many recovery endpoint scopes");
+        }
+        let scope = self
+            .recovery_addresses
+            .entry(scope_id)
+            .or_insert_with(|| RecoveryAddresses {
+                addresses: HashMap::new(),
+                expires_at: tokio::time::Instant::now() + DHT_TTL,
+            });
+        if !scope.addresses.contains_key(&peer)
+            && scope.addresses.len() >= MAX_RECOVERY_ADDRESS_PEERS
+        {
+            bail!("recovery endpoint scope has too many peers");
+        }
+        let lifetime = Duration::from_secs(
+            expires_at_unix_seconds
+                .saturating_sub(now_unix)
+                .min(DHT_TTL.as_secs()),
+        );
+        scope.expires_at = scope.expires_at.min(tokio::time::Instant::now() + lifetime);
+        let peer_addresses = scope.addresses.entry(peer).or_default();
+        for address in addresses {
+            let address = normalize_known_address(peer, address)?;
+            if !peer_addresses.contains(&address) && peer_addresses.len() >= MAX_ENDPOINTS_PER_PEER
+            {
+                bail!("recovery peer has too many attempt-scoped endpoints");
+            }
+            self.swarm.add_peer_address(peer, address.clone());
+            self.swarm
+                .behaviour_mut()
+                .kademlia
+                .add_address(&peer, address.clone());
+            peer_addresses.insert(address);
+        }
+        Ok(())
+    }
+
+    fn clear_recovery_addresses(&mut self, scope_id: Uuid) {
+        let Some(scope) = self.recovery_addresses.remove(&scope_id) else {
+            return;
+        };
+        for (peer, addresses) in scope.addresses {
+            for address in addresses {
+                if !self.address_retained(peer, &address) {
+                    remove_known_address(&mut self.swarm, peer, &address);
+                }
+            }
+            self.forget_transfer_history_if_unretained(peer);
+        }
+    }
+
+    fn expire_recovery_addresses(&mut self) {
+        let now = tokio::time::Instant::now();
+        let expired = self
+            .recovery_addresses
+            .iter()
+            .filter_map(|(scope, addresses)| (addresses.expires_at <= now).then_some(*scope))
+            .collect::<Vec<_>>();
+        for scope in expired {
+            self.clear_recovery_addresses(scope);
+        }
+    }
+
+    fn address_retained_outside_learned(&self, peer: PeerId, address: &Multiaddr) -> bool {
+        self.persistent_addresses
+            .get(&peer)
+            .is_some_and(|addresses| addresses.contains(address))
+            || self.recovery_addresses.values().any(|scope| {
+                scope
+                    .addresses
+                    .get(&peer)
+                    .is_some_and(|addresses| addresses.contains(address))
+            })
+    }
+
+    fn address_retained(&self, peer: PeerId, address: &Multiaddr) -> bool {
+        self.address_retained_outside_learned(peer, address)
+            || self
+                .learned_addresses
+                .get(&peer)
+                .is_some_and(|addresses| addresses.addresses.contains(address))
+    }
+
     fn expire_learned_addresses(&mut self) {
         let now = tokio::time::Instant::now();
         let expired = self
@@ -1329,11 +1485,7 @@ impl P2pEventLoop {
                 continue;
             };
             for address in addresses.addresses {
-                let persistent = self
-                    .persistent_addresses
-                    .get(&peer)
-                    .is_some_and(|addresses| addresses.contains(&address));
-                if !persistent {
+                if !self.address_retained_outside_learned(peer, &address) {
                     remove_known_address(&mut self.swarm, peer, &address);
                 }
             }
@@ -1350,6 +1502,21 @@ impl P2pEventLoop {
             } => {
                 let result = self.add_learned_address(peer, address);
                 let _ = response.send(result);
+            }
+            Command::AddRecoveryAddresses {
+                scope,
+                peer,
+                addresses,
+                expires_at_unix_seconds,
+                response,
+            } => {
+                let result =
+                    self.add_recovery_addresses(scope, peer, addresses, expires_at_unix_seconds);
+                let _ = response.send(result);
+            }
+            Command::ClearRecoveryAddresses { scope, response } => {
+                self.clear_recovery_addresses(scope);
+                let _ = response.send(Ok(()));
             }
             Command::ReplaceLearnedAddresses {
                 peer,
@@ -2057,25 +2224,37 @@ pub async fn run_dht_publications(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Res
     }
 }
 
+pub async fn run_relay_membership_sync(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {
+    loop {
+        if let Err(error) = sync_relay_membership_once(node.clone(), &p2p).await {
+            tracing::warn!(%error, "relay membership synchronization failed");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn sync_relay_membership_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
+    let guild = node_blocking(node, |node| node.guild_summary()).await?;
+    let members = guild
+        .filter(|guild| matches!(guild.phase, GuildPhase::Active))
+        .into_iter()
+        .flat_map(|guild| guild.peers)
+        .map(|peer| peer.member.node_id.libp2p_peer_id())
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    p2p.set_relay_members(members).await
+}
+
 async fn refresh_guild_endpoints(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
-    let (guild, local_id) = node_blocking(node, |node| {
+    let (guild, local_id) = node_blocking(node.clone(), |node| {
         Ok((node.guild_summary()?, node.keys().node_id()))
     })
     .await?;
     let Some(guild) = guild else {
-        p2p.set_relay_members(BTreeSet::new()).await?;
         return Ok(());
     };
     if !matches!(guild.phase, GuildPhase::Active) {
-        p2p.set_relay_members(BTreeSet::new()).await?;
         return Ok(());
     }
-    let relay_members = guild
-        .peers
-        .iter()
-        .filter_map(|peer| peer.member.node_id.libp2p_peer_id().ok())
-        .collect();
-    p2p.set_relay_members(relay_members).await?;
     let mut queries = FuturesUnordered::new();
     for peer in guild.peers {
         if peer.member.node_id == local_id {
@@ -2093,13 +2272,9 @@ async fn refresh_guild_endpoints(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Res
                 continue;
             }
         };
-        let endpoint = match select_endpoint_record(member, records) {
+        let endpoint = match select_durable_endpoint_record(node.clone(), member, records).await {
             Ok(Some(endpoint)) => endpoint,
-            Ok(None) => {
-                p2p.replace_learned_peer_addresses(member, Vec::new(), 0)
-                    .await?;
-                continue;
-            }
+            Ok(None) => continue,
             Err(error) => {
                 tracing::warn!(%member, %error, "guild member published conflicting endpoints");
                 continue;
@@ -2193,15 +2368,25 @@ async fn publish_dht_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()>
         bundle_queries.push(async move { (provider, p2p.get_record(key).await) });
     }
     let mut confirmations = Vec::new();
+    let mut rejected_providers = HashSet::new();
+    let mut considered_publishers = HashSet::new();
     while let Some((provider, records)) = bundle_queries.next().await {
         let Ok(records) = records else {
             tracing::warn!(%provider, "DHT readiness provider lookup failed");
             continue;
         };
-        let bundle = match select_recovery_bundle(&provider, local_id, records) {
+        let bundle = match select_durable_recovery_bundle(
+            node.clone(),
+            &provider,
+            local_id,
+            records,
+        )
+        .await
+        {
             Ok(Some(bundle)) => bundle,
             Ok(None) => continue,
             Err(error) => {
+                rejected_providers.insert(provider.clone());
                 tracing::warn!(%provider, %error, "rejected conflicting DHT readiness records");
                 continue;
             }
@@ -2217,6 +2402,26 @@ async fn publish_dht_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()>
         .await
         .is_ok()
         {
+            considered_publishers.insert(publisher);
+            confirmations.push((publisher, expires_at));
+        }
+    }
+    for (provider, bundle) in retained_recovery_bundles(node.clone(), local_id).await? {
+        let publisher = bundle.value.publisher;
+        if rejected_providers.contains(&provider) || considered_publishers.contains(&publisher) {
+            continue;
+        }
+        let expires_at = bundle.value.expires_at_unix_seconds;
+        if validate_ready_bundle(
+            node.clone(),
+            &provider,
+            publications.checkpoint_hash,
+            bundle,
+        )
+        .await
+        .is_ok()
+        {
+            considered_publishers.insert(publisher);
             confirmations.push((publisher, expires_at));
         }
     }
@@ -2333,15 +2538,19 @@ pub async fn recover_from_dht(
         bundle_queries.push(async move { (provider, p2p.get_record(key).await) });
     }
     let mut candidates = Vec::new();
+    let mut rejected_providers = HashSet::new();
     while let Some((provider, records)) = bundle_queries.next().await {
         let Ok(records) = records else {
             tracing::warn!(%provider, "recovery provider lookup failed");
             continue;
         };
-        let bundle = match select_recovery_bundle(&provider, subject, records) {
+        let bundle = match select_durable_recovery_bundle(node.clone(), &provider, subject, records)
+            .await
+        {
             Ok(Some(bundle)) => bundle,
             Ok(None) => continue,
             Err(error) => {
+                rejected_providers.insert(provider.clone());
                 tracing::warn!(%provider, %error, "recovery provider published conflicting records");
                 continue;
             }
@@ -2356,6 +2565,23 @@ pub async fn recover_from_dht(
             Err(error) => {
                 tracing::warn!(%provider, %error, "ignored invalid recovery candidate");
             }
+        }
+    }
+    for (provider, bundle) in retained_recovery_bundles(node.clone(), subject).await? {
+        if rejected_providers.contains(&provider)
+            || candidates
+                .iter()
+                .any(|candidate| candidate.publisher == bundle.value.publisher)
+        {
+            continue;
+        }
+        match node_blocking(node.clone(), move |node| {
+            decode_recovery_candidate(node, &provider, bundle)
+        })
+        .await
+        {
+            Ok(candidate) => candidates.push(candidate),
+            Err(error) => tracing::warn!(%error, "ignored retained recovery candidate"),
         }
     }
     let mut candidates_by_head = BTreeMap::<_, Vec<RecoveryCandidate>>::new();
@@ -2467,19 +2693,27 @@ pub async fn recover_from_dht(
             peer.endpoints = local_endpoints.clone();
             continue;
         }
+        let mut endpoints_expire_at = None;
         if let Some(candidate) = candidates
             .iter()
             .find(|candidate| candidate.publisher == peer.member.node_id)
         {
             peer.endpoints = candidate.locator.endpoints.clone();
+            endpoints_expire_at = Some(candidate.locator.expires_at_unix_seconds);
         }
-        match select_endpoint_record(
+        match select_durable_endpoint_record(
+            node.clone(),
             peer.member.node_id,
             endpoint_records
                 .remove(&peer.member.node_id)
                 .unwrap_or_default(),
-        ) {
-            Ok(Some(endpoint)) => peer.endpoints = endpoint.value.endpoints,
+        )
+        .await
+        {
+            Ok(Some(endpoint)) => {
+                endpoints_expire_at = Some(endpoint.value.expires_at_unix_seconds);
+                peer.endpoints = endpoint.value.endpoints;
+            }
             Ok(None) => {}
             Err(error) => {
                 tracing::warn!(member = %peer.member.node_id, %error, "ignored conflicting endpoint records");
@@ -2491,14 +2725,29 @@ pub async fn recover_from_dht(
                 tracing::warn!(member = %peer.member.node_id, %endpoint, "ignored malformed endpoint");
                 continue;
             };
-            match p2p.add_peer_address(peer.member.node_id, address).await {
-                Ok(()) => usable_endpoints.push(endpoint.clone()),
-                Err(error) => {
-                    tracing::warn!(member = %peer.member.node_id, %endpoint, %error, "ignored unusable endpoint");
-                }
+            usable_endpoints.push((endpoint.clone(), address));
+        }
+        if let Some(expires_at_unix_seconds) = endpoints_expire_at {
+            let addresses = usable_endpoints
+                .iter()
+                .map(|(_, address)| address.clone())
+                .collect();
+            if let Err(error) = p2p
+                .replace_learned_peer_addresses(
+                    peer.member.node_id,
+                    addresses,
+                    expires_at_unix_seconds,
+                )
+                .await
+            {
+                tracing::warn!(member = %peer.member.node_id, %error, "ignored unusable endpoint set");
+                usable_endpoints.clear();
             }
         }
-        peer.endpoints = usable_endpoints;
+        peer.endpoints = usable_endpoints
+            .into_iter()
+            .map(|(endpoint, _)| endpoint)
+            .collect();
     }
     let recovered_genesis = genesis.clone();
     let recovered_roster = roster.clone();
@@ -2544,74 +2793,91 @@ async fn validate_recovery_head(
     generation: u64,
     candidates: Vec<RecoveryCandidate>,
 ) -> Result<ValidatedRecoveryHead> {
-    for candidate in &candidates {
-        for endpoint in &candidate.locator.endpoints {
-            let Ok(address) = endpoint.parse::<Multiaddr>() else {
-                continue;
-            };
-            if let Err(error) = p2p.add_peer_address(candidate.publisher, address).await {
-                tracing::debug!(publisher = %candidate.publisher, %endpoint, %error, "candidate endpoint was not usable");
+    let scope = Uuid::new_v4();
+    let result = async {
+        for candidate in &candidates {
+            let addresses = candidate
+                .locator
+                .endpoints
+                .iter()
+                .filter_map(|endpoint| endpoint.parse::<Multiaddr>().ok())
+                .collect::<Vec<_>>();
+            if let Err(error) = p2p
+                .add_recovery_addresses(
+                    scope,
+                    candidate.publisher,
+                    addresses,
+                    candidate.locator.expires_at_unix_seconds,
+                )
+                .await
+            {
+                tracing::debug!(publisher = %candidate.publisher, %error, "candidate endpoints were not usable");
             }
         }
-    }
-    let mut state_attempts = FuturesUnordered::new();
-    for candidate in &candidates {
-        let publisher = candidate.publisher;
-        state_attempts.push(async move {
-            let genesis = p2p.guild_genesis(publisher, guild_id).await?;
-            let checkpoint =
-                fetch_p2p_checkpoint(p2p, publisher, guild_id, checkpoint_hash).await?;
-            Ok::<_, anyhow::Error>((genesis, checkpoint))
-        });
-    }
-    while let Some(attempt) = state_attempts.next().await {
-        let Ok((genesis, checkpoint)) = attempt else {
-            continue;
-        };
-        let state_matches = (|| -> Result<bool> {
-            genesis.verify()?;
-            checkpoint.verify()?;
-            Ok(genesis.genesis.guild_id == guild_id
-                && genesis.hash()? == checkpoint.checkpoint.genesis_hash
-                && checkpoint.checkpoint.guild_id == guild_id
-                && checkpoint.checkpoint.generation == generation
-                && checkpoint.hash()? == checkpoint_hash
-                && checkpoint.checkpoint.members == genesis.genesis.members)
-        })()
-        .unwrap_or(false);
-        if !state_matches {
-            continue;
-        }
-        let checkpoint_for_validation = checkpoint.clone();
-        let candidates_for_validation = candidates.clone();
-        let valid_candidates = node_blocking(node.clone(), move |node| {
-            Ok(candidates_for_validation
-                .iter()
-                .filter(|candidate| {
-                    checkpoint_for_validation
-                        .validate_recovery_authority(
-                            node.keys(),
-                            &candidate.locator,
-                            candidate.publisher,
-                        )
-                        .is_ok()
-                })
-                .cloned()
-                .collect::<Vec<_>>())
-        })
-        .await?;
-        if valid_candidates.len() >= 3 {
-            return Ok(ValidatedRecoveryHead {
-                guild_id,
-                checkpoint_hash,
-                generation,
-                genesis,
-                checkpoint,
-                candidates: valid_candidates,
+        let mut state_attempts = FuturesUnordered::new();
+        for candidate in &candidates {
+            let publisher = candidate.publisher;
+            state_attempts.push(async move {
+                let genesis = p2p.guild_genesis(publisher, guild_id).await?;
+                let checkpoint =
+                    fetch_p2p_checkpoint(p2p, publisher, guild_id, checkpoint_hash).await?;
+                Ok::<_, anyhow::Error>((genesis, checkpoint))
             });
         }
+        while let Some(attempt) = state_attempts.next().await {
+            let Ok((genesis, checkpoint)) = attempt else {
+                continue;
+            };
+            let state_matches = (|| -> Result<bool> {
+                genesis.verify()?;
+                checkpoint.verify()?;
+                Ok(genesis.genesis.guild_id == guild_id
+                    && genesis.hash()? == checkpoint.checkpoint.genesis_hash
+                    && checkpoint.checkpoint.guild_id == guild_id
+                    && checkpoint.checkpoint.generation == generation
+                    && checkpoint.hash()? == checkpoint_hash
+                    && checkpoint.checkpoint.members == genesis.genesis.members)
+            })()
+            .unwrap_or(false);
+            if !state_matches {
+                continue;
+            }
+            let checkpoint_for_validation = checkpoint.clone();
+            let candidates_for_validation = candidates.clone();
+            let valid_candidates = node_blocking(node.clone(), move |node| {
+                Ok(candidates_for_validation
+                    .iter()
+                    .filter(|candidate| {
+                        checkpoint_for_validation
+                            .validate_recovery_authority(
+                                node.keys(),
+                                &candidate.locator,
+                                candidate.publisher,
+                            )
+                            .is_ok()
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>())
+            })
+            .await?;
+            if valid_candidates.len() >= 3 {
+                return Ok(ValidatedRecoveryHead {
+                    guild_id,
+                    checkpoint_hash,
+                    generation,
+                    genesis,
+                    checkpoint,
+                    candidates: valid_candidates,
+                });
+            }
+        }
+        bail!("no publisher served a certified state authorizing three recovery locators")
     }
-    bail!("no publisher served a certified state authorizing three recovery locators")
+    .await;
+    if let Err(error) = p2p.clear_recovery_addresses(scope).await {
+        tracing::warn!(%error, "could not clear attempt-scoped recovery endpoints");
+    }
+    result
 }
 
 fn decode_recovery_candidate(
@@ -2653,7 +2919,19 @@ fn select_recovery_bundle(
     subject: NodeId,
     records: Vec<DhtRecord>,
 ) -> Result<Option<SignedRecord<mb_core::RecoveryBundle>>> {
-    let mut selected: Option<(u64, [u8; 32], SignedRecord<mb_core::RecoveryBundle>)> = None;
+    let observations = recovery_bundle_observations(provider_peer_id, subject, records)?;
+    let Some(bytes) = select_current_observation(observations)? else {
+        return Ok(None);
+    };
+    Ok(Some(decode_canonical(&bytes)?))
+}
+
+fn recovery_bundle_observations(
+    provider_peer_id: &str,
+    subject: NodeId,
+    records: Vec<DhtRecord>,
+) -> Result<Vec<DhtRecordObservation>> {
+    let mut observations = Vec::new();
     for record in records {
         let Ok(bundle) = decode_canonical::<SignedRecord<mb_core::RecoveryBundle>>(&record.value)
         else {
@@ -2669,25 +2947,107 @@ fn select_recovery_bundle(
         {
             continue;
         }
-        let hash = *blake3::hash(&canonical_bytes(&bundle)?).as_bytes();
-        match &selected {
-            Some((sequence, existing_hash, _)) if *sequence == bundle.value.sequence => {
-                if *existing_hash != hash {
-                    bail!("recovery publisher forked one DHT sequence");
-                }
-            }
-            Some((sequence, _, _)) if *sequence > bundle.value.sequence => {}
-            _ => selected = Some((bundle.value.sequence, hash, bundle)),
-        }
+        observations.push(DhtRecordObservation {
+            sequence: bundle.value.sequence,
+            expires_at_unix_seconds: bundle.value.expires_at_unix_seconds,
+            bytes: canonical_bytes(&bundle)?,
+        });
     }
-    Ok(selected.map(|(_, _, bundle)| bundle))
+    Ok(observations)
 }
 
 fn select_endpoint_record(
     publisher: NodeId,
     records: Vec<DhtRecord>,
 ) -> Result<Option<SignedRecord<mb_core::EndpointRecord>>> {
-    let mut selected: Option<(u64, [u8; 32], SignedRecord<mb_core::EndpointRecord>)> = None;
+    let observations = endpoint_record_observations(publisher, records)?;
+    let Some(bytes) = select_current_observation(observations)? else {
+        return Ok(None);
+    };
+    Ok(Some(decode_canonical(&bytes)?))
+}
+
+async fn select_durable_endpoint_record(
+    node: Arc<Mutex<Node>>,
+    publisher: NodeId,
+    records: Vec<DhtRecord>,
+) -> Result<Option<SignedRecord<mb_core::EndpointRecord>>> {
+    let observations = endpoint_record_observations(publisher, records)?;
+    let record_id = publisher.0;
+    let selected = node_blocking(node, move |node| {
+        node.observe_dht_records("dht-observed-endpoint", &record_id, observations)
+    })
+    .await?;
+    match selected {
+        Some(bytes) => select_endpoint_record(
+            publisher,
+            vec![DhtRecord {
+                publisher: None,
+                value: bytes,
+            }],
+        ),
+        None => Ok(None),
+    }
+}
+
+async fn select_durable_recovery_bundle(
+    node: Arc<Mutex<Node>>,
+    provider_peer_id: &str,
+    subject: NodeId,
+    records: Vec<DhtRecord>,
+) -> Result<Option<SignedRecord<mb_core::RecoveryBundle>>> {
+    let observations = recovery_bundle_observations(provider_peer_id, subject, records)?;
+    let mut record_id = [0_u8; 64];
+    record_id[..32].copy_from_slice(&subject.0);
+    record_id[32..].copy_from_slice(blake3::hash(provider_peer_id.as_bytes()).as_bytes());
+    let selected = node_blocking(node, move |node| {
+        node.observe_dht_records("dht-observed-recovery", &record_id, observations)
+    })
+    .await?;
+    match selected {
+        Some(bytes) => select_recovery_bundle(
+            provider_peer_id,
+            subject,
+            vec![DhtRecord {
+                publisher: None,
+                value: bytes,
+            }],
+        ),
+        None => Ok(None),
+    }
+}
+
+async fn retained_recovery_bundles(
+    node: Arc<Mutex<Node>>,
+    subject: NodeId,
+) -> Result<Vec<(String, SignedRecord<mb_core::RecoveryBundle>)>> {
+    let records = node_blocking(node, move |node| node.observed_recovery_records(subject)).await?;
+    let mut bundles = Vec::new();
+    for (provider_hash, bytes) in records {
+        let bundle: SignedRecord<mb_core::RecoveryBundle> = decode_canonical(&bytes)?;
+        let provider = bundle.value.publisher.libp2p_peer_id()?.to_string();
+        if blake3::hash(provider.as_bytes()).as_bytes() != &provider_hash {
+            bail!("durable recovery observation is stored under another provider");
+        }
+        if let Some(bundle) = select_recovery_bundle(
+            &provider,
+            subject,
+            vec![DhtRecord {
+                publisher: None,
+                value: bytes,
+            }],
+        )? {
+            bundles.push((provider, bundle));
+        }
+    }
+    Ok(bundles)
+}
+
+fn endpoint_record_observations(
+    publisher: NodeId,
+    records: Vec<DhtRecord>,
+) -> Result<Vec<DhtRecordObservation>> {
+    let mut observations = Vec::new();
     for record in records {
         let Ok(endpoint) = decode_canonical::<SignedRecord<mb_core::EndpointRecord>>(&record.value)
         else {
@@ -2703,18 +3063,30 @@ fn select_endpoint_record(
         {
             continue;
         }
-        let hash = *blake3::hash(&canonical_bytes(&endpoint)?).as_bytes();
-        match &selected {
-            Some((sequence, existing_hash, _)) if *sequence == endpoint.value.sequence => {
-                if *existing_hash != hash {
-                    bail!("endpoint publisher forked one DHT sequence");
-                }
+        observations.push(DhtRecordObservation {
+            sequence: endpoint.value.sequence,
+            expires_at_unix_seconds: endpoint.value.expires_at_unix_seconds,
+            bytes: canonical_bytes(&endpoint)?,
+        });
+    }
+    Ok(observations)
+}
+
+fn select_current_observation(observations: Vec<DhtRecordObservation>) -> Result<Option<Vec<u8>>> {
+    let mut by_sequence = BTreeMap::<u64, ([u8; 32], Vec<u8>)>::new();
+    for observation in observations {
+        let hash = *blake3::hash(&observation.bytes).as_bytes();
+        if let Some((existing_hash, _)) = by_sequence.get(&observation.sequence) {
+            if *existing_hash != hash {
+                bail!("DHT publisher forked one sequence");
             }
-            Some((sequence, _, _)) if *sequence > endpoint.value.sequence => {}
-            _ => selected = Some((endpoint.value.sequence, hash, endpoint)),
+        } else {
+            by_sequence.insert(observation.sequence, (hash, observation.bytes));
         }
     }
-    Ok(selected.map(|(_, _, endpoint)| endpoint))
+    Ok(by_sequence
+        .last_key_value()
+        .map(|(_, (_, bytes))| bytes.clone()))
 }
 
 fn valid_endpoint_values(publisher: NodeId, endpoints: &[String]) -> bool {
@@ -2735,7 +3107,7 @@ fn valid_endpoint_values(publisher: NodeId, endpoints: &[String]) -> bool {
 }
 
 fn highest_endpoint_sequence(publisher: NodeId, records: Vec<DhtRecord>) -> Result<Option<u64>> {
-    let mut highest = None;
+    let mut observed = BTreeMap::new();
     for record in records {
         let Ok(endpoint) = decode_canonical::<SignedRecord<mb_core::EndpointRecord>>(&record.value)
         else {
@@ -2746,10 +3118,14 @@ fn highest_endpoint_sequence(publisher: NodeId, records: Vec<DhtRecord>) -> Resu
             && endpoint.value.publisher == publisher
             && endpoint.value.sequence > 0
         {
-            highest = Some(highest.unwrap_or(0).max(endpoint.value.sequence));
+            insert_sequence_hash(
+                &mut observed,
+                endpoint.value.sequence,
+                *blake3::hash(&canonical_bytes(&endpoint)?).as_bytes(),
+            )?;
         }
     }
-    Ok(highest)
+    Ok(observed.last_key_value().map(|(sequence, _)| *sequence))
 }
 
 fn highest_recovery_sequence(
@@ -2757,7 +3133,7 @@ fn highest_recovery_sequence(
     subject: NodeId,
     records: Vec<DhtRecord>,
 ) -> Result<Option<u64>> {
-    let mut highest = None;
+    let mut observed = BTreeMap::new();
     for record in records {
         let Ok(bundle) = decode_canonical::<SignedRecord<mb_core::RecoveryBundle>>(&record.value)
         else {
@@ -2770,10 +3146,27 @@ fn highest_recovery_sequence(
             && bundle.value.sequence > 0
             && bundle.value.publisher.libp2p_peer_id()?.to_string() == provider_peer_id
         {
-            highest = Some(highest.unwrap_or(0).max(bundle.value.sequence));
+            insert_sequence_hash(
+                &mut observed,
+                bundle.value.sequence,
+                *blake3::hash(&canonical_bytes(&bundle)?).as_bytes(),
+            )?;
         }
     }
-    Ok(highest)
+    Ok(observed.last_key_value().map(|(sequence, _)| *sequence))
+}
+
+fn insert_sequence_hash(
+    observed: &mut BTreeMap<u64, [u8; 32]>,
+    sequence: u64,
+    hash: [u8; 32],
+) -> Result<()> {
+    if let Some(existing) = observed.insert(sequence, hash)
+        && existing != hash
+    {
+        bail!("DHT publisher forked one sequence");
+    }
+    Ok(())
 }
 
 fn next_sequence_floor(highest: Option<u64>) -> Result<u64> {
@@ -4057,6 +4450,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn uncertified_recovery_addresses_are_attempt_scoped() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::open(temp.path(), Seed::from_bytes([69; 32])).unwrap();
+        let local_id = node.keys().node_id();
+        let (_client, mut event_loop) =
+            build_p2p(Arc::new(Mutex::new(node)), config(local_id)).unwrap();
+        let peer = KeyMaterial::from_seed(&Seed::from_bytes([68; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let address: Multiaddr = format!("/ip4/127.0.0.1/udp/4300/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+        let scope = Uuid::new_v4();
+
+        event_loop
+            .add_recovery_addresses(scope, peer, vec![address], unix_seconds() + 300)
+            .unwrap();
+
+        assert!(event_loop.recovery_addresses.contains_key(&scope));
+        assert!(!event_loop.learned_addresses.contains_key(&peer));
+        event_loop.clear_recovery_addresses(scope);
+        assert!(!event_loop.recovery_addresses.contains_key(&scope));
+        assert!(!event_loop.retains_transfer_history(peer));
+    }
+
     async fn listening_address(client: &P2pClient) -> Multiaddr {
         for _ in 0..100 {
             let status = client.status().await.unwrap();
@@ -4097,6 +4517,74 @@ mod tests {
             .unwrap();
         assert_eq!(selected.value.sequence, 2);
         assert!(select_endpoint_record(publisher, vec![make(3, 3), make(3, 4)]).is_err());
+        assert!(
+            select_endpoint_record(publisher, vec![make(4, 5), make(3, 3), make(3, 4)]).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_recovery_bundle_survives_empty_queries_and_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let subject_seed = Seed::from_bytes([76; 32]);
+        let subject = KeyMaterial::from_seed(&subject_seed).node_id();
+        let publisher_keys = KeyMaterial::from_seed(&Seed::from_bytes([75; 32]));
+        let publisher = publisher_keys.node_id();
+        let provider = publisher.libp2p_peer_id().unwrap().to_string();
+        let expires = unix_seconds() + 300;
+        let make = |sequence, marker| {
+            let value = mb_core::RecoveryBundle {
+                format_version: 1,
+                subject,
+                publisher,
+                sequence,
+                expires_at_unix_seconds: expires,
+                sealed: mb_core::SealedRecoveryRecord {
+                    format_version: 1,
+                    ephemeral_public_key: [marker; 32],
+                    nonce: [marker; 24],
+                    ciphertext: vec![marker; 64],
+                },
+            };
+            let signed =
+                SignedRecord::sign(b"mutualbackup/recovery-bundle/v1", value, &publisher_keys)
+                    .unwrap();
+            DhtRecord {
+                publisher: None,
+                value: canonical_bytes(&signed).unwrap(),
+            }
+        };
+        let node = Arc::new(Mutex::new(
+            Node::open(temp.path(), subject_seed.clone()).unwrap(),
+        ));
+        let selected = select_durable_recovery_bundle(
+            node.clone(),
+            &provider,
+            subject,
+            vec![make(1, 1), make(2, 2)],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.value.sequence, 2);
+        drop(node);
+
+        let reopened = Arc::new(Mutex::new(Node::open(temp.path(), subject_seed).unwrap()));
+        let selected =
+            select_durable_recovery_bundle(reopened.clone(), &provider, subject, Vec::new())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(selected.value.sequence, 2);
+        let retained = retained_recovery_bundles(reopened.clone(), subject)
+            .await
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].1.value.sequence, 2);
+        assert!(
+            select_durable_recovery_bundle(reopened, &provider, subject, vec![make(1, 9)],)
+                .await
+                .is_err()
+        );
     }
 
     fn peer_endpoint(client: &P2pClient, address: Multiaddr) -> String {
@@ -4634,6 +5122,55 @@ mod tests {
             let reopened = node.installed_guild_certificate().unwrap().unwrap();
             assert_eq!(reopened, certificate);
             reopened.verify().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_membership_updates_when_dht_maintenance_is_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds = (86_u8..=90)
+            .map(|value| Seed::from_bytes([value; 32]))
+            .collect::<Vec<_>>();
+        let mut nodes = Vec::new();
+        let mut clients = Vec::new();
+        let mut relay_members = Vec::new();
+        let mut tasks = Vec::new();
+        for (index, seed) in seeds.into_iter().enumerate() {
+            let node = Node::open(temp.path().join(format!("node-{index}")), seed).unwrap();
+            let node_id = node.keys().node_id();
+            let node = Arc::new(Mutex::new(node));
+            let mut node_config = config(node_id);
+            node_config.enable_dht_maintenance = false;
+            let (client, event_loop) = build_p2p(node.clone(), node_config).unwrap();
+            relay_members.push(event_loop.relay_members.clone());
+            nodes.push(node);
+            clients.push(client);
+            tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let addresses = futures::future::join_all(clients.iter().map(listening_address)).await;
+        let endpoints = clients
+            .iter()
+            .zip(addresses.iter().cloned())
+            .map(|(client, address)| peer_endpoint(client, address))
+            .collect::<Vec<_>>();
+        form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+
+        for (node, client) in nodes.iter().zip(&clients) {
+            sync_relay_membership_once(node.clone(), client)
+                .await
+                .unwrap();
+        }
+        assert!(
+            relay_members
+                .iter()
+                .all(|members| members.read().is_ok_and(|members| members.len() == 5))
+        );
+
+        for client in &clients {
+            client.shutdown().await.unwrap();
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
         }
     }
 

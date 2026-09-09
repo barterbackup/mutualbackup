@@ -51,7 +51,7 @@ pub use p2p::{
     DhtRecord, DhtRecoveryResult, P2pClient, P2pConfig, P2pEventLoop, P2pPath, P2pPathTransfer,
     P2pPeerProfile, P2pPeerStatus, P2pStartup, P2pStartupReceiver, P2pStatus, build_p2p,
     endpoint_record_key, recover_from_dht, recovery_bundle_key, recovery_mailbox_key,
-    run_coordinator_jobs, run_dht_publications,
+    run_coordinator_jobs, run_dht_publications, run_relay_membership_sync,
 };
 use wire::*;
 
