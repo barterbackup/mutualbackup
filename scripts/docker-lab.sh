@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
 
 LAB_ROOT=${MUTUALBACKUP_DOCKER_LAB_ROOT:-"$REPO_ROOT/.docker-lab"}
 if [[ $LAB_ROOT != /* ]]; then
@@ -24,10 +24,10 @@ IP_PREFIX=${MUTUALBACKUP_LAB_IP_PREFIX:-172.30.77}
 P2P_BASE_PORT=${MUTUALBACKUP_LAB_P2P_BASE_PORT:-44000}
 NODE_COUNT=5
 
-LAB_CHECKSUM=$(printf '%s' "$LAB_ROOT" | cksum | awk '{print $1}')
-NAME_PREFIX=mutualbackup-lab-$LAB_CHECKSUM
-NETWORK_NAME=$NAME_PREFIX
-LAB_LABEL=io.mutualbackup.lab=$LAB_CHECKSUM
+LAB_CHECKSUM=
+NAME_PREFIX=
+NETWORK_NAME=
+LAB_LABEL=
 
 DOCKER=()
 SUDO=()
@@ -79,6 +79,19 @@ EOF
 }
 
 validate_layout() {
+    command -v readlink >/dev/null || die "readlink is required"
+    [[ $LAB_ROOT != *,* && $CLI_BIN != *,* && $DAEMON_BIN != *,* ]] ||
+        die "Docker lab and binary paths must not contain commas"
+    LAB_ROOT=$(readlink -m -- "$LAB_ROOT") || die "cannot resolve Docker lab root: $LAB_ROOT"
+    [[ $LAB_ROOT == /* ]] || die "resolved Docker lab root is not absolute: $LAB_ROOT"
+    if [[ $LAB_ROOT == / || $REPO_ROOT == "$LAB_ROOT" || $REPO_ROOT == "$LAB_ROOT"/* ]]; then
+        die "refusing unsafe lab root: $LAB_ROOT"
+    fi
+    LAB_CHECKSUM=$(printf '%s' "$LAB_ROOT" | cksum | awk '{print $1}')
+    NAME_PREFIX=mutualbackup-lab-$LAB_CHECKSUM
+    NETWORK_NAME=$NAME_PREFIX
+    LAB_LABEL=io.mutualbackup.lab=$LAB_CHECKSUM
+
     [[ $IP_PREFIX =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] ||
         die "MUTUALBACKUP_LAB_IP_PREFIX must contain three IPv4 octets"
     local octet
@@ -93,10 +106,6 @@ validate_layout() {
     if [[ ! $PARITY_BUDGET_BYTES =~ ^[0-9]+$ ]] || ((10#$PARITY_BUDGET_BYTES == 0)); then
         die "parity budget must be a positive byte count"
     fi
-    [[ $LAB_ROOT != / && $LAB_ROOT != "$REPO_ROOT" ]] ||
-        die "refusing unsafe lab root: $LAB_ROOT"
-    [[ $LAB_ROOT != *,* && $CLI_BIN != *,* && $DAEMON_BIN != *,* ]] ||
-        die "Docker lab and binary paths must not contain commas"
 }
 
 validate_node() {
@@ -469,6 +478,14 @@ publish_new_filesystem_image() {
     sync "$(dirname "$image")"
 }
 
+normalize_filesystem_root() {
+    local node=$1 mount_dir
+    mount_dir=$(node_mount "$node")
+    "${SUDO[@]}" chown "$(id -u):$(id -g)" "$mount_dir"
+    chmod 700 "$mount_dir"
+    mkdir -p "$(node_exchange "$node")"
+}
+
 ensure_filesystem() {
     local node=$1
     local image mount_dir record loop filesystem staging
@@ -480,7 +497,7 @@ ensure_filesystem() {
     if mountpoint -q "$mount_dir"; then
         loop=$(verified_mounted_loop "$node")
         printf '%s\n' "$loop" >"$record"
-        mkdir -p "$(node_exchange "$node")"
+        normalize_filesystem_root "$node"
         return
     fi
 
@@ -507,9 +524,10 @@ ensure_filesystem() {
         "${SUDO[@]}" "$LOSETUP" --detach "$loop" || true
         die "cannot mount node $node Btrfs image; is the kernel btrfs module available?"
     fi
-    "${SUDO[@]}" chown "$(id -u):$(id -g)" "$mount_dir"
-    chmod 700 "$mount_dir"
-    mkdir -p "$(node_exchange "$node")"
+    if [[ ${MUTUALBACKUP_TEST_FAIL_AFTER_BTRFS_MOUNT:-} == "$node" ]]; then
+        die "test interruption after mounting node $node Btrfs filesystem"
+    fi
+    normalize_filesystem_root "$node"
 }
 
 unmount_filesystem() {
@@ -1174,6 +1192,11 @@ command_status() {
 main() {
     local command=${1:-help}
     shift || true
+    if [[ $command == help || $command == -h || $command == --help ]]; then
+        usage
+        return
+    fi
+    validate_layout
     case $command in
         up) (($# == 0)) || die "up takes no arguments"; command_up ;;
         down) (($# == 0)) || die "down takes no arguments"; command_down ;;
@@ -1188,7 +1211,6 @@ main() {
         info) (($# == 0)) || die "info takes no arguments"; command_info ;;
         mounts) (($# == 0)) || die "mounts takes no arguments"; command_mounts ;;
         path) (($# == 1)) || die "usage: $0 path NODE"; command_path "$1" ;;
-        help|-h|--help) usage ;;
         *) usage >&2; die "unknown command: $command" ;;
     esac
 }

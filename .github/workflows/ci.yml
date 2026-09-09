@@ -13,6 +13,7 @@ jobs:
         with:
           toolchain: 1.88.0
           components: clippy,rustfmt
+      - run: bash scripts/docker-lab-safety-test.sh
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --all-targets --locked

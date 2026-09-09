@@ -265,6 +265,64 @@ pub fn identity_manifest_path(data_dir: &Path) -> PathBuf {
     data_dir.join(IDENTITY_MANIFEST_FILE)
 }
 
+/// Reject namespace overlap between initialization's durable outputs.
+///
+/// Both paths may be absent, so resolve their deepest existing ancestor and
+/// append the missing suffix after canonicalizing that ancestor. This retains
+/// filesystem `..` and symlink semantics without creating either output.
+pub fn validate_initialization_output_paths(data_dir: &Path, seed_file: &Path) -> Result<()> {
+    let data_dir = resolve_path_with_missing_suffix(data_dir)
+        .with_context(|| format!("cannot resolve data directory {}", data_dir.display()))?;
+    let seed_file = resolve_path_with_missing_suffix(seed_file).with_context(|| {
+        format!(
+            "cannot resolve recovery-string output {}",
+            seed_file.display()
+        )
+    })?;
+    if data_dir.starts_with(&seed_file) || seed_file.starts_with(&data_dir) {
+        bail!("data directory and recovery-string output must not overlap");
+    }
+    Ok(())
+}
+
+fn resolve_path_with_missing_suffix(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut cursor = absolute.as_path();
+    let mut missing = Vec::<OsString>::new();
+    loop {
+        match fs::canonicalize(cursor) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                let component = cursor.file_name().with_context(|| {
+                    format!(
+                        "cannot resolve missing path component in {}",
+                        path.display()
+                    )
+                })?;
+                missing.push(component.to_os_string());
+                cursor = cursor.parent().with_context(|| {
+                    format!("cannot find an existing ancestor of {}", path.display())
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 pub fn initialize_identity(
     data_dir: &Path,
     seed: &Seed,

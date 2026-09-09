@@ -301,6 +301,114 @@ fn init_preflights_an_existing_manifest_before_installing_a_seed() {
 }
 
 #[test]
+fn init_rejects_overlapping_output_paths_without_mutation() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    set_private(temp.path());
+    let recovery = b"overlapping-initialization-output-recovery-string-2027!";
+
+    let equal_output = temp.path().join("equal-output");
+    assert!(
+        run_cli_with_input(
+            &[
+                os("init"),
+                os("--seed-stdin"),
+                os("--seed-file"),
+                equal_output.as_os_str().to_owned(),
+                os("--data-dir"),
+                equal_output.as_os_str().to_owned(),
+            ],
+            recovery,
+            CLI_TIMEOUT,
+        )
+        .is_err()
+    );
+    assert!(!equal_output.exists());
+
+    let containing_data = temp.path().join("containing-state");
+    fs::create_dir(&containing_data).unwrap();
+    let contained_seed = containing_data.join("node.seed");
+    assert!(
+        run_cli_with_input(
+            &[
+                os("init"),
+                os("--seed-stdin"),
+                os("--seed-file"),
+                contained_seed.as_os_str().to_owned(),
+                os("--data-dir"),
+                containing_data.as_os_str().to_owned(),
+            ],
+            recovery,
+            CLI_TIMEOUT,
+        )
+        .is_err()
+    );
+    assert!(fs::read_dir(&containing_data).unwrap().next().is_none());
+
+    let ancestor_seed = temp.path().join("seed-as-parent");
+    let nested_data = ancestor_seed.join("state");
+    assert!(
+        run_cli_with_input(
+            &[
+                os("init"),
+                os("--seed-stdin"),
+                os("--seed-file"),
+                ancestor_seed.as_os_str().to_owned(),
+                os("--data-dir"),
+                nested_data.as_os_str().to_owned(),
+            ],
+            recovery,
+            CLI_TIMEOUT,
+        )
+        .is_err()
+    );
+    assert!(!ancestor_seed.exists());
+
+    let real_data = temp.path().join("real-state");
+    fs::create_dir(&real_data).unwrap();
+    let data_alias = temp.path().join("state-alias");
+    symlink(&real_data, &data_alias).unwrap();
+    let aliased_seed = data_alias.join("node.seed");
+    assert!(
+        run_cli_with_input(
+            &[
+                os("init"),
+                os("--seed-stdin"),
+                os("--seed-file"),
+                aliased_seed.as_os_str().to_owned(),
+                os("--data-dir"),
+                real_data.as_os_str().to_owned(),
+            ],
+            recovery,
+            CLI_TIMEOUT,
+        )
+        .is_err()
+    );
+    assert!(fs::read_dir(&real_data).unwrap().next().is_none());
+
+    let dotdot_parent = temp.path().join("dotdot-parent");
+    fs::create_dir(&dotdot_parent).unwrap();
+    let dotdot_seed = dotdot_parent.join("../real-state/node.seed");
+    assert!(
+        run_cli_with_input(
+            &[
+                os("init"),
+                os("--seed-stdin"),
+                os("--seed-file"),
+                dotdot_seed.as_os_str().to_owned(),
+                os("--data-dir"),
+                real_data.as_os_str().to_owned(),
+            ],
+            recovery,
+            CLI_TIMEOUT,
+        )
+        .is_err()
+    );
+    assert!(fs::read_dir(&real_data).unwrap().next().is_none());
+}
+
+#[test]
 fn init_accepts_bare_relative_seed_and_data_paths() {
     let temp = tempfile::tempdir().unwrap();
     set_private(temp.path());
