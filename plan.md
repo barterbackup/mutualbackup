@@ -57,10 +57,11 @@ them as ADRs and test vectors before promising wire compatibility.
 
 ### Implemented baseline — first usable IP prototype
 
-The architectural prototype and Milestone 2 are implemented and have passed
-their corrective review gate. The repository connects two real binaries and
-persistent local control to static five-member guild onboarding, reflink
-capture, owner encryption, actual `3+2` RS, remote SQLCipher
+The first usable architectural prototype remains implemented. Milestone 2's
+operator-configuration and identity-state work is also implemented, but its
+corrective review gate is currently reopened. The repository connects two real
+binaries and persistent local control to static five-member guild onboarding,
+reflink capture, owner encryption, actual `3+2` RS, remote SQLCipher
 parity, unanimous revisions/checkpoints, QUIC, Kademlia discovery, relay/DCUtR
 transport support, repeated backups, and DHT-assisted cold recovery. The
 five-process acceptance path launches real daemons and CLIs, removes an owner's
@@ -74,10 +75,12 @@ Call this a runnable product slice, not a claim of production quality. Repeated
 source-only reviews found initialization, startup rollback, recovery resumption,
 address-lifetime, path-attribution, capture, quota, and Docker crash-safety
 defects that the original suite did not expose. Corrective work through
-`52af408`, its focused regressions, the complete remote runtime gates, and a
-final source-only audit closed that list. Application-transfer acceptance
-attributes post-baseline bulk bytes to the exact direct, DCUtR, or
-relay-fallback connection used.
+`52af408`, its focused regressions, and the complete remote runtime gates closed
+the previously known list. A later source-only audit at `f339fd7` found
+remaining descriptor-traversal, restore-cleanup/re-anchoring, and Docker-lab
+ownership/crash-recovery defects; these now block Milestone 3.
+Application-transfer acceptance attributes post-baseline bulk bytes to the
+exact direct, DCUtR, or relay-fallback connection used.
 
 The baseline deliberately remains one guild and one reflink root per member,
 one parity database, Linux only, fixed 64 KiB sectors and `3+2`, unanimous
@@ -639,18 +642,21 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0, 1, and 2 are passed. Corrective commits
-`896db36`, `02108c3`, `9bde0e9`, and `52af408` preserve endpoint sequence
-continuity through seed recovery; make checkpoint recovery atomic, branch
-pinned, quota bounded, and storage-only complete; harden reflink capture and
-cleanup across path, mount, retry, and crash boundaries; and confine Docker-lab
-operations to marked child namespaces. Their focused regressions, locked
-workspace tests, Btrfs/reflink and real-network acceptance, static Nix artifact,
-interrupted/resumed real Docker lifecycle, and final source-only audit passed.
-No high-confidence Milestone 2 defect remains in `TODO.md`.
+**Current position:** Milestones 0 and 1 are passed. Milestone 2's feature scope
+is implemented, and commits `896db36`, `02108c3`, `9bde0e9`, and `52af408`
+correct the previously identified recovery, capture, and Docker-lab defects.
+The fresh source-only audit at `f339fd7` nevertheless reopened its corrective
+gate: descendant capture is not fully descriptor-bound; capture and cleanup
+resource bounds are incomplete; restore cleanup and recovered re-anchoring are
+not yet safe across mount/crash boundaries; and Docker teardown, mutable leaf
+provenance, and namespace initialization remain unsafe in confirmed cases.
 
-The next run may begin Milestone 3. Start with the Arti version/key/transport
-ADR and a private-Tor test topology before changing production endpoint types.
+The next run must close the Milestone 2 section of `TODO.md`, add focused
+regressions for every listed failure boundary, rerun the complete locked,
+Btrfs/reflink, network, recovery, Nix-artifact, and Docker-lab gates, and finish
+with another source-only review. Milestone 3 begins only after that list is
+empty. Its first task remains the Arti version/key/transport ADR and a private
+Tor test topology before production endpoint types change.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
 
@@ -696,7 +702,7 @@ The Milestone 2 gate included inherited stabilization regressions that the first
 acceptance pass did not expose; they remain part of the mandatory regression
 contract.
 
-### Milestone 2 — operator configuration and identity-state separation (passed)
+### Milestone 2 — operator configuration and identity-state separation (corrective gate reopened)
 
 - Replace duplicated daemon parsing with one typed options model consumed by
   optional TOML and equivalent nonsecret command-line flags. Test flag-over-file
@@ -762,28 +768,43 @@ capturable entry before deduplication. Its focused tests, complete remote gates,
 static artifact handoff, and destructive/restart/remount Docker lifecycle all
 passed for that bounded follow-up.
 
-The final corrective slice through `52af408` closes the defects found at
+The corrective slice through `52af408` addressed the defects then known at
 `8426910`:
 
 1. Recovery locators carry the subject's observed endpoint floor, recovered
    checkpoint state is one SQL transaction, attempts pin an exact checkpoint,
    storage-only recovery completes, and parity imports obey the configured
    budget.
-2. Capture walks the pinned root descriptor, safely abandons failed intents,
-   publishes first-use anchor areas from durable staging, rejects special files
-   through non-I/O handles, and removes owned trees without crossing mounts.
-3. The Docker lab requires marked, owned direct namespaces, atomically creates
-   new children, validates per-node mount paths, and refuses symlink, mount, or
-   unmarked-directory substitution before destructive work.
+2. Capture pins its root descriptor, safely abandons failed intents, publishes
+   first-use anchor areas from durable staging, rejects special files through
+   non-I/O handles, and gives anchor cleanup a no-cross-mount remover.
+3. The Docker lab introduces marked, owned child namespaces, atomic child
+   creation, and provenance checks on its principal create, start, and reinit
+   paths.
 4. The focused fault tests and every inherited Milestone 2 gate passed on the
-   GCP runner; the closing source-only review found no remaining
-   high-confidence Milestone 2 defect.
+   GCP runner. The later source-only audit at `f339fd7` found remaining gaps and
+   reopened the gate.
+
+The reopened corrective slice is deliberately bounded to existing behavior:
+
+1. Replace descendant pathname enumeration with a descriptor-recursive capture
+   walk, and make its descriptor and cleanup-memory budgets enforceable.
+2. Apply descriptor-relative no-cross-mount cleanup to every restore/recovery
+   staging path, and journal recovered re-anchoring plus old/orphan retirement.
+3. Close Docker-lab mutable-leaf aliases, validate loop provenance and global
+   mount state before detach, and make interrupted namespace initialization
+   resumable.
+4. Add focused fault regressions, rerun every Milestone 2 gate named above, and
+   perform a fresh source-only audit. Do not begin Milestone 3 until this slice
+   and the corresponding `TODO.md` section are closed.
 
 ### Milestone 3 — Tor and robust connectivity beta
 
-Entry condition: satisfied. No Milestone 3 implementation has begun. Start by
-pinning and reviewing the maintained Arti version and writing the transport/key
-lifecycle ADR before integrating it with the bounded IP endpoint lifecycle.
+Entry condition: not yet satisfied; the reopened Milestone 2 corrective gate
+must close first. No Milestone 3 implementation has begun. Once admitted, start
+by pinning and reviewing the maintained Arti version and writing the
+transport/key lifecycle ADR before integrating it with the bounded IP endpoint
+lifecycle.
 
 - Adapt the narrow, useful BarterBackup `nettor` principles to a maintained Arti
   release: outbound onion dialing, an inbound v3 onion service, persistent Tor

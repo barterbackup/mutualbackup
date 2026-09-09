@@ -1,5 +1,55 @@
 # Product TODO
 
+## Milestone 2 corrective gate — blocks Milestone 3
+
+A source-only audit at `f339fd7` reopened the gate. The recovery-network
+corrections remain sound, but the following current-path defects must be fixed
+and covered by focused regressions before Tor work begins.
+
+### Reflink capture and restore lifecycle
+
+- Make descendant capture descriptor-bound, not merely root-bound. `WalkDir`
+  opens descendant directories through paths independently of the descriptors
+  later retained and validated. A transient child overmount can therefore
+  supply the enumeration, disappear, and leave capture validating the unchanged
+  underlying directory while committing an incomplete manifest. Enumerate,
+  enforce the filesystem boundary, and validate each directory through the same
+  pinned handle; regress a child overmount removed after enumeration begins.
+- Make capture and cleanup resource limits real. Capture retains one descriptor
+  per file and directory until final validation, so an ordinary valid tree can
+  exhaust `RLIMIT_NOFILE` far below the advertised 8,192-entry catalog limit.
+  Owned-tree cleanup first collects every directory name into a vector and only
+  then applies its entry budget, so hostile fanout can exhaust memory before
+  rejection. Use bounded descriptor consumption and streaming or bounded-batch
+  directory enumeration, with low-FD-limit and excessive-fanout regressions.
+- Replace `remove_dir_all` in ordinary restore and cold-recovery staging cleanup
+  with the same descriptor-relative, no-cross-mount removal rule required for
+  anchors. Checking only the staging root does not protect an external tree
+  mounted at a descendant from deletion. Bind cleanup to the expected staging
+  identity and keep failed cleanup as a visible durable obligation.
+- Journal recovered re-anchoring before creating its final anchor. A crash after
+  `ReflinkAnchor::capture` but before the manifest transaction currently leaves
+  an unreferenced full anchor, and failure to remove the replaced anchor is
+  silently forgotten. Make creation, metadata installation, and retirement a
+  resumable intent whose orphan cleanup remains durable until it succeeds.
+
+### Docker-lab ownership and crash safety
+
+- Confine every mutable per-node leaf, not only its parent namespace. Loop-record
+  redirection follows an existing symlink or hard link, while staged and final
+  image checks accept hard-linked regular files; those paths can truncate,
+  format, or later modify an external inode. Create records without following
+  aliases and require exclusive, unmounted, lab-owned image inodes before every
+  mutating operation.
+- Harden teardown as strictly as creation. `unmount_filesystem` accepts an image
+  symlink through `-f` and detaches every loop associated with its target without
+  validating image provenance or refusing a loop still mounted elsewhere. It
+  must validate the exact managed leaf and mounted-loop state before detach.
+- Make namespace-marker creation recoverable. Interruption after writing its
+  temporary marker but before rename leaves a nonempty unmarked root that all
+  later invocations reject. Either clean up a verifiable owned temporary marker
+  on retry or use an initialization protocol that cannot strand the namespace.
+
 ## Later guild geometry and coding protocol
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
