@@ -574,8 +574,8 @@ fn btrfs_subvolume_tree_id(file: &File) -> Result<u64, AnchorError> {
 }
 
 #[cfg(target_os = "linux")]
-fn stable_filesystem_id(file: &File, filesystem_type: i64) -> Result<u64, AnchorError> {
-    const BTRFS_SUPER_MAGIC: i64 = 0x9123_683e;
+fn stable_filesystem_id(file: &File, filesystem_type: u32) -> Result<u64, AnchorError> {
+    const BTRFS_SUPER_MAGIC: u32 = 0x9123_683e;
 
     let external = ioctl_external_filesystem_uuid(file)?;
     let (uuid_len, uuid) = match external {
@@ -674,7 +674,11 @@ pub fn filesystem_identity(path: impl AsRef<Path>) -> Result<FilesystemIdentity,
     }
     let filesystem = unsafe { filesystem.assume_init() };
     let file = File::open(path)?;
-    let stable_id = stable_filesystem_id(&file, filesystem.f_type)?;
+    // `libc::statfs::f_type` is signed under glibc and unsigned under musl.
+    // Linux filesystem magic values occupy 32 bits, so normalize the ABI field
+    // before comparing or hashing it. This also keeps identities stable across
+    // libc implementations and machine word sizes.
+    let stable_id = stable_filesystem_id(&file, filesystem.f_type as u32)?;
     Ok(FilesystemIdentity {
         stable_id,
         device: fs::metadata(path)?.dev(),
