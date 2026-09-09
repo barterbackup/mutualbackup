@@ -22,13 +22,22 @@ const MAX_CAPTURE_ENTRIES: usize = 8_192;
 const MAX_CAPTURE_EXTENTS: usize = 65_536;
 const MAX_CAPTURE_DEPTH: usize = 256;
 const MAX_RELATIVE_PATH_BYTES: usize = 4_096;
+#[cfg(target_os = "linux")]
+const CLEANUP_BATCH_ENTRIES: usize = 64;
 const FAILED_AREA_SCAN_RETRY: Duration = Duration::from_secs(60);
 
 static ANCHOR_AREA_INDEX: OnceLock<Mutex<BTreeMap<Uuid, AnchorAreaIndexEntry>>> = OnceLock::new();
 
 #[cfg(test)]
+type CaptureDirectoryHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
 thread_local! {
     static BEFORE_CAPTURE_WALK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static BEFORE_CAPTURE_DIRECTORY_READ: std::cell::RefCell<Option<CaptureDirectoryHook>> =
+        std::cell::RefCell::new(None);
+    static AFTER_CAPTURE_DIRECTORY_READ: std::cell::RefCell<Option<CaptureDirectoryHook>> =
         std::cell::RefCell::new(None);
 }
 
@@ -919,131 +928,219 @@ fn capture_entries(
     filesystem: FilesystemIdentity,
     staging: &Path,
 ) -> Result<Vec<CapturedEntry>, AnchorError> {
-    let mut entries = Vec::new();
-    let mut directory_versions = vec![(
-        PathBuf::new(),
-        root_file.try_clone()?,
-        root_metadata.clone(),
-    )];
-    let mut file_versions = Vec::new();
-    let mut captured_links = BTreeMap::<NativeFileId, PathBuf>::new();
-    let mut captured_extent_count = 0_usize;
-    #[cfg(target_os = "linux")]
-    let walk_root = proc_fd_path(root_file);
-    #[cfg(not(target_os = "linux"))]
-    let walk_root = source_root.to_path_buf();
     #[cfg(test)]
     BEFORE_CAPTURE_WALK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
             hook();
         }
     });
-    for entry in WalkDir::new(&walk_root)
-        .follow_root_links(true)
-        .follow_links(false)
+
+    #[cfg(target_os = "linux")]
     {
-        let entry = entry?;
-        if entry.depth() == 0 {
-            continue;
-        }
-        if entry.depth() > MAX_CAPTURE_DEPTH {
-            return Err(AnchorError::CatalogTooLarge);
-        }
-        if entries.len() >= MAX_CAPTURE_ENTRIES {
-            return Err(AnchorError::CatalogTooLarge);
-        }
-        let relative = entry
-            .path()
-            .strip_prefix(&walk_root)
-            .map_err(|_| AnchorError::UnsafePath)?;
-        validate_relative(relative)?;
-        let relative_string = relative
-            .to_str()
-            .ok_or(AnchorError::NonUtf8Path)?
-            .to_owned();
-        if relative_string.len() > MAX_RELATIVE_PATH_BYTES {
-            return Err(AnchorError::CatalogTooLarge);
-        }
-        let file = open_source_beneath(root_file, relative, entry.file_type().is_dir())?;
-        let before = file.metadata()?;
-        if before.file_type().is_symlink() {
-            return Err(AnchorError::Symlink(relative.to_path_buf()));
-        }
-        let destination = staging.join(relative);
-        if before.is_dir() {
-            #[cfg(target_os = "linux")]
-            if filesystem_identity_for_file(&file)? != filesystem {
-                return Err(AnchorError::NestedFilesystem(source_root.join(relative)));
+        let mut capture = DescriptorCapture {
+            source_root,
+            root_file,
+            filesystem,
+            staging,
+            entries: Vec::new(),
+            versions: vec![CapturedVersion {
+                relative: PathBuf::new(),
+                directory: true,
+                version: capture_version(filesystem.stable_id, root_metadata),
+            }],
+            captured_links: BTreeMap::new(),
+            captured_extent_count: 0,
+        };
+        capture.capture_directory(root_file, Path::new(""), 0)?;
+        capture.validate_versions()?;
+        capture
+            .entries
+            .sort_by(|left, right| entry_path(left).cmp(entry_path(right)));
+        Ok(capture.entries)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (source_root, root_file, root_metadata, filesystem, staging);
+        Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "descriptor-relative capture is currently implemented only on Linux",
+        )))
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct CapturedVersion {
+    relative: PathBuf,
+    directory: bool,
+    version: CaptureVersion,
+}
+
+#[cfg(target_os = "linux")]
+struct DescriptorCapture<'a> {
+    source_root: &'a Path,
+    root_file: &'a File,
+    filesystem: FilesystemIdentity,
+    staging: &'a Path,
+    entries: Vec<CapturedEntry>,
+    versions: Vec<CapturedVersion>,
+    captured_links: BTreeMap<NativeFileId, PathBuf>,
+    captured_extent_count: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl DescriptorCapture<'_> {
+    fn capture_directory(
+        &mut self,
+        directory: &File,
+        relative_directory: &Path,
+        depth: usize,
+    ) -> Result<(), AnchorError> {
+        #[cfg(test)]
+        BEFORE_CAPTURE_DIRECTORY_READ.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(relative_directory);
             }
-            create_private_dir_new(&destination)?;
-            let (modified_secs, modified_nanos) = modified_parts(&before);
-            entries.push(CapturedEntry::Directory {
-                path: relative_string,
-                mode: unix_mode(&before),
-                modified_secs,
-                modified_nanos,
-            });
-            directory_versions.push((relative.to_path_buf(), file, before));
-        } else if before.is_file() {
-            #[cfg(target_os = "linux")]
-            if filesystem_identity_for_file(&file)? != filesystem {
-                return Err(AnchorError::NestedFilesystem(source_root.join(relative)));
+        });
+        let mut stream = DirectoryStream::open(directory)?;
+        #[cfg(test)]
+        AFTER_CAPTURE_DIRECTORY_READ.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(relative_directory);
             }
-            if let Some(parent) = destination.parent() {
-                create_private_dir(parent)?;
-            }
-            let native_id = native_file_id(filesystem.stable_id, &before);
-            if let Some(first_destination) = captured_links.get(&native_id) {
-                fs::hard_link(first_destination, &destination)?;
-            } else {
-                reflink_open_file(&file, &destination).map_err(AnchorError::ReflinkUnavailable)?;
-                captured_links.insert(native_id, destination.clone());
-            }
-            let after = file.metadata()?;
-            let captured = fs::symlink_metadata(&destination)?;
-            if !same_capture_version(&before, &after)
-                || captured.len() != after.len()
-                || !captured.is_file()
-            {
-                let _ = fs::remove_file(&destination);
-                return Err(AnchorError::SourceChanged(relative.to_path_buf()));
-            }
-            seal_anchor_file(&destination)?;
-            let (modified_secs, modified_nanos) = modified_parts(&after);
-            let captured_file = File::open(&destination)?;
-            let data_extents = file_data_extents(&captured_file, after.len())?;
-            captured_extent_count = captured_extent_count
-                .checked_add(data_extents.len())
-                .ok_or(AnchorError::CatalogTooLarge)?;
-            if captured_extent_count > MAX_CAPTURE_EXTENTS {
+        });
+
+        while let Some(name) = stream.next_name()? {
+            if self.entries.len() >= MAX_CAPTURE_ENTRIES {
                 return Err(AnchorError::CatalogTooLarge);
             }
-            entries.push(CapturedEntry::FileV2 {
-                path: relative_string,
-                mode: unix_mode(&after),
-                logical_len: after.len(),
-                modified_secs,
-                modified_nanos,
-                native_id,
-                data_extents,
-            });
-            file_versions.push((relative.to_path_buf(), file, after));
-        } else {
-            return Err(AnchorError::UnsupportedObject(relative.to_path_buf()));
+            let child_depth = depth.checked_add(1).ok_or(AnchorError::CatalogTooLarge)?;
+            if child_depth > MAX_CAPTURE_DEPTH {
+                return Err(AnchorError::CatalogTooLarge);
+            }
+            use std::os::unix::ffi::OsStrExt;
+            let component = Path::new(std::ffi::OsStr::from_bytes(name.as_bytes()));
+            let relative = relative_directory.join(component);
+            validate_relative(&relative)?;
+            let relative_string = relative
+                .to_str()
+                .ok_or(AnchorError::NonUtf8Path)?
+                .to_owned();
+            if relative_string.len() > MAX_RELATIVE_PATH_BYTES {
+                return Err(AnchorError::CatalogTooLarge);
+            }
+
+            let pinned = match open_path_no_xdev_beneath(directory, component) {
+                Ok(file) => file,
+                Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+                    return Err(AnchorError::NestedFilesystem(
+                        self.source_root.join(&relative),
+                    ));
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                    return Err(AnchorError::Symlink(relative));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let pinned_metadata = pinned.metadata()?;
+            if pinned_metadata.file_type().is_symlink() {
+                return Err(AnchorError::Symlink(relative));
+            }
+            let directory = pinned_metadata.is_dir();
+            if !directory && !pinned_metadata.is_file() {
+                return Err(AnchorError::UnsupportedObject(relative));
+            }
+            let file = reopen_pinned_file(&pinned, directory, &relative)?;
+            let before = file.metadata()?;
+            if filesystem_identity_for_file(&file)? != self.filesystem {
+                return Err(AnchorError::NestedFilesystem(
+                    self.source_root.join(&relative),
+                ));
+            }
+            let destination = self.staging.join(&relative);
+
+            if directory {
+                create_private_dir_new(&destination)?;
+                let (modified_secs, modified_nanos) = modified_parts(&before);
+                self.entries.push(CapturedEntry::Directory {
+                    path: relative_string,
+                    mode: unix_mode(&before),
+                    modified_secs,
+                    modified_nanos,
+                });
+                self.versions.push(CapturedVersion {
+                    relative: relative.clone(),
+                    directory: true,
+                    version: capture_version(self.filesystem.stable_id, &before),
+                });
+                self.capture_directory(&file, &relative, child_depth)?;
+            } else {
+                if let Some(parent) = destination.parent() {
+                    create_private_dir(parent)?;
+                }
+                let native_id = native_file_id(self.filesystem.stable_id, &before);
+                if let Some(first_destination) = self.captured_links.get(&native_id) {
+                    fs::hard_link(first_destination, &destination)?;
+                } else {
+                    reflink_open_file(&file, &destination)
+                        .map_err(AnchorError::ReflinkUnavailable)?;
+                    self.captured_links.insert(native_id, destination.clone());
+                }
+                let after = file.metadata()?;
+                let captured = fs::symlink_metadata(&destination)?;
+                if !same_capture_version(&before, &after)
+                    || captured.len() != after.len()
+                    || !captured.is_file()
+                {
+                    let _ = fs::remove_file(&destination);
+                    return Err(AnchorError::SourceChanged(relative));
+                }
+                seal_anchor_file(&destination)?;
+                let (modified_secs, modified_nanos) = modified_parts(&after);
+                let captured_file = File::open(&destination)?;
+                let data_extents = file_data_extents(&captured_file, after.len())?;
+                self.captured_extent_count = self
+                    .captured_extent_count
+                    .checked_add(data_extents.len())
+                    .ok_or(AnchorError::CatalogTooLarge)?;
+                if self.captured_extent_count > MAX_CAPTURE_EXTENTS {
+                    return Err(AnchorError::CatalogTooLarge);
+                }
+                self.entries.push(CapturedEntry::FileV2 {
+                    path: relative_string,
+                    mode: unix_mode(&after),
+                    logical_len: after.len(),
+                    modified_secs,
+                    modified_nanos,
+                    native_id,
+                    data_extents,
+                });
+                self.versions.push(CapturedVersion {
+                    relative,
+                    directory: false,
+                    version: capture_version(self.filesystem.stable_id, &after),
+                });
+            }
         }
+        Ok(())
     }
-    for (relative, directory, before) in directory_versions {
-        if !same_capture_version(&before, &directory.metadata()?) {
-            return Err(AnchorError::SourceChanged(relative));
+
+    fn validate_versions(&self) -> Result<(), AnchorError> {
+        for expected in &self.versions {
+            let current = if expected.relative.as_os_str().is_empty() {
+                self.root_file.try_clone()?
+            } else {
+                open_source_beneath(self.root_file, &expected.relative, expected.directory)?
+            };
+            if filesystem_identity_for_file(&current)? != self.filesystem
+                || capture_version(self.filesystem.stable_id, &current.metadata()?)
+                    != expected.version
+            {
+                return Err(AnchorError::SourceChanged(expected.relative.clone()));
+            }
         }
+        Ok(())
     }
-    for (relative, file, before) in file_versions {
-        if !same_capture_version(&before, &file.metadata()?) {
-            return Err(AnchorError::SourceChanged(relative));
-        }
-    }
-    entries.sort_by(|left, right| entry_path(left).cmp(entry_path(right)));
-    Ok(entries)
 }
 
 fn ensure_anchor_area(
@@ -1569,75 +1666,106 @@ fn remove_directory_contents(
     if depth > MAX_CAPTURE_DEPTH {
         return Err(AnchorError::AnchorAreaCollision(display.to_path_buf()));
     }
-    for name in directory_entry_names(directory)? {
-        if *remaining == 0 {
-            return Err(AnchorError::AnchorAreaCollision(display.to_path_buf()));
+    loop {
+        let names = directory_entry_batch(directory, CLEANUP_BATCH_ENTRIES)?;
+        if names.is_empty() {
+            return Ok(());
         }
-        *remaining -= 1;
-        let relative = Path::new(std::ffi::OsStr::from_bytes(name.as_bytes()));
-        let child_display = display.join(relative);
-        let handle = match open_path_no_xdev_beneath(directory, relative) {
-            Ok(handle) => handle,
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
-            Err(_) => return Err(AnchorError::AnchorAreaCollision(child_display)),
-        };
-        if handle.metadata()?.is_dir() {
-            let child = reopen_pinned_file(&handle, true, relative)?;
-            remove_directory_contents(&child, &child_display, depth + 1, remaining)?;
-            unlink_pinned_name(directory, relative, &handle, true, &child_display)?;
-        } else {
-            unlink_pinned_name(directory, relative, &handle, false, &child_display)?;
+        for name in names {
+            if *remaining == 0 {
+                return Err(AnchorError::AnchorAreaCollision(display.to_path_buf()));
+            }
+            *remaining -= 1;
+            let relative = Path::new(std::ffi::OsStr::from_bytes(name.as_bytes()));
+            let child_display = display.join(relative);
+            let handle = match open_path_no_xdev_beneath(directory, relative) {
+                Ok(handle) => handle,
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
+                Err(_) => return Err(AnchorError::AnchorAreaCollision(child_display)),
+            };
+            if handle.metadata()?.is_dir() {
+                let child = reopen_pinned_file(&handle, true, relative)?;
+                remove_directory_contents(&child, &child_display, depth + 1, remaining)?;
+                unlink_pinned_name(directory, relative, &handle, true, &child_display)?;
+            } else {
+                unlink_pinned_name(directory, relative, &handle, false, &child_display)?;
+            }
         }
     }
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn directory_entry_names(directory: &File) -> Result<Vec<CString>, AnchorError> {
-    use std::os::fd::AsRawFd;
+fn directory_entry_batch(directory: &File, maximum: usize) -> Result<Vec<CString>, AnchorError> {
+    let mut stream = DirectoryStream::open(directory)?;
+    let mut names = Vec::with_capacity(maximum);
+    while names.len() < maximum {
+        let Some(name) = stream.next_name()? else {
+            break;
+        };
+        names.push(name);
+    }
+    Ok(names)
+}
 
-    struct DirectoryStream(*mut libc::DIR);
-    impl Drop for DirectoryStream {
-        fn drop(&mut self) {
-            unsafe {
-                libc::closedir(self.0);
-            }
-        }
-    }
+#[cfg(target_os = "linux")]
+struct DirectoryStream(*mut libc::DIR);
 
-    let descriptor = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-    if descriptor < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let stream = unsafe { libc::fdopendir(descriptor) };
-    if stream.is_null() {
-        let error = std::io::Error::last_os_error();
-        unsafe {
-            libc::close(descriptor);
+#[cfg(target_os = "linux")]
+impl DirectoryStream {
+    fn open(directory: &File) -> Result<Self, AnchorError> {
+        use std::os::fd::AsRawFd;
+
+        let descriptor = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error().into());
         }
-        return Err(error.into());
-    }
-    let stream = DirectoryStream(stream);
-    let mut names = Vec::new();
-    loop {
-        unsafe {
-            *libc::__errno_location() = 0;
-        }
-        let entry = unsafe { libc::readdir(stream.0) };
-        if entry.is_null() {
+        if unsafe { libc::lseek(descriptor, 0, libc::SEEK_SET) } < 0 {
             let error = std::io::Error::last_os_error();
-            if error.raw_os_error().unwrap_or(0) == 0 {
-                break;
+            unsafe {
+                libc::close(descriptor);
             }
             return Err(error.into());
         }
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if name.to_bytes() == b"." || name.to_bytes() == b".." {
-            continue;
+        let stream = unsafe { libc::fdopendir(descriptor) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(descriptor);
+            }
+            return Err(error.into());
         }
-        names.push(name.to_owned());
+        Ok(Self(stream))
     }
-    Ok(names)
+
+    fn next_name(&mut self) -> Result<Option<CString>, AnchorError> {
+        loop {
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            let entry = unsafe { libc::readdir(self.0) };
+            if entry.is_null() {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error().unwrap_or(0) == 0 {
+                    return Ok(None);
+                }
+                return Err(error.into());
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            return Ok(Some(name.to_owned()));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        unsafe {
+            libc::closedir(self.0);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1923,13 +2051,6 @@ fn open_path_beneath(root: &File, relative: &Path) -> Result<File, AnchorError> 
         return Err(error.into());
     }
     Ok(unsafe { File::from_raw_fd(descriptor as i32) })
-}
-
-#[cfg(target_os = "linux")]
-fn proc_fd_path(file: &File) -> PathBuf {
-    use std::os::fd::AsRawFd;
-
-    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
 #[cfg(target_os = "linux")]
@@ -2358,6 +2479,117 @@ mod tests {
             .read_to_string(&mut payload)
             .unwrap();
         assert_eq!(payload, "pinned-root-payload");
+        manifest.remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn capture_walk_enumerates_a_descendant_through_its_pinned_descriptor() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("descendant-swap-{}", Uuid::new_v4()));
+        let protected = run_root.join("protected");
+        let child = protected.join("child");
+        let replacement = run_root.join("replacement");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        fs::write(child.join("payload"), b"pinned-child-payload").unwrap();
+        let plan = ReflinkAnchor::plan(&protected).unwrap();
+
+        let mount_source = replacement.clone();
+        let mount_target = child.clone();
+        BEFORE_CAPTURE_DIRECTORY_READ.with(|hook| {
+            assert!(
+                hook.borrow_mut()
+                    .replace(Box::new(move |relative| {
+                        if relative == Path::new("child") {
+                            bind_mount(&mount_source, &mount_target);
+                        }
+                    }))
+                    .is_none()
+            );
+        });
+        let unmount_target = child.clone();
+        AFTER_CAPTURE_DIRECTORY_READ.with(|hook| {
+            assert!(
+                hook.borrow_mut()
+                    .replace(Box::new(move |relative| {
+                        if relative == Path::new("child") {
+                            unmount(&unmount_target);
+                        }
+                    }))
+                    .is_none()
+            );
+        });
+
+        let manifest = ReflinkAnchor::capture_plan(&plan).unwrap();
+        BEFORE_CAPTURE_DIRECTORY_READ.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        AFTER_CAPTURE_DIRECTORY_READ.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        assert!(manifest.entries.iter().any(|entry| {
+            matches!(entry, CapturedEntry::FileV2 { path, .. } if path == "child/payload")
+        }));
+        let mut payload = String::new();
+        manifest
+            .file_locator("child/payload".to_owned())
+            .unwrap()
+            .open()
+            .unwrap()
+            .read_to_string(&mut payload)
+            .unwrap();
+        assert_eq!(payload, "pinned-child-payload");
+        manifest.remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn capture_descriptor_use_is_bounded_by_tree_depth() {
+        struct OpenFileLimitGuard(libc::rlimit);
+
+        impl Drop for OpenFileLimitGuard {
+            fn drop(&mut self) {
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) }, 0);
+            }
+        }
+
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("bounded-fds-{}", Uuid::new_v4()));
+        let protected = run_root.join("protected");
+        fs::create_dir_all(&protected).unwrap();
+        for ordinal in 0..512 {
+            fs::write(protected.join(format!("file-{ordinal:04}")), b"payload").unwrap();
+        }
+        let plan = ReflinkAnchor::plan(&protected).unwrap();
+
+        let mut original = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, original.as_mut_ptr()) },
+            0
+        );
+        let original = unsafe { original.assume_init() };
+        assert!(original.rlim_cur >= 96);
+        let limited = libc::rlimit {
+            rlim_cur: 96,
+            rlim_max: original.rlim_max,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limited) }, 0);
+        let limit = OpenFileLimitGuard(original);
+
+        let manifest = ReflinkAnchor::capture_plan(&plan).unwrap();
+        assert_eq!(manifest.entries.len(), 512);
+        drop(limit);
         manifest.remove().unwrap();
         fs::remove_dir_all(run_root).unwrap();
     }

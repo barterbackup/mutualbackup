@@ -9,6 +9,8 @@ fi
 cargo test -p mb-store anchor::tests::stable_locator_survives_parent_rename --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::nested_btrfs_subvolumes_are_rejected_before_and_during_capture --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::capture_walk_remains_bound_to_the_open_root --locked -- --ignored --exact
+cargo test -p mb-store anchor::tests::capture_walk_enumerates_a_descendant_through_its_pinned_descriptor --locked -- --ignored --exact
+cargo test -p mb-store anchor::tests::capture_descriptor_use_is_bounded_by_tree_depth --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::anchor_cleanup_refuses_to_cross_a_child_mount --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::anchor_area_initialization_recovers_staged_publication --locked -- --ignored --exact
 cargo test -p mb-node snapshot::metadata_compatibility_tests::rejected_capture_can_be_repaired_and_replanned --locked -- --ignored --exact
