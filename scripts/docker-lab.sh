@@ -125,15 +125,22 @@ validate_owned_directory() {
 }
 
 validate_existing_namespace_shape() {
-    local role path node mount_path
+    local role path node mount_path marked=false
     if [[ ! -e $LAB_ROOT && ! -L $LAB_ROOT ]]; then
         return
     fi
     validate_owned_directory "$LAB_ROOT" "Docker lab root"
+    if [[ -e $LAB_ROOT/$NAMESPACE_MARKER || -L $LAB_ROOT/$NAMESPACE_MARKER ]]; then
+        validate_namespace_marker "$LAB_ROOT" root
+        marked=true
+    fi
     for role in "${NAMESPACE_ROLES[@]}"; do
         path=$LAB_ROOT/$role
         if [[ -e $path || -L $path ]]; then
             validate_owned_directory "$path" "Docker lab $role namespace"
+            if [[ $marked == true ]]; then
+                validate_namespace_marker "$path" "$role"
+            fi
         fi
     done
     if [[ -d $LAB_ROOT/mounts && ! -L $LAB_ROOT/mounts ]]; then
@@ -176,19 +183,32 @@ write_namespace_marker() {
     validate_namespace_marker "$directory" "$role"
 }
 
+directory_is_empty() {
+    local directory=$1
+    [[ -z $(find "$directory" -mindepth 1 -maxdepth 1 -print -quit) ]]
+}
+
 ensure_namespace_directory() {
-    local role=$1 path
+    local role=$1 path staging
     path=$LAB_ROOT/$role
     if [[ -e $path || -L $path ]]; then
         validate_owned_directory "$path" "Docker lab $role namespace"
-    else
-        (umask 077 && mkdir -- "$path")
-        validate_owned_directory "$path" "Docker lab $role namespace"
+        if mountpoint -q "$path"; then
+            die "Docker lab $role namespace must not be a mount point: $path"
+        fi
+        validate_namespace_marker "$path" "$role"
+        return
     fi
-    if mountpoint -q "$path"; then
-        die "Docker lab $role namespace must not be a mount point: $path"
+
+    staging=$LAB_ROOT/.$role.namespace-init-$$-$RANDOM
+    (umask 077 && mkdir -- "$staging")
+    write_namespace_marker "$staging" "$role"
+    if ! mv -T -- "$staging" "$path"; then
+        die "cannot publish Docker lab $role namespace: $path"
     fi
-    write_namespace_marker "$path" "$role"
+    sync "$LAB_ROOT"
+    validate_owned_directory "$path" "Docker lab $role namespace"
+    validate_namespace_marker "$path" "$role"
 }
 
 ensure_node_mount_directory() {
@@ -213,11 +233,18 @@ ensure_lab_namespace() {
         die "Docker lab root parent must already be a non-symlink directory: $parent"
     if [[ -e $LAB_ROOT || -L $LAB_ROOT ]]; then
         validate_owned_directory "$LAB_ROOT" "Docker lab root"
+        if [[ -e $LAB_ROOT/$NAMESPACE_MARKER || -L $LAB_ROOT/$NAMESPACE_MARKER ]]; then
+            validate_namespace_marker "$LAB_ROOT" root
+        else
+            directory_is_empty "$LAB_ROOT" ||
+                die "refusing unmarked nonempty Docker lab root: $LAB_ROOT"
+            write_namespace_marker "$LAB_ROOT" root
+        fi
     else
         (umask 077 && mkdir -- "$LAB_ROOT")
         validate_owned_directory "$LAB_ROOT" "Docker lab root"
+        write_namespace_marker "$LAB_ROOT" root
     fi
-    write_namespace_marker "$LAB_ROOT" root
 
     local lock=$LAB_ROOT/controller.lock
     if [[ -e $lock || -L $lock ]]; then
@@ -330,6 +357,7 @@ prepare_docker_only() {
 
 acquire_lock() {
     command -v mountpoint >/dev/null || die "mountpoint is required"
+    command -v find >/dev/null || die "find is required"
     ensure_lab_namespace
 }
 

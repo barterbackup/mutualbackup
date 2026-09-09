@@ -333,8 +333,9 @@ The controller also marks and validates its `images`, `mounts`, `loops`,
 `seeds`, and `configs` namespaces. It refuses every mutating command if one of
 those directories, or a per-node mount path, has been replaced by a symlink or
 foreign mount. Do not remove the `.mutualbackup-docker-lab-directory-v1`
-marker files; an existing safe pre-marker lab is adopted on its first mutating
-command.
+marker files. An unmarked nonempty lab or child namespace is rejected rather
+than guessed to be application-owned; retain it for inspection and select a
+fresh lab root.
 
 `down` retains image files, configs, and seeds under `.docker-lab/`, so a later
 `up` resumes the same data and identities. While down, the host mount-point

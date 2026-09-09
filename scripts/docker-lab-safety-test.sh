@@ -33,6 +33,16 @@ expect_namespace_rejected() {
     grep -Fq 'must be a non-symlink directory' "$TEST_ROOT/stderr"
 }
 
+expect_marker_rejected() {
+    local root=$1
+    if MUTUALBACKUP_DOCKER_LAB_ROOT=$root "$LAB" path 0 \
+        >"$TEST_ROOT/stdout" 2>"$TEST_ROOT/stderr"; then
+        printf 'unmarked lab namespace was accepted: %s\n' "$root" >&2
+        exit 1
+    fi
+    grep -Fq 'has no owned marker' "$TEST_ROOT/stderr"
+}
+
 mkdir "$TEST_ROOT/safe"
 safe_alias=$TEST_ROOT/safe/../lab
 expected=$(readlink -m -- "$TEST_ROOT/lab/mounts/node2/exchange")
@@ -59,6 +69,13 @@ nested_root=$TEST_ROOT/substituted-node-mount
 mkdir -p "$nested_root/mounts" "$TEST_ROOT/external-node-mount"
 ln -s "$TEST_ROOT/external-node-mount" "$nested_root/mounts/node0"
 expect_namespace_rejected "$nested_root"
+
+marked_root=$TEST_ROOT/marked-root
+mkdir "$marked_root" "$marked_root/configs"
+marked_checksum=$(printf '%s' "$marked_root" | cksum | awk '{print $1}')
+printf 'mutualbackup-docker-lab-directory-v1\nlab=%s\nrole=root\n' "$marked_checksum" \
+    >"$marked_root/.mutualbackup-docker-lab-directory-v1"
+expect_marker_rejected "$marked_root"
 
 [[ ! -e $REPO_ROOT/controller.lock ]]
 printf 'Docker lab path safety checks passed\n'
