@@ -73,8 +73,9 @@ application sessions without transport mocks.
 Call this a runnable product slice, not a claim of production quality. Repeated
 source-only reviews found initialization, startup rollback, recovery resumption,
 address-lifetime, path-attribution, and Docker crash-safety defects that the
-original suite did not expose. Most were fixed, but the latest review reopened
-the Milestone 2 gate with the bounded corrective list in `TODO.md`.
+original suite did not expose. The corrective implementation and full gates
+addressed that list, but its final source-only review found two second-order
+Milestone 2 blockers recorded in `TODO.md`.
 Application-transfer acceptance attributes post-baseline bulk bytes to the
 exact direct, DCUtR, or relay-fallback connection used.
 
@@ -421,11 +422,12 @@ The asynchronous daemon/process split, locked startup, recovery-string input,
 expected-identity check, bounded worker ownership, and formal wire contracts are
 implemented. Human configuration and application-owned identity state are also
 separate. A strictly checked recovery-string file remains an explicit
-unattended auto-unlock option rather than a daemon prerequisite. Most of the
-first Milestone 2 corrective findings are fixed, but the current source-only
-review found remaining initialization, recovery, resource-bounding, endpoint
-state, relay policy, durable filesystem identity, and Docker safety defects.
-The gate is open; the architectural boundary itself remains the intended one.
+unattended auto-unlock option rather than a daemon prerequisite. The first
+Milestone 2 corrective list is fixed and its full gates passed. The final audit
+found two remaining defects: durable recovery observations can permanently
+exhaust their provider-scope cap, and nested Btrfs subvolumes can bypass capture
+isolation. The gate remains open; the architectural boundary itself remains the
+intended one.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -640,12 +642,14 @@ integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
 **Current position:** Milestone 0 is a runnable baseline and the Milestone 1 and
-2 feature sets exist, but the latest source-only review at `fb9a475` reopened
-the Milestone 2 exit gate. The next implementation slice is only the bounded
-corrective follow-up in `TODO.md`. After those fixes, add the named regressions,
-rerun the locked format/clippy/workspace, Btrfs, real-network, five-process,
-Nix-artifact, and Docker lifecycle gates, and pause for another source review.
-Milestone 3 remains blocked until that gate passes.
+2 feature sets exist. The ten-item Milestone 2 corrective slice through
+`6abcfcc` is implemented, and the locked workspace, Btrfs/reflink,
+real-network, five-process recovery, static Nix artifact, and destructive plus
+retained Docker lifecycle gates passed. Its final source-only review found two
+remaining blockers in `TODO.md`: durable recovery-observation scope exhaustion
+and nested-Btrfs-subvolume capture aliasing. Fix only those next, add their
+focused regressions, rerun the affected and complete gates, and repeat the
+source review. Milestone 3 remains blocked until that gate passes.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
 
@@ -733,27 +737,19 @@ also:
    including recovery progress across alternating shard availability and a
    daemon restart.
 
-The later source-only audit at `fb9a475` found second-order failures listed in
+The ten-item corrective implementation through `6abcfcc` and its complete
+runtime gates passed. The final source-only audit found two defects listed in
 `TODO.md`. Complete this bounded slice next:
 
-1. Close the initialization output/data-directory overlap that can make a
-   failed `init` retry impossible.
-2. Resume already installed recovery locally, bound or cancel caller-abandoned
-   outbound peer requests, and bound or collect superseded durable recovery
-   attempts.
-3. Persist signed endpoint and recovery-bundle replay/fork state across
-   refreshes and retries, retain unexpired endpoints across empty lookups, keep
-   uncertified recovery hints out of shared retained state, and synchronize
-   relay authorization even when outbound DHT maintenance is disabled.
-4. Replace durable mount-instance IDs with remount-stable filesystem identity,
-   reconcile Docker Btrfs ownership on every successful mount path, and
-   canonicalize the lab root before any mutation.
-5. Add focused regressions for every boundary above, rerun the complete locked
-   format, warnings-as-errors, workspace, Btrfs, real-network, five-process,
-   Nix-artifact, and real Docker/Btrfs recovery gates, then repeat the focused
-   source review.
-
-No runtime gate was rerun as part of this source-only audit.
+1. Reclaim expired durable recovery observations and keep uncertified provider
+   scopes from permanently exhausting trusted recovery capacity.
+2. Detect and reject nested Btrfs subvolume boundaries without opening special
+   files, so capture never aliases equal inode numbers from distinct
+   subvolumes.
+3. Add the focused hostile-provider/restart and real nested-subvolume/FIFO
+   regressions, rerun the complete locked format, warnings-as-errors, workspace,
+   Btrfs, real-network, five-process, static Nix artifact, and real Docker/Btrfs
+   recovery gates, then repeat the focused source review.
 
 ### Milestone 3 — Tor and robust connectivity beta
 

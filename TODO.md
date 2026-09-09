@@ -2,97 +2,26 @@
 
 ## Milestone 2 corrective follow-up
 
-The latest source-only review found the current defects below. They are faults
-in implemented behavior or in Milestone 2's claimed exit assurance, not delayed
-features. Fix and remove them before beginning Milestone 3.
+The source-only review of `e363bc7..6abcfcc` confirms that the previous ten
+corrective items are fixed. It found the two implemented defects below. Fix and
+remove them before beginning Milestone 3.
 
-- Reject any overlap between a recovery-string output and `data_dir` before
-  writing either path. With an existing empty directory,
-  `init --data-dir DIR --seed-file DIR/seed` installs the seed and then rejects
-  the now-nonempty directory. In the reverse direction, an absent
-  `--seed-file /tmp/node --data-dir /tmp/node/state` creates `/tmp/node` as a
-  file and makes the child directory impossible. Identical retries remain
-  wedged. Resolve path topology safely even when the leaf is absent, and cover
-  equal paths, both nesting directions, `..` components, symlink aliases, and
-  matching or conflicting existing outputs without mutation on rejection.
-- Resume locally installed cold recovery before consulting the DHT again.
-  Still-staged recovery rows are reused, but `recover_from_dht` unconditionally
-  starts provider discovery and certification. Once checkpoint installation
-  has moved the sectors into their regular stores and cleared staging, a crash
-  before or during restore makes complete local state and its durable recovery
-  job depend on three peers again. The Docker lab compounds this by requiring
-  three live survivors before it permits any pending reinit to resume. Make
-  both layers recognize locally resumable state first, and add interruption
-  coverage which removes the recovery quorum before retrying owned building,
-  ready, published, and complete states.
-- Bound and reconcile durable cold-recovery attempts. Partial 64 KiB shard rows
-  are deleted only after successful installation of their exact checkpoint;
-  moving through newer certified heads can strand catalog-scale rows for every
-  failed head. Per-checkpoint recovery jobs can likewise leave hidden build
-  trees when another head supersedes them. Define durable active/pinned attempt
-  ownership, preserve work that can still resume, and transactionally collect
-  superseded rows and application-owned trees. Exercise repeated partial heads
-  under a deliberately small space/attempt bound.
-- Cancel or explicitly bound abandoned outbound peer requests. Shard recovery
-  starts every non-target fetch and stops polling after any three valid shards;
-  recovery-head validation similarly returns after the first certifying state
-  fetch. In both cases the dropped futures leave their requests in the event
-  loop's unbounded `pending_requests` map until response or timeout. Many coding
-  groups with one slow fourth holder can accumulate one live request per group,
-  while a candidate race can abandon many at once. Make caller cancellation
-  observable by the event loop or enforce a global permit owned by each pending
-  request until terminal cleanup, and cover both paths at their configured
-  bounds.
-- Retain accepted signed-DHT-record sequence and hash state across refreshes and
-  retries. Both endpoint and recovery-bundle selection are stateless per query,
-  so a later response containing only sequence N-1 rolls back sequence N, while
-  two different sequence-N records returned on different polls evade fork
-  detection. The selectors can also miss a fork at a lower sequence in one
-  result after selecting a higher record. Key durable observations by record
-  kind, publisher, and recovery subject where applicable; compare every valid
-  same-sequence hash before selecting the highest. A successful but empty
-  endpoint lookup must not clear the last unexpired signed address set because
-  DHT absence is not an authenticated revocation. Exercise endpoint and bundle
-  rollback/forks, empty refresh, failed-recovery retry, and restart cases.
-- Isolate pre-authority recovery addresses from the shared learned-endpoint
-  cache. Candidate endpoints are inserted before their guild/checkpoint
-  authority is established and remain for up to 15 minutes when validation
-  fails, potentially past the signed locator's own expiry. Repeated hostile
-  provider sets can exhaust the 1,024-peer cache and reject legitimate recovery
-  peers. Use an attempt-owned scope with unconditional cleanup, or promote only
-  certified candidates into bounded retained state.
-- Keep relay authorization synchronized independently of outbound DHT
-  maintenance. A relay server initializes admission from the active guild at
-  startup, but its only later synchronizer is coupled to DHT refresh. When
-  `enable_dht_maintenance = false`, forming or installing the guild in the
-  running daemon never updates that set, so every member is rejected until a
-  restart. Notify the network on guild-state transitions or run a separate
-  lightweight membership synchronizer, and cover the documented server-only
-  configuration.
-- Reconcile Btrfs mount ownership and mode on the already-mounted branch of the
-  Docker lab. Interruption after `mount` but before ownership and mode
-  normalization leaves the fresh filesystem with the wrong owner or mode; the
-  next `up` sees a valid mount and skips those repairs. This can block the
-  unprivileged node or leave its host tree less private than promised. Make
-  every successful `ensure_filesystem` return enforce the expected UID/GID and
-  mode, with interruption regressions at both boundaries.
-- Replace mount-instance identifiers in durable filesystem identity. A
-  protected root persists `(st_dev, statx mount_id)` and exact checks in backup
-  and watcher paths reject it after an ordinary remount; Docker `down`/`up`
-  recreates both the Btrfs mount and container mount namespace. Recovery also
-  persists `(st_dev, st_ino)` for ready, published, and complete targets, while
-  moved-anchor discovery filters on a recorded `st_dev`; loop reallocation can
-  invalidate both. Use a remount-stable filesystem identity and application
-  markers/object IDs for durable ownership, retaining mount IDs only as live
-  transition guards. Fault-inject `down`/`up` with changed loop allocation,
-  then cover backup, moved-anchor discovery, and every resumable restore state.
-- Canonicalize and validate the Docker lab root before deriving its checksum or
-  mutating anything below it. The current `/` and repository-root exclusions
-  compare only the lexical string, so `..` components or symlink aliases bypass
-  them while later mount, image, and reinit deletion paths resolve to the
-  protected location. Define an absent-leaf and ancestor-symlink policy, reject
-  canonical aliases of unsafe roots, and cover traversal and symlink cases
-  without creating, mounting, or deleting anything on rejection.
+- Reclaim and authority-partition durable recovery-bundle observations. A new
+  `(subject, provider)` row consumes one of 64 slots before the sealed locator
+  or checkpoint authority is validated. Expired rows stop producing candidates
+  but are never deleted, so 64 expired or unauthorized self-signed providers
+  can permanently prevent a legitimate provider from being observed, including
+  after restart. Prune expired scopes transactionally and prevent uncertified
+  providers from consuming permanent trusted capacity; cover a valid guild
+  provider arriving after a full hostile/expired set and after restart.
+- Reject nested Btrfs subvolumes without reopening arbitrary special files.
+  The nested-filesystem check compares only live mount ID and device, which are
+  shared by subvolumes, while capture assigns the root subvolume's stable ID to
+  every descendant. Inodes are scoped to a Btrfs subvolume, so equal inode
+  numbers in two subvolumes can be mistaken for hard links and capture the wrong
+  bytes. Check each directory's stable subvolume identity, or use an equivalent
+  nonblocking boundary test, before capture. Add a real nested-subvolume inode
+  collision regression while retaining the FIFO/nonblocking regression.
 
 ## Later guild geometry and coding protocol
 
