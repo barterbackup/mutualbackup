@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mb_store::filesystem_identity;
-use notify::{RecursiveMode, Watcher};
+use notify::event::{AccessKind, AccessMode};
+use notify::{EventKind, RecursiveMode, Watcher};
 
 use crate::{Node, ProtectedRoot};
 
@@ -70,10 +71,14 @@ async fn watch_once(node: Arc<Mutex<Node>>, root: &ProtectedRoot) -> Result<()> 
     let watcher_failure = Arc::new(Mutex::new(None::<String>));
     let callback_failure = watcher_failure.clone();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        if let Err(error) = event
-            && let Ok(mut failure) = callback_failure.lock()
-        {
-            *failure = Some(error.to_string());
+        match event {
+            Ok(event) if !event_requires_reconciliation(&event.kind) => return,
+            Ok(_) => {}
+            Err(error) => {
+                if let Ok(mut failure) = callback_failure.lock() {
+                    *failure = Some(error.to_string());
+                }
+            }
         }
         // One pending notification is sufficient: events are hints which trigger a
         // full reconciliation, not an authoritative change journal. Watcher errors
@@ -111,6 +116,15 @@ async fn watch_once(node: Arc<Mutex<Node>>, root: &ProtectedRoot) -> Result<()> 
             }
         }
     }
+}
+
+fn event_requires_reconciliation(kind: &EventKind) -> bool {
+    !matches!(
+        kind,
+        EventKind::Access(
+            AccessKind::Read | AccessKind::Open(_) | AccessKind::Close(AccessMode::Read)
+        )
+    )
 }
 
 fn open_watched_root(root: &ProtectedRoot) -> Result<(File, WatchedRootIdentity)> {
@@ -182,6 +196,25 @@ mod tests {
         );
         assert_eq!(next_retry_delay(Duration::from_secs(32)), WATCH_RETRY_MAX);
         assert_eq!(next_retry_delay(WATCH_RETRY_MAX), WATCH_RETRY_MAX);
+    }
+
+    #[test]
+    fn watcher_ignores_reads_but_not_close_after_write() {
+        assert!(!event_requires_reconciliation(&EventKind::Access(
+            AccessKind::Open(AccessMode::Any)
+        )));
+        assert!(!event_requires_reconciliation(&EventKind::Access(
+            AccessKind::Read
+        )));
+        assert!(!event_requires_reconciliation(&EventKind::Access(
+            AccessKind::Close(AccessMode::Read)
+        )));
+        assert!(event_requires_reconciliation(&EventKind::Access(
+            AccessKind::Close(AccessMode::Write)
+        )));
+        assert!(event_requires_reconciliation(&EventKind::Modify(
+            notify::event::ModifyKind::Any
+        )));
     }
 
     #[test]
