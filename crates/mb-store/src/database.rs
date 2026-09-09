@@ -409,6 +409,51 @@ impl ControlStore {
         Ok(())
     }
 
+    pub fn pin_recovery_attempt_and_reconcile_records(
+        &mut self,
+        checkpoint_hash: &[u8; 32],
+        attempt: &[u8],
+        kind: &str,
+        delete_record_ids: &[Vec<u8>],
+        replacements: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), DatabaseError> {
+        let transaction = self.connection.transaction()?;
+        {
+            let mut delete = transaction.prepare_cached(
+                "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
+            )?;
+            for record_id in delete_record_ids {
+                delete.execute(params![kind, record_id])?;
+            }
+        }
+        {
+            let mut replace = transaction.prepare_cached(
+                "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+            )?;
+            for (record_id, bytes) in replacements {
+                replace.execute(params![kind, record_id, bytes])?;
+            }
+        }
+        transaction.execute(
+            "INSERT INTO protocol_records(kind, record_id, bytes)
+             VALUES ('recovery-attempt', ?1, ?2)
+             ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+            params![b"active".as_slice(), attempt],
+        )?;
+        transaction.execute(
+            "DELETE FROM recovery_shards WHERE checkpoint_hash <> ?1",
+            [checkpoint_hash.as_slice()],
+        )?;
+        transaction.execute(
+            "DELETE FROM protocol_records
+             WHERE kind = 'recovery-job' AND record_id <> ?1",
+            [checkpoint_hash.as_slice()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn complete_recovery_attempt(
         &mut self,
         checkpoint_hash: &[u8; 32],
@@ -1722,9 +1767,18 @@ mod tests {
         store
             .put_record("recovery-job", &active_checkpoint, b"active-job")
             .unwrap();
+        store
+            .put_record("dht-observed-recovery", b"stale", b"stale-observation")
+            .unwrap();
 
         store
-            .pin_recovery_attempt(&active_checkpoint, b"active-attempt")
+            .pin_recovery_attempt_and_reconcile_records(
+                &active_checkpoint,
+                b"active-attempt",
+                "dht-observed-recovery",
+                &[b"stale".to_vec()],
+                &[(b"current".to_vec(), b"current-observation".to_vec())],
+            )
             .unwrap();
 
         assert!(matches!(
@@ -1744,6 +1798,19 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             b"active-attempt"
+        );
+        assert!(
+            store
+                .get_record("dht-observed-recovery", b"stale")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_record("dht-observed-recovery", b"current")
+                .unwrap()
+                .unwrap(),
+            b"current-observation"
         );
 
         store

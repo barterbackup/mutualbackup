@@ -2160,6 +2160,21 @@ impl Node {
         checkpoint: &QuorumCheckpoint,
         observations: Vec<CheckpointRecoveryObservation>,
     ) -> Result<()> {
+        let (delete_record_ids, replacements) =
+            self.checkpoint_recovery_record_reconciliation(checkpoint, observations)?;
+        self.control.reconcile_records(
+            "dht-observed-recovery",
+            &delete_record_ids,
+            &replacements,
+        )?;
+        Ok(())
+    }
+
+    fn checkpoint_recovery_record_reconciliation(
+        &self,
+        checkpoint: &QuorumCheckpoint,
+        observations: Vec<CheckpointRecoveryObservation>,
+    ) -> Result<(Vec<Vec<u8>>, Vec<(Vec<u8>, Vec<u8>)>)> {
         checkpoint.verify()?;
         let subject = self.keys.node_id();
         if !checkpoint
@@ -2176,7 +2191,7 @@ impl Node {
             let peer_id = member.node_id.libp2p_peer_id()?.to_string();
             allowed.insert(
                 recovery_observation_record_id(subject, &peer_id).to_vec(),
-                member.node_id,
+                (member.node_id, peer_id),
             );
         }
 
@@ -2190,14 +2205,37 @@ impl Node {
             }
             let state: DhtObservationState = decode_canonical(&bytes)?;
             validate_dht_observation_state(&state)?;
-            if record_id[..32] != subject.0
-                || !allowed.contains_key(&record_id)
-                || state.current.expires_at_unix_seconds <= now
+            let Some((publisher, provider_peer_id)) = allowed.get(&record_id) else {
+                delete_record_ids.push(record_id);
+                continue;
+            };
+            if record_id[..32] != subject.0 || state.current.expires_at_unix_seconds <= now {
+                delete_record_ids.push(record_id);
+                continue;
+            }
+            let Ok(selected) =
+                decode_canonical::<SignedRecord<RecoveryBundle>>(&state.current.bytes)
+            else {
+                delete_record_ids.push(record_id);
+                continue;
+            };
+            let candidate = CheckpointRecoveryObservation {
+                provider_peer_id: provider_peer_id.clone(),
+                selected,
+                observations: Vec::new(),
+            };
+            if candidate.selected.value.publisher != *publisher
+                || candidate.selected.value.sequence != state.current.sequence
+                || candidate.selected.value.expires_at_unix_seconds
+                    != state.current.expires_at_unix_seconds
+                || self
+                    .validate_checkpoint_recovery_observation(checkpoint, &candidate, now)
+                    .is_err()
             {
                 delete_record_ids.push(record_id);
-            } else {
-                retained.insert(record_id, bytes);
+                continue;
             }
+            retained.insert(record_id, bytes);
         }
 
         let mut seen_publishers = BTreeMap::new();
@@ -2226,12 +2264,7 @@ impl Node {
         if retained.len() > MAX_DHT_OBSERVED_RECOVERY_SCOPES {
             anyhow::bail!("durable recovery observation scope limit reached");
         }
-        self.control.reconcile_records(
-            "dht-observed-recovery",
-            &delete_record_ids,
-            &replacements,
-        )?;
-        Ok(())
+        Ok((delete_record_ids, replacements))
     }
 
     fn validate_checkpoint_recovery_observation(
@@ -2639,7 +2672,11 @@ impl Node {
         }))
     }
 
-    pub(crate) fn pin_recovery_attempt(&mut self, checkpoint: &QuorumCheckpoint) -> Result<()> {
+    pub(crate) fn pin_recovery_attempt(
+        &mut self,
+        checkpoint: &QuorumCheckpoint,
+        observations: Vec<CheckpointRecoveryObservation>,
+    ) -> Result<()> {
         checkpoint.verify()?;
         self.validate_local_member(&checkpoint.checkpoint)?;
         let checkpoint_hash = checkpoint.hash()?;
@@ -2651,6 +2688,8 @@ impl Node {
         {
             anyhow::bail!("recovery attempt would roll back or fork durable recovery state");
         }
+        let (delete_record_ids, replacements) =
+            self.checkpoint_recovery_record_reconciliation(checkpoint, observations)?;
         for (record_id, bytes) in self.control.records("recovery-job")? {
             if record_id.as_slice() == checkpoint_hash {
                 continue;
@@ -2667,8 +2706,13 @@ impl Node {
             checkpoint_hash,
             generation: checkpoint.checkpoint.generation,
         };
-        self.control
-            .pin_recovery_attempt(&checkpoint_hash, &canonical_bytes(&attempt)?)?;
+        self.control.pin_recovery_attempt_and_reconcile_records(
+            &checkpoint_hash,
+            &canonical_bytes(&attempt)?,
+            "dht-observed-recovery",
+            &delete_record_ids,
+            &replacements,
+        )?;
         Ok(())
     }
 
@@ -3416,6 +3460,105 @@ fn set_private_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn signed_recovery_checkpoint_fixture() -> (Seed, Seed, QuorumCheckpoint) {
+        let seeds = (0_u8..5)
+            .map(|index| Seed::from_bytes([index + 130; 32]))
+            .collect::<Vec<_>>();
+        let keys = seeds.iter().map(KeyMaterial::from_seed).collect::<Vec<_>>();
+        let mut members = keys
+            .iter()
+            .enumerate()
+            .map(|(index, keys)| Member {
+                node_id: keys.node_id(),
+                recovery_public_key: keys.recovery_public_key(),
+                failure_domain: format!("checkpoint-domain-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let target = SectorRef {
+            id: [131; 32],
+            root: [132; 32],
+            logical_len: 1,
+        };
+        let guild_id = [133; 32];
+        let roles = [
+            ShardRole::Information(mb_core::InformationRole {
+                owner: keys[0].node_id(),
+                sector: target.clone(),
+            }),
+            ShardRole::Information(mb_core::InformationRole {
+                owner: keys[1].node_id(),
+                sector: SectorRef {
+                    id: [134; 32],
+                    root: [135; 32],
+                    logical_len: 0,
+                },
+            }),
+            ShardRole::Information(mb_core::InformationRole {
+                owner: keys[2].node_id(),
+                sector: SectorRef {
+                    id: [136; 32],
+                    root: [137; 32],
+                    logical_len: 0,
+                },
+            }),
+            ShardRole::Parity(mb_core::ParityRole {
+                holder: keys[3].node_id(),
+                row: 0,
+                root: [138; 32],
+            }),
+            ShardRole::Parity(mb_core::ParityRole {
+                holder: keys[4].node_id(),
+                row: 1,
+                root: [139; 32],
+            }),
+        ];
+        let mut group = mb_core::CodingGroup {
+            id: [0; 32],
+            format_version: 1,
+            guild_id,
+            data_shards: mb_core::V1_RS_DATA_SHARDS,
+            parity_shards: mb_core::V1_RS_PARITY_SHARDS,
+            shard_size: mb_core::V1_SECTOR_SIZE as u32,
+            roles,
+        };
+        group.id = group.calculate_id().unwrap();
+        let revision = SignedRecord::sign(
+            b"mutualbackup/user-revision/v1",
+            UserRevision {
+                format_version: 1,
+                guild_id,
+                cipher_profile: mb_core::V1_CIPHER_PROFILE,
+                revision_id: Uuid::from_bytes([140; 16]),
+                owner: keys[0].node_id(),
+                sequence: 1,
+                parent: None,
+                metadata_sectors: vec![target],
+                data_sectors: Vec::new(),
+            },
+            &keys[0],
+        )
+        .unwrap();
+        members.sort_by_key(|member| member.node_id);
+        let mut checkpoint = QuorumCheckpoint {
+            checkpoint: GuildCheckpoint {
+                format_version: 1,
+                guild_id,
+                genesis_hash: [141; 32],
+                generation: 1,
+                parent: None,
+                members,
+                revisions: vec![revision],
+                coding_groups: vec![group],
+            },
+            signatures: Vec::new(),
+        };
+        for keys in &keys {
+            checkpoint.add_signature(keys).unwrap();
+        }
+        checkpoint.verify().unwrap();
+        (seeds[0].clone(), seeds[1].clone(), checkpoint)
+    }
+
     fn recovery_guild_fixture() -> (Seed, QuorumGuildGenesis, Vec<GuildPeer>) {
         let mut identities = (0_u8..5)
             .map(|index| {
@@ -4058,5 +4201,101 @@ mod tests {
             node.require_active_recovery_attempt([127; 32], checkpoint_hash)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn checkpoint_reconciliation_prunes_invalid_existing_member_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let (subject_seed, publisher_seed, checkpoint) = signed_recovery_checkpoint_fixture();
+        let mut node = Node::open(temp.path(), subject_seed).unwrap();
+        let publisher_keys = KeyMaterial::from_seed(&publisher_seed);
+        let publisher = publisher_keys.node_id();
+        let provider = publisher.libp2p_peer_id().unwrap().to_string();
+        let expires_at_unix_seconds = unix_seconds() + 300;
+        let sequence = u64::MAX - 1;
+        let bundle = SignedRecord::sign(
+            b"mutualbackup/recovery-bundle/v1",
+            RecoveryBundle {
+                format_version: 1,
+                subject: node.keys().node_id(),
+                publisher,
+                sequence,
+                expires_at_unix_seconds,
+                sealed: mb_core::SealedRecoveryRecord {
+                    format_version: 1,
+                    ephemeral_public_key: [0; 32],
+                    nonce: [0; 24],
+                    ciphertext: vec![0; 64],
+                },
+            },
+            &publisher_keys,
+        )
+        .unwrap();
+        let bytes = canonical_bytes(&bundle).unwrap();
+        let hash = *blake3::hash(&bytes).as_bytes();
+        let state = DhtObservationState {
+            format_version: 1,
+            highest_sequence: sequence,
+            hashes: vec![DhtObservedHash { sequence, hash }],
+            current: DhtObservedRecord {
+                sequence,
+                hash,
+                expires_at_unix_seconds,
+                bytes,
+            },
+        };
+        let record_id = recovery_observation_record_id(node.keys().node_id(), &provider);
+        node.control
+            .put_record(
+                "dht-observed-recovery",
+                &record_id,
+                &canonical_bytes(&state).unwrap(),
+            )
+            .unwrap();
+
+        node.retain_checkpoint_recovery_records(&checkpoint, Vec::new())
+            .unwrap();
+
+        assert!(
+            node.control
+                .get_record("dht-observed-recovery", &record_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejected_recovery_attempt_does_not_reconcile_dht_observations() {
+        let temp = tempfile::tempdir().unwrap();
+        let (seed, _, checkpoint) = signed_recovery_checkpoint_fixture();
+        let mut node = Node::open(temp.path(), seed).unwrap();
+        let active = RecoveryAttempt {
+            format_version: 1,
+            guild_id: checkpoint.checkpoint.guild_id,
+            checkpoint_hash: [142; 32],
+            generation: checkpoint.checkpoint.generation + 1,
+        };
+        node.control
+            .put_record(
+                "recovery-attempt",
+                b"active",
+                &canonical_bytes(&active).unwrap(),
+            )
+            .unwrap();
+        let stale_record_id = vec![143; 64];
+        let stale_record = b"must survive rejected transition".to_vec();
+        node.control
+            .put_record("dht-observed-recovery", &stale_record_id, &stale_record)
+            .unwrap();
+
+        assert!(node.pin_recovery_attempt(&checkpoint, Vec::new()).is_err());
+
+        assert_eq!(
+            node.control
+                .get_record("dht-observed-recovery", &stale_record_id)
+                .unwrap(),
+            Some(stale_record)
+        );
+        assert_eq!(node.active_recovery_attempt().unwrap(), Some(active));
     }
 }

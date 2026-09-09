@@ -2753,8 +2753,7 @@ pub async fn recover_from_dht(
         .collect();
     let checkpoint_for_attempt = checkpoint.clone();
     node_blocking(node.clone(), move |node| {
-        node.retain_checkpoint_recovery_records(&checkpoint_for_attempt, recovery_observations)?;
-        node.pin_recovery_attempt(&checkpoint_for_attempt)
+        node.pin_recovery_attempt(&checkpoint_for_attempt, recovery_observations)
     })
     .await?;
 
@@ -4146,7 +4145,13 @@ mod tests {
         }
     }
 
-    fn install_legacy_recovery_observation_poison(data_dir: &std::path::Path, subject_seed: &Seed) {
+    const LEGACY_MEMBER_POISON_SEQUENCE: u64 = u64::MAX - 1;
+
+    fn install_legacy_recovery_observation_poison(
+        data_dir: &std::path::Path,
+        subject_seed: &Seed,
+        authorized_publisher_seed: &Seed,
+    ) {
         #[derive(serde::Serialize)]
         struct StoredHash {
             sequence: u64,
@@ -4175,7 +4180,7 @@ mod tests {
         let control =
             mb_store::ControlStore::open(data_dir.join("control.db"), &subject_keys).unwrap();
         let now = unix_seconds();
-        for index in 0_u8..64 {
+        for index in 0_u8..63 {
             let mut fake_seed = [0xe7; 32];
             fake_seed[0] = index;
             fake_seed[31] = !index;
@@ -4229,6 +4234,54 @@ mod tests {
                 )
                 .unwrap();
         }
+        let publisher_keys = KeyMaterial::from_seed(authorized_publisher_seed);
+        let publisher = publisher_keys.node_id();
+        let provider = publisher.libp2p_peer_id().unwrap().to_string();
+        let expires_at_unix_seconds = now + 300;
+        let bundle = SignedRecord::sign(
+            b"mutualbackup/recovery-bundle/v1",
+            mb_core::RecoveryBundle {
+                format_version: 1,
+                subject,
+                publisher,
+                sequence: LEGACY_MEMBER_POISON_SEQUENCE,
+                expires_at_unix_seconds,
+                sealed: mb_core::SealedRecoveryRecord {
+                    format_version: 1,
+                    ephemeral_public_key: [0; 32],
+                    nonce: [0; 24],
+                    ciphertext: vec![0; 64],
+                },
+            },
+            &publisher_keys,
+        )
+        .unwrap();
+        let bytes = canonical_bytes(&bundle).unwrap();
+        let hash = *blake3::hash(&bytes).as_bytes();
+        let state = StoredState {
+            format_version: 1,
+            highest_sequence: LEGACY_MEMBER_POISON_SEQUENCE,
+            hashes: vec![StoredHash {
+                sequence: LEGACY_MEMBER_POISON_SEQUENCE,
+                hash,
+            }],
+            current: StoredRecord {
+                sequence: LEGACY_MEMBER_POISON_SEQUENCE,
+                hash,
+                expires_at_unix_seconds,
+                bytes,
+            },
+        };
+        let mut record_id = [0_u8; 64];
+        record_id[..32].copy_from_slice(&subject.0);
+        record_id[32..].copy_from_slice(blake3::hash(provider.as_bytes()).as_bytes());
+        control
+            .put_record(
+                "dht-observed-recovery",
+                &record_id,
+                &canonical_bytes(&state).unwrap(),
+            )
+            .unwrap();
         assert_eq!(control.records("dht-observed-recovery").unwrap().len(), 64);
     }
 
@@ -5574,7 +5627,7 @@ mod tests {
         std::fs::remove_dir_all(&lost_source).unwrap();
         let recovered_state = run_root.join("recovered-node-1");
         let restored = run_root.join("restored-node-1");
-        install_legacy_recovery_observation_poison(&recovered_state, &seeds[1]);
+        install_legacy_recovery_observation_poison(&recovered_state, &seeds[1], &seeds[4]);
         let recovered_node = Node::open(&recovered_state, seeds[1].clone()).unwrap();
         let recovered_id = recovered_node.keys().node_id();
         let recovered_node = Arc::new(Mutex::new(recovered_node));
@@ -5642,6 +5695,13 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(retained.len() >= 3);
         assert!(retained.len() <= 4);
+        assert!(retained.iter().all(|(_, bytes)| {
+            decode_canonical::<SignedRecord<mb_core::RecoveryBundle>>(bytes)
+                .unwrap()
+                .value
+                .sequence
+                != LEGACY_MEMBER_POISON_SEQUENCE
+        }));
         assert!(
             retained
                 .iter()
