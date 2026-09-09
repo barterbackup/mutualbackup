@@ -1598,7 +1598,8 @@ impl Node {
         group: &mb_core::CodingGroup,
         object: &ParityObject,
     ) -> Result<()> {
-        self.parity.stage_and_publish(object)?;
+        self.parity
+            .stage_and_publish_ack(object, &[], self.parity_budget_bytes)?;
         self.control.put_record(
             "local-parity-proof",
             &parity_proof_id(&group.id, object.shard_index),
@@ -1938,6 +1939,8 @@ impl Node {
             guild_id,
             checkpoint_hash,
             checkpoint_generation,
+            subject_endpoint_sequence_floor: self
+                .observed_endpoint_sequence_floor(subject.node_id)?,
             endpoints,
             expires_at_unix_seconds,
         };
@@ -2125,13 +2128,28 @@ impl Node {
         {
             anyhow::bail!("durable DHT observation scope limit reached");
         }
+        let active_stored = match stored.as_deref() {
+            Some(bytes) => {
+                let state: DhtObservationState = decode_canonical(bytes)?;
+                validate_dht_observation_state(&state)?;
+                (state.current.expires_at_unix_seconds > now).then_some(bytes)
+            }
+            None => None,
+        };
         let Some(state) = merge_dht_observation_state(
-            stored.as_deref(),
+            if incoming.is_empty() {
+                stored.as_deref()
+            } else {
+                active_stored
+            },
             incoming,
             now,
             DHT_OBSERVATION_FORMAT_UNCERTIFIED,
         )?
         else {
+            if stored.is_some() {
+                self.control.delete_record(kind, record_id)?;
+            }
             return Ok(None);
         };
         let selected =
@@ -2572,6 +2590,47 @@ impl Node {
         Ok(next)
     }
 
+    pub(crate) fn recover_endpoint_publication_sequence_floor(
+        &mut self,
+        guild_id: [u8; 32],
+        recovered_floor: u64,
+    ) -> Result<()> {
+        if recovered_floor == u64::MAX {
+            anyhow::bail!("recovered endpoint publication sequence is exhausted");
+        }
+        let local_id = self.keys.node_id();
+        let slot = publication_slot(b"endpoint", local_id, local_id, guild_id);
+        let current = self
+            .control
+            .get_record("recovery-publication-sequence", &slot)?
+            .map(|bytes| decode_canonical::<u64>(&bytes))
+            .transpose()?
+            .unwrap_or(0);
+        if recovered_floor > current {
+            self.control.put_record(
+                "recovery-publication-sequence",
+                &slot,
+                &canonical_bytes(&recovered_floor)?,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn observed_endpoint_sequence_floor(&self, subject: NodeId) -> Result<u64> {
+        let Some(bytes) = self
+            .control
+            .get_record("dht-observed-endpoint", &subject.0)?
+        else {
+            return Ok(0);
+        };
+        let state: DhtObservationState = decode_canonical(&bytes)?;
+        validate_dht_observation_state(&state)?;
+        if state.highest_sequence == u64::MAX {
+            anyhow::bail!("observed endpoint publication sequence is exhausted");
+        }
+        Ok(state.highest_sequence)
+    }
+
     pub fn checkpoint(&self, hash: &[u8; 32]) -> Result<QuorumCheckpoint> {
         let bytes = self
             .control
@@ -2645,29 +2704,24 @@ impl Node {
             }
         }
         self.validate_local_roles(&checkpoint.checkpoint)?;
-        self.control.commit_checkpoint(
+        let local_revision = checkpoint
+            .checkpoint
+            .revisions
+            .iter()
+            .filter(|revision| revision.value.owner == self.keys.node_id())
+            .max_by_key(|revision| revision.value.sequence)
+            .map(canonical_bytes)
+            .transpose()?;
+        self.control.commit_recovered_checkpoint(
             &checkpoint.checkpoint.guild_id,
             checkpoint.checkpoint.generation,
             checkpoint.checkpoint.parent.as_ref(),
             &checkpoint_hash,
             &canonical_bytes(&checkpoint.checkpoint)?,
             &canonical_bytes(checkpoint)?,
-            false,
+            local_revision.as_deref(),
+            local_revision.is_none(),
         )?;
-        if let Some(revision) = checkpoint
-            .checkpoint
-            .revisions
-            .iter()
-            .filter(|revision| revision.value.owner == self.keys.node_id())
-            .max_by_key(|revision| revision.value.sequence)
-        {
-            self.control.put_record(
-                "user-revision-head",
-                &checkpoint.checkpoint.guild_id,
-                &canonical_bytes(revision)?,
-            )?;
-        }
-        self.control.clear_recovery_shards(&checkpoint_hash)?;
         Ok(checkpoint_hash)
     }
 
@@ -2714,9 +2768,8 @@ impl Node {
         let checkpoint_hash = checkpoint.hash()?;
         if let Some(active) = self.active_recovery_attempt()?
             && (active.guild_id != checkpoint.checkpoint.guild_id
-                || active.generation > checkpoint.checkpoint.generation
-                || (active.generation == checkpoint.checkpoint.generation
-                    && active.checkpoint_hash != checkpoint_hash))
+                || active.generation != checkpoint.checkpoint.generation
+                || active.checkpoint_hash != checkpoint_hash)
         {
             anyhow::bail!("recovery attempt would roll back or fork durable recovery state");
         }
@@ -3501,7 +3554,7 @@ fn set_private_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn signed_recovery_checkpoint_fixture() -> (Seed, Seed, QuorumCheckpoint) {
+    fn signed_recovery_checkpoint_fixture() -> (Vec<Seed>, QuorumCheckpoint) {
         let seeds = (0_u8..5)
             .map(|index| Seed::from_bytes([index + 130; 32]))
             .collect::<Vec<_>>();
@@ -3597,7 +3650,7 @@ mod tests {
             checkpoint.add_signature(keys).unwrap();
         }
         checkpoint.verify().unwrap();
-        (seeds[0].clone(), seeds[1].clone(), checkpoint)
+        (seeds, checkpoint)
     }
 
     fn recovery_guild_fixture() -> (Seed, QuorumGuildGenesis, Vec<GuildPeer>) {
@@ -3802,6 +3855,35 @@ mod tests {
     }
 
     #[test]
+    fn recovered_parity_respects_the_configured_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut node = Node::open(temp.path(), Seed::from_bytes([83; 32])).unwrap();
+        node.configure_parity_budget((mb_core::V1_SECTOR_SIZE - 1) as u64)
+            .unwrap();
+        let (_, checkpoint) = signed_recovery_checkpoint_fixture();
+        let group = &checkpoint.checkpoint.coding_groups[0];
+        let bytes = vec![82; mb_core::V1_SECTOR_SIZE];
+        let object = ParityObject {
+            format_version: 1,
+            guild_id: group.guild_id,
+            group_id: group.id,
+            shard_index: 3,
+            root: sector_root(&bytes),
+            bytes,
+        };
+
+        let error = node.publish_validated_parity(group, &object).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<DatabaseError>(),
+            Some(DatabaseError::CapacityExceeded)
+        ));
+        assert!(matches!(
+            node.parity.load_ready(&group.id, 3),
+            Err(DatabaseError::NotReady)
+        ));
+    }
+
+    #[test]
     fn accepted_dht_sequences_reject_rollback_and_forks_after_restart() {
         let temp = tempfile::tempdir().unwrap();
         let seed = Seed::from_bytes([82; 32]);
@@ -3899,7 +3981,7 @@ mod tests {
                     }],
                 )
                 .unwrap(),
-            None
+            Some(b"first".to_vec())
         );
         assert_eq!(
             reopened
@@ -3914,6 +3996,83 @@ mod tests {
                 )
                 .unwrap(),
             Some(b"third".to_vec())
+        );
+    }
+
+    #[test]
+    fn recovery_locators_carry_and_restore_the_subject_endpoint_floor() {
+        let publisher_dir = tempfile::tempdir().unwrap();
+        let recovered_dir = tempfile::tempdir().unwrap();
+        let publisher_seed = Seed::from_bytes([80; 32]);
+        let subject_seed = Seed::from_bytes([79; 32]);
+        let subject_keys = KeyMaterial::from_seed(&subject_seed);
+        let subject = Member {
+            node_id: subject_keys.node_id(),
+            recovery_public_key: subject_keys.recovery_public_key(),
+            failure_domain: "subject-domain".to_owned(),
+        };
+        let publisher = Node::open(publisher_dir.path(), publisher_seed).unwrap();
+        let observed_bytes = b"last subject endpoint".to_vec();
+        let observed_hash = *blake3::hash(&observed_bytes).as_bytes();
+        let observed_sequence = 73;
+        let state = DhtObservationState {
+            format_version: DHT_OBSERVATION_FORMAT_UNCERTIFIED,
+            highest_sequence: observed_sequence,
+            hashes: vec![DhtObservedHash {
+                sequence: observed_sequence,
+                hash: observed_hash,
+            }],
+            current: DhtObservedRecord {
+                sequence: observed_sequence,
+                hash: observed_hash,
+                expires_at_unix_seconds: unix_seconds().saturating_sub(1),
+                bytes: observed_bytes,
+            },
+        };
+        publisher
+            .control
+            .put_record(
+                "dht-observed-endpoint",
+                &subject.node_id.0,
+                &canonical_bytes(&state).unwrap(),
+            )
+            .unwrap();
+        let sealed = publisher
+            .recovery_record_for_endpoints(
+                &subject,
+                [78; 32],
+                [77; 32],
+                4,
+                vec!["memory://publisher".to_owned()],
+                unix_seconds() + 300,
+            )
+            .unwrap();
+        let plaintext = open_recovery_record(&subject_keys, &sealed).unwrap();
+        let locator: SignedRecord<RecoveryLocator> = decode_canonical(&plaintext).unwrap();
+        locator.verify(RECOVERY_LOCATOR_DOMAIN).unwrap();
+        assert_eq!(
+            locator.value.subject_endpoint_sequence_floor,
+            observed_sequence
+        );
+
+        let mut recovered = Node::open(recovered_dir.path(), subject_seed).unwrap();
+        recovered
+            .recover_endpoint_publication_sequence_floor(
+                locator.value.guild_id,
+                locator.value.subject_endpoint_sequence_floor,
+            )
+            .unwrap();
+        let slot = publication_slot(
+            b"endpoint",
+            subject.node_id,
+            subject.node_id,
+            locator.value.guild_id,
+        );
+        assert_eq!(
+            recovered
+                .next_recovery_publication_sequence(&slot, 1)
+                .unwrap(),
+            observed_sequence + 1
         );
     }
 
@@ -4302,7 +4461,9 @@ mod tests {
     #[test]
     fn checkpoint_reconciliation_prunes_invalid_existing_member_bundle() {
         let temp = tempfile::tempdir().unwrap();
-        let (subject_seed, publisher_seed, checkpoint) = signed_recovery_checkpoint_fixture();
+        let (seeds, checkpoint) = signed_recovery_checkpoint_fixture();
+        let subject_seed = seeds[0].clone();
+        let publisher_seed = seeds[1].clone();
         let mut node = Node::open(temp.path(), subject_seed).unwrap();
         let publisher_keys = KeyMaterial::from_seed(&publisher_seed);
         let publisher = publisher_keys.node_id();
@@ -4361,10 +4522,40 @@ mod tests {
     }
 
     #[test]
+    fn pinned_recovery_attempt_rejects_a_higher_signed_fork() {
+        let temp = tempfile::tempdir().unwrap();
+        let (seeds, checkpoint) = signed_recovery_checkpoint_fixture();
+        let mut node = Node::open(temp.path(), seeds[0].clone()).unwrap();
+        node.pin_recovery_attempt(&checkpoint, Vec::new()).unwrap();
+
+        let mut fork = checkpoint.checkpoint.clone();
+        fork.generation = checkpoint.checkpoint.generation + 1;
+        fork.parent = Some([201; 32]);
+        let mut fork = QuorumCheckpoint {
+            checkpoint: fork,
+            signatures: Vec::new(),
+        };
+        for seed in &seeds {
+            fork.add_signature(&KeyMaterial::from_seed(seed)).unwrap();
+        }
+        fork.verify().unwrap();
+        assert!(node.pin_recovery_attempt(&fork, Vec::new()).is_err());
+        assert_eq!(
+            node.active_recovery_attempt().unwrap(),
+            Some(RecoveryAttempt {
+                format_version: 1,
+                guild_id: checkpoint.checkpoint.guild_id,
+                checkpoint_hash: checkpoint.hash().unwrap(),
+                generation: checkpoint.checkpoint.generation,
+            })
+        );
+    }
+
+    #[test]
     fn rejected_recovery_attempt_does_not_reconcile_dht_observations() {
         let temp = tempfile::tempdir().unwrap();
-        let (seed, _, checkpoint) = signed_recovery_checkpoint_fixture();
-        let mut node = Node::open(temp.path(), seed).unwrap();
+        let (seeds, checkpoint) = signed_recovery_checkpoint_fixture();
+        let mut node = Node::open(temp.path(), seeds[0].clone()).unwrap();
         let active = RecoveryAttempt {
             format_version: 1,
             guild_id: checkpoint.checkpoint.guild_id,

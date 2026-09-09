@@ -2747,13 +2747,22 @@ pub async fn recover_from_dht(
         checkpoint,
         candidates,
     } = selected.context("no advertised recovery head could be certified")?;
+    let recovered_endpoint_sequence_floor = candidates
+        .iter()
+        .map(|candidate| candidate.locator.subject_endpoint_sequence_floor)
+        .max()
+        .unwrap_or(0);
     let recovery_observations = candidates
         .iter()
         .map(|candidate| candidate.observation.clone())
         .collect();
     let checkpoint_for_attempt = checkpoint.clone();
     node_blocking(node.clone(), move |node| {
-        node.pin_recovery_attempt(&checkpoint_for_attempt, recovery_observations)
+        node.pin_recovery_attempt(&checkpoint_for_attempt, recovery_observations)?;
+        node.recover_endpoint_publication_sequence_floor(
+            guild_id,
+            recovered_endpoint_sequence_floor,
+        )
     })
     .await?;
 

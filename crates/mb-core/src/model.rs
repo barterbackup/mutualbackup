@@ -543,6 +543,7 @@ impl QuorumCheckpoint {
             || locator.guild_id != self.checkpoint.guild_id
             || locator.checkpoint_generation != self.checkpoint.generation
             || locator.checkpoint_hash != self.hash()?
+            || locator.subject_endpoint_sequence_floor == u64::MAX
             || locator.expires_at_unix_seconds == 0
             || locator.endpoints.is_empty()
             || locator.endpoints.len() > 8
@@ -962,6 +963,7 @@ mod tests {
             guild_id,
             checkpoint_hash: checkpoint.hash().unwrap(),
             checkpoint_generation: 1,
+            subject_endpoint_sequence_floor: 0,
             endpoints: vec!["tcp://127.0.0.1:1".to_owned()],
             expires_at_unix_seconds: u64::MAX,
         };

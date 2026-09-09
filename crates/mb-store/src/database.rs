@@ -795,6 +795,93 @@ impl ControlStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_recovered_checkpoint(
+        &mut self,
+        guild_id: &[u8; 32],
+        generation: u64,
+        parent: Option<&[u8; 32]>,
+        checkpoint_hash: &[u8; 32],
+        checkpoint_body_bytes: &[u8],
+        checkpoint_certificate_bytes: &[u8],
+        local_revision_head: Option<&[u8]>,
+        complete_recovery_attempt: bool,
+    ) -> Result<(), DatabaseError> {
+        let generation_i64 = i64::try_from(generation).map_err(|_| DatabaseError::Integrity)?;
+        let transaction = self.connection.transaction()?;
+        let current = checkpoint_row(&transaction, "checkpoint_heads", guild_id)?;
+        match current {
+            Some((stored_generation, stored_hash, stored_bytes))
+                if stored_generation == generation
+                    && stored_hash == *checkpoint_hash
+                    && stored_bytes == checkpoint_certificate_bytes => {}
+            Some((stored_generation, stored_hash, _))
+                if stored_generation.checked_add(1) == Some(generation)
+                    && parent == Some(&stored_hash) => {}
+            Some(_) => return Err(DatabaseError::Conflict),
+            None if generation == 1 && parent.is_none() => {}
+            None => {}
+        }
+        transaction.execute(
+            "INSERT INTO protocol_records(kind, record_id, bytes)
+             VALUES ('guild-checkpoint', ?1, ?2)
+             ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+            params![checkpoint_hash.as_slice(), checkpoint_certificate_bytes],
+        )?;
+        transaction.execute(
+            "INSERT INTO checkpoint_heads(
+                guild_id, generation, checkpoint_hash, checkpoint_bytes
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(guild_id) DO UPDATE SET
+                generation = excluded.generation,
+                checkpoint_hash = excluded.checkpoint_hash,
+                checkpoint_bytes = excluded.checkpoint_bytes",
+            params![
+                guild_id.as_slice(),
+                generation_i64,
+                checkpoint_hash.as_slice(),
+                checkpoint_certificate_bytes,
+            ],
+        )?;
+        upsert_checkpoint_signature_lock(
+            &transaction,
+            guild_id,
+            generation_i64,
+            checkpoint_hash,
+            checkpoint_body_bytes,
+        )?;
+        match local_revision_head {
+            Some(revision) => {
+                transaction.execute(
+                    "INSERT INTO protocol_records(kind, record_id, bytes)
+                     VALUES ('user-revision-head', ?1, ?2)
+                     ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+                    params![guild_id.as_slice(), revision],
+                )?;
+            }
+            None => {
+                transaction.execute(
+                    "DELETE FROM protocol_records
+                     WHERE kind = 'user-revision-head' AND record_id = ?1",
+                    [guild_id.as_slice()],
+                )?;
+            }
+        }
+        transaction.execute(
+            "DELETE FROM recovery_shards WHERE checkpoint_hash = ?1",
+            [checkpoint_hash.as_slice()],
+        )?;
+        if complete_recovery_attempt {
+            transaction.execute(
+                "DELETE FROM protocol_records
+                 WHERE kind = 'recovery-attempt' AND record_id = ?1",
+                [b"active".as_slice()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn cipher_integrity_check(&self) -> Result<(), DatabaseError> {
         cipher_integrity_check(&self.connection)
     }
@@ -1947,6 +2034,148 @@ mod tests {
                 .begin_operation(&operation, "ensure-filler", &caller, &request)
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn recovered_checkpoint_control_state_commits_atomically() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([61; 32]));
+        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let guild_id = [62; 32];
+        let checkpoint_hash = [63; 32];
+        let group_id = [64; 32];
+        let shard = vec![65; V1_SECTOR_SIZE];
+        let shard_root = sector_root(&shard);
+        store
+            .stage_recovery_shard(
+                &checkpoint_hash,
+                &guild_id,
+                &group_id,
+                0,
+                &shard_root,
+                &shard,
+            )
+            .unwrap();
+        store
+            .put_record("recovery-attempt", b"active", b"attempt")
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_recovered_revision
+                 BEFORE INSERT ON protocol_records
+                 WHEN NEW.kind = 'user-revision-head'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'fault after checkpoint');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .commit_recovered_checkpoint(
+                    &guild_id,
+                    1,
+                    None,
+                    &checkpoint_hash,
+                    b"checkpoint-body",
+                    b"checkpoint-certificate",
+                    Some(b"local-revision"),
+                    false,
+                )
+                .is_err()
+        );
+        assert!(store.checkpoint_head(&guild_id).unwrap().is_none());
+        assert!(
+            store
+                .get_record("guild-checkpoint", &checkpoint_hash)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .recovery_shard(&checkpoint_hash, &guild_id, &group_id, 0, &shard_root)
+                .unwrap(),
+            shard
+        );
+        assert_eq!(
+            store.get_record("recovery-attempt", b"active").unwrap(),
+            Some(b"attempt".to_vec())
+        );
+
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_recovered_revision")
+            .unwrap();
+        store
+            .commit_recovered_checkpoint(
+                &guild_id,
+                1,
+                None,
+                &checkpoint_hash,
+                b"checkpoint-body",
+                b"checkpoint-certificate",
+                Some(b"local-revision"),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            store.checkpoint_head(&guild_id).unwrap(),
+            Some((1, checkpoint_hash, b"checkpoint-certificate".to_vec()))
+        );
+        assert_eq!(
+            store.get_record("user-revision-head", &guild_id).unwrap(),
+            Some(b"local-revision".to_vec())
+        );
+        assert!(matches!(
+            store.recovery_shard(&checkpoint_hash, &guild_id, &group_id, 0, &shard_root),
+            Err(DatabaseError::NotReady)
+        ));
+        assert_eq!(
+            store.get_record("recovery-attempt", b"active").unwrap(),
+            Some(b"attempt".to_vec())
+        );
+    }
+
+    #[test]
+    fn storage_only_recovered_checkpoint_completes_the_attempt() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([66; 32]));
+        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let guild_id = [67; 32];
+        let checkpoint_hash = [68; 32];
+        store
+            .put_record("recovery-attempt", b"active", b"storage-only")
+            .unwrap();
+        store
+            .put_record("user-revision-head", &guild_id, b"stale")
+            .unwrap();
+
+        store
+            .commit_recovered_checkpoint(
+                &guild_id,
+                1,
+                None,
+                &checkpoint_hash,
+                b"checkpoint-body",
+                b"checkpoint-certificate",
+                None,
+                true,
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .get_record("recovery-attempt", b"active")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_record("user-revision-head", &guild_id)
+                .unwrap()
+                .is_none()
         );
     }
 

@@ -18,6 +18,7 @@ pub struct RecoveryLocator {
     pub guild_id: [u8; 32],
     pub checkpoint_hash: [u8; 32],
     pub checkpoint_generation: u64,
+    pub subject_endpoint_sequence_floor: u64,
     pub endpoints: Vec<String>,
     pub expires_at_unix_seconds: u64,
 }

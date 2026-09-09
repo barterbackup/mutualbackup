@@ -410,6 +410,7 @@ mod tests {
                 guild_id: [5; 32],
                 checkpoint_hash: [6; 32],
                 checkpoint_generation: 7,
+                subject_endpoint_sequence_floor: 41,
                 endpoints: vec![format!("/ip4/192.0.2.7/udp/4400/quic-v1/p2p/{peer_id}")],
                 expires_at_unix_seconds: 1_700_000_000,
             },
