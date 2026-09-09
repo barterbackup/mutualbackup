@@ -173,6 +173,11 @@ struct DhtObservationState {
     current: DhtObservedRecord,
 }
 
+struct DhtRecordReconciliation {
+    delete_record_ids: Vec<Vec<u8>>,
+    replacements: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct DhtObservedHash {
     sequence: u64,
@@ -2160,12 +2165,12 @@ impl Node {
         checkpoint: &QuorumCheckpoint,
         observations: Vec<CheckpointRecoveryObservation>,
     ) -> Result<()> {
-        let (delete_record_ids, replacements) =
+        let reconciliation =
             self.checkpoint_recovery_record_reconciliation(checkpoint, observations)?;
         self.control.reconcile_records(
             "dht-observed-recovery",
-            &delete_record_ids,
-            &replacements,
+            &reconciliation.delete_record_ids,
+            &reconciliation.replacements,
         )?;
         Ok(())
     }
@@ -2174,7 +2179,7 @@ impl Node {
         &self,
         checkpoint: &QuorumCheckpoint,
         observations: Vec<CheckpointRecoveryObservation>,
-    ) -> Result<(Vec<Vec<u8>>, Vec<(Vec<u8>, Vec<u8>)>)> {
+    ) -> Result<DhtRecordReconciliation> {
         checkpoint.verify()?;
         let subject = self.keys.node_id();
         if !checkpoint
@@ -2264,7 +2269,10 @@ impl Node {
         if retained.len() > MAX_DHT_OBSERVED_RECOVERY_SCOPES {
             anyhow::bail!("durable recovery observation scope limit reached");
         }
-        Ok((delete_record_ids, replacements))
+        Ok(DhtRecordReconciliation {
+            delete_record_ids,
+            replacements,
+        })
     }
 
     fn validate_checkpoint_recovery_observation(
@@ -2688,7 +2696,7 @@ impl Node {
         {
             anyhow::bail!("recovery attempt would roll back or fork durable recovery state");
         }
-        let (delete_record_ids, replacements) =
+        let reconciliation =
             self.checkpoint_recovery_record_reconciliation(checkpoint, observations)?;
         for (record_id, bytes) in self.control.records("recovery-job")? {
             if record_id.as_slice() == checkpoint_hash {
@@ -2710,8 +2718,8 @@ impl Node {
             &checkpoint_hash,
             &canonical_bytes(&attempt)?,
             "dht-observed-recovery",
-            &delete_record_ids,
-            &replacements,
+            &reconciliation.delete_record_ids,
+            &reconciliation.replacements,
         )?;
         Ok(())
     }
