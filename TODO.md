@@ -1,5 +1,70 @@
 # Product TODO
 
+## Milestone 2 corrective gate — blocks Milestone 3
+
+A fresh source-only audit at `3d85e75` reopened the gate. The recent capture,
+restore, and Docker-lab corrections remain useful, but the following defects
+are reachable on current paths and must be fixed with focused fault regressions
+before Tor work begins.
+
+### Capture and restore ownership/durability
+
+- Bind an anchor transaction to one validated area descriptor and one newly
+  created staging descriptor. `capture_plan` currently validates the area by
+  pathname, then independently uses pathnames for staging cleanup/creation,
+  captured destinations, publication, and final sync. A same-UID
+  rename/replacement can split those phases across different directories,
+  redirect output outside the validated area, or make a committed rename
+  non-durable. Anchor retirement has the same final gap: stable and legacy
+  removal drop the descriptor used for unlinking and reopen the path to sync.
+  Perform creation, writes, rename/unlink, cleanup, and `sync_all` relative to
+  the pinned descriptors; regress area replacement before writes and between
+  mutation and sync.
+- Make the version-6 recovery initializer owned before it can exist. Its random
+  directory is currently created before its marker, while both resume and
+  cleanup ignore an initializer whose marker is absent or incomplete. A crash
+  or marker-write failure therefore leaves an unowned orphan that cannot be
+  reclaimed safely. Journal the exact initializer name/identity first, or use
+  an equivalently atomic ownership protocol, and regress every
+  create/write/rename boundary.
+- Keep the first durable recovery-staging identity immutable and build through
+  pinned descriptors. The current path samples an identity after verification,
+  ignores a missing-marker result, lets `build_revision_restore` sample the
+  pathname again, and finally overwrites the journaled identity. A replacement
+  can therefore be adopted and later recursively deleted; path-based
+  descendant creation can also follow a substituted intermediate symlink.
+  Never adopt a later inode, and create, link, metadata-update, sync, publish,
+  and clean the restored hierarchy descriptor-relatively without crossing a
+  mount or symlink. Regress root and descendant replacement with foreign
+  sentinels.
+- Turn ordinary restore into a durable staged/publication job instead of an
+  unrecorded UUID directory. A crash before rename currently strands its hidden
+  tree, while a crash after rename leaves an ambiguous target that retry
+  rejects. A successful rename followed by parent-`fsync` failure is likewise
+  reported as failed publication and cleans only the now-missing staging name.
+  Renaming/replacing the parent can also make cleanup inspect a different
+  directory and mistake the absent old name for completed cleanup. Pin the
+  containing directory during an attempt, distinguish pre-rename from
+  post-rename failure, and retain a restart-visible obligation until either
+  the expected target is durably published or the expected staging tree is
+  durably removed. Regress parent rename/replacement, interruption on both
+  sides of rename, and directory-sync failure.
+
+### Docker-lab ownership validation
+
+- Make namespace enumeration fail closed. `directory_is_empty` decides from
+  `find` output but discards its failure status, and marker recovery loses the
+  same status through process substitution. An owned nonempty root without read
+  permission can consequently look empty, be marked as lab-owned, and later be
+  chmodded and used by destructive lifecycle operations. Capture and check the
+  enumerator status before adopting or cleaning a namespace; regress an
+  unreadable nonempty root and a failed marker scan.
+- Parse loop records as exactly one newline-terminated `/dev/loopN` token.
+  Counting newlines currently accepts a valid first line followed by an
+  unterminated trailing line. Detach no longer trusts the record, so this is not
+  independently a Milestone 3 blocker, but it is definite malformed-state
+  acceptance in the Milestone 2 lab path and should be fixed in this slice.
+
 ## Later guild geometry and coding protocol
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
