@@ -1485,7 +1485,7 @@ where
     let parent = containing_directory(target);
     fs::create_dir_all(parent)?;
     let staging = parent.join(format!(".mutualbackup-restore-{}", Uuid::new_v4()));
-    build_revision_restore(
+    let staging_identity = build_revision_restore(
         keys,
         guild_id,
         revision,
@@ -1493,7 +1493,7 @@ where
         &mut load_ciphertext,
         true,
     )?;
-    publish_restore(&staging, target)
+    publish_restore_or_cleanup(&staging, staging_identity, target)
 }
 
 pub(crate) fn build_revision_restore<F>(
@@ -1503,7 +1503,7 @@ pub(crate) fn build_revision_restore<F>(
     staging: &Path,
     load_ciphertext: &mut F,
     apply_root_metadata: bool,
-) -> Result<()>
+) -> Result<(u64, u64)>
 where
     F: FnMut(&SectorId) -> Result<Vec<u8>>,
 {
@@ -1535,7 +1535,8 @@ where
         &encryption_key,
         load_ciphertext,
         apply_root_metadata,
-    );
+    )
+    .and_then(|()| sync_tree_bottom_up(staging));
     if let Err(error) = result {
         if let Err(cleanup_error) = remove_owned_restore_directory(staging, staging_identity) {
             return Err(error).with_context(|| {
@@ -1546,8 +1547,7 @@ where
         }
         return Err(error);
     }
-    sync_tree_bottom_up(staging)?;
-    Ok(())
+    Ok(staging_identity)
 }
 
 pub(crate) fn publish_restore(staging: &Path, target: &Path) -> Result<()> {
@@ -1555,6 +1555,26 @@ pub(crate) fn publish_restore(staging: &Path, target: &Path) -> Result<()> {
     rename_no_replace(staging, target)?;
     sync_directory(parent)?;
     Ok(())
+}
+
+fn publish_restore_or_cleanup(
+    staging: &Path,
+    staging_identity: (u64, u64),
+    target: &Path,
+) -> Result<()> {
+    match publish_restore(staging, target) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Err(cleanup_error) = remove_owned_restore_directory(staging, staging_identity) {
+                return Err(error).with_context(|| {
+                    format!(
+                        "restore publication failed and its owned staging directory could not be removed safely: {cleanup_error}"
+                    )
+                });
+            }
+            Err(error)
+        }
+    }
 }
 
 fn containing_directory(path: &Path) -> &Path {
@@ -2224,6 +2244,29 @@ mod metadata_compatibility_tests {
             create_owned_restore_staging(parent.path(), &staging, &marker_name, &marker).is_err()
         );
         fs::remove_file(&staging).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_restore_publication_removes_only_its_owned_staging_tree() {
+        let parent = tempfile::tempdir().unwrap();
+        let staging = parent.path().join(format!(
+            ".mutualbackup-restore-{}",
+            Uuid::from_bytes([47; 16])
+        ));
+        let target = parent.path().join("existing-target");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("partial"), b"staged restore").unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("must-survive"), b"existing bytes").unwrap();
+        let identity = native_directory_id(&staging).unwrap();
+
+        assert!(publish_restore_or_cleanup(&staging, identity, &target).is_err());
+        assert!(!staging.exists());
+        assert_eq!(
+            fs::read(target.join("must-survive")).unwrap(),
+            b"existing bytes"
+        );
     }
 
     #[cfg(target_os = "linux")]
