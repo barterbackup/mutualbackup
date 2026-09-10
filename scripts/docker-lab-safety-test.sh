@@ -303,4 +303,88 @@ grep -Fq 'belongs to another identity' "$TEST_ROOT/stderr"
 grep -Fqx 'original image' "$resumed_root/images/node0.btrfs"
 [[ ! -e $resumed_root/prepare-called ]]
 
+overlong_root=$TEST_ROOT/reinit-overlong-name
+initialize_namespace "$overlong_root"
+printf 'original image\n' >"$overlong_root/images/node0.btrfs"
+printf -v overlong_name '%*s' 256 ''
+overlong_name=${overlong_name// /a}
+if MUTUALBACKUP_DOCKER_LAB_ROOT=$overlong_root bash -c '
+    source "$1"
+    prepare_host() { printf called >"$LAB_ROOT/prepare-called"; }
+    command_reinit 0 "$2" --yes
+' bash "$LAB" "$overlong_name" >"$TEST_ROOT/stdout" 2>"$TEST_ROOT/stderr"; then
+    printf 'reinit accepted an overlong restore name\n' >&2
+    exit 1
+fi
+grep -Fq 'restore NAME must be at most 255 bytes' "$TEST_ROOT/stderr"
+grep -Fqx 'original image' "$overlong_root/images/node0.btrfs"
+[[ ! -e $overlong_root/seeds/node0.recovery-intent ]]
+[[ ! -e $overlong_root/prepare-called ]]
+
+failover_root=$TEST_ROOT/reinit-restoring-failover
+initialize_namespace "$failover_root"
+printf 'node-a\n' >"$failover_root/seeds/node0.seed"
+printf 'format=2\nphase=restoring\nbootstrap_node=1\nrestore_name=recovered\nguild_id=%s\nexpected_node_id=%s\n' \
+    "$guild" "$node_a" >"$failover_root/seeds/node0.recovery-intent"
+chmod 600 "$failover_root/seeds/node0.seed" "$failover_root/seeds/node0.recovery-intent"
+printf 'original image\n' >"$failover_root/images/node0.btrfs"
+MUTUALBACKUP_DOCKER_LAB_ROOT=$failover_root FAKE_GUILD=$guild FAKE_NODE_A=$node_a \
+    bash -c '
+        source "$1"
+        ensure_recovery_identity_binding() { :; }
+        prepare_recovery_container() {
+            printf "%s\n" "$RECOVERY_BOOTSTRAP_NODE" >>"$LAB_ROOT/prepare-log"
+        }
+        start_node_internal() { :; }
+        daemon_node_id() { printf "%s\n" "$FAKE_NODE_A"; }
+        container_running() { [[ $1 == 2 || $1 == 3 || $1 == 4 ]]; }
+        guild_phase() { printf "Active\n"; }
+        guild_id() { printf "%s\n" "$FAKE_GUILD"; }
+        cli_raw() {
+            local node=$1 command=$2 attempts
+            if [[ $command == status ]]; then
+                return 0
+            fi
+            [[ $command == restore ]] || return 90
+            attempts=0
+            [[ ! -e $LAB_ROOT/restore-attempts ]] || attempts=$(<"$LAB_ROOT/restore-attempts")
+            ((attempts += 1))
+            printf "%s\n" "$attempts" >"$LAB_ROOT/restore-attempts"
+            ((attempts >= 2))
+        }
+        remove_container() { printf "%s\n" "$1" >>"$LAB_ROOT/remove-log"; }
+        resume_recovery_transaction 0
+    ' bash "$LAB" >"$TEST_ROOT/stdout" 2>"$TEST_ROOT/stderr"
+[[ $(<"$failover_root/restore-attempts") == 2 ]]
+[[ $(sed -n '1p' "$failover_root/prepare-log") == 1 ]]
+[[ $(sed -n '2p' "$failover_root/prepare-log") == 2 ]]
+[[ $(<"$failover_root/remove-log") == 0 ]]
+[[ ! -e $failover_root/seeds/node0.recovery-intent ]]
+grep -Fqx 'original image' "$failover_root/images/node0.btrfs"
+
+local_retry_root=$TEST_ROOT/reinit-restoring-local-retry
+initialize_namespace "$local_retry_root"
+printf 'node-a\n' >"$local_retry_root/seeds/node0.seed"
+printf 'format=2\nphase=restoring\nbootstrap_node=1\nrestore_name=recovered\nguild_id=%s\nexpected_node_id=%s\n' \
+    "$guild" "$node_a" >"$local_retry_root/seeds/node0.recovery-intent"
+chmod 600 "$local_retry_root/seeds/node0.seed" "$local_retry_root/seeds/node0.recovery-intent"
+MUTUALBACKUP_DOCKER_LAB_ROOT=$local_retry_root FAKE_GUILD=$guild FAKE_NODE_A=$node_a \
+    bash -c '
+        source "$1"
+        ensure_recovery_identity_binding() { :; }
+        prepare_recovery_container() { :; }
+        start_node_internal() { :; }
+        daemon_node_id() { printf "%s\n" "$FAKE_NODE_A"; }
+        guild_phase() { printf "Active\n"; }
+        guild_id() { printf "%s\n" "$FAKE_GUILD"; }
+        cli_raw() { [[ $2 == restore ]]; }
+        validate_recovery_survivors() {
+            printf called >"$LAB_ROOT/survivor-check-called"
+            return 1
+        }
+        resume_recovery_transaction 0
+    ' bash "$LAB" >"$TEST_ROOT/stdout" 2>"$TEST_ROOT/stderr"
+[[ ! -e $local_retry_root/seeds/node0.recovery-intent ]]
+[[ ! -e $local_retry_root/survivor-check-called ]]
+
 printf 'Docker lab safety checks passed\n'

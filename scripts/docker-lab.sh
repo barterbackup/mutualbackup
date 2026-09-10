@@ -23,6 +23,7 @@ PARITY_BUDGET_BYTES=${MUTUALBACKUP_LAB_PARITY_BUDGET_BYTES:-536870912}
 IP_PREFIX=${MUTUALBACKUP_LAB_IP_PREFIX:-172.30.77}
 P2P_BASE_PORT=${MUTUALBACKUP_LAB_P2P_BASE_PORT:-44000}
 NODE_COUNT=5
+MAX_RESTORE_NAME_BYTES=255
 NAMESPACE_MARKER=.mutualbackup-docker-lab-directory-v1
 NAMESPACE_ROLES=(images mounts loops seeds configs)
 
@@ -382,6 +383,14 @@ validate_node() {
     [[ $node =~ ^[0-4]$ ]] || die "NODE must be one of 0, 1, 2, 3, or 4"
 }
 
+validate_restore_name() {
+    local name=$1
+    [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+        die "restore NAME must be a simple relative directory name"
+    ((${#name} <= MAX_RESTORE_NAME_BYTES)) ||
+        die "restore NAME must be at most $MAX_RESTORE_NAME_BYTES bytes"
+}
+
 find_tool() {
     local name=$1
     shift
@@ -572,8 +581,7 @@ load_recovery_intent() {
     [[ $RECOVERY_PHASE =~ ^(prepared|erasing|erased|initialized|container_created|restoring)$ ]] ||
         die "invalid recovery phase in $path: $RECOVERY_PHASE"
     validate_node "$RECOVERY_BOOTSTRAP_NODE"
-    [[ $RECOVERY_RESTORE_NAME =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
-        die "invalid recovery target in $path"
+    validate_restore_name "$RECOVERY_RESTORE_NAME"
     [[ $RECOVERY_GUILD_ID =~ ^[0-9a-fA-F]{64}$ ]] || die "invalid recovery guild in $path"
     if [[ $RECOVERY_FORMAT == 2 ]]; then
         [[ $node_seen == true ]] || die "recovery intent has no expected node identity: $path"
@@ -1325,17 +1333,8 @@ prepare_recovery_container() {
     fi
 }
 
-resume_recovery_transaction() {
-    local node=$1
-    local intent expected_guild restore_name
-    intent=$(node_recovery_intent "$node")
-    load_recovery_intent "$intent" || die "node $node has no recovery transaction to resume"
-    ensure_recovery_identity_binding "$node"
-    expected_guild=$RECOVERY_GUILD_ID
-    restore_name=$RECOVERY_RESTORE_NAME
-    if [[ $RECOVERY_PHASE != restoring ]]; then
-        validate_recovery_survivors "$node" "$expected_guild"
-    fi
+prepare_recovery_restore_attempt() {
+    local node=$1 restore_name=$2
     prepare_recovery_container "$node"
     start_node_internal "$node"
     [[ $(daemon_node_id "$node") == "$RECOVERY_EXPECTED_NODE_ID" ]] ||
@@ -1344,17 +1343,46 @@ resume_recovery_transaction() {
         advance_recovery_intent "$node" restoring
     fi
     say "recovering guild state and latest owned revision into /node/exchange/$restore_name"
-    if ! cli_raw "$node" restore "/node/exchange/$restore_name"; then
-        say "recovery did not complete; its durable transaction remains at: $intent" >&2
-        say "retry with: $0 reinit $node $restore_name --yes (or run up)" >&2
-        return 1
-    fi
+}
+
+finish_recovery_restore_attempt() {
+    local node=$1 expected_guild=$2 restore_name=$3
     [[ $(daemon_node_id "$node") == "$RECOVERY_EXPECTED_NODE_ID" ]] ||
         die "recovered node $node changed identity"
     [[ $(guild_phase "$node") == Active && $(guild_id "$node") == "$expected_guild" ]] ||
         die "recovered node $node did not rejoin its original active guild"
     clear_recovery_intent "$node"
     say "host-visible restored tree: $(node_exchange "$node")/$restore_name"
+}
+
+resume_recovery_transaction() {
+    local node=$1
+    local intent expected_guild restore_name
+    intent=$(node_recovery_intent "$node")
+    load_recovery_intent "$intent" || die "node $node has no recovery transaction to resume"
+    ensure_recovery_identity_binding "$node"
+    expected_guild=$RECOVERY_GUILD_ID
+    restore_name=$RECOVERY_RESTORE_NAME
+
+    if [[ $RECOVERY_PHASE == restoring ]]; then
+        prepare_recovery_restore_attempt "$node" "$restore_name"
+        if cli_raw "$node" restore "/node/exchange/$restore_name"; then
+            finish_recovery_restore_attempt "$node" "$expected_guild" "$restore_name"
+            return
+        fi
+        say "local recovery retry did not complete; checking for another bootstrap member" >&2
+        validate_recovery_survivors "$node" "$expected_guild"
+    else
+        validate_recovery_survivors "$node" "$expected_guild"
+    fi
+
+    prepare_recovery_restore_attempt "$node" "$restore_name"
+    if ! cli_raw "$node" restore "/node/exchange/$restore_name"; then
+        say "recovery did not complete; its durable transaction remains at: $intent" >&2
+        say "retry with: $0 reinit $node $restore_name --yes (or run up)" >&2
+        return 1
+    fi
+    finish_recovery_restore_attempt "$node" "$expected_guild" "$restore_name"
 }
 
 ensure_guild() {
@@ -1537,8 +1565,7 @@ command_reinit() {
         esac
         shift
     done
-    [[ $restore_name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
-        die "restore NAME must be a simple relative directory name"
+    validate_restore_name "$restore_name"
 
     prepare_host
     acquire_lock
