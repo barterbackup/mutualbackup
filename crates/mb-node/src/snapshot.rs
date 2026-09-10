@@ -1689,6 +1689,9 @@ pub(crate) fn publish_owned_restore(
         (Some(actual), None) if actual == expected => {
             parent.rename_child_no_replace(staging_name, target_name)?;
             run_after_restore_rename_hook()?;
+            if parent.entry_identity(target_name, true)? != Some(expected) {
+                bail!("restore target changed during publication");
+            }
         }
         (None, Some(actual)) if actual == expected => {}
         (Some(_), None) => bail!("durable restore staging directory was replaced"),
@@ -1731,7 +1734,7 @@ fn restore_entries<F>(
 where
     F: FnMut(&SectorId) -> Result<Vec<u8>>,
 {
-    let mut directory_metadata = Vec::new();
+    let mut directory_metadata = BTreeMap::new();
     let mut expected_entries = BTreeMap::<PathBuf, ExpectedRestoreEntry>::new();
     let mut declared_paths = BTreeSet::new();
     let mut restored_links = BTreeMap::<u64, RestoredLink>::new();
@@ -1762,7 +1765,7 @@ where
                     bail!("duplicate path in recovered metadata");
                 }
                 ensure_restore_directory(staging, &destination, &mut expected_entries)?;
-                directory_metadata.push((destination, *mode, *modified_secs, *modified_nanos));
+                directory_metadata.insert(destination, (*mode, *modified_secs, *modified_nanos));
             }
             PrivateEntry::File {
                 path,
@@ -1917,37 +1920,29 @@ where
     let mut directories = expected_entries
         .iter()
         .filter(|(_, expected)| expected.directory)
-        .map(|(path, _)| {
-            open_expected_restore_directory(staging, path, &expected_entries)
-                .map(|directory| (path.clone(), directory))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    directories.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
-    for (_, directory) in &directories {
-        directory.sync_all()?;
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in directories {
+        let directory = open_expected_restore_directory(staging, &path, &expected_entries)?;
+        if let Some((mode, modified_secs, modified_nanos)) = directory_metadata.remove(&path) {
+            set_metadata_durable(directory.as_file(), mode, modified_secs, modified_nanos)?;
+        } else {
+            directory.sync_all()?;
+        }
     }
-    staging.sync_all()?;
-
+    if !directory_metadata.is_empty() {
+        bail!("restored directory metadata has no matching directory");
+    }
     if apply_root_metadata {
-        directory_metadata.push((
-            PathBuf::new(),
+        set_metadata_durable(
+            staging.as_file(),
             metadata.root_mode,
             metadata.root_modified_secs,
             metadata.root_modified_nanos,
-        ));
-    }
-    directory_metadata.sort_by_key(|(path, ..)| std::cmp::Reverse(path.components().count()));
-    for (path, mode, modified_secs, modified_nanos) in directory_metadata {
-        let directory = if path.as_os_str().is_empty() {
-            staging
-        } else {
-            &directories
-                .iter()
-                .find(|(candidate, _)| candidate == &path)
-                .context("restored directory handle is unavailable")?
-                .1
-        };
-        set_metadata_durable(directory.as_file(), mode, modified_secs, modified_nanos)?;
+        )?;
+    } else {
+        staging.sync_all()?;
     }
     Ok(())
 }
@@ -2376,6 +2371,39 @@ mod metadata_compatibility_tests {
         assert_eq!(fs::read(parent.join("foreign")).unwrap(), b"must survive");
     }
 
+    #[test]
+    fn ordinary_restore_keeps_obligation_when_target_is_replaced_after_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([209; 32]));
+        let guild_id = [210; 32];
+        let control = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let (revision, ciphertexts) = restore_fixture(&keys, guild_id, Vec::new(), Vec::new());
+        let target = temp.path().join("restored");
+        let moved = temp.path().join("moved-restored");
+        let target_for_hook = target.clone();
+        let moved_for_hook = moved.clone();
+
+        AFTER_RESTORE_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&target_for_hook, &moved_for_hook)?;
+                fs::create_dir(&target_for_hook)?;
+                fs::write(target_for_hook.join("foreign"), b"must survive")?;
+                Ok(())
+            }));
+        });
+        assert!(
+            restore_revision(&control, &keys, guild_id, &revision, &ciphertexts, &target).is_err()
+        );
+        assert!(moved.is_dir());
+        assert_eq!(fs::read(target.join("foreign")).unwrap(), b"must survive");
+        assert!(
+            control
+                .get_record(RESTORE_JOB_KIND, revision.value.revision_id.as_bytes())
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn ordinary_restore_rejects_staging_root_replacement() {
@@ -2725,6 +2753,61 @@ mod metadata_compatibility_tests {
     #[test]
     fn bare_restore_target_uses_the_current_directory() {
         assert_eq!(containing_directory(Path::new("restored")), Path::new("."));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "temporarily lowers the process descriptor limit"]
+    fn restore_directory_descriptor_use_is_bounded() {
+        struct OpenFileLimitGuard(libc::rlimit);
+
+        impl Drop for OpenFileLimitGuard {
+            fn drop(&mut self) {
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) }, 0);
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let staging = PinnedDirectory::open(temp.path()).unwrap();
+        let metadata = PrivateMetadata {
+            format_version: 3,
+            root_mode: 0o755,
+            root_modified_secs: 1_700_000_000,
+            root_modified_nanos: 0,
+            entries: (0..512)
+                .map(|ordinal| PrivateEntry::Directory {
+                    path: format!("directory-{ordinal:04}"),
+                    mode: 0o755,
+                    modified_secs: 1_700_000_000,
+                    modified_nanos: 0,
+                })
+                .collect(),
+        };
+        let mut original = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, original.as_mut_ptr()) },
+            0
+        );
+        let original = unsafe { original.assume_init() };
+        assert!(original.rlim_cur >= 96);
+        let limited = libc::rlimit {
+            rlim_cur: 96,
+            rlim_max: original.rlim_max,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limited) }, 0);
+        let limit = OpenFileLimitGuard(original);
+
+        restore_entries(
+            &staging,
+            &metadata,
+            &[0; 32],
+            &mut |_| unreachable!(),
+            false,
+        )
+        .unwrap();
+
+        drop(limit);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 512);
     }
 
     #[test]

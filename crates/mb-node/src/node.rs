@@ -3020,6 +3020,7 @@ impl Node {
                         revision,
                         &restored.descriptor_path(),
                     )?;
+                    verify_pinned_parent_path(&parent, &parent_path)?;
                     return Ok(());
                 }
                 RecoveryJobState::Ready => {
