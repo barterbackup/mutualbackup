@@ -745,8 +745,7 @@ impl ReflinkAnchor {
                 filesystem,
                 &staging_file,
                 &staging,
-                &link_pool_file,
-                &link_pool,
+                (&link_pool_file, &link_pool),
             )?;
             remove_directory_at(&area_file, &link_pool_name, &link_pool)?;
             area_file.sync_all()?;
@@ -1371,9 +1370,9 @@ fn capture_entries(
     filesystem: FilesystemIdentity,
     staging: &File,
     staging_display: &Path,
-    link_pool: &File,
-    link_pool_display: &Path,
+    link_pool: (&File, &Path),
 ) -> Result<Vec<CapturedEntry>, AnchorError> {
+    let (link_pool, link_pool_display) = link_pool;
     #[cfg(test)]
     BEFORE_CAPTURE_WALK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
