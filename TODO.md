@@ -1,5 +1,47 @@
 # Product TODO
 
+## Milestone 2 corrective gate — blocks Milestone 3
+
+- Make the target-keyed ordinary restore journal an exclusive state machine,
+  not only an atomic initial insert. A late caller can currently insert after a
+  completed caller deletes its row, and two same-revision callers can advance
+  one `Building` row with unconditional upserts; both schedules can leave a
+  stale job or an extra staging tree beside the published target. Use
+  compare-and-transition ownership through publication and test the ABA and
+  stale-writer schedules with independent `ControlStore` connections.
+- Reconcile reachable legacy restore state instead of rejecting it forever.
+  The revision-keyed implementation could leave two failed version-1 jobs for
+  different revisions at one still-absent target; the new scanner sees both and
+  aborts every retry, and there is no abandon/reconcile operation. Select or
+  retire them safely under one transaction and regress this exact upgrade
+  state without deleting either staging tree unless its recorded identity is
+  verified.
+- Let a public ordinary-restore retry finish an existing `Publishing` job
+  before validating or reconstructing source sectors. The CLI/control path now
+  runs the complete P2P repair loop first, so a post-rename job cannot clear its
+  journal while local recipes are missing and peers are temporarily offline,
+  although the complete target is already present. Cover the public control
+  path, not only `Node::restore_snapshot`, with a post-rename interruption and
+  unavailable sectors.
+- Make verification of a `Complete` seed-recovery job genuinely read-only even
+  when a stable anchor area has moved. The verifier currently calls
+  `render_sector`, which tries to refresh the anchor-location cache; under
+  SQLite `query_only` that error is treated as an unstable recipe and triggers
+  a writing reanchor. Separate non-mutating render/verification from optional
+  hint maintenance and regress a relocated, discoverable anchor with the
+  control connection query-only.
+- Allow a Docker-lab transaction in `restoring` to replace a dead recorded
+  bootstrap without erasing the recovered image again. That phase currently
+  skips survivor validation forever, so failure of the one bootstrap after the
+  phase transition can strand recovery despite three alternate healthy guild
+  members. Regress failover after `container_created -> restoring` and prove
+  that `up` persists the replacement and completes from the existing image.
+- Bound and preflight Docker `reinit`'s restore name before writing its intent
+  or erasing anything. A 256-byte ASCII component passes the current regex,
+  becomes immutable in the durable intent, and only then fails on Btrfs with
+  `ENAMETOOLONG`. Regress rejection with the original container/image intact,
+  no recovery intent, and no recovery initialization.
+
 ## Later guild geometry and coding protocol
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
