@@ -1,5 +1,51 @@
 # Product TODO
 
+## Milestone 2 corrective gate — blocks Milestone 3
+
+A source-only follow-up at `d52b193` found the following reachable defects in
+the completed Milestone 2 paths. Fix each one with a focused regression, then
+rerun the inherited Milestone 2 gates and repeat the source review before
+starting Tor work.
+
+### Capture and restore lifecycle
+
+- Move capture bookkeeping out of the protected tree's filename namespace.
+  Capture always creates `.mutualbackup-capture-hardlinks` at the anchor root,
+  then exclusively creates the protected root's top-level entries beside it.
+  A valid source containing a file or directory with that name therefore fails
+  every backup with `EEXIST`. Regress both the file and directory cases while
+  preserving hard-link reconstruction.
+- Let the real CLI/control restore path consult the durable restore job before
+  rejecting an existing target. Both public wrappers currently return early on
+  `target.exists()`, so a crash or parent-sync error after the staging rename
+  leaves an internally resumable `Publishing` job that no public retry can
+  finish. Exercise the fault through the public control path, not only the
+  lower-level restore helper.
+- Reserve each canonical restore target across all unfinished ordinary restore
+  jobs, not only within the revision-ID-keyed record. A failed job for revision
+  R1 can currently leave its target absent, after which R2—including a later
+  revision selected by the default `latest` request—can publish to the same
+  target and permanently strand R1's journal and staging tree. Make reservation
+  and job creation atomic, and regress sequential and concurrent conflicts.
+- Make a retry of a verified `Complete` seed-recovery job genuinely read-only.
+  `restore_recovered_revision` currently performs an unconditional SQL UPSERT
+  before its completed-state return, so an intact completed recovery can fail
+  solely because SQLite cannot take a write path. Regress completion with
+  writes denied rather than merely making the restored tree unreadable.
+
+### Docker-lab destructive recovery
+
+- Bind `reinit` to the node identity before permitting irreversible erasure.
+  The script currently checks only the retained seed file's ownership and shape,
+  deletes the valid Btrfs image, and parses the seed for the first time during
+  `recover-init`. A corrupt seed therefore destroys the node before failing; a
+  different same-guild member's valid seed can pass the final guild-only check.
+  Derive and compare the seed's Node ID before the `prepared -> erasing`
+  transition, persist that expected Node ID in the durable recovery intent, and
+  verify it again in the new manifest and at completion. Regress corrupt and
+  wrong-member seeds without deleting the original image, including resumed
+  transactions.
+
 ## Later guild geometry and coding protocol
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
