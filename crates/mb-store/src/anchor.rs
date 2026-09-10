@@ -39,6 +39,8 @@ thread_local! {
         std::cell::RefCell::new(None);
     static AFTER_CAPTURE_DIRECTORY_READ: std::cell::RefCell<Option<CaptureDirectoryHook>> =
         std::cell::RefCell::new(None);
+    static BEFORE_OWNED_PARENT_SYNC: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 #[derive(Clone)]
@@ -330,7 +332,13 @@ pub fn remove_owned_directory_tree(
             }
         },
     )?;
-    sync_directory(parent)?;
+    #[cfg(test)]
+    BEFORE_OWNED_PARENT_SYNC.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    parent_file.sync_all()?;
     Ok(())
 }
 
@@ -2792,6 +2800,45 @@ mod tests {
         assert!(remove_owned_directory_tree(&owned, identity).is_err());
         assert!(owned.is_dir());
         fs::remove_dir_all(&owned).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_tree_cleanup_syncs_the_pinned_parent_after_a_rename() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        let moved_parent = root.path().join("moved-parent");
+        let missing = root.path().join("missing");
+        let owned = parent.join("owned");
+        fs::create_dir_all(&owned).unwrap();
+        fs::write(owned.join("payload"), b"owned payload").unwrap();
+        let identity = directory_identity(&owned).unwrap();
+
+        let parent_for_hook = parent.clone();
+        let moved_for_hook = moved_parent.clone();
+        BEFORE_OWNED_PARENT_SYNC.with(|hook| {
+            assert!(
+                hook.borrow_mut()
+                    .replace(Box::new(move || {
+                        fs::rename(&parent_for_hook, &moved_for_hook).unwrap();
+                        symlink(&missing, &parent_for_hook).unwrap();
+                    }))
+                    .is_none()
+            );
+        });
+
+        remove_owned_directory_tree(&owned, identity).unwrap();
+        assert!(!moved_parent.join("owned").exists());
+        assert!(
+            fs::symlink_metadata(&parent)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_file(parent).unwrap();
+        fs::remove_dir(moved_parent).unwrap();
     }
 
     #[cfg(target_os = "linux")]
