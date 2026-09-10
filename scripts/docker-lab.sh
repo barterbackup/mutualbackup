@@ -1266,6 +1266,9 @@ prepare_recovery_container() {
     validate_owned_regular_leaf "$seed" "retained recovery string"
 
     if [[ $RECOVERY_PHASE == prepared ]]; then
+        # Recheck at the irreversible boundary, after survivor discovery or an
+        # interactive confirmation may have delayed this transaction.
+        ensure_recovery_identity_binding "$node"
         advance_recovery_intent "$node" erasing
     fi
     if [[ $RECOVERY_PHASE == erasing ]]; then
