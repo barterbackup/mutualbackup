@@ -138,6 +138,23 @@ impl ControlStore {
         )? == 1)
     }
 
+    pub fn delete_record_if_value(
+        &self,
+        kind: &str,
+        record_id: &[u8],
+        expected: &[u8],
+    ) -> Result<(), DatabaseError> {
+        let removed = self.connection.execute(
+            "DELETE FROM protocol_records
+             WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
+            params![kind, record_id, expected],
+        )?;
+        if removed != 1 {
+            return Err(DatabaseError::Conflict);
+        }
+        Ok(())
+    }
+
     pub fn abandon_capture_intent(
         &self,
         capture_id: &[u8; 16],

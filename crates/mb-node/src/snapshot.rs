@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -10,8 +10,8 @@ use mb_core::{
     decode_canonical, encrypted_sector, make_sector_id, sector_root,
 };
 use mb_store::{
-    AnchorFileLocator, CapturedEntry, ControlStore, FileExtent, NativeFileId, ReflinkAnchor,
-    ReflinkCapturePlan, StableAnchorFileLocator, directory_identity, remove_owned_directory_tree,
+    AnchorFileLocator, CapturedEntry, ControlStore, FileExtent, NativeFileId, PinnedDirectory,
+    ReflinkAnchor, ReflinkCapturePlan, StableAnchorFileLocator,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -22,11 +22,17 @@ const RECOVERY_ANCHOR_INTENT_KIND: &str = "recovery-anchor-intent";
 const ANCHOR_RETIREMENT_KIND: &str = "anchor-retirement";
 const MAX_METADATA_SECTORS: usize = V1_MAX_CATALOG_BYTES.div_ceil(V1_SECTOR_SIZE);
 const MAX_DATA_SECTORS: usize = V1_MAX_CODING_GROUPS - MAX_METADATA_SECTORS;
+const RESTORE_JOB_KIND: &str = "restore-job";
+
+#[cfg(test)]
+type RestoreRenameHook = Box<dyn FnOnce() -> Result<()>>;
 
 #[cfg(test)]
 thread_local! {
     static INTERRUPT_RECOVERY_ANCHOR_AFTER_CAPTURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static AFTER_RESTORE_RENAME: std::cell::RefCell<Option<RestoreRenameHook>> =
+        std::cell::RefCell::new(None);
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -78,6 +84,24 @@ pub struct PrivateMetadata {
     pub root_modified_secs: i64,
     pub root_modified_nanos: u32,
     pub entries: Vec<PrivateEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum RestoreJobState {
+    Building,
+    Publishing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct RestoreJob {
+    format_version: u16,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    target: PathBuf,
+    parent_identity: NativeFileId,
+    staging_name: String,
+    staged_identity: Option<NativeFileId>,
+    state: RestoreJobState,
 }
 
 // Private metadata version 2 existed briefly with two different positional
@@ -1120,27 +1144,32 @@ fn convert_native_v2(metadata: NativeV2PrivateMetadata) -> Result<PrivateMetadat
     })
 }
 
-pub(crate) fn restore_signed_root_metadata(
+pub(crate) fn restore_signed_root_metadata_at(
     control: &ControlStore,
     keys: &KeyMaterial,
     guild_id: [u8; 32],
     revision: &SignedRecord<UserRevision>,
-    restored_root: &Path,
+    restored_root: &PinnedDirectory,
 ) -> Result<()> {
     let metadata = load_private_metadata(control, keys, guild_id, revision)?;
-    let directory = File::open(restored_root)?;
     set_metadata_durable(
-        &directory,
-        restored_root,
+        restored_root.as_file(),
         metadata.root_mode,
         metadata.root_modified_secs,
         metadata.root_modified_nanos,
     )
 }
 
-pub(crate) fn make_restore_root_private(restored_root: &Path) -> Result<()> {
-    set_mode(restored_root, 0o700)?;
-    File::open(restored_root)?.sync_all()?;
+pub(crate) fn make_restore_root_private_at(restored_root: &PinnedDirectory) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        restored_root
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    restored_root.sync_all()?;
     Ok(())
 }
 
@@ -1455,13 +1484,14 @@ pub(crate) fn local_recipe_is_inline(control: &ControlStore, sector_id: &SectorI
 }
 
 pub fn restore_revision(
+    control: &ControlStore,
     keys: &KeyMaterial,
     guild_id: [u8; 32],
     revision: &SignedRecord<UserRevision>,
     ciphertexts: &BTreeMap<SectorId, Vec<u8>>,
     target: &Path,
 ) -> Result<()> {
-    restore_revision_from_source(keys, guild_id, revision, target, |sector_id| {
+    restore_revision_from_source(control, keys, guild_id, revision, target, |sector_id| {
         ciphertexts
             .get(sector_id)
             .cloned()
@@ -1470,6 +1500,7 @@ pub fn restore_revision(
 }
 
 pub fn restore_revision_from_source<F>(
+    control: &ControlStore,
     keys: &KeyMaterial,
     guild_id: [u8; 32],
     revision: &SignedRecord<UserRevision>,
@@ -1479,13 +1510,79 @@ pub fn restore_revision_from_source<F>(
 where
     F: FnMut(&SectorId) -> Result<Vec<u8>>,
 {
-    if target.exists() {
-        bail!("restore target already exists: {}", target.display());
+    revision.verify(b"mutualbackup/user-revision/v1")?;
+    if revision.signer != keys.node_id()
+        || revision.value.owner != keys.node_id()
+        || revision.value.guild_id != guild_id
+        || revision.value.format_version != 1
+        || revision.value.cipher_profile != V1_CIPHER_PROFILE
+    {
+        bail!("revision does not belong to the recovering seed and guild");
     }
-    let parent = containing_directory(target);
-    fs::create_dir_all(parent)?;
-    let staging = parent.join(format!(".mutualbackup-restore-{}", Uuid::new_v4()));
-    let staging_identity = build_revision_restore(
+
+    let (target, target_name, parent) = pinned_restore_parent(target)?;
+    let record_id = revision.value.revision_id.as_bytes();
+    let mut job = match control.get_record(RESTORE_JOB_KIND, record_id)? {
+        Some(bytes) => {
+            let job: RestoreJob = decode_canonical(&bytes)?;
+            if job.format_version != 1
+                || job.guild_id != guild_id
+                || job.revision_id != revision.value.revision_id
+                || job.target != target
+                || job.parent_identity != parent.identity()?
+            {
+                bail!("restore request conflicts with an unfinished durable restore job");
+            }
+            job
+        }
+        None => {
+            if parent.entry_identity(&target_name, true)?.is_some() {
+                bail!("restore target already exists: {}", target.display());
+            }
+            let job = RestoreJob {
+                format_version: 1,
+                guild_id,
+                revision_id: revision.value.revision_id,
+                target: target.clone(),
+                parent_identity: parent.identity()?,
+                staging_name: format!(".mutualbackup-restore-{}", Uuid::new_v4()),
+                staged_identity: None,
+                state: RestoreJobState::Building,
+            };
+            control.put_record(RESTORE_JOB_KIND, record_id, &canonical_bytes(&job)?)?;
+            job
+        }
+    };
+
+    if parent.identity()? != job.parent_identity {
+        bail!("restore parent directory changed since the durable job was created");
+    }
+    if job.state == RestoreJobState::Publishing {
+        return finish_durable_restore_publication(control, record_id, &job, &parent, &target_name);
+    }
+
+    if let Some(actual) = parent.entry_identity(&job.staging_name, true)? {
+        if let Some(expected) = job.staged_identity
+            && actual != expected
+        {
+            bail!("durable restore staging directory was replaced");
+        }
+        parent.remove_child_directory(&job.staging_name, actual)?;
+        parent.sync_all()?;
+    }
+    if parent.entry_identity(&target_name, true)?.is_some() {
+        bail!("restore target appeared while rebuilding an unfinished restore");
+    }
+
+    job.staged_identity = None;
+    control.put_record(RESTORE_JOB_KIND, record_id, &canonical_bytes(&job)?)?;
+    let staging = parent.create_child_directory(&job.staging_name)?;
+    parent.sync_all()?;
+    let staged_identity = staging.identity()?;
+    job.staged_identity = Some(staged_identity);
+    control.put_record(RESTORE_JOB_KIND, record_id, &canonical_bytes(&job)?)?;
+
+    build_revision_restore(
         keys,
         guild_id,
         revision,
@@ -1493,17 +1590,22 @@ where
         &mut load_ciphertext,
         true,
     )?;
-    publish_restore_or_cleanup(&staging, staging_identity, target)
+    if parent.entry_identity(&job.staging_name, true)? != Some(staged_identity) {
+        bail!("restore staging directory changed during construction");
+    }
+    job.state = RestoreJobState::Publishing;
+    control.put_record(RESTORE_JOB_KIND, record_id, &canonical_bytes(&job)?)?;
+    finish_durable_restore_publication(control, record_id, &job, &parent, &target_name)
 }
 
 pub(crate) fn build_revision_restore<F>(
     keys: &KeyMaterial,
     guild_id: [u8; 32],
     revision: &SignedRecord<UserRevision>,
-    staging: &Path,
+    staging: &PinnedDirectory,
     load_ciphertext: &mut F,
     apply_root_metadata: bool,
-) -> Result<(u64, u64)>
+) -> Result<()>
 where
     F: FnMut(&SectorId) -> Result<Vec<u8>>,
 {
@@ -1527,54 +1629,90 @@ where
     }
     let metadata = decode_private_metadata(&metadata_bytes)?;
 
-    create_private_dir(staging)?;
-    let staging_identity = native_directory_id(staging)?;
-    let result = restore_entries(
+    restore_entries(
         staging,
         &metadata,
         &encryption_key,
         load_ciphertext,
         apply_root_metadata,
     )
-    .and_then(|()| sync_tree_bottom_up(staging));
-    if let Err(error) = result {
-        if let Err(cleanup_error) = remove_owned_restore_directory(staging, staging_identity) {
-            return Err(error).with_context(|| {
-                format!(
-                    "restore failed and its owned staging directory could not be removed safely: {cleanup_error}"
-                )
-            });
-        }
-        return Err(error);
-    }
-    Ok(staging_identity)
 }
 
-pub(crate) fn publish_restore(staging: &Path, target: &Path) -> Result<()> {
-    let parent = containing_directory(target);
-    rename_no_replace(staging, target)?;
-    sync_directory(parent)?;
+fn pinned_restore_parent(target: &Path) -> Result<(PathBuf, String, PinnedDirectory)> {
+    let parent_hint = containing_directory(target);
+    fs::create_dir_all(parent_hint)?;
+    let parent_path = parent_hint.canonicalize()?;
+    let target_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("restore target needs one UTF-8 file name")?
+        .to_owned();
+    let relative = Path::new(&target_name);
+    if relative.components().count() != 1
+        || !matches!(relative.components().next(), Some(Component::Normal(_)))
+    {
+        bail!("restore target needs one safe file name");
+    }
+    let parent = PinnedDirectory::open(&parent_path)?;
+    Ok((parent_path.join(&target_name), target_name, parent))
+}
+
+fn finish_durable_restore_publication(
+    control: &ControlStore,
+    record_id: &[u8],
+    job: &RestoreJob,
+    parent: &PinnedDirectory,
+    target_name: &str,
+) -> Result<()> {
+    let expected = job
+        .staged_identity
+        .context("publishing restore job has no staged directory identity")?;
+    publish_owned_restore(parent, &job.staging_name, target_name, expected)?;
+    if parent.descriptor_path().canonicalize()? != containing_directory(&job.target) {
+        bail!("restore parent directory was renamed during publication");
+    }
+    let expected_record = canonical_bytes(job)?;
+    control.delete_record_if_value(RESTORE_JOB_KIND, record_id, &expected_record)?;
     Ok(())
 }
 
-fn publish_restore_or_cleanup(
-    staging: &Path,
-    staging_identity: (u64, u64),
-    target: &Path,
+pub(crate) fn publish_owned_restore(
+    parent: &PinnedDirectory,
+    staging_name: &str,
+    target_name: &str,
+    expected: NativeFileId,
 ) -> Result<()> {
-    match publish_restore(staging, target) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            if let Err(cleanup_error) = remove_owned_restore_directory(staging, staging_identity) {
-                return Err(error).with_context(|| {
-                    format!(
-                        "restore publication failed and its owned staging directory could not be removed safely: {cleanup_error}"
-                    )
-                });
-            }
-            Err(error)
+    match (
+        parent.entry_identity(staging_name, true)?,
+        parent.entry_identity(target_name, true)?,
+    ) {
+        (Some(actual), None) if actual == expected => {
+            parent.rename_child_no_replace(staging_name, target_name)?;
+            run_after_restore_rename_hook()?;
         }
+        (None, Some(actual)) if actual == expected => {}
+        (Some(_), None) => bail!("durable restore staging directory was replaced"),
+        (None, Some(_)) => bail!("restore target was created by another actor"),
+        (Some(_), Some(_)) => bail!("both restore staging and target names exist"),
+        (None, None) => bail!("durable restore staging and published target are both missing"),
     }
+    parent.sync_all()?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn run_after_restore_rename_hook() -> Result<()> {
+    AFTER_RESTORE_RENAME.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook()?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+fn run_after_restore_rename_hook() -> Result<()> {
+    Ok(())
 }
 
 fn containing_directory(path: &Path) -> &Path {
@@ -1583,230 +1721,8 @@ fn containing_directory(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-pub(crate) fn install_recovery_marker(
-    root: &Path,
-    marker_name: &str,
-    marker: &[u8; 32],
-) -> Result<()> {
-    let path = recovery_marker_path(root, marker_name)?;
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(marker)?;
-    file.sync_all()?;
-    sync_directory(root)?;
-    Ok(())
-}
-
-pub(crate) fn create_owned_restore_staging(
-    parent: &Path,
-    staging: &Path,
-    marker_name: &str,
-    marker: &[u8; 32],
-) -> Result<()> {
-    if staging.parent() != Some(parent) {
-        bail!("restore staging directory is outside its expected parent");
-    }
-    match fs::symlink_metadata(staging) {
-        Ok(_) => {
-            verify_owned_restore_initializer(staging, marker_name, marker)?;
-            return Ok(());
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-
-    let prefix = recovery_initializer_prefix(staging)?;
-    let mut initialized = None;
-    for entry in fs::read_dir(parent)? {
-        let entry = entry?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if !name.starts_with(&prefix) {
-            continue;
-        }
-        let path = entry.path();
-        if verify_owned_restore_initializer(&path, marker_name, marker).is_ok()
-            && initialized.replace(path).is_some()
-        {
-            bail!("multiple owned restore initializers exist");
-        }
-    }
-
-    let initialized = match initialized {
-        Some(path) => path,
-        None => {
-            let path = parent.join(format!("{prefix}{}", Uuid::new_v4()));
-            fs::create_dir(&path)?;
-            make_restore_root_private(&path)?;
-            install_recovery_marker(&path, marker_name, marker)?;
-            path
-        }
-    };
-    rename_no_replace(&initialized, staging)?;
-    sync_directory(parent)?;
-    verify_owned_restore_initializer(staging, marker_name, marker)
-}
-
-pub(crate) fn remove_owned_restore_initializers(
-    parent: &Path,
-    staging: &Path,
-    marker_name: &str,
-    marker: &[u8; 32],
-) -> Result<()> {
-    let prefix = recovery_initializer_prefix(staging)?;
-    let mut initialized = Vec::new();
-    for entry in fs::read_dir(parent)? {
-        let entry = entry?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if !name.starts_with(&prefix) {
-            continue;
-        }
-        let path = entry.path();
-        if verify_owned_restore_initializer(&path, marker_name, marker).is_ok() {
-            initialized.push(path);
-            if initialized.len() > 1 {
-                bail!("multiple owned restore initializers exist");
-            }
-        }
-    }
-    for path in initialized {
-        let identity = native_directory_id(&path)?;
-        remove_owned_restore_directory(&path, identity)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn verify_recovery_marker(
-    root: &Path,
-    marker_name: &str,
-    expected: &[u8; 32],
-) -> Result<()> {
-    let path = recovery_marker_path(root, marker_name)?;
-    let metadata = fs::symlink_metadata(&path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != 32 {
-        bail!("restore ownership marker is not a safe regular file");
-    }
-    let mut file = open_file_no_follow(&path)?;
-    let mut actual = [0_u8; 32];
-    file.read_exact(&mut actual)?;
-    if actual != *expected {
-        bail!("restore ownership marker does not match the durable recovery job");
-    }
-    Ok(())
-}
-
-pub(crate) fn remove_recovery_marker(
-    root: &Path,
-    marker_name: &str,
-    expected: &[u8; 32],
-) -> Result<bool> {
-    let path = recovery_marker_path(root, marker_name)?;
-    if !path.exists() {
-        return Ok(false);
-    }
-    verify_recovery_marker(root, marker_name, expected)?;
-    fs::remove_file(path)?;
-    sync_directory(root)?;
-    Ok(true)
-}
-
-fn recovery_marker_path(root: &Path, marker_name: &str) -> Result<PathBuf> {
-    let relative = Path::new(marker_name);
-    if !marker_name.starts_with(".mutualbackup-recovery-ownership-")
-        || relative.components().count() != 1
-        || !matches!(relative.components().next(), Some(Component::Normal(_)))
-    {
-        bail!("invalid recovery ownership marker name");
-    }
-    Ok(root.join(relative))
-}
-
-fn recovery_initializer_prefix(staging: &Path) -> Result<String> {
-    let name = staging
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("restore staging path has no portable file name")?;
-    if !name.starts_with(".mutualbackup-restore-") {
-        bail!("restore staging path has an invalid name");
-    }
-    Ok(format!(".{name}.initializing-"))
-}
-
-fn verify_owned_restore_initializer(
-    path: &Path,
-    marker_name: &str,
-    marker: &[u8; 32],
-) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        bail!("restore initializer is not a safe directory");
-    }
-    verify_recovery_marker(path, marker_name, marker)
-}
-
-#[cfg(unix)]
-fn open_file_no_follow(path: &Path) -> Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    Ok(OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)?)
-}
-
-#[cfg(not(unix))]
-fn open_file_no_follow(path: &Path) -> Result<File> {
-    Ok(File::open(path)?)
-}
-
-#[cfg(unix)]
-pub(crate) fn native_directory_id(path: &Path) -> Result<(u64, u64)> {
-    let identity = directory_identity(path)?;
-    Ok((identity.filesystem_id, identity.inode))
-}
-
-pub(crate) fn remove_owned_restore_directory(path: &Path, expected: (u64, u64)) -> Result<()> {
-    remove_owned_directory_tree(
-        path,
-        NativeFileId {
-            filesystem_id: expected.0,
-            inode: expected.1,
-        },
-    )
-    .with_context(|| format!("refuse unsafe restore cleanup at {}", path.display()))
-}
-
-#[cfg(unix)]
-pub(crate) fn legacy_native_directory_id(path: &Path) -> Result<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        bail!("restore object is not a directory");
-    }
-    Ok((metadata.dev(), metadata.ino()))
-}
-
-#[cfg(not(unix))]
-pub(crate) fn native_directory_id(_path: &Path) -> Result<(u64, u64)> {
-    bail!("native restore identity is not implemented on this platform")
-}
-
-#[cfg(not(unix))]
-pub(crate) fn legacy_native_directory_id(_path: &Path) -> Result<(u64, u64)> {
-    bail!("native restore identity is not implemented on this platform")
-}
-
 fn restore_entries<F>(
-    staging: &Path,
+    staging: &PinnedDirectory,
     metadata: &PrivateMetadata,
     encryption_key: &[u8; 32],
     load_ciphertext: &mut F,
@@ -1816,7 +1732,23 @@ where
     F: FnMut(&SectorId) -> Result<Vec<u8>>,
 {
     let mut directory_metadata = Vec::new();
+    let mut expected_entries = BTreeMap::<PathBuf, ExpectedRestoreEntry>::new();
+    let mut declared_paths = BTreeSet::new();
     let mut restored_links = BTreeMap::<u64, RestoredLink>::new();
+    let link_pool_name = loop {
+        let candidate = format!(".mutualbackup-restore-links-{}", Uuid::new_v4());
+        if !metadata.entries.iter().any(|entry| {
+            Path::new(private_entry_path(entry))
+                .components()
+                .next()
+                .is_some_and(|component| component.as_os_str() == candidate.as_str())
+        }) {
+            break candidate;
+        }
+    };
+    let link_pool = staging.create_child_directory(&link_pool_name)?;
+    let link_pool_identity = link_pool.identity()?;
+    let mut pooled_links = Vec::new();
     for entry in &metadata.entries {
         match entry {
             PrivateEntry::Directory {
@@ -1825,8 +1757,11 @@ where
                 modified_secs,
                 modified_nanos,
             } => {
-                let destination = safe_join(staging, path)?;
-                create_private_dir(&destination)?;
+                let destination = safe_relative_path(path)?;
+                if !declared_paths.insert(destination.clone()) {
+                    bail!("duplicate path in recovered metadata");
+                }
+                ensure_restore_directory(staging, &destination, &mut expected_entries)?;
                 directory_metadata.push((destination, *mode, *modified_secs, *modified_nanos));
             }
             PrivateEntry::File {
@@ -1837,14 +1772,14 @@ where
                 modified_nanos,
                 sectors,
             } => {
-                let destination = safe_join(staging, path)?;
-                if let Some(parent) = destination.parent() {
-                    create_private_dir(parent)?;
+                let destination = safe_relative_path(path)?;
+                if !declared_paths.insert(destination.clone()) {
+                    bail!("duplicate path in recovered metadata");
                 }
-                let mut file = OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(&destination)?;
+                let (parent, name) =
+                    restore_destination(staging, &destination, &mut expected_entries)?;
+                let mut file = parent.create_child_file(&name)?;
+                let identity = native_id_for_file(staging, &file)?;
                 let mut written = 0_u64;
                 for reference in sectors {
                     let plaintext = decrypt_reference(encryption_key, reference, load_ciphertext)?;
@@ -1854,7 +1789,14 @@ where
                 if written != *logical_len {
                     bail!("restored file length does not match signed metadata");
                 }
-                set_metadata_durable(&file, &destination, *mode, *modified_secs, *modified_nanos)?;
+                set_metadata_durable(&file, *mode, *modified_secs, *modified_nanos)?;
+                expected_entries.insert(
+                    destination,
+                    ExpectedRestoreEntry {
+                        directory: false,
+                        identity,
+                    },
+                );
             }
             PrivateEntry::FileV2 {
                 path,
@@ -1865,10 +1807,12 @@ where
                 link_group,
                 data_extents,
             } => {
-                let destination = safe_join(staging, path)?;
-                if let Some(parent) = destination.parent() {
-                    create_private_dir(parent)?;
+                let destination = safe_relative_path(path)?;
+                if !declared_paths.insert(destination.clone()) {
+                    bail!("duplicate path in recovered metadata");
                 }
+                let (parent, name) =
+                    restore_destination(staging, &destination, &mut expected_entries)?;
                 if let Some(existing) = restored_links.get(link_group) {
                     if existing.mode != *mode
                         || existing.logical_len != *logical_len
@@ -1878,27 +1822,40 @@ where
                     {
                         bail!("hard-linked aliases have inconsistent signed metadata");
                     }
-                    fs::hard_link(&existing.path, &destination)?;
+                    link_pool.hard_link_child_from(&existing.pool_name, &parent, &name)?;
+                    expected_entries.insert(
+                        destination,
+                        ExpectedRestoreEntry {
+                            directory: false,
+                            identity: existing.identity,
+                        },
+                    );
                 } else {
+                    let mut file = parent.create_child_file(&name)?;
                     restore_sparse_file(
-                        &destination,
+                        &mut file,
                         *logical_len,
                         data_extents,
                         encryption_key,
                         load_ciphertext,
                     )?;
-                    let file = File::open(&destination)?;
-                    set_metadata_durable(
-                        &file,
-                        &destination,
-                        *mode,
-                        *modified_secs,
-                        *modified_nanos,
-                    )?;
+                    set_metadata_durable(&file, *mode, *modified_secs, *modified_nanos)?;
+                    let identity = native_id_for_file(staging, &file)?;
+                    let pool_name = link_group.to_string();
+                    parent.hard_link_child_from(&name, &link_pool, &pool_name)?;
+                    pooled_links.push(pool_name.clone());
+                    expected_entries.insert(
+                        destination,
+                        ExpectedRestoreEntry {
+                            directory: false,
+                            identity,
+                        },
+                    );
                     restored_links.insert(
                         *link_group,
                         RestoredLink {
-                            path: destination,
+                            pool_name,
+                            identity,
                             mode: *mode,
                             logical_len: *logical_len,
                             modified_secs: *modified_secs,
@@ -1916,10 +1873,12 @@ where
                 modified_nanos,
                 link_group,
             } => {
-                let destination = safe_join(staging, path)?;
-                if let Some(parent) = destination.parent() {
-                    create_private_dir(parent)?;
+                let destination = safe_relative_path(path)?;
+                if !declared_paths.insert(destination.clone()) {
+                    bail!("duplicate path in recovered metadata");
                 }
+                let (parent, name) =
+                    restore_destination(staging, &destination, &mut expected_entries)?;
                 let existing = restored_links
                     .get(link_group)
                     .context("hard-link alias precedes its signed primary file")?;
@@ -1930,13 +1889,48 @@ where
                 {
                     bail!("hard-linked alias has inconsistent signed metadata");
                 }
-                fs::hard_link(&existing.path, &destination)?;
+                link_pool.hard_link_child_from(&existing.pool_name, &parent, &name)?;
+                expected_entries.insert(
+                    destination,
+                    ExpectedRestoreEntry {
+                        directory: false,
+                        identity: existing.identity,
+                    },
+                );
             }
         }
     }
+    for name in pooled_links {
+        link_pool.remove_child_file(name)?;
+    }
+    link_pool.sync_all()?;
+    staging.remove_child_directory(&link_pool_name, link_pool_identity)?;
+
+    for (path, expected) in &expected_entries {
+        if staging.entry_identity(path, expected.directory)? != Some(expected.identity) {
+            bail!(
+                "restored entry changed during construction: {}",
+                path.display()
+            );
+        }
+    }
+    let mut directories = expected_entries
+        .iter()
+        .filter(|(_, expected)| expected.directory)
+        .map(|(path, _)| {
+            open_expected_restore_directory(staging, path, &expected_entries)
+                .map(|directory| (path.clone(), directory))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    directories.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+    for (_, directory) in &directories {
+        directory.sync_all()?;
+    }
+    staging.sync_all()?;
+
     if apply_root_metadata {
         directory_metadata.push((
-            staging.to_path_buf(),
+            PathBuf::new(),
             metadata.root_mode,
             metadata.root_modified_secs,
             metadata.root_modified_nanos,
@@ -1944,14 +1938,29 @@ where
     }
     directory_metadata.sort_by_key(|(path, ..)| std::cmp::Reverse(path.components().count()));
     for (path, mode, modified_secs, modified_nanos) in directory_metadata {
-        let directory = File::open(&path)?;
-        set_metadata_durable(&directory, &path, mode, modified_secs, modified_nanos)?;
+        let directory = if path.as_os_str().is_empty() {
+            staging
+        } else {
+            &directories
+                .iter()
+                .find(|(candidate, _)| candidate == &path)
+                .context("restored directory handle is unavailable")?
+                .1
+        };
+        set_metadata_durable(directory.as_file(), mode, modified_secs, modified_nanos)?;
     }
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct ExpectedRestoreEntry {
+    directory: bool,
+    identity: NativeFileId,
+}
+
 struct RestoredLink {
-    path: PathBuf,
+    pool_name: String,
+    identity: NativeFileId,
     mode: u32,
     logical_len: u64,
     modified_secs: i64,
@@ -1959,8 +1968,104 @@ struct RestoredLink {
     data_extents: Vec<PrivateDataExtent>,
 }
 
+fn ensure_restore_directory(
+    root: &PinnedDirectory,
+    relative: &Path,
+    expected: &mut BTreeMap<PathBuf, ExpectedRestoreEntry>,
+) -> Result<PinnedDirectory> {
+    let mut current = root.try_clone()?;
+    let mut traversed = PathBuf::new();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            bail!("unsafe path in recovered metadata");
+        };
+        traversed.push(name);
+        current = match expected.get(&traversed) {
+            Some(entry) if entry.directory => {
+                let directory = current
+                    .open_child_directory(name)?
+                    .context("expected restored directory disappeared")?;
+                if directory.identity()? != entry.identity {
+                    bail!("restored directory was replaced: {}", traversed.display());
+                }
+                directory
+            }
+            Some(_) => bail!("restored path is both a file and directory"),
+            None => {
+                if current.open_child_directory(name)?.is_some() {
+                    bail!("unexpected directory appeared in restore staging");
+                }
+                let directory = current.create_child_directory(name)?;
+                expected.insert(
+                    traversed.clone(),
+                    ExpectedRestoreEntry {
+                        directory: true,
+                        identity: directory.identity()?,
+                    },
+                );
+                directory
+            }
+        };
+    }
+    Ok(current)
+}
+
+fn restore_destination(
+    root: &PinnedDirectory,
+    relative: &Path,
+    expected: &mut BTreeMap<PathBuf, ExpectedRestoreEntry>,
+) -> Result<(PinnedDirectory, PathBuf)> {
+    let name = relative
+        .file_name()
+        .map(PathBuf::from)
+        .context("restored path has no file name")?;
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let directory = if parent.as_os_str().is_empty() {
+        root.try_clone()?
+    } else {
+        ensure_restore_directory(root, parent, expected)?
+    };
+    if expected.contains_key(relative) {
+        bail!("duplicate path in recovered metadata");
+    }
+    Ok((directory, name))
+}
+
+fn open_expected_restore_directory(
+    root: &PinnedDirectory,
+    relative: &Path,
+    expected: &BTreeMap<PathBuf, ExpectedRestoreEntry>,
+) -> Result<PinnedDirectory> {
+    let entry = expected
+        .get(relative)
+        .filter(|entry| entry.directory)
+        .context("restored directory is not tracked")?;
+    let directory = root.open_descendant_directory(relative)?;
+    if directory.identity()? != entry.identity {
+        bail!("restored directory was replaced: {}", relative.display());
+    }
+    Ok(directory)
+}
+
+fn native_id_for_file(root: &PinnedDirectory, file: &File) -> Result<NativeFileId> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(NativeFileId {
+            filesystem_id: root.identity()?.filesystem_id,
+            inode: file.metadata()?.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, file);
+        bail!("native restore identity is not implemented on this platform")
+    }
+}
+
 fn restore_sparse_file<F>(
-    destination: &Path,
+    file: &mut File,
     logical_len: u64,
     data_extents: &[PrivateDataExtent],
     encryption_key: &[u8; 32],
@@ -1975,10 +2080,6 @@ where
             .iter()
             .map(|extent| (extent.offset, extent.logical_len)),
     )?;
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(destination)?;
     file.set_len(logical_len)?;
     for extent in data_extents {
         file.seek(SeekFrom::Start(extent.offset))?;
@@ -2019,7 +2120,7 @@ where
     Ok(bytes)
 }
 
-fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
+fn safe_relative_path(relative: &str) -> Result<PathBuf> {
     let relative = Path::new(relative);
     if relative.as_os_str().is_empty()
         || relative.is_absolute()
@@ -2029,29 +2130,11 @@ fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
     {
         bail!("unsafe path in recovered metadata");
     }
-    Ok(root.join(relative))
-}
-
-fn create_private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    Ok(())
+    Ok(relative.to_path_buf())
 }
 
 fn set_metadata_durable(
     file: &File,
-    path: &Path,
     mode: u32,
     modified_secs: i64,
     modified_nanos: u32,
@@ -2059,70 +2142,30 @@ fn set_metadata_durable(
     if modified_nanos >= 1_000_000_000 {
         bail!("invalid modification timestamp");
     }
-    set_mode(path, mode)?;
-    filetime::set_file_mtime(
-        path,
-        filetime::FileTime::from_unix_time(modified_secs, modified_nanos),
-    )?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        let timestamps = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: modified_secs,
+                tv_nsec: i64::from(modified_nanos),
+            },
+        ];
+        if unsafe { libc::futimens(file.as_raw_fd(), timestamps.as_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (mode, modified_secs, modified_nanos);
     file.sync_all()?;
     Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
-    Ok(())
-}
-
-fn sync_directory(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    File::open(path)?.sync_all()?;
-    let _ = path;
-    Ok(())
-}
-
-fn sync_tree_bottom_up(root: &Path) -> Result<()> {
-    let mut directories = walkdir::WalkDir::new(root)
-        .min_depth(0)
-        .into_iter()
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|entry| entry.file_type().is_dir())
-        .map(|entry| entry.into_path())
-        .collect::<Vec<_>>();
-    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for path in directories {
-        sync_directory(&path)?;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn rename_no_replace(source: &Path, destination: &Path) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let source = CString::new(source.as_os_str().as_bytes())?;
-    let destination = CString::new(destination.as_os_str().as_bytes())?;
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            destination.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result == -1 {
-        Err(std::io::Error::last_os_error().into())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn rename_no_replace(_source: &Path, _destination: &Path) -> Result<()> {
-    bail!("atomic no-replace restore is currently implemented only on Linux")
 }
 
 fn hex_id(id: &[u8; 32]) -> String {
@@ -2132,6 +2175,330 @@ fn hex_id(id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod metadata_compatibility_tests {
     use super::*;
+
+    fn restore_fixture(
+        keys: &KeyMaterial,
+        guild_id: [u8; 32],
+        entries: Vec<PrivateEntry>,
+        data: Vec<(u64, Vec<u8>)>,
+    ) -> (SignedRecord<UserRevision>, BTreeMap<SectorId, Vec<u8>>) {
+        let revision_id = Uuid::new_v4();
+        let encryption_key = keys.guild_data_key(&guild_id);
+        let mut ciphertexts = BTreeMap::new();
+        let mut data_sectors = Vec::new();
+        for (ordinal, plaintext) in data {
+            let id = make_sector_id(keys.node_id(), revision_id, SectorPurpose::Data, ordinal);
+            let (reference, ciphertext) =
+                encrypted_sector(&encryption_key, id, &plaintext).unwrap();
+            data_sectors.push(reference);
+            ciphertexts.insert(id, ciphertext);
+        }
+        let metadata = PrivateMetadata {
+            format_version: 3,
+            root_mode: 0o755,
+            root_modified_secs: 1_700_000_000,
+            root_modified_nanos: 123,
+            entries,
+        };
+        let encoded = canonical_bytes(&metadata).unwrap();
+        let mut metadata_sectors = Vec::new();
+        for (ordinal, plaintext) in encoded.chunks(V1_SECTOR_SIZE).enumerate() {
+            let id = make_sector_id(
+                keys.node_id(),
+                revision_id,
+                SectorPurpose::Metadata,
+                ordinal as u64,
+            );
+            let (reference, ciphertext) = encrypted_sector(&encryption_key, id, plaintext).unwrap();
+            metadata_sectors.push(reference);
+            ciphertexts.insert(id, ciphertext);
+        }
+        let revision = SignedRecord::sign(
+            b"mutualbackup/user-revision/v1",
+            UserRevision {
+                format_version: 1,
+                guild_id,
+                cipher_profile: V1_CIPHER_PROFILE,
+                revision_id,
+                owner: keys.node_id(),
+                sequence: 1,
+                parent: None,
+                metadata_sectors,
+                data_sectors,
+            },
+            keys,
+        )
+        .unwrap();
+        (revision, ciphertexts)
+    }
+
+    #[test]
+    fn ordinary_restore_resumes_after_rename_before_parent_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([201; 32]));
+        let guild_id = [202; 32];
+        let control = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let (revision, ciphertexts) = restore_fixture(&keys, guild_id, Vec::new(), Vec::new());
+        let target = temp.path().join("restored");
+
+        AFTER_RESTORE_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| anyhow::bail!("injected parent sync failure")));
+        });
+        assert!(
+            restore_revision(&control, &keys, guild_id, &revision, &ciphertexts, &target).is_err()
+        );
+        assert!(target.is_dir());
+        assert!(
+            control
+                .get_record(RESTORE_JOB_KIND, revision.value.revision_id.as_bytes())
+                .unwrap()
+                .is_some()
+        );
+
+        restore_revision(&control, &keys, guild_id, &revision, &ciphertexts, &target).unwrap();
+        assert!(
+            control
+                .get_record(RESTORE_JOB_KIND, revision.value.revision_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ordinary_restore_resumes_from_publishing_before_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([220; 32]));
+        let guild_id = [221; 32];
+        let control = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let (revision, ciphertexts) = restore_fixture(&keys, guild_id, Vec::new(), Vec::new());
+        let parent = PinnedDirectory::open(temp.path()).unwrap();
+        let staging_name = format!(".mutualbackup-restore-{}", Uuid::new_v4());
+        let staging = parent.create_child_directory(&staging_name).unwrap();
+        parent.sync_all().unwrap();
+        let job = RestoreJob {
+            format_version: 1,
+            guild_id,
+            revision_id: revision.value.revision_id,
+            target: temp.path().canonicalize().unwrap().join("restored"),
+            parent_identity: parent.identity().unwrap(),
+            staging_name,
+            staged_identity: Some(staging.identity().unwrap()),
+            state: RestoreJobState::Publishing,
+        };
+        control
+            .put_record(
+                RESTORE_JOB_KIND,
+                revision.value.revision_id.as_bytes(),
+                &canonical_bytes(&job).unwrap(),
+            )
+            .unwrap();
+
+        let target = temp.path().join("restored");
+        restore_revision(&control, &keys, guild_id, &revision, &ciphertexts, &target).unwrap();
+        assert!(target.is_dir());
+        assert!(
+            control
+                .get_record(RESTORE_JOB_KIND, revision.value.revision_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ordinary_restore_rebuilds_a_durably_owned_partial_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([222; 32]));
+        let guild_id = [223; 32];
+        let control = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let (revision, ciphertexts) = restore_fixture(&keys, guild_id, Vec::new(), Vec::new());
+        let target = temp.path().join("restored");
+
+        assert!(
+            restore_revision_from_source(
+                &control,
+                &keys,
+                guild_id,
+                &revision,
+                &target,
+                |_| anyhow::bail!("injected sector read failure"),
+            )
+            .is_err()
+        );
+        let bytes = control
+            .get_record(RESTORE_JOB_KIND, revision.value.revision_id.as_bytes())
+            .unwrap()
+            .unwrap();
+        let interrupted: RestoreJob = decode_canonical(&bytes).unwrap();
+        assert_eq!(interrupted.state, RestoreJobState::Building);
+        assert!(temp.path().join(&interrupted.staging_name).is_dir());
+
+        restore_revision(&control, &keys, guild_id, &revision, &ciphertexts, &target).unwrap();
+        assert!(target.is_dir());
+        assert!(!temp.path().join(interrupted.staging_name).exists());
+    }
+
+    #[test]
+    fn ordinary_restore_keeps_renamed_parent_obligation() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let moved = temp.path().join("moved-parent");
+        fs::create_dir(&parent).unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([203; 32]));
+        let guild_id = [204; 32];
+        let control = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let (revision, ciphertexts) = restore_fixture(&keys, guild_id, Vec::new(), Vec::new());
+        let target = parent.join("restored");
+        let parent_for_hook = parent.clone();
+        let moved_for_hook = moved.clone();
+
+        AFTER_RESTORE_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&parent_for_hook, &moved_for_hook)?;
+                fs::create_dir(&parent_for_hook)?;
+                fs::write(parent_for_hook.join("foreign"), b"must survive")?;
+                Ok(())
+            }));
+        });
+        assert!(
+            restore_revision(&control, &keys, guild_id, &revision, &ciphertexts, &target).is_err()
+        );
+        assert!(moved.join("restored").is_dir());
+        assert_eq!(fs::read(parent.join("foreign")).unwrap(), b"must survive");
+        assert!(
+            control
+                .get_record(RESTORE_JOB_KIND, revision.value.revision_id.as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            restore_revision(&control, &keys, guild_id, &revision, &ciphertexts, &target).is_err()
+        );
+        assert_eq!(fs::read(parent.join("foreign")).unwrap(), b"must survive");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ordinary_restore_rejects_staging_root_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let external = temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("sentinel"), b"must survive").unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([205; 32]));
+        let guild_id = [206; 32];
+        let control = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let (revision, ciphertexts) = restore_fixture(&keys, guild_id, Vec::new(), Vec::new());
+        let target = temp.path().join("restored");
+        let mut replaced = false;
+
+        assert!(
+            restore_revision_from_source(
+                &control,
+                &keys,
+                guild_id,
+                &revision,
+                &target,
+                |sector_id| {
+                    if !replaced {
+                        let bytes = control
+                            .get_record(RESTORE_JOB_KIND, revision.value.revision_id.as_bytes())?
+                            .context("restore job missing")?;
+                        let job: RestoreJob = decode_canonical(&bytes)?;
+                        let moved = temp.path().join("moved-staging");
+                        fs::rename(temp.path().join(&job.staging_name), &moved)?;
+                        symlink(&external, temp.path().join(&job.staging_name))?;
+                        replaced = true;
+                    }
+                    ciphertexts
+                        .get(sector_id)
+                        .cloned()
+                        .context("missing fixture sector")
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(external.join("sentinel")).unwrap(),
+            b"must survive"
+        );
+        assert!(!target.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ordinary_restore_rejects_descendant_symlink_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let external = temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("sentinel"), b"must survive").unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([207; 32]));
+        let guild_id = [208; 32];
+        let revision_id = Uuid::new_v4();
+        let data_id = make_sector_id(keys.node_id(), revision_id, SectorPurpose::Data, 0);
+        let plaintext = b"payload".to_vec();
+        let (data_reference, data_ciphertext) =
+            encrypted_sector(&keys.guild_data_key(&guild_id), data_id, &plaintext).unwrap();
+        let entries = vec![
+            PrivateEntry::Directory {
+                path: "nested".into(),
+                mode: 0o755,
+                modified_secs: 1,
+                modified_nanos: 0,
+            },
+            PrivateEntry::File {
+                path: "nested/payload".into(),
+                mode: 0o644,
+                logical_len: plaintext.len() as u64,
+                modified_secs: 1,
+                modified_nanos: 0,
+                sectors: vec![data_reference.clone()],
+            },
+        ];
+        let (mut revision, mut ciphertexts) = restore_fixture(&keys, guild_id, entries, Vec::new());
+        revision.value.revision_id = revision_id;
+        revision.value.data_sectors = vec![data_reference];
+        revision =
+            SignedRecord::sign(b"mutualbackup/user-revision/v1", revision.value, &keys).unwrap();
+        ciphertexts.insert(data_id, data_ciphertext);
+        let control = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let target = temp.path().join("restored");
+        let mut replaced = false;
+
+        assert!(
+            restore_revision_from_source(
+                &control,
+                &keys,
+                guild_id,
+                &revision,
+                &target,
+                |sector_id| {
+                    if *sector_id == data_id && !replaced {
+                        let bytes = control
+                            .get_record(RESTORE_JOB_KIND, revision.value.revision_id.as_bytes())?
+                            .context("restore job missing")?;
+                        let job: RestoreJob = decode_canonical(&bytes)?;
+                        let staging = temp.path().join(&job.staging_name);
+                        fs::rename(staging.join("nested"), staging.join("moved-nested"))?;
+                        symlink(&external, staging.join("nested"))?;
+                        replaced = true;
+                    }
+                    ciphertexts
+                        .get(sector_id)
+                        .cloned()
+                        .context("missing fixture sector")
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(external.join("sentinel")).unwrap(),
+            b"must survive"
+        );
+        assert!(!target.exists());
+    }
 
     #[cfg(target_os = "linux")]
     fn bind_mount_for_recovery_test(source: &Path, target: &Path) {
@@ -2213,64 +2580,6 @@ mod metadata_compatibility_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn marked_restore_initializer_resumes_without_trusting_unmarked_siblings() {
-        use std::os::unix::fs::symlink;
-
-        let parent = tempfile::tempdir().unwrap();
-        let staging = parent.path().join(format!(
-            ".mutualbackup-restore-{}",
-            Uuid::from_bytes([44; 16])
-        ));
-        let marker_name = format!(
-            ".mutualbackup-recovery-ownership-{}",
-            Uuid::from_bytes([45; 16])
-        );
-        let marker = [46; 32];
-        let prefix = recovery_initializer_prefix(&staging).unwrap();
-        let unmarked = parent.path().join(format!("{prefix}untrusted"));
-        fs::create_dir(&unmarked).unwrap();
-
-        create_owned_restore_staging(parent.path(), &staging, &marker_name, &marker).unwrap();
-        verify_recovery_marker(&staging, &marker_name, &marker).unwrap();
-        assert!(unmarked.is_dir());
-        let identity = native_directory_id(&staging).unwrap();
-        remove_owned_restore_directory(&staging, identity).unwrap();
-
-        let external = parent.path().join("external");
-        fs::create_dir(&external).unwrap();
-        install_recovery_marker(&external, &marker_name, &marker).unwrap();
-        symlink(&external, &staging).unwrap();
-        assert!(
-            create_owned_restore_staging(parent.path(), &staging, &marker_name, &marker).is_err()
-        );
-        fs::remove_file(&staging).unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn failed_restore_publication_removes_only_its_owned_staging_tree() {
-        let parent = tempfile::tempdir().unwrap();
-        let staging = parent.path().join(format!(
-            ".mutualbackup-restore-{}",
-            Uuid::from_bytes([47; 16])
-        ));
-        let target = parent.path().join("existing-target");
-        fs::create_dir(&staging).unwrap();
-        fs::write(staging.join("partial"), b"staged restore").unwrap();
-        fs::create_dir(&target).unwrap();
-        fs::write(target.join("must-survive"), b"existing bytes").unwrap();
-        let identity = native_directory_id(&staging).unwrap();
-
-        assert!(publish_restore_or_cleanup(&staging, identity, &target).is_err());
-        assert!(!staging.exists());
-        assert_eq!(
-            fs::read(target.join("must-survive")).unwrap(),
-            b"existing bytes"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn recovered_anchor_resumes_after_capture_before_database_commit() {
         let test_root = PathBuf::from(
@@ -2286,9 +2595,14 @@ mod metadata_compatibility_tests {
         let mut control = ControlStore::open(run_root.join("control.db"), &keys).unwrap();
         let guild_id = [48; 32];
         let revision = prepare_revision(&mut control, &keys, guild_id, &source, 1, None).unwrap();
-        restore_revision_from_source(&keys, guild_id, &revision, &restored, |sector_id| {
-            render_sector(&control, &keys, sector_id, Some(&guild_id))
-        })
+        restore_revision_from_source(
+            &control,
+            &keys,
+            guild_id,
+            &revision,
+            &restored,
+            |sector_id| render_sector(&control, &keys, sector_id, Some(&guild_id)),
+        )
         .unwrap();
         let old: mb_store::StableAnchorManifest = decode_canonical(
             &control
@@ -2369,9 +2683,14 @@ mod metadata_compatibility_tests {
         let mut control = ControlStore::open(run_root.join("control.db"), &keys).unwrap();
         let guild_id = [50; 32];
         let revision = prepare_revision(&mut control, &keys, guild_id, &source, 1, None).unwrap();
-        restore_revision_from_source(&keys, guild_id, &revision, &restored, |sector_id| {
-            render_sector(&control, &keys, sector_id, Some(&guild_id))
-        })
+        restore_revision_from_source(
+            &control,
+            &keys,
+            guild_id,
+            &revision,
+            &restored,
+            |sector_id| render_sector(&control, &keys, sector_id, Some(&guild_id)),
+        )
         .unwrap();
         let old: mb_store::StableAnchorManifest = decode_canonical(
             &control

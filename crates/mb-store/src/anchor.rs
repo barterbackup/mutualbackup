@@ -131,6 +131,272 @@ pub struct NativeFileId {
     pub inode: u64,
 }
 
+/// A directory capability used for descriptor-relative mutations of an owned
+/// namespace. Every descendant lookup rejects symlinks and mount crossings.
+pub struct PinnedDirectory {
+    file: File,
+    filesystem_id: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl PinnedDirectory {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, AnchorError> {
+        let file = open_source_root(path.as_ref())?;
+        let filesystem_id = stable_filesystem_id_for_file(&file)?;
+        Ok(Self {
+            file,
+            filesystem_id,
+        })
+    }
+
+    pub fn try_clone(&self) -> Result<Self, AnchorError> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+            filesystem_id: self.filesystem_id,
+        })
+    }
+
+    pub fn identity(&self) -> Result<NativeFileId, AnchorError> {
+        Ok(native_file_id(self.filesystem_id, &self.file.metadata()?))
+    }
+
+    pub fn as_file(&self) -> &File {
+        &self.file
+    }
+
+    pub fn descriptor_path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd;
+
+        PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+
+    pub fn sync_all(&self) -> Result<(), AnchorError> {
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    pub fn open_child_directory(
+        &self,
+        name: impl AsRef<Path>,
+    ) -> Result<Option<Self>, AnchorError> {
+        let name = name.as_ref();
+        validate_single_component(name)?;
+        let pinned = match open_path_no_xdev_beneath(&self.file, name) {
+            Ok(pinned) => pinned,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if !pinned.metadata()?.is_dir() {
+            return Err(AnchorError::UnsupportedObject(name.to_path_buf()));
+        }
+        let file = reopen_pinned_file(&pinned, true, name)?;
+        Ok(Some(Self {
+            file,
+            filesystem_id: self.filesystem_id,
+        }))
+    }
+
+    pub fn create_child_directory(&self, name: impl AsRef<Path>) -> Result<Self, AnchorError> {
+        let name = name.as_ref();
+        let file = create_private_directory_at(&self.file, name, name)?;
+        Ok(Self {
+            file,
+            filesystem_id: self.filesystem_id,
+        })
+    }
+
+    pub fn create_child_file(&self, name: impl AsRef<Path>) -> Result<File, AnchorError> {
+        let name = name.as_ref();
+        create_regular_file_at(&self.file, name, name)
+    }
+
+    pub fn entry_identity(
+        &self,
+        relative: impl AsRef<Path>,
+        directory: bool,
+    ) -> Result<Option<NativeFileId>, AnchorError> {
+        let relative = relative.as_ref();
+        validate_relative(relative)?;
+        let pinned = match open_path_no_xdev_beneath(&self.file, relative) {
+            Ok(pinned) => pinned,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = pinned.metadata()?;
+        if (directory && !metadata.is_dir()) || (!directory && !metadata.is_file()) {
+            return Err(AnchorError::UnsupportedObject(relative.to_path_buf()));
+        }
+        Ok(Some(native_file_id(self.filesystem_id, &metadata)))
+    }
+
+    pub fn open_descendant_directory(
+        &self,
+        relative: impl AsRef<Path>,
+    ) -> Result<Self, AnchorError> {
+        let relative = relative.as_ref();
+        validate_relative(relative)?;
+        let pinned = open_path_no_xdev_beneath(&self.file, relative)?;
+        if !pinned.metadata()?.is_dir() {
+            return Err(AnchorError::UnsupportedObject(relative.to_path_buf()));
+        }
+        let file = reopen_pinned_file(&pinned, true, relative)?;
+        Ok(Self {
+            file,
+            filesystem_id: self.filesystem_id,
+        })
+    }
+
+    pub fn hard_link_child_from(
+        &self,
+        source_name: impl AsRef<Path>,
+        destination_parent: &Self,
+        destination_name: impl AsRef<Path>,
+    ) -> Result<(), AnchorError> {
+        create_hard_link_at(
+            &self.file,
+            source_name.as_ref(),
+            &destination_parent.file,
+            destination_name.as_ref(),
+        )
+    }
+
+    pub fn remove_child_file(&self, name: impl AsRef<Path>) -> Result<(), AnchorError> {
+        let name = name.as_ref();
+        validate_single_component(name)?;
+        let pinned = open_path_no_xdev_beneath(&self.file, name)?;
+        if !pinned.metadata()?.is_file() {
+            return Err(AnchorError::UnsupportedObject(name.to_path_buf()));
+        }
+        unlink_pinned_name(&self.file, name, &pinned, false, name)
+    }
+
+    pub fn remove_child_directory(
+        &self,
+        name: impl AsRef<Path>,
+        expected: NativeFileId,
+    ) -> Result<(), AnchorError> {
+        let name = name.as_ref();
+        validate_single_component(name)?;
+        remove_directory_at_expected(&self.file, name, name, Some(expected)).map_err(|error| {
+            if let AnchorError::AnchorAreaCollision(path) = error {
+                AnchorError::UnsafeOwnedDirectory(path)
+            } else {
+                error
+            }
+        })
+    }
+
+    pub fn rename_child_no_replace(
+        &self,
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<(), AnchorError> {
+        rename_no_replace_at(
+            &self.file,
+            source.as_ref(),
+            &self.file,
+            destination.as_ref(),
+        )
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl PinnedDirectory {
+    pub fn open(_path: impl AsRef<Path>) -> Result<Self, AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn try_clone(&self) -> Result<Self, AnchorError> {
+        let _ = self;
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn identity(&self) -> Result<NativeFileId, AnchorError> {
+        let _ = self;
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn as_file(&self) -> &File {
+        &self.file
+    }
+
+    pub fn descriptor_path(&self) -> PathBuf {
+        PathBuf::new()
+    }
+
+    pub fn sync_all(&self) -> Result<(), AnchorError> {
+        let _ = self;
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn open_child_directory(
+        &self,
+        _name: impl AsRef<Path>,
+    ) -> Result<Option<Self>, AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn create_child_directory(&self, _name: impl AsRef<Path>) -> Result<Self, AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn create_child_file(&self, _name: impl AsRef<Path>) -> Result<File, AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn entry_identity(
+        &self,
+        _relative: impl AsRef<Path>,
+        _directory: bool,
+    ) -> Result<Option<NativeFileId>, AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn open_descendant_directory(
+        &self,
+        _relative: impl AsRef<Path>,
+    ) -> Result<Self, AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn hard_link_child_from(
+        &self,
+        _source_name: impl AsRef<Path>,
+        _destination_parent: &Self,
+        _destination_name: impl AsRef<Path>,
+    ) -> Result<(), AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn remove_child_file(&self, _name: impl AsRef<Path>) -> Result<(), AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn remove_child_directory(
+        &self,
+        _name: impl AsRef<Path>,
+        _expected: NativeFileId,
+    ) -> Result<(), AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn rename_child_no_replace(
+        &self,
+        _source: impl AsRef<Path>,
+        _destination: impl AsRef<Path>,
+    ) -> Result<(), AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unsupported_pinned_directory() -> AnchorError {
+    AnchorError::ReflinkUnavailable(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "descriptor-relative directory access is implemented only on Linux",
+    ))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileExtent {
     pub offset: u64,
