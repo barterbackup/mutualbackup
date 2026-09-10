@@ -3010,16 +3010,6 @@ impl Node {
             }
             match job.state {
                 RecoveryJobState::Complete => {
-                    let restored = parent
-                        .open_child_directory(&target_name)?
-                        .context("published recovery target disappeared")?;
-                    reanchor_recovered_revision(
-                        &mut self.control,
-                        &self.keys,
-                        guild_id,
-                        revision,
-                        &restored.descriptor_path(),
-                    )?;
                     verify_pinned_parent_path(&parent, &parent_path)?;
                     return Ok(());
                 }
@@ -4491,6 +4481,16 @@ mod tests {
             .unwrap();
         let completed: RecoveryJob = decode_canonical(&bytes).unwrap();
         assert_eq!(completed.state, RecoveryJobState::Complete);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+            node.restore_recovered_revision(&checkpoint_hash, guild_id, &revision, &target)
+                .unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        }
 
         let mut interrupted_finalization = completed;
         interrupted_finalization.state = RecoveryJobState::Published;
