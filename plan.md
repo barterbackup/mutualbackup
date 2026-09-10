@@ -648,8 +648,10 @@ descriptor-bound anchor transactions, durable ordinary and seed-recovery
 publication jobs, bounded restore descriptors, and fail-closed Docker namespace
 and loop-record validation. The locked workspace, Btrfs/reflink, real-network,
 five-daemon seed-recovery, static Nix-artifact, and real Docker/Btrfs lifecycle
-gates remain mandatory regressions. The final source-only review found no
-remaining high-confidence Milestone 2 defect, so Milestone 3 is admitted.
+gates remain mandatory regressions. The closure run passed all of them,
+including destructive Docker reinitialization with stable identity and
+byte-exact recovery. The final source-only review found no remaining
+high-confidence Milestone 2 defect, so Milestone 3 is admitted.
 
 The next run starts Milestone 3: pin and review the maintained Arti version,
 record the key/transport lifecycle ADR, and build a private Tor test topology
