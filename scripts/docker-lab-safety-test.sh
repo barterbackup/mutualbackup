@@ -124,6 +124,33 @@ fi
 grep -Fq 'must have exactly one hard link' "$TEST_ROOT/stderr"
 grep -Fqx 'must survive' "$TEST_ROOT/external-marker"
 
+unreadable_root=$TEST_ROOT/unreadable-root
+mkdir "$unreadable_root"
+printf 'must survive\n' >"$unreadable_root/foreign"
+chmod 000 "$unreadable_root"
+if initialize_namespace "$unreadable_root" >"$TEST_ROOT/stdout" 2>"$TEST_ROOT/stderr"; then
+    printf 'unreadable nonempty namespace was accepted\n' >&2
+    exit 1
+fi
+chmod 700 "$unreadable_root"
+grep -Fq 'cannot enumerate Docker lab root namespace safely' "$TEST_ROOT/stderr"
+[[ ! -e $unreadable_root/.mutualbackup-docker-lab-directory-v1 ]]
+grep -Fqx 'must survive' "$unreadable_root/foreign"
+
+failed_scan_root=$TEST_ROOT/failed-marker-scan-root
+mkdir "$failed_scan_root"
+if MUTUALBACKUP_DOCKER_LAB_ROOT=$failed_scan_root bash -c '
+    source "$1"
+    validate_layout
+    find() { return 42; }
+    recover_namespace_marker "$LAB_ROOT" root
+' bash "$LAB" >"$TEST_ROOT/stdout" 2>"$TEST_ROOT/stderr"; then
+    printf 'failed namespace marker scan was accepted\n' >&2
+    exit 1
+fi
+grep -Fq 'cannot enumerate Docker lab root namespace safely' "$TEST_ROOT/stderr"
+[[ ! -e $failed_scan_root/.mutualbackup-docker-lab-directory-v1 ]]
+
 leaf_root=$TEST_ROOT/leaf-root
 initialize_namespace "$leaf_root"
 printf 'external image bytes\n' >"$TEST_ROOT/external-image"
@@ -142,6 +169,10 @@ rm "$leaf_root/loops/node0"
 
 ln -s "$TEST_ROOT/external-loop-record" "$leaf_root/loops/node0"
 expect_leaf_rejected "$leaf_root" 'must be a regular non-symlink file'
+rm "$leaf_root/loops/node0"
+
+printf '/dev/loop999\nunterminated' >"$leaf_root/loops/node0"
+expect_leaf_rejected "$leaf_root" 'loop record has trailing data'
 rm "$leaf_root/loops/node0"
 
 printf 'external seed\n' >"$TEST_ROOT/external-seed"

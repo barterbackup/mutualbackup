@@ -217,14 +217,19 @@ validate_namespace_marker() {
 }
 
 recover_namespace_marker() {
-    local directory=$1 role=$2 marker expected entry name actual
+    local directory=$1 role=$2 marker expected entry name actual scan_fd scan_pid unexpected=false
     local -a candidates=() incomplete=()
     marker=$directory/$NAMESPACE_MARKER
     [[ ! -e $marker && ! -L $marker ]] || return 1
     expected=$(namespace_marker_contents "$role")
-    while IFS= read -r -d '' entry; do
+    exec {scan_fd}< <(find "$directory" -mindepth 1 -maxdepth 1 -print0)
+    scan_pid=$!
+    while IFS= read -r -d '' entry <&"$scan_fd"; do
         name=${entry##*/}
-        [[ $name == ".$NAMESPACE_MARKER.tmp."* ]] || return 1
+        if [[ $name != ".$NAMESPACE_MARKER.tmp."* ]]; then
+            unexpected=true
+            continue
+        fi
         validate_owned_regular_leaf "$entry" "Docker lab $role temporary namespace marker"
         actual=$(<"$entry")
         if [[ $actual == "$expected" ]]; then
@@ -232,7 +237,12 @@ recover_namespace_marker() {
         else
             incomplete+=("$entry")
         fi
-    done < <(find "$directory" -mindepth 1 -maxdepth 1 -print0)
+    done
+    exec {scan_fd}<&-
+    if ! wait "$scan_pid"; then
+        die "cannot enumerate Docker lab $role namespace safely: $directory"
+    fi
+    [[ $unexpected == false ]] || return 1
 
     for entry in "${incomplete[@]}"; do
         validate_owned_regular_leaf "$entry" "Docker lab $role incomplete namespace marker"
@@ -283,8 +293,11 @@ write_namespace_marker() {
 }
 
 directory_is_empty() {
-    local directory=$1
-    [[ -z $(find "$directory" -mindepth 1 -maxdepth 1 -print -quit) ]]
+    local directory=$1 first
+    if ! first=$(find "$directory" -mindepth 1 -maxdepth 1 -print -quit); then
+        die "cannot enumerate Docker lab namespace safely: $directory"
+    fi
+    [[ -z $first ]]
 }
 
 ensure_namespace_directory() {
@@ -663,11 +676,13 @@ load_associated_loops() {
 }
 
 validate_loop_record() {
-    local record=$1 loop
+    local record=$1 loop bytes expected_bytes
     validate_owned_regular_leaf "$record" "Docker lab loop record"
-    IFS= read -r loop <"$record" || true
+    IFS= read -r loop <"$record" || die "Docker lab loop record is not newline-terminated: $record"
     [[ $loop =~ ^/dev/loop[0-9]+$ ]] || die "Docker lab loop record is invalid: $record"
-    [[ $(wc -l <"$record") == 1 ]] || die "Docker lab loop record has trailing data: $record"
+    bytes=$(wc -c <"$record")
+    expected_bytes=$((${#loop} + 1))
+    [[ $bytes == "$expected_bytes" ]] || die "Docker lab loop record has trailing data: $record"
 }
 
 write_loop_record() {
