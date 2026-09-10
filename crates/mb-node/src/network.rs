@@ -2841,6 +2841,15 @@ mod tests {
             fs::read(restored.join("payload")).unwrap(),
             vec![0x5a; 150_000]
         );
+        recovered.make_control_query_only().unwrap();
+        recovered
+            .restore_recovered_revision(
+                &first_commit.checkpoint_hash,
+                recovered_checkpoint.checkpoint.guild_id,
+                recovered_revision,
+                &restored,
+            )
+            .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;

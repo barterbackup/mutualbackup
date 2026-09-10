@@ -24,8 +24,9 @@ use crate::control::{NodeStatus, ProtectedRoot};
 use crate::snapshot::{
     abandon_recovered_anchor_capture, build_revision_restore, install_inline_recipe,
     install_recovered_sector_recipe, make_restore_root_private_at, prepare_revision,
-    publish_owned_restore, reanchor_recovered_revision, reconcile_pending_captures, render_sector,
-    restore_revision_from_source, restore_signed_root_metadata_at,
+    publish_owned_restore, reanchor_recovered_revision, reconcile_pending_captures,
+    recovered_recipe_is_stable, render_sector, restore_revision_from_source,
+    restore_signed_root_metadata_at,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1544,6 +1545,12 @@ impl Node {
     }
 
     #[cfg(test)]
+    pub(crate) fn make_control_query_only(&self) -> Result<()> {
+        self.control.make_query_only()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn forget_local_sector(&self, sector_id: &SectorId) -> Result<()> {
         if !self.control.delete_record("local-sector", sector_id)? {
             anyhow::bail!("local sector recipe is unavailable");
@@ -3010,6 +3017,32 @@ impl Node {
             }
             match job.state {
                 RecoveryJobState::Complete => {
+                    let mut needs_reanchor = false;
+                    for reference in &revision.value.data_sectors {
+                        if !recovered_recipe_is_stable(
+                            &self.control,
+                            &self.keys,
+                            guild_id,
+                            reference,
+                        )? {
+                            needs_reanchor = true;
+                            break;
+                        }
+                    }
+                    if needs_reanchor {
+                        let restored = open_expected_recovery_directory(
+                            &parent,
+                            &target_name,
+                            Some(expected),
+                        )?;
+                        reanchor_recovered_revision(
+                            &mut self.control,
+                            &self.keys,
+                            guild_id,
+                            revision,
+                            &restored.descriptor_path(),
+                        )?;
+                    }
                     verify_pinned_parent_path(&parent, &parent_path)?;
                     return Ok(());
                 }

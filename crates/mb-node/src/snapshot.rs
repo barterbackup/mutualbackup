@@ -782,6 +782,11 @@ pub(crate) fn install_recovered_sector_recipe(
     {
         bail!("recovered information shard does not match its descriptor");
     }
+    if render_sector(control, keys, &reference.id, Some(&guild_id))
+        .is_ok_and(|existing| existing == ciphertext)
+    {
+        return Ok(());
+    }
     let mut plaintext = ciphertext.to_vec();
     crypt_sector(
         &keys.guild_data_key(&guild_id),
@@ -1486,6 +1491,26 @@ pub(crate) fn local_recipe_is_inline(control: &ControlStore, sector_id: &SectorI
         .context("local sector recipe is unavailable")?;
     let recipe: LocalSectorRecipe = decode_canonical(&encoded)?;
     Ok(matches!(recipe.source, LocalPlaintextSource::Inline(_)))
+}
+
+pub(crate) fn recovered_recipe_is_stable(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    reference: &SectorRef,
+) -> Result<bool> {
+    let Some(encoded) = control.get_record("local-sector", &reference.id)? else {
+        return Ok(false);
+    };
+    let recipe: LocalSectorRecipe = decode_canonical(&encoded)?;
+    if recipe.guild_id != guild_id || recipe.reference != *reference {
+        bail!("local sector recipe conflicts with the recovered revision");
+    }
+    if !matches!(recipe.source, LocalPlaintextSource::StableAnchorFile { .. }) {
+        return Ok(false);
+    }
+    Ok(render_sector(control, keys, &reference.id, Some(&guild_id))
+        .is_ok_and(|ciphertext| sector_root(&ciphertext) == reference.root))
 }
 
 pub fn restore_revision(
@@ -2861,6 +2886,19 @@ mod metadata_compatibility_tests {
             .read_to_string(&mut payload)
             .unwrap();
         assert_eq!(payload, "recovered anchor payload");
+
+        let reference = revision.value.data_sectors[0].clone();
+        let ciphertext = render_sector(&control, &keys, &reference.id, Some(&guild_id)).unwrap();
+        assert!(!local_recipe_is_inline(&control, &reference.id).unwrap());
+        install_recovered_sector_recipe(
+            &mut control,
+            &keys,
+            guild_id,
+            reference.clone(),
+            &ciphertext,
+        )
+        .unwrap();
+        assert!(!local_recipe_is_inline(&control, &reference.id).unwrap());
 
         current.remove().unwrap();
         drop(control);
