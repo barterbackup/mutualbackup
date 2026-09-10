@@ -110,11 +110,14 @@ The first run performs the complete deployment:
 images, recreates containers, and resumes the same identities and guild. It
 does not regenerate an existing recovery string or identity manifest. If a
 first-time `up` stopped after writing a seed but before writing its manifest,
-the next `up` resumes ordinary new-node initialization. `reinit` records its
-recovery intent, original guild, bootstrap member, restore target, and current
-phase before removing state. A later `up` or the same `reinit` command resumes
-that transaction without another wipe and does not clear it until restore has
-succeeded and the node has rejoined the original active guild. Guild formation
+the next `up` resumes ordinary new-node initialization. `reinit` first proves
+that the retained recovery string and identity summary match the running node,
+then records that Node ID with its recovery intent, original guild, bootstrap
+member, restore target, and current phase before removing state. It rechecks
+the binding at the erase boundary and on every resume. A later `up` or the same
+`reinit` command resumes that transaction without another wipe and does not
+clear it until restore has succeeded as the original Node ID and the node has
+rejoined the original active guild. Guild formation
 likewise resumes when some members installed the final certificate before the
 coordinator. The controller rewrites its own lab configs from the selected
 environment settings; do not hand-edit them.
@@ -245,18 +248,25 @@ for test files.
 `reinit` is the destructive failure/recovery exercise. It:
 
 1. verifies that the node has published seed-recovery material to the DHT;
-2. verifies that at least three responsive survivors report the same active
+2. derives the retained recovery string's Node ID and checks it against both
+   the running daemon and retained identity summary before recording that ID in
+   the durable recovery transaction;
+3. verifies that at least three responsive survivors report the same active
    guild;
-3. removes the old container;
-4. unmounts, detaches, and permanently deletes that node's Btrfs image;
-5. creates and mounts a new empty Btrfs image;
-6. retains the original seed, creates a new recovery identity manifest, and
+4. removes the old container;
+5. unmounts, detaches, and permanently deletes that node's Btrfs image;
+6. creates and mounts a new empty Btrfs image;
+7. retains the original seed, creates a new recovery identity manifest, and
    archives the previous config;
-7. writes daemon options bootstrapping through a surviving peer;
-8. creates a new container at the node's old IP with the same recovery-string identity;
-9. recovers guild state and the latest owned revision over the real DHT/QUIC
+8. writes daemon options bootstrapping through a surviving peer;
+9. creates a new container at the node's old IP with the same recovery-string identity;
+10. recovers guild state and the latest owned revision over the real DHT/QUIC
    data path; and
-10. restores it to `/node/exchange/recovered` by default.
+11. restores it to `/node/exchange/recovered` by default.
+
+A corrupt retained string or one belonging to another guild member is rejected
+before the original image is removed. The expected Node ID is checked again in
+the new identity manifest, the restarted daemon, and the completed recovery.
 
 The node must have at least one committed owned backup. Wait until its recovery
 publication is ready:

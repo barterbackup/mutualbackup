@@ -57,10 +57,8 @@ them as ADRs and test vectors before promising wire compatibility.
 
 ### Implemented baseline — first usable IP prototype
 
-The first usable architectural prototype is passed, and the Milestone 2
-operator-configuration and identity-state feature scope is implemented. Its
-acceptance gate is currently reopened by the source-only findings listed in
-`TODO.md`. The repository
+The first usable architectural prototype and the Milestone 2
+operator-configuration and identity-state gate are passed. The repository
 connects two real binaries and persistent local control to static five-member
 guild onboarding,
 reflink capture, owner encryption, actual `3+2` RS, remote SQLCipher
@@ -80,10 +78,12 @@ defects that the original suite did not expose. Repeated corrective reviews
 closed the descriptor-traversal, crash-resumption, Docker-namespace,
 build-source, and bounded-resource gaps then known in this draft. A follow-up
 at `d52b193` found remaining capture-name, restore-job integration,
-completed-retry, and destructive seed-validation defects. The existing focused
-regressions and complete remote gates remain the Milestone 2 regression
-baseline, but they do not admit the next milestone until these findings are
-fixed and reviewed.
+completed-retry, and destructive seed-validation defects. The corrective slice
+fixed those paths with focused regressions. The locked workspace, full
+Btrfs/reflink and real-network acceptance, static Nix artifact, and real
+Docker/Btrfs erase-and-seed-recovery gates all pass. A final source-only review
+found no remaining high-confidence Milestone 2 defect, so Milestone 3 is
+admitted.
 Application-transfer acceptance attributes post-baseline bulk bytes to the
 exact direct, DCUtR, or relay-fallback connection used.
 
@@ -431,11 +431,9 @@ expected-identity check, bounded worker ownership, and formal wire contracts are
 implemented. Human configuration and application-owned identity state are also
 separate. A strictly checked recovery-string file remains an explicit
 unattended auto-unlock option rather than a daemon prerequisite. The Milestone 2
-feature work and previous corrective lists are implemented, but the latest
-source follow-up reopened its acceptance gate. The resulting architecture
-remains the candidate base for Milestone 3; close the current `TODO.md` gate
-before changing its wire or durable-state boundaries through that milestone's
-reviewed ADRs.
+feature work and corrective gates are complete. The resulting architecture is
+the base for Milestone 3; preserve its wire and durable-state boundaries until
+that milestone's reviewed ADRs explicitly change them.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -649,23 +647,21 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 and 1 are passed. Milestone 2's feature scope
-and its previous corrective slices are implemented, but a source-only audit at
-`d52b193` reopened the gate. Capture reserves a valid user filename; public
-ordinary-restore retries cannot reach the post-rename journal state; separate
-revision jobs can claim one target; completed seed-recovery retries still write
-the database; and Docker `reinit` can erase a node before authenticating its
-retained seed. Milestone 3 is not admitted.
+**Current position:** Milestones 0, 1, and 2 are passed. The five findings from
+the `d52b193` follow-up are fixed: capture bookkeeping no longer consumes a
+source filename, ordinary restore owns each canonical target through one
+durable cross-revision reservation, public retries resume publication,
+completed seed recovery has a verified read-only retry, and Docker `reinit`
+authenticates and durably binds the retained Node ID before erasure. Focused
+regressions, the inherited locked/Btrfs/network suites, static packaging, and a
+real five-container Btrfs erase/recovery lifecycle all pass; the closing
+source-only review found no new high-confidence Milestone 2 defect.
 
-The next run is one bounded Milestone 2 corrective slice: fix every item in the
-top `TODO.md` section, add focused unit, public-process, and fault regressions
-as appropriate, then rerun the locked workspace, Btrfs/reflink, real-network,
-five-daemon seed-recovery, static Nix-artifact, and real Docker/Btrfs lifecycle
-gates.
-Finish with another source-only review. Only a clean result admits Milestone 3;
-the first Tor slice then pins and reviews Arti, records the key/transport
-lifecycle ADR, and builds the private Tor topology before production endpoint
-types change.
+The next run starts Milestone 3's first bounded slice: pin and source-review a
+maintained Arti release, record the transport/key/cache/readiness lifecycle ADR,
+and build a hermetic private-Tor topology and identity-persistence test before
+changing production endpoint types. Pause and review that foundation before
+adding onion publication, dialing policy, or fallback orchestration.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
 
@@ -711,7 +707,7 @@ The Milestone 2 gate included inherited stabilization regressions that the first
 acceptance pass did not expose; they remain part of the mandatory regression
 contract.
 
-### Milestone 2 — operator configuration and identity-state separation (corrective gate reopened)
+### Milestone 2 — operator configuration and identity-state separation (passed)
 
 - Replace duplicated daemon parsing with one typed options model consumed by
   optional TOML and equivalent nonsecret command-line flags. Test flag-over-file
@@ -763,17 +759,19 @@ directory descriptors are bounded by traversal depth rather than entry count.
 Docker-lab namespace enumeration fails closed and loop records accept exactly
 one newline-terminated device token. Focused crash, replacement,
 descriptor-limit, and malformed-state regressions cover these boundaries. The
-follow-up source review at `d52b193` nevertheless exposed the five current-path
-defects recorded at the top of `TODO.md`; those defects, their focused
-regressions, and the inherited gates must be closed before this milestone
-passes.
+follow-up source review at `d52b193` exposed five additional current-path
+defects. They are fixed with focused regressions, including legacy restore-job
+migration, concurrent target ownership, query-only completed recovery, and
+pre-erase Docker identity rejection. The inherited and packaged runtime gates
+were rerun successfully, and the closing source-only review found no additional
+high-confidence Milestone 2 defect.
 
 ### Milestone 3 — Tor and robust connectivity beta
 
-Entry condition: not satisfied; the Milestone 2 corrective gate is open. No
-Milestone 3 implementation has begun. Once admitted, start by pinning and
-reviewing the maintained Arti version and writing the transport/key lifecycle
-ADR before integrating it with the bounded IP endpoint lifecycle.
+Entry condition: satisfied; Milestone 2 is closed. No Milestone 3 implementation
+has begun. Start by pinning and reviewing the maintained Arti version and
+writing the transport/key lifecycle ADR before integrating it with the bounded
+IP endpoint lifecycle.
 
 - Adapt the narrow, useful BarterBackup `nettor` principles to a maintained Arti
   release: outbound onion dialing, an inbound v3 onion service, persistent Tor

@@ -303,4 +303,4 @@ grep -Fq 'belongs to another identity' "$TEST_ROOT/stderr"
 grep -Fqx 'original image' "$resumed_root/images/node0.btrfs"
 [[ ! -e $resumed_root/prepare-called ]]
 
-printf 'Docker lab path safety checks passed\n'
+printf 'Docker lab safety checks passed\n'
