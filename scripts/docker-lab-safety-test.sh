@@ -206,4 +206,101 @@ grep -Fq 'while it is mounted' "$TEST_ROOT/stderr"
 [[ ! -e $TEST_ROOT/detached ]]
 
 [[ ! -e $REPO_ROOT/controller.lock ]]
+
+node_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+node_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+guild=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+fake_cli=$TEST_ROOT/fake-mutualbackup
+cat >"$fake_cli" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ ${1:-} == identity ]] || exit 90
+shift
+seed=
+while (($#)); do
+    case $1 in
+        --seed-file) seed=$2; shift 2 ;;
+        *) exit 91 ;;
+    esac
+done
+case $(<"$seed") in
+    node-a) value=$FAKE_NODE_A ;;
+    node-b) value=$FAKE_NODE_B ;;
+    *) exit 92 ;;
+esac
+printf 'node id:       %s\nlibp2p peer id: fake\n' "$value"
+EOF
+chmod +x "$fake_cli"
+
+expect_initial_reinit_identity_rejected() {
+    local case_name=$1 seed_value=$2 expected_error=$3
+    local root=$TEST_ROOT/reinit-$case_name
+    initialize_namespace "$root"
+    printf '%s\n' "$seed_value" >"$root/seeds/node0.seed"
+    printf 'node id:       %s\nlibp2p peer id: fake\n' "$node_a" \
+        >"$root/seeds/node0.identity"
+    chmod 600 "$root/seeds/node0.seed" "$root/seeds/node0.identity"
+    printf 'original image\n' >"$root/images/node0.btrfs"
+    if MUTUALBACKUP_DOCKER_LAB_ROOT=$root MUTUALBACKUP_CLI_BIN=$fake_cli \
+        FAKE_NODE_A=$node_a FAKE_NODE_B=$node_b FAKE_GUILD=$guild \
+        bash -c '
+            source "$1"
+            prepare_host() { :; }
+            acquire_lock() { :; }
+            container_running() { return 0; }
+            cli_raw() {
+                shift
+                case "$*" in
+                    status) printf "node id:       %s\nrecovery ready: true\n" "$FAKE_NODE_A" ;;
+                    *) return 0 ;;
+                esac
+            }
+            guild_phase() { printf "Active\n"; }
+            guild_id() { printf "%s\n" "$FAKE_GUILD"; }
+            validate_recovery_survivors() { :; }
+            confirm_reinit() { :; }
+            resume_recovery_transaction() { printf called >"$LAB_ROOT/resume-called"; }
+            command_reinit 0 --yes
+        ' bash "$LAB" >"$TEST_ROOT/stdout" 2>"$TEST_ROOT/stderr"; then
+        printf 'reinit accepted %s retained seed\n' "$case_name" >&2
+        exit 1
+    fi
+    grep -Fq "$expected_error" "$TEST_ROOT/stderr"
+    grep -Fqx 'original image' "$root/images/node0.btrfs"
+    [[ ! -e $root/seeds/node0.recovery-intent ]]
+    [[ ! -e $root/resume-called ]]
+}
+
+expect_initial_reinit_identity_rejected wrong-member node-b 'does not match its running identity'
+expect_initial_reinit_identity_rejected corrupt corrupt-seed 'retained recovery string for node 0 is invalid'
+
+resumed_root=$TEST_ROOT/reinit-resumed
+initialize_namespace "$resumed_root"
+printf 'node-b\n' >"$resumed_root/seeds/node0.seed"
+printf 'node id:       %s\nlibp2p peer id: fake\n' "$node_a" \
+    >"$resumed_root/seeds/node0.identity"
+printf 'format=2\nphase=prepared\nbootstrap_node=1\nrestore_name=recovered\nguild_id=%s\nexpected_node_id=%s\n' \
+    "$guild" "$node_a" >"$resumed_root/seeds/node0.recovery-intent"
+chmod 600 "$resumed_root/seeds/node0.seed" "$resumed_root/seeds/node0.identity" \
+    "$resumed_root/seeds/node0.recovery-intent"
+printf 'original image\n' >"$resumed_root/images/node0.btrfs"
+if MUTUALBACKUP_DOCKER_LAB_ROOT=$resumed_root MUTUALBACKUP_CLI_BIN=$fake_cli \
+    FAKE_NODE_A=$node_a FAKE_NODE_B=$node_b \
+    bash -c '
+        source "$1"
+        validate_layout
+        validate_recovery_survivors() { :; }
+        prepare_recovery_container() {
+            printf called >"$LAB_ROOT/prepare-called"
+            rm -- "$LAB_ROOT/images/node0.btrfs"
+        }
+        resume_recovery_transaction 0
+    ' bash "$LAB" >"$TEST_ROOT/stdout" 2>"$TEST_ROOT/stderr"; then
+    printf 'resumed reinit accepted a wrong-member retained seed\n' >&2
+    exit 1
+fi
+grep -Fq 'belongs to another identity' "$TEST_ROOT/stderr"
+grep -Fqx 'original image' "$resumed_root/images/node0.btrfs"
+[[ ! -e $resumed_root/prepare-called ]]
+
 printf 'Docker lab path safety checks passed\n'

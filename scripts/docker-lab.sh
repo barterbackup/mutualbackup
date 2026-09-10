@@ -515,10 +515,12 @@ RECOVERY_PHASE=
 RECOVERY_BOOTSTRAP_NODE=
 RECOVERY_RESTORE_NAME=
 RECOVERY_GUILD_ID=
+RECOVERY_EXPECTED_NODE_ID=
+RECOVERY_FORMAT=
 
 load_recovery_intent() {
     local path=$1
-    local key value format_seen=false phase_seen=false bootstrap_seen=false restore_seen=false guild_seen=false
+    local key value format_seen=false phase_seen=false bootstrap_seen=false restore_seen=false guild_seen=false node_seen=false
     if [[ ! -e $path && ! -L $path ]]; then
         return 1
     fi
@@ -527,11 +529,14 @@ load_recovery_intent() {
     RECOVERY_BOOTSTRAP_NODE=
     RECOVERY_RESTORE_NAME=
     RECOVERY_GUILD_ID=
+    RECOVERY_EXPECTED_NODE_ID=
+    RECOVERY_FORMAT=
     while IFS='=' read -r key value; do
         case $key in
             format)
                 [[ $format_seen == false ]] || die "duplicate recovery format in $path"
-                [[ $value == 1 ]] || die "unsupported recovery intent format in $path"
+                [[ $value == 1 || $value == 2 ]] || die "unsupported recovery intent format in $path"
+                RECOVERY_FORMAT=$value
                 format_seen=true
                 ;;
             phase)
@@ -554,6 +559,11 @@ load_recovery_intent() {
                 RECOVERY_GUILD_ID=$value
                 guild_seen=true
                 ;;
+            expected_node_id)
+                [[ $node_seen == false ]] || die "duplicate recovery node identity in $path"
+                RECOVERY_EXPECTED_NODE_ID=$value
+                node_seen=true
+                ;;
             *) die "invalid recovery intent field in $path: $key" ;;
         esac
     done <"$path"
@@ -565,10 +575,17 @@ load_recovery_intent() {
     [[ $RECOVERY_RESTORE_NAME =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
         die "invalid recovery target in $path"
     [[ $RECOVERY_GUILD_ID =~ ^[0-9a-fA-F]{64}$ ]] || die "invalid recovery guild in $path"
+    if [[ $RECOVERY_FORMAT == 2 ]]; then
+        [[ $node_seen == true ]] || die "recovery intent has no expected node identity: $path"
+        [[ $RECOVERY_EXPECTED_NODE_ID =~ ^[0-9a-f]{64}$ ]] ||
+            die "invalid recovery node identity in $path"
+    elif [[ $node_seen == true ]]; then
+        die "legacy recovery intent contains a version-2 field: $path"
+    fi
 }
 
 write_recovery_intent() {
-    local node=$1 phase=$2 bootstrap_node=$3 restore_name=$4 expected_guild=$5
+    local node=$1 phase=$2 bootstrap_node=$3 restore_name=$4 expected_guild=$5 expected_node_id=$6
     local path temporary parent
     path=$(node_recovery_intent "$node")
     parent=$(dirname "$path")
@@ -577,8 +594,10 @@ write_recovery_intent() {
         validate_owned_regular_leaf "$path" "recovery intent"
     fi
     temporary=$(mktemp "$parent/.node-recovery-intent.XXXXXX")
-    printf 'format=1\nphase=%s\nbootstrap_node=%s\nrestore_name=%s\nguild_id=%s\n' \
-        "$phase" "$bootstrap_node" "$restore_name" "$expected_guild" >"$temporary"
+    [[ $expected_node_id =~ ^[0-9a-f]{64}$ ]] || die "cannot persist invalid recovery node identity"
+    printf 'format=2\nphase=%s\nbootstrap_node=%s\nrestore_name=%s\nguild_id=%s\nexpected_node_id=%s\n' \
+        "$phase" "$bootstrap_node" "$restore_name" "$expected_guild" "$expected_node_id" \
+        >"$temporary"
     chmod 600 "$temporary"
     sync "$temporary"
     mv -T -- "$temporary" "$path"
@@ -589,8 +608,9 @@ write_recovery_intent() {
 advance_recovery_intent() {
     local node=$1 phase=$2
     write_recovery_intent "$node" "$phase" "$RECOVERY_BOOTSTRAP_NODE" \
-        "$RECOVERY_RESTORE_NAME" "$RECOVERY_GUILD_ID"
+        "$RECOVERY_RESTORE_NAME" "$RECOVERY_GUILD_ID" "$RECOVERY_EXPECTED_NODE_ID"
     RECOVERY_PHASE=$phase
+    RECOVERY_FORMAT=2
 }
 
 clear_recovery_intent() {
@@ -967,6 +987,66 @@ peer_id() {
     sed -n 's/^libp2p peer id: *//p' "$(node_identity "$1")"
 }
 
+node_id_from_output() {
+    local label=$1 output=$2 value count
+    value=$(printf '%s\n' "$output" | sed -n 's/^node id:[[:space:]]*//p')
+    count=$(printf '%s\n' "$value" | sed '/^$/d' | wc -l)
+    [[ $count == 1 && $value =~ ^[0-9a-f]{64}$ ]] ||
+        die "$label did not report exactly one valid node ID"
+    printf '%s\n' "$value"
+}
+
+seed_node_id() {
+    local node=$1 seed output
+    seed=$(node_seed "$node")
+    validate_owned_regular_leaf "$seed" "retained recovery string"
+    output=$("$CLI_BIN" identity --seed-file "$seed") ||
+        die "retained recovery string for node $node is invalid"
+    node_id_from_output "retained recovery string for node $node" "$output"
+}
+
+identity_summary_node_id() {
+    local node=$1 identity output
+    identity=$(node_identity "$node")
+    validate_owned_regular_leaf "$identity" "node identity summary"
+    output=$(<"$identity")
+    node_id_from_output "identity summary for node $node" "$output"
+}
+
+daemon_node_id() {
+    local node=$1 output
+    output=$(cli_raw "$node" status) || die "cannot read node $node identity from its daemon"
+    node_id_from_output "daemon for node $node" "$output"
+}
+
+manifest_node_id() {
+    local path=$1 value count
+    [[ -f $path && ! -L $path ]] || die "identity manifest is not a safe regular file: $path"
+    value=$(sed -n 's/^expected_node_id[[:space:]]*=[[:space:]]*"\([0-9a-f]\{64\}\)"[[:space:]]*$/\1/p' "$path")
+    count=$(printf '%s\n' "$value" | sed '/^$/d' | wc -l)
+    [[ $count == 1 ]] || die "identity manifest did not contain exactly one valid node ID: $path"
+    printf '%s\n' "$value"
+}
+
+ensure_recovery_identity_binding() {
+    local node=$1 summary derived intent
+    summary=$(identity_summary_node_id "$node")
+    derived=$(seed_node_id "$node")
+    [[ $derived == "$summary" ]] ||
+        die "retained recovery string for node $node belongs to another identity"
+    if [[ -z $RECOVERY_EXPECTED_NODE_ID ]]; then
+        [[ $RECOVERY_FORMAT == 1 ]] || die "recovery transaction has no expected node identity"
+        RECOVERY_EXPECTED_NODE_ID=$summary
+        intent=$(node_recovery_intent "$node")
+        write_recovery_intent "$node" "$RECOVERY_PHASE" "$RECOVERY_BOOTSTRAP_NODE" \
+            "$RECOVERY_RESTORE_NAME" "$RECOVERY_GUILD_ID" "$RECOVERY_EXPECTED_NODE_ID"
+        RECOVERY_FORMAT=2
+        say "upgraded legacy recovery intent with node identity: $intent"
+    fi
+    [[ $derived == "$RECOVERY_EXPECTED_NODE_ID" ]] ||
+        die "retained recovery string does not match the recovery transaction for node $node"
+}
+
 peer_endpoint() {
     local node=$1
     printf '/ip4/%s/udp/%s/quic-v1/p2p/%s\n' \
@@ -1147,7 +1227,8 @@ validate_recovery_survivors() {
         if [[ -e "$(node_recovery_intent "$recovering_node")" ]]; then
             remove_container "$recovering_node"
             write_recovery_intent "$recovering_node" "$RECOVERY_PHASE" \
-                "$RECOVERY_BOOTSTRAP_NODE" "$RECOVERY_RESTORE_NAME" "$RECOVERY_GUILD_ID"
+                "$RECOVERY_BOOTSTRAP_NODE" "$RECOVERY_RESTORE_NAME" "$RECOVERY_GUILD_ID" \
+                "$RECOVERY_EXPECTED_NODE_ID"
         fi
     fi
 }
@@ -1215,6 +1296,8 @@ prepare_recovery_container() {
             die "recovery initialization did not create a safe identity manifest for node $node"
         grep -Fqx 'intent = "recovery"' "$manifest" ||
             die "node $node recovery filesystem contains a non-recovery identity"
+        [[ $(manifest_node_id "$manifest") == "$RECOVERY_EXPECTED_NODE_ID" ]] ||
+            die "node $node recovery manifest belongs to another identity"
         advance_recovery_intent "$node" initialized
     fi
     if [[ $RECOVERY_PHASE =~ ^(initialized|container_created|restoring)$ ]]; then
@@ -1223,6 +1306,8 @@ prepare_recovery_container() {
             die "node $node recovery identity disappeared"
         grep -Fqx 'intent = "recovery"' "$manifest" ||
             die "node $node recovery filesystem contains a non-recovery identity"
+        [[ $(manifest_node_id "$manifest") == "$RECOVERY_EXPECTED_NODE_ID" ]] ||
+            die "node $node recovery manifest belongs to another identity"
         if container_exists "$node"; then
             container_owned "$node" || die "container name collision: $(node_name "$node")"
             grep -Fq "p2p_bootstrap_addresses = [\"$(peer_endpoint "$RECOVERY_BOOTSTRAP_NODE")\"]" "$config" ||
@@ -1242,6 +1327,7 @@ resume_recovery_transaction() {
     local intent expected_guild restore_name
     intent=$(node_recovery_intent "$node")
     load_recovery_intent "$intent" || die "node $node has no recovery transaction to resume"
+    ensure_recovery_identity_binding "$node"
     expected_guild=$RECOVERY_GUILD_ID
     restore_name=$RECOVERY_RESTORE_NAME
     if [[ $RECOVERY_PHASE != restoring ]]; then
@@ -1249,6 +1335,8 @@ resume_recovery_transaction() {
     fi
     prepare_recovery_container "$node"
     start_node_internal "$node"
+    [[ $(daemon_node_id "$node") == "$RECOVERY_EXPECTED_NODE_ID" ]] ||
+        die "recovered daemon for node $node started as another identity"
     if [[ $RECOVERY_PHASE == container_created ]]; then
         advance_recovery_intent "$node" restoring
     fi
@@ -1258,6 +1346,8 @@ resume_recovery_transaction() {
         say "retry with: $0 reinit $node $restore_name --yes (or run up)" >&2
         return 1
     fi
+    [[ $(daemon_node_id "$node") == "$RECOVERY_EXPECTED_NODE_ID" ]] ||
+        die "recovered node $node changed identity"
     [[ $(guild_phase "$node") == Active && $(guild_id "$node") == "$expected_guild" ]] ||
         die "recovered node $node did not rejoin its original active guild"
     clear_recovery_intent "$node"
@@ -1449,7 +1539,7 @@ command_reinit() {
 
     prepare_host
     acquire_lock
-    local recovery_intent expected_guild bootstrap_node='' candidate
+    local recovery_intent expected_guild expected_node_id retained_node_id summary_node_id bootstrap_node='' candidate
     recovery_intent=$(node_recovery_intent "$node")
     if load_recovery_intent "$recovery_intent"; then
         if [[ $restore_name_seen == true && $restore_name != "$RECOVERY_RESTORE_NAME" ]]; then
@@ -1464,6 +1554,13 @@ command_reinit() {
     [[ $(guild_phase "$node") == Active ]] || die "node $node is not in an active guild"
     expected_guild=$(guild_id "$node")
     [[ $expected_guild =~ ^[0-9a-fA-F]{64}$ ]] || die "node $node reported an invalid guild ID"
+    expected_node_id=$(daemon_node_id "$node")
+    retained_node_id=$(seed_node_id "$node")
+    summary_node_id=$(identity_summary_node_id "$node")
+    [[ $retained_node_id == "$expected_node_id" ]] ||
+        die "retained recovery string for node $node does not match its running identity"
+    [[ $summary_node_id == "$expected_node_id" ]] ||
+        die "identity summary for node $node does not match its running identity"
     for candidate in 0 1 2 3 4; do
         if ((candidate != node)) && container_running "$candidate" &&
             cli_raw "$candidate" status >/dev/null 2>&1 &&
@@ -1478,9 +1575,12 @@ command_reinit() {
     RECOVERY_BOOTSTRAP_NODE=$bootstrap_node
     RECOVERY_RESTORE_NAME=$restore_name
     RECOVERY_GUILD_ID=$expected_guild
+    RECOVERY_EXPECTED_NODE_ID=$expected_node_id
+    RECOVERY_FORMAT=2
     validate_recovery_survivors "$node" "$expected_guild"
     confirm_reinit "$node" "$assume_yes"
-    write_recovery_intent "$node" prepared "$RECOVERY_BOOTSTRAP_NODE" "$restore_name" "$expected_guild"
+    write_recovery_intent "$node" prepared "$RECOVERY_BOOTSTRAP_NODE" "$restore_name" \
+        "$expected_guild" "$expected_node_id"
     say "recorded durable recovery intent; preserving $(node_seed "$node")"
     resume_recovery_transaction "$node"
 }
