@@ -7,10 +7,28 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
+      sourceRoot = toString ./.;
+      cleanSource = pkgs.lib.cleanSourceWith {
+        name = "mutualbackup-source";
+        src = ./.;
+        filter = path: _type:
+          let
+            relative = pkgs.lib.removePrefix "${sourceRoot}/" (toString path);
+            firstComponent = builtins.head (pkgs.lib.splitString "/" relative);
+          in
+          !(builtins.elem firstComponent [
+            ".git"
+            ".direnv"
+            ".docker-lab"
+            "dist"
+            "result"
+            "target"
+          ] || pkgs.lib.hasPrefix "result-" firstComponent);
+      };
       staticBinary = pkgs.pkgsStatic.rustPlatform.buildRustPackage {
         pname = "mutualbackup";
         version = "0.1.0";
-        src = ./.;
+        src = cleanSource;
         cargoLock.lockFile = ./Cargo.lock;
         cargoBuildFlags = [ "-p" "mutualbackup" ];
         nativeBuildInputs = with pkgs; [ perl pkg-config ];
