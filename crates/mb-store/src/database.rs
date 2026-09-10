@@ -56,6 +56,13 @@ impl ControlStore {
         &self.path
     }
 
+    /// Prevent this connection from changing database state. This is useful
+    /// for integrity inspection and for exercising genuinely read-only paths.
+    pub fn make_query_only(&self) -> Result<(), DatabaseError> {
+        self.connection.pragma_update(None, "query_only", true)?;
+        Ok(())
+    }
+
     pub fn put_record(
         &self,
         kind: &str,
@@ -67,6 +74,51 @@ impl ControlStore {
              ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
             params![kind, record_id, bytes],
         )?;
+        Ok(())
+    }
+
+    pub fn put_record_if_absent(
+        &self,
+        kind: &str,
+        record_id: &[u8],
+        bytes: &[u8],
+    ) -> Result<bool, DatabaseError> {
+        Ok(self.connection.execute(
+            "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+             ON CONFLICT(kind, record_id) DO NOTHING",
+            params![kind, record_id, bytes],
+        )? == 1)
+    }
+
+    pub fn move_record_if_value(
+        &self,
+        kind: &str,
+        old_record_id: &[u8],
+        expected: &[u8],
+        new_record_id: &[u8],
+        replacement: &[u8],
+    ) -> Result<(), DatabaseError> {
+        if old_record_id == new_record_id {
+            return Err(DatabaseError::Conflict);
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let inserted = transaction.execute(
+            "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+             ON CONFLICT(kind, record_id) DO NOTHING",
+            params![kind, new_record_id, replacement],
+        )?;
+        if inserted != 1 {
+            return Err(DatabaseError::Conflict);
+        }
+        let removed = transaction.execute(
+            "DELETE FROM protocol_records
+             WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
+            params![kind, old_record_id, expected],
+        )?;
+        if removed != 1 {
+            return Err(DatabaseError::Conflict);
+        }
+        transaction.commit()?;
         Ok(())
     }
 

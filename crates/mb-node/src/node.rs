@@ -2493,9 +2493,6 @@ impl Node {
         revision_id: Option<Uuid>,
         target: &Path,
     ) -> Result<SnapshotInfo> {
-        if target.exists() {
-            anyhow::bail!("restore target must not already exist");
-        }
         let installed = self
             .installed_guild()?
             .context("this node has no active guild")?;
@@ -2965,6 +2962,7 @@ impl Node {
         let (target, target_name, parent_path, parent) = pinned_recovery_target(target)?;
         let parent_identity = native_id_tuple(parent.identity()?);
         let existing = self.control.get_record("recovery-job", checkpoint_hash)?;
+        let is_new_job = existing.is_none();
         let mut job = match existing {
             Some(bytes) => {
                 let job: RecoveryJob = decode_canonical(&bytes)?;
@@ -2990,8 +2988,10 @@ impl Node {
                 parent_native_id: Some(parent_identity),
             },
         };
-        self.control
-            .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
+        if is_new_job {
+            self.control
+                .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
+        }
 
         let staging_name = job
             .staging
@@ -3818,6 +3818,132 @@ mod tests {
         (identities[2].1.clone(), certificate, peers)
     }
 
+    fn install_public_restore_fixture(
+        node: &mut Node,
+        local_seed: &Seed,
+    ) -> SignedRecord<UserRevision> {
+        let mut seeds = vec![local_seed.clone()];
+        seeds.extend((0_u8..4).map(|index| Seed::from_bytes([index + 228; 32])));
+        let keys = seeds.iter().map(KeyMaterial::from_seed).collect::<Vec<_>>();
+        let mut members = keys
+            .iter()
+            .enumerate()
+            .map(|(index, keys)| Member {
+                node_id: keys.node_id(),
+                recovery_public_key: keys.recovery_public_key(),
+                failure_domain: format!("public-restore-domain-{index}"),
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| member.node_id);
+        let guild_id = [233; 32];
+        let genesis = GuildGenesis {
+            format_version: 1,
+            guild_id,
+            coordinator: members[0].node_id,
+            members: members.clone(),
+        };
+        let mut genesis_signatures = keys
+            .iter()
+            .map(|keys| genesis.member_signature(keys).unwrap())
+            .collect::<Vec<_>>();
+        genesis_signatures.sort_by_key(|signature| signature.signer);
+        let certificate = QuorumGuildGenesis {
+            genesis,
+            signatures: genesis_signatures,
+        };
+        certificate.verify().unwrap();
+
+        let revision = install_empty_recovery_revision(node, guild_id, Uuid::from_bytes([234; 16]));
+        let local_id = node.keys().node_id();
+        let other_ids = members
+            .iter()
+            .map(|member| member.node_id)
+            .filter(|node_id| *node_id != local_id)
+            .collect::<Vec<_>>();
+        let roles = [
+            ShardRole::Information(mb_core::InformationRole {
+                owner: local_id,
+                sector: revision.value.metadata_sectors[0].clone(),
+            }),
+            ShardRole::Information(mb_core::InformationRole {
+                owner: other_ids[0],
+                sector: SectorRef {
+                    id: [235; 32],
+                    root: [236; 32],
+                    logical_len: 0,
+                },
+            }),
+            ShardRole::Information(mb_core::InformationRole {
+                owner: other_ids[1],
+                sector: SectorRef {
+                    id: [237; 32],
+                    root: [238; 32],
+                    logical_len: 0,
+                },
+            }),
+            ShardRole::Parity(mb_core::ParityRole {
+                holder: other_ids[2],
+                row: 0,
+                root: [239; 32],
+            }),
+            ShardRole::Parity(mb_core::ParityRole {
+                holder: other_ids[3],
+                row: 1,
+                root: [240; 32],
+            }),
+        ];
+        let mut group = mb_core::CodingGroup {
+            id: [0; 32],
+            format_version: 1,
+            guild_id,
+            data_shards: mb_core::V1_RS_DATA_SHARDS,
+            parity_shards: mb_core::V1_RS_PARITY_SHARDS,
+            shard_size: mb_core::V1_SECTOR_SIZE as u32,
+            roles,
+        };
+        group.id = group.calculate_id().unwrap();
+        let mut checkpoint = QuorumCheckpoint {
+            checkpoint: GuildCheckpoint {
+                format_version: 1,
+                guild_id,
+                genesis_hash: certificate.hash().unwrap(),
+                generation: 1,
+                parent: None,
+                members,
+                revisions: vec![revision.clone()],
+                coding_groups: vec![group],
+            },
+            signatures: Vec::new(),
+        };
+        for keys in &keys {
+            checkpoint.add_signature(keys).unwrap();
+        }
+        let installed = InstalledGuild {
+            format_version: 2,
+            certificate,
+        };
+        node.control
+            .put_record(
+                "guild-installed",
+                b"primary",
+                &canonical_bytes(&installed).unwrap(),
+            )
+            .unwrap();
+        let checkpoint_hash = checkpoint.hash().unwrap();
+        node.control
+            .commit_checkpoint(
+                &guild_id,
+                1,
+                None,
+                &checkpoint_hash,
+                &canonical_bytes(&checkpoint.checkpoint).unwrap(),
+                &canonical_bytes(&checkpoint).unwrap(),
+                false,
+            )
+            .unwrap();
+        revision
+    }
+
     #[test]
     fn data_directory_has_one_live_owner() {
         let temp = tempfile::tempdir().unwrap();
@@ -3825,6 +3951,26 @@ mod tests {
         assert!(Node::open(temp.path(), Seed::from_bytes([91; 32])).is_err());
         drop(first);
         Node::open(temp.path(), Seed::from_bytes([91; 32])).unwrap();
+    }
+
+    #[test]
+    fn public_restore_retry_finishes_a_renamed_publishing_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([227; 32]);
+        let mut node = Node::open(temp.path().join("node"), seed.clone()).unwrap();
+        let revision = install_public_restore_fixture(&mut node, &seed);
+        let target = temp.path().join("restored");
+
+        crate::snapshot::interrupt_next_restore_after_rename();
+        assert!(
+            node.restore_snapshot(Some(revision.value.revision_id), &target)
+                .is_err()
+        );
+        assert!(target.is_dir());
+
+        node.restore_snapshot(Some(revision.value.revision_id), &target)
+            .unwrap();
+        assert!(node.control.records("restore-job").unwrap().is_empty());
     }
 
     #[test]
@@ -4482,16 +4628,6 @@ mod tests {
         let completed: RecoveryJob = decode_canonical(&bytes).unwrap();
         assert_eq!(completed.state, RecoveryJobState::Complete);
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
-            node.restore_recovered_revision(&checkpoint_hash, guild_id, &revision, &target)
-                .unwrap();
-            fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-
         let mut interrupted_finalization = completed;
         interrupted_finalization.state = RecoveryJobState::Published;
         node.control
@@ -4510,6 +4646,10 @@ mod tests {
             .unwrap();
         let completed_again: RecoveryJob = decode_canonical(&bytes).unwrap();
         assert_eq!(completed_again.state, RecoveryJobState::Complete);
+
+        node.control.make_query_only().unwrap();
+        node.restore_recovered_revision(&checkpoint_hash, guild_id, &revision, &target)
+            .unwrap();
     }
 
     #[cfg(target_os = "linux")]

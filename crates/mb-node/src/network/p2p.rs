@@ -3511,9 +3511,6 @@ pub(crate) async fn restore_snapshot_with_p2p(
     revision_id: Option<Uuid>,
     target: &std::path::Path,
 ) -> Result<SnapshotInfo> {
-    if target.exists() {
-        bail!("restore target must not already exist");
-    }
     let (checkpoint, revision, roster) = node_blocking(node.clone(), move |node| {
         node.snapshot_repair_plan(revision_id)
     })
