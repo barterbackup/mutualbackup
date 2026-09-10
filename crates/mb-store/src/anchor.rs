@@ -18,6 +18,7 @@ const AREA_PREFIX: &str = ".mutualbackup-anchors";
 const AREA_MARKER: &str = ".mutualbackup-anchor-area-v1";
 const AREA_MAGIC: &str = "mutualbackup-anchor-area-v1";
 const CAPTURE_MANIFEST_PREFIX: &str = ".mutualbackup-capture-manifest-v1-";
+const CAPTURE_LINK_POOL_PREFIX: &str = ".mutualbackup-capture-links-v1-";
 const MAX_CAPTURE_ENTRIES: usize = 8_192;
 const MAX_CAPTURE_EXTENTS: usize = 65_536;
 const MAX_CAPTURE_DEPTH: usize = 256;
@@ -674,11 +675,18 @@ impl ReflinkAnchor {
         let area_file = open_stable_anchor_area(&area_path, &plan.area)?;
         let staging_name = format!(".staging-{}", plan.anchor_id);
         let anchor_name = plan.anchor_id.to_string();
+        let link_pool_name = capture_link_pool_name(plan.anchor_id);
         let staging = area_path.join(&staging_name);
         let anchor_root = area_path.join(&anchor_name);
+        let link_pool = area_path.join(&link_pool_name);
         match open_path_no_xdev_beneath(&area_file, Path::new(&anchor_name)) {
             Ok(_) => match read_planned_manifest_at(&area_file, &area_path, plan) {
-                Ok(manifest) => return Ok(manifest),
+                Ok(manifest) => {
+                    remove_directory_at(&area_file, &staging_name, &staging)?;
+                    remove_directory_at(&area_file, &link_pool_name, &link_pool)?;
+                    area_file.sync_all()?;
+                    return Ok(manifest);
+                }
                 Err(_) => {
                     remove_directory_at(&area_file, &anchor_name, &anchor_root)?;
                     area_file.sync_all()?;
@@ -688,6 +696,7 @@ impl ReflinkAnchor {
             Err(_) => return Err(AnchorError::AnchorAreaCollision(anchor_root)),
         }
         remove_directory_at(&area_file, &staging_name, &staging)?;
+        remove_directory_at(&area_file, &link_pool_name, &link_pool)?;
         area_file.sync_all()?;
 
         let source_root = plan
@@ -718,6 +727,15 @@ impl ReflinkAnchor {
             }
         });
         let staging_file = create_private_directory_at(&area_file, &staging_name, &staging)?;
+        let link_pool_file =
+            match create_private_directory_at(&area_file, &link_pool_name, &link_pool) {
+                Ok(link_pool_file) => link_pool_file,
+                Err(error) => {
+                    let _ = remove_directory_at(&area_file, &staging_name, &staging);
+                    let _ = area_file.sync_all();
+                    return Err(error);
+                }
+            };
 
         let capture_result = (|| {
             let entries = capture_entries(
@@ -727,7 +745,11 @@ impl ReflinkAnchor {
                 filesystem,
                 &staging_file,
                 &staging,
+                &link_pool_file,
+                &link_pool,
             )?;
+            remove_directory_at(&area_file, &link_pool_name, &link_pool)?;
+            area_file.sync_all()?;
             let manifest = StableAnchorManifest {
                 format_version: 2,
                 anchor_id: plan.anchor_id,
@@ -761,6 +783,7 @@ impl ReflinkAnchor {
         let manifest = match capture_result {
             Ok(manifest) => manifest,
             Err(error) => {
+                let _ = remove_directory_at(&area_file, &link_pool_name, &link_pool);
                 let _ = remove_directory_at(&area_file, &staging_name, &staging);
                 let _ = area_file.sync_all();
                 return Err(error);
@@ -782,6 +805,12 @@ impl ReflinkAnchor {
         let area_path = resolve_anchor_area(&plan.area)?;
         let area_file = open_stable_anchor_area(&area_path, &plan.area)?;
         let staging_name = format!(".staging-{}", plan.anchor_id);
+        let link_pool_name = capture_link_pool_name(plan.anchor_id);
+        remove_directory_at(
+            &area_file,
+            &link_pool_name,
+            &area_path.join(&link_pool_name),
+        )?;
         remove_directory_at(&area_file, &staging_name, &area_path.join(&staging_name))?;
         let anchor_name = plan.anchor_id.to_string();
         remove_directory_at(&area_file, &anchor_name, &area_path.join(&anchor_name))?;
@@ -807,6 +836,12 @@ impl ReflinkAnchor {
         }
         let staging_name = format!(".staging-{}", plan.anchor_id);
         remove_directory_at(&area_file, &staging_name, &area_path.join(&staging_name))?;
+        let link_pool_name = capture_link_pool_name(plan.anchor_id);
+        remove_directory_at(
+            &area_file,
+            &link_pool_name,
+            &area_path.join(&link_pool_name),
+        )?;
         run_before_anchor_area_sync_hook();
         area_file.sync_all()?;
         Ok(())
@@ -1336,6 +1371,8 @@ fn capture_entries(
     filesystem: FilesystemIdentity,
     staging: &File,
     staging_display: &Path,
+    link_pool: &File,
+    link_pool_display: &Path,
 ) -> Result<Vec<CapturedEntry>, AnchorError> {
     #[cfg(test)]
     BEFORE_CAPTURE_WALK.with(|hook| {
@@ -1346,18 +1383,13 @@ fn capture_entries(
 
     #[cfg(target_os = "linux")]
     {
-        let link_pool_name = ".mutualbackup-capture-hardlinks";
-        let link_pool = create_private_directory_at(
-            staging,
-            link_pool_name,
-            &staging_display.join(link_pool_name),
-        )?;
         let mut capture = DescriptorCapture {
             source_root,
             root_file,
             filesystem,
             staging_display,
-            link_pool: &link_pool,
+            link_pool,
+            link_pool_display,
             entries: Vec::new(),
             versions: vec![CapturedVersion {
                 relative: PathBuf::new(),
@@ -1369,11 +1401,6 @@ fn capture_entries(
         };
         capture.capture_directory(root_file, staging, Path::new(""), 0)?;
         capture.validate_versions()?;
-        remove_directory_at(
-            staging,
-            link_pool_name,
-            &staging_display.join(link_pool_name),
-        )?;
         staging.sync_all()?;
         capture
             .entries
@@ -1390,6 +1417,8 @@ fn capture_entries(
             filesystem,
             staging,
             staging_display,
+            link_pool,
+            link_pool_display,
         );
         Err(AnchorError::ReflinkUnavailable(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -1412,6 +1441,7 @@ struct DescriptorCapture<'a> {
     filesystem: FilesystemIdentity,
     staging_display: &'a Path,
     link_pool: &'a File,
+    link_pool_display: &'a Path,
     entries: Vec<CapturedEntry>,
     versions: Vec<CapturedVersion>,
     captured_links: BTreeMap<NativeFileId, CapturedHardLink>,
@@ -1544,10 +1574,7 @@ impl DescriptorCapture<'_> {
                     let linked = open_regular_file_at(
                         self.link_pool,
                         Path::new(&link_name),
-                        &self
-                            .staging_display
-                            .join(".mutualbackup-capture-hardlinks")
-                            .join(&link_name),
+                        &self.link_pool_display.join(&link_name),
                     )?;
                     let metadata = captured_file.metadata()?;
                     let linked_metadata = linked.metadata()?;
@@ -2600,6 +2627,10 @@ fn capture_manifest_name(anchor_id: Uuid) -> String {
     format!("{CAPTURE_MANIFEST_PREFIX}{anchor_id}")
 }
 
+fn capture_link_pool_name(anchor_id: Uuid) -> String {
+    format!("{CAPTURE_LINK_POOL_PREFIX}{anchor_id}")
+}
+
 #[cfg(unix)]
 fn capture_version(filesystem_id: u64, metadata: &fs::Metadata) -> CaptureVersion {
     use std::os::unix::fs::MetadataExt;
@@ -3321,9 +3352,57 @@ mod tests {
             alias.metadata().unwrap().ino()
         );
         let anchor_root = manifest.area.path_hint.join(manifest.anchor_id.to_string());
+        assert!(
+            !manifest
+                .area
+                .path_hint
+                .join(capture_link_pool_name(manifest.anchor_id))
+                .exists()
+        );
         assert!(!anchor_root.join(".mutualbackup-capture-hardlinks").exists());
 
         manifest.remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn capture_accepts_the_previous_internal_link_pool_name() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("capture-pool-name-{}", Uuid::new_v4()));
+        let file_root = run_root.join("file-case");
+        let directory_root = run_root.join("directory-case");
+        fs::create_dir_all(&file_root).unwrap();
+        fs::create_dir_all(directory_root.join(".mutualbackup-capture-hardlinks")).unwrap();
+        fs::write(
+            file_root.join(".mutualbackup-capture-hardlinks"),
+            b"ordinary source file",
+        )
+        .unwrap();
+        fs::write(
+            directory_root.join(".mutualbackup-capture-hardlinks/payload"),
+            b"ordinary source directory",
+        )
+        .unwrap();
+
+        let file_manifest = ReflinkAnchor::capture(&file_root).unwrap();
+        assert!(file_manifest.entries.iter().any(|entry| {
+            matches!(entry, CapturedEntry::FileV2 { path, .. } if path == ".mutualbackup-capture-hardlinks")
+        }));
+        let directory_manifest = ReflinkAnchor::capture(&directory_root).unwrap();
+        assert!(directory_manifest.entries.iter().any(|entry| {
+            matches!(entry, CapturedEntry::Directory { path, .. } if path == ".mutualbackup-capture-hardlinks")
+        }));
+        assert!(directory_manifest.entries.iter().any(|entry| {
+            matches!(entry, CapturedEntry::FileV2 { path, .. } if path == ".mutualbackup-capture-hardlinks/payload")
+        }));
+
+        file_manifest.remove().unwrap();
+        directory_manifest.remove().unwrap();
         fs::remove_dir_all(run_root).unwrap();
     }
 
