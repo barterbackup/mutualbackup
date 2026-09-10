@@ -26,7 +26,7 @@ use crate::snapshot::{
     install_recovered_sector_recipe, make_restore_root_private_at, prepare_revision,
     publish_owned_restore, reanchor_recovered_revision, reconcile_pending_captures,
     recovered_recipe_is_stable, render_sector, restore_revision_from_source,
-    restore_signed_root_metadata_at,
+    restore_signed_root_metadata_at, resume_restore_publication,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1558,6 +1558,11 @@ impl Node {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn restore_job_count(&self) -> Result<usize> {
+        Ok(self.control.records("restore-job")?.len())
+    }
+
     pub fn publish_verified_parity(
         &mut self,
         group: &mb_core::CodingGroup,
@@ -2537,6 +2542,43 @@ impl Node {
         })
     }
 
+    pub(crate) fn resume_snapshot_publication(
+        &self,
+        revision_id: Option<Uuid>,
+        target: &Path,
+    ) -> Result<Option<SnapshotInfo>> {
+        let installed = self
+            .installed_guild()?
+            .context("this node has no active guild")?;
+        let guild_id = installed.certificate.genesis.guild_id;
+        let checkpoint = self
+            .current_checkpoint(guild_id)?
+            .context("guild has no committed snapshots")?;
+        checkpoint.verify()?;
+        let revision = match revision_id {
+            Some(revision_id) => checkpoint.checkpoint.revisions.iter().find(|revision| {
+                revision.value.owner == self.keys.node_id()
+                    && revision.value.revision_id == revision_id
+            }),
+            None => checkpoint
+                .checkpoint
+                .revisions
+                .iter()
+                .filter(|revision| revision.value.owner == self.keys.node_id())
+                .max_by_key(|revision| revision.value.sequence),
+        }
+        .context("requested snapshot is unavailable for this node")?;
+        if !resume_restore_publication(&self.control, &self.keys, guild_id, revision, target)? {
+            return Ok(None);
+        }
+        Ok(Some(SnapshotInfo {
+            revision_id: revision.value.revision_id,
+            sequence: revision.value.sequence,
+            checkpoint_generation: checkpoint.checkpoint.generation,
+            checkpoint_hash: checkpoint.hash()?,
+        }))
+    }
+
     pub(crate) fn snapshot_repair_plan(
         &self,
         revision_id: Option<Uuid>,
@@ -2881,13 +2923,14 @@ impl Node {
             .and_then(|name| name.to_str())
             .context("durable recovery staging has no UTF-8 file name")?;
         if let Some(actual) = parent.entry_identity(staging_name, true)? {
-            if let Some(expected) = job.staged_native_id.map(tuple_native_id)
-                && actual != expected
-            {
-                anyhow::bail!("durable recovery staging directory was replaced");
+            match job.staged_native_id.map(tuple_native_id) {
+                Some(expected) if actual == expected => {
+                    parent.remove_child_directory(staging_name, actual)?;
+                    parent.sync_all()?;
+                }
+                Some(_) => anyhow::bail!("durable recovery staging directory was replaced"),
+                None => {}
             }
-            parent.remove_child_directory(staging_name, actual)?;
-            parent.sync_all()?;
         }
         Ok(())
     }
@@ -3000,7 +3043,7 @@ impl Node {
                 .put_record("recovery-job", checkpoint_hash, &canonical_bytes(&job)?)?;
         }
 
-        let staging_name = job
+        let mut staging_name = job
             .staging
             .file_name()
             .and_then(|name| name.to_str())
@@ -3121,14 +3164,22 @@ impl Node {
         }
 
         if let Some(actual) = parent.entry_identity(&staging_name, true)? {
-            if let Some(expected) = expected
-                && actual != expected
-            {
-                anyhow::bail!("recovery staging directory was replaced");
+            match expected {
+                Some(expected) if actual == expected => {
+                    parent.remove_child_directory(&staging_name, actual)?;
+                    parent.sync_all()?;
+                }
+                Some(_) => anyhow::bail!("recovery staging directory was replaced"),
+                None => {
+                    // The process may have stopped between creating the
+                    // directory and recording its inode. The name is not an
+                    // ownership proof, so leave this entry untouched and
+                    // continue under a fresh random name.
+                }
             }
-            parent.remove_child_directory(&staging_name, actual)?;
-            parent.sync_all()?;
         }
+        staging_name = format!(".mutualbackup-restore-{}", Uuid::new_v4());
+        job.staging = parent_path.join(&staging_name);
         job.state = RecoveryJobState::Building;
         job.staged_native_id = None;
         self.control
@@ -4687,6 +4738,80 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn complete_recovery_verifies_a_relocated_anchor_without_writing() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("complete-recovery-query-only-{}", Uuid::new_v4()));
+        let original_parent = run_root.join("original");
+        let moved_parent = run_root.join("moved");
+        let source = original_parent.join("source");
+        let restore_parent = run_root.join("restore-parent");
+        let target = restore_parent.join("restored");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(source.join("payload"), b"relocated stable anchor").unwrap();
+
+        let mut node = Node::open(run_root.join("node"), Seed::from_bytes([220; 32])).unwrap();
+        let guild_id = [221; 32];
+        let checkpoint_hash = [222; 32];
+        let revision = node.prepare_revision(guild_id, &source, 1, None).unwrap();
+        assert!(!revision.value.data_sectors.is_empty());
+        let manifest: mb_store::StableAnchorManifest = decode_canonical(
+            &node
+                .control
+                .get_record("anchor-manifest", revision.value.revision_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let parent = PinnedDirectory::open(&restore_parent).unwrap();
+        let target_identity = parent
+            .open_child_directory("restored")
+            .unwrap()
+            .unwrap()
+            .identity()
+            .unwrap();
+        let job = RecoveryJob {
+            format_version: 7,
+            guild_id,
+            revision_id: revision.value.revision_id,
+            target: target.canonicalize().unwrap(),
+            staging: restore_parent.join(format!(".mutualbackup-restore-{}", Uuid::new_v4())),
+            staged_native_id: Some(native_id_tuple(target_identity)),
+            state: RecoveryJobState::Complete,
+            parent_native_id: Some(native_id_tuple(parent.identity().unwrap())),
+        };
+        let job_bytes = canonical_bytes(&job).unwrap();
+        node.control
+            .put_record("recovery-job", &checkpoint_hash, &job_bytes)
+            .unwrap();
+        let location_hints = node.control.records("anchor-area-location").unwrap();
+
+        fs::rename(&original_parent, &moved_parent).unwrap();
+        node.control.make_query_only().unwrap();
+        node.restore_recovered_revision(&checkpoint_hash, guild_id, &revision, &target)
+            .unwrap();
+
+        assert_eq!(
+            node.control
+                .get_record("recovery-job", &checkpoint_hash)
+                .unwrap(),
+            Some(job_bytes)
+        );
+        assert_eq!(
+            node.control.records("anchor-area-location").unwrap(),
+            location_hints
+        );
+        drop(node);
+        manifest.remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn recovery_never_adopts_a_replaced_staging_identity() {
         use std::os::unix::fs::symlink;
 
@@ -4741,7 +4866,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn recovery_reclaims_exact_stage_after_pre_identity_interruption() {
+    fn recovery_leaves_unbound_stage_after_pre_identity_interruption() {
         let temp = tempfile::tempdir().unwrap();
         let run_root = temp.path();
         let mut node = Node::open(run_root.join("node"), Seed::from_bytes([216; 32])).unwrap();
@@ -4765,11 +4890,24 @@ mod tests {
         assert_eq!(interrupted.state, RecoveryJobState::Building);
         assert!(interrupted.staged_native_id.is_none());
         assert!(interrupted.staging.is_dir());
+        fs::write(interrupted.staging.join("must-survive"), b"unbound staging").unwrap();
 
         node.restore_recovered_revision(&checkpoint_hash, guild_id, &revision, &target)
             .unwrap();
         assert!(target.is_dir());
-        assert!(!interrupted.staging.exists());
+        assert_eq!(
+            fs::read(interrupted.staging.join("must-survive")).unwrap(),
+            b"unbound staging"
+        );
+        let completed: RecoveryJob = decode_canonical(
+            &node
+                .control
+                .get_record("recovery-job", &checkpoint_hash)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(completed.staging, interrupted.staging);
     }
 
     #[test]
@@ -4804,6 +4942,42 @@ mod tests {
         node.remove_superseded_recovery_job(&job).unwrap();
 
         assert!(!staging.exists());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn superseded_recovery_leaves_an_unbound_hidden_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut node = Node::open(temp.path().join("node"), Seed::from_bytes([223; 32])).unwrap();
+        let target = temp.path().join("restored");
+        let staging = temp.path().join(format!(
+            ".mutualbackup-restore-{}",
+            Uuid::from_bytes([224; 16])
+        ));
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("must-survive"), b"unbound staging").unwrap();
+        let job = RecoveryJob {
+            format_version: 7,
+            guild_id: [225; 32],
+            revision_id: Uuid::from_bytes([226; 16]),
+            target: temp.path().canonicalize().unwrap().join("restored"),
+            staging: staging.clone(),
+            staged_native_id: None,
+            state: RecoveryJobState::Building,
+            parent_native_id: Some(native_id_tuple(
+                PinnedDirectory::open(temp.path())
+                    .unwrap()
+                    .identity()
+                    .unwrap(),
+            )),
+        };
+
+        node.remove_superseded_recovery_job(&job).unwrap();
+
+        assert_eq!(
+            fs::read(staging.join("must-survive")).unwrap(),
+            b"unbound staging"
+        );
         assert!(!target.exists());
     }
 

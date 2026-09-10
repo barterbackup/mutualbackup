@@ -3511,6 +3511,14 @@ pub(crate) async fn restore_snapshot_with_p2p(
     revision_id: Option<Uuid>,
     target: &std::path::Path,
 ) -> Result<SnapshotInfo> {
+    let publication_target = target.to_path_buf();
+    if let Some(restored) = node_blocking(node.clone(), move |node| {
+        node.resume_snapshot_publication(revision_id, &publication_target)
+    })
+    .await?
+    {
+        return Ok(restored);
+    }
     let (checkpoint, revision, roster) = node_blocking(node.clone(), move |node| {
         node.snapshot_repair_plan(revision_id)
     })
@@ -5671,6 +5679,21 @@ mod tests {
             endpoint.value.endpoints,
             advertised_p2p_endpoints(&recovery_client).await.unwrap()
         );
+        let publishing_restore = run_root.join("publishing-restore-node-2");
+        crate::snapshot::interrupt_next_restore_after_rename();
+        assert!(
+            nodes[2]
+                .lock()
+                .unwrap()
+                .restore_snapshot(None, &publishing_restore)
+                .is_err()
+        );
+        assert!(publishing_restore.is_dir());
+        nodes[2]
+            .lock()
+            .unwrap()
+            .forget_local_sector(&forgotten_sector)
+            .unwrap();
         for index in [0_usize, 2, 3] {
             clients[index].shutdown().await.unwrap();
         }
@@ -5721,6 +5744,14 @@ mod tests {
         for task in tasks {
             task.await.unwrap().unwrap();
         }
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            restore_snapshot_with_p2p(nodes[2].clone(), &clients[2], None, &publishing_restore),
+        )
+        .await
+        .expect("publishing restore retry must not contact unavailable peers")
+        .unwrap();
+        assert!(nodes[2].lock().unwrap().restore_job_count().unwrap() == 0);
         drop(clients);
         drop(nodes);
         std::fs::remove_dir_all(run_root).unwrap();

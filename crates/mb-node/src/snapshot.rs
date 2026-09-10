@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use mb_core::{
     KeyMaterial, SectorId, SectorPurpose, SectorRef, SignedRecord, UserRevision, V1_CIPHER_PROFILE,
     V1_MAX_CATALOG_BYTES, V1_MAX_CODING_GROUPS, V1_SECTOR_SIZE, canonical_bytes, crypt_sector,
@@ -106,8 +107,11 @@ struct RestoreJob {
 
 struct ReservedRestoreJob {
     record_id: [u8; 32],
+    bytes: Vec<u8>,
     job: RestoreJob,
 }
+
+struct RestoreOperationGuard(File);
 
 // Private metadata version 2 existed briefly with two different positional
 // postcard layouts. Keep both wire types immutable: changing PrivateEntry
@@ -1437,6 +1441,16 @@ pub(crate) fn render_sector(
     sector_id: &SectorId,
     expected_guild: Option<&[u8; 32]>,
 ) -> Result<Vec<u8>> {
+    render_sector_with_hint_update(control, keys, sector_id, expected_guild, true)
+}
+
+fn render_sector_with_hint_update(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    sector_id: &SectorId,
+    expected_guild: Option<&[u8; 32]>,
+    update_area_hint: bool,
+) -> Result<Vec<u8>> {
     let encoded = control
         .get_record("local-sector", sector_id)?
         .context("local sector recipe is unavailable")?;
@@ -1459,7 +1473,7 @@ pub(crate) fn render_sector(
             let (mut file, resolved_area) = locator
                 .open_with_area_hint(area_hint.as_deref())
                 .context("open stable source anchor")?;
-            if area_hint.as_ref() != Some(&resolved_area) {
+            if update_area_hint && area_hint.as_ref() != Some(&resolved_area) {
                 control.put_record(
                     ANCHOR_AREA_LOCATION_KIND,
                     locator.area.area_id.as_bytes(),
@@ -1509,8 +1523,10 @@ pub(crate) fn recovered_recipe_is_stable(
     if !matches!(recipe.source, LocalPlaintextSource::StableAnchorFile { .. }) {
         return Ok(false);
     }
-    Ok(render_sector(control, keys, &reference.id, Some(&guild_id))
-        .is_ok_and(|ciphertext| sector_root(&ciphertext) == reference.root))
+    Ok(
+        render_sector_with_hint_update(control, keys, &reference.id, Some(&guild_id), false)
+            .is_ok_and(|ciphertext| sector_root(&ciphertext) == reference.root),
+    )
 }
 
 pub fn restore_revision(
@@ -1540,20 +1556,22 @@ pub fn restore_revision_from_source<F>(
 where
     F: FnMut(&SectorId) -> Result<Vec<u8>>,
 {
-    revision.verify(b"mutualbackup/user-revision/v1")?;
-    if revision.signer != keys.node_id()
-        || revision.value.owner != keys.node_id()
-        || revision.value.guild_id != guild_id
-        || revision.value.format_version != 1
-        || revision.value.cipher_profile != V1_CIPHER_PROFILE
-    {
-        bail!("revision does not belong to the recovering seed and guild");
-    }
-
+    validate_restore_revision(keys, guild_id, revision)?;
+    let _operation = lock_restore_operations(control)?;
     let (target, target_name, parent) = pinned_restore_parent(target)?;
     let parent_identity = parent.identity()?;
-    let ReservedRestoreJob { record_id, mut job } = loop {
-        if let Some(reserved) = reserved_restore_job(control, &target)? {
+    let ReservedRestoreJob {
+        record_id,
+        mut bytes,
+        mut job,
+    } = loop {
+        if let Some(reserved) = reserved_restore_job(
+            control,
+            &target,
+            &parent,
+            guild_id,
+            revision.value.revision_id,
+        )? {
             break reserved;
         }
         if parent.entry_identity(&target_name, true)?.is_some() {
@@ -1570,19 +1588,24 @@ where
             state: RestoreJobState::Building,
         };
         let record_id = restore_job_record_id(&target)?;
-        if control.put_record_if_absent(RESTORE_JOB_KIND, &record_id, &canonical_bytes(&job)?)? {
-            break ReservedRestoreJob { record_id, job };
+        let bytes = canonical_bytes(&job)?;
+        if control.put_record_if_absent(RESTORE_JOB_KIND, &record_id, &bytes)? {
+            break ReservedRestoreJob {
+                record_id,
+                bytes,
+                job,
+            };
         }
-        // Another process reserved this target between the read and insert.
-        // Reload that exact durable owner and report a request conflict below.
+        // A non-cooperating writer changed the journal despite the operation
+        // lock. Reload the durable owner and fail closed below.
     };
-    if job.guild_id != guild_id
-        || job.revision_id != revision.value.revision_id
-        || job.target != target
-        || job.parent_identity != parent_identity
-    {
-        bail!("restore request conflicts with an unfinished durable restore job");
-    }
+    validate_reserved_restore_job(
+        &job,
+        guild_id,
+        revision.value.revision_id,
+        &target,
+        parent_identity,
+    )?;
 
     if parent.identity()? != job.parent_identity {
         bail!("restore parent directory changed since the durable job was created");
@@ -1591,32 +1614,52 @@ where
         return finish_durable_restore_publication(
             control,
             &record_id,
+            &bytes,
             &job,
             &parent,
             &target_name,
         );
     }
 
-    if let Some(actual) = parent.entry_identity(&job.staging_name, true)? {
-        if let Some(expected) = job.staged_identity
-            && actual != expected
-        {
-            bail!("durable restore staging directory was replaced");
-        }
-        parent.remove_child_directory(&job.staging_name, actual)?;
-        parent.sync_all()?;
-    }
+    let prior_staging_identity = parent.entry_identity(&job.staging_name, true)?;
     if parent.entry_identity(&target_name, true)?.is_some() {
+        if job.staged_identity.is_none() && prior_staging_identity.is_none() {
+            control.delete_record_if_value(RESTORE_JOB_KIND, &record_id, &bytes)?;
+        }
         bail!("restore target appeared while rebuilding an unfinished restore");
     }
+    if let Some(actual) = prior_staging_identity {
+        match job.staged_identity {
+            Some(expected) if actual == expected => {
+                parent.remove_child_directory(&job.staging_name, actual)?;
+                parent.sync_all()?;
+            }
+            Some(_) => bail!("durable restore staging directory was replaced"),
+            None => {
+                // The process may have stopped between directory creation and
+                // recording its inode. Never delete an unbound name; rotate to
+                // a fresh staging name and leave the unknown entry untouched.
+            }
+        }
+    }
 
+    job.staging_name = format!(".mutualbackup-restore-{}", Uuid::new_v4());
     job.staged_identity = None;
-    control.put_record(RESTORE_JOB_KIND, &record_id, &canonical_bytes(&job)?)?;
+    bytes = replace_restore_job(control, &record_id, &bytes, &job)?;
     let staging = parent.create_child_directory(&job.staging_name)?;
     parent.sync_all()?;
     let staged_identity = staging.identity()?;
     job.staged_identity = Some(staged_identity);
-    control.put_record(RESTORE_JOB_KIND, &record_id, &canonical_bytes(&job)?)?;
+    match replace_restore_job(control, &record_id, &bytes, &job) {
+        Ok(replacement) => bytes = replacement,
+        Err(error) => {
+            if parent.entry_identity(&job.staging_name, true)? == Some(staged_identity) {
+                parent.remove_child_directory(&job.staging_name, staged_identity)?;
+                parent.sync_all()?;
+            }
+            return Err(error);
+        }
+    }
 
     build_revision_restore(
         keys,
@@ -1630,8 +1673,108 @@ where
         bail!("restore staging directory changed during construction");
     }
     job.state = RestoreJobState::Publishing;
-    control.put_record(RESTORE_JOB_KIND, &record_id, &canonical_bytes(&job)?)?;
-    finish_durable_restore_publication(control, &record_id, &job, &parent, &target_name)
+    bytes = replace_restore_job(control, &record_id, &bytes, &job)?;
+    finish_durable_restore_publication(control, &record_id, &bytes, &job, &parent, &target_name)
+}
+
+pub(crate) fn resume_restore_publication(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+    target: &Path,
+) -> Result<bool> {
+    validate_restore_revision(keys, guild_id, revision)?;
+    let _operation = lock_restore_operations(control)?;
+    let (target, target_name, parent) = pinned_restore_parent(target)?;
+    let parent_identity = parent.identity()?;
+    let Some(ReservedRestoreJob {
+        record_id,
+        bytes,
+        job,
+    }) = reserved_restore_job(
+        control,
+        &target,
+        &parent,
+        guild_id,
+        revision.value.revision_id,
+    )?
+    else {
+        return Ok(false);
+    };
+    validate_reserved_restore_job(
+        &job,
+        guild_id,
+        revision.value.revision_id,
+        &target,
+        parent_identity,
+    )?;
+    if job.state != RestoreJobState::Publishing {
+        return Ok(false);
+    }
+    finish_durable_restore_publication(control, &record_id, &bytes, &job, &parent, &target_name)?;
+    Ok(true)
+}
+
+fn validate_restore_revision(
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+) -> Result<()> {
+    revision.verify(b"mutualbackup/user-revision/v1")?;
+    if revision.signer != keys.node_id()
+        || revision.value.owner != keys.node_id()
+        || revision.value.guild_id != guild_id
+        || revision.value.format_version != 1
+        || revision.value.cipher_profile != V1_CIPHER_PROFILE
+    {
+        bail!("revision does not belong to the recovering seed and guild");
+    }
+    Ok(())
+}
+
+fn validate_reserved_restore_job(
+    job: &RestoreJob,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    target: &Path,
+    parent_identity: NativeFileId,
+) -> Result<()> {
+    if job.guild_id != guild_id
+        || job.revision_id != revision_id
+        || job.target != target
+        || job.parent_identity != parent_identity
+    {
+        bail!("restore request conflicts with an unfinished durable restore job");
+    }
+    Ok(())
+}
+
+fn lock_restore_operations(control: &ControlStore) -> Result<RestoreOperationGuard> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(control.path())
+        .context("open control database for restore serialization")?;
+    FileExt::lock_exclusive(&file).context("serialize ordinary restore operations")?;
+    Ok(RestoreOperationGuard(file))
+}
+
+impl Drop for RestoreOperationGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
+fn replace_restore_job(
+    control: &ControlStore,
+    record_id: &[u8; 32],
+    expected: &[u8],
+    replacement: &RestoreJob,
+) -> Result<Vec<u8>> {
+    let replacement = canonical_bytes(replacement)?;
+    control.replace_record_if_value(RESTORE_JOB_KIND, record_id, expected, &replacement)?;
+    Ok(replacement)
 }
 
 fn restore_job_record_id(target: &Path) -> Result<[u8; 32]> {
@@ -1643,6 +1786,9 @@ fn restore_job_record_id(target: &Path) -> Result<[u8; 32]> {
 fn reserved_restore_job(
     control: &ControlStore,
     target: &Path,
+    parent: &PinnedDirectory,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
 ) -> Result<Option<ReservedRestoreJob>> {
     let target_record_id = restore_job_record_id(target)?;
     for _ in 0..2 {
@@ -1659,7 +1805,15 @@ fn reserved_restore_job(
             }
         }
         if matching.len() > 1 {
-            bail!("multiple unfinished durable restore jobs reserve the same target");
+            return reconcile_legacy_restore_jobs(
+                control,
+                target,
+                parent,
+                guild_id,
+                revision_id,
+                target_record_id,
+                matching,
+            );
         }
         let Some((record_id, bytes, mut job)) = matching.pop() else {
             return Ok(None);
@@ -1667,21 +1821,24 @@ fn reserved_restore_job(
         if job.format_version == 2 {
             return Ok(Some(ReservedRestoreJob {
                 record_id: target_record_id,
+                bytes,
                 job,
             }));
         }
 
         job.format_version = 2;
+        let replacement = canonical_bytes(&job)?;
         match control.move_record_if_value(
             RESTORE_JOB_KIND,
             &record_id,
             &bytes,
             &target_record_id,
-            &canonical_bytes(&job)?,
+            &replacement,
         ) {
             Ok(()) => {
                 return Ok(Some(ReservedRestoreJob {
                     record_id: target_record_id,
+                    bytes: replacement,
                     job,
                 }));
             }
@@ -1690,6 +1847,92 @@ fn reserved_restore_job(
         }
     }
     bail!("unfinished durable restore job changed concurrently")
+}
+
+fn reconcile_legacy_restore_jobs(
+    control: &ControlStore,
+    target: &Path,
+    parent: &PinnedDirectory,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    target_record_id: [u8; 32],
+    matching: Vec<(Vec<u8>, Vec<u8>, RestoreJob)>,
+) -> Result<Option<ReservedRestoreJob>> {
+    if matching.iter().any(|(_, _, job)| job.format_version != 1) {
+        bail!("multiple unfinished durable restore jobs reserve the same target");
+    }
+    let selected_index = matching
+        .iter()
+        .position(|(_, _, job)| job.guild_id == guild_id && job.revision_id == revision_id)
+        .context("restore request conflicts with multiple legacy jobs for this target")?;
+    let parent_identity = parent.identity()?;
+    if matching
+        .iter()
+        .any(|(_, _, job)| job.parent_identity != parent_identity)
+    {
+        bail!("legacy restore parent directory changed unexpectedly");
+    }
+    let target_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("legacy restore target has no UTF-8 file name")?;
+    if let Some(actual_target) = parent.entry_identity(target_name, true)? {
+        let owners = matching
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, job))| {
+                job.state == RestoreJobState::Publishing
+                    && job.staged_identity == Some(actual_target)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if owners.as_slice() != [selected_index] {
+            bail!("existing restore target belongs to another legacy job or actor");
+        }
+    }
+    let selected_staging = &matching[selected_index].2.staging_name;
+    for (index, (_, _, job)) in matching.iter().enumerate() {
+        if index == selected_index {
+            continue;
+        }
+        if &job.staging_name == selected_staging {
+            bail!("multiple legacy restore jobs share one staging name");
+        }
+        retire_legacy_restore_staging(parent, job)?;
+    }
+    let mut selected = matching[selected_index].2.clone();
+    selected.format_version = 2;
+    let replacement = canonical_bytes(&selected)?;
+    let old_records = matching
+        .iter()
+        .map(|(record_id, bytes, _)| (record_id.clone(), bytes.clone()))
+        .collect::<Vec<_>>();
+    control.replace_records_with_one(
+        RESTORE_JOB_KIND,
+        &old_records,
+        &target_record_id,
+        &replacement,
+    )?;
+    Ok(Some(ReservedRestoreJob {
+        record_id: target_record_id,
+        bytes: replacement,
+        job: selected,
+    }))
+}
+
+fn retire_legacy_restore_staging(parent: &PinnedDirectory, job: &RestoreJob) -> Result<()> {
+    let Some(actual) = parent.entry_identity(&job.staging_name, true)? else {
+        return Ok(());
+    };
+    match job.staged_identity {
+        Some(expected) if expected == actual => {
+            parent.remove_child_directory(&job.staging_name, expected)?;
+            parent.sync_all()?;
+            Ok(())
+        }
+        Some(_) => bail!("legacy restore staging directory was replaced"),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn build_revision_restore<F>(
@@ -1754,6 +1997,7 @@ fn pinned_restore_parent(target: &Path) -> Result<(PathBuf, String, PinnedDirect
 fn finish_durable_restore_publication(
     control: &ControlStore,
     record_id: &[u8],
+    expected_record: &[u8],
     job: &RestoreJob,
     parent: &PinnedDirectory,
     target_name: &str,
@@ -1765,8 +2009,13 @@ fn finish_durable_restore_publication(
     if parent.descriptor_path().canonicalize()? != containing_directory(&job.target) {
         bail!("restore parent directory was renamed during publication");
     }
-    let expected_record = canonical_bytes(job)?;
-    control.delete_record_if_value(RESTORE_JOB_KIND, record_id, &expected_record)?;
+    match control.delete_record_if_value(RESTORE_JOB_KIND, record_id, expected_record) {
+        Ok(()) => {}
+        Err(mb_store::DatabaseError::Conflict)
+            if control.get_record(RESTORE_JOB_KIND, record_id)?.is_none()
+                && parent.entry_identity(target_name, true)? == Some(expected) => {}
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 
@@ -2532,6 +2781,207 @@ mod metadata_compatibility_tests {
         );
         let control = ControlStore::open(&database, &keys).unwrap();
         assert_eq!(control.records(RESTORE_JOB_KIND).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn completed_restore_cannot_be_followed_by_a_late_reservation() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([231; 32]));
+        let guild_id = [232; 32];
+        let database = temp.path().join("control.db");
+        let first_control = ControlStore::open(&database, &keys).unwrap();
+        let second_control = ControlStore::open(&database, &keys).unwrap();
+        let (first, first_ciphertexts) = restore_fixture(&keys, guild_id, Vec::new(), Vec::new());
+        let (second, second_ciphertexts) = restore_fixture(&keys, guild_id, Vec::new(), Vec::new());
+        let target = temp.path().join("restored");
+        let barrier = Arc::new(Barrier::new(2));
+
+        let run = |control: ControlStore,
+                   revision: SignedRecord<UserRevision>,
+                   ciphertexts: BTreeMap<SectorId, Vec<u8>>,
+                   barrier: Arc<Barrier>| {
+            let target = target.clone();
+            std::thread::spawn(move || {
+                let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([231; 32]));
+                barrier.wait();
+                restore_revision(&control, &keys, guild_id, &revision, &ciphertexts, &target)
+            })
+        };
+        let first_thread = run(first_control, first, first_ciphertexts, barrier.clone());
+        let second_thread = run(second_control, second, second_ciphertexts, barrier);
+        let results = [first_thread.join().unwrap(), second_thread.join().unwrap()];
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        let control = ControlStore::open(&database, &keys).unwrap();
+        assert!(control.records(RESTORE_JOB_KIND).unwrap().is_empty());
+        assert!(target.is_dir());
+        assert!(!fs::read_dir(temp.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".mutualbackup-restore-")
+        }));
+    }
+
+    #[test]
+    fn same_revision_restore_callers_cannot_recreate_a_published_job() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([233; 32]));
+        let guild_id = [234; 32];
+        let database = temp.path().join("control.db");
+        let first_control = ControlStore::open(&database, &keys).unwrap();
+        let second_control = ControlStore::open(&database, &keys).unwrap();
+        let (revision, ciphertexts) = restore_fixture(&keys, guild_id, Vec::new(), Vec::new());
+        let target = temp.path().join("restored");
+        let barrier = Arc::new(Barrier::new(2));
+
+        let run = |control: ControlStore, barrier: Arc<Barrier>| {
+            let target = target.clone();
+            let revision = revision.clone();
+            let ciphertexts = ciphertexts.clone();
+            std::thread::spawn(move || {
+                let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([233; 32]));
+                barrier.wait();
+                restore_revision(&control, &keys, guild_id, &revision, &ciphertexts, &target)
+            })
+        };
+        let first_thread = run(first_control, barrier.clone());
+        let second_thread = run(second_control, barrier);
+        let results = [first_thread.join().unwrap(), second_thread.join().unwrap()];
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        let control = ControlStore::open(&database, &keys).unwrap();
+        assert!(control.records(RESTORE_JOB_KIND).unwrap().is_empty());
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn multiple_legacy_restore_jobs_are_reconciled_without_unbound_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([235; 32]));
+        let guild_id = [236; 32];
+        let control = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let (selected_revision, ciphertexts) =
+            restore_fixture(&keys, guild_id, Vec::new(), Vec::new());
+        let (retired_revision, _) = restore_fixture(&keys, guild_id, Vec::new(), Vec::new());
+        let target = temp.path().join("restored");
+        let parent = PinnedDirectory::open(temp.path()).unwrap();
+        let selected_name = format!(".mutualbackup-restore-{}", Uuid::new_v4());
+        let retired_name = format!(".mutualbackup-restore-{}", Uuid::new_v4());
+        let selected_staging = parent.create_child_directory(&selected_name).unwrap();
+        let retired_staging = parent.create_child_directory(&retired_name).unwrap();
+        fs::write(
+            temp.path().join(&retired_name).join("must-survive"),
+            b"unbound staging",
+        )
+        .unwrap();
+        parent.sync_all().unwrap();
+        let canonical_target = temp.path().canonicalize().unwrap().join("restored");
+        let selected_job = RestoreJob {
+            format_version: 1,
+            guild_id,
+            revision_id: selected_revision.value.revision_id,
+            target: canonical_target.clone(),
+            parent_identity: parent.identity().unwrap(),
+            staging_name: selected_name.clone(),
+            staged_identity: Some(selected_staging.identity().unwrap()),
+            state: RestoreJobState::Building,
+        };
+        let retired_job = RestoreJob {
+            format_version: 1,
+            guild_id,
+            revision_id: retired_revision.value.revision_id,
+            target: canonical_target,
+            parent_identity: parent.identity().unwrap(),
+            staging_name: retired_name.clone(),
+            staged_identity: None,
+            state: RestoreJobState::Building,
+        };
+        drop(retired_staging);
+        control
+            .put_record(
+                RESTORE_JOB_KIND,
+                selected_revision.value.revision_id.as_bytes(),
+                &canonical_bytes(&selected_job).unwrap(),
+            )
+            .unwrap();
+        control
+            .put_record(
+                RESTORE_JOB_KIND,
+                retired_revision.value.revision_id.as_bytes(),
+                &canonical_bytes(&retired_job).unwrap(),
+            )
+            .unwrap();
+
+        restore_revision(
+            &control,
+            &keys,
+            guild_id,
+            &selected_revision,
+            &ciphertexts,
+            &target,
+        )
+        .unwrap();
+
+        assert!(target.is_dir());
+        assert!(!temp.path().join(selected_name).exists());
+        assert_eq!(
+            fs::read(temp.path().join(retired_name).join("must-survive")).unwrap(),
+            b"unbound staging"
+        );
+        assert!(control.records(RESTORE_JOB_KIND).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ordinary_restore_never_deletes_an_unbound_staging_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([237; 32]));
+        let guild_id = [238; 32];
+        let control = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let (revision, ciphertexts) = restore_fixture(&keys, guild_id, Vec::new(), Vec::new());
+        let target = temp.path().join("restored");
+        let parent = PinnedDirectory::open(temp.path()).unwrap();
+        let unbound_name = format!(".mutualbackup-restore-{}", Uuid::new_v4());
+        fs::create_dir(temp.path().join(&unbound_name)).unwrap();
+        fs::write(
+            temp.path().join(&unbound_name).join("must-survive"),
+            b"unverified directory",
+        )
+        .unwrap();
+        let canonical_target = temp.path().canonicalize().unwrap().join("restored");
+        let job = RestoreJob {
+            format_version: 2,
+            guild_id,
+            revision_id: revision.value.revision_id,
+            target: canonical_target.clone(),
+            parent_identity: parent.identity().unwrap(),
+            staging_name: unbound_name.clone(),
+            staged_identity: None,
+            state: RestoreJobState::Building,
+        };
+        control
+            .put_record(
+                RESTORE_JOB_KIND,
+                &restore_job_record_id(&canonical_target).unwrap(),
+                &canonical_bytes(&job).unwrap(),
+            )
+            .unwrap();
+
+        restore_revision(&control, &keys, guild_id, &revision, &ciphertexts, &target).unwrap();
+
+        assert!(target.is_dir());
+        assert_eq!(
+            fs::read(temp.path().join(unbound_name).join("must-survive")).unwrap(),
+            b"unverified directory"
+        );
+        assert!(control.records(RESTORE_JOB_KIND).unwrap().is_empty());
     }
 
     #[test]

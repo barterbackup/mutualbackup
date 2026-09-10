@@ -122,6 +122,61 @@ impl ControlStore {
         Ok(())
     }
 
+    pub fn replace_record_if_value(
+        &self,
+        kind: &str,
+        record_id: &[u8],
+        expected: &[u8],
+        replacement: &[u8],
+    ) -> Result<(), DatabaseError> {
+        let replaced = self.connection.execute(
+            "UPDATE protocol_records SET bytes = ?4
+             WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
+            params![kind, record_id, expected, replacement],
+        )?;
+        if replaced != 1 {
+            return Err(DatabaseError::Conflict);
+        }
+        Ok(())
+    }
+
+    pub fn replace_records_with_one(
+        &self,
+        kind: &str,
+        old_records: &[(Vec<u8>, Vec<u8>)],
+        new_record_id: &[u8],
+        replacement: &[u8],
+    ) -> Result<(), DatabaseError> {
+        if old_records.is_empty()
+            || old_records
+                .iter()
+                .any(|(record_id, _)| record_id.as_slice() == new_record_id)
+        {
+            return Err(DatabaseError::Conflict);
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let inserted = transaction.execute(
+            "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+             ON CONFLICT(kind, record_id) DO NOTHING",
+            params![kind, new_record_id, replacement],
+        )?;
+        if inserted != 1 {
+            return Err(DatabaseError::Conflict);
+        }
+        for (record_id, expected) in old_records {
+            let removed = transaction.execute(
+                "DELETE FROM protocol_records
+                 WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
+                params![kind, record_id, expected],
+            )?;
+            if removed != 1 {
+                return Err(DatabaseError::Conflict);
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn put_records(
         &mut self,
         records: &[(String, Vec<u8>, Vec<u8>)],
@@ -1900,6 +1955,64 @@ mod tests {
         assert!(store.get_record("test", b"id").unwrap().is_some());
         let wrong = KeyMaterial::from_seed(&Seed::from_bytes([2; 32]));
         assert!(ControlStore::open(&path, &wrong).is_err());
+    }
+
+    #[test]
+    fn protocol_record_compare_and_replace_rejects_stale_writers() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([72; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        store.put_record("job", b"one", b"first").unwrap();
+
+        store
+            .replace_record_if_value("job", b"one", b"first", b"second")
+            .unwrap();
+        assert!(matches!(
+            store.replace_record_if_value("job", b"one", b"first", b"stale"),
+            Err(DatabaseError::Conflict)
+        ));
+        assert_eq!(store.get_record("job", b"one").unwrap().unwrap(), b"second");
+    }
+
+    #[test]
+    fn protocol_record_many_to_one_replacement_is_atomic() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([73; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        store.put_record("job", b"one", b"first").unwrap();
+        store.put_record("job", b"two", b"second").unwrap();
+
+        store
+            .replace_records_with_one(
+                "job",
+                &[
+                    (b"one".to_vec(), b"first".to_vec()),
+                    (b"two".to_vec(), b"second".to_vec()),
+                ],
+                b"current",
+                b"replacement",
+            )
+            .unwrap();
+        assert_eq!(
+            store.records("job").unwrap(),
+            vec![(b"current".to_vec(), b"replacement".to_vec())]
+        );
+
+        store.put_record("job", b"one", b"changed").unwrap();
+        assert!(matches!(
+            store.replace_records_with_one(
+                "job",
+                &[(b"one".to_vec(), b"stale".to_vec())],
+                b"new",
+                b"must-roll-back",
+            ),
+            Err(DatabaseError::Conflict)
+        ));
+        assert!(store.get_record("job", b"new").unwrap().is_none());
+        assert_eq!(
+            store.get_record("job", b"one").unwrap().unwrap(),
+            b"changed"
+        );
     }
 
     #[test]

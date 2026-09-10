@@ -2814,7 +2814,7 @@ mod tests {
         fs::remove_dir_all(&source).unwrap();
 
         let restored = root.join("restored");
-        let recovered = recover_over_network(
+        let mut recovered = recover_over_network(
             Seed::from_bytes([100; 32]),
             &root.join("recovered-node"),
             &restored,
