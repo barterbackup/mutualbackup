@@ -82,6 +82,8 @@ EOF
 
 validate_layout() {
     command -v readlink >/dev/null || die "readlink is required"
+    command -v stat >/dev/null || die "stat is required"
+    command -v wc >/dev/null || die "wc is required"
     [[ $LAB_ROOT != *,* && $CLI_BIN != *,* && $DAEMON_BIN != *,* ]] ||
         die "Docker lab and binary paths must not contain commas"
     LAB_ROOT=$(readlink -m -- "$LAB_ROOT") || die "cannot resolve Docker lab root: $LAB_ROOT"
@@ -124,6 +126,14 @@ validate_owned_directory() {
     [[ -O $path ]] || die "$label must be owned by the current user: $path"
 }
 
+validate_owned_regular_leaf() {
+    local path=$1 label=$2 links
+    [[ -f $path && ! -L $path ]] || die "$label must be a regular non-symlink file: $path"
+    [[ -O $path ]] || die "$label must be owned by the current user: $path"
+    links=$(stat -c '%h' -- "$path") || die "cannot inspect $label link count: $path"
+    [[ $links == 1 ]] || die "$label must have exactly one hard link: $path"
+}
+
 validate_existing_namespace_shape() {
     local role path node mount_path marked=false
     if [[ ! -e $LAB_ROOT && ! -L $LAB_ROOT ]]; then
@@ -151,6 +161,42 @@ validate_existing_namespace_shape() {
             fi
         done
     fi
+    if [[ $marked == true && -d $LAB_ROOT/images && ! -L $LAB_ROOT/images ]]; then
+        for node in 0 1 2 3 4; do
+            for path in "$LAB_ROOT/images/node$node.btrfs" "$LAB_ROOT/images/node$node.btrfs.creating"; do
+                if [[ -e $path || -L $path ]]; then
+                    validate_regular_image "$path"
+                fi
+            done
+        done
+    fi
+    if [[ $marked == true && -d $LAB_ROOT/loops && ! -L $LAB_ROOT/loops ]]; then
+        for node in 0 1 2 3 4; do
+            path=$LAB_ROOT/loops/node$node
+            if [[ -e $path || -L $path ]]; then
+                validate_loop_record "$path"
+            fi
+        done
+    fi
+    if [[ $marked == true && -d $LAB_ROOT/seeds && ! -L $LAB_ROOT/seeds ]]; then
+        for node in 0 1 2 3 4; do
+            for path in "$LAB_ROOT/seeds/node$node.seed" \
+                "$LAB_ROOT/seeds/node$node.identity" \
+                "$LAB_ROOT/seeds/node$node.recovery-intent"; do
+                if [[ -e $path || -L $path ]]; then
+                    validate_owned_regular_leaf "$path" "Docker lab node $node seed-state leaf"
+                fi
+            done
+        done
+    fi
+    if [[ $marked == true && -d $LAB_ROOT/configs && ! -L $LAB_ROOT/configs ]]; then
+        for node in 0 1 2 3 4; do
+            path=$LAB_ROOT/configs/node$node.toml
+            if [[ -e $path || -L $path ]]; then
+                validate_owned_regular_leaf "$path" "Docker lab node $node configuration"
+            fi
+        done
+    fi
 }
 
 namespace_marker_contents() {
@@ -161,11 +207,54 @@ namespace_marker_contents() {
 validate_namespace_marker() {
     local directory=$1 role=$2 marker expected actual
     marker=$directory/$NAMESPACE_MARKER
-    [[ -f $marker && ! -L $marker && -O $marker ]] ||
+    if [[ ! -e $marker && ! -L $marker ]]; then
         die "Docker lab $role namespace has no owned marker: $marker"
+    fi
+    validate_owned_regular_leaf "$marker" "Docker lab $role namespace marker"
     expected=$(namespace_marker_contents "$role")
     actual=$(<"$marker")
     [[ $actual == "$expected" ]] || die "Docker lab $role namespace marker is invalid: $marker"
+}
+
+recover_namespace_marker() {
+    local directory=$1 role=$2 marker expected entry name actual
+    local -a candidates=() incomplete=()
+    marker=$directory/$NAMESPACE_MARKER
+    [[ ! -e $marker && ! -L $marker ]] || return 1
+    expected=$(namespace_marker_contents "$role")
+    while IFS= read -r -d '' entry; do
+        name=${entry##*/}
+        [[ $name == ".$NAMESPACE_MARKER.tmp."* ]] || return 1
+        validate_owned_regular_leaf "$entry" "Docker lab $role temporary namespace marker"
+        actual=$(<"$entry")
+        if [[ $actual == "$expected" ]]; then
+            candidates+=("$entry")
+        else
+            incomplete+=("$entry")
+        fi
+    done < <(find "$directory" -mindepth 1 -maxdepth 1 -print0)
+
+    for entry in "${incomplete[@]}"; do
+        validate_owned_regular_leaf "$entry" "Docker lab $role incomplete namespace marker"
+        rm -- "$entry"
+    done
+    if ((${#candidates[@]} == 0)); then
+        ((${#incomplete[@]} > 0)) && sync "$directory"
+        return 1
+    fi
+
+    mv -Tn -- "${candidates[0]}" "$marker"
+    validate_namespace_marker "$directory" "$role"
+    if [[ -e ${candidates[0]} || -L ${candidates[0]} ]]; then
+        validate_owned_regular_leaf "${candidates[0]}" "Docker lab $role redundant namespace marker"
+        rm -- "${candidates[0]}"
+    fi
+    for entry in "${candidates[@]:1}"; do
+        validate_owned_regular_leaf "$entry" "Docker lab $role redundant namespace marker"
+        rm -- "$entry"
+    done
+    sync "$directory"
+    return 0
 }
 
 write_namespace_marker() {
@@ -175,10 +264,20 @@ write_namespace_marker() {
         validate_namespace_marker "$directory" "$role"
         return
     fi
-    temporary=$directory/.$NAMESPACE_MARKER.tmp.$$.$RANDOM
-    (umask 077 && namespace_marker_contents "$role" >"$temporary")
+    if recover_namespace_marker "$directory" "$role"; then
+        return
+    fi
+    directory_is_empty "$directory" ||
+        die "refusing to initialize nonempty Docker lab $role namespace: $directory"
+    temporary=$(mktemp "$directory/.$NAMESPACE_MARKER.tmp.XXXXXX")
+    namespace_marker_contents "$role" >"$temporary"
     sync "$temporary"
-    mv -T -- "$temporary" "$marker"
+    mv -Tn -- "$temporary" "$marker"
+    if [[ -e $temporary || -L $temporary ]]; then
+        validate_namespace_marker "$directory" "$role"
+        validate_owned_regular_leaf "$temporary" "Docker lab $role redundant namespace marker"
+        rm -- "$temporary"
+    fi
     sync "$directory"
     validate_namespace_marker "$directory" "$role"
 }
@@ -236,8 +335,10 @@ ensure_lab_namespace() {
         if [[ -e $LAB_ROOT/$NAMESPACE_MARKER || -L $LAB_ROOT/$NAMESPACE_MARKER ]]; then
             validate_namespace_marker "$LAB_ROOT" root
         else
-            directory_is_empty "$LAB_ROOT" ||
-                die "refusing unmarked nonempty Docker lab root: $LAB_ROOT"
+            if ! recover_namespace_marker "$LAB_ROOT" root; then
+                directory_is_empty "$LAB_ROOT" ||
+                    die "refusing unmarked nonempty Docker lab root: $LAB_ROOT"
+            fi
             write_namespace_marker "$LAB_ROOT" root
         fi
     else
@@ -248,10 +349,10 @@ ensure_lab_namespace() {
 
     local lock=$LAB_ROOT/controller.lock
     if [[ -e $lock || -L $lock ]]; then
-        [[ -f $lock && ! -L $lock && -O $lock ]] ||
-            die "Docker lab lock must be an owned non-symlink file: $lock"
+        validate_owned_regular_leaf "$lock" "Docker lab lock"
     else
-        (umask 077 && : >"$lock")
+        (umask 077 && set -o noclobber && : >"$lock") 2>/dev/null ||
+            die "cannot create Docker lab lock safely: $lock"
     fi
     exec 9<>"$lock"
     flock -n 9 || die "another Docker lab operation is in progress"
@@ -408,9 +509,7 @@ load_recovery_intent() {
     if [[ ! -e $path && ! -L $path ]]; then
         return 1
     fi
-    [[ -f $path && ! -L $path ]] ||
-        die "recovery intent must be a regular non-symlink file: $path"
-    [[ -O $path ]] || die "recovery intent must be owned by the current user: $path"
+    validate_owned_regular_leaf "$path" "recovery intent"
     RECOVERY_PHASE=
     RECOVERY_BOOTSTRAP_NODE=
     RECOVERY_RESTORE_NAME=
@@ -461,11 +560,16 @@ write_recovery_intent() {
     path=$(node_recovery_intent "$node")
     parent=$(dirname "$path")
     mkdir -p "$parent"
-    temporary=$path.tmp.$$
-    (umask 077 && printf 'format=1\nphase=%s\nbootstrap_node=%s\nrestore_name=%s\nguild_id=%s\n' \
-        "$phase" "$bootstrap_node" "$restore_name" "$expected_guild" >"$temporary")
+    if [[ -e $path || -L $path ]]; then
+        validate_owned_regular_leaf "$path" "recovery intent"
+    fi
+    temporary=$(mktemp "$parent/.node-recovery-intent.XXXXXX")
+    printf 'format=1\nphase=%s\nbootstrap_node=%s\nrestore_name=%s\nguild_id=%s\n' \
+        "$phase" "$bootstrap_node" "$restore_name" "$expected_guild" >"$temporary"
+    chmod 600 "$temporary"
     sync "$temporary"
-    mv "$temporary" "$path"
+    mv -T -- "$temporary" "$path"
+    validate_owned_regular_leaf "$path" "recovery intent"
     sync "$parent"
 }
 
@@ -480,7 +584,10 @@ clear_recovery_intent() {
     local node=$1 path parent
     path=$(node_recovery_intent "$node")
     parent=$(dirname "$path")
-    rm -f "$path"
+    if [[ -e $path || -L $path ]]; then
+        validate_owned_regular_leaf "$path" "recovery intent"
+        rm -- "$path"
+    fi
     sync "$parent"
 }
 
@@ -545,15 +652,53 @@ remove_network() {
     "${DOCKER[@]}" network rm "$NETWORK_NAME" >/dev/null
 }
 
-associated_loops() {
-    local image=$1
-    "${SUDO[@]}" "$LOSETUP" --associated "$image" --output NAME --noheadings 2>/dev/null |
-        awk 'NF {print $1}'
+ASSOCIATED_LOOPS=()
+
+load_associated_loops() {
+    local image=$1 output
+    if ! output=$("${SUDO[@]}" "$LOSETUP" --associated "$image" --output NAME --noheadings 2>&1); then
+        die "cannot inspect loop attachments for image $image: $output"
+    fi
+    mapfile -t ASSOCIATED_LOOPS < <(awk 'NF {print $1}' <<<"$output")
+}
+
+validate_loop_record() {
+    local record=$1 loop
+    validate_owned_regular_leaf "$record" "Docker lab loop record"
+    IFS= read -r loop <"$record" || true
+    [[ $loop =~ ^/dev/loop[0-9]+$ ]] || die "Docker lab loop record is invalid: $record"
+    [[ $(wc -l <"$record") == 1 ]] || die "Docker lab loop record has trailing data: $record"
+}
+
+write_loop_record() {
+    local record=$1 loop=$2 parent temporary
+    [[ $loop =~ ^/dev/loop[0-9]+$ ]] || die "refusing unexpected loop device: $loop"
+    parent=$(dirname "$record")
+    if [[ -e $record || -L $record ]]; then
+        validate_loop_record "$record"
+    fi
+    temporary=$(mktemp "$parent/.node-loop-record.XXXXXX")
+    printf '%s\n' "$loop" >"$temporary"
+    chmod 600 "$temporary"
+    sync "$temporary"
+    mv -T -- "$temporary" "$record"
+    sync "$parent"
+    validate_loop_record "$record"
+}
+
+remove_loop_record() {
+    local record=$1
+    if [[ ! -e $record && ! -L $record ]]; then
+        return
+    fi
+    validate_loop_record "$record"
+    rm -- "$record"
+    sync "$(dirname "$record")"
 }
 
 verified_mounted_loop() {
     local node=$1
-    local image mount_dir filesystem source candidate source_real candidate_real
+    local image mount_dir filesystem source candidate source_real candidate_real matches=0
     image=$(node_image "$node")
     mount_dir=$(node_mount "$node")
     filesystem=$(findmnt -rn -o FSTYPE --target "$mount_dir")
@@ -566,15 +711,18 @@ verified_mounted_loop() {
     [[ $source =~ ^/dev/loop[0-9]+$ ]] ||
         die "$mount_dir is mounted from unexpected source $source"
     source_real=$(readlink -f -- "$source")
-    while IFS= read -r candidate; do
-        [[ -z $candidate ]] && continue
+    load_associated_loops "$image"
+    ((${#ASSOCIATED_LOOPS[@]} == 1)) ||
+        die "node $node's mounted image does not have exactly one loop attachment"
+    for candidate in "${ASSOCIATED_LOOPS[@]}"; do
         candidate_real=$(readlink -f -- "$candidate")
         if [[ $candidate_real == "$source_real" ]]; then
-            printf '%s\n' "$source"
-            return
+            matches=1
         fi
-    done < <(associated_loops "$image")
-    die "$mount_dir is mounted from $source, which is not attached to node $node's image $image"
+    done
+    ((matches == 1)) ||
+        die "$mount_dir is mounted from $source, which is not attached to node $node's image $image"
+    printf '%s\n' "$source"
 }
 
 require_mounted_filesystem() {
@@ -586,27 +734,60 @@ require_mounted_filesystem() {
 
 validate_regular_image() {
     local image=$1
-    [[ -f $image && ! -L $image ]] ||
-        die "Btrfs image must be a regular non-symlink file: $image"
-    [[ -O $image ]] || die "Btrfs image must be owned by the current user: $image"
-    # Images contain the node's plaintext exchange/source tree as well as its
-    # encrypted databases. Interrupted staging files may have been created
-    # under a permissive umask, so normalize both staged and completed images
-    # before attaching them.
-    chmod 600 "$image"
+    validate_owned_regular_leaf "$image" "Btrfs image"
 }
 
 detach_image_loops() {
     local image=$1
     local loop
-    while IFS= read -r loop; do
-        [[ -z $loop ]] && continue
+    validate_regular_image "$image"
+    load_associated_loops "$image"
+    for loop in "${ASSOCIATED_LOOPS[@]}"; do
         [[ $loop =~ ^/dev/loop[0-9]+$ ]] || die "refusing unexpected loop device: $loop"
         if findmnt -rn --source "$loop" >/dev/null; then
-            die "cannot resume image creation while $loop is mounted"
+            die "cannot detach $loop for image $image while it is mounted"
         fi
         "${SUDO[@]}" "$LOSETUP" --detach "$loop"
-    done < <(associated_loops "$image")
+    done
+    load_associated_loops "$image"
+    ((${#ASSOCIATED_LOOPS[@]} == 0)) || die "cannot detach every loop for image: $image"
+    validate_regular_image "$image"
+}
+
+prepare_image_mutation() {
+    local image=$1
+    validate_regular_image "$image"
+    detach_image_loops "$image"
+    validate_regular_image "$image"
+    # Images contain plaintext exchange/source data as well as encrypted
+    # databases. Tighten permissions only after alias and loop checks.
+    chmod 600 "$image"
+    validate_regular_image "$image"
+}
+
+verify_image_loop_unmounted() {
+    local image=$1 expected=$2 candidate candidate_real expected_real count=0
+    validate_regular_image "$image"
+    [[ $expected =~ ^/dev/loop[0-9]+$ ]] || die "refusing unexpected loop device: $expected"
+    expected_real=$(readlink -f -- "$expected")
+    load_associated_loops "$image"
+    for candidate in "${ASSOCIATED_LOOPS[@]}"; do
+        candidate_real=$(readlink -f -- "$candidate")
+        [[ $candidate_real == "$expected_real" ]] ||
+            die "image $image has an unexpected concurrent loop attachment: $candidate"
+        ((count += 1))
+    done
+    ((count == 1)) || die "loop $expected is not exclusively attached to image $image"
+    if findmnt -rn --source "$expected" >/dev/null; then
+        die "loop $expected for image $image is mounted unexpectedly"
+    fi
+}
+
+create_regular_image_exclusive() {
+    local image=$1
+    (umask 077 && set -o noclobber && : >"$image") 2>/dev/null ||
+        die "cannot create Btrfs image without replacing an existing leaf: $image"
+    validate_regular_image "$image"
 }
 
 publish_new_filesystem_image() {
@@ -616,20 +797,28 @@ publish_new_filesystem_image() {
     local loop
     if [[ -e $staging || -L $staging ]]; then
         validate_regular_image "$staging"
-        detach_image_loops "$staging"
     else
-        (umask 077 && : >"$staging")
+        create_regular_image_exclusive "$staging"
     fi
+    prepare_image_mutation "$staging"
+    validate_regular_image "$staging"
     truncate -s "$DISK_SIZE" "$staging"
+    validate_regular_image "$staging"
     loop=$("${SUDO[@]}" "$LOSETUP" --find --show "$staging")
     [[ $loop =~ ^/dev/loop[0-9]+$ ]] || die "unexpected loop device returned for $staging: $loop"
+    verify_image_loop_unmounted "$staging" "$loop"
     if ! "${SUDO[@]}" "$MKFS_BTRFS" --quiet --force --label "mb-lab-node$node" "$loop"; then
         "${SUDO[@]}" "$LOSETUP" --detach "$loop" || true
         die "cannot format node $node's staged Btrfs image"
     fi
     "${SUDO[@]}" sync "$loop"
+    verify_image_loop_unmounted "$staging" "$loop"
     "${SUDO[@]}" "$LOSETUP" --detach "$loop"
-    mv "$staging" "$image"
+    validate_regular_image "$staging"
+    [[ ! -e $image && ! -L $image ]] || die "refusing to replace existing image: $image"
+    mv -Tn -- "$staging" "$image"
+    [[ ! -e $staging && ! -L $staging ]] || die "cannot publish staged Btrfs image: $image"
+    validate_regular_image "$image"
     sync "$(dirname "$image")"
 }
 
@@ -651,7 +840,7 @@ ensure_filesystem() {
 
     if mountpoint -q "$mount_dir"; then
         loop=$(verified_mounted_loop "$node")
-        printf '%s\n' "$loop" >"$record"
+        write_loop_record "$record" "$loop"
         normalize_filesystem_root "$node"
         return
     fi
@@ -665,15 +854,17 @@ ensure_filesystem() {
         publish_new_filesystem_image "$node" "$image"
     fi
 
-    detach_image_loops "$image"
+    prepare_image_mutation "$image"
     loop=$("${SUDO[@]}" "$LOSETUP" --find --show "$image")
     [[ $loop =~ ^/dev/loop[0-9]+$ ]] || die "unexpected loop device returned for $image: $loop"
+    verify_image_loop_unmounted "$image" "$loop"
     filesystem=$("${SUDO[@]}" "$BLKID" -p -s TYPE -o value "$loop" 2>/dev/null || true)
     if [[ $filesystem != btrfs ]]; then
         "${SUDO[@]}" "$LOSETUP" --detach "$loop" || true
         die "existing node $node image is not a completed Btrfs filesystem: $image"
     fi
-    printf '%s\n' "$loop" >"$record"
+    verify_image_loop_unmounted "$image" "$loop"
+    write_loop_record "$record" "$loop"
 
     if ! "${SUDO[@]}" "$MOUNT" -t btrfs -o noatime,compress=zstd "$loop" "$mount_dir"; then
         "${SUDO[@]}" "$LOSETUP" --detach "$loop" || true
@@ -687,8 +878,9 @@ ensure_filesystem() {
 
 unmount_filesystem() {
     local node=$1
-    local image mount_dir record loop
+    local image staging mount_dir record loop
     image=$(node_image "$node")
+    staging=$image.creating
     mount_dir=$(node_mount "$node")
     record=$(loop_record "$node")
     if mountpoint -q "$mount_dir"; then
@@ -696,14 +888,15 @@ unmount_filesystem() {
         "${SUDO[@]}" "$UMOUNT" "$mount_dir" ||
             die "cannot unmount $mount_dir; close shells and files using it, then retry"
     fi
-    if [[ -f $image ]]; then
-        while IFS= read -r loop; do
-            [[ -z $loop ]] && continue
-            [[ $loop =~ ^/dev/loop[0-9]+$ ]] || die "refusing unexpected loop device: $loop"
-            "${SUDO[@]}" "$LOSETUP" --detach "$loop"
-        done < <(associated_loops "$image")
+    if [[ -e $image || -L $image ]]; then
+        validate_regular_image "$image"
+        detach_image_loops "$image"
     fi
-    rm -f "$record"
+    if [[ -e $staging || -L $staging ]]; then
+        validate_regular_image "$staging"
+        detach_image_loops "$staging"
+    fi
+    remove_loop_record "$record"
 }
 
 ensure_seed() {
@@ -715,8 +908,8 @@ ensure_seed() {
     state=$(node_mount "$node")/state
     manifest=$state/identity.toml
     if [[ -e $seed || -L $seed ]]; then
-        [[ -f $seed && ! -L $seed ]] ||
-            die "recovery string must be a regular non-symlink file: $seed"
+        validate_owned_regular_leaf "$seed" "recovery string"
+        chmod 600 "$seed"
         seed_exists=true
     fi
     if [[ -e $manifest || -L $manifest ]]; then
@@ -736,12 +929,22 @@ ensure_seed() {
         "$CLI_BIN" init --seed-file "$seed" --data-dir "$state" >/dev/null
         say "resumed new-node initialization for node $node from: $seed"
     fi
+    validate_owned_regular_leaf "$seed" "recovery string"
     chmod 600 "$seed"
-    if [[ ! -f $identity ]]; then
-        temporary="$identity.tmp.$$"
+    if [[ -e $identity || -L $identity ]]; then
+        validate_owned_regular_leaf "$identity" "node identity summary"
+    else
+        temporary=$(mktemp "$(dirname "$identity")/.node-identity.XXXXXX")
         "$CLI_BIN" identity --seed-file "$seed" >"$temporary"
         chmod 600 "$temporary"
-        mv "$temporary" "$identity"
+        sync "$temporary"
+        mv -Tn -- "$temporary" "$identity"
+        if [[ -e $temporary || -L $temporary ]]; then
+            validate_owned_regular_leaf "$identity" "node identity summary"
+            rm -- "$temporary"
+        fi
+        sync "$(dirname "$identity")"
+        validate_owned_regular_leaf "$identity" "node identity summary"
     fi
 }
 
@@ -759,7 +962,10 @@ write_normal_config() {
     local node=$1
     local config temporary bootstrap relay relay_server
     config=$(node_config "$node")
-    temporary=$config.tmp.$$
+    if [[ -e $config || -L $config ]]; then
+        validate_owned_regular_leaf "$config" "node configuration"
+    fi
+    temporary=$(mktemp "$(dirname "$config")/.node-config.XXXXXX")
     bootstrap='[]'
     relay='[]'
     relay_server=false
@@ -786,7 +992,8 @@ enable_dht_maintenance = true
 max_connections = 32
 EOF
     sync "$temporary"
-    mv "$temporary" "$config"
+    mv -T -- "$temporary" "$config"
+    validate_owned_regular_leaf "$config" "node configuration"
     sync "$(dirname "$config")"
 }
 
@@ -795,7 +1002,10 @@ write_recovery_config() {
     local bootstrap_node=$2
     local config temporary relay relay_server
     config=$(node_config "$node")
-    temporary=$config.tmp.$$
+    if [[ -e $config || -L $config ]]; then
+        validate_owned_regular_leaf "$config" "node configuration"
+    fi
+    temporary=$(mktemp "$(dirname "$config")/.node-config.XXXXXX")
     relay='[]'
     relay_server=false
     if ((node == 0)); then
@@ -819,7 +1029,8 @@ enable_dht_maintenance = true
 max_connections = 32
 EOF
     sync "$temporary"
-    mv "$temporary" "$config"
+    mv -T -- "$temporary" "$config"
+    validate_owned_regular_leaf "$config" "node configuration"
     sync "$(dirname "$config")"
 }
 
@@ -933,8 +1144,11 @@ archive_reinit_config() {
     if [[ -f $config && ! -L $config ]]; then
         timestamp=$(date -u +%Y%m%dT%H%M%SZ)
         previous=$config.before-reinit-$timestamp-$$
-        [[ ! -e $previous ]] || die "refusing to overwrite previous config $previous"
-        mv "$config" "$previous"
+        validate_owned_regular_leaf "$config" "node configuration"
+        [[ ! -e $previous && ! -L $previous ]] || die "refusing to overwrite previous config $previous"
+        mv -Tn -- "$config" "$previous"
+        [[ ! -e $config && ! -L $config ]] || die "cannot archive node configuration: $config"
+        validate_owned_regular_leaf "$previous" "archived node configuration"
         sync "$(dirname "$config")"
         say "previous config retained at: $previous"
     elif [[ -e $config || -L $config ]]; then
@@ -950,8 +1164,10 @@ prepare_recovery_container() {
     manifest=$(node_mount "$node")/state/identity.toml
     config=$(node_config "$node")
     seed=$(node_seed "$node")
-    [[ -f $seed && ! -L $seed && -O $seed ]] ||
+    if [[ ! -e $seed && ! -L $seed ]]; then
         die "cannot resume reinit without the retained recovery string: $seed"
+    fi
+    validate_owned_regular_leaf "$seed" "retained recovery string"
 
     if [[ $RECOVERY_PHASE == prepared ]]; then
         advance_recovery_intent "$node" erasing
@@ -1371,4 +1587,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi
