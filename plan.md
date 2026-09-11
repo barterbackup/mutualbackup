@@ -60,8 +60,7 @@ them as ADRs and test vectors before promising wire compatibility.
 
 The first usable architectural prototype and the Milestone 2
 operator-configuration and identity-state slice are implemented. Milestone 2's
-formal gate is temporarily reopened by the acceptance-environment defect noted
-below.
+formal gate is temporarily reopened by the process-topology defect noted below.
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
 reflink capture, owner encryption, actual `3+2` RS, remote SQLCipher
@@ -88,13 +87,15 @@ from a live but unusable bootstrap without erasing the recovered image; and
 makes destructive restore-name validation ASCII and byte-exact. Focused
 regressions and the locked workspace, Btrfs/reflink and real-network acceptance,
 static Nix artifact, and real Docker/Btrfs erase-and-seed-recovery paths have
-passed. A later source-only closeout review found that the documented default
-Nix development shell omits the `btrfs` executable required by a mandatory
-reflink fixture, so the full Milestone 2 gate is not reproducible from its
-stated command. Treat Milestone 2 as implemented but not closed until that gate
-environment is fixed and the complete suite passes from a fresh disposable
-Btrfs root. Milestone 3 is implemented but cannot be formally admitted while
-this inherited gate is open.
+passed in earlier gates. The missing `btrfs` executable in the documented
+default development shell is now fixed and preflighted. The subsequent
+source-only closeout found that the five-process DCUtR phase cannot force NAT
+while both peers share one loopback namespace: normal endpoint discovery can
+reveal a genuinely reachable direct listener and correctly bypass the punch.
+Treat Milestone 2 as implemented but not closed until process acceptance uses a
+real isolated routing/NAT topology and the complete suite passes from a fresh
+disposable Btrfs root. Milestone 3 is implemented but cannot be formally
+admitted while this inherited gate is open.
 Application-transfer acceptance attributes post-baseline bulk bytes to the
 exact direct, DCUtR, or relay-fallback connection used.
 
@@ -448,9 +449,9 @@ expected-identity check, bounded worker ownership, and formal wire contracts are
 implemented. Human configuration and application-owned identity state are also
 separate. A strictly checked recovery-string file remains an explicit
 unattended auto-unlock option rather than a daemon prerequisite. Milestones 2
-and 3 are implemented, but their closeout is held by the reproducible reflink
-gate recorded in `TODO.md`; later wire or durable-state changes require the
-review and gate of the milestone that owns them.
+and 3 are implemented, but their closeout is held by the process-topology gate
+recorded in `TODO.md`; later wire or durable-state changes require the review
+and gate of the milestone that owns them.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -665,18 +666,23 @@ review at every gate before committing the next milestone's detailed scope.
 
 **Current position:** Milestones 0 and 1 are passed. Milestone 2's product work
 is implemented, and the closing source-only review of the recent corrective
-commits found no additional high-confidence Rust/product defect. It did find
-one high-confidence gate defect: the documented default Nix shell lacks
-`btrfs-progs`, although the mandatory reflink acceptance sequence invokes
-`btrfs`. This prevents a clean run from reaching the full Milestone 2 gate.
+commits found no additional high-confidence Rust/product defect. The previously
+reopened reflink-environment defect is fixed: the default shell now supplies
+`btrfs-progs` and the acceptance script preflights it. One high-confidence gate
+defect remains. The five-daemon acceptance phase tries to prove DCUtR while both
+peers occupy one loopback namespace and one peer has a directly reachable QUIC
+listener. Signed endpoint exchange and libp2p Identify may legitimately reveal
+that address, after which the product correctly prefers direct QUIC and the
+test's `HolePunched` assertion is not deterministic.
 
-Fix that single `TODO.md` blocker, preflight the gate's external tools, and
-rerun the complete locked, fresh-Btrfs, real-network, static-artifact, and
-no-build Docker-lab suite. Then perform the short closing source review. If it
-is clean, close Milestone 2 and admit the already implemented Milestone 3
-candidate; rerun its private-Tor acceptance and closeout gate before changing
-durable operations. Do not start Milestone 4 while this inherited gate remains
-open.
+Repair that single `TODO.md` blocker with a process-level isolated routing/NAT
+fixture which leaves production discovery enabled and deterministically proves
+direct, successful-DCUtR, and failed-punch relay application paths. Then rerun
+the complete locked, fresh-Btrfs, real-network, static-artifact, and no-build
+Docker-lab suite and perform a short closing source review. If it is clean,
+close Milestone 2 and admit the already implemented Milestone 3 candidate;
+rerun its private-Tor acceptance and closeout gate before changing durable
+operations. Do not start Milestone 4 while this inherited gate remains open.
 
 The Milestone 3 candidate integrates exact-pinned Arti 0.46.0 behind the
 existing bounded libp2p session and endpoint abstractions. Its static gate
@@ -686,7 +692,7 @@ an unrelated direct connection. DCUtR provenance now follows that retained
 connection, and focused repetition has exercised the exact topology. Its Tor,
 gateway-mapping, signed onion-discovery, transport-fallback, and private-network
 acceptance implementation remains present; its formal pass is deferred only by
-the inherited Milestone 2 closeout blocker above.
+the inherited Milestone 2 process-topology blocker above.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
 
@@ -800,9 +806,11 @@ and outbound permits while carrying unhealthy-holder knowledge across a large
 repair, advances Docker recovery past a control-responsive but P2P-unusable
 bootstrap without replacing its recovered Btrfs image, and validates destructive
 restore names as ASCII bytes before mutation. Focused regressions and the prior
-full gate passed. The current closeout review found no new Rust/product defect,
-but reopened the gate for the missing `btrfs` acceptance dependency recorded in
-`TODO.md`.
+full gate passed. The missing `btrfs` acceptance dependency found by the next
+review is now fixed and preflighted. The current source-only closeout found no
+new Rust/product defect, but the process-level DCUtR assertion is not a valid
+forced topology while both peers share one loopback namespace; the remaining
+gate repair is recorded in `TODO.md`.
 
 ### Milestone 3 — Tor and robust connectivity beta (implemented candidate; not admitted)
 

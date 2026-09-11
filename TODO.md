@@ -2,14 +2,18 @@
 
 ## Milestone 2 closeout blocker
 
-- Make the documented reflink acceptance command self-contained. The default
-  `nix develop` shell used by `scripts/reflink-acceptance.sh` does not provide
-  `btrfs`, although the mandatory nested-subvolume fixture executes that
-  program directly; `btrfs-progs` exists only in the Docker-lab and private-Tor
-  shells. Add it to the shell used by this gate (or define and document a
-  dedicated reflink shell), preflight the executable before starting the
-  sequence, and rerun the complete Milestone 2 gate from a fresh disposable
-  Btrfs root. Do not admit the next milestone on a partial run.
+- Make the process-level DCUtR acceptance topology real and deterministic. The
+  current five-daemon test restarts both peers in one host network namespace,
+  leaves a directly reachable loopback QUIC listener on the punched peer, and
+  assumes that publishing only a circuit address hides that listener. It does
+  not: authenticated peer exchange retains live endpoint knowledge and libp2p
+  Identify announces listen addresses, so the ordinary direct path can
+  correctly win before DCUtR. Exercise the daemons behind isolated network
+  namespaces/containers with actual routing or NAT constraints, then assert
+  direct, successful-punch, and retained-relay application transfers there.
+  Do not make the gate pass by disabling production endpoint exchange or
+  Identify. Rerun the complete Milestone 2 gate from a fresh disposable Btrfs
+  root after repairing the fixture.
 
 ## Later guild geometry and coding protocol
 
