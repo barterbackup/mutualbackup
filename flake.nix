@@ -40,7 +40,12 @@
         cargoLock.lockFile = ./Cargo.lock;
         cargoBuildFlags = [ "-p" "mutualbackup" ];
         nativeBuildInputs = with pkgs; [ perl pkg-config ];
-        doCheck = true;
+        # Restore/native-identity tests require the separately provisioned
+        # Btrfs acceptance root.  A Nix build sandbox cannot create or mount
+        # that filesystem, so keep the release derivation build-only and run
+        # the locked workspace plus scripts/reflink-acceptance.sh as distinct
+        # mandatory gates.
+        doCheck = false;
       };
       labArtifacts = pkgs.runCommandNoCC "mutualbackup-lab-artifacts-0.1.0" { } ''
         install -Dm755 ${staticBinary}/bin/mutualbackup \
