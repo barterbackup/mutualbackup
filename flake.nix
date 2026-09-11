@@ -76,6 +76,7 @@
             perl
             pkg-config
             procps
+            python3
             rustc
             rustfmt
             clippy

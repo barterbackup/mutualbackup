@@ -105,6 +105,17 @@ relay-only paths real rather than inferred. It requires passwordless `sudo` for
 that network plumbing; daemons are dropped back to the invoking UID/GID, and an
 exit trap removes the namespaces and rules and restores the forwarding setting.
 
+The separate gateway-mapping gate runs a real stateful NAT-PMP exchange in an
+isolated namespace and verifies acquisition, replacement, loss, reacquisition,
+and orderly deletion:
+
+```sh
+nix develop -c bash scripts/port-mapping-acceptance.sh
+```
+
+It also requires passwordless `sudo`; its namespace and veth pair are removed
+by an exit trap.
+
 The onion-only recovery gate starts a pinned private Tor network and uses no
 peer IP listener, relay, or hole-punch path:
 

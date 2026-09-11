@@ -4,6 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::UdpSocket;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -161,20 +162,41 @@ impl Daemon {
     }
 
     fn stop(&mut self) {
+        self.stop_inner(false);
+    }
+
+    fn stop_gracefully(&mut self) {
+        self.stop_inner(true);
+    }
+
+    fn stop_inner(&mut self, require_graceful: bool) {
         if let Some(mut child) = self.child.take() {
             if let Some(namespace) = &self.network_namespace {
                 namespace.signal_processes(libc::SIGTERM);
-                let deadline = Instant::now() + Duration::from_secs(2);
-                while Instant::now() < deadline {
-                    if child.try_wait().ok().flatten().is_some() {
-                        return;
-                    }
-                    thread::sleep(Duration::from_millis(10));
+            } else {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
                 }
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                if child.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            if let Some(namespace) = &self.network_namespace {
                 namespace.signal_processes(libc::SIGKILL);
             }
             let _ = child.kill();
             let _ = child.wait();
+            if require_graceful && !thread::panicking() {
+                panic!(
+                    "daemon did not exit cleanly after SIGTERM:\n{}",
+                    fs::read_to_string(&self.log).unwrap_or_default()
+                );
+            }
         }
     }
 
@@ -1651,6 +1673,14 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
     for (index, socket) in sockets.iter().enumerate() {
         let peer_dir = run_root.join(format!("p{index}"));
         let config = peer_dir.join("node.toml");
+        let node_arti_config = peer_dir.join("arti.toml");
+        let mut node_arti = fs::read_to_string(&arti_config).unwrap();
+        node_arti.push_str(&format!(
+            "\n[storage]\nstate_dir = {:?}\ncache_dir = {:?}\n",
+            peer_dir.join("operator-tor-state"),
+            peer_dir.join("operator-tor-cache")
+        ));
+        fs::write(&node_arti_config, node_arti).unwrap();
         write_test_config(
             &config,
             &DaemonOptions {
@@ -1678,9 +1708,9 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
                 enable_port_mapping: false,
                 enable_dht_maintenance: true,
                 tor_mode: mb_node::TorMode::RequireTor,
-                tor_state_dir: None,
-                tor_cache_dir: None,
-                arti_config_file: Some(arti_config.clone()),
+                tor_state_dir: Some(peer_dir.join("ignored-tor-state")),
+                tor_cache_dir: Some(peer_dir.join("ignored-tor-cache")),
+                arti_config_file: Some(node_arti_config),
                 max_connections: 32,
             },
         );
@@ -1692,12 +1722,70 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
     // creating an artificial all-at-once introduction-circuit stampede.
     let mut daemons = Vec::with_capacity(5);
     for index in 0..5 {
+        let startup_lock = if index == 0 {
+            let state = run_root.join("p0/operator-tor-state");
+            fs::create_dir_all(&state).unwrap();
+            set_private(&state);
+            let lock = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(state.join("mutualbackup.lock"))
+                .unwrap();
+            assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+            Some(lock)
+        } else {
+            None
+        };
         let mut daemon = Daemon::new(
             configs[index].clone(),
             run_root.join(format!("p{index}.log")),
         );
+        if index == 0 {
+            daemon.args.push(os("--start-locked"));
+        }
         daemon.set_env("RUST_LOG", "warn");
         daemon.start();
+        if let Some(lock) = startup_lock {
+            assert!(
+                wait_for_status(&sockets[index], &mut daemon, Duration::from_secs(30))
+                    .contains("Locked")
+            );
+            assert!(
+                run_cli(
+                    &[
+                        os("--socket"),
+                        sockets[index].as_os_str().to_owned(),
+                        os("unlock"),
+                        os("--seed-file"),
+                        seed_dir.join("p0.seed").into_os_string(),
+                    ],
+                    Duration::from_secs(30),
+                )
+                .is_err()
+            );
+            assert!(
+                wait_for_status(&sockets[index], &mut daemon, Duration::from_secs(30))
+                    .contains("Locked")
+            );
+            assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+            drop(lock);
+            run_cli(
+                &[
+                    os("--socket"),
+                    sockets[index].as_os_str().to_owned(),
+                    os("unlock"),
+                    os("--seed-file"),
+                    seed_dir.join("p0.seed").into_os_string(),
+                ],
+                Duration::from_secs(240),
+            )
+            .unwrap();
+            daemon
+                .args
+                .retain(|argument| argument != OsStr::new("--start-locked"));
+        }
         let status = wait_for_status_text(
             &sockets[index],
             &mut daemon,
@@ -1706,6 +1794,9 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
         );
         assert_onion_only_status(&status);
         assert_stable_onion_is_advertised(&status, &onion_endpoints[index]);
+        let peer_dir = run_root.join(format!("p{index}"));
+        assert!(peer_dir.join("operator-tor-state").is_dir());
+        assert!(!peer_dir.join("ignored-tor-state").exists());
         daemons.push(daemon);
     }
 
@@ -1738,7 +1829,7 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
     }
 
     for daemon in &mut daemons {
-        daemon.stop();
+        daemon.stop_gracefully();
     }
     for index in 0..5 {
         daemons[index].start();
@@ -1775,6 +1866,14 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
     )
     .unwrap();
     let recovered_config = recovered_dir.join("node.toml");
+    let recovered_arti_config = recovered_dir.join("arti.toml");
+    let mut recovered_arti = fs::read_to_string(&arti_config).unwrap();
+    recovered_arti.push_str(&format!(
+        "\n[storage]\nstate_dir = {:?}\ncache_dir = {:?}\n",
+        recovered_dir.join("operator-tor-state"),
+        recovered_dir.join("operator-tor-cache")
+    ));
+    fs::write(&recovered_arti_config, recovered_arti).unwrap();
     write_test_config(
         &recovered_config,
         &DaemonOptions {
@@ -1798,9 +1897,9 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
             enable_port_mapping: false,
             enable_dht_maintenance: true,
             tor_mode: mb_node::TorMode::RequireTor,
-            tor_state_dir: None,
-            tor_cache_dir: None,
-            arti_config_file: Some(arti_config),
+            tor_state_dir: Some(recovered_dir.join("ignored-tor-state")),
+            tor_cache_dir: Some(recovered_dir.join("ignored-tor-cache")),
+            arti_config_file: Some(recovered_arti_config),
             max_connections: 32,
         },
     );
@@ -1815,6 +1914,8 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
     );
     assert_onion_only_status(&status);
     assert_stable_onion_is_advertised(&status, &onion_endpoints[1]);
+    assert!(recovered_dir.join("operator-tor-state").is_dir());
+    assert!(!recovered_dir.join("ignored-tor-state").exists());
     let bootstrap_session = format!("peer connection: {} active=[Tor]", peer_ids[0]);
     let status = wait_for_status_text(
         &recovered_socket,

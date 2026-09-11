@@ -59,9 +59,9 @@ pub use p2p::{
 };
 pub use port_mapping::{run_port_mapping, validate_port_mapping_listeners};
 pub use tor::{
-    ONION_SERVICE_PORT, TorMode, TorTransport, TorTransportConfig, is_onion_address,
-    onion_address_matches_node, onion_address_matches_peer, onion_listener_address,
-    wait_for_onion_service_shutdown,
+    ONION_SERVICE_PORT, PreparedTorTransportConfig, TorMode, TorShutdownHandle, TorTransport,
+    TorTransportConfig, is_onion_address, onion_address_matches_node, onion_address_matches_peer,
+    onion_listener_address, wait_for_onion_service_shutdown,
 };
 use wire::*;
 

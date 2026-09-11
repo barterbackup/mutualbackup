@@ -4,26 +4,32 @@ use std::num::NonZeroU16;
 use anyhow::{Context, Result, bail};
 use libp2p::Multiaddr;
 use libp2p::multiaddr::Protocol;
+use tokio::sync::watch;
 
 use super::P2pClient;
 
-/// Validate that automatic gateway mapping has one unambiguous IPv4 QUIC UDP
-/// listener to expose. A zero configured port is allowed because Swarm replaces
-/// it with the allocated port before [`run_port_mapping`] starts.
+const MAPPING_WITHDRAW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const MAPPING_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Validate that automatic gateway mapping has one unambiguous wildcard IPv4
+/// QUIC UDP listener to expose. The mapper uses the default-route local address,
+/// so a listener bound to another specific interface is not sufficient. A zero
+/// configured port is allowed because Swarm replaces it before mapping starts.
 pub fn validate_port_mapping_listeners(addresses: &[Multiaddr]) -> Result<()> {
     let candidates = addresses
         .iter()
-        .filter(|address| ipv4_quic_listener(address).is_some())
-        .count();
-    if candidates != 1 {
-        bail!("port mapping requires exactly one non-loopback IPv4 UDP/QUIC listen address");
+        .filter_map(ipv4_quic_listener)
+        .collect::<Vec<_>>();
+    if candidates.len() != 1 || !candidates[0].0.is_unspecified() {
+        bail!("port mapping requires exactly one wildcard IPv4 UDP/QUIC listen address");
     }
     Ok(())
 }
 
 /// Maintain a real PCP, NAT-PMP, or UPnP mapping for the active QUIC listener
 /// and feed every resulting external-address transition into libp2p.
-pub async fn run_port_mapping(p2p: P2pClient) -> Result<()> {
+pub async fn run_port_mapping(p2p: P2pClient, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     let status = p2p.status().await?;
     let mut ports = status
         .listen_addresses
@@ -46,6 +52,7 @@ pub async fn run_port_mapping(p2p: P2pClient) -> Result<()> {
             protocol: portmapper::Protocol::Udp,
         });
         let mut external = client.watch_external_address();
+        probe_gateway_mapping_protocols(&client).await;
         client.update_local_port(local_port);
         tracing::info!(
             port = local_port.get(),
@@ -53,6 +60,10 @@ pub async fn run_port_mapping(p2p: P2pClient) -> Result<()> {
         );
 
         let mut installed = None;
+        let mut retry = tokio::time::interval_at(
+            tokio::time::Instant::now() + MAPPING_RETRY_INTERVAL,
+            MAPPING_RETRY_INTERVAL,
+        );
         loop {
             let current = *external.borrow_and_update();
             if current != installed {
@@ -69,13 +80,76 @@ pub async fn run_port_mapping(p2p: P2pClient) -> Result<()> {
                     None => tracing::warn!("automatic gateway mapping is no longer active"),
                 }
             }
-            if external.changed().await.is_err() {
-                break;
+            tokio::select! {
+                changed = external.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        client.deactivate();
+                        // Messages from one client enter the mapper's bounded
+                        // service queue in order. A following probe is handled
+                        // only after `deactivate` has awaited the
+                        // protocol-specific release attempt, giving shutdown
+                        // an acknowledgement the public API does not expose
+                        // directly.
+                        let release_barrier = client.probe();
+                        let deadline = tokio::time::Instant::now() + MAPPING_WITHDRAW_TIMEOUT;
+                        while external.borrow().is_some() {
+                            tokio::time::timeout_at(deadline, external.changed())
+                                .await
+                                .context("timed out withdrawing automatic gateway mapping")?
+                                .context("port-mapping service stopped before withdrawal")?;
+                        }
+                        let barrier_result = tokio::time::timeout_at(deadline, release_barrier)
+                            .await
+                            .context("timed out waiting for the gateway mapping release")?
+                            .context("port-mapping service stopped during gateway release")?;
+                        if matches!(
+                            barrier_result,
+                            Err(
+                                portmapper::ProbeError::ChannelFull { .. }
+                                    | portmapper::ProbeError::ChannelClosed { .. }
+                            )
+                        ) {
+                            bail!("port-mapping service did not accept the release barrier");
+                        }
+                        p2p.set_mapped_external_address(None).await?;
+                        tracing::info!("automatic gateway mapping withdrawn");
+                        return Ok(());
+                    }
+                }
+                _ = retry.tick(), if installed.is_none() => {
+                    probe_gateway_mapping_protocols(&client).await;
+                    client.procure_mapping();
+                }
             }
         }
         p2p.set_mapped_external_address(None).await?;
         tracing::warn!("port-mapping service stopped; retrying");
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+async fn probe_gateway_mapping_protocols(client: &portmapper::Client) {
+    match tokio::time::timeout(PROBE_TIMEOUT, client.probe()).await {
+        Ok(Ok(Ok(available))) => tracing::debug!(?available, "gateway mapping probe completed"),
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(%error, "gateway mapping probe failed; using protocol fallback")
+        }
+        Ok(Err(_)) => {
+            tracing::warn!("gateway mapping probe service stopped; using protocol fallback")
+        }
+        Err(_) => tracing::warn!("gateway mapping probe timed out; using protocol fallback"),
     }
 }
 
@@ -104,6 +178,51 @@ pub(super) fn valid_mapped_external_address(address: &Multiaddr) -> bool {
 mod tests {
     use super::*;
 
+    async fn fixture_control(command: &str) {
+        let address = std::env::var("MUTUALBACKUP_NAT_PMP_CONTROL").unwrap();
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        socket.connect(address).await.unwrap();
+        socket.send(command.as_bytes()).await.unwrap();
+        let mut reply = [0_u8; 16];
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(2), socket.recv(&mut reply))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&reply[..received], b"ok");
+    }
+
+    async fn wait_for_mapping(client: &P2pClient, expected_port: Option<u16>) {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let status = client.status().await.unwrap();
+                let observed = status
+                    .port_mapping_external_address
+                    .as_deref()
+                    .and_then(|address| address.parse::<Multiaddr>().ok())
+                    .and_then(|address| ipv4_quic_listener(&address));
+                let advertised = status
+                    .advertised_addresses
+                    .iter()
+                    .filter_map(|address| address.parse::<Multiaddr>().ok())
+                    .filter_map(|address| ipv4_quic_listener(&address))
+                    .filter(|(ip, _)| *ip == "198.51.100.7".parse::<Ipv4Addr>().unwrap())
+                    .collect::<Vec<_>>();
+                if observed == expected_port.map(|port| ("198.51.100.7".parse().unwrap(), port))
+                    && advertised
+                        == expected_port
+                            .map(|port| vec![("198.51.100.7".parse().unwrap(), port)])
+                            .unwrap_or_default()
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("mapping did not converge to external port {expected_port:?}"));
+    }
+
     #[test]
     fn port_mapping_listener_must_be_one_unambiguous_ipv4_quic_socket() {
         let wildcard: Multiaddr = "/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap();
@@ -113,11 +232,85 @@ mod tests {
         validate_port_mapping_listeners(&[wildcard.clone(), ipv6]).unwrap();
 
         let second: Multiaddr = "/ip4/192.0.2.4/udp/44001/quic-v1".parse().unwrap();
-        assert!(validate_port_mapping_listeners(&[wildcard, second]).is_err());
+        assert!(validate_port_mapping_listeners(&[wildcard, second.clone()]).is_err());
+        assert!(validate_port_mapping_listeners(&[second]).is_err());
         assert!(
             validate_port_mapping_listeners(&["/ip4/127.0.0.1/udp/44000/quic-v1".parse().unwrap()])
                 .is_err()
         );
         assert!(validate_port_mapping_listeners(&[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn real_nat_pmp_mapping_is_published_replaced_reacquired_and_withdrawn() {
+        let Ok(events_path) = std::env::var("MUTUALBACKUP_NAT_PMP_EVENTS") else {
+            return;
+        };
+        use super::super::{P2pConfig, TorMode, build_p2p};
+        use crate::{Node, Seed};
+        use std::sync::{Arc, Mutex};
+
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::open(temp.path(), Seed::from_bytes([61; 32])).unwrap();
+        let node_id = node.keys().node_id();
+        let config = P2pConfig {
+            listen_addresses: vec!["/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap()],
+            external_addresses: Vec::new(),
+            bootstrap_addresses: Vec::new(),
+            relay_reservation_addresses: Vec::new(),
+            enable_dht_maintenance: false,
+            enable_relay_server: false,
+            enable_hole_punching: false,
+            enable_port_mapping: true,
+            public_endpoint: "/ip4/0.0.0.0/udp/0/quic-v1".to_owned(),
+            failure_domain: node_id.to_string(),
+            configure_failure_domain: true,
+            max_connections: 4,
+            tor_mode: TorMode::DisableTor,
+        };
+        let (client, mut event_loop) = build_p2p(Arc::new(Mutex::new(node)), config).unwrap();
+        let startup = event_loop.take_startup_receiver().unwrap();
+        let p2p_task = tokio::spawn(event_loop.run());
+        tokio::time::timeout(std::time::Duration::from_secs(5), startup)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let (shutdown, receiver) = watch::channel(false);
+        let mapping_task = tokio::spawn(run_port_mapping(client.clone(), receiver));
+        wait_for_mapping(&client, Some(45_000)).await;
+
+        fixture_control("replace").await;
+        wait_for_mapping(&client, Some(45_001)).await;
+        fixture_control("drop").await;
+        wait_for_mapping(&client, None).await;
+        fixture_control("restore").await;
+        wait_for_mapping(&client, Some(45_002)).await;
+
+        shutdown.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), mapping_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        wait_for_mapping(&client, None).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if std::fs::read_to_string(&events_path)
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|line| line.starts_with("delete "))
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("NAT-PMP fixture did not observe orderly deletion");
+
+        client.shutdown().await.unwrap();
+        p2p_task.await.unwrap().unwrap();
     }
 }

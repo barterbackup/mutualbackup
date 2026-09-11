@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
@@ -23,7 +24,7 @@ use libp2p::multiaddr::Protocol;
 use mb_core::NodeId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{Notify, Semaphore, mpsc, watch};
 use tor_config::sources::MustRead;
 use tor_config::{ConfigurationSource, ConfigurationSources, ExplicitOrAuto};
 use tor_config_path::arti_client_base_resolver;
@@ -98,6 +99,71 @@ pub struct TorTransportConfig {
     pub max_inbound_streams: usize,
 }
 
+pub struct PreparedTorTransportConfig {
+    loaded: LoadedArtiConfig,
+    max_inbound_streams: usize,
+}
+
+impl PreparedTorTransportConfig {
+    pub fn state_dir(&self) -> &Path {
+        &self.loaded.state_dir
+    }
+}
+
+struct TorTaskTracker {
+    active: AtomicUsize,
+    notify: Notify,
+}
+
+impl TorTaskTracker {
+    fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            notify: Notify::new(),
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct TorTaskGuard(Arc<TorTaskTracker>);
+
+impl Drop for TorTaskGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+        self.0.notify.notify_one();
+    }
+}
+
+pub struct TorShutdownHandle {
+    shutdown: watch::Sender<bool>,
+    tasks: Arc<TorTaskTracker>,
+    state_dir: PathBuf,
+    _state_lock: Arc<File>,
+}
+
+impl TorShutdownHandle {
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    pub async fn wait_stopped(&self) -> Result<()> {
+        let _ = self.shutdown.send(true);
+        tokio::time::timeout(SERVICE_SHUTDOWN_TIMEOUT, self.tasks.wait())
+            .await
+            .context("timed out waiting for Arti transport tasks to stop")?;
+        wait_for_onion_service_shutdown(&self.state_dir).await
+    }
+}
+
 #[derive(Debug, Error)]
 #[error("{message}")]
 pub struct TorTransportError {
@@ -120,6 +186,7 @@ enum InboundEvent {
 /// Raw ordered-stream transport for libp2p Noise+yamux over Arti.
 pub struct TorTransport {
     client: Arc<TorClient<PreferredRuntime>>,
+    state_dir: PathBuf,
     listen_address: Multiaddr,
     listeners: HashMap<ListenerId, Multiaddr>,
     pending_events: VecDeque<
@@ -132,22 +199,40 @@ pub struct TorTransport {
     service_status: tor_hsservice::status::OnionServiceStatusStream,
     reachable: bool,
     shutdown: watch::Sender<bool>,
+    tasks: Arc<TorTaskTracker>,
     accept_task: tokio::task::JoinHandle<()>,
     bootstrap_task: tokio::task::JoinHandle<()>,
     _service: Arc<RunningOnionService>,
-    _state_lock: File,
+    _state_lock: Arc<File>,
 }
 
 impl TorTransport {
+    pub fn prepare_config(config: &TorTransportConfig) -> Result<PreparedTorTransportConfig> {
+        if config.max_inbound_streams == 0 {
+            bail!("Tor inbound stream limit must be greater than zero");
+        }
+        Ok(PreparedTorTransportConfig {
+            loaded: load_arti_config(config)?,
+            max_inbound_streams: config.max_inbound_streams,
+        })
+    }
+
     pub async fn new(
         config: TorTransportConfig,
         identity_seed: Zeroizing<[u8; 32]>,
         node_id: NodeId,
     ) -> Result<Self> {
-        if config.max_inbound_streams == 0 {
-            bail!("Tor inbound stream limit must be greater than zero");
-        }
-        let loaded = load_arti_config(&config)?;
+        let prepared = Self::prepare_config(&config)?;
+        Self::new_prepared(prepared, identity_seed, node_id).await
+    }
+
+    pub async fn new_prepared(
+        prepared: PreparedTorTransportConfig,
+        identity_seed: Zeroizing<[u8; 32]>,
+        node_id: NodeId,
+    ) -> Result<Self> {
+        let max_inbound_streams = prepared.max_inbound_streams;
+        let loaded = prepared.loaded;
         prepare_private_directory(&loaded.state_dir, "Tor state")?;
         prepare_private_directory(&loaded.cache_dir, "Tor cache")?;
         let canonical_state = fs::canonicalize(&loaded.state_dir).context("resolve Tor state")?;
@@ -158,7 +243,7 @@ impl TorTransport {
         {
             bail!("Tor state and cache directories must not overlap");
         }
-        let state_lock = lock_tor_state(&loaded.state_dir)?;
+        let state_lock = Arc::new(lock_tor_state(&loaded.state_dir)?);
         validate_onion_service_state(&loaded.state_dir)?;
 
         let client = TorClient::<PreferredRuntime>::builder()
@@ -191,17 +276,19 @@ impl TorTransport {
 
         let listen_address = onion_listener_address(node_id)?;
         let service_status = service.status_events();
-        let (incoming_sender, incoming) = mpsc::channel(config.max_inbound_streams);
+        let (incoming_sender, incoming) = mpsc::channel(max_inbound_streams);
         let (shutdown, shutdown_receiver) = watch::channel(false);
+        let tasks = Arc::new(TorTaskTracker::new());
         let accept_task = spawn_accept_task(
             rend_requests,
             incoming_sender,
             shutdown_receiver,
-            config.max_inbound_streams,
+            max_inbound_streams,
+            Arc::clone(&tasks),
         );
         let bootstrap_client = Arc::clone(&client);
         let mut bootstrap_shutdown = shutdown.subscribe();
-        let bootstrap_task = tokio::spawn(async move {
+        let bootstrap_task = spawn_tracked(Arc::clone(&tasks), async move {
             loop {
                 let attempt = tokio::select! {
                     _ = bootstrap_shutdown.changed() => return,
@@ -225,6 +312,7 @@ impl TorTransport {
 
         Ok(Self {
             client,
+            state_dir: loaded.state_dir,
             listen_address,
             listeners: HashMap::new(),
             pending_events: VecDeque::new(),
@@ -232,6 +320,7 @@ impl TorTransport {
             service_status,
             reachable: service.status().state().is_fully_reachable(),
             shutdown,
+            tasks,
             accept_task,
             bootstrap_task,
             _service: service,
@@ -241,6 +330,19 @@ impl TorTransport {
 
     pub fn listen_address(&self) -> &Multiaddr {
         &self.listen_address
+    }
+
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    pub fn shutdown_handle(&self) -> TorShutdownHandle {
+        TorShutdownHandle {
+            shutdown: self.shutdown.clone(),
+            tasks: Arc::clone(&self.tasks),
+            state_dir: self.state_dir.clone(),
+            _state_lock: Arc::clone(&self._state_lock),
+        }
     }
 
     fn change_reachability(&mut self, reachable: bool) {
@@ -473,13 +575,27 @@ impl Transport for TorTransport {
     }
 }
 
+fn spawn_tracked<F>(tracker: Arc<TorTaskTracker>, future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tracker.active.fetch_add(1, Ordering::AcqRel);
+    let guard = TorTaskGuard(tracker);
+    tokio::spawn(async move {
+        let _guard = guard;
+        future.await
+    })
+}
+
 fn spawn_accept_task(
     rend_requests: impl Stream<Item = tor_hsservice::RendRequest> + Send + 'static,
     incoming: mpsc::Sender<InboundEvent>,
     mut shutdown: watch::Receiver<bool>,
     max_inbound_streams: usize,
+    tasks: Arc<TorTaskTracker>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    spawn_tracked(tasks, async move {
         let permits = Arc::new(Semaphore::new(max_inbound_streams));
         let mut requests = Box::pin(rend_requests);
         let mut rendezvous = tokio::task::JoinSet::new();
@@ -926,6 +1042,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prepared_config_exposes_the_arti_storage_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let configured_state = temp.path().join("operator-state");
+        let configured_cache = temp.path().join("operator-cache");
+        let arti_config = temp.path().join("arti.toml");
+        fs::write(
+            &arti_config,
+            format!(
+                "[storage]\nstate_dir = {:?}\ncache_dir = {:?}\n",
+                configured_state, configured_cache
+            ),
+        )
+        .unwrap();
+        let prepared = TorTransport::prepare_config(&TorTransportConfig {
+            state_dir: temp.path().join("ignored-state"),
+            cache_dir: temp.path().join("ignored-cache"),
+            arti_config_file: Some(arti_config),
+            max_inbound_streams: 1,
+        })
+        .unwrap();
+        assert_eq!(prepared.state_dir(), configured_state);
+    }
+
     #[cfg(unix)]
     #[test]
     fn state_lock_excludes_another_daemon_and_state_symlinks_are_rejected() {
@@ -962,5 +1102,40 @@ mod tests {
         });
         wait_for_onion_service_shutdown(&state).await.unwrap();
         release.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_handle_joins_tracked_transport_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let (shutdown, mut receiver) = watch::channel(false);
+        let tasks = Arc::new(TorTaskTracker::new());
+        let task = spawn_tracked(Arc::clone(&tasks), async move {
+            let _ = receiver.changed().await;
+        });
+        let handle = TorShutdownHandle {
+            shutdown,
+            tasks: Arc::clone(&tasks),
+            state_dir: temp.path().to_path_buf(),
+            _state_lock: Arc::new(lock_tor_state(temp.path()).unwrap()),
+        };
+
+        handle.wait_stopped().await.unwrap();
+        task.await.unwrap();
+        assert_eq!(tasks.active.load(Ordering::Acquire), 0);
+        assert!(lock_tor_state(temp.path()).is_err());
+        drop(handle);
+        lock_tor_state(temp.path()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn aborting_an_unpolled_transport_task_releases_its_tracker_slot() {
+        let tasks = Arc::new(TorTaskTracker::new());
+        let task = spawn_tracked(Arc::clone(&tasks), std::future::pending::<()>());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), tasks.wait())
+            .await
+            .unwrap();
+        assert_eq!(tasks.active.load(Ordering::Acquire), 0);
     }
 }
