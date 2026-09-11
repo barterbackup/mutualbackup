@@ -1,5 +1,16 @@
 # Product TODO
 
+## Milestone 2 closeout blocker
+
+- Make the documented reflink acceptance command self-contained. The default
+  `nix develop` shell used by `scripts/reflink-acceptance.sh` does not provide
+  `btrfs`, although the mandatory nested-subvolume fixture executes that
+  program directly; `btrfs-progs` exists only in the Docker-lab and private-Tor
+  shells. Add it to the shell used by this gate (or define and document a
+  dedicated reflink shell), preflight the executable before starting the
+  sequence, and rerun the complete Milestone 2 gate from a fresh disposable
+  Btrfs root. Do not admit the next milestone on a partial run.
+
 ## Later guild geometry and coding protocol
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
