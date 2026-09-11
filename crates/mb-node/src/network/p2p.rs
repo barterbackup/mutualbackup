@@ -366,9 +366,11 @@ struct PendingRequest {
     peer: PeerId,
     recipient: NodeId,
     response_recipient: NodeId,
+    request: SignedRecord<PeerRequestEnvelope>,
     request_id: [u8; 16],
     request_hash: [u8; 32],
     request_bytes: u64,
+    transport_tier: u8,
     started_at: tokio::time::Instant,
     response: oneshot::Sender<Result<PeerResponse>>,
     _permit: OwnedSemaphorePermit,
@@ -2314,8 +2316,13 @@ impl P2pEventLoop {
                         match request_hash {
                             Ok(request_hash) => {
                                 let request_bytes = cbor_wire_len(&request).unwrap_or(0);
-                                let outbound_id =
-                                    self.swarm.behaviour_mut().peer.send_request(&peer, request);
+                                let transport_tier =
+                                    self.fallback_tiers.get(&peer).copied().unwrap_or(0);
+                                let outbound_id = self
+                                    .swarm
+                                    .behaviour_mut()
+                                    .peer
+                                    .send_request(&peer, request.clone());
                                 self.pending_requests.insert(
                                     outbound_id,
                                     PendingRequest {
@@ -2327,9 +2334,11 @@ impl P2pEventLoop {
                                             .reader_config
                                             .keys()
                                             .node_id(),
+                                        request,
                                         request_id,
                                         request_hash,
                                         request_bytes,
+                                        transport_tier,
                                         started_at: tokio::time::Instant::now(),
                                         response,
                                         _permit: permit,
@@ -2884,18 +2893,32 @@ impl P2pEventLoop {
                 error,
                 ..
             } => {
-                if let Some(pending) = self.pending_requests.remove(&request_id) {
+                if let Some(mut pending) = self.pending_requests.remove(&request_id) {
                     let path = self
                         .last_application_paths
                         .get(&peer)
                         .copied()
                         .or_else(|| self.selected_path_hint(peer));
                     self.record_request_result(path, pending.started_at, false);
-                    let _ = pending
-                        .response
-                        .send(Err(anyhow::anyhow!("libp2p request failed: {error}")));
-                }
-                if !self.swarm.is_connected(&peer) {
+                    if !self.swarm.is_connected(&peer) {
+                        self.activate_fallback(peer);
+                    }
+                    let selected_tier = self.fallback_tiers.get(&peer).copied().unwrap_or(0);
+                    if selected_tier > pending.transport_tier {
+                        let retry_id = self
+                            .swarm
+                            .behaviour_mut()
+                            .peer
+                            .send_request(&peer, pending.request.clone());
+                        pending.transport_tier = selected_tier;
+                        pending.started_at = tokio::time::Instant::now();
+                        self.pending_requests.insert(retry_id, pending);
+                    } else {
+                        let _ = pending
+                            .response
+                            .send(Err(anyhow::anyhow!("libp2p request failed: {error}")));
+                    }
+                } else if !self.swarm.is_connected(&peer) {
                     self.activate_fallback(peer);
                 }
             }
@@ -6410,7 +6433,7 @@ mod tests {
         let first_node = guild_nodes.next().unwrap();
         let second_node = guild_nodes.next().unwrap();
         let fallback_node = guild_nodes.next().unwrap();
-        let _offline_member = guild_nodes.next().unwrap();
+        let fallback_source_node = guild_nodes.next().unwrap();
         let relay_id = relay_node.keys().node_id();
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let relay_port = socket.local_addr().unwrap().port();
@@ -6525,17 +6548,43 @@ mod tests {
         let (fallback_client, fallback_loop) =
             build_p2p(Arc::new(Mutex::new(fallback_node)), fallback_config).unwrap();
         let fallback_task = tokio::spawn(fallback_loop.run());
-        first_client
+        let fallback_source_id = fallback_source_node.keys().node_id();
+        let mut fallback_source_config = config(fallback_source_id);
+        fallback_source_config.listen_addresses.clear();
+        fallback_source_config.enable_relay_server = false;
+        fallback_source_config.enable_hole_punching = false;
+        fallback_source_config.relay_reservation_addresses = vec![relay_address.clone()];
+        let (fallback_source_client, fallback_source_loop) = build_p2p(
+            Arc::new(Mutex::new(fallback_source_node)),
+            fallback_source_config,
+        )
+        .unwrap();
+        let fallback_source_task = tokio::spawn(fallback_source_loop.run());
+        let unreachable_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let unreachable_direct: Multiaddr = format!(
+            "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}",
+            unreachable_socket.local_addr().unwrap().port(),
+            fallback_client.local_peer_id()
+        )
+        .parse()
+        .unwrap();
+        drop(unreachable_socket);
+        fallback_source_client
+            .add_peer_address(fallback_id, unreachable_direct)
+            .await
+            .unwrap();
+        fallback_source_client
             .add_peer_address(fallback_id, relayed_address(&fallback_client).await)
             .await
             .unwrap();
-        let profile = first_client.profile(fallback_id).await.unwrap();
+        // The request which discovers that the preferred direct path is dead
+        // must continue over the next policy tier without a caller retry.
+        let profile = fallback_source_client.profile(fallback_id).await.unwrap();
         assert_eq!(profile.member.node_id, fallback_id);
-        let status = first_client.status().await.unwrap();
+        let status = fallback_source_client.status().await.unwrap();
         assert!(
             status.peers.iter().any(|peer| {
                 peer.peer_id == fallback_client.local_peer_id()
-                    && peer.last_application_path == Some(P2pPath::RelayFallback)
                     && peer.application_bytes_sent > 0
                     && peer.application_bytes_received > 0
                     && peer.path_transfers.iter().any(|transfer| {
@@ -6573,11 +6622,13 @@ mod tests {
         first_client.shutdown().await.unwrap();
         second_client.shutdown().await.unwrap();
         fallback_client.shutdown().await.unwrap();
+        fallback_source_client.shutdown().await.unwrap();
         nonmember_client.shutdown().await.unwrap();
         relay_client.shutdown().await.unwrap();
         first_task.await.unwrap().unwrap();
         second_task.await.unwrap().unwrap();
         fallback_task.await.unwrap().unwrap();
+        fallback_source_task.await.unwrap().unwrap();
         nonmember_task.await.unwrap().unwrap();
         relay_task.await.unwrap().unwrap();
     }
