@@ -21,7 +21,10 @@ for command in arti awk cargo date python3 readlink sed tor; do
   fi
 done
 
-work_dir="$(mktemp -d "${TMPDIR:-/tmp}/mutualbackup-private-tor.XXXXXX")"
+# Tor's control sockets have a small platform path limit.  Do not inherit a
+# potentially long Nix/Btrfs TMPDIR here: only MutualBackup's test root needs
+# reflinks, while the disposable Chutney network needs short socket names.
+work_dir="$(mktemp -d /tmp/mbtor.XXXXXX)"
 export CHUTNEY_DATA_DIR="$work_dir/chutney-data"
 export CHUTNEY_CONFIG_PHASE=1
 export CHUTNEY_LAUNCH_PHASE=1
@@ -48,7 +51,7 @@ cleanup() {
   fi
   if (( test_succeeded )); then
     case "$work_dir" in
-      "${TMPDIR:-/tmp}"/mutualbackup-private-tor.*)
+      /tmp/mbtor.*)
         rm -rf -- "$work_dir"
         ;;
       *)
