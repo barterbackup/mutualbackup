@@ -1,5 +1,38 @@
 # Product TODO
 
+## Milestone 2 corrective gate — blocks Milestone 3
+
+- Make legacy ordinary-restore reconciliation crash-safe across its filesystem
+  and SQL changes. It currently removes and syncs each losing identity-bound
+  staging tree before atomically replacing the old journal rows. A crash in
+  between can leave a losing `Publishing` row whose staging and target are both
+  absent; selecting that revision later is then a permanent publication dead
+  end. Durably retire the losing rows or record cleanup before deletion, or
+  make that exact missing-stage state safely rebuildable. Inject failure after
+  losing-tree sync and prove that retrying the losing revision completes.
+- Give abandoned peer shard fetches real cancellation and release their
+  event-loop state and outbound permits promptly. Reconstruction stops polling
+  after any three valid shards, but an already-issued request to a blackholed
+  fourth holder remains in `PendingRequest` until the 20-second transport
+  timeout. One such request per coding group exhausts `max_connections` during
+  a larger otherwise-recoverable restore. Regress more than
+  `max_connections` groups with exactly three responsive holders and one
+  blackholed holder; recovery and ordinary repair must progress without
+  timeout-cadence stalls, permit starvation, or unbounded pending requests.
+- Rotate away from the bootstrap used by a failed Docker recovery attempt even
+  when its container and local control socket still report the expected active
+  guild. Those checks do not prove that the fresh node can reach its QUIC/DHT
+  endpoint, so the current retry selects the same unusable bootstrap forever.
+  Persist a different validated survivor before recreating only the recovery
+  container/config, retain the recovered Btrfs image, and regress a live,
+  control-responsive, same-guild bootstrap whose P2P path is blocked.
+- Make Docker reinit's destructive restore-name preflight explicitly ASCII and
+  byte-counted independent of the caller's locale. POSIX regular-expression
+  ranges are locale-sensitive and Bash `${#name}` can count characters, so a
+  multibyte name may pass the claimed 255-byte limit and fail only after image
+  erasure. Regress non-ASCII/multibyte rejection before host preparation,
+  intent creation, or mutation, plus the exact 255/256 ASCII-byte boundary.
+
 ## Later guild geometry and coding protocol
 
 - Treat failure domain as a human-supplied correlation claim, never a generated

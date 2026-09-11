@@ -651,18 +651,22 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0, 1, and 2 are passed. The six defects from the
-last Milestone 2 review are fixed with focused regressions; the completion audit
-also fixed an unsafe unbound superseded-recovery cleanup and a query-only test
-compile failure. The locked workspace, Btrfs/reflink suite, real QUIC/DHT and
-five-daemon recovery paths, static Nix artifacts, and a real five-container
-Btrfs erase-and-seed-recovery exercise all pass. The closing source-only audit
-found no new high-confidence Milestone 2 defect.
+**Current position:** Milestones 0 and 1 are passed. Milestone 2's implementation
+and earlier runtime gates completed, but the latest source-only re-audit reopened
+its corrective gate with four high-confidence defects: legacy restore migration
+can strand a `Publishing` journal across a crash; abandoned shard requests can
+starve outbound permits during a large recoverable restore; Docker recovery can
+retry one live but P2P-unreachable bootstrap forever; and destructive restore
+name validation is not locale-independent or reliably byte-bounded. The exact
+fix and regression contracts are in `TODO.md`; no Milestone 3 work should begin
+until they are closed and reviewed.
 
-The next run begins Milestone 3. First pin and review the maintained Arti
-version and write the transport/key-lifecycle ADR. Pause at that design gate,
-then integrate Tor without changing the proven IP, recovery, and storage paths
-until the ADR defines their exact extension points.
+The next run is one final Milestone 2 corrective slice. Fix the four blocking
+items in `TODO.md`, add their focused crash/network/locale regressions, then run
+the complete locked workspace, Btrfs/reflink, real QUIC/DHT recovery, static Nix
+artifact, and five-container erase-and-seed-recovery gates. Pause for another
+source-only closure review. Only after that gate passes should Milestone 3 pin
+and review Arti and write the transport/key-lifecycle ADR.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
 
@@ -708,7 +712,7 @@ The Milestone 2 gate included inherited stabilization regressions that the first
 acceptance pass did not expose; they remain part of the mandatory regression
 contract.
 
-### Milestone 2 — operator configuration and identity-state separation (passed)
+### Milestone 2 — operator configuration and identity-state separation (corrective gate reopened)
 
 - Replace duplicated daemon parsing with one typed options model consumed by
   optional TOML and equivalent nonsecret command-line flags. Test flag-over-file
@@ -770,14 +774,17 @@ data-independent publication retry, non-mutating completed-recovery
 verification, safe restoring-phase bootstrap replacement, and destructive-name
 preflight. The complete locked, Btrfs, network, packaging, and real Docker lab
 gates were rerun successfully, and the closing source-only audit found no new
-high-confidence Milestone 2 defect.
+high-confidence Milestone 2 defect. A subsequent source-only re-audit found the
+four current blockers recorded in `TODO.md`; those findings supersede the prior
+closure verdict but do not invalidate the other completed fixes or gate results.
 
 ### Milestone 3 — Tor and robust connectivity beta
 
-Entry condition: satisfied by the completed Milestone 2 gate. No Milestone 3
-implementation has begun. Start by pinning and reviewing the maintained Arti
-version and writing the transport/key lifecycle ADR before integrating it with
-the bounded IP endpoint lifecycle.
+Entry condition: not yet satisfied because the Milestone 2 corrective gate is
+reopened for the four blockers in `TODO.md`. No Milestone 3 implementation has
+begun. After Milestone 2 closes again, start by pinning and reviewing the
+maintained Arti version and writing the transport/key lifecycle ADR before
+integrating it with the bounded IP endpoint lifecycle.
 
 - Adapt the narrow, useful BarterBackup `nettor` principles to a maintained Arti
   release: outbound onion dialing, an inbound v3 onion service, persistent Tor
