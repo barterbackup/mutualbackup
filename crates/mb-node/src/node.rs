@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -346,6 +346,32 @@ impl NodeReader {
             anyhow::bail!("requested guild differs from installed guild");
         }
         Ok(installed.certificate)
+    }
+
+    pub(crate) fn peer_exchange_endpoints(
+        &self,
+        guild_id: [u8; 32],
+    ) -> Result<Vec<SignedRecord<EndpointRecord>>> {
+        let certificate = self.installed_guild_certificate(guild_id)?;
+        let allowed = certificate
+            .genesis
+            .members
+            .iter()
+            .map(|member| member.node_id)
+            .collect::<BTreeSet<_>>();
+        let now = unix_seconds();
+        let mut records = BTreeMap::<NodeId, SignedRecord<EndpointRecord>>::new();
+        if let Some(bytes) = self.control.get_record("dht-endpoint", b"primary")? {
+            retain_exchange_endpoint(&mut records, &allowed, now, &bytes)?;
+        }
+        for (_, bytes) in self.control.records("dht-observed-endpoint")? {
+            let state: DhtObservationState = decode_canonical(&bytes)?;
+            validate_dht_observation_state(&state)?;
+            if state.current.expires_at_unix_seconds > now {
+                retain_exchange_endpoint(&mut records, &allowed, now, &state.current.bytes)?;
+            }
+        }
+        Ok(records.into_values().collect())
     }
 
     pub(crate) fn sector_for_guild(
@@ -2023,23 +2049,12 @@ impl Node {
                 }));
             }
         }
-        let endpoint_slot = publication_slot(b"endpoint", local_id, local_id, guild_id);
-        let endpoint = SignedRecord::sign(
-            b"mutualbackup/endpoint-record/v1",
-            EndpointRecord {
-                format_version: 1,
-                publisher: local_id,
-                sequence: self.next_recovery_publication_sequence(
-                    &endpoint_slot,
-                    sequence_floors.endpoint.max(1),
-                )?,
-                expires_at_unix_seconds,
-                endpoints: endpoints.clone(),
-            },
-            &self.keys,
+        let endpoint = self.build_endpoint_publication(
+            guild_id,
+            endpoints.clone(),
+            expires_at_unix_seconds,
+            sequence_floors.endpoint,
         )?;
-        self.control
-            .put_record("dht-endpoint", b"primary", &canonical_bytes(&endpoint)?)?;
         let mut recovery = Vec::new();
         for subject in installed
             .certificate
@@ -2105,6 +2120,70 @@ impl Node {
             endpoint,
             recovery,
         }))
+    }
+
+    pub(crate) fn refresh_peer_exchange_endpoint(
+        &mut self,
+        endpoints: Vec<String>,
+        expires_at_unix_seconds: u64,
+    ) -> Result<Option<SignedRecord<EndpointRecord>>> {
+        let Some(installed) = self.installed_guild()? else {
+            return Ok(None);
+        };
+        installed.certificate.verify()?;
+        Ok(Some(self.build_endpoint_publication(
+            installed.certificate.genesis.guild_id,
+            endpoints,
+            expires_at_unix_seconds,
+            1,
+        )?))
+    }
+
+    fn build_endpoint_publication(
+        &mut self,
+        guild_id: [u8; 32],
+        endpoints: Vec<String>,
+        expires_at_unix_seconds: u64,
+        sequence_floor: u64,
+    ) -> Result<SignedRecord<EndpointRecord>> {
+        let local_id = self.keys.node_id();
+        validate_endpoint_set(local_id, &endpoints)?;
+        if expires_at_unix_seconds <= unix_seconds() {
+            anyhow::bail!("endpoint publication expiry must be in the future");
+        }
+        if let Some(bytes) = self.control.get_record("dht-endpoint", b"primary")? {
+            let current: SignedRecord<EndpointRecord> = decode_canonical(&bytes)?;
+            current.verify(b"mutualbackup/endpoint-record/v1")?;
+            if current.signer != local_id
+                || current.value.publisher != local_id
+                || current.value.format_version != 1
+            {
+                anyhow::bail!("stored endpoint publication belongs to another identity");
+            }
+            if current.value.endpoints == endpoints
+                && current.value.sequence >= sequence_floor
+                && current.value.expires_at_unix_seconds.saturating_add(5 * 60)
+                    >= expires_at_unix_seconds
+            {
+                return Ok(current);
+            }
+        }
+        let endpoint_slot = publication_slot(b"endpoint", local_id, local_id, guild_id);
+        let endpoint = SignedRecord::sign(
+            b"mutualbackup/endpoint-record/v1",
+            EndpointRecord {
+                format_version: 1,
+                publisher: local_id,
+                sequence: self
+                    .next_recovery_publication_sequence(&endpoint_slot, sequence_floor.max(1))?,
+                expires_at_unix_seconds,
+                endpoints,
+            },
+            &self.keys,
+        )?;
+        self.control
+            .put_record("dht-endpoint", b"primary", &canonical_bytes(&endpoint)?)?;
+        Ok(endpoint)
     }
 
     pub fn dht_recovery_sequence_probe_subjects(&self) -> Result<Vec<NodeId>> {
@@ -3457,6 +3536,40 @@ fn validate_endpoint_set(node_id: NodeId, endpoints: &[String]) -> Result<()> {
         if address.iter().last() != Some(Protocol::P2p(expected)) {
             anyhow::bail!("guild endpoint is not bound to its seed-derived peer identity");
         }
+        if !crate::network::onion_address_matches_node(&address, node_id) {
+            anyhow::bail!("guild onion endpoint differs from its seed-derived node identity");
+        }
+    }
+    Ok(())
+}
+
+fn retain_exchange_endpoint(
+    records: &mut BTreeMap<NodeId, SignedRecord<EndpointRecord>>,
+    allowed: &BTreeSet<NodeId>,
+    now: u64,
+    bytes: &[u8],
+) -> Result<()> {
+    let endpoint: SignedRecord<EndpointRecord> = decode_canonical(bytes)?;
+    endpoint.verify(b"mutualbackup/endpoint-record/v1")?;
+    if endpoint.value.format_version != 1
+        || endpoint.signer != endpoint.value.publisher
+        || !allowed.contains(&endpoint.value.publisher)
+        || endpoint.value.sequence == 0
+        || endpoint.value.expires_at_unix_seconds <= now
+    {
+        anyhow::bail!("stored endpoint record is not eligible for peer exchange");
+    }
+    validate_endpoint_set(endpoint.value.publisher, &endpoint.value.endpoints)?;
+    match records.get(&endpoint.value.publisher) {
+        Some(current) if current.value.sequence == endpoint.value.sequence => {
+            if canonical_bytes(current)? != canonical_bytes(&endpoint)? {
+                anyhow::bail!("stored endpoint publisher forked one sequence");
+            }
+        }
+        Some(current) if current.value.sequence > endpoint.value.sequence => {}
+        _ => {
+            records.insert(endpoint.value.publisher, endpoint);
+        }
     }
     Ok(())
 }
@@ -4128,6 +4241,46 @@ mod tests {
                 .endpoints
                 .as_slice(),
             std::slice::from_ref(&changed_endpoint)
+        );
+    }
+
+    #[test]
+    fn peer_exchange_endpoint_exists_before_a_checkpoint_and_reuses_its_sequence() {
+        let temp = tempfile::tempdir().unwrap();
+        let (local_seed, certificate, peers) = recovery_guild_fixture();
+        let mut node = Node::open(temp.path(), local_seed).unwrap();
+        node.adopt_recovered_guild(certificate.clone(), peers)
+            .unwrap();
+        let local_id = node.keys().node_id();
+        let peer_id = local_id.libp2p_peer_id().unwrap();
+        let onion = crate::network::onion_listener_address(local_id).unwrap();
+        let endpoints = vec![
+            format!("/ip4/198.51.100.8/udp/44000/quic-v1/p2p/{peer_id}"),
+            format!("{onion}/p2p/{peer_id}"),
+        ];
+        let expires = unix_seconds() + 15 * 60;
+        let first = node
+            .refresh_peer_exchange_endpoint(endpoints.clone(), expires)
+            .unwrap()
+            .unwrap();
+        let reused = node
+            .refresh_peer_exchange_endpoint(endpoints, expires + 30)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, reused);
+        assert_eq!(first.value.sequence, 1);
+
+        let reader = node.reader_config().open().unwrap();
+        assert_eq!(
+            reader
+                .peer_exchange_endpoints(certificate.genesis.guild_id)
+                .unwrap(),
+            vec![first]
+        );
+        assert!(
+            node.current_checkpoint(certificate.genesis.guild_id)
+                .unwrap()
+                .is_none()
         );
     }
 

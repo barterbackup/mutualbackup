@@ -611,6 +611,10 @@ fn daemon_accepts_config_only_and_flag_overrides() {
             enable_relay_server: false,
             enable_hole_punching: true,
             enable_dht_maintenance: true,
+            tor_mode: mb_node::TorMode::DisableTor,
+            tor_state_dir: None,
+            tor_cache_dir: None,
+            arti_config_file: None,
             max_connections: 32,
         },
     );
@@ -792,6 +796,10 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
                 enable_relay_server: index == 0,
                 enable_hole_punching: true,
                 enable_dht_maintenance: true,
+                tor_mode: mb_node::TorMode::DisableTor,
+                tor_state_dir: None,
+                tor_cache_dir: None,
+                arti_config_file: None,
                 max_connections: 32,
             },
         );
@@ -1004,6 +1012,10 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
             enable_relay_server: false,
             enable_hole_punching: true,
             enable_dht_maintenance: true,
+            tor_mode: mb_node::TorMode::DisableTor,
+            tor_state_dir: None,
+            tor_cache_dir: None,
+            arti_config_file: None,
             max_connections: 32,
         },
     );
@@ -1095,6 +1107,10 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
             enable_relay_server: false,
             enable_hole_punching: true,
             enable_dht_maintenance: true,
+            tor_mode: mb_node::TorMode::DisableTor,
+            tor_state_dir: None,
+            tor_cache_dir: None,
+            arti_config_file: None,
             max_connections: 32,
         },
     );
@@ -1372,6 +1388,10 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
             enable_relay_server: false,
             enable_hole_punching: true,
             enable_dht_maintenance: true,
+            tor_mode: mb_node::TorMode::DisableTor,
+            tor_state_dir: None,
+            tor_cache_dir: None,
+            arti_config_file: None,
             max_connections: 32,
         },
     );
@@ -1435,6 +1455,7 @@ impl DhtNoise {
                         failure_domain: "malicious-dht-publisher".into(),
                         configure_failure_domain: true,
                         max_connections: 4,
+                        tor_mode: mb_node::TorMode::DisableTor,
                     },
                 )
                 .unwrap();

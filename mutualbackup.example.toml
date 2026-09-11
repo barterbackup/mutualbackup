@@ -40,5 +40,12 @@ enable_hole_punching = true
 # and application requests. Normal nodes should leave this true.
 enable_dht_maintenance = true
 
+# Start an onion service and use it automatically when direct/relay paths fail.
+# Other values are "prefer-tor", "require-tor", and "disable-tor".
+tor_mode = "auto"
+# tor_state_dir = "./state/tor/state"
+# tor_cache_dir = "./state/tor/cache"
+# arti_config_file = "./arti.toml"
+
 # Bound established libp2p sessions and concurrent peer workers.
 max_connections = 32

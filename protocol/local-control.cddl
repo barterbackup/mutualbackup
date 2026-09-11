@@ -67,10 +67,16 @@ p2p-status = {
   direct_listeners_active: uint,
   relay_reservations_configured: uint,
   relay_reservations_active: uint,
+  tor_mode: "auto" / "prefer-tor" / "require-tor" / "disable-tor",
+  onion_service_configured: bool,
+  onion_service_reachable: bool,
   degraded: [* tstr],
   listen_addresses: [* tstr],
   advertised_addresses: [* tstr],
-  peers: [* p2p-peer-status]
+  peers: [* p2p-peer-status],
+  active_sessions: [* p2p-active-session],
+  recent_sessions: [* p2p-session-history],
+  path_metrics: [* p2p-path-metrics]
 }
 
 p2p-peer-status = {
@@ -88,7 +94,40 @@ p2p-path-transfer = {
   application_bytes_received: uint
 }
 
-p2p-path = "direct" / "relayed" / "hole-punched" / "relay-fallback"
+p2p-active-session = {
+  sequence: uint,
+  peer_id: tstr,
+  path: p2p-path,
+  direction: p2p-session-direction,
+  opened_at_unix_seconds: uint
+}
+
+p2p-session-history = {
+  sequence: uint,
+  peer_id: tstr,
+  path: p2p-path,
+  direction: p2p-session-direction,
+  opened_at_unix_seconds: uint,
+  closed_at_unix_seconds: uint,
+  duration_millis: uint,
+  outcome: "closed" / "collapsed" / "transport-error"
+}
+
+p2p-path-metrics = {
+  path: p2p-path,
+  sessions_opened: uint,
+  sessions_closed: uint,
+  dial_failures: uint,
+  requests_succeeded: uint,
+  requests_failed: uint,
+  request_latency_millis_total: uint,
+  application_bytes_sent: uint,
+  application_bytes_received: uint
+}
+
+p2p-session-direction = "inbound" / "outbound"
+
+p2p-path = "direct" / "relayed" / "hole-punched" / "relay-fallback" / "tor"
 
 guild-summary = {
   format_version: uint,

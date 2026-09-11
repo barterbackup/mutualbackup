@@ -1093,6 +1093,7 @@ p2p_relay_addresses = $relay
 enable_relay_server = $relay_server
 enable_hole_punching = true
 enable_dht_maintenance = true
+tor_mode = "disable-tor"
 max_connections = 32
 EOF
     sync "$temporary"
@@ -1130,6 +1131,7 @@ p2p_relay_addresses = $relay
 enable_relay_server = $relay_server
 enable_hole_punching = true
 enable_dht_maintenance = true
+tor_mode = "disable-tor"
 max_connections = 32
 EOF
     sync "$temporary"

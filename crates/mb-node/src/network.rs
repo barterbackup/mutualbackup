@@ -45,13 +45,21 @@ use crate::{
 };
 
 mod p2p;
+mod tor;
 mod wire;
 pub(crate) use p2p::restore_snapshot_with_p2p;
 pub use p2p::{
-    DhtRecord, DhtRecoveryResult, P2pClient, P2pConfig, P2pEventLoop, P2pPath, P2pPathTransfer,
-    P2pPeerProfile, P2pPeerStatus, P2pStartup, P2pStartupReceiver, P2pStatus, build_p2p,
-    endpoint_record_key, recover_from_dht, recovery_bundle_key, recovery_mailbox_key,
-    run_coordinator_jobs, run_dht_publications, run_relay_membership_sync,
+    DhtRecord, DhtRecoveryResult, P2pActiveSession, P2pClient, P2pConfig, P2pEventLoop, P2pPath,
+    P2pPathMetrics, P2pPathTransfer, P2pPeerProfile, P2pPeerStatus, P2pSessionDirection,
+    P2pSessionHistory, P2pSessionOutcome, P2pStartup, P2pStartupReceiver, P2pStatus, build_p2p,
+    build_p2p_with_tor, endpoint_record_key, recover_from_dht, recovery_bundle_key,
+    recovery_mailbox_key, run_coordinator_jobs, run_dht_publications, run_peer_exchange,
+    run_relay_membership_sync,
+};
+pub use tor::{
+    ONION_SERVICE_PORT, TorMode, TorTransport, TorTransportConfig, is_onion_address,
+    onion_address_matches_node, onion_address_matches_peer, onion_listener_address,
+    wait_for_onion_service_shutdown,
 };
 use wire::*;
 
@@ -840,6 +848,9 @@ fn execute_read_request(
         PeerRequest::GetGuildGenesis { guild_id } => Ok(PeerResponse::GuildGenesis(Box::new(
             node.installed_guild_certificate(guild_id)?,
         ))),
+        PeerRequest::ExchangeEndpoints { guild_id } => Ok(PeerResponse::EndpointRecords(
+            node.peer_exchange_endpoints(guild_id)?,
+        )),
         _ => bail!("mutation was sent to a read-only node worker"),
     }
 }
@@ -983,6 +994,9 @@ fn execute_peer_request(
         }
         PeerRequest::GetGuildGenesis { .. } => {
             bail!("guild genesis read was sent to a mutation worker")
+        }
+        PeerRequest::ExchangeEndpoints { .. } => {
+            bail!("endpoint exchange was sent to a mutation worker")
         }
         #[cfg(test)]
         PeerRequest::BuildRecoveryRecord {

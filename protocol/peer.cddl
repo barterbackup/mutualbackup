@@ -40,6 +40,7 @@ peer-request =
   / { "SubmitBackup": { descriptor: backup-descriptor } }
   / { "BackupStatus": { guild_id: bytes32-array, revision_id: uuid-bytes } }
   / { "GetGuildGenesis": { guild_id: bytes32-array } }
+  / { "ExchangeEndpoints": { guild_id: bytes32-array } }
   / { "GetPreparedRevisionPage": { guild_id: bytes32-array, revision_id: uuid-bytes, page_index: uint } }
   / { "EnsureFiller": { guild_id: bytes32-array, revision_id: uuid-bytes, ordinal: uint } }
   / { "GetSector": { guild_id: bytes32-array, sector_id: bytes32-array } }
@@ -73,6 +74,7 @@ peer-response =
   / { "BackupJob": backup-job }
   / { "StorageAcknowledgement": signed-storage-ack }
   / { "GuildGenesis": quorum-guild-genesis }
+  / { "EndpointRecords": [* signed-endpoint-record] }
   / { "CheckpointPage": { total_pages: uint, page_hash: bytes32-array, bytes: byte-vector } }
   / "Ack"
 
@@ -169,6 +171,20 @@ storage-ack = {
 signed-storage-ack = {
   signer: bytes32-array,
   value: storage-ack,
+  signature: bytes64-array
+}
+
+endpoint-record = {
+  format_version: 1,
+  publisher: bytes32-array,
+  sequence: uint,
+  expires_at_unix_seconds: uint,
+  endpoints: [* tstr]
+}
+
+signed-endpoint-record = {
+  signer: bytes32-array,
+  value: endpoint-record,
   signature: bytes64-array
 }
 

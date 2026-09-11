@@ -243,6 +243,11 @@ async fn main() -> Result<()> {
                     "relay reservations: {}/{}",
                     network.relay_reservations_active, network.relay_reservations_configured
                 );
+                println!("Tor mode:        {}", network.tor_mode);
+                println!(
+                    "onion service:   configured={} reachable={}",
+                    network.onion_service_configured, network.onion_service_reachable
+                );
                 for reason in network.degraded {
                     println!("network degraded: {reason}");
                 }
@@ -251,6 +256,30 @@ async fn main() -> Result<()> {
                 }
                 for address in network.advertised_addresses {
                     println!("advertised address: {address}");
+                }
+                for metrics in network.path_metrics {
+                    println!(
+                        "path metrics: {:?} sessions={}/{} dial-failures={} requests={}/{} latency-ms-total={} sent={} received={}",
+                        metrics.path,
+                        metrics.sessions_opened,
+                        metrics.sessions_closed,
+                        metrics.dial_failures,
+                        metrics.requests_succeeded,
+                        metrics.requests_failed,
+                        metrics.request_latency_millis_total,
+                        metrics.application_bytes_sent,
+                        metrics.application_bytes_received
+                    );
+                }
+                for session in network.active_sessions {
+                    println!(
+                        "active session: #{} {} {:?} {:?} opened={}",
+                        session.sequence,
+                        session.peer_id,
+                        session.path,
+                        session.direction,
+                        session.opened_at_unix_seconds
+                    );
                 }
                 for peer in network.peers {
                     println!(
@@ -270,6 +299,18 @@ async fn main() -> Result<()> {
                             transfer.application_bytes_received
                         );
                     }
+                }
+                let history_skip = network.recent_sessions.len().saturating_sub(20);
+                for session in network.recent_sessions.into_iter().skip(history_skip) {
+                    println!(
+                        "recent session: #{} {} {:?} {:?} outcome={:?} duration-ms={}",
+                        session.sequence,
+                        session.peer_id,
+                        session.path,
+                        session.direction,
+                        session.outcome,
+                        session.duration_millis
+                    );
                 }
             }
         }

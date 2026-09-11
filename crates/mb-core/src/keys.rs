@@ -46,6 +46,11 @@ impl NodeId {
         let public = libp2p_identity::ed25519::PublicKey::try_from_bytes(&self.0)?;
         Ok(libp2p_identity::PublicKey::from(public).to_peer_id())
     }
+
+    /// Return the v3 onion hostname whose identity key is this Node ID.
+    pub fn onion_hostname(&self) -> String {
+        onion_hostname_from_public_key(&self.0)
+    }
 }
 
 /// Public key used to encrypt cold-recovery locators and key envelopes.
@@ -240,7 +245,13 @@ impl KeyMaterial {
     }
 
     pub fn onion_hostname(&self) -> String {
-        onion_hostname_from_public_key(&self.signing.verifying_key().to_bytes())
+        self.node_id().onion_hostname()
+    }
+
+    /// Copy the common Ed25519 identity seed into a short-lived zeroizing
+    /// buffer for Arti's in-memory hidden-service key injection.
+    pub fn onion_identity_seed(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.signing.to_bytes())
     }
 }
 

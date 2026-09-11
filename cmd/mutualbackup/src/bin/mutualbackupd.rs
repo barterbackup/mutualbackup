@@ -5,8 +5,10 @@ use anyhow::{Context, Result};
 use libp2p::Multiaddr;
 use mb_node::{
     LocalControlListener, LocalRequest, LocalResponse, LockedDataDir, Node, P2pConfig, P2pStartup,
-    UnlockSecret, WireError, bind_local_control, build_p2p, run_coordinator_jobs,
-    run_dht_publications, run_relay_membership_sync, run_root_watcher, serve_local_control_on,
+    TorTransport, TorTransportConfig, UnlockSecret, WireError, bind_local_control,
+    build_p2p_with_tor, onion_listener_address, run_coordinator_jobs, run_dht_publications,
+    run_peer_exchange, run_relay_membership_sync, run_root_watcher, serve_local_control_on,
+    wait_for_onion_service_shutdown,
 };
 use mutualbackup::{
     DaemonOptions, DaemonOptionsError, IdentityManifest, InitializationIntent, read_daemon_options,
@@ -83,8 +85,11 @@ async fn main() -> Result<()> {
     let node_id = identity.expected_node_id;
     println!("node {node_id} ready");
     println!(
-        "network ingress: direct={} relay={} degraded={:?}",
-        startup.direct_listeners_active, startup.relay_reservations_active, startup.degraded
+        "network ingress: direct={} relay={} onion={} degraded={:?}",
+        startup.direct_listeners_active,
+        startup.relay_reservations_active,
+        startup.onion_service_reachable,
+        startup.degraded
     );
     println!("libp2p peer id: {}", p2p_client.local_peer_id());
     println!("control socket: {}", config.control_socket.display());
@@ -93,6 +98,7 @@ async fn main() -> Result<()> {
         result = serve_local_control_on(node.clone(), p2p_client.clone(), listener) => result,
         result = run_coordinator_jobs(node.clone(), p2p_client.clone()) => result,
         result = run_dht_publications(node.clone(), p2p_client.clone()), if config.enable_dht_maintenance => result,
+        result = run_peer_exchange(node.clone(), p2p_client.clone()) => result,
         result = run_relay_membership_sync(node.clone(), p2p_client.clone()) => result,
         result = run_root_watcher(node.clone()) => result,
         result = &mut p2p_task => result.context("libp2p event-loop task failed")?,
@@ -113,46 +119,74 @@ async fn start_ready_runtime(
     tokio::task::JoinHandle<Result<()>>,
     P2pStartup,
 )> {
-    let (node, client, mut event_loop) = start_node_runtime(config, identity, node)?;
+    let (node, client, mut event_loop) = start_node_runtime(config, identity, node).await?;
     let startup_receiver = event_loop.take_startup_receiver()?;
     let task = tokio::spawn(event_loop.run());
-    let startup = match tokio::time::timeout(Duration::from_secs(30), startup_receiver).await {
+    let startup_timeout = if config.tor_mode.enabled() {
+        Duration::from_secs(180)
+    } else {
+        Duration::from_secs(30)
+    };
+    let startup = match tokio::time::timeout(startup_timeout, startup_receiver).await {
         Ok(Ok(Ok(startup))) => startup,
         Ok(Ok(Err(error))) => {
-            task.abort();
-            let _ = task.await;
+            stop_failed_network_runtime(task, config).await?;
             anyhow::bail!("libp2p startup failed: {error}");
         }
         Ok(Err(_)) => {
             let result = task
                 .await
                 .context("libp2p event-loop task failed before startup")?;
+            wait_for_failed_tor_shutdown(config).await?;
             return Err(result
                 .err()
                 .unwrap_or_else(|| anyhow::anyhow!("libp2p event loop stopped before startup")));
         }
         Err(_) => {
-            task.abort();
-            let _ = task.await;
-            anyhow::bail!("libp2p startup timed out after 30 seconds");
+            stop_failed_network_runtime(task, config).await?;
+            anyhow::bail!(
+                "libp2p startup timed out after {} seconds",
+                startup_timeout.as_secs()
+            );
         }
     };
     Ok((node, client, task, startup))
 }
 
-fn start_node_runtime(
+async fn stop_failed_network_runtime(
+    task: tokio::task::JoinHandle<Result<()>>,
+    config: &DaemonOptions,
+) -> Result<()> {
+    task.abort();
+    let _ = task.await;
+    wait_for_failed_tor_shutdown(config).await
+}
+
+async fn wait_for_failed_tor_shutdown(config: &DaemonOptions) -> Result<()> {
+    if config.tor_mode.enabled() {
+        wait_for_onion_service_shutdown(&config.effective_tor_state_dir())
+            .await
+            .context("wait for failed Arti runtime to release its state")?;
+    }
+    Ok(())
+}
+
+async fn start_node_runtime(
     config: &DaemonOptions,
     identity: &IdentityManifest,
     node: Node,
 ) -> Result<(Arc<Mutex<Node>>, mb_node::P2pClient, mb_node::P2pEventLoop)> {
+    let onion_endpoint = onion_listener_address(identity.expected_node_id)?;
     let direct_endpoint = config
         .p2p_external_addresses
         .first()
         .or_else(|| config.p2p_listen_addresses.first())
         .cloned();
-    let public_endpoint = match direct_endpoint {
-        Some(endpoint) => endpoint,
-        None => format!(
+    let public_endpoint = match (config.tor_mode.requires_tor(), direct_endpoint) {
+        (true, _) => onion_endpoint.to_string(),
+        (false, Some(endpoint)) => endpoint,
+        (false, None) if config.tor_mode.enabled() => onion_endpoint.to_string(),
+        (false, None) => format!(
             "{}/p2p-circuit/p2p/{}",
             config
                 .p2p_relay_addresses
@@ -162,12 +196,35 @@ fn start_node_runtime(
         ),
     };
     let failure_domain = config.effective_failure_domain(identity);
+    // Finish all fallible option parsing before launching Arti. There is no
+    // asynchronous service to drain if one of these operator values is bad.
+    let listen_addresses = parse_addresses(&config.p2p_listen_addresses)?;
+    let external_addresses = parse_addresses(&config.p2p_external_addresses)?;
+    let bootstrap_addresses = parse_addresses(&config.p2p_bootstrap_addresses)?;
+    let relay_reservation_addresses = parse_addresses(&config.p2p_relay_addresses)?;
+    let tor_transport = if config.tor_mode.enabled() {
+        Some(
+            TorTransport::new(
+                TorTransportConfig {
+                    state_dir: config.effective_tor_state_dir(),
+                    cache_dir: config.effective_tor_cache_dir(),
+                    arti_config_file: config.arti_config_file.clone(),
+                    max_inbound_streams: config.max_connections,
+                },
+                node.keys().onion_identity_seed(),
+                identity.expected_node_id,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let node = Arc::new(Mutex::new(node));
     let p2p_config = P2pConfig {
-        listen_addresses: parse_addresses(&config.p2p_listen_addresses)?,
-        external_addresses: parse_addresses(&config.p2p_external_addresses)?,
-        bootstrap_addresses: parse_addresses(&config.p2p_bootstrap_addresses)?,
-        relay_reservation_addresses: parse_addresses(&config.p2p_relay_addresses)?,
+        listen_addresses,
+        external_addresses,
+        bootstrap_addresses,
+        relay_reservation_addresses,
         enable_dht_maintenance: config.enable_dht_maintenance,
         enable_relay_server: config.enable_relay_server,
         enable_hole_punching: config.enable_hole_punching,
@@ -175,8 +232,16 @@ fn start_node_runtime(
         failure_domain,
         configure_failure_domain: identity.intent == InitializationIntent::New,
         max_connections: config.max_connections,
+        tor_mode: config.tor_mode,
     };
-    let (p2p_client, p2p_event_loop) = build_p2p(node.clone(), p2p_config)?;
+    let (p2p_client, p2p_event_loop) =
+        match build_p2p_with_tor(node.clone(), p2p_config, tor_transport) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                wait_for_failed_tor_shutdown(config).await?;
+                return Err(error);
+            }
+        };
     Ok((node, p2p_client, p2p_event_loop))
 }
 

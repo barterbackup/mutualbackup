@@ -11,10 +11,11 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-rust-version = "1.88"
+rust-version = "1.91"
 
 [workspace.dependencies]
 anyhow = "1.0"
+arti-client = { version = "=0.46.0", default-features = false, features = ["compression", "ephemeral-keystore", "experimental-api", "onion-service-client", "onion-service-service", "rustls", "tokio"] }
 argon2 = { version = "0.5", features = ["zeroize"] }
 bip39 = { version = "=2.2.2", features = ["rand", "zeroize"] }
 blake3 = "1.8"
@@ -48,6 +49,15 @@ tempfile = "3.21"
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9"
+tor-config = "=0.46.0"
+tor-config-path = "=0.46.0"
+tor-cell = "=0.46.0"
+tor-hscrypto = "=0.46.0"
+tor-hsservice = "=0.46.0"
+tor-keymgr = "=0.46.0"
+tor-llcrypto = "=0.46.0"
+tor-proto = "=0.46.0"
+tor-rtcompat = { version = "=0.46.0", default-features = false, features = ["rustls", "tokio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }

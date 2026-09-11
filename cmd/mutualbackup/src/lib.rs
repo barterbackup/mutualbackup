@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use conf::Conf;
 use mb_core::{NodeId, Seed};
+use mb_node::TorMode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -108,6 +109,22 @@ pub struct DaemonOptions {
     #[conf(parameter, long, default(true))]
     pub enable_dht_maintenance: bool,
 
+    /// Onion routing policy for inbound and outbound peer sessions.
+    #[conf(parameter, long, default(TorMode::Auto))]
+    pub tor_mode: TorMode,
+
+    /// Persistent Arti state directory; defaults below the node data directory.
+    #[conf(parameter, long)]
+    pub tor_state_dir: Option<PathBuf>,
+
+    /// Persistent Arti cache directory; defaults below the node data directory.
+    #[conf(parameter, long)]
+    pub tor_cache_dir: Option<PathBuf>,
+
+    /// Optional Arti TOML configuration, including private-network authorities.
+    #[conf(parameter, long)]
+    pub arti_config_file: Option<PathBuf>,
+
     /// Bound for established libp2p sessions and concurrent peer workers.
     #[conf(parameter, long, default(DEFAULT_MAX_CONNECTIONS))]
     pub max_connections: usize,
@@ -148,8 +165,11 @@ impl DaemonOptions {
         if self.parity_budget_bytes == 0 {
             bail!("parity_budget_bytes must be greater than zero");
         }
-        if self.p2p_listen_addresses.is_empty() && self.p2p_relay_addresses.is_empty() {
-            bail!("at least one --listen or --relay address is required");
+        if self.tor_mode == TorMode::DisableTor
+            && self.p2p_listen_addresses.is_empty()
+            && self.p2p_relay_addresses.is_empty()
+        {
+            bail!("at least one --listen or --relay address is required when Tor is disabled");
         }
         if self.max_connections == 0 {
             bail!("max_connections must be greater than zero");
@@ -159,6 +179,11 @@ impl DaemonOptions {
         {
             bail!("daemon paths must be distinct");
         }
+        let tor_state = resolve_path_with_missing_suffix(&self.effective_tor_state_dir())?;
+        let tor_cache = resolve_path_with_missing_suffix(&self.effective_tor_cache_dir())?;
+        if tor_state == tor_cache {
+            bail!("Tor state and cache directories must be distinct");
+        }
         Ok(())
     }
 
@@ -167,6 +192,18 @@ impl DaemonOptions {
             InitializationIntent::New => self.failure_domain.clone().unwrap_or_default(),
             InitializationIntent::Recovery => String::new(),
         }
+    }
+
+    pub fn effective_tor_state_dir(&self) -> PathBuf {
+        self.tor_state_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("tor/state"))
+    }
+
+    pub fn effective_tor_cache_dir(&self) -> PathBuf {
+        self.tor_cache_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("tor/cache"))
     }
 }
 
@@ -722,7 +759,14 @@ fn resolve_document_paths(document: &mut toml::Value, base: &Path) -> Result<()>
     let table = document
         .as_table_mut()
         .context("daemon config must be a TOML table")?;
-    for key in ["data_dir", "seed_file", "control_socket"] {
+    for key in [
+        "data_dir",
+        "seed_file",
+        "control_socket",
+        "tor_state_dir",
+        "tor_cache_dir",
+        "arti_config_file",
+    ] {
         let Some(value) = table.get_mut(key) else {
             continue;
         };
@@ -962,6 +1006,15 @@ p2p_listen_addresses = ["/ip4/127.0.0.1/udp/1/quic-v1"]
         assert_eq!(loaded.parity_budget_bytes, DEFAULT_PARITY_BUDGET_BYTES);
         assert!(loaded.enable_hole_punching);
         assert!(loaded.enable_dht_maintenance);
+        assert_eq!(loaded.tor_mode, TorMode::Auto);
+        assert_eq!(
+            loaded.effective_tor_state_dir(),
+            Path::new("state/tor/state")
+        );
+        assert_eq!(
+            loaded.effective_tor_cache_dir(),
+            Path::new("state/tor/cache")
+        );
         assert_eq!(
             loaded.p2p_bootstrap_addresses,
             [
@@ -969,6 +1022,44 @@ p2p_listen_addresses = ["/ip4/127.0.0.1/udp/1/quic-v1"]
                 "/ip4/127.0.0.1/udp/3/quic-v1"
             ]
         );
+    }
+
+    #[test]
+    fn tor_only_daemon_needs_no_ip_listener_and_resolves_arti_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("node.toml");
+        fs::write(
+            &config_path,
+            r#"
+data_dir = "state"
+failure_domain = "disk-a"
+tor_mode = "require-tor"
+tor_state_dir = "tor-state"
+tor_cache_dir = "tor-cache"
+arti_config_file = "private-tor.toml"
+"#,
+        )
+        .unwrap();
+        let loaded = read_daemon_options([
+            OsString::from("mutualbackupd"),
+            OsString::from("--config"),
+            config_path.into_os_string(),
+        ])
+        .unwrap();
+        assert_eq!(loaded.tor_mode, TorMode::RequireTor);
+        assert_eq!(loaded.tor_state_dir, Some(temp.path().join("tor-state")));
+        assert_eq!(loaded.tor_cache_dir, Some(temp.path().join("tor-cache")));
+        assert_eq!(
+            loaded.arti_config_file,
+            Some(temp.path().join("private-tor.toml"))
+        );
+        let seed = Seed::from_recovery_string("correct-horse-battery-staple-2026!").unwrap();
+        let identity = IdentityManifest {
+            format_version: 1,
+            expected_node_id: mb_core::KeyMaterial::from_seed(&seed).node_id(),
+            intent: InitializationIntent::New,
+        };
+        loaded.validate(&identity).unwrap();
     }
 
     #[test]

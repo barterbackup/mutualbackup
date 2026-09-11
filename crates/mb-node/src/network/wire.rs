@@ -1,6 +1,6 @@
 use mb_core::{
-    CodingGroup, GuildGenesis, GuildInvite, Member, MemberSignature, NodeId, QuorumGuildGenesis,
-    SectorId, SectorRef, SignedRecord, StorageAcknowledgement,
+    CodingGroup, EndpointRecord, GuildGenesis, GuildInvite, Member, MemberSignature, NodeId,
+    QuorumGuildGenesis, SectorId, SectorRef, SignedRecord, StorageAcknowledgement,
 };
 use mb_store::ParityObject;
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,9 @@ pub(super) enum PeerRequest {
         revision_id: Uuid,
     },
     GetGuildGenesis {
+        guild_id: [u8; 32],
+    },
+    ExchangeEndpoints {
         guild_id: [u8; 32],
     },
     #[cfg(test)]
@@ -152,6 +155,7 @@ impl PeerRequest {
                 | Self::GetCheckpointPage { .. }
                 | Self::BackupStatus { .. }
                 | Self::GetGuildGenesis { .. }
+                | Self::ExchangeEndpoints { .. }
         )
     }
 
@@ -163,7 +167,8 @@ impl PeerRequest {
             | Self::GetPreparedRevisionPage { .. }
             | Self::GetCheckpointPage { .. }
             | Self::BackupStatus { .. }
-            | Self::GetGuildGenesis { .. } => None,
+            | Self::GetGuildGenesis { .. }
+            | Self::ExchangeEndpoints { .. } => None,
             #[cfg(test)]
             Self::BeginCommit { .. } => Some("begin-commit"),
             Self::JoinGuild { .. } => Some("join-guild"),
@@ -204,6 +209,7 @@ impl PeerRequest {
             | Self::FinalizeCheckpoint { guild_id, .. }
             | Self::GetCheckpointPage { guild_id, .. }
             | Self::BackupStatus { guild_id, .. } => Some(*guild_id),
+            Self::ExchangeEndpoints { guild_id } => Some(*guild_id),
             #[cfg(test)]
             Self::PrepareSource { guild_id, .. }
             | Self::CompleteCommit { guild_id, .. }
@@ -255,6 +261,7 @@ pub(super) enum PeerResponse {
     BackupJob(BackupJob),
     StorageAcknowledgement(SignedRecord<StorageAcknowledgement>),
     GuildGenesis(Box<QuorumGuildGenesis>),
+    EndpointRecords(Vec<SignedRecord<EndpointRecord>>),
     CheckpointPage {
         total_pages: u32,
         page_hash: [u8; 32],

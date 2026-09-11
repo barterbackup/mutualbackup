@@ -1,14 +1,16 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, stream::FuturesUnordered};
-use libp2p::core::transport::ListenerId;
+use libp2p::core::transport::{ListenerId, OptionalTransport};
+use libp2p::core::{ConnectedPoint, Transport as _, upgrade};
 use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::behaviour::{FromSwarm, NewExternalAddrCandidate};
+use libp2p::swarm::dial_opts::{DialOpts as SwarmDialOpts, PeerCondition};
 use libp2p::swarm::{ConnectionId, NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder, autonat, dcutr, identify, kad, noise, ping, relay,
@@ -30,11 +32,16 @@ use uuid::Uuid;
 
 use crate::node::{CheckpointRecoveryObservation, DhtRecordObservation, GuildPhase, SnapshotInfo};
 
+#[cfg(test)]
+use super::onion_listener_address;
 use super::{
     BackupDescriptor, BackupJob, CheckpointObjectKind, DhtSequenceFloors, GuildPeer,
     MAX_PEER_FRAME_BYTES, Node, NodeServerConfig, NodeService, PEER_RESPONSE_DOMAIN, PeerRequest,
     PeerRequestEnvelope, PeerResponse, PeerResponseEnvelope, checked_catalog_page_count,
     make_peer_request, peer_error_response, process_peer_request, storage_operation_id,
+};
+use super::{
+    TorMode, TorTransport, is_onion_address, onion_address_matches_node, onion_address_matches_peer,
 };
 
 const P2P_PROTOCOL: StreamProtocol = StreamProtocol::new("/mutualbackup/peer/1");
@@ -61,6 +68,10 @@ const MAX_RELAY_RESERVATIONS: usize = 5;
 const MAX_RELAY_CIRCUITS: usize = 8;
 const MAX_RELAY_CIRCUIT_BYTES: u64 = 8 * 1024 * 1024;
 const SHARD_FETCH_ATTEMPTS: usize = 3;
+const PEER_EXCHANGE_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_EXCHANGED_ENDPOINT_RECORDS: usize = 64;
+const PREFERRED_PATH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_SESSION_HISTORY: usize = 256;
 
 type RelayMembers = Arc<RwLock<BTreeSet<PeerId>>>;
 
@@ -77,6 +88,7 @@ pub struct P2pConfig {
     pub failure_domain: String,
     pub configure_failure_domain: bool,
     pub max_connections: usize,
+    pub tor_mode: TorMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -94,6 +106,7 @@ pub enum P2pPath {
     Relayed,
     HolePunched,
     RelayFallback,
+    Tor,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -113,6 +126,55 @@ pub struct P2pPeerStatus {
     pub path_transfers: Vec<P2pPathTransfer>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum P2pSessionDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum P2pSessionOutcome {
+    Closed,
+    Collapsed,
+    TransportError,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct P2pActiveSession {
+    pub sequence: u64,
+    pub peer_id: String,
+    pub path: P2pPath,
+    pub direction: P2pSessionDirection,
+    pub opened_at_unix_seconds: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct P2pSessionHistory {
+    pub sequence: u64,
+    pub peer_id: String,
+    pub path: P2pPath,
+    pub direction: P2pSessionDirection,
+    pub opened_at_unix_seconds: u64,
+    pub closed_at_unix_seconds: u64,
+    pub duration_millis: u64,
+    pub outcome: P2pSessionOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct P2pPathMetrics {
+    pub path: P2pPath,
+    pub sessions_opened: u64,
+    pub sessions_closed: u64,
+    pub dial_failures: u64,
+    pub requests_succeeded: u64,
+    pub requests_failed: u64,
+    pub request_latency_millis_total: u64,
+    pub application_bytes_sent: u64,
+    pub application_bytes_received: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct P2pStatus {
     pub peer_id: String,
@@ -121,16 +183,23 @@ pub struct P2pStatus {
     pub direct_listeners_active: usize,
     pub relay_reservations_configured: usize,
     pub relay_reservations_active: usize,
+    pub tor_mode: TorMode,
+    pub onion_service_configured: bool,
+    pub onion_service_reachable: bool,
     pub degraded: Vec<String>,
     pub listen_addresses: Vec<String>,
     pub advertised_addresses: Vec<String>,
     pub peers: Vec<P2pPeerStatus>,
+    pub active_sessions: Vec<P2pActiveSession>,
+    pub recent_sessions: Vec<P2pSessionHistory>,
+    pub path_metrics: Vec<P2pPathMetrics>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct P2pStartup {
     pub direct_listeners_active: usize,
     pub relay_reservations_active: usize,
+    pub onion_service_reachable: bool,
     pub degraded: Vec<String>,
 }
 
@@ -169,6 +238,9 @@ pub struct P2pEventLoop {
     direct_listeners: HashMap<ListenerId, Multiaddr>,
     active_direct_listeners: HashSet<ListenerId>,
     closed_direct_listeners: HashSet<ListenerId>,
+    tor_mode: TorMode,
+    tor_listener: Option<(ListenerId, Multiaddr)>,
+    active_tor_listener: bool,
     bootstrap_addresses: Vec<Multiaddr>,
     enable_dht_maintenance: bool,
     bootstrap_retry: tokio::time::Interval,
@@ -180,11 +252,21 @@ pub struct P2pEventLoop {
     relay_retirement_tick: tokio::time::Interval,
     relay_members: RelayMembers,
     persistent_addresses: HashMap<PeerId, BTreeSet<Multiaddr>>,
+    installed_policy_addresses: HashMap<PeerId, BTreeSet<Multiaddr>>,
+    fallback_tiers: HashMap<PeerId, u8>,
+    preferred_path_retry: tokio::time::Interval,
     learned_addresses: HashMap<PeerId, LearnedAddresses>,
     recovery_addresses: HashMap<Uuid, RecoveryAddresses>,
     recovery_quarantine: HashMap<PeerId, tokio::time::Instant>,
     learned_endpoint_expiry: tokio::time::Interval,
     connection_paths: HashMap<ConnectionId, (PeerId, P2pPath)>,
+    connection_dialers: HashMap<ConnectionId, bool>,
+    duplicate_retirement: HashMap<ConnectionId, (PeerId, tokio::time::Instant)>,
+    next_session_sequence: u64,
+    sessions: HashMap<ConnectionId, SessionRuntime>,
+    recent_sessions: VecDeque<P2pSessionHistory>,
+    path_metrics: BTreeMap<P2pPath, PathMetrics>,
+    collapsing_connections: HashSet<ConnectionId>,
     last_application_paths: HashMap<PeerId, P2pPath>,
     transfer_counters: HashMap<PeerId, TransferCounters>,
     path_transfer_counters: HashMap<PeerId, BTreeMap<P2pPath, TransferCounters>>,
@@ -275,6 +357,7 @@ struct PendingRequest {
     request_id: [u8; 16],
     request_hash: [u8; 32],
     request_bytes: u64,
+    started_at: tokio::time::Instant,
     response: oneshot::Sender<Result<PeerResponse>>,
     _permit: OwnedSemaphorePermit,
 }
@@ -321,6 +404,27 @@ struct LearnedAddresses {
 struct RecoveryAddresses {
     addresses: HashMap<PeerId, BTreeSet<Multiaddr>>,
     expires_at: tokio::time::Instant,
+}
+
+struct SessionRuntime {
+    sequence: u64,
+    peer: PeerId,
+    path: P2pPath,
+    direction: P2pSessionDirection,
+    opened_at_unix_seconds: u64,
+    opened_at: tokio::time::Instant,
+}
+
+#[derive(Default)]
+struct PathMetrics {
+    sessions_opened: u64,
+    sessions_closed: u64,
+    dial_failures: u64,
+    requests_succeeded: u64,
+    requests_failed: u64,
+    request_latency_millis_total: u64,
+    application_bytes_sent: u64,
+    application_bytes_received: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -381,10 +485,142 @@ fn merge_established_path(recorded: Option<P2pPath>, generic: P2pPath) -> P2pPat
     }
 }
 
-pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient, P2pEventLoop)> {
-    if config.listen_addresses.is_empty() && config.relay_reservation_addresses.is_empty()
+fn address_allowed_by_tor_mode(mode: TorMode, address: &Multiaddr) -> bool {
+    match mode {
+        TorMode::DisableTor => !is_onion_address(address),
+        TorMode::RequireTor => is_onion_address(address),
+        TorMode::Auto | TorMode::PreferTor => true,
+    }
+}
+
+fn path_preference_rank(mode: TorMode, path: P2pPath) -> u8 {
+    match mode {
+        TorMode::Auto => match path {
+            P2pPath::Direct | P2pPath::HolePunched => 0,
+            P2pPath::Relayed | P2pPath::RelayFallback => 1,
+            P2pPath::Tor => 2,
+        },
+        TorMode::PreferTor => match path {
+            P2pPath::Tor => 0,
+            P2pPath::Direct | P2pPath::HolePunched => 1,
+            P2pPath::Relayed | P2pPath::RelayFallback => 2,
+        },
+        TorMode::RequireTor => u8::from(path != P2pPath::Tor),
+        TorMode::DisableTor => match path {
+            P2pPath::Direct | P2pPath::HolePunched => 0,
+            P2pPath::Relayed | P2pPath::RelayFallback => 1,
+            P2pPath::Tor => 2,
+        },
+    }
+}
+
+fn address_path(address: &Multiaddr) -> P2pPath {
+    if is_onion_address(address) {
+        P2pPath::Tor
+    } else if address
+        .iter()
+        .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2pCircuit))
+    {
+        P2pPath::Relayed
+    } else {
+        P2pPath::Direct
+    }
+}
+
+fn policy_address_tiers(
+    mode: TorMode,
+    addresses: impl IntoIterator<Item = Multiaddr>,
+) -> BTreeMap<u8, BTreeSet<Multiaddr>> {
+    let mut tiers = BTreeMap::<u8, BTreeSet<Multiaddr>>::new();
+    for address in addresses {
+        if !address_allowed_by_tor_mode(mode, &address) {
+            continue;
+        }
+        tiers
+            .entry(path_preference_rank(mode, address_path(&address)))
+            .or_default()
+            .insert(address);
+    }
+    tiers
+}
+
+fn selected_policy_addresses(
+    mode: TorMode,
+    addresses: impl IntoIterator<Item = Multiaddr>,
+    requested_tier: u8,
+) -> (u8, BTreeSet<Multiaddr>) {
+    let tiers = policy_address_tiers(mode, addresses);
+    tiers
+        .range(requested_tier..)
+        .next()
+        .or_else(|| tiers.first_key_value())
+        .map(|(tier, addresses)| (*tier, addresses.clone()))
+        .unwrap_or((0, BTreeSet::new()))
+}
+
+fn connected_point_path(endpoint: &ConnectedPoint) -> P2pPath {
+    if endpoint.is_relayed() {
+        return P2pPath::Relayed;
+    }
+    let address = match endpoint {
+        ConnectedPoint::Dialer { address, .. } => address,
+        ConnectedPoint::Listener { local_addr, .. } => local_addr,
+    };
+    if is_onion_address(address) {
+        P2pPath::Tor
+    } else {
+        P2pPath::Direct
+    }
+}
+
+fn status_advertised_addresses(
+    configured: &[Multiaddr],
+    listen_addresses: &[String],
+) -> Vec<String> {
+    let mut advertised = if configured.is_empty() {
+        listen_addresses.to_vec()
+    } else {
+        let mut addresses = configured
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        addresses.extend(
+            listen_addresses
+                .iter()
+                .filter(|value| {
+                    value.contains("/p2p-circuit")
+                        || value
+                            .parse::<Multiaddr>()
+                            .is_ok_and(|address| is_onion_address(&address))
+                })
+                .cloned(),
+        );
+        addresses
+    };
+    advertised.sort();
+    advertised.dedup();
+    advertised
+}
+
+pub fn build_p2p(
+    node: Arc<Mutex<Node>>,
+    mut config: P2pConfig,
+) -> Result<(P2pClient, P2pEventLoop)> {
+    config.tor_mode = TorMode::DisableTor;
+    build_p2p_with_tor(node, config, None)
+}
+
+pub fn build_p2p_with_tor(
+    node: Arc<Mutex<Node>>,
+    config: P2pConfig,
+    tor_transport: Option<TorTransport>,
+) -> Result<(P2pClient, P2pEventLoop)> {
+    if config.listen_addresses.is_empty()
+        && config.relay_reservation_addresses.is_empty()
+        && tor_transport.is_none()
         || config.configure_failure_domain && config.failure_domain.is_empty()
         || config.max_connections == 0
+        || config.tor_mode.enabled() != tor_transport.is_some()
     {
         bail!("invalid libp2p configuration");
     }
@@ -430,9 +666,26 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
     relay_config
         .circuit_src_rate_limiters
         .push(guild_relay_admission(relay_members.clone()));
+    let tor_listen_address = tor_transport
+        .as_ref()
+        .map(|transport| transport.listen_address().clone());
+    let optional_tor = match tor_transport {
+        Some(transport) => OptionalTransport::some(transport),
+        None => OptionalTransport::none(),
+    };
     let mut swarm = SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_quic()
+        .with_other_transport(|key| {
+            let noise = noise::Config::new(key)
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                optional_tor
+                    .upgrade(upgrade::Version::V1Lazy)
+                    .authenticate(noise)
+                    .multiplex(yamux::Config::default()),
+            )
+        })?
         .with_relay_client(noise::Config::new, yamux::Config::default)?
         .with_behaviour(move |key, relay_client| {
             let peer_id = key.public().to_peer_id();
@@ -481,13 +734,29 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
         .build();
 
     let mut direct_listeners = HashMap::new();
-    for address in &config.listen_addresses {
+    for address in config
+        .listen_addresses
+        .iter()
+        .filter(|_| !config.tor_mode.requires_tor())
+    {
         let listener = swarm
             .listen_on(address.clone())
             .with_context(|| format!("cannot listen on {address}"))?;
         direct_listeners.insert(listener, address.clone());
     }
+    let tor_listener = match tor_listen_address {
+        Some(address) => {
+            let listener = swarm
+                .listen_on(address.clone())
+                .with_context(|| format!("cannot launch onion listener on {address}"))?;
+            Some((listener, address))
+        }
+        None => None,
+    };
     for address in &config.external_addresses {
+        if !address_allowed_by_tor_mode(config.tor_mode, address) {
+            continue;
+        }
         // DCUtR currently learns dial candidates from
         // `NewExternalAddrCandidate`, not `ExternalAddrConfirmed`. Feeding the
         // configured address through that lifecycle first also avoids Swarm's
@@ -500,20 +769,31 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
         swarm.add_external_address(address.clone());
     }
     let mut persistent_addresses = HashMap::<PeerId, BTreeSet<Multiaddr>>::new();
-    for address in &config.bootstrap_addresses {
-        let (peer, normalized) = add_address_to_swarm(&mut swarm, address.clone())?;
+    let bootstrap_addresses = config
+        .bootstrap_addresses
+        .iter()
+        .filter(|address| address_allowed_by_tor_mode(config.tor_mode, address))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut bootstrap_peers = BTreeSet::new();
+    for address in &bootstrap_addresses {
+        let peer = terminal_peer_id(address)?;
+        let normalized = normalize_known_address(peer, address.clone())?;
         persistent_addresses
             .entry(peer)
             .or_default()
             .insert(normalized);
-        if let Err(error) = swarm.dial(address.clone()) {
-            tracing::warn!(%address, %error, "initial libp2p dial was rejected");
-        }
+        bootstrap_peers.insert(peer);
     }
     let mut relay_reservations = Vec::new();
     let mut relay_listeners = HashMap::new();
-    for address in &config.relay_reservation_addresses {
-        let (peer, normalized) = add_address_to_swarm(&mut swarm, address.clone())?;
+    for address in config
+        .relay_reservation_addresses
+        .iter()
+        .filter(|_| !config.tor_mode.requires_tor())
+    {
+        let peer = terminal_peer_id(address)?;
+        let normalized = normalize_known_address(peer, address.clone())?;
         persistent_addresses
             .entry(peer)
             .or_default()
@@ -527,8 +807,45 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
         relay_reservations.push(reservation.clone());
         relay_listeners.insert(listener, reservation);
     }
+    let mut installed_policy_addresses = HashMap::new();
+    let mut fallback_tiers = HashMap::new();
+    for (peer, addresses) in &persistent_addresses {
+        let (selected_tier, selected) =
+            selected_policy_addresses(config.tor_mode, addresses.iter().cloned(), 0);
+        if selected_tier > 0 {
+            fallback_tiers.insert(*peer, selected_tier);
+        }
+        for address in &selected {
+            swarm.add_peer_address(*peer, address.clone());
+            swarm
+                .behaviour_mut()
+                .kademlia
+                .add_address(peer, address.clone());
+        }
+        if !selected.is_empty() {
+            installed_policy_addresses.insert(*peer, selected);
+        }
+    }
+    for peer in bootstrap_peers {
+        let addresses = installed_policy_addresses
+            .get(&peer)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            continue;
+        }
+        let dial = SwarmDialOpts::peer_id(peer)
+            .addresses(addresses)
+            .condition(PeerCondition::DisconnectedAndNotDialing)
+            .build();
+        if let Err(error) = swarm.dial(dial) {
+            tracing::warn!(%peer, %error, "initial libp2p dial was rejected");
+        }
+    }
     if config.enable_dht_maintenance
-        && !config.bootstrap_addresses.is_empty()
+        && !bootstrap_addresses.is_empty()
         && let Err(error) = swarm.behaviour_mut().kademlia.bootstrap()
     {
         tracing::warn!(%error, "initial Kademlia bootstrap could not start");
@@ -576,11 +893,18 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
             pending_dht: HashMap::new(),
             service,
             server_config,
-            advertised_addresses: config.external_addresses,
+            advertised_addresses: config
+                .external_addresses
+                .into_iter()
+                .filter(|address| address_allowed_by_tor_mode(config.tor_mode, address))
+                .collect(),
             direct_listeners,
             active_direct_listeners: HashSet::new(),
             closed_direct_listeners: HashSet::new(),
-            bootstrap_addresses: config.bootstrap_addresses,
+            tor_mode: config.tor_mode,
+            tor_listener,
+            active_tor_listener: false,
+            bootstrap_addresses,
             enable_dht_maintenance: config.enable_dht_maintenance,
             bootstrap_retry: retry_interval(BOOTSTRAP_RETRY_INTERVAL),
             relay_reservations,
@@ -591,11 +915,21 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
             relay_retirement_tick: retry_interval(RELAY_RETIREMENT_POLL_INTERVAL),
             relay_members,
             persistent_addresses,
+            installed_policy_addresses,
+            fallback_tiers,
+            preferred_path_retry: retry_interval(PREFERRED_PATH_RETRY_INTERVAL),
             learned_addresses: HashMap::new(),
             recovery_addresses: HashMap::new(),
             recovery_quarantine: HashMap::new(),
             learned_endpoint_expiry: retry_interval(LEARNED_ENDPOINT_EXPIRY_INTERVAL),
             connection_paths: HashMap::new(),
+            connection_dialers: HashMap::new(),
+            duplicate_retirement: HashMap::new(),
+            next_session_sequence: 1,
+            sessions: HashMap::new(),
+            recent_sessions: VecDeque::new(),
+            path_metrics: BTreeMap::new(),
+            collapsing_connections: HashSet::new(),
             last_application_paths: HashMap::new(),
             transfer_counters: HashMap::new(),
             path_transfer_counters: HashMap::new(),
@@ -702,6 +1036,23 @@ impl P2pClient {
             member: profile.member,
             endpoint: profile.endpoint,
         })
+    }
+
+    pub async fn exchange_endpoints(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+    ) -> Result<Vec<SignedRecord<mb_core::EndpointRecord>>> {
+        let response = self
+            .call(peer, PeerRequest::ExchangeEndpoints { guild_id })
+            .await?;
+        let PeerResponse::EndpointRecords(records) = response else {
+            bail!("peer returned the wrong response to endpoint exchange");
+        };
+        if records.len() > MAX_EXCHANGED_ENDPOINT_RECORDS {
+            bail!("peer returned too many endpoint records");
+        }
+        Ok(records)
     }
 
     pub async fn join_guild(
@@ -1174,6 +1525,12 @@ impl P2pEventLoop {
     }
 
     fn record_transfer(&mut self, peer: PeerId, path: Option<P2pPath>, sent: u64, received: u64) {
+        if let Some(path) = path {
+            let metrics = self.path_metrics.entry(path).or_default();
+            metrics.application_bytes_sent = metrics.application_bytes_sent.saturating_add(sent);
+            metrics.application_bytes_received =
+                metrics.application_bytes_received.saturating_add(received);
+        }
         if !self.retains_transfer_history(peer) {
             return;
         }
@@ -1190,6 +1547,99 @@ impl P2pEventLoop {
             by_path.sent = by_path.sent.saturating_add(sent);
             by_path.received = by_path.received.saturating_add(received);
         }
+    }
+
+    fn record_request_result(
+        &mut self,
+        path: Option<P2pPath>,
+        started_at: tokio::time::Instant,
+        succeeded: bool,
+    ) {
+        let Some(path) = path else {
+            return;
+        };
+        let metrics = self.path_metrics.entry(path).or_default();
+        if succeeded {
+            metrics.requests_succeeded = metrics.requests_succeeded.saturating_add(1);
+        } else {
+            metrics.requests_failed = metrics.requests_failed.saturating_add(1);
+        }
+        metrics.request_latency_millis_total = metrics
+            .request_latency_millis_total
+            .saturating_add(u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX));
+    }
+
+    fn record_session_open(
+        &mut self,
+        connection: ConnectionId,
+        peer: PeerId,
+        path: P2pPath,
+        direction: P2pSessionDirection,
+    ) {
+        let sequence = self.next_session_sequence;
+        self.next_session_sequence = self.next_session_sequence.saturating_add(1);
+        self.sessions.insert(
+            connection,
+            SessionRuntime {
+                sequence,
+                peer,
+                path,
+                direction,
+                opened_at_unix_seconds: unix_seconds(),
+                opened_at: tokio::time::Instant::now(),
+            },
+        );
+        let metrics = self.path_metrics.entry(path).or_default();
+        metrics.sessions_opened = metrics.sessions_opened.saturating_add(1);
+    }
+
+    fn update_session_path(&mut self, connection: ConnectionId, path: P2pPath) {
+        let Some(session) = self.sessions.get_mut(&connection) else {
+            return;
+        };
+        if session.path == path {
+            return;
+        }
+        let previous = session.path;
+        session.path = path;
+        // DCUtR reports the more precise classification for a connection that
+        // Swarm may already have announced as generic direct QUIC. Move that
+        // single opening between buckets instead of counting two sessions.
+        let previous_metrics = self.path_metrics.entry(previous).or_default();
+        previous_metrics.sessions_opened = previous_metrics.sessions_opened.saturating_sub(1);
+        let metrics = self.path_metrics.entry(path).or_default();
+        metrics.sessions_opened = metrics.sessions_opened.saturating_add(1);
+    }
+
+    fn record_session_close(&mut self, connection: ConnectionId, transport_error: bool) {
+        let Some(session) = self.sessions.remove(&connection) else {
+            return;
+        };
+        let outcome = if self.collapsing_connections.remove(&connection) {
+            P2pSessionOutcome::Collapsed
+        } else if transport_error {
+            P2pSessionOutcome::TransportError
+        } else {
+            P2pSessionOutcome::Closed
+        };
+        let duration_millis =
+            u64::try_from(session.opened_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let closed_at_unix_seconds = unix_seconds();
+        self.recent_sessions.push_back(P2pSessionHistory {
+            sequence: session.sequence,
+            peer_id: session.peer.to_string(),
+            path: session.path,
+            direction: session.direction,
+            opened_at_unix_seconds: session.opened_at_unix_seconds,
+            closed_at_unix_seconds,
+            duration_millis,
+            outcome,
+        });
+        while self.recent_sessions.len() > MAX_SESSION_HISTORY {
+            self.recent_sessions.pop_front();
+        }
+        let metrics = self.path_metrics.entry(session.path).or_default();
+        metrics.sessions_closed = metrics.sessions_closed.saturating_add(1);
     }
 
     fn cancel_request(&mut self, cancellation_id: Uuid) {
@@ -1247,8 +1697,12 @@ impl P2pEventLoop {
                 _ = self.relay_retry.tick(), if !self.relay_reservations.is_empty() => {
                     self.retry_relay_reservations();
                 }
-                _ = self.relay_retirement_tick.tick(), if !self.relay_retirement.is_empty() => {
+                _ = self.relay_retirement_tick.tick(), if !self.relay_retirement.is_empty() || !self.duplicate_retirement.is_empty() => {
                     self.retire_idle_relay_connections();
+                    self.retire_duplicate_sessions();
+                }
+                _ = self.preferred_path_retry.tick(), if !self.fallback_tiers.is_empty() => {
+                    self.retry_preferred_paths();
                 }
                 _ = self.learned_endpoint_expiry.tick(), if !self.learned_addresses.is_empty() || !self.recovery_addresses.is_empty() || !self.recovery_quarantine.is_empty() => {
                     self.expire_learned_addresses();
@@ -1265,7 +1719,13 @@ impl P2pEventLoop {
     }
 
     fn network_ready(&self) -> bool {
-        !self.active_direct_listeners.is_empty() || !self.active_relay_listeners.is_empty()
+        if self.tor_mode.requires_tor() {
+            self.active_tor_listener
+        } else {
+            !self.active_direct_listeners.is_empty()
+                || !self.active_relay_listeners.is_empty()
+                || self.active_tor_listener
+        }
     }
 
     fn transport_degradation(&self) -> Vec<String> {
@@ -1284,6 +1744,9 @@ impl P2pEventLoop {
                 self.relay_reservations.len()
             ));
         }
+        if self.tor_mode.enabled() && !self.active_tor_listener {
+            degraded.push("Tor onion service is not reachable".to_owned());
+        }
         degraded
     }
 
@@ -1295,6 +1758,7 @@ impl P2pEventLoop {
             let _ = sender.send(Ok(P2pStartup {
                 direct_listeners_active: self.active_direct_listeners.len(),
                 relay_reservations_active: self.active_relay_listeners.len(),
+                onion_service_reachable: self.active_tor_listener,
                 degraded: self.transport_degradation(),
             }));
         }
@@ -1307,22 +1771,145 @@ impl P2pEventLoop {
     }
 
     fn retry_bootstrap(&mut self) {
-        for address in &self.bootstrap_addresses {
+        let peers = self
+            .bootstrap_addresses
+            .iter()
+            .filter_map(|address| terminal_peer_id(address).ok())
+            .collect::<BTreeSet<_>>();
+        for peer in peers {
             // A circuit address contains both the relay and destination peer
             // IDs. Connectivity to the relay does not mean the destination is
             // connected, so retries must key off the terminal identity.
-            let peer = terminal_peer_id(address).ok();
-            if peer.is_some_and(|peer| self.swarm.is_connected(&peer)) {
+            if self.swarm.is_connected(&peer) {
                 continue;
             }
-            if let Err(error) = self.swarm.dial(address.clone()) {
-                tracing::debug!(%address, %error, "libp2p bootstrap retry was rejected");
-            }
+            self.dial_selected_addresses(peer, PeerCondition::DisconnectedAndNotDialing);
         }
         if self.enable_dht_maintenance
             && let Err(error) = self.swarm.behaviour_mut().kademlia.bootstrap()
         {
             tracing::debug!(%error, "Kademlia bootstrap retry could not start");
+        }
+    }
+
+    fn retained_peer_addresses(&self, peer: PeerId) -> BTreeSet<Multiaddr> {
+        let mut addresses = BTreeSet::new();
+        if let Some(persistent) = self.persistent_addresses.get(&peer) {
+            addresses.extend(persistent.iter().cloned());
+        }
+        if let Some(learned) = self.learned_addresses.get(&peer) {
+            addresses.extend(learned.addresses.iter().cloned());
+        }
+        for scope in self.recovery_addresses.values() {
+            if let Some(recovery) = scope.addresses.get(&peer) {
+                addresses.extend(recovery.iter().cloned());
+            }
+        }
+        addresses
+    }
+
+    fn reconcile_policy_addresses(&mut self, peer: PeerId) {
+        let retained = self.retained_peer_addresses(peer);
+        let requested_tier = self.fallback_tiers.get(&peer).copied().unwrap_or(0);
+        let (selected_tier, desired) =
+            selected_policy_addresses(self.tor_mode, retained, requested_tier);
+        if selected_tier == 0 {
+            self.fallback_tiers.remove(&peer);
+        } else if !desired.is_empty() {
+            self.fallback_tiers.insert(peer, selected_tier);
+        }
+        let previous = self
+            .installed_policy_addresses
+            .remove(&peer)
+            .unwrap_or_default();
+        for address in previous.difference(&desired) {
+            remove_known_address(&mut self.swarm, peer, address);
+        }
+        for address in desired.difference(&previous) {
+            self.swarm.add_peer_address(peer, address.clone());
+            self.swarm
+                .behaviour_mut()
+                .kademlia
+                .add_address(&peer, address.clone());
+        }
+        if !desired.is_empty() {
+            self.installed_policy_addresses.insert(peer, desired);
+        }
+    }
+
+    fn dial_selected_addresses(&mut self, peer: PeerId, condition: PeerCondition) {
+        let addresses = self
+            .installed_policy_addresses
+            .get(&peer)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            return;
+        }
+        let dial = SwarmDialOpts::peer_id(peer)
+            .addresses(addresses)
+            .condition(condition)
+            .build();
+        if let Err(error) = self.swarm.dial(dial) {
+            tracing::debug!(%peer, %error, "policy-selected libp2p dial was rejected");
+        }
+    }
+
+    fn selected_path_hint(&self, peer: PeerId) -> Option<P2pPath> {
+        let address = self.installed_policy_addresses.get(&peer)?.iter().next()?;
+        Some(address_path(address))
+    }
+
+    fn record_dial_failure(&mut self, peer: PeerId) {
+        if let Some(path) = self.selected_path_hint(peer) {
+            let metrics = self.path_metrics.entry(path).or_default();
+            metrics.dial_failures = metrics.dial_failures.saturating_add(1);
+        }
+    }
+
+    fn activate_fallback(&mut self, peer: PeerId) {
+        let tiers = policy_address_tiers(self.tor_mode, self.retained_peer_addresses(peer));
+        let current = self
+            .fallback_tiers
+            .get(&peer)
+            .copied()
+            .or_else(|| tiers.first_key_value().map(|(tier, _)| *tier))
+            .unwrap_or(0);
+        let Some(next) = tiers.keys().copied().find(|tier| *tier > current) else {
+            return;
+        };
+        if self.fallback_tiers.insert(peer, next) != Some(next) {
+            tracing::info!(%peer, mode = %self.tor_mode, tier = next, "switching peer to fallback transport tier");
+            self.reconcile_policy_addresses(peer);
+        }
+        self.dial_selected_addresses(peer, PeerCondition::DisconnectedAndNotDialing);
+    }
+
+    fn retry_preferred_paths(&mut self) {
+        let peers = self
+            .fallback_tiers
+            .iter()
+            .map(|(peer, tier)| (*peer, *tier))
+            .collect::<Vec<_>>();
+        for (peer, current_tier) in peers {
+            let tiers = policy_address_tiers(self.tor_mode, self.retained_peer_addresses(peer));
+            let addresses = tiers
+                .iter()
+                .find(|(tier, _)| **tier < current_tier)
+                .map(|(_, addresses)| addresses.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            if addresses.is_empty() {
+                continue;
+            }
+            let dial = SwarmDialOpts::peer_id(peer)
+                .addresses(addresses)
+                .condition(PeerCondition::NotDialing)
+                .build();
+            if let Err(error) = self.swarm.dial(dial) {
+                tracing::debug!(%peer, %error, "preferred-path probe was rejected");
+            }
         }
     }
 
@@ -1368,24 +1955,12 @@ impl P2pEventLoop {
 
         let mut normalized = BTreeSet::new();
         for address in addresses {
-            normalized.insert(normalize_known_address(peer, address)?);
-        }
-        for address in &normalized {
-            self.swarm.add_peer_address(peer, address.clone());
-            self.swarm
-                .behaviour_mut()
-                .kademlia
-                .add_address(&peer, address.clone());
-        }
-
-        let previous = self.learned_addresses.remove(&peer);
-        if let Some(previous) = previous {
-            for address in previous.addresses.difference(&normalized) {
-                if !self.address_retained_outside_learned(peer, address) {
-                    remove_known_address(&mut self.swarm, peer, address);
-                }
+            let address = normalize_known_address(peer, address)?;
+            if address_allowed_by_tor_mode(self.tor_mode, &address) {
+                normalized.insert(address);
             }
         }
+        self.learned_addresses.remove(&peer);
         if !normalized.is_empty() {
             let lifetime = Duration::from_secs(
                 expires_at_unix_seconds
@@ -1399,14 +1974,17 @@ impl P2pEventLoop {
                     expires_at: tokio::time::Instant::now() + lifetime,
                 },
             );
-        } else {
-            self.forget_transfer_history_if_unretained(peer);
         }
+        self.reconcile_policy_addresses(peer);
+        self.forget_transfer_history_if_unretained(peer);
         Ok(())
     }
 
     fn add_learned_address(&mut self, peer: PeerId, address: Multiaddr) -> Result<()> {
         let address = normalize_known_address(peer, address)?;
+        if !address_allowed_by_tor_mode(self.tor_mode, &address) {
+            return Ok(());
+        }
         let existing = self.learned_addresses.get(&peer);
         if existing.is_none() && self.learned_addresses.len() >= MAX_LEARNED_ENDPOINT_PEERS {
             bail!("learned endpoint cache is full");
@@ -1416,11 +1994,6 @@ impl P2pEventLoop {
         }) {
             bail!("peer has too many learned endpoints");
         }
-        self.swarm.add_peer_address(peer, address.clone());
-        self.swarm
-            .behaviour_mut()
-            .kademlia
-            .add_address(&peer, address.clone());
         let learned = self
             .learned_addresses
             .entry(peer)
@@ -1430,11 +2003,15 @@ impl P2pEventLoop {
             });
         learned.addresses.insert(address);
         learned.expires_at = tokio::time::Instant::now() + DHT_TTL;
+        self.reconcile_policy_addresses(peer);
         Ok(())
     }
 
     fn add_identified_address(&mut self, peer: PeerId, address: Multiaddr) -> Result<()> {
         let address = normalize_known_address(peer, address)?;
+        if !address_allowed_by_tor_mode(self.tor_mode, &address) {
+            return Ok(());
+        }
         if address.to_string().len() > 512
             || address
                 .iter()
@@ -1474,11 +2051,6 @@ impl P2pEventLoop {
                 bail!("Identify supplied too many attempt-scoped recovery endpoints");
             }
         }
-        self.swarm.add_peer_address(peer, address.clone());
-        self.swarm
-            .behaviour_mut()
-            .kademlia
-            .add_address(&peer, address.clone());
         for scope_id in scopes {
             self.recovery_addresses
                 .get_mut(&scope_id)
@@ -1486,6 +2058,7 @@ impl P2pEventLoop {
                 .context("recovery address scope changed during Identify handling")?
                 .insert(address.clone());
         }
+        self.reconcile_policy_addresses(peer);
         Ok(())
     }
 
@@ -1539,17 +2112,16 @@ impl P2pEventLoop {
         let peer_addresses = scope.addresses.entry(peer).or_default();
         for address in addresses {
             let address = normalize_known_address(peer, address)?;
+            if !address_allowed_by_tor_mode(self.tor_mode, &address) {
+                continue;
+            }
             if !peer_addresses.contains(&address) && peer_addresses.len() >= MAX_ENDPOINTS_PER_PEER
             {
                 bail!("recovery peer has too many attempt-scoped endpoints");
             }
-            self.swarm.add_peer_address(peer, address.clone());
-            self.swarm
-                .behaviour_mut()
-                .kademlia
-                .add_address(&peer, address.clone());
             peer_addresses.insert(address);
         }
+        self.reconcile_policy_addresses(peer);
         Ok(())
     }
 
@@ -1557,12 +2129,8 @@ impl P2pEventLoop {
         let Some(scope) = self.recovery_addresses.remove(&scope_id) else {
             return;
         };
-        for (peer, addresses) in scope.addresses {
-            for address in addresses {
-                if !self.address_retained(peer, &address) {
-                    remove_known_address(&mut self.swarm, peer, &address);
-                }
-            }
+        for peer in scope.addresses.into_keys() {
+            self.reconcile_policy_addresses(peer);
             self.forget_transfer_history_if_unretained(peer);
         }
     }
@@ -1581,26 +2149,6 @@ impl P2pEventLoop {
             .retain(|_, expires_at| *expires_at > now);
     }
 
-    fn address_retained_outside_learned(&self, peer: PeerId, address: &Multiaddr) -> bool {
-        self.persistent_addresses
-            .get(&peer)
-            .is_some_and(|addresses| addresses.contains(address))
-            || self.recovery_addresses.values().any(|scope| {
-                scope
-                    .addresses
-                    .get(&peer)
-                    .is_some_and(|addresses| addresses.contains(address))
-            })
-    }
-
-    fn address_retained(&self, peer: PeerId, address: &Multiaddr) -> bool {
-        self.address_retained_outside_learned(peer, address)
-            || self
-                .learned_addresses
-                .get(&peer)
-                .is_some_and(|addresses| addresses.addresses.contains(address))
-    }
-
     fn expire_learned_addresses(&mut self) {
         let now = tokio::time::Instant::now();
         let expired = self
@@ -1609,14 +2157,10 @@ impl P2pEventLoop {
             .filter_map(|(peer, addresses)| (addresses.expires_at <= now).then_some(*peer))
             .collect::<Vec<_>>();
         for peer in expired {
-            let Some(addresses) = self.learned_addresses.remove(&peer) else {
+            let Some(_) = self.learned_addresses.remove(&peer) else {
                 continue;
             };
-            for address in addresses.addresses {
-                if !self.address_retained_outside_learned(peer, &address) {
-                    remove_known_address(&mut self.swarm, peer, &address);
-                }
-            }
+            self.reconcile_policy_addresses(peer);
             self.forget_transfer_history_if_unretained(peer);
         }
     }
@@ -1714,6 +2258,7 @@ impl P2pEventLoop {
                                         request_id,
                                         request_hash,
                                         request_bytes,
+                                        started_at: tokio::time::Instant::now(),
                                         response,
                                         _permit: permit,
                                     },
@@ -1736,24 +2281,8 @@ impl P2pEventLoop {
                     .map(ToString::to_string)
                     .collect::<Vec<_>>();
                 listen_addresses.sort();
-                let mut advertised_addresses = if self.advertised_addresses.is_empty() {
-                    listen_addresses.clone()
-                } else {
-                    let mut addresses = self
-                        .advertised_addresses
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>();
-                    addresses.extend(
-                        listen_addresses
-                            .iter()
-                            .filter(|address| address.contains("/p2p-circuit"))
-                            .cloned(),
-                    );
-                    addresses
-                };
-                advertised_addresses.sort();
-                advertised_addresses.dedup();
+                let advertised_addresses =
+                    status_advertised_addresses(&self.advertised_addresses, &listen_addresses);
                 let mut known_peers = self
                     .swarm
                     .connected_peers()
@@ -1800,6 +2329,34 @@ impl P2pEventLoop {
                     })
                     .collect::<Vec<_>>();
                 peers.sort_by(|left, right| left.peer_id.cmp(&right.peer_id));
+                let mut active_sessions = self
+                    .sessions
+                    .values()
+                    .map(|session| P2pActiveSession {
+                        sequence: session.sequence,
+                        peer_id: session.peer.to_string(),
+                        path: session.path,
+                        direction: session.direction,
+                        opened_at_unix_seconds: session.opened_at_unix_seconds,
+                    })
+                    .collect::<Vec<_>>();
+                active_sessions.sort_by_key(|session| session.sequence);
+                let recent_sessions = self.recent_sessions.iter().cloned().collect();
+                let path_metrics = self
+                    .path_metrics
+                    .iter()
+                    .map(|(path, metrics)| P2pPathMetrics {
+                        path: *path,
+                        sessions_opened: metrics.sessions_opened,
+                        sessions_closed: metrics.sessions_closed,
+                        dial_failures: metrics.dial_failures,
+                        requests_succeeded: metrics.requests_succeeded,
+                        requests_failed: metrics.requests_failed,
+                        request_latency_millis_total: metrics.request_latency_millis_total,
+                        application_bytes_sent: metrics.application_bytes_sent,
+                        application_bytes_received: metrics.application_bytes_received,
+                    })
+                    .collect();
                 let _ = response.send(P2pStatus {
                     peer_id: self.swarm.local_peer_id().to_string(),
                     network_ready: self.network_ready(),
@@ -1807,10 +2364,16 @@ impl P2pEventLoop {
                     direct_listeners_active: self.active_direct_listeners.len(),
                     relay_reservations_configured: self.relay_reservations.len(),
                     relay_reservations_active: self.active_relay_listeners.len(),
+                    tor_mode: self.tor_mode,
+                    onion_service_configured: self.tor_mode.enabled(),
+                    onion_service_reachable: self.active_tor_listener,
                     degraded: self.transport_degradation(),
                     listen_addresses,
                     advertised_addresses,
                     peers,
+                    active_sessions,
+                    recent_sessions,
+                    path_metrics,
                 });
             }
             Command::PutRecord {
@@ -1905,6 +2468,11 @@ impl P2pEventLoop {
                     Ok(connection_id) => {
                         self.connection_paths
                             .insert(*connection_id, (event.remote_peer_id, P2pPath::HolePunched));
+                        self.update_session_path(*connection_id, P2pPath::HolePunched);
+                        self.schedule_duplicate_session_collapse(
+                            event.remote_peer_id,
+                            *connection_id,
+                        );
                         // request-response does not expose per-request
                         // connection selection and may otherwise keep using
                         // the older relay circuit indefinitely. Schedule only
@@ -1960,8 +2528,28 @@ impl P2pEventLoop {
                 if self.relay_listeners.contains_key(&listener_id) {
                     self.active_relay_listeners.insert(listener_id);
                 }
+                if self
+                    .tor_listener
+                    .as_ref()
+                    .is_some_and(|(tor_listener, _)| *tor_listener == listener_id)
+                {
+                    self.active_tor_listener = true;
+                }
                 self.complete_startup_if_ready();
                 tracing::info!(%address, "libp2p listening");
+            }
+            SwarmEvent::ExpiredListenAddr {
+                listener_id,
+                address,
+            } => {
+                if self
+                    .tor_listener
+                    .as_ref()
+                    .is_some_and(|(tor_listener, _)| *tor_listener == listener_id)
+                {
+                    self.active_tor_listener = false;
+                }
+                tracing::warn!(%address, "libp2p listen address expired");
             }
             event @ SwarmEvent::ListenerError { .. } => {
                 tracing::warn!(?event, "libp2p listener failed");
@@ -1979,12 +2567,32 @@ impl P2pEventLoop {
                 if self.relay_listeners.remove(&listener_id).is_some() {
                     self.active_relay_listeners.remove(&listener_id);
                 }
+                let tor_closed = self
+                    .tor_listener
+                    .as_ref()
+                    .is_some_and(|(tor_listener, _)| *tor_listener == listener_id);
+                if tor_closed {
+                    self.active_tor_listener = false;
+                    self.tor_listener = None;
+                }
                 let direct_exhausted = !self.direct_listeners.is_empty()
                     && self.active_direct_listeners.is_empty()
                     && self.closed_direct_listeners.len() == self.direct_listeners.len();
-                if direct_exhausted && self.relay_reservations.is_empty() {
-                    let error =
-                        format!("all configured direct libp2p listeners closed: {reason:?}");
+                let all_paths_exhausted = (self.direct_listeners.is_empty() || direct_exhausted)
+                    && self.relay_reservations.is_empty()
+                    && self.tor_listener.is_none();
+                // An expired address is a recoverable reachability transition,
+                // but a closed Arti listener means its acceptor has terminated
+                // and cannot be reconstructed from inside this Swarm.  Exit so
+                // the daemon's process supervisor can recreate the transport;
+                // otherwise auto/prefer mode would silently lose its promised
+                // fallback while an IP listener kept the event loop alive.
+                if tor_closed || all_paths_exhausted {
+                    let error = if tor_closed {
+                        format!("Arti onion listener closed: {reason:?}")
+                    } else {
+                        format!("all configured libp2p listeners closed: {reason:?}")
+                    };
                     self.fail_startup(error.clone());
                     self.fatal_error = Some(error);
                 }
@@ -1996,11 +2604,8 @@ impl P2pEventLoop {
                 endpoint,
                 ..
             } => {
-                let path = if endpoint.is_relayed() {
-                    P2pPath::Relayed
-                } else {
-                    P2pPath::Direct
-                };
+                let path = connected_point_path(&endpoint);
+                let dialer = matches!(&endpoint, ConnectedPoint::Dialer { .. });
                 // DCUtR may report the upgraded connection before or after the
                 // generic swarm event. Do not let the latter erase the more
                 // specific classification when it arrives second.
@@ -2012,16 +2617,49 @@ impl P2pEventLoop {
                     connection_id,
                     (peer_id, merge_established_path(recorded, path)),
                 );
+                self.connection_dialers.insert(connection_id, dialer);
+                self.record_session_open(
+                    connection_id,
+                    peer_id,
+                    merge_established_path(recorded, path),
+                    if dialer {
+                        P2pSessionDirection::Outbound
+                    } else {
+                        P2pSessionDirection::Inbound
+                    },
+                );
+                let rank = path_preference_rank(self.tor_mode, path);
+                if self
+                    .fallback_tiers
+                    .get(&peer_id)
+                    .is_some_and(|current| rank < *current)
+                {
+                    if rank == 0 {
+                        self.fallback_tiers.remove(&peer_id);
+                    } else {
+                        self.fallback_tiers.insert(peer_id, rank);
+                    }
+                    self.reconcile_policy_addresses(peer_id);
+                    tracing::info!(peer = %peer_id, ?path, "peer returned to its preferred transport path");
+                }
+                self.schedule_duplicate_session_collapse(peer_id, connection_id);
                 tracing::info!(peer = %peer_id, ?endpoint, "libp2p connection established");
             }
             SwarmEvent::ConnectionClosed {
                 connection_id,
                 peer_id,
                 num_established,
+                cause,
                 ..
             } => {
-                self.connection_paths.remove(&connection_id);
+                let closed_path = self
+                    .connection_paths
+                    .remove(&connection_id)
+                    .map(|(_, path)| path);
+                self.connection_dialers.remove(&connection_id);
                 self.relay_retirement.remove(&connection_id);
+                self.duplicate_retirement.remove(&connection_id);
+                self.record_session_close(connection_id, cause.is_some());
                 if !self
                     .connection_paths
                     .values()
@@ -2032,10 +2670,22 @@ impl P2pEventLoop {
                 }
                 if num_established == 0 {
                     self.last_application_paths.remove(&peer_id);
+                    let current_tier = self.fallback_tiers.get(&peer_id).copied().unwrap_or(0);
+                    if closed_path.is_some_and(|path| {
+                        path_preference_rank(self.tor_mode, path) == current_tier
+                    }) {
+                        self.activate_fallback(peer_id);
+                    }
                 }
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 tracing::warn!(peer = ?peer_id, %error, "libp2p outgoing connection failed");
+                if let Some(peer) = peer_id
+                    && !self.swarm.is_connected(&peer)
+                {
+                    self.record_dial_failure(peer);
+                    self.activate_fallback(peer);
+                }
             }
             _ => {}
         }
@@ -2142,18 +2792,31 @@ impl P2pEventLoop {
                             } else {
                                 Err(anyhow::anyhow!("libp2p response came from the wrong peer"))
                             };
+                            self.record_request_result(path, pending.started_at, result.is_ok());
                             let _ = pending.response.send(result);
                         }
                     }
                 }
             }
             request_response::Event::OutboundFailure {
-                request_id, error, ..
+                peer,
+                request_id,
+                error,
+                ..
             } => {
                 if let Some(pending) = self.pending_requests.remove(&request_id) {
+                    let path = self
+                        .last_application_paths
+                        .get(&peer)
+                        .copied()
+                        .or_else(|| self.selected_path_hint(peer));
+                    self.record_request_result(path, pending.started_at, false);
                     let _ = pending
                         .response
                         .send(Err(anyhow::anyhow!("libp2p request failed: {error}")));
+                }
+                if !self.swarm.is_connected(&peer) {
+                    self.activate_fallback(peer);
                 }
             }
             request_response::Event::InboundFailure {
@@ -2205,12 +2868,134 @@ impl P2pEventLoop {
                 .collect::<Vec<_>>();
         for (connection_id, peer, should_close) in finished {
             self.relay_retirement.remove(&connection_id);
-            if should_close && self.swarm.close_connection(connection_id) {
-                tracing::debug!(
-                    %peer,
-                    ?connection_id,
-                    "retiring idle relay connection after successful DCUtR"
+            if should_close {
+                self.collapsing_connections.insert(connection_id);
+                if self.swarm.close_connection(connection_id) {
+                    tracing::debug!(
+                        %peer,
+                        ?connection_id,
+                        "retiring idle relay connection after successful DCUtR"
+                    );
+                } else {
+                    self.collapsing_connections.remove(&connection_id);
+                }
+            }
+        }
+    }
+
+    fn schedule_duplicate_session_collapse(&mut self, peer: PeerId, new_connection: ConnectionId) {
+        let connections = self
+            .connection_paths
+            .iter()
+            .filter_map(|(connection, (candidate, path))| {
+                (*candidate == peer).then_some((
+                    *connection,
+                    *path,
+                    self.connection_dialers
+                        .get(connection)
+                        .copied()
+                        .unwrap_or(false),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if connections.len() < 2 {
+            return;
+        }
+        let best_rank = connections
+            .iter()
+            .map(|(_, path, _)| path_preference_rank(self.tor_mode, *path))
+            .min()
+            .expect("two connections have a best rank");
+        let deadline = tokio::time::Instant::now() + RELAY_RETIREMENT_GRACE;
+        for (connection, path, _) in &connections {
+            if path_preference_rank(self.tor_mode, *path) > best_rank {
+                self.duplicate_retirement
+                    .insert(*connection, (peer, deadline));
+            }
+        }
+
+        let local_prefers_dialer = self.swarm.local_peer_id() < &peer;
+        let preferred_direction_exists = connections.iter().any(|(_, path, dialer)| {
+            path_preference_rank(self.tor_mode, *path) == best_rank
+                && *dialer == local_prefers_dialer
+        });
+        if !preferred_direction_exists {
+            return;
+        }
+        for (connection, path, dialer) in &connections {
+            if path_preference_rank(self.tor_mode, *path) == best_rank
+                && *dialer != local_prefers_dialer
+            {
+                self.duplicate_retirement
+                    .insert(*connection, (peer, deadline));
+            }
+        }
+        if local_prefers_dialer {
+            let older_preferred_exists = connections.iter().any(|(connection, path, dialer)| {
+                *connection != new_connection
+                    && path_preference_rank(self.tor_mode, *path) == best_rank
+                    && *dialer
+            });
+            if older_preferred_exists
+                && self
+                    .connection_dialers
+                    .get(&new_connection)
+                    .copied()
+                    .unwrap_or(false)
+                && self
+                    .connection_paths
+                    .get(&new_connection)
+                    .is_some_and(|(_, path)| {
+                        path_preference_rank(self.tor_mode, *path) == best_rank
+                    })
+            {
+                self.duplicate_retirement
+                    .insert(new_connection, (peer, deadline));
+            }
+        }
+    }
+
+    fn retire_duplicate_sessions(&mut self) {
+        let now = tokio::time::Instant::now();
+        let finished = self
+            .duplicate_retirement
+            .iter()
+            .filter_map(|(connection, (peer, deadline))| {
+                if *deadline > now {
+                    return None;
+                }
+                let busy = self
+                    .pending_requests
+                    .values()
+                    .any(|pending| pending.peer == *peer)
+                    || self
+                        .active_inbound_requests
+                        .values()
+                        .any(|candidate| *candidate == *peer);
+                if busy {
+                    return None;
+                }
+                let Some((_, path)) = self.connection_paths.get(connection) else {
+                    return Some((*connection, false));
+                };
+                let replacement_exists = self.connection_paths.iter().any(
+                    |(candidate_connection, (candidate_peer, candidate_path))| {
+                        *candidate_connection != *connection
+                            && *candidate_peer == *peer
+                            && path_preference_rank(self.tor_mode, *candidate_path)
+                                <= path_preference_rank(self.tor_mode, *path)
+                    },
                 );
+                Some((*connection, replacement_exists))
+            })
+            .collect::<Vec<_>>();
+        for (connection, should_close) in finished {
+            self.duplicate_retirement.remove(&connection);
+            if should_close {
+                self.collapsing_connections.insert(connection);
+                if !self.swarm.close_connection(connection) {
+                    self.collapsing_connections.remove(&connection);
+                }
             }
         }
     }
@@ -2356,6 +3141,15 @@ pub async fn run_dht_publications(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Res
     }
 }
 
+pub async fn run_peer_exchange(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {
+    loop {
+        if let Err(error) = exchange_guild_endpoints_once(node.clone(), &p2p).await {
+            tracing::warn!(%error, "guild peer endpoint exchange failed");
+        }
+        tokio::time::sleep(PEER_EXCHANGE_INTERVAL).await;
+    }
+}
+
 pub async fn run_relay_membership_sync(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {
     loop {
         if let Err(error) = sync_relay_membership_once(node.clone(), &p2p).await {
@@ -2412,29 +3206,97 @@ async fn refresh_guild_endpoints(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Res
                 continue;
             }
         };
-        let expires_at_unix_seconds = endpoint.value.expires_at_unix_seconds;
-        let mut addresses = Vec::with_capacity(endpoint.value.endpoints.len());
-        for value in endpoint.value.endpoints {
-            let Ok(address) = value.parse::<Multiaddr>() else {
-                tracing::warn!(%member, endpoint = %value, "ignored malformed signed endpoint");
-                continue;
-            };
-            if address.iter().last()
-                != Some(libp2p::multiaddr::Protocol::P2p(member.libp2p_peer_id()?))
-            {
-                tracing::warn!(%member, endpoint = %value, "ignored endpoint bound to another peer");
+        apply_endpoint_record(p2p, endpoint).await?;
+    }
+    Ok(())
+}
+
+async fn exchange_guild_endpoints_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
+    let local_endpoints = advertised_p2p_endpoints(p2p).await?;
+    let endpoint_expiry = unix_seconds()
+        .checked_add(DHT_TTL.as_secs())
+        .context("peer-exchange endpoint expiry overflow")?;
+    node_blocking(node.clone(), move |node| {
+        node.refresh_peer_exchange_endpoint(local_endpoints, endpoint_expiry)
+            .map(|_| ())
+    })
+    .await?;
+    let (guild, local_id) = node_blocking(node.clone(), |node| {
+        Ok((node.guild_summary()?, node.keys().node_id()))
+    })
+    .await?;
+    let Some(guild) = guild.filter(|guild| matches!(guild.phase, GuildPhase::Active)) else {
+        return Ok(());
+    };
+    let allowed = guild
+        .peers
+        .iter()
+        .map(|peer| peer.member.node_id)
+        .collect::<BTreeSet<_>>();
+    let mut queries = FuturesUnordered::new();
+    for member in allowed.iter().copied().filter(|member| *member != local_id) {
+        queries.push(async move { (member, p2p.exchange_endpoints(member, guild.guild_id).await) });
+    }
+    while let Some((source, result)) = queries.next().await {
+        let records = match result {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::debug!(%source, %error, "peer endpoint exchange request failed");
                 continue;
             }
-            addresses.push(address);
-        }
-        if let Err(error) = p2p
-            .replace_learned_peer_addresses(member, addresses, expires_at_unix_seconds)
+        };
+        for record in records {
+            let publisher = record.value.publisher;
+            if !allowed.contains(&publisher) {
+                tracing::warn!(%source, %publisher, "peer gossiped an endpoint outside the guild");
+                continue;
+            }
+            let selected = match select_durable_endpoint_record(
+                node.clone(),
+                publisher,
+                vec![DhtRecord {
+                    publisher: None,
+                    value: canonical_bytes(&record)?,
+                }],
+            )
             .await
-        {
-            tracing::debug!(%member, %error, "could not replace signed endpoints");
+            {
+                Ok(selected) => selected,
+                Err(error) => {
+                    tracing::warn!(%source, %publisher, %error, "rejected conflicting peer-exchanged endpoint");
+                    continue;
+                }
+            };
+            if let Some(endpoint) = selected
+                && let Err(error) = apply_endpoint_record(p2p, endpoint).await
+            {
+                tracing::debug!(%publisher, %error, "could not apply peer-exchanged endpoint");
+            }
         }
     }
     Ok(())
+}
+
+async fn apply_endpoint_record(
+    p2p: &P2pClient,
+    endpoint: SignedRecord<mb_core::EndpointRecord>,
+) -> Result<()> {
+    let member = endpoint.value.publisher;
+    let expires_at_unix_seconds = endpoint.value.expires_at_unix_seconds;
+    let mut addresses = Vec::with_capacity(endpoint.value.endpoints.len());
+    for value in endpoint.value.endpoints {
+        let address = value
+            .parse::<Multiaddr>()
+            .with_context(|| format!("malformed signed endpoint {value}"))?;
+        if address.iter().last() != Some(libp2p::multiaddr::Protocol::P2p(member.libp2p_peer_id()?))
+            || !onion_address_matches_node(&address, member)
+        {
+            bail!("signed endpoint is bound to another peer identity");
+        }
+        addresses.push(address);
+    }
+    p2p.replace_learned_peer_addresses(member, addresses, expires_at_unix_seconds)
+        .await
 }
 
 async fn publish_dht_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
@@ -3279,6 +4141,7 @@ fn valid_endpoint_values(publisher: NodeId, endpoints: &[String]) -> bool {
             && unique.insert(value)
             && value.parse::<Multiaddr>().is_ok_and(|address| {
                 address.iter().last() == Some(libp2p::multiaddr::Protocol::P2p(expected))
+                    && onion_address_matches_node(&address, publisher)
             })
     })
 }
@@ -4185,15 +5048,6 @@ fn validate_outbound_response(
     response.value.result.map_err(anyhow::Error::new)
 }
 
-fn add_address_to_swarm(
-    swarm: &mut Swarm<Behaviour>,
-    address: Multiaddr,
-) -> Result<(PeerId, Multiaddr)> {
-    let peer = terminal_peer_id(&address)?;
-    let address = add_known_address(swarm, peer, address)?;
-    Ok((peer, address))
-}
-
 fn terminal_peer_id(address: &Multiaddr) -> Result<PeerId> {
     address
         .iter()
@@ -4205,26 +5059,15 @@ fn terminal_peer_id(address: &Multiaddr) -> Result<PeerId> {
         .context("peer multiaddress has no /p2p identity")
 }
 
-fn add_known_address(
-    swarm: &mut Swarm<Behaviour>,
-    peer: PeerId,
-    address: Multiaddr,
-) -> Result<Multiaddr> {
-    let address = normalize_known_address(peer, address)?;
-    swarm.add_peer_address(peer, address.clone());
-    swarm
-        .behaviour_mut()
-        .kademlia
-        .add_address(&peer, address.clone());
-    Ok(address)
-}
-
 fn normalize_known_address(peer: PeerId, mut address: Multiaddr) -> Result<Multiaddr> {
     if address.iter().last() == Some(libp2p::multiaddr::Protocol::P2p(peer)) {
         address.pop();
     }
     if address.is_empty() {
         bail!("peer address has no transport components");
+    }
+    if !onion_address_matches_peer(&address, peer) {
+        bail!("onion address identity differs from the peer identity");
     }
     Ok(address)
 }
@@ -4257,7 +5100,82 @@ mod tests {
             failure_domain: node_id.to_string(),
             configure_failure_domain: true,
             max_connections: 8,
+            tor_mode: TorMode::DisableTor,
         }
+    }
+
+    #[test]
+    fn tor_policy_selects_one_transport_class_and_a_bounded_fallback() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([201; 32]));
+        let ip: Multiaddr = "/ip4/192.0.2.1/udp/44000/quic-v1".parse().unwrap();
+        let relay: Multiaddr = format!(
+            "/ip4/192.0.2.2/udp/44001/quic-v1/p2p/{}/p2p-circuit",
+            keys.node_id().libp2p_peer_id().unwrap()
+        )
+        .parse()
+        .unwrap();
+        let onion = onion_listener_address(keys.node_id()).unwrap();
+        let all = vec![relay.clone(), onion.clone(), ip.clone()];
+
+        assert_eq!(
+            selected_policy_addresses(TorMode::Auto, all.clone(), 0),
+            (0, BTreeSet::from([ip.clone()]))
+        );
+        assert_eq!(
+            selected_policy_addresses(TorMode::Auto, all.clone(), 1),
+            (1, BTreeSet::from([relay.clone()]))
+        );
+        assert_eq!(
+            selected_policy_addresses(TorMode::Auto, all.clone(), 2),
+            (2, BTreeSet::from([onion.clone()]))
+        );
+        assert_eq!(
+            selected_policy_addresses(TorMode::PreferTor, all.clone(), 0),
+            (0, BTreeSet::from([onion.clone()]))
+        );
+        assert_eq!(
+            selected_policy_addresses(TorMode::PreferTor, all.clone(), 1),
+            (1, BTreeSet::from([ip.clone()]))
+        );
+        assert_eq!(
+            selected_policy_addresses(TorMode::PreferTor, all.clone(), 2),
+            (2, BTreeSet::from([relay.clone()]))
+        );
+        assert_eq!(
+            selected_policy_addresses(TorMode::RequireTor, all.clone(), 0),
+            (0, BTreeSet::from([onion.clone()]))
+        );
+        assert_eq!(
+            selected_policy_addresses(TorMode::DisableTor, all.clone(), 0),
+            (0, BTreeSet::from([ip]))
+        );
+        assert_eq!(
+            selected_policy_addresses(TorMode::DisableTor, all, 1),
+            (1, BTreeSet::from([relay]))
+        );
+        assert_eq!(
+            selected_policy_addresses(TorMode::Auto, vec![onion.clone()], 1),
+            (2, BTreeSet::from([onion]))
+        );
+    }
+
+    #[test]
+    fn configured_ip_endpoint_does_not_hide_active_onion_listener() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([202; 32]));
+        let onion = onion_listener_address(keys.node_id()).unwrap().to_string();
+        let direct_listener = "/ip4/0.0.0.0/udp/44000/quic-v1".to_owned();
+        let relay_listener = format!(
+            "/ip4/192.0.2.2/udp/44001/quic-v1/p2p/{}/p2p-circuit",
+            keys.node_id().libp2p_peer_id().unwrap()
+        );
+        let external: Multiaddr = "/ip4/198.51.100.7/udp/44000/quic-v1".parse().unwrap();
+        let advertised = status_advertised_addresses(
+            std::slice::from_ref(&external),
+            &[direct_listener, onion.clone(), relay_listener.clone()],
+        );
+        let mut expected = vec![external.to_string(), onion, relay_listener];
+        expected.sort();
+        assert_eq!(advertised, expected);
     }
 
     const LEGACY_MEMBER_POISON_SEQUENCE: u64 = u64::MAX - 1;
