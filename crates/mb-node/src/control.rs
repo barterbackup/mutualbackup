@@ -281,7 +281,7 @@ async fn handle_request(
         LocalRequest::Status => {
             let mut status = blocking_node(node, |node| node.status()).await?;
             status.network = Some(p2p.status().await?);
-            Ok(LocalResponse::Status(status))
+            Ok(LocalResponse::Status(Box::new(status)))
         }
         LocalRequest::AddRoot { path } => {
             blocking_node(node, move |node| {

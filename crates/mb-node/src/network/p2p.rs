@@ -84,6 +84,7 @@ pub struct P2pConfig {
     pub enable_dht_maintenance: bool,
     pub enable_relay_server: bool,
     pub enable_hole_punching: bool,
+    pub enable_port_mapping: bool,
     pub public_endpoint: String,
     pub failure_domain: String,
     pub configure_failure_domain: bool,
@@ -186,6 +187,8 @@ pub struct P2pStatus {
     pub tor_mode: TorMode,
     pub onion_service_configured: bool,
     pub onion_service_reachable: bool,
+    pub port_mapping_enabled: bool,
+    pub port_mapping_external_address: Option<String>,
     pub degraded: Vec<String>,
     pub listen_addresses: Vec<String>,
     pub advertised_addresses: Vec<String>,
@@ -235,6 +238,8 @@ pub struct P2pEventLoop {
     service: Arc<NodeService>,
     server_config: NodeServerConfig,
     advertised_addresses: Vec<Multiaddr>,
+    port_mapping_enabled: bool,
+    mapped_external_address: Option<Multiaddr>,
     direct_listeners: HashMap<ListenerId, Multiaddr>,
     active_direct_listeners: HashSet<ListenerId>,
     closed_direct_listeners: HashSet<ListenerId>,
@@ -316,6 +321,10 @@ enum Command {
     },
     SetRelayMembers {
         members: BTreeSet<PeerId>,
+        response: oneshot::Sender<Result<()>>,
+    },
+    SetMappedExternalAddress {
+        address: Option<Multiaddr>,
         response: oneshot::Sender<Result<()>>,
     },
     Request {
@@ -575,6 +584,7 @@ fn connected_point_path(endpoint: &ConnectedPoint) -> P2pPath {
 
 fn status_advertised_addresses(
     configured: &[Multiaddr],
+    mapped: Option<&Multiaddr>,
     listen_addresses: &[String],
 ) -> Vec<String> {
     let mut advertised = if configured.is_empty() {
@@ -597,6 +607,9 @@ fn status_advertised_addresses(
         );
         addresses
     };
+    if let Some(mapped) = mapped {
+        advertised.push(mapped.to_string());
+    }
     advertised.sort();
     advertised.dedup();
     advertised
@@ -615,6 +628,12 @@ pub fn build_p2p_with_tor(
     config: P2pConfig,
     tor_transport: Option<TorTransport>,
 ) -> Result<(P2pClient, P2pEventLoop)> {
+    if config.enable_port_mapping {
+        if config.tor_mode.requires_tor() {
+            bail!("port mapping cannot be enabled in require-tor mode");
+        }
+        super::port_mapping::validate_port_mapping_listeners(&config.listen_addresses)?;
+    }
     if config.listen_addresses.is_empty()
         && config.relay_reservation_addresses.is_empty()
         && tor_transport.is_none()
@@ -898,6 +917,8 @@ pub fn build_p2p_with_tor(
                 .into_iter()
                 .filter(|address| address_allowed_by_tor_mode(config.tor_mode, address))
                 .collect(),
+            port_mapping_enabled: config.enable_port_mapping,
+            mapped_external_address: None,
             direct_listeners,
             active_direct_listeners: HashSet::new(),
             closed_direct_listeners: HashSet::new(),
@@ -1025,6 +1046,20 @@ impl P2pClient {
         receiver
             .await
             .context("libp2p relay-membership command was lost")?
+    }
+
+    pub(crate) async fn set_mapped_external_address(
+        &self,
+        address: Option<Multiaddr>,
+    ) -> Result<()> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(Command::SetMappedExternalAddress { address, response })
+            .await
+            .context("libp2p event loop stopped")?;
+        receiver
+            .await
+            .context("libp2p port-mapping command was lost")?
     }
 
     pub async fn profile(&self, peer: NodeId) -> Result<P2pPeerProfile> {
@@ -1747,6 +1782,9 @@ impl P2pEventLoop {
         if self.tor_mode.enabled() && !self.active_tor_listener {
             degraded.push("Tor onion service is not reachable".to_owned());
         }
+        if self.port_mapping_enabled && self.mapped_external_address.is_none() {
+            degraded.push("automatic gateway port mapping is not active".to_owned());
+        }
         degraded
     }
 
@@ -1835,6 +1873,30 @@ impl P2pEventLoop {
         if !desired.is_empty() {
             self.installed_policy_addresses.insert(peer, desired);
         }
+    }
+
+    fn replace_mapped_external_address(&mut self, address: Option<Multiaddr>) -> Result<()> {
+        if address == self.mapped_external_address {
+            return Ok(());
+        }
+        if let Some(address) = &address
+            && !super::port_mapping::valid_mapped_external_address(address)
+        {
+            bail!("port mapper returned an invalid external QUIC address");
+        }
+        if let Some(previous) = self.mapped_external_address.take() {
+            self.swarm.remove_external_address(&previous);
+        }
+        if let Some(address) = address {
+            self.swarm
+                .behaviour_mut()
+                .on_swarm_event(FromSwarm::NewExternalAddrCandidate(
+                    NewExternalAddrCandidate { addr: &address },
+                ));
+            self.swarm.add_external_address(address.clone());
+            self.mapped_external_address = Some(address);
+        }
+        Ok(())
     }
 
     fn dial_selected_addresses(&mut self, peer: PeerId, condition: PeerCondition) {
@@ -2219,6 +2281,10 @@ impl P2pEventLoop {
                 }
                 let _ = response.send(result);
             }
+            Command::SetMappedExternalAddress { address, response } => {
+                let result = self.replace_mapped_external_address(address);
+                let _ = response.send(result);
+            }
             Command::Request {
                 cancellation_id,
                 peer,
@@ -2281,8 +2347,11 @@ impl P2pEventLoop {
                     .map(ToString::to_string)
                     .collect::<Vec<_>>();
                 listen_addresses.sort();
-                let advertised_addresses =
-                    status_advertised_addresses(&self.advertised_addresses, &listen_addresses);
+                let advertised_addresses = status_advertised_addresses(
+                    &self.advertised_addresses,
+                    self.mapped_external_address.as_ref(),
+                    &listen_addresses,
+                );
                 let mut known_peers = self
                     .swarm
                     .connected_peers()
@@ -2367,6 +2436,11 @@ impl P2pEventLoop {
                     tor_mode: self.tor_mode,
                     onion_service_configured: self.tor_mode.enabled(),
                     onion_service_reachable: self.active_tor_listener,
+                    port_mapping_enabled: self.port_mapping_enabled,
+                    port_mapping_external_address: self
+                        .mapped_external_address
+                        .as_ref()
+                        .map(ToString::to_string),
                     degraded: self.transport_degradation(),
                     listen_addresses,
                     advertised_addresses,
@@ -5096,6 +5170,7 @@ mod tests {
             enable_dht_maintenance: true,
             enable_relay_server: true,
             enable_hole_punching: true,
+            enable_port_mapping: false,
             public_endpoint: "/ip4/127.0.0.1/udp/0/quic-v1".into(),
             failure_domain: node_id.to_string(),
             configure_failure_domain: true,
@@ -5169,13 +5244,64 @@ mod tests {
             keys.node_id().libp2p_peer_id().unwrap()
         );
         let external: Multiaddr = "/ip4/198.51.100.7/udp/44000/quic-v1".parse().unwrap();
+        let mapped: Multiaddr = "/ip4/203.0.113.8/udp/44002/quic-v1".parse().unwrap();
         let advertised = status_advertised_addresses(
             std::slice::from_ref(&external),
+            Some(&mapped),
             &[direct_listener, onion.clone(), relay_listener.clone()],
         );
-        let mut expected = vec![external.to_string(), onion, relay_listener];
+        let mut expected = vec![
+            external.to_string(),
+            mapped.to_string(),
+            onion,
+            relay_listener,
+        ];
         expected.sort();
         assert_eq!(advertised, expected);
+    }
+
+    #[tokio::test]
+    async fn mapped_external_address_is_replaceable_and_controls_degraded_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([203; 32]);
+        let keys = KeyMaterial::from_seed(&seed);
+        let node = Node::open(temp.path().join("node"), seed).unwrap();
+        let mut p2p_config = config(keys.node_id());
+        p2p_config.listen_addresses = vec!["/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap()];
+        p2p_config.enable_port_mapping = true;
+        let (_, mut event_loop) = build_p2p(Arc::new(Mutex::new(node)), p2p_config).unwrap();
+
+        assert!(
+            event_loop
+                .transport_degradation()
+                .iter()
+                .any(|reason| reason.contains("port mapping"))
+        );
+        let first: Multiaddr = "/ip4/198.51.100.8/udp/44000/quic-v1".parse().unwrap();
+        event_loop
+            .replace_mapped_external_address(Some(first.clone()))
+            .unwrap();
+        assert_eq!(event_loop.mapped_external_address.as_ref(), Some(&first));
+        assert!(
+            !event_loop
+                .transport_degradation()
+                .iter()
+                .any(|reason| reason.contains("port mapping"))
+        );
+
+        let second: Multiaddr = "/ip4/203.0.113.9/udp/44001/quic-v1".parse().unwrap();
+        event_loop
+            .replace_mapped_external_address(Some(second.clone()))
+            .unwrap();
+        assert_eq!(event_loop.mapped_external_address.as_ref(), Some(&second));
+        event_loop.replace_mapped_external_address(None).unwrap();
+        assert!(event_loop.mapped_external_address.is_none());
+        assert!(
+            event_loop
+                .transport_degradation()
+                .iter()
+                .any(|reason| reason.contains("port mapping"))
+        );
     }
 
     const LEGACY_MEMBER_POISON_SEQUENCE: u64 = u64::MAX - 1;

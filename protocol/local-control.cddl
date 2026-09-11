@@ -70,6 +70,8 @@ p2p-status = {
   tor_mode: "auto" / "prefer-tor" / "require-tor" / "disable-tor",
   onion_service_configured: bool,
   onion_service_reachable: bool,
+  port_mapping_enabled: bool,
+  port_mapping_external_address: null / tstr,
   degraded: [* tstr],
   listen_addresses: [* tstr],
   advertised_addresses: [* tstr],

@@ -37,6 +37,7 @@ libp2p = { version = "0.56.0", default-features = false, features = ["autonat", 
 libp2p-identity = { version = "0.2", features = ["ed25519", "peerid"] }
 notify = "8.2"
 postcard = { version = "1.1", features = ["alloc", "use-std"] }
+portmapper = { version = "=0.19.1", default-features = false }
 rand = "0.8"
 reed-solomon-erasure = "6.0"
 rpassword = "=7.5.4"

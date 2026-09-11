@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use conf::Conf;
+use libp2p::Multiaddr;
 use mb_core::{NodeId, Seed};
-use mb_node::TorMode;
+use mb_node::{TorMode, validate_port_mapping_listeners};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -105,6 +106,10 @@ pub struct DaemonOptions {
     #[conf(parameter, long, default(true))]
     pub enable_hole_punching: bool,
 
+    /// Whether to request an automatic PCP, NAT-PMP, or UPnP mapping for QUIC.
+    #[conf(parameter, long, default(false))]
+    pub enable_port_mapping: bool,
+
     /// Whether this daemon bootstraps, publishes, and refreshes DHT records.
     #[conf(parameter, long, default(true))]
     pub enable_dht_maintenance: bool,
@@ -170,6 +175,21 @@ impl DaemonOptions {
             && self.p2p_relay_addresses.is_empty()
         {
             bail!("at least one --listen or --relay address is required when Tor is disabled");
+        }
+        if self.enable_port_mapping {
+            if self.tor_mode.requires_tor() {
+                bail!("port mapping cannot be enabled in require-tor mode");
+            }
+            let listeners = self
+                .p2p_listen_addresses
+                .iter()
+                .map(|value| {
+                    value
+                        .parse::<Multiaddr>()
+                        .with_context(|| format!("invalid listen multiaddress {value}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            validate_port_mapping_listeners(&listeners)?;
         }
         if self.max_connections == 0 {
             bail!("max_connections must be greater than zero");
@@ -1005,6 +1025,7 @@ p2p_listen_addresses = ["/ip4/127.0.0.1/udp/1/quic-v1"]
         assert_eq!(loaded.max_connections, 7);
         assert_eq!(loaded.parity_budget_bytes, DEFAULT_PARITY_BUDGET_BYTES);
         assert!(loaded.enable_hole_punching);
+        assert!(!loaded.enable_port_mapping);
         assert!(loaded.enable_dht_maintenance);
         assert_eq!(loaded.tor_mode, TorMode::Auto);
         assert_eq!(
@@ -1021,6 +1042,58 @@ p2p_listen_addresses = ["/ip4/127.0.0.1/udp/1/quic-v1"]
                 "/ip4/127.0.0.1/udp/2/quic-v1",
                 "/ip4/127.0.0.1/udp/3/quic-v1"
             ]
+        );
+    }
+
+    #[test]
+    fn automatic_port_mapping_requires_one_ipv4_quic_listener() {
+        let seed = Seed::from_recovery_string("correct-horse-battery-staple-2026!").unwrap();
+        let identity = IdentityManifest {
+            format_version: 1,
+            expected_node_id: mb_core::KeyMaterial::from_seed(&seed).node_id(),
+            intent: InitializationIntent::New,
+        };
+        let parse = |listen: &[&str], tor_mode: &str| {
+            let mut args = vec![
+                "mutualbackupd",
+                "--data-dir",
+                "state",
+                "--failure-domain",
+                "disk-a",
+                "--enable-port-mapping",
+                "true",
+                "--tor-mode",
+                tor_mode,
+            ];
+            for address in listen {
+                args.extend(["--listen", address]);
+            }
+            read_daemon_options(args).unwrap()
+        };
+
+        parse(&["/ip4/0.0.0.0/udp/0/quic-v1"], "disable-tor")
+            .validate(&identity)
+            .unwrap();
+        assert!(
+            parse(&["/ip4/127.0.0.1/udp/44000/quic-v1"], "disable-tor")
+                .validate(&identity)
+                .is_err()
+        );
+        assert!(
+            parse(
+                &[
+                    "/ip4/0.0.0.0/udp/44000/quic-v1",
+                    "/ip4/192.0.2.10/udp/44001/quic-v1",
+                ],
+                "disable-tor",
+            )
+            .validate(&identity)
+            .is_err()
+        );
+        assert!(
+            parse(&["/ip4/0.0.0.0/udp/44000/quic-v1"], "require-tor")
+                .validate(&identity)
+                .is_err()
         );
     }
 

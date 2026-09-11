@@ -21,6 +21,7 @@ mb-core = { path = "../mb-core" }
 mb-store = { path = "../mb-store" }
 notify.workspace = true
 postcard.workspace = true
+portmapper.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

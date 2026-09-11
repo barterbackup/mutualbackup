@@ -248,6 +248,14 @@ async fn main() -> Result<()> {
                     "onion service:   configured={} reachable={}",
                     network.onion_service_configured, network.onion_service_reachable
                 );
+                println!(
+                    "gateway mapping: enabled={} external={}",
+                    network.port_mapping_enabled,
+                    network
+                        .port_mapping_external_address
+                        .as_deref()
+                        .unwrap_or("(none)")
+                );
                 for reason in network.degraded {
                     println!("network degraded: {reason}");
                 }

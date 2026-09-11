@@ -66,7 +66,7 @@ pub enum LocalResponse {
     Unlocked {
         node_id: NodeId,
     },
-    Status(NodeStatus),
+    Status(Box<NodeStatus>),
     RootAdded(ProtectedRoot),
     Guild(Option<GuildSummary>),
     GuildInvite {

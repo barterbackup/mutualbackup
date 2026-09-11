@@ -7,8 +7,8 @@ use mb_node::{
     LocalControlListener, LocalRequest, LocalResponse, LockedDataDir, Node, P2pConfig, P2pStartup,
     TorTransport, TorTransportConfig, UnlockSecret, WireError, bind_local_control,
     build_p2p_with_tor, onion_listener_address, run_coordinator_jobs, run_dht_publications,
-    run_peer_exchange, run_relay_membership_sync, run_root_watcher, serve_local_control_on,
-    wait_for_onion_service_shutdown,
+    run_peer_exchange, run_port_mapping, run_relay_membership_sync, run_root_watcher,
+    serve_local_control_on, wait_for_onion_service_shutdown,
 };
 use mutualbackup::{
     DaemonOptions, DaemonOptionsError, IdentityManifest, InitializationIntent, read_daemon_options,
@@ -99,6 +99,7 @@ async fn main() -> Result<()> {
         result = run_coordinator_jobs(node.clone(), p2p_client.clone()) => result,
         result = run_dht_publications(node.clone(), p2p_client.clone()), if config.enable_dht_maintenance => result,
         result = run_peer_exchange(node.clone(), p2p_client.clone()) => result,
+        result = run_port_mapping(p2p_client.clone()), if config.enable_port_mapping => result,
         result = run_relay_membership_sync(node.clone(), p2p_client.clone()) => result,
         result = run_root_watcher(node.clone()) => result,
         result = &mut p2p_task => result.context("libp2p event-loop task failed")?,
@@ -228,6 +229,7 @@ async fn start_node_runtime(
         enable_dht_maintenance: config.enable_dht_maintenance,
         enable_relay_server: config.enable_relay_server,
         enable_hole_punching: config.enable_hole_punching,
+        enable_port_mapping: config.enable_port_mapping,
         public_endpoint,
         failure_domain,
         configure_failure_domain: identity.intent == InitializationIntent::New,

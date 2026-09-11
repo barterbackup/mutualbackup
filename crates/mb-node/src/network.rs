@@ -45,6 +45,7 @@ use crate::{
 };
 
 mod p2p;
+mod port_mapping;
 mod tor;
 mod wire;
 pub(crate) use p2p::restore_snapshot_with_p2p;
@@ -56,6 +57,7 @@ pub use p2p::{
     recovery_mailbox_key, run_coordinator_jobs, run_dht_publications, run_peer_exchange,
     run_relay_membership_sync,
 };
+pub use port_mapping::{run_port_mapping, validate_port_mapping_listeners};
 pub use tor::{
     ONION_SERVICE_PORT, TorMode, TorTransport, TorTransportConfig, is_onion_address,
     onion_address_matches_node, onion_address_matches_peer, onion_listener_address,
