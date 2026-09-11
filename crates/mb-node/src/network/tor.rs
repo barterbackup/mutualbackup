@@ -27,7 +27,7 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tor_config::sources::MustRead;
 use tor_config::{ConfigurationSource, ConfigurationSources, ExplicitOrAuto};
 use tor_config_path::arti_client_base_resolver;
-use tor_hscrypto::pk::HsIdKeypair;
+use tor_hscrypto::pk::{HsId, HsIdKeypair};
 use tor_hsservice::config::OnionServiceConfigBuilder;
 use tor_hsservice::{HsNickname, RunningOnionService};
 use tor_keymgr::config::ArtiKeystoreKind;
@@ -423,7 +423,14 @@ impl Transport for TorTransport {
                     listener_id,
                     upgrade: ready(Ok(*stream)),
                     local_addr: local_addr.clone(),
-                    send_back_addr: local_addr,
+                    // Tor intentionally hides the client's network address and
+                    // does not prove that it owns an onion service of its own.
+                    // Reporting our listener here makes Identify tell the
+                    // client that our onion address is its observed address,
+                    // which in turn feeds a bogus AutoNAT probe.  An empty
+                    // multiaddress is the explicit "unknown remote address"
+                    // representation used by this transport.
+                    send_back_addr: anonymous_inbound_address(),
                 })
             }
             Poll::Ready(Some(InboundEvent::Error(message))) => {
@@ -729,26 +736,45 @@ pub fn onion_listener_address(node_id: NodeId) -> Result<Multiaddr> {
         .context("construct onion multiaddress")
 }
 
+fn anonymous_inbound_address() -> Multiaddr {
+    Multiaddr::empty()
+}
+
 fn parse_onion_target(address: &Multiaddr) -> Option<(String, u16)> {
+    let (hostname, port, _) = parse_canonical_onion_endpoint(address)?;
+    Some((hostname, port))
+}
+
+fn parse_canonical_onion_endpoint(
+    address: &Multiaddr,
+) -> Option<(String, u16, Option<libp2p::PeerId>)> {
     let mut protocols = address.iter();
     let Protocol::Onion3(onion) = protocols.next()? else {
         return None;
     };
-    if onion.port() == 0 {
+    if onion.port() != ONION_SERVICE_PORT {
         return None;
     }
-    match protocols.next() {
-        None => {}
-        Some(Protocol::P2p(_)) if protocols.next().is_none() => {}
+    let terminal_peer = match protocols.next() {
+        None => None,
+        Some(Protocol::P2p(peer)) if protocols.next().is_none() => Some(peer),
         _ => return None,
+    };
+    let hostname = format!(
+        "{}.onion",
+        BASE32_NOPAD.encode(onion.hash()).to_ascii_lowercase()
+    );
+    hostname.parse::<HsId>().ok()?;
+    let onion_peer = peer_id_from_onion_hash(onion.hash())?;
+    if terminal_peer.is_some_and(|peer| peer != onion_peer) {
+        return None;
     }
-    Some((
-        format!(
-            "{}.onion",
-            BASE32_NOPAD.encode(onion.hash()).to_ascii_lowercase()
-        ),
-        onion.port(),
-    ))
+    Some((hostname, onion.port(), terminal_peer))
+}
+
+fn peer_id_from_onion_hash(hash: &[u8; 35]) -> Option<libp2p::PeerId> {
+    let public = libp2p::identity::ed25519::PublicKey::try_from_bytes(&hash[..32]).ok()?;
+    Some(libp2p::identity::PublicKey::from(public).to_peer_id())
 }
 
 pub fn is_onion_address(address: &Multiaddr) -> bool {
@@ -757,38 +783,28 @@ pub fn is_onion_address(address: &Multiaddr) -> bool {
         .any(|protocol| matches!(protocol, Protocol::Onion3(_)))
 }
 
+pub fn is_canonical_onion_address(address: &Multiaddr) -> bool {
+    parse_canonical_onion_endpoint(address).is_some()
+}
+
 pub fn onion_address_matches_node(address: &Multiaddr, node_id: NodeId) -> bool {
-    let Some(protocol) = address
-        .iter()
-        .find(|protocol| matches!(protocol, Protocol::Onion3(_)))
-    else {
+    if !is_onion_address(address) {
         return true;
-    };
-    let Protocol::Onion3(onion) = protocol else {
-        return false;
-    };
-    onion.hash()[..32] == node_id.0
-        && format!(
-            "{}.onion",
-            BASE32_NOPAD.encode(onion.hash()).to_ascii_lowercase()
-        ) == node_id.onion_hostname()
+    }
+    parse_canonical_onion_endpoint(address)
+        .is_some_and(|(hostname, _, _)| hostname == node_id.onion_hostname())
 }
 
 pub fn onion_address_matches_peer(address: &Multiaddr, peer: libp2p::PeerId) -> bool {
-    let Some(protocol) = address
-        .iter()
-        .find(|protocol| matches!(protocol, Protocol::Onion3(_)))
-    else {
+    if !is_onion_address(address) {
         return true;
-    };
-    let Protocol::Onion3(onion) = protocol else {
+    }
+    let mut protocols = address.iter();
+    let Some(Protocol::Onion3(onion)) = protocols.next() else {
         return false;
     };
-    let Ok(public) = libp2p::identity::ed25519::PublicKey::try_from_bytes(&onion.hash()[..32])
-    else {
-        return false;
-    };
-    libp2p::identity::PublicKey::from(public).to_peer_id() == peer
+    parse_canonical_onion_endpoint(address).is_some()
+        && peer_id_from_onion_hash(onion.hash()) == Some(peer)
 }
 
 #[cfg(test)]
@@ -822,6 +838,57 @@ mod tests {
 
         let with_suffix: Multiaddr = format!("{bare}/p2p/{peer}/p2p-circuit").parse().unwrap();
         assert!(parse_onion_target(&with_suffix).is_none());
+
+        let other_peer = KeyMaterial::from_seed(&Seed::from_bytes([10; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let mismatched_peer: Multiaddr = format!("{bare}/p2p/{other_peer}").parse().unwrap();
+        assert!(parse_onion_target(&mismatched_peer).is_none());
+    }
+
+    #[test]
+    fn onion_endpoint_rejects_corrupt_v3_bytes_and_wrong_port() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([11; 32]));
+        let valid = onion_listener_address(keys.node_id()).unwrap();
+        let Protocol::Onion3(onion) = valid.iter().next().unwrap() else {
+            panic!("generated address is not onion3");
+        };
+
+        for index in [32, 34] {
+            let mut corrupt = *onion.hash();
+            corrupt[index] ^= 1;
+            let address =
+                Multiaddr::empty().with(Protocol::Onion3((corrupt, ONION_SERVICE_PORT).into()));
+            assert!(parse_onion_target(&address).is_none());
+            assert!(!onion_address_matches_node(&address, keys.node_id()));
+            assert!(!onion_address_matches_peer(
+                &address,
+                keys.node_id().libp2p_peer_id().unwrap()
+            ));
+        }
+
+        let wrong_port = Multiaddr::empty().with(Protocol::Onion3(
+            ((*onion.hash()), ONION_SERVICE_PORT + 1).into(),
+        ));
+        assert!(parse_onion_target(&wrong_port).is_none());
+        assert!(!onion_address_matches_node(&wrong_port, keys.node_id()));
+
+        let prefixed = Multiaddr::empty()
+            .with(Protocol::Memory(7))
+            .with(Protocol::Onion3(
+                ((*onion.hash()), ONION_SERVICE_PORT).into(),
+            ));
+        assert!(!onion_address_matches_node(&prefixed, keys.node_id()));
+    }
+
+    #[test]
+    fn anonymous_inbound_address_is_not_the_onion_listener() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([12; 32]));
+        let listener = onion_listener_address(keys.node_id()).unwrap();
+        let remote = anonymous_inbound_address();
+        assert!(remote.is_empty());
+        assert_ne!(remote, listener);
     }
 
     #[test]

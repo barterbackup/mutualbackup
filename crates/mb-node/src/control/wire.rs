@@ -107,6 +107,10 @@ mod tests {
         include_str!("../../../../protocol/vectors/local-status-request.json");
     const LOCKED_ERROR_RESPONSE: &str =
         include_str!("../../../../protocol/vectors/local-locked-error-response.json");
+    const STATUS_RESPONSE: &str =
+        include_str!("../../../../protocol/vectors/local-status-response.json");
+    const ROOT_ADDED_RESPONSE: &str =
+        include_str!("../../../../protocol/vectors/local-root-added-response.json");
     const INVALID_VERSION: &str =
         include_str!("../../../../protocol/vectors/local-invalid-version.json");
 
@@ -134,6 +138,32 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&response).unwrap(),
             LOCKED_ERROR_RESPONSE.trim_end()
+        );
+
+        cddl_cat::validate_json_str("local-response-envelope", SCHEMA, STATUS_RESPONSE).unwrap();
+        let response: LocalResponseEnvelope = serde_json::from_str(STATUS_RESPONSE).unwrap();
+        assert!(matches!(
+            &response.result,
+            Ok(LocalResponse::Status(status))
+                if status.protected_root.as_ref().is_some_and(|root|
+                    root.filesystem_id == 41 && root.root_inode == 43)
+        ));
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            STATUS_RESPONSE.trim_end()
+        );
+
+        cddl_cat::validate_json_str("local-response-envelope", SCHEMA, ROOT_ADDED_RESPONSE)
+            .unwrap();
+        let response: LocalResponseEnvelope = serde_json::from_str(ROOT_ADDED_RESPONSE).unwrap();
+        assert!(matches!(
+            &response.result,
+            Ok(LocalResponse::RootAdded(root))
+                if root.filesystem_id == 41 && root.root_inode == 43
+        ));
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            ROOT_ADDED_RESPONSE.trim_end()
         );
 
         assert!(

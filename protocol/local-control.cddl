@@ -57,7 +57,8 @@ protected-root = {
   format_version: uint,
   root_id: uuid-text,
   path: tstr,
-  filesystem_device: uint
+  filesystem_id: uint,
+  root_inode: uint
 }
 
 p2p-status = {
