@@ -51,7 +51,10 @@ const COMMAND_CAPACITY: usize = 128;
 const DHT_TTL: Duration = Duration::from_secs(15 * 60);
 const DHT_REPUBLISH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DHT_MAX_PACKET_BYTES: usize = 128 * 1024;
-const DHT_REPLICATION_FACTOR: usize = 5;
+// Three replicas survive any two losses in the fixed five-node profile. Asking
+// Kademlia for all five makes recovery wait for the two nodes it is designed to
+// tolerate losing before it can use the three live publishers.
+const DHT_REPLICATION_FACTOR: usize = 3;
 const BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const RELAY_RESERVATION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const RELAY_RETIREMENT_GRACE: Duration = Duration::from_millis(500);

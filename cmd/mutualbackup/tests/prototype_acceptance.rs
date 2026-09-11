@@ -479,6 +479,8 @@ fn daemon_never_reports_ready_when_its_only_listener_cannot_start() {
             temp.path().join("control.sock").into_os_string(),
             os("--failure-domain"),
             os("listener-readiness-test"),
+            os("--tor-mode"),
+            os("disable-tor"),
             os("--listen"),
             os(address),
         ],
@@ -530,6 +532,8 @@ fn manual_unlock_returns_to_locked_after_network_startup_failure() {
             socket.as_os_str().to_owned(),
             os("--failure-domain"),
             os("manual-network-retry-test"),
+            os("--tor-mode"),
+            os("disable-tor"),
             os("--listen"),
             os(address.clone()),
         ],
@@ -1146,19 +1150,24 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     storage_recovered_daemon.stop();
 
     let relay = format!("{}/p2p/{}", transports[5], peer_ids[1]);
+    let coordinator_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[0]);
     let punched_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[3]);
     let fallback_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[4]);
     update_config(&recovered_config, |config| {
         config.enable_relay_server = true
     });
     update_config(&configs[0], |config| {
+        // Peer exchange is intentionally active in the product. Publish only
+        // the circuit endpoint in this topology so it cannot reveal the
+        // loopback listener and bypass the DCUtR path under test.
+        config.p2p_external_addresses = vec![coordinator_circuit.clone()];
         config.p2p_bootstrap_addresses = vec![punched_circuit.clone(), fallback_circuit.clone()];
         config.p2p_relay_addresses = vec![relay.clone()];
         config.enable_dht_maintenance = false;
     });
     update_config(&configs[3], |config| {
         config.p2p_listen_addresses = vec![transports[6].clone()];
-        config.p2p_external_addresses.clear();
+        config.p2p_external_addresses = vec![punched_circuit.clone()];
         config.p2p_bootstrap_addresses.clear();
         config.p2p_relay_addresses = vec![relay.clone()];
         config.enable_hole_punching = true;
