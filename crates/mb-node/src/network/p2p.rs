@@ -6992,8 +6992,12 @@ mod tests {
         let (recovery_client, recovery_loop) =
             build_p2p(recovered_node.clone(), recovery_config).unwrap();
         let recovery_task = tokio::spawn(recovery_loop.run());
+        // This covers DHT discovery, certified-state validation, endpoint
+        // refresh, all coding groups, and publication. Keep the integration
+        // bound above the protocol's single 20-second request timeout; focused
+        // tests separately prove that abandoned requests release their state.
         let recovered = tokio::time::timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(60),
             recover_from_dht(recovered_node.clone(), &recovery_client, &restored),
         )
         .await
