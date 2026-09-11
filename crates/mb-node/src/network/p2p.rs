@@ -51,6 +51,7 @@ const COMMAND_CAPACITY: usize = 128;
 const DHT_TTL: Duration = Duration::from_secs(15 * 60);
 const DHT_REPUBLISH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DHT_MAX_PACKET_BYTES: usize = 128 * 1024;
+const DHT_REPLICATION_FACTOR: usize = 5;
 const BOOTSTRAP_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const RELAY_RESERVATION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const RELAY_RETIREMENT_GRACE: Duration = Duration::from_millis(500);
@@ -67,6 +68,8 @@ const MAX_RECOVERY_QUARANTINED_PEERS: usize =
 const MAX_RELAY_RESERVATIONS: usize = 5;
 const MAX_RELAY_CIRCUITS: usize = 8;
 const MAX_RELAY_CIRCUIT_BYTES: u64 = 8 * 1024 * 1024;
+const DHT_RECOVERY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const DHT_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const SHARD_FETCH_ATTEMPTS: usize = 3;
 const PEER_EXCHANGE_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_EXCHANGED_ENDPOINT_RECORDS: usize = 64;
@@ -711,7 +714,10 @@ pub fn build_p2p_with_tor(
             let mut kad_config = kad::Config::new(KAD_PROTOCOL);
             kad_config
                 .set_query_timeout(Duration::from_secs(30))
-                .set_replication_factor(NonZeroUsize::new(3).expect("three is nonzero"))
+                .set_replication_factor(
+                    NonZeroUsize::new(DHT_REPLICATION_FACTOR)
+                        .expect("DHT replication factor is nonzero"),
+                )
                 .set_record_ttl(Some(DHT_TTL))
                 .set_publication_interval(Some(DHT_REPUBLISH_INTERVAL))
                 .set_provider_record_ttl(Some(DHT_TTL))
@@ -3374,57 +3380,72 @@ async fn apply_endpoint_record(
 }
 
 async fn publish_dht_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
-    let endpoints = advertised_p2p_endpoints(p2p).await?;
-    let expires = unix_seconds()
-        .checked_add(DHT_TTL.as_secs())
-        .context("DHT publication expiry overflow")?;
-    let (local_id, probe_subjects) = node_blocking(node.clone(), |node| {
-        Ok((
-            node.keys().node_id(),
-            node.dht_recovery_sequence_probe_subjects()?,
-        ))
-    })
-    .await?;
+    let endpoints = available_p2p_endpoints(p2p).await?;
+    let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
     let local_peer = p2p.local_peer_id();
-    let mut sequence_floors = DhtSequenceFloors::default();
-    if !probe_subjects.is_empty() {
-        let records = p2p.get_record(endpoint_record_key(&local_peer)).await?;
-        sequence_floors.endpoint =
-            next_sequence_floor(highest_endpoint_sequence(local_id, records)?)?;
-        let mut queries = FuturesUnordered::new();
-        for subject in probe_subjects {
-            let publisher = local_peer.clone();
-            let key = recovery_bundle_key(subject, &local_peer);
-            queries.push(async move { (publisher, subject, p2p.get_record(key).await) });
+    let published_checkpoint_hash = if endpoints.is_empty() {
+        tracing::debug!("DHT publication deferred until a local endpoint is reachable");
+        None
+    } else {
+        let expires = unix_seconds()
+            .checked_add(DHT_TTL.as_secs())
+            .context("DHT publication expiry overflow")?;
+        let probe_subjects = node_blocking(node.clone(), |node| {
+            node.dht_recovery_sequence_probe_subjects()
+        })
+        .await?;
+        let mut sequence_floors = DhtSequenceFloors::default();
+        if !probe_subjects.is_empty() {
+            let records = p2p.get_record(endpoint_record_key(&local_peer)).await?;
+            sequence_floors.endpoint =
+                next_sequence_floor(highest_endpoint_sequence(local_id, records)?)?;
+            let mut queries = FuturesUnordered::new();
+            for subject in probe_subjects {
+                let publisher = local_peer.clone();
+                let key = recovery_bundle_key(subject, &local_peer);
+                queries.push(async move { (publisher, subject, p2p.get_record(key).await) });
+            }
+            while let Some((publisher, subject, records)) = queries.next().await {
+                sequence_floors.recovery.insert(
+                    subject,
+                    next_sequence_floor(highest_recovery_sequence(&publisher, subject, records?)?)?,
+                );
+            }
         }
-        while let Some((publisher, subject, records)) = queries.next().await {
-            sequence_floors.recovery.insert(
-                subject,
-                next_sequence_floor(highest_recovery_sequence(&publisher, subject, records?)?)?,
-            );
-        }
-    }
-    let Some(publications) = node_blocking(node.clone(), move |node| {
-        node.build_dht_publications(endpoints, expires, sequence_floors)
-    })
-    .await?
-    else {
-        return Ok(());
-    };
-    p2p.put_record(
-        endpoint_record_key(&local_peer),
-        canonical_bytes(&publications.endpoint)?,
-    )
-    .await?;
-    for bundle in publications.recovery {
-        let subject = bundle.value.subject;
+        let Some(publications) = node_blocking(node.clone(), move |node| {
+            node.build_dht_publications(endpoints, expires, sequence_floors)
+        })
+        .await?
+        else {
+            return Ok(());
+        };
         p2p.put_record(
-            recovery_bundle_key(subject, &local_peer),
-            canonical_bytes(&bundle)?,
+            endpoint_record_key(&local_peer),
+            canonical_bytes(&publications.endpoint)?,
         )
         .await?;
-        p2p.start_providing(recovery_mailbox_key(subject)).await?;
-    }
+        for bundle in publications.recovery {
+            let subject = bundle.value.subject;
+            p2p.put_record(
+                recovery_bundle_key(subject, &local_peer),
+                canonical_bytes(&bundle)?,
+            )
+            .await?;
+            p2p.start_providing(recovery_mailbox_key(subject)).await?;
+        }
+        Some(publications.checkpoint_hash)
+    };
+    let checkpoint_hash = match published_checkpoint_hash {
+        Some(hash) => hash,
+        None => {
+            let Some(hash) =
+                node_blocking(node.clone(), |node| node.dht_readiness_checkpoint_hash()).await?
+            else {
+                return Ok(());
+            };
+            hash
+        }
+    };
 
     let providers = p2p.get_providers(recovery_mailbox_key(local_id)).await?;
     let mut bundle_queries = FuturesUnordered::new();
@@ -3465,7 +3486,7 @@ async fn publish_dht_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()>
         if validate_ready_bundle(
             node.clone(),
             &provider,
-            publications.checkpoint_hash,
+            checkpoint_hash,
             observation.selected.clone(),
         )
         .await
@@ -3482,24 +3503,18 @@ async fn publish_dht_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()>
             continue;
         }
         let expires_at = bundle.value.expires_at_unix_seconds;
-        if validate_ready_bundle(
-            node.clone(),
-            &provider,
-            publications.checkpoint_hash,
-            bundle,
-        )
-        .await
-        .is_ok()
+        if validate_ready_bundle(node.clone(), &provider, checkpoint_hash, bundle)
+            .await
+            .is_ok()
         {
             considered_publishers.insert(publisher);
             confirmations.push((publisher, expires_at));
         }
     }
-    let hash = publications.checkpoint_hash;
     node_blocking(node, move |node| {
-        let checkpoint = node.checkpoint(&hash)?;
+        let checkpoint = node.checkpoint(&checkpoint_hash)?;
         node.retain_checkpoint_recovery_records(&checkpoint, certified_observations)?;
-        node.update_seed_recovery_readiness(hash, confirmations)
+        node.update_seed_recovery_readiness(checkpoint_hash, confirmations)
     })
     .await?;
     Ok(())
@@ -3569,6 +3584,10 @@ pub struct DhtRecoveryResult {
     pub revision_id: Option<Uuid>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct RecoveryDiscoveryPending(&'static str);
+
 #[derive(Clone)]
 struct RecoveryCandidate {
     publisher: NodeId,
@@ -3609,8 +3628,38 @@ pub async fn recover_from_dht(
             revision_id: local.revision_id,
         });
     }
+    let deadline = tokio::time::Instant::now() + DHT_RECOVERY_DISCOVERY_TIMEOUT;
+    loop {
+        match recover_from_dht_once(node.clone(), p2p, restore_target).await {
+            Ok(result) => return Ok(result),
+            Err(error) if error.downcast_ref::<RecoveryDiscoveryPending>().is_some() => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(error).context(format!(
+                        "recovery discovery timed out after {} seconds",
+                        DHT_RECOVERY_DISCOVERY_TIMEOUT.as_secs()
+                    ));
+                }
+                tracing::debug!(%error, "DHT recovery discovery is not ready; retrying");
+                tokio::time::sleep(DHT_RECOVERY_RETRY_INTERVAL).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn recover_from_dht_once(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    restore_target: &std::path::Path,
+) -> Result<DhtRecoveryResult> {
     let subject = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
-    let providers = p2p.get_providers(recovery_mailbox_key(subject)).await?;
+    let providers = p2p
+        .get_providers(recovery_mailbox_key(subject))
+        .await
+        .context(RecoveryDiscoveryPending(
+            "Kademlia recovery provider lookup is not ready",
+        ))?;
+    tracing::debug!(subject = %subject, providers = providers.len(), "DHT recovery provider query completed");
     let mut bundle_queries = FuturesUnordered::new();
     for provider in providers {
         let key = recovery_bundle_key(subject, &provider);
@@ -3691,6 +3740,12 @@ pub async fn recover_from_dht(
         group.sort_by_key(|candidate| candidate.publisher);
         group.dedup_by_key(|candidate| candidate.publisher);
     }
+    tracing::debug!(
+        subject = %subject,
+        heads = candidates_by_head.len(),
+        candidates = candidates_by_head.values().map(Vec::len).sum::<usize>(),
+        "DHT recovery candidates validated"
+    );
     let mut generations = candidates_by_head
         .iter()
         .filter(|(_, candidates)| candidates.len() >= 3)
@@ -3699,7 +3754,10 @@ pub async fn recover_from_dht(
     generations.sort_unstable_by(|left, right| right.cmp(left));
     generations.dedup();
     if generations.is_empty() {
-        bail!("Kademlia returned no recovery head confirmed by three publishers");
+        return Err(RecoveryDiscoveryPending(
+            "Kademlia returned no recovery head confirmed by three publishers",
+        )
+        .into());
     }
 
     let mut selected = None;
@@ -3741,7 +3799,9 @@ pub async fn recover_from_dht(
         genesis,
         checkpoint,
         candidates,
-    } = selected.context("no advertised recovery head could be certified")?;
+    } = selected.ok_or(RecoveryDiscoveryPending(
+        "no advertised recovery head could be certified",
+    ))?;
     let recovered_endpoint_sequence_floor = candidates
         .iter()
         .map(|candidate| candidate.locator.subject_endpoint_sequence_floor)
@@ -3761,7 +3821,11 @@ pub async fn recover_from_dht(
     })
     .await?;
 
-    let local_endpoints = advertised_p2p_endpoints(p2p).await?;
+    // Recovery is an outbound operation and does not require the recovering
+    // node's listener to be reachable at this exact instant.  The durable
+    // roster permits an empty local endpoint set until the onion service (or
+    // another ingress path) is advertised again.
+    let local_endpoints = available_p2p_endpoints(p2p).await?;
     let mut roster = genesis
         .genesis
         .members
@@ -4624,6 +4688,14 @@ fn dht_key(kind: &[u8], parts: &[&[u8]]) -> Vec<u8> {
 }
 
 async fn advertised_p2p_endpoints(p2p: &P2pClient) -> Result<Vec<String>> {
+    let endpoints = available_p2p_endpoints(p2p).await?;
+    if endpoints.is_empty() {
+        bail!("daemon has no usable DHT endpoint");
+    }
+    Ok(endpoints)
+}
+
+async fn available_p2p_endpoints(p2p: &P2pClient) -> Result<Vec<String>> {
     let status = p2p.status().await?;
     let peer_id: PeerId = status.peer_id.parse()?;
     let mut endpoints = Vec::new();
@@ -4647,9 +4719,6 @@ async fn advertised_p2p_endpoints(p2p: &P2pClient) -> Result<Vec<String>> {
     }
     endpoints.sort();
     endpoints.dedup();
-    if endpoints.is_empty() {
-        bail!("daemon has no usable DHT endpoint");
-    }
     Ok(endpoints)
 }
 

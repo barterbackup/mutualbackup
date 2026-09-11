@@ -734,8 +734,13 @@ fn parse_onion_target(address: &Multiaddr) -> Option<(String, u16)> {
     let Protocol::Onion3(onion) = protocols.next()? else {
         return None;
     };
-    if protocols.next().is_some() || onion.port() == 0 {
+    if onion.port() == 0 {
         return None;
+    }
+    match protocols.next() {
+        None => {}
+        Some(Protocol::P2p(_)) if protocols.next().is_none() => {}
+        _ => return None,
     }
     Some((
         format!(
@@ -805,6 +810,18 @@ mod tests {
             &address,
             KeyMaterial::from_seed(&Seed::from_bytes([8; 32])).node_id()
         ));
+    }
+
+    #[test]
+    fn onion_dial_target_accepts_only_an_optional_terminal_peer_id() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([9; 32]));
+        let bare = onion_listener_address(keys.node_id()).unwrap();
+        let peer = keys.node_id().libp2p_peer_id().unwrap();
+        let with_peer: Multiaddr = format!("{bare}/p2p/{peer}").parse().unwrap();
+        assert_eq!(parse_onion_target(&bare), parse_onion_target(&with_peer));
+
+        let with_suffix: Multiaddr = format!("{bare}/p2p/{peer}/p2p-circuit").parse().unwrap();
+        assert!(parse_onion_target(&with_suffix).is_none());
     }
 
     #[test]

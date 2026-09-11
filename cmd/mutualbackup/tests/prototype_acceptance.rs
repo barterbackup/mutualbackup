@@ -17,7 +17,8 @@ use mb_core::{
     canonical_bytes,
 };
 use mb_node::{
-    Node, P2pConfig, build_p2p, endpoint_record_key, recovery_bundle_key, recovery_mailbox_key,
+    Node, P2pConfig, build_p2p, endpoint_record_key, onion_listener_address, recovery_bundle_key,
+    recovery_mailbox_key,
 };
 use mutualbackup::{
     DaemonOptions, InitializationIntent, read_daemon_options, read_identity_manifest,
@@ -1422,6 +1423,265 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     fs::remove_dir_all(&run_root).unwrap();
 }
 
+#[test]
+#[ignore = "requires a provisioned reflink filesystem and private Chutney Tor network"]
+fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
+    let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+        .expect("the acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT");
+    let arti_config = PathBuf::from(
+        std::env::var_os("MUTUALBACKUP_PRIVATE_TOR_CONFIG")
+            .expect("the private-Tor harness must set MUTUALBACKUP_PRIVATE_TOR_CONFIG"),
+    );
+    assert!(arti_config.is_file());
+    let run_root = PathBuf::from(test_root).join(format!("private-tor-{}", Uuid::new_v4()));
+    fs::create_dir_all(&run_root).unwrap();
+    let seed_dir = run_root.join("offline");
+    fs::create_dir(&seed_dir).unwrap();
+    set_private(&seed_dir);
+
+    let mut node_ids = Vec::new();
+    let mut peer_ids = Vec::new();
+    let mut onion_endpoints = Vec::new();
+    let mut sockets = Vec::new();
+    let mut configs = Vec::new();
+    for index in 0..5 {
+        let peer_dir = run_root.join(format!("p{index}"));
+        fs::create_dir(&peer_dir).unwrap();
+        set_private(&peer_dir);
+        let seed_file = seed_dir.join(format!("p{index}.seed"));
+        let socket = peer_dir.join("control.sock");
+        let output = run_cli(
+            &[
+                os("--socket"),
+                socket.as_os_str().to_owned(),
+                os("init"),
+                os("--seed-file"),
+                seed_file.as_os_str().to_owned(),
+                os("--data-dir"),
+                peer_dir.join("state").into_os_string(),
+            ],
+            CLI_TIMEOUT,
+        )
+        .unwrap();
+        let node_id = value_after(&output, "node id:       ")
+            .parse::<NodeId>()
+            .unwrap();
+        let peer_id = value_after(&output, "libp2p peer id: ");
+        let onion = onion_listener_address(node_id).unwrap().to_string();
+        node_ids.push(node_id);
+        peer_ids.push(peer_id);
+        onion_endpoints.push(onion);
+        sockets.push(socket);
+    }
+
+    let bootstrap = format!("{}/p2p/{}", onion_endpoints[0], peer_ids[0]);
+    for (index, socket) in sockets.iter().enumerate() {
+        let peer_dir = run_root.join(format!("p{index}"));
+        let config = peer_dir.join("node.toml");
+        write_test_config(
+            &config,
+            &DaemonOptions {
+                config_file: None,
+                data_dir: peer_dir.join("state"),
+                seed_file: Some(seed_dir.join(format!("p{index}.seed"))),
+                start_locked: false,
+                control_socket: socket.clone(),
+                failure_domain: Some(format!("tor-disk-{index}")),
+                parity_budget_bytes: 10 * 1024 * 1024 * 1024,
+                p2p_listen_addresses: Vec::new(),
+                clear_p2p_listen_addresses: false,
+                p2p_external_addresses: Vec::new(),
+                clear_p2p_external_addresses: false,
+                p2p_bootstrap_addresses: if index == 0 {
+                    Vec::new()
+                } else {
+                    vec![bootstrap.clone()]
+                },
+                clear_p2p_bootstrap_addresses: false,
+                p2p_relay_addresses: Vec::new(),
+                clear_p2p_relay_addresses: false,
+                enable_relay_server: false,
+                enable_hole_punching: false,
+                enable_port_mapping: false,
+                enable_dht_maintenance: true,
+                tor_mode: mb_node::TorMode::RequireTor,
+                tor_state_dir: None,
+                tor_cache_dir: None,
+                arti_config_file: Some(arti_config.clone()),
+                max_connections: 32,
+            },
+        );
+        configs.push(config);
+    }
+
+    let mut daemons = configs
+        .iter()
+        .enumerate()
+        .map(|(index, config)| {
+            let mut daemon = Daemon::new(config.clone(), run_root.join(format!("p{index}.log")));
+            daemon.set_env("RUST_LOG", "warn");
+            daemon.start();
+            daemon
+        })
+        .collect::<Vec<_>>();
+    for index in 0..5 {
+        let status = wait_for_status_text(
+            &sockets[index],
+            &mut daemons[index],
+            "configured=true reachable=true",
+            Duration::from_secs(240),
+        );
+        assert_onion_only_status(&status);
+        assert_stable_onion_is_advertised(&status, &onion_endpoints[index]);
+    }
+
+    cli(&sockets[0], ["guild", "create"], Duration::from_secs(60));
+    for index in 1..5 {
+        let invite = cli(&sockets[0], ["guild", "invite"], Duration::from_secs(60));
+        let token = value_after(&invite, "invitation: ");
+        join_guild_with_retry(&sockets[index], &token, Duration::from_secs(240));
+    }
+    let finalized = cli(&sockets[0], ["guild", "finalize"], Duration::from_secs(300));
+    assert!(finalized.contains("members:     5 of 5"));
+
+    let source = run_root.join("p1/source");
+    fs::create_dir_all(source.join("documents")).unwrap();
+    let expected = deterministic_bytes(192_017, 83);
+    fs::write(source.join("documents/onion.bin"), &expected).unwrap();
+    cli_path(&sockets[1], ["root", "add"], &source);
+    let backup = cli(&sockets[1], ["backup", "--wait"], Duration::from_secs(300));
+    assert!(backup.contains("state:      Committed"));
+    let owner_status = wait_for_status(&sockets[1], &mut daemons[1], Duration::from_secs(30));
+    assert_onion_only_status(&owner_status);
+    assert_tor_bulk_transfer(&owner_status);
+
+    for index in 0..5 {
+        wait_for_recovery_ready(
+            &sockets[index],
+            &mut daemons[index],
+            Duration::from_secs(180),
+        );
+    }
+
+    for daemon in &mut daemons {
+        daemon.stop();
+    }
+    for daemon in &mut daemons {
+        daemon.start();
+    }
+    for index in 0..5 {
+        let status = wait_for_status_text(
+            &sockets[index],
+            &mut daemons[index],
+            "configured=true reachable=true",
+            Duration::from_secs(240),
+        );
+        assert_onion_only_status(&status);
+        assert_stable_onion_is_advertised(&status, &onion_endpoints[index]);
+    }
+
+    daemons[1].stop();
+    daemons[4].stop();
+    fs::remove_dir_all(run_root.join("p1")).unwrap();
+    fs::remove_dir_all(run_root.join("p4")).unwrap();
+
+    let recovered_dir = run_root.join("recovered-p1");
+    fs::create_dir(&recovered_dir).unwrap();
+    set_private(&recovered_dir);
+    let recovered_socket = recovered_dir.join("control.sock");
+    run_cli(
+        &[
+            os("--socket"),
+            recovered_socket.as_os_str().to_owned(),
+            os("recover-init"),
+            os("--seed-file"),
+            seed_dir.join("p1.seed").into_os_string(),
+            os("--data-dir"),
+            recovered_dir.join("state").into_os_string(),
+        ],
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+    let recovered_config = recovered_dir.join("node.toml");
+    write_test_config(
+        &recovered_config,
+        &DaemonOptions {
+            config_file: None,
+            data_dir: recovered_dir.join("state"),
+            seed_file: Some(seed_dir.join("p1.seed")),
+            start_locked: false,
+            control_socket: recovered_socket.clone(),
+            failure_domain: None,
+            parity_budget_bytes: 10 * 1024 * 1024 * 1024,
+            p2p_listen_addresses: Vec::new(),
+            clear_p2p_listen_addresses: false,
+            p2p_external_addresses: Vec::new(),
+            clear_p2p_external_addresses: false,
+            p2p_bootstrap_addresses: vec![bootstrap],
+            clear_p2p_bootstrap_addresses: false,
+            p2p_relay_addresses: Vec::new(),
+            clear_p2p_relay_addresses: false,
+            enable_relay_server: false,
+            enable_hole_punching: false,
+            enable_port_mapping: false,
+            enable_dht_maintenance: true,
+            tor_mode: mb_node::TorMode::RequireTor,
+            tor_state_dir: None,
+            tor_cache_dir: None,
+            arti_config_file: Some(arti_config),
+            max_connections: 32,
+        },
+    );
+    let mut recovered = Daemon::new(recovered_config, run_root.join("recovered-p1.log"));
+    recovered.set_env("RUST_LOG", "warn");
+    recovered.start();
+    let status = wait_for_status_text(
+        &recovered_socket,
+        &mut recovered,
+        "configured=true reachable=true",
+        Duration::from_secs(240),
+    );
+    assert_onion_only_status(&status);
+    assert_stable_onion_is_advertised(&status, &onion_endpoints[1]);
+    let bootstrap_session = format!("peer connection: {} active=[Tor]", peer_ids[0]);
+    let status = wait_for_status_text(
+        &recovered_socket,
+        &mut recovered,
+        &bootstrap_session,
+        Duration::from_secs(240),
+    );
+    assert_onion_only_status(&status);
+
+    let restored = run_root.join("restored-from-onion");
+    let output = cli_path_with_timeout(
+        &recovered_socket,
+        ["restore"],
+        &restored,
+        Duration::from_secs(600),
+    );
+    assert!(output.contains("restore succeeded:"));
+    assert_eq!(
+        fs::read(restored.join("documents/onion.bin")).unwrap(),
+        expected
+    );
+    let recovered_status =
+        wait_for_status(&recovered_socket, &mut recovered, Duration::from_secs(30));
+    assert_tor_bulk_transfer(&recovered_status);
+    assert_onion_only_status(&recovered_status);
+
+    assert_eq!(
+        node_ids[1],
+        read_identity_manifest(&recovered_dir.join("state"))
+            .unwrap()
+            .expected_node_id
+    );
+    recovered.stop();
+    for daemon in &mut daemons {
+        daemon.stop();
+    }
+    fs::remove_dir_all(&run_root).unwrap();
+}
+
 struct DhtNoise {
     shutdown: Option<mpsc::Sender<()>>,
     worker: Option<thread::JoinHandle<()>>,
@@ -1796,6 +2056,53 @@ fn numeric_status_field(line: &str, prefix: &str) -> Option<u64> {
         .find_map(|field| field.strip_prefix(prefix))?
         .parse()
         .ok()
+}
+
+fn assert_onion_only_status(status: &str) {
+    assert!(
+        status.contains("direct listeners: 0/0"),
+        "onion-only node exposed a direct listener:\n{status}"
+    );
+    let addresses = status.lines().filter(|line| {
+        line.starts_with("listen address: ") || line.starts_with("advertised address: ")
+    });
+    for line in addresses {
+        assert!(
+            line.contains("/onion3/"),
+            "onion-only node exposed a non-onion endpoint:\n{status}"
+        );
+    }
+    for forbidden in ["Direct", "Relayed", "HolePunched", "RelayFallback"] {
+        assert!(
+            !status.lines().any(|line| {
+                line.starts_with("peer path transfer: ")
+                    && line.contains(&format!(" path={forbidden} "))
+            }),
+            "onion-only node transferred application data through {forbidden}:\n{status}"
+        );
+    }
+}
+
+fn assert_stable_onion_is_advertised(status: &str, expected_onion: &str) {
+    assert!(
+        status
+            .lines()
+            .any(|line| line.strip_prefix("advertised address: ") == Some(expected_onion)),
+        "expected stable onion endpoint {expected_onion} was not advertised:\n{status}"
+    );
+}
+
+fn assert_tor_bulk_transfer(status: &str) {
+    let metrics = status
+        .lines()
+        .find(|line| line.starts_with("path metrics: Tor "))
+        .unwrap_or_else(|| panic!("status has no Tor path metrics:\n{status}"));
+    let sent = numeric_status_field(metrics, "sent=").unwrap();
+    let received = numeric_status_field(metrics, "received=").unwrap();
+    assert!(
+        sent.max(received) >= MIN_BULK_TRANSFER_BYTES,
+        "Tor path did not carry a complete sector: sent={sent} received={received}\n{status}"
+    );
 }
 
 fn unix_seconds() -> u64 {

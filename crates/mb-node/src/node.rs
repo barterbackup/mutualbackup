@@ -2122,6 +2122,18 @@ impl Node {
         }))
     }
 
+    pub(crate) fn dht_readiness_checkpoint_hash(&self) -> Result<Option<[u8; 32]>> {
+        let Some(installed) = self.installed_guild()? else {
+            return Ok(None);
+        };
+        let Some(checkpoint) = self.current_checkpoint(installed.certificate.genesis.guild_id)?
+        else {
+            return Ok(None);
+        };
+        checkpoint.verify()?;
+        Ok(Some(checkpoint.hash()?))
+    }
+
     pub(crate) fn refresh_peer_exchange_endpoint(
         &mut self,
         endpoints: Vec<String>,
