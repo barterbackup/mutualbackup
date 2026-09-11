@@ -56,11 +56,12 @@ them as ADRs and test vectors before promising wire compatibility.
   checkpoints. Leave a compatible authorization interface for later quorum
   policies and FROST once membership and recovery policy are stable.
 
-### Implemented baseline — first usable product through Tor beta
+### Implemented baseline — first usable product and Tor beta candidate
 
 The first usable architectural prototype, the Milestone 2 operator-configuration
-and identity-state slice, and the Milestone 3 robust-connectivity beta are
-implemented and have passed their review gates.
+and identity-state slice have passed their review gates. The Milestone 3
+robust-connectivity beta is implemented, but its closeout is reopened by the
+source-only review at `57a5972`; it is not yet the base for Milestone 4.
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
 reflink capture, owner encryption, actual `3+2` RS, remote SQLCipher
@@ -445,12 +446,14 @@ Proactive background repair comes later.
 ### Execution and local test model
 
 The asynchronous daemon/process split, locked startup, recovery-string input,
-expected-identity check, bounded worker ownership, and formal wire contracts are
-implemented. Human configuration and application-owned identity state are also
-separate. A strictly checked recovery-string file remains an explicit
-unattended auto-unlock option rather than a daemon prerequisite. Milestones 2
-and 3 have passed; later wire or durable-state changes require the review and
-gate of the milestone that owns them.
+expected-identity check, bounded worker ownership, and formal wire-contract
+machinery are implemented; the closeout TODO tracks one stale local schema.
+Human configuration and application-owned identity state are also separate. A
+strictly checked recovery-string file remains an explicit
+unattended auto-unlock option rather than a daemon prerequisite. Milestone 2 has
+passed. Milestone 3 remains implemented but is reopened for the closeout work in
+`TODO.md`; later wire or durable-state changes require the review and gate of
+the milestone that owns them.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -663,28 +666,34 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 3 are passed. The final source-only
-review of the recent corrective commits found no remaining high-confidence
-Milestone 2 product defect. Its last invalid loopback DCUtR fixture is replaced
-by a process-level isolated routing/NAT topology that leaves production
-discovery enabled and deterministically proves direct, successful-punch, and
-relay-only application transfers. The complete locked workspace suite and
-fresh-Btrfs reflink/network gate passed. The source-defined static artifact then
-passed `nix flake check`; packaging is intentionally build-only because native
-restore-identity tests require the separately provisioned filesystem. A fresh
-no-build five-container lab formed a guild, committed data, erased a member's
-Btrfs image, and recovered byte-exact data from its seed. The private-Tor gate
-also passed five-daemon onion-only seed recovery after constraining Chutney to a
-short control-socket path.
+**Current position:** Milestones 0 through 2 are passed. Milestone 3 has a
+substantial implementation candidate at `57a5972`, and its isolated IP/NAT,
+static Nix artifact, no-build Docker recovery, and five-daemon private-Tor
+recovery gates have run successfully. The source-only closeout nevertheless
+found current-path policy, fallback, lifecycle, address-validation,
+port-mapping, quota, and telemetry defects listed in `TODO.md`. It also found
+one inherited local-control schema drift. Milestone 3 is therefore reopened,
+and Milestone 4 must not begin yet.
 
-Milestone 3 integrates exact-pinned Arti 0.46.0 behind the existing bounded
-libp2p session and endpoint abstractions. Its gate also fixed a DCUtR
-observability race: provenance now follows the retained half of a simultaneous
-QUIC punch after deterministic duplicate collapse. Tor, gateway mapping,
-signed onion discovery, tiered request fallback, and the private-network
-acceptance are admitted. Pause here for review; the next implementation slice
-is Milestone 4 durable operations and multi-volume storage. Guild geometry and
-coding-protocol changes remain Milestone 5 work.
+Close Milestone 3 as one corrective slice, in this order:
+
+1. Put transport policy and canonical onion validation at the real
+   dial/session boundary, including Kademlia-originated addresses and anonymous
+   inbound Tor address handling.
+2. Replace peer-wide fallback heuristics with a connection-aware, single-step
+   attempt state machine; then make DCUtR and application-transfer provenance
+   use the same session state.
+3. Add orderly signal-driven shutdown, exact resolved-Arti-state ownership, and
+   explicit gateway-mapping teardown; restrict mapping to a listener the
+   library actually maps.
+4. Isolate untrusted Identify observations from guild/recovery endpoint quota
+   and repair the inherited local-control CDDL/vector mismatch.
+5. Add focused regressions for every item, then rerun the locked workspace,
+   fresh-Btrfs, isolated IP/NAT, mixed-DHT transport-policy, three-tier
+   fallback, custom-Arti-state restart, real gateway-mapping, static Nix,
+   no-build Docker, and private-Tor seed-recovery gates. Finish with another
+   source-only review. Only a clean result marks Milestone 3 passed and opens
+   Milestone 4; guild geometry and coding-protocol changes remain Milestone 5.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
 
@@ -804,32 +813,37 @@ replaced by isolated network namespaces and port-preserving NAT without
 disabling production discovery. The final source-only review found no new
 high-confidence Milestone 2 defect, and the full remote gate passed.
 
-### Milestone 3 — Tor and robust connectivity beta (passed)
+### Milestone 3 — Tor and robust connectivity beta (closeout reopened)
 
-- ADR 0001 pins and source-reviews Arti 0.46.0 and fixes the transport,
+- ADR 0001 pins and source-reviews Arti 0.46.0 and defines the transport,
   identity-key, onion-service-key, discovery, policy, and cache lifecycle
-  boundary. The implementation supplies outbound onion dialing, an inbound v3
-  onion service, persistent non-identity Tor state, ephemeral service-key
-  injection, supervised readiness, and clean shutdown.
-- The onion service is bound to the same seed-derived identity. Signed onion
-  endpoints flow through DHT recovery records and bounded peer exchange under
-  `auto`, `prefer-tor`, `require-tor`, and `disable-tor`; bootstrap/discovery can
-  therefore remain onion-only when every peer IP path is unavailable.
-- Connection selection collapses redundant sessions, records bounded path,
-  byte, latency, and failure telemetry, retries an in-flight idempotent request
-  when its transport tier fails, and optionally requests PCP, NAT-PMP, or UPnP
-  gateway mappings.
+  boundary. Closure requires outbound onion dialing, an inbound v3 onion
+  service, persistent non-identity Tor state, ephemeral service-key injection,
+  supervised readiness, and clean shutdown.
+- Bind the onion service to the same seed-derived identity. Flow strictly
+  validated signed onion endpoints through DHT recovery records and bounded
+  peer exchange under `auto`, `prefer-tor`, `require-tor`, and `disable-tor`;
+  bootstrap/discovery must remain onion-only when every peer IP path is
+  unavailable or policy forbids it.
+- Collapse redundant sessions, record consistent bounded path, byte, latency,
+  and failure telemetry, retry an in-flight idempotent request when its actual
+  transport attempt fails, and optionally request PCP, NAT-PMP, or UPnP gateway
+  mappings with a verified listener and lifecycle.
 - The gate starts a pinned private Tor network and five real daemons, excludes
   peer IP application paths, restarts onion services, erases the owner and a
   shard holder, and proves byte-exact seed-only recovery through one onion
   bootstrap address. The recovered node begins without its old guild, endpoint,
   source, database, or Tor cache state.
 
-The gate passed on the remote disposable Btrfs runner, including the isolated
-IP/NAT process topology, static Nix artifact, no-build Docker erase/recovery,
-and real onion-only Chutney/Arti recovery. Milestone 4 is the next work boundary.
+The previous gate passed on the remote disposable Btrfs runner, including the
+isolated IP/NAT process topology, static Nix artifact, no-build Docker
+erase/recovery, and real onion-only Chutney/Arti recovery. That remains useful
+evidence, but it did not cover behaviour-originated policy bypass, unhealthy
+established sessions, double fallback advancement, custom Arti state paths,
+orderly process shutdown, or a real gateway mapper. Complete the closeout slice
+above before treating this milestone as passed.
 
-### Milestone 4 — durable operations and multi-volume storage beta
+### Milestone 4 — durable operations and multi-volume storage beta (blocked)
 
 - Add writer-incarnation fencing before supporting concurrent loss/recovery;
   then add retention and tombstones, safe GC, audits/scrubs, repair and emergency

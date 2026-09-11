@@ -1,5 +1,71 @@
 # Product TODO
 
+## Milestone 3 closeout — required before Milestone 4
+
+- Enforce `TorMode` at the actual dial and established-session boundary, not
+  only while copying addresses into application-managed caches. The composite
+  swarm always installs QUIC, and Kademlia can temporarily learn and dial
+  addresses directly from query responses; today a `require-tor` node can
+  therefore dial and use a returned IP address. Apply the policy to every
+  behaviour-originated dial and reject a forbidden inbound or outbound session
+  before Identify, Kademlia, or application traffic. Gate this with a mixed DHT
+  whose peer responses deliberately advertise forbidden transports.
+- Make request fallback connection- and attempt-aware. Consume the exact
+  `connection_id` on outbound failure, quarantine or close an unhealthy live
+  session, use a healthy duplicate when one exists, and advance one tier only
+  once even when libp2p reports both a dial error and a request failure. Do not
+  let request-response round-robin a retry onto a stale or retiring session;
+  retain the same signed, idempotent request across the sequential
+  direct/hole-punch, relay, and Tor attempts. Periodic recovery probes must try
+  every better available tier rather than repeatedly skipping an intermediate
+  tier. Cover live-session timeouts, duplicate-session failure, and the full
+  three-tier race.
+- Keep connection path and session telemetry in one consistent state
+  transition. Failed DCUtR currently changes `connection_paths` from `relayed`
+  to `relay-fallback` without updating the corresponding active session,
+  history, or opened/closed metric buckets. Assert the same exact provenance in
+  peer status, active and recent sessions, path counters, and application-byte
+  attribution before and after duplicate collapse.
+- Strictly parse every MutualBackup onion endpoint as one canonical
+  `/onion3/<v3-address>:443` transport, optionally followed by the expected
+  `/p2p` identity. Validate all 35 address bytes, including the v3 checksum and
+  version, as well as the fixed service port; matching only the embedded
+  Ed25519 key lets unusable bootstrap and discovered endpoints pass validation.
+  For anonymous inbound Tor streams, do not report the local onion listener as
+  `send_back_addr`; model the unknown remote address so Identify and AutoNAT
+  cannot promote or probe the server's address as the client's address.
+- Make daemon and Arti shutdown explicit and awaitable. Handle both SIGINT and
+  SIGTERM, cancel the background jobs, ask the P2P loop to shut down, await its
+  task, stop and join Tor work, and withdraw any gateway mapping before exit.
+  Carry the Arti loader's resolved `storage.state_dir` through runtime ownership
+  and failed-start cleanup: an operator Arti file can override that path, while
+  cleanup currently waits on the unrelated daemon-option default and can race
+  the next manual unlock against the old onion-service lock. Gate clean stop,
+  failed unlock, immediate unlock retry, and restart with an overridden path.
+- Finish the admitted gateway-mapping path rather than treating fabricated
+  external-address injection as its acceptance test. The mapping library maps
+  the default-route local address, while current validation also accepts a QUIC
+  socket bound only to another interface; either support and verify the exact
+  selected local address or restrict this mode to a compatible wildcard/default
+  route listener. Add a real isolated PCP, NAT-PMP, or UPnP fixture that proves
+  acquisition, publication, replacement, loss, reacquisition, and orderly
+  withdrawal. Keep the static Nix artifact as an enforced regression gate as
+  dependencies change.
+- Separate opportunistic addresses learned from non-guild Identify peers from
+  the quota reserved for configured, guild, and recovery endpoints. Unknown
+  peers currently consume the same 1,024-peer cache, so sequential ephemeral
+  Peer IDs can prevent a legitimate new endpoint from being retained for the
+  cache lifetime. Unknown observations must be expendable and must never block
+  or evict an authorized peer's endpoint.
+
+## Inherited contract regression found during Milestone 3 closeout
+
+- Bring `protocol/local-control.cddl` back into exact agreement with the Rust
+  `ProtectedRoot`: the implementation serializes `filesystem_id` and
+  `root_inode`, while the schema still specifies the removed
+  `filesystem_device`. Add byte-exact `Status` and `RootAdded` response vectors
+  so another storage-identity change cannot drift silently.
+
 ## Later guild geometry and coding protocol
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
