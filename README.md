@@ -23,6 +23,8 @@ For a no-build, step-by-step walkthrough using the packaged Linux binaries,
 including a five-daemon lab and recovery-string-only recovery, see
 [`docs/getting-started.md`](docs/getting-started.md). A commented daemon config
 is available as [`mutualbackup.example.toml`](mutualbackup.example.toml).
+The accepted [Tor transport ADR](docs/adr/0001-tor-libp2p-transport.md) records
+the Milestone 3 identity, state, policy, discovery, and private-network gate.
 
 For an isolated five-container environment with one disposable loop-backed
 Btrfs filesystem per node, automatic seed/config management, host-visible file

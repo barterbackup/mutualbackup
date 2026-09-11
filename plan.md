@@ -662,11 +662,11 @@ new high-confidence defect. That re-audit deliberately did not rerun builds or
 tests; the previously passing gates remain the runtime evidence. No Milestone 2
 corrective slice is queued.
 
-The next run begins Milestone 3. First pin and source-review the maintained Arti
-release and write the transport, identity-key, onion-service-key, discovery,
-and cache lifecycle ADR. Then integrate Tor behind the existing bounded session
-and endpoint abstractions and stop at the private-Tor recovery gate below for
-another focused review.
+Milestone 3 is now in progress. ADR 0001 pins and source-reviews Arti 0.46.0 and
+fixes the transport, identity-key, onion-service-key, discovery, policy, and
+cache lifecycle boundary. The current implementation slice integrates that
+transport behind the existing bounded session and endpoint abstractions and
+stops at the private-Tor recovery gate below for another focused review.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
 
@@ -785,10 +785,9 @@ Milestone 2 defect.
 
 ### Milestone 3 — Tor and robust connectivity beta
 
-Entry condition: satisfied. Milestone 2 is closed and no Milestone 3
-implementation has begun. Start by pinning and reviewing the maintained Arti
-version and writing the transport/key lifecycle ADR before integrating it with
-the bounded IP endpoint lifecycle.
+Entry condition: satisfied; implementation is in progress. ADR 0001 records the
+maintained Arti pin and the transport/key lifecycle decision before integration
+with the bounded IP endpoint lifecycle.
 
 - Adapt the narrow, useful BarterBackup `nettor` principles to a maintained Arti
   release: outbound onion dialing, an inbound v3 onion service, persistent Tor
