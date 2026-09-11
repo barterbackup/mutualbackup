@@ -146,6 +146,7 @@ pub struct DhtRecord {
 pub struct P2pClient {
     local_peer_id: PeerId,
     commands: mpsc::Sender<Command>,
+    request_cancellations: mpsc::UnboundedSender<Uuid>,
     outbound_permits: Arc<Semaphore>,
     cold_recovery_permit: Arc<Semaphore>,
 }
@@ -153,6 +154,7 @@ pub struct P2pClient {
 pub struct P2pEventLoop {
     swarm: Swarm<Behaviour>,
     commands: mpsc::Receiver<Command>,
+    request_cancellations: mpsc::UnboundedReceiver<Uuid>,
     inbound_results: mpsc::Receiver<InboundResult>,
     inbound_sender: mpsc::Sender<InboundResult>,
     inbound_permits: Arc<Semaphore>,
@@ -235,6 +237,7 @@ enum Command {
         response: oneshot::Sender<Result<()>>,
     },
     Request {
+        cancellation_id: Uuid,
         peer: PeerId,
         recipient: NodeId,
         request: Box<PeerRequest>,
@@ -265,6 +268,7 @@ enum Command {
 }
 
 struct PendingRequest {
+    cancellation_id: Uuid,
     peer: PeerId,
     recipient: NodeId,
     response_recipient: NodeId,
@@ -273,6 +277,32 @@ struct PendingRequest {
     request_bytes: u64,
     response: oneshot::Sender<Result<PeerResponse>>,
     _permit: OwnedSemaphorePermit,
+}
+
+struct RequestCancellation {
+    id: Option<Uuid>,
+    sender: mpsc::UnboundedSender<Uuid>,
+}
+
+impl RequestCancellation {
+    fn new(id: Uuid, sender: mpsc::UnboundedSender<Uuid>) -> Self {
+        Self {
+            id: Some(id),
+            sender,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for RequestCancellation {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            let _ = self.sender.send(id);
+        }
+    }
 }
 
 struct InboundResult {
@@ -522,18 +552,21 @@ pub fn build_p2p(node: Arc<Mutex<Node>>, config: P2pConfig) -> Result<(P2pClient
         max_connections: config.max_connections,
     };
     let (command_sender, command_receiver) = mpsc::channel(COMMAND_CAPACITY);
+    let (request_cancellation_sender, request_cancellations) = mpsc::unbounded_channel();
     let (inbound_sender, inbound_results) = mpsc::channel(COMMAND_CAPACITY);
     let (startup_sender, startup_receiver) = oneshot::channel();
     Ok((
         P2pClient {
             local_peer_id,
             commands: command_sender,
+            request_cancellations: request_cancellation_sender,
             outbound_permits: Arc::new(Semaphore::new(config.max_connections)),
             cold_recovery_permit: Arc::new(Semaphore::new(1)),
         },
         P2pEventLoop {
             swarm,
             commands: command_receiver,
+            request_cancellations,
             inbound_results,
             inbound_sender,
             inbound_permits: Arc::new(Semaphore::new(config.max_connections)),
@@ -1074,8 +1107,12 @@ impl P2pClient {
             .await
             .context("libp2p event loop stopped")?;
         let (response, receiver) = oneshot::channel();
+        let cancellation_id = Uuid::new_v4();
+        let mut cancellation =
+            RequestCancellation::new(cancellation_id, self.request_cancellations.clone());
         self.commands
             .send(Command::Request {
+                cancellation_id,
                 peer: expected_peer_id,
                 recipient: peer,
                 request: Box::new(request),
@@ -1084,7 +1121,9 @@ impl P2pClient {
             })
             .await
             .context("libp2p event loop stopped")?;
-        receiver.await.context("libp2p request command was lost")?
+        let result = receiver.await.context("libp2p request command was lost");
+        cancellation.disarm();
+        result?
     }
 }
 
@@ -1153,6 +1192,18 @@ impl P2pEventLoop {
         }
     }
 
+    fn cancel_request(&mut self, cancellation_id: Uuid) {
+        let outbound_id = self
+            .pending_requests
+            .iter()
+            .find_map(|(outbound_id, pending)| {
+                (pending.cancellation_id == cancellation_id).then_some(*outbound_id)
+            });
+        if let Some(outbound_id) = outbound_id {
+            self.pending_requests.remove(&outbound_id);
+        }
+    }
+
     async fn run_inner(&mut self) -> Result<()> {
         loop {
             tokio::select! {
@@ -1160,6 +1211,9 @@ impl P2pEventLoop {
                     if self.handle_command(command)? {
                         return Ok(());
                     }
+                }
+                Some(cancellation_id) = self.request_cancellations.recv() => {
+                    self.cancel_request(cancellation_id);
                 }
                 Some(result) = self.inbound_results.recv() => {
                     match result.response {
@@ -1622,12 +1676,16 @@ impl P2pEventLoop {
                 let _ = response.send(result);
             }
             Command::Request {
+                cancellation_id,
                 peer,
                 recipient,
                 request,
                 response,
                 permit,
             } => {
+                if response.is_closed() {
+                    return Ok(false);
+                }
                 match make_peer_request(
                     self.service.reader_config.keys(),
                     (!matches!(*request, PeerRequest::Profile)).then_some(recipient),
@@ -1645,6 +1703,7 @@ impl P2pEventLoop {
                                 self.pending_requests.insert(
                                     outbound_id,
                                     PendingRequest {
+                                        cancellation_id,
                                         peer,
                                         recipient,
                                         response_recipient: self
@@ -3340,8 +3399,12 @@ async fn recover_p2p_local_shards(
     checkpoint: &QuorumCheckpoint,
     roster: &[GuildPeer],
 ) -> Result<()> {
-    recover_local_shards_with(node, checkpoint, |group, target_index| async move {
-        reconstruct_shard_from_peers(p2p, &group, target_index, roster).await
+    let deferred_holders = Arc::new(Mutex::new(BTreeSet::new()));
+    recover_local_shards_with(node, checkpoint, |group, target_index| {
+        let deferred_holders = deferred_holders.clone();
+        async move {
+            reconstruct_shard_from_peers(p2p, &group, target_index, roster, &deferred_holders).await
+        }
     })
     .await
 }
@@ -3412,6 +3475,7 @@ async fn reconstruct_shard_from_peers(
     group: &CodingGroup,
     target_index: usize,
     roster: &[GuildPeer],
+    deferred_holders: &Mutex<BTreeSet<NodeId>>,
 ) -> Result<Vec<u8>> {
     if target_index >= group.roles.len() {
         bail!("target shard index is outside its coding group");
@@ -3426,7 +3490,11 @@ async fn reconstruct_shard_from_peers(
     }
     let mut shards = vec![None; group.roles.len()];
     for attempt in 0..SHARD_FETCH_ATTEMPTS {
-        let mut requests = FuturesUnordered::new();
+        let deferred = deferred_holders
+            .lock()
+            .map_err(|_| anyhow::anyhow!("shard holder health lock is poisoned"))?
+            .clone();
+        let mut candidates = Vec::new();
         for (index, role) in group.roles.iter().enumerate() {
             if index == target_index || shards[index].is_some() {
                 continue;
@@ -3442,6 +3510,24 @@ async fn reconstruct_shard_from_peers(
             if !roster.iter().any(|peer| peer.member.node_id == holder) {
                 continue;
             }
+            candidates.push((index, holder, root, sector_id));
+        }
+        candidates.sort_by_key(|(_, holder, _, _)| deferred.contains(holder));
+        let preferred_count = candidates
+            .iter()
+            .take_while(|(_, holder, _, _)| !deferred.contains(holder))
+            .count();
+        let valid_count = shards.iter().filter(|shard| shard.is_some()).count();
+        let needed = usize::from(V1_RS_DATA_SHARDS).saturating_sub(valid_count);
+        let request_count = if preferred_count >= needed {
+            preferred_count.min(needed.saturating_add(1))
+        } else {
+            candidates.len()
+        };
+        let mut requests = FuturesUnordered::new();
+        let mut issued = Vec::with_capacity(request_count);
+        for (index, holder, root, sector_id) in candidates.into_iter().take(request_count) {
+            issued.push((index, holder));
             let client = p2p.clone();
             let guild_id = group.guild_id;
             let group_id = group.id;
@@ -3475,14 +3561,26 @@ async fn reconstruct_shard_from_peers(
                     "could not fetch a recovery shard"
                 ),
             }
-            // Reconstruction needs any three valid shards. Do not wait for an
-            // unrelated offline holder once that threshold has been reached;
-            // cold recovery can span many coding groups and otherwise pays the
-            // full request timeout once per group.
+            // Reconstruction needs any three valid shards. Dropping the
+            // remaining calls cancels their event-loop ownership and permits;
+            // defer those holders in later groups so the transport does not
+            // accumulate one timed-out request per group.
             if shards.iter().filter(|shard| shard.is_some()).count()
                 >= usize::from(V1_RS_DATA_SHARDS)
             {
                 break;
+            }
+        }
+        {
+            let mut deferred = deferred_holders
+                .lock()
+                .map_err(|_| anyhow::anyhow!("shard holder health lock is poisoned"))?;
+            for (index, holder) in issued {
+                if shards[index].is_some() {
+                    deferred.remove(&holder);
+                } else {
+                    deferred.insert(holder);
+                }
             }
         }
         if shards.iter().filter(|shard| shard.is_some()).count() >= usize::from(V1_RS_DATA_SHARDS) {
@@ -3531,6 +3629,7 @@ pub(crate) async fn restore_snapshot_with_p2p(
         .chain(&revision.value.data_sectors)
         .cloned()
         .collect::<Vec<_>>();
+    let deferred_holders = Mutex::new(BTreeSet::new());
     for reference in references {
         let sector_id = reference.id;
         let expected_root = reference.root;
@@ -3560,7 +3659,9 @@ pub(crate) async fn restore_snapshot_with_p2p(
                     .map(|(index, _)| (group, index))
             })
             .context("snapshot sector is not present in the certified coding catalog")?;
-        let bytes = reconstruct_shard_from_peers(p2p, group, target_index, &roster).await?;
+        let bytes =
+            reconstruct_shard_from_peers(p2p, group, target_index, &roster, &deferred_holders)
+                .await?;
         let reference_for_install = reference.clone();
         node_blocking(node.clone(), move |node| {
             node.install_repaired_information_sector(guild_id, reference_for_install, &bytes)
@@ -4300,51 +4401,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abandoned_callers_cannot_exceed_the_outbound_request_bound() {
+    async fn abandoned_callers_release_event_loop_state_and_outbound_permits() {
+        let temp = tempfile::tempdir().unwrap();
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([79; 32]));
-        let peer = keys.node_id();
-        let (commands, mut receiver) = mpsc::channel(COMMAND_CAPACITY);
-        let permits = Arc::new(Semaphore::new(2));
-        let client = P2pClient {
-            local_peer_id: peer.libp2p_peer_id().unwrap(),
-            commands,
-            outbound_permits: permits.clone(),
-            cold_recovery_permit: Arc::new(Semaphore::new(1)),
-        };
-        let first = tokio::spawn({
-            let client = client.clone();
-            async move { client.call(peer, PeerRequest::Profile).await }
-        });
-        let second = tokio::spawn({
-            let client = client.clone();
-            async move { client.call(peer, PeerRequest::Profile).await }
-        });
-        let held = vec![
-            receiver.recv().await.unwrap(),
-            receiver.recv().await.unwrap(),
-        ];
-        first.abort();
-        second.abort();
-        assert_eq!(permits.available_permits(), 0);
+        let node = Arc::new(Mutex::new(
+            Node::open(temp.path().join("node"), Seed::from_bytes([79; 32])).unwrap(),
+        ));
+        let mut p2p_config = config(keys.node_id());
+        p2p_config.max_connections = 2;
+        let (client, mut event_loop) = build_p2p(node, p2p_config).unwrap();
+        let peer = KeyMaterial::from_seed(&Seed::from_bytes([80; 32])).node_id();
 
-        let third = tokio::spawn({
+        let started = tokio::spawn({
             let client = client.clone();
             async move { client.call(peer, PeerRequest::Profile).await }
         });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), receiver.recv())
-                .await
-                .is_err()
-        );
-        drop(held);
-        let third_command = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(permits.available_permits(), 1);
-        drop(third_command);
-        assert_eq!(permits.available_permits(), 2);
-        assert!(third.await.unwrap().is_err());
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+        assert_eq!(event_loop.pending_requests.len(), 1);
+        assert_eq!(client.outbound_permits.available_permits(), 1);
+
+        started.abort();
+        assert!(started.await.unwrap_err().is_cancelled());
+        let cancellation_id = tokio::time::timeout(
+            Duration::from_secs(1),
+            event_loop.request_cancellations.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        event_loop.cancel_request(cancellation_id);
+        assert!(event_loop.pending_requests.is_empty());
+        assert_eq!(client.outbound_permits.available_permits(), 2);
+
+        let queued = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(peer, PeerRequest::Profile).await }
+        });
+        let command = event_loop.commands.recv().await.unwrap();
+        queued.abort();
+        assert!(queued.await.unwrap_err().is_cancelled());
+        let cancellation_id = tokio::time::timeout(
+            Duration::from_secs(1),
+            event_loop.request_cancellations.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        event_loop.cancel_request(cancellation_id);
+        event_loop.handle_command(command).unwrap();
+        assert!(event_loop.pending_requests.is_empty());
+        assert_eq!(client.outbound_permits.available_permits(), 2);
     }
 
     #[tokio::test]
@@ -5484,6 +5591,16 @@ mod tests {
             .map(|(client, address)| peer_endpoint(client, address))
             .collect::<Vec<_>>();
         let genesis = form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+        let owner_content = |owner_index: usize| {
+            let len = if owner_index == 1 {
+                V1_SECTOR_SIZE * 10 + 123
+            } else {
+                90_000
+            };
+            (0..len)
+                .map(|offset| ((offset + owner_index * 29) % 251) as u8)
+                .collect::<Vec<_>>()
+        };
 
         let mut watcher_task = None;
         for (owner_index, expected_generation) in [(1_usize, 1_u64), (2, 2)] {
@@ -5491,9 +5608,7 @@ mod tests {
             std::fs::create_dir_all(source.join("documents")).unwrap();
             std::fs::write(
                 source.join("documents/content.bin"),
-                (0..90_000)
-                    .map(|offset| ((offset + owner_index * 29) % 251) as u8)
-                    .collect::<Vec<_>>(),
+                owner_content(owner_index),
             )
             .unwrap();
             let owner_id = nodes[owner_index].lock().unwrap().keys().node_id();
@@ -5565,9 +5680,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             std::fs::read(healthy_restore.join("documents/content.bin")).unwrap(),
-            (0..90_000)
-                .map(|offset| ((offset + 58) % 251) as u8)
-                .collect::<Vec<_>>()
+            owner_content(2)
         );
         assert!(!nodes[2].lock().unwrap().root_dirty().unwrap());
         std::fs::write(
@@ -5652,15 +5765,17 @@ mod tests {
         let (recovery_client, recovery_loop) =
             build_p2p(recovered_node.clone(), recovery_config).unwrap();
         let recovery_task = tokio::spawn(recovery_loop.run());
-        let recovered = recover_from_dht(recovered_node.clone(), &recovery_client, &restored)
-            .await
-            .unwrap();
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(15),
+            recover_from_dht(recovered_node.clone(), &recovery_client, &restored),
+        )
+        .await
+        .expect("large recovery with three live holders must not wait for abandoned requests")
+        .unwrap();
         assert_eq!(recovered.generation, 2);
         assert_eq!(
             std::fs::read(restored.join("documents/content.bin")).unwrap(),
-            (0..90_000)
-                .map(|offset| ((offset + 29) % 251) as u8)
-                .collect::<Vec<_>>()
+            owner_content(1)
         );
         publish_dht_once(recovered_node.clone(), &recovery_client)
             .await
