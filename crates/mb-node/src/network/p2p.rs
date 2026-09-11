@@ -1,20 +1,26 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, stream::FuturesUnordered};
-use libp2p::core::transport::{ListenerId, OptionalTransport};
-use libp2p::core::{ConnectedPoint, Transport as _, upgrade};
+use libp2p::core::muxing::StreamMuxerBox;
+use libp2p::core::transport::{
+    DialOpts as TransportDialOpts, ListenerId, OptionalTransport, Transport, TransportError,
+    TransportEvent,
+};
+use libp2p::core::{ConnectedPoint, upgrade};
 use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::behaviour::{FromSwarm, NewExternalAddrCandidate};
 use libp2p::swarm::dial_opts::{DialOpts as SwarmDialOpts, PeerCondition};
 use libp2p::swarm::{ConnectionId, NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::{
-    Multiaddr, PeerId, Swarm, SwarmBuilder, autonat, dcutr, identify, kad, noise, ping, relay,
-    request_response, yamux,
+    Multiaddr, PeerId, Swarm, SwarmBuilder, autonat, dcutr, identify, kad, noise, ping, quic,
+    relay, request_response, yamux,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
@@ -34,6 +40,7 @@ use crate::node::{CheckpointRecoveryObservation, DhtRecordObservation, GuildPhas
 
 #[cfg(test)]
 use super::onion_listener_address;
+use super::tor::is_canonical_onion_address;
 use super::{
     BackupDescriptor, BackupJob, CheckpointObjectKind, DhtSequenceFloors, GuildPeer,
     MAX_PEER_FRAME_BYTES, Node, NodeServerConfig, NodeService, PEER_RESPONSE_DOMAIN, PeerRequest,
@@ -80,6 +87,60 @@ const PREFERRED_PATH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_SESSION_HISTORY: usize = 256;
 
 type RelayMembers = Arc<RwLock<BTreeSet<PeerId>>>;
+
+struct PolicyTransport<T> {
+    inner: T,
+    mode: TorMode,
+}
+
+impl<T> PolicyTransport<T> {
+    fn new(inner: T, mode: TorMode) -> Self {
+        Self { inner, mode }
+    }
+}
+
+impl<T> Transport for PolicyTransport<T>
+where
+    T: Transport + Unpin,
+{
+    type Output = T::Output;
+    type Error = T::Error;
+    type ListenerUpgrade = T::ListenerUpgrade;
+    type Dial = T::Dial;
+
+    fn listen_on(
+        &mut self,
+        id: ListenerId,
+        address: Multiaddr,
+    ) -> std::result::Result<(), TransportError<Self::Error>> {
+        if !transport_address_allowed(self.mode, &address) {
+            return Err(TransportError::MultiaddrNotSupported(address));
+        }
+        self.inner.listen_on(id, address)
+    }
+
+    fn remove_listener(&mut self, id: ListenerId) -> bool {
+        self.inner.remove_listener(id)
+    }
+
+    fn dial(
+        &mut self,
+        address: Multiaddr,
+        options: TransportDialOpts,
+    ) -> std::result::Result<Self::Dial, TransportError<Self::Error>> {
+        if !transport_address_allowed(self.mode, &address) {
+            return Err(TransportError::MultiaddrNotSupported(address));
+        }
+        self.inner.dial(address, options)
+    }
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<TransportEvent<Self::ListenerUpgrade, Self::Error>> {
+        Pin::new(&mut self.inner).poll(cx)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct P2pConfig {
@@ -237,6 +298,7 @@ pub struct P2pEventLoop {
     inbound_sender: mpsc::Sender<InboundResult>,
     inbound_permits: Arc<Semaphore>,
     pending_requests: HashMap<request_response::OutboundRequestId, PendingRequest>,
+    queued_requests: VecDeque<PendingRequest>,
     active_inbound_requests: HashMap<request_response::InboundRequestId, PeerId>,
     pending_response_bytes:
         HashMap<request_response::InboundRequestId, (PeerId, Option<P2pPath>, u64)>,
@@ -278,6 +340,7 @@ pub struct P2pEventLoop {
     recent_sessions: VecDeque<P2pSessionHistory>,
     path_metrics: BTreeMap<P2pPath, PathMetrics>,
     collapsing_connections: HashSet<ConnectionId>,
+    unhealthy_connections: HashSet<ConnectionId>,
     last_application_paths: HashMap<PeerId, P2pPath>,
     transfer_counters: HashMap<PeerId, TransferCounters>,
     path_transfer_counters: HashMap<PeerId, BTreeMap<P2pPath, TransferCounters>>,
@@ -503,9 +566,24 @@ fn merge_established_path(recorded: Option<P2pPath>, generic: P2pPath) -> P2pPat
 }
 
 fn address_allowed_by_tor_mode(mode: TorMode, address: &Multiaddr) -> bool {
+    if is_onion_address(address) && !is_canonical_onion_address(address) {
+        return false;
+    }
     match mode {
         TorMode::DisableTor => !is_onion_address(address),
-        TorMode::RequireTor => is_onion_address(address),
+        TorMode::RequireTor => is_canonical_onion_address(address),
+        TorMode::Auto | TorMode::PreferTor => true,
+    }
+}
+
+fn transport_address_allowed(mode: TorMode, address: &Multiaddr) -> bool {
+    address_allowed_by_tor_mode(mode, address)
+}
+
+fn transport_path_allowed(mode: TorMode, path: P2pPath) -> bool {
+    match mode {
+        TorMode::DisableTor => path != P2pPath::Tor,
+        TorMode::RequireTor => path == P2pPath::Tor,
         TorMode::Auto | TorMode::PreferTor => true,
     }
 }
@@ -573,6 +651,17 @@ fn selected_policy_addresses(
         .or_else(|| tiers.first_key_value())
         .map(|(tier, addresses)| (*tier, addresses.clone()))
         .unwrap_or((0, BTreeSet::new()))
+}
+
+fn next_preferred_addresses(
+    tiers: &BTreeMap<u8, BTreeSet<Multiaddr>>,
+    current_tier: u8,
+) -> Vec<Multiaddr> {
+    tiers
+        .range(..current_tier)
+        .next_back()
+        .map(|(_, addresses)| addresses.iter().cloned().collect())
+        .unwrap_or_default()
 }
 
 fn connected_point_path(endpoint: &ConnectedPoint) -> P2pPath {
@@ -700,21 +789,29 @@ pub fn build_p2p_with_tor(
         Some(transport) => OptionalTransport::some(transport),
         None => OptionalTransport::none(),
     };
+    let quic_transport = quic::tokio::Transport::new(quic::Config::new(&identity))
+        .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)));
+    let tor_transport = optional_tor
+        .upgrade(upgrade::Version::V1Lazy)
+        .authenticate(noise::Config::new(&identity)?)
+        .multiplex(yamux::Config::default())
+        .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)));
+    let (relay_transport, relay_client) = relay::client::new(local_peer_id);
+    let relay_transport = relay_transport
+        .upgrade(upgrade::Version::V1Lazy)
+        .authenticate(noise::Config::new(&identity)?)
+        .multiplex(yamux::Config::default())
+        .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)));
+    let transport = quic_transport
+        .or_transport(tor_transport)
+        .map(|either, _| either.into_inner())
+        .or_transport(relay_transport)
+        .map(|either, _| either.into_inner());
+    let transport = PolicyTransport::new(transport, config.tor_mode);
     let mut swarm = SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
-        .with_quic()
-        .with_other_transport(|key| {
-            let noise = noise::Config::new(key)
-                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
-                optional_tor
-                    .upgrade(upgrade::Version::V1Lazy)
-                    .authenticate(noise)
-                    .multiplex(yamux::Config::default()),
-            )
-        })?
-        .with_relay_client(noise::Config::new, yamux::Config::default)?
-        .with_behaviour(move |key, relay_client| {
+        .with_other_transport(move |_| transport)?
+        .with_behaviour(move |key| {
             let peer_id = key.public().to_peer_id();
             let mut kad_config = kad::Config::new(KAD_PROTOCOL);
             kad_config
@@ -918,6 +1015,7 @@ pub fn build_p2p_with_tor(
             inbound_sender,
             inbound_permits: Arc::new(Semaphore::new(config.max_connections)),
             pending_requests: HashMap::new(),
+            queued_requests: VecDeque::new(),
             active_inbound_requests: HashMap::new(),
             pending_response_bytes: HashMap::new(),
             pending_dht: HashMap::new(),
@@ -962,6 +1060,7 @@ pub fn build_p2p_with_tor(
             recent_sessions: VecDeque::new(),
             path_metrics: BTreeMap::new(),
             collapsing_connections: HashSet::new(),
+            unhealthy_connections: HashSet::new(),
             last_application_paths: HashMap::new(),
             transfer_counters: HashMap::new(),
             path_transfer_counters: HashMap::new(),
@@ -1699,6 +1798,21 @@ impl P2pEventLoop {
         }
     }
 
+    fn classify_failed_dcutr(&mut self, peer: PeerId) {
+        let relayed_connections = self
+            .connection_paths
+            .iter()
+            .filter_map(|(connection, (candidate, path))| {
+                (*candidate == peer && *path == P2pPath::Relayed).then_some(*connection)
+            })
+            .collect::<Vec<_>>();
+        for connection in relayed_connections {
+            self.connection_paths
+                .insert(connection, (peer, P2pPath::RelayFallback));
+            self.update_session_path(connection, P2pPath::RelayFallback);
+        }
+    }
+
     fn record_session_close(&mut self, connection: ConnectionId, transport_error: bool) {
         let Some(session) = self.sessions.remove(&connection) else {
             return;
@@ -1730,16 +1844,120 @@ impl P2pEventLoop {
         metrics.sessions_closed = metrics.sessions_closed.saturating_add(1);
     }
 
-    fn cancel_request(&mut self, cancellation_id: Uuid) {
-        let outbound_id = self
-            .pending_requests
+    fn has_outstanding_request(&self, peer: PeerId) -> bool {
+        self.pending_requests
+            .values()
+            .chain(self.queued_requests.iter())
+            .any(|pending| pending.peer == peer)
+    }
+
+    fn connection_is_retiring_or_unhealthy(&self, connection: ConnectionId) -> bool {
+        self.unhealthy_connections.contains(&connection)
+            || self.collapsing_connections.contains(&connection)
+            || self.relay_retirement.contains_key(&connection)
+            || self.duplicate_retirement.contains_key(&connection)
+    }
+
+    fn peer_has_unsettled_connections(&self, peer: PeerId) -> bool {
+        self.connection_paths
             .iter()
-            .find_map(|(outbound_id, pending)| {
-                (pending.cancellation_id == cancellation_id).then_some(*outbound_id)
-            });
-        if let Some(outbound_id) = outbound_id {
-            self.pending_requests.remove(&outbound_id);
+            .any(|(connection, (candidate, _))| {
+                *candidate == peer && self.connection_is_retiring_or_unhealthy(*connection)
+            })
+    }
+
+    fn healthy_duplicate_exists(&self, peer: PeerId, failed: ConnectionId) -> bool {
+        self.connection_paths
+            .iter()
+            .any(|(connection, (candidate, _))| {
+                *candidate == peer
+                    && *connection != failed
+                    && !self.connection_is_retiring_or_unhealthy(*connection)
+            })
+    }
+
+    fn selected_transport_tier(&self, peer: PeerId) -> Option<u8> {
+        let requested = self.fallback_tiers.get(&peer).copied().unwrap_or(0);
+        let (tier, addresses) =
+            selected_policy_addresses(self.tor_mode, self.retained_peer_addresses(peer), requested);
+        (!addresses.is_empty()).then_some(tier)
+    }
+
+    fn retire_non_policy_connections(&mut self, peer: PeerId) {
+        let selected_tier = self.selected_transport_tier(peer);
+        let connections = self
+            .connection_paths
+            .iter()
+            .filter_map(|(connection, (candidate, path))| {
+                if *candidate != peer || self.connection_is_retiring_or_unhealthy(*connection) {
+                    return None;
+                }
+                let forbidden = !transport_path_allowed(self.tor_mode, *path);
+                let wrong_tier = selected_tier
+                    .is_some_and(|tier| path_preference_rank(self.tor_mode, *path) != tier);
+                (forbidden || wrong_tier).then_some(*connection)
+            })
+            .collect::<Vec<_>>();
+        for connection in connections {
+            self.collapsing_connections.insert(connection);
+            if !self.swarm.close_connection(connection) {
+                self.collapsing_connections.remove(&connection);
+            }
         }
+    }
+
+    fn dispatch_request(&mut self, mut pending: PendingRequest) {
+        if pending.response.is_closed() {
+            return;
+        }
+        pending.transport_tier = self.fallback_tiers.get(&pending.peer).copied().unwrap_or(0);
+        pending.started_at = tokio::time::Instant::now();
+        let outbound_id = self
+            .swarm
+            .behaviour_mut()
+            .peer
+            .send_request(&pending.peer, pending.request.clone());
+        self.pending_requests.insert(outbound_id, pending);
+    }
+
+    fn queue_or_dispatch_request(&mut self, pending: PendingRequest) {
+        if pending.response.is_closed() {
+            return;
+        }
+        self.retire_non_policy_connections(pending.peer);
+        if self.peer_has_unsettled_connections(pending.peer) {
+            self.queued_requests.push_back(pending);
+        } else {
+            self.dispatch_request(pending);
+        }
+    }
+
+    fn drain_queued_requests(&mut self, peer: PeerId) {
+        let queued = self.queued_requests.len();
+        for _ in 0..queued {
+            let Some(pending) = self.queued_requests.pop_front() else {
+                break;
+            };
+            if pending.peer == peer {
+                self.queue_or_dispatch_request(pending);
+            } else {
+                self.queued_requests.push_back(pending);
+            }
+        }
+    }
+
+    fn cancel_request(&mut self, cancellation_id: Uuid) {
+        if let Some(position) = self
+            .queued_requests
+            .iter()
+            .position(|pending| pending.cancellation_id == cancellation_id)
+        {
+            self.queued_requests.remove(position);
+        }
+        // libp2p request-response has no cancellation primitive. Keep a
+        // dispatched request and its permit until its terminal event so a
+        // caller cannot evade the configured in-flight bound by dropping its
+        // response future. The closed response channel suppresses retries.
     }
 
     async fn run_inner(&mut self) -> Result<()> {
@@ -2010,11 +2228,7 @@ impl P2pEventLoop {
             .collect::<Vec<_>>();
         for (peer, current_tier) in peers {
             let tiers = policy_address_tiers(self.tor_mode, self.retained_peer_addresses(peer));
-            let addresses = tiers
-                .iter()
-                .find(|(tier, _)| **tier < current_tier)
-                .map(|(_, addresses)| addresses.iter().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
+            let addresses = next_preferred_addresses(&tiers, current_tier);
             if addresses.is_empty() {
                 continue;
             }
@@ -2151,10 +2365,12 @@ impl P2pEventLoop {
             })
             .collect::<Vec<_>>();
         if scopes.is_empty() {
-            if self.recovery_quarantine.contains_key(&peer) {
-                return Ok(());
-            }
-            return self.add_learned_address(peer, address);
+            // An authenticated libp2p session proves control of this Peer ID,
+            // not guild membership or authority to consume the endpoint cache.
+            // The current connection remains usable; discard its unsolicited
+            // Identify hints unless a configured/guild or recovery scope owns
+            // a bounded slot for this peer.
+            return Ok(());
         }
         for scope_id in &scopes {
             let addresses = self
@@ -2363,32 +2579,20 @@ impl P2pEventLoop {
                                 let request_bytes = cbor_wire_len(&request).unwrap_or(0);
                                 let transport_tier =
                                     self.fallback_tiers.get(&peer).copied().unwrap_or(0);
-                                let outbound_id = self
-                                    .swarm
-                                    .behaviour_mut()
-                                    .peer
-                                    .send_request(&peer, request.clone());
-                                self.pending_requests.insert(
-                                    outbound_id,
-                                    PendingRequest {
-                                        cancellation_id,
-                                        peer,
-                                        recipient,
-                                        response_recipient: self
-                                            .service
-                                            .reader_config
-                                            .keys()
-                                            .node_id(),
-                                        request,
-                                        request_id,
-                                        request_hash,
-                                        request_bytes,
-                                        transport_tier,
-                                        started_at: tokio::time::Instant::now(),
-                                        response,
-                                        _permit: permit,
-                                    },
-                                );
+                                self.queue_or_dispatch_request(PendingRequest {
+                                    cancellation_id,
+                                    peer,
+                                    recipient,
+                                    response_recipient: self.service.reader_config.keys().node_id(),
+                                    request,
+                                    request_id,
+                                    request_hash,
+                                    request_bytes,
+                                    transport_tier,
+                                    started_at: tokio::time::Instant::now(),
+                                    response,
+                                    _permit: permit,
+                                });
                             }
                             Err(error) => {
                                 let _ = response.send(Err(error.into()));
@@ -2632,11 +2836,7 @@ impl P2pEventLoop {
                         }
                     }
                     Err(_) => {
-                        for (peer, path) in self.connection_paths.values_mut() {
-                            if *peer == event.remote_peer_id && *path == P2pPath::Relayed {
-                                *path = P2pPath::RelayFallback;
-                            }
-                        }
+                        self.classify_failed_dcutr(event.remote_peer_id);
                     }
                 }
                 tracing::info!(?event, "DCUtR event");
@@ -2780,6 +2980,14 @@ impl P2pEventLoop {
                     .get(&connection_id)
                     .map(|(_, path)| *path)
                     .unwrap_or(established_path);
+                if !transport_path_allowed(self.tor_mode, path) {
+                    self.collapsing_connections.insert(connection_id);
+                    if !self.swarm.close_connection(connection_id) {
+                        self.collapsing_connections.remove(&connection_id);
+                    }
+                    tracing::warn!(%peer_id, ?path, "closing a transport-policy-forbidden session");
+                    return;
+                }
                 let rank = path_preference_rank(self.tor_mode, path);
                 if self
                     .fallback_tiers
@@ -2795,6 +3003,7 @@ impl P2pEventLoop {
                     tracing::info!(peer = %peer_id, ?path, "peer returned to its preferred transport path");
                 }
                 self.schedule_duplicate_session_collapse(peer_id, connection_id);
+                self.retire_non_policy_connections(peer_id);
                 tracing::info!(peer = %peer_id, ?endpoint, "libp2p connection established");
             }
             SwarmEvent::ConnectionClosed {
@@ -2811,7 +3020,8 @@ impl P2pEventLoop {
                 self.connection_dialers.remove(&connection_id);
                 self.relay_retirement.remove(&connection_id);
                 self.duplicate_retirement.remove(&connection_id);
-                self.record_session_close(connection_id, cause.is_some());
+                let unhealthy = self.unhealthy_connections.remove(&connection_id);
+                self.record_session_close(connection_id, cause.is_some() || unhealthy);
                 if !self
                     .connection_paths
                     .values()
@@ -2823,12 +3033,15 @@ impl P2pEventLoop {
                 if num_established == 0 {
                     self.last_application_paths.remove(&peer_id);
                     let current_tier = self.fallback_tiers.get(&peer_id).copied().unwrap_or(0);
-                    if closed_path.is_some_and(|path| {
-                        path_preference_rank(self.tor_mode, path) == current_tier
-                    }) {
+                    if !self.has_outstanding_request(peer_id)
+                        && closed_path.is_some_and(|path| {
+                            path_preference_rank(self.tor_mode, path) == current_tier
+                        })
+                    {
                         self.activate_fallback(peer_id);
                     }
                 }
+                self.drain_queued_requests(peer_id);
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 tracing::warn!(peer = ?peer_id, %error, "libp2p outgoing connection failed");
@@ -2836,7 +3049,9 @@ impl P2pEventLoop {
                     && !self.swarm.is_connected(&peer)
                 {
                     self.record_dial_failure(peer);
-                    self.activate_fallback(peer);
+                    if !self.has_outstanding_request(peer) {
+                        self.activate_fallback(peer);
+                    }
                 }
             }
             _ => {}
@@ -2952,37 +3167,50 @@ impl P2pEventLoop {
             }
             request_response::Event::OutboundFailure {
                 peer,
+                connection_id,
                 request_id,
                 error,
-                ..
             } => {
-                if let Some(mut pending) = self.pending_requests.remove(&request_id) {
+                if let Some(pending) = self.pending_requests.remove(&request_id) {
                     let path = self
-                        .last_application_paths
-                        .get(&peer)
-                        .copied()
+                        .application_path(connection_id)
                         .or_else(|| self.selected_path_hint(peer));
                     self.record_request_result(path, pending.started_at, false);
-                    if !self.swarm.is_connected(&peer) {
+
+                    let attempted_tier = pending.transport_tier;
+                    let used_wrong_tier = path.is_some_and(|path| {
+                        path_preference_rank(self.tor_mode, path) != attempted_tier
+                    });
+
+                    let healthy_duplicate = self.healthy_duplicate_exists(peer, connection_id);
+                    if self
+                        .connection_paths
+                        .get(&connection_id)
+                        .is_some_and(|(candidate, _)| *candidate == peer)
+                    {
+                        self.unhealthy_connections.insert(connection_id);
+                        if !self.swarm.close_connection(connection_id) {
+                            self.unhealthy_connections.remove(&connection_id);
+                        }
+                    }
+
+                    if pending.response.is_closed() {
+                        return;
+                    }
+                    if !healthy_duplicate
+                        && !used_wrong_tier
+                        && self.fallback_tiers.get(&peer).copied().unwrap_or(0) <= attempted_tier
+                    {
                         self.activate_fallback(peer);
                     }
                     let selected_tier = self.fallback_tiers.get(&peer).copied().unwrap_or(0);
-                    if selected_tier > pending.transport_tier {
-                        let retry_id = self
-                            .swarm
-                            .behaviour_mut()
-                            .peer
-                            .send_request(&peer, pending.request.clone());
-                        pending.transport_tier = selected_tier;
-                        pending.started_at = tokio::time::Instant::now();
-                        self.pending_requests.insert(retry_id, pending);
+                    if healthy_duplicate || used_wrong_tier || selected_tier > attempted_tier {
+                        self.queue_or_dispatch_request(pending);
                     } else {
                         let _ = pending
                             .response
                             .send(Err(anyhow::anyhow!("libp2p request failed: {error}")));
                     }
-                } else if !self.swarm.is_connected(&peer) {
-                    self.activate_fallback(peer);
                 }
             }
             request_response::Event::InboundFailure {
@@ -3034,9 +3262,11 @@ impl P2pEventLoop {
                 .collect::<Vec<_>>();
         for (connection_id, peer, should_close) in finished {
             self.relay_retirement.remove(&connection_id);
+            let mut awaiting_close = false;
             if should_close {
                 self.collapsing_connections.insert(connection_id);
                 if self.swarm.close_connection(connection_id) {
+                    awaiting_close = true;
                     tracing::debug!(
                         %peer,
                         ?connection_id,
@@ -3045,6 +3275,9 @@ impl P2pEventLoop {
                 } else {
                     self.collapsing_connections.remove(&connection_id);
                 }
+            }
+            if !awaiting_close {
+                self.drain_queued_requests(peer);
             }
         }
     }
@@ -3142,7 +3375,7 @@ impl P2pEventLoop {
                     return None;
                 }
                 let Some((_, path)) = self.connection_paths.get(connection) else {
-                    return Some((*connection, false));
+                    return Some((*connection, *peer, false));
                 };
                 let replacement_exists = self.connection_paths.iter().any(
                     |(candidate_connection, (candidate_peer, candidate_path))| {
@@ -3152,16 +3385,22 @@ impl P2pEventLoop {
                                 <= path_preference_rank(self.tor_mode, *path)
                     },
                 );
-                Some((*connection, replacement_exists))
+                Some((*connection, *peer, replacement_exists))
             })
             .collect::<Vec<_>>();
-        for (connection, should_close) in finished {
+        for (connection, peer, should_close) in finished {
             self.duplicate_retirement.remove(&connection);
+            let mut awaiting_close = false;
             if should_close {
                 self.collapsing_connections.insert(connection);
-                if !self.swarm.close_connection(connection) {
+                if self.swarm.close_connection(connection) {
+                    awaiting_close = true;
+                } else {
                     self.collapsing_connections.remove(&connection);
                 }
+            }
+            if !awaiting_close {
+                self.drain_queued_requests(peer);
             }
         }
     }
@@ -5313,8 +5552,11 @@ fn remove_known_address(swarm: &mut Swarm<Behaviour>, peer: PeerId, address: &Mu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::future::{Pending, Ready, ready};
+    use libp2p::core::{Endpoint, transport::PortUse};
     use mb_core::{KeyMaterial, Seed};
     use request_response::Codec as _;
+    use std::io;
 
     fn config(node_id: NodeId) -> P2pConfig {
         P2pConfig {
@@ -5377,15 +5619,171 @@ mod tests {
         );
         assert_eq!(
             selected_policy_addresses(TorMode::DisableTor, all.clone(), 0),
-            (0, BTreeSet::from([ip]))
+            (0, BTreeSet::from([ip.clone()]))
         );
         assert_eq!(
-            selected_policy_addresses(TorMode::DisableTor, all, 1),
-            (1, BTreeSet::from([relay]))
+            selected_policy_addresses(TorMode::DisableTor, all.clone(), 1),
+            (1, BTreeSet::from([relay.clone()]))
         );
         assert_eq!(
             selected_policy_addresses(TorMode::Auto, vec![onion.clone()], 1),
             (2, BTreeSet::from([onion]))
+        );
+        let tiers = policy_address_tiers(TorMode::Auto, all);
+        assert_eq!(next_preferred_addresses(&tiers, 2), vec![relay.clone()]);
+        assert_eq!(next_preferred_addresses(&tiers, 1), vec![ip]);
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingTransport {
+        dialed: Arc<Mutex<Vec<Multiaddr>>>,
+        listened: Arc<Mutex<Vec<Multiaddr>>>,
+    }
+
+    impl Transport for RecordingTransport {
+        type Output = ();
+        type Error = io::Error;
+        type ListenerUpgrade = Pending<std::result::Result<(), io::Error>>;
+        type Dial = Ready<std::result::Result<(), io::Error>>;
+
+        fn listen_on(
+            &mut self,
+            _id: ListenerId,
+            address: Multiaddr,
+        ) -> std::result::Result<(), TransportError<Self::Error>> {
+            self.listened.lock().unwrap().push(address);
+            Ok(())
+        }
+
+        fn remove_listener(&mut self, _id: ListenerId) -> bool {
+            false
+        }
+
+        fn dial(
+            &mut self,
+            address: Multiaddr,
+            _options: TransportDialOpts,
+        ) -> std::result::Result<Self::Dial, TransportError<Self::Error>> {
+            self.dialed.lock().unwrap().push(address);
+            Ok(ready(Ok(())))
+        }
+
+        fn poll(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<TransportEvent<Self::ListenerUpgrade, Self::Error>> {
+            Poll::Pending
+        }
+    }
+
+    #[test]
+    fn require_tor_blocks_mixed_discovery_dials_at_transport_boundary() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([200; 32]));
+        let peer = keys.node_id().libp2p_peer_id().unwrap();
+        let ip: Multiaddr = format!("/ip4/192.0.2.1/udp/44000/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+        let relay: Multiaddr =
+            format!("/ip4/192.0.2.2/udp/44001/quic-v1/p2p/{peer}/p2p-circuit/p2p/{peer}")
+                .parse()
+                .unwrap();
+        let onion = onion_listener_address(keys.node_id()).unwrap();
+        let mut invalid_onion = onion.clone();
+        invalid_onion.push(libp2p::multiaddr::Protocol::P2pCircuit);
+        let inner = RecordingTransport::default();
+        let dialed = inner.dialed.clone();
+        let listened = inner.listened.clone();
+        let mut transport = PolicyTransport::new(inner, TorMode::RequireTor);
+        let options = TransportDialOpts {
+            role: Endpoint::Dialer,
+            port_use: PortUse::Reuse,
+        };
+
+        for forbidden in [ip, relay, invalid_onion] {
+            assert!(matches!(
+                transport.dial(forbidden, options),
+                Err(TransportError::MultiaddrNotSupported(_))
+            ));
+        }
+        assert!(transport.dial(onion.clone(), options).is_ok());
+        assert_eq!(*dialed.lock().unwrap(), vec![onion]);
+
+        let forbidden_listener: Multiaddr = "/ip4/0.0.0.0/udp/44000/quic-v1".parse().unwrap();
+        assert!(matches!(
+            transport.listen_on(ListenerId::next(), forbidden_listener),
+            Err(TransportError::MultiaddrNotSupported(_))
+        ));
+        let onion_listener = onion_listener_address(keys.node_id()).unwrap();
+        assert!(
+            transport
+                .listen_on(ListenerId::next(), onion_listener.clone())
+                .is_ok()
+        );
+        assert_eq!(*listened.lock().unwrap(), vec![onion_listener]);
+    }
+
+    #[tokio::test]
+    async fn kademlia_originated_dials_cross_the_require_tor_transport_boundary() {
+        let local = KeyMaterial::from_seed(&Seed::from_bytes([203; 32]));
+        let remote = KeyMaterial::from_seed(&Seed::from_bytes([204; 32]));
+        let relay = KeyMaterial::from_seed(&Seed::from_bytes([205; 32]));
+        let remote_peer = remote.node_id().libp2p_peer_id().unwrap();
+        let relay_peer = relay.node_id().libp2p_peer_id().unwrap();
+        let ip: Multiaddr = "/ip4/192.0.2.20/udp/44000/quic-v1".parse().unwrap();
+        let relayed: Multiaddr =
+            format!("/ip4/192.0.2.21/udp/44001/quic-v1/p2p/{relay_peer}/p2p-circuit")
+                .parse()
+                .unwrap();
+        let expected = BTreeSet::from([
+            ip.clone()
+                .with(libp2p::multiaddr::Protocol::P2p(remote_peer)),
+            relayed
+                .clone()
+                .with(libp2p::multiaddr::Protocol::P2p(remote_peer)),
+        ]);
+
+        let identity = local.libp2p_keypair();
+        let local_peer = identity.public().to_peer_id();
+        let transport = quic::tokio::Transport::new(quic::Config::new(&identity))
+            .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)));
+        let transport = PolicyTransport::new(transport, TorMode::RequireTor);
+        let mut swarm = SwarmBuilder::with_existing_identity(identity)
+            .with_tokio()
+            .with_other_transport(move |_| transport)
+            .unwrap()
+            .with_behaviour(move |_| kad::Behaviour::new(local_peer, MemoryStore::new(local_peer)))
+            .unwrap()
+            .build();
+        swarm.behaviour_mut().add_address(&remote_peer, ip.clone());
+        swarm
+            .behaviour_mut()
+            .add_address(&remote_peer, relayed.clone());
+        swarm.behaviour_mut().bootstrap().unwrap();
+
+        let rejected = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let SwarmEvent::OutgoingConnectionError {
+                    peer_id: Some(peer),
+                    error: libp2p::swarm::DialError::Transport(errors),
+                    ..
+                } = swarm.select_next_some().await
+                    && peer == remote_peer
+                {
+                    return errors;
+                }
+            }
+        })
+        .await
+        .expect("Kademlia did not attempt its mixed forbidden address set");
+        assert_eq!(
+            rejected
+                .into_iter()
+                .map(|(address, error)| {
+                    assert!(matches!(error, TransportError::MultiaddrNotSupported(_)));
+                    address
+                })
+                .collect::<BTreeSet<_>>(),
+            expected
         );
     }
 
@@ -5600,7 +5998,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abandoned_callers_release_event_loop_state_and_outbound_permits() {
+    async fn abandoned_callers_cannot_evade_the_dispatched_request_bound() {
         let temp = tempfile::tempdir().unwrap();
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([79; 32]));
         let node = Arc::new(Mutex::new(
@@ -5630,8 +6028,8 @@ mod tests {
         .unwrap()
         .unwrap();
         event_loop.cancel_request(cancellation_id);
-        assert!(event_loop.pending_requests.is_empty());
-        assert_eq!(client.outbound_permits.available_permits(), 2);
+        assert_eq!(event_loop.pending_requests.len(), 1);
+        assert_eq!(client.outbound_permits.available_permits(), 1);
 
         let queued = tokio::spawn({
             let client = client.clone();
@@ -5649,8 +6047,193 @@ mod tests {
         .unwrap();
         event_loop.cancel_request(cancellation_id);
         event_loop.handle_command(command).unwrap();
-        assert!(event_loop.pending_requests.is_empty());
+        assert_eq!(event_loop.pending_requests.len(), 1);
+        assert!(event_loop.queued_requests.is_empty());
+        assert_eq!(client.outbound_permits.available_permits(), 1);
+
+        drop(event_loop);
         assert_eq!(client.outbound_permits.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_retirement_without_a_close_event_resumes_queued_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([84; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([85; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        let address: Multiaddr = format!("/ip4/192.0.2.85/udp/44000/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+        event_loop.add_learned_address(peer, address).unwrap();
+
+        let retiring = ConnectionId::new_unchecked(799);
+        event_loop
+            .connection_paths
+            .insert(retiring, (peer, P2pPath::Direct));
+        event_loop.duplicate_retirement.insert(
+            retiring,
+            (peer, tokio::time::Instant::now() - Duration::from_secs(1)),
+        );
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(target, PeerRequest::Profile).await }
+        });
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+        assert!(event_loop.pending_requests.is_empty());
+        assert_eq!(event_loop.queued_requests.len(), 1);
+
+        event_loop.retire_duplicate_sessions();
+        assert!(event_loop.duplicate_retirement.is_empty());
+        assert!(event_loop.queued_requests.is_empty());
+        assert_eq!(event_loop.pending_requests.len(), 1);
+
+        drop(event_loop);
+        assert!(call.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn request_failure_uses_healthy_duplicate_then_advances_each_transport_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([81; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        // This is a synthetic event-state test and does not poll the concrete
+        // transport. Keep construction cheap, then exercise the exact Auto
+        // policy state that includes all three tiers.
+        event_loop.tor_mode = TorMode::Auto;
+        let target_keys = KeyMaterial::from_seed(&Seed::from_bytes([82; 32]));
+        let target = target_keys.node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        let relay = KeyMaterial::from_seed(&Seed::from_bytes([83; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let direct: Multiaddr = format!("/ip4/192.0.2.10/udp/44000/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+        let relayed: Multiaddr =
+            format!("/ip4/192.0.2.11/udp/44001/quic-v1/p2p/{relay}/p2p-circuit/p2p/{peer}")
+                .parse()
+                .unwrap();
+        let onion = onion_listener_address(target).unwrap();
+        for address in [direct, relayed, onion] {
+            event_loop.add_learned_address(peer, address).unwrap();
+        }
+
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(target, PeerRequest::Profile).await }
+        });
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+        let first_outbound = *event_loop.pending_requests.keys().next().unwrap();
+        let signed_request =
+            canonical_bytes(&event_loop.pending_requests[&first_outbound].request).unwrap();
+        let protocol_request_id = event_loop.pending_requests[&first_outbound].request_id;
+
+        // A connection-selection race onto a non-selected tier is quarantined
+        // and retried at the original tier rather than skipping a fallback.
+        let wrong_tier = ConnectionId::new_unchecked(800);
+        event_loop
+            .connection_paths
+            .insert(wrong_tier, (peer, P2pPath::RelayFallback));
+        event_loop.handle_peer_event(request_response::Event::OutboundFailure {
+            peer,
+            connection_id: wrong_tier,
+            request_id: first_outbound,
+            error: request_response::OutboundFailure::Timeout,
+        });
+        assert_eq!(
+            event_loop.fallback_tiers.get(&peer).copied().unwrap_or(0),
+            0
+        );
+        let after_wrong_tier = *event_loop.pending_requests.keys().next().unwrap();
+        assert_eq!(
+            canonical_bytes(&event_loop.pending_requests[&after_wrong_tier].request).unwrap(),
+            signed_request
+        );
+        event_loop.connection_paths.clear();
+
+        let failed = ConnectionId::new_unchecked(801);
+        let healthy = ConnectionId::new_unchecked(802);
+        event_loop
+            .connection_paths
+            .insert(failed, (peer, P2pPath::Direct));
+        event_loop
+            .connection_paths
+            .insert(healthy, (peer, P2pPath::Direct));
+        event_loop.handle_peer_event(request_response::Event::OutboundFailure {
+            peer,
+            connection_id: failed,
+            request_id: after_wrong_tier,
+            error: request_response::OutboundFailure::Timeout,
+        });
+        assert_eq!(
+            event_loop.fallback_tiers.get(&peer).copied().unwrap_or(0),
+            0
+        );
+        assert_eq!(event_loop.pending_requests.len(), 1);
+        let second_outbound = *event_loop.pending_requests.keys().next().unwrap();
+        assert_eq!(
+            canonical_bytes(&event_loop.pending_requests[&second_outbound].request).unwrap(),
+            signed_request
+        );
+        assert_eq!(
+            event_loop.pending_requests[&second_outbound].request_id,
+            protocol_request_id
+        );
+
+        event_loop.connection_paths.clear();
+        let relay_failure = ConnectionId::new_unchecked(803);
+        event_loop
+            .connection_paths
+            .insert(relay_failure, (peer, P2pPath::Direct));
+        event_loop.handle_peer_event(request_response::Event::OutboundFailure {
+            peer,
+            connection_id: relay_failure,
+            request_id: second_outbound,
+            error: request_response::OutboundFailure::Timeout,
+        });
+        assert_eq!(event_loop.fallback_tiers.get(&peer), Some(&1));
+        let third_outbound = *event_loop.pending_requests.keys().next().unwrap();
+        assert_eq!(
+            canonical_bytes(&event_loop.pending_requests[&third_outbound].request).unwrap(),
+            signed_request
+        );
+
+        event_loop.connection_paths.clear();
+        let tor_failure = ConnectionId::new_unchecked(804);
+        event_loop
+            .connection_paths
+            .insert(tor_failure, (peer, P2pPath::RelayFallback));
+        event_loop.handle_peer_event(request_response::Event::OutboundFailure {
+            peer,
+            connection_id: tor_failure,
+            request_id: third_outbound,
+            error: request_response::OutboundFailure::Timeout,
+        });
+        assert_eq!(event_loop.fallback_tiers.get(&peer), Some(&2));
+        let fourth_outbound = *event_loop.pending_requests.keys().next().unwrap();
+        assert_eq!(
+            canonical_bytes(&event_loop.pending_requests[&fourth_outbound].request).unwrap(),
+            signed_request
+        );
+
+        event_loop.connection_paths.clear();
+        event_loop.handle_peer_event(request_response::Event::OutboundFailure {
+            peer,
+            connection_id: ConnectionId::new_unchecked(805),
+            request_id: fourth_outbound,
+            error: request_response::OutboundFailure::Timeout,
+        });
+        assert!(event_loop.pending_requests.is_empty());
+        assert!(call.await.unwrap().is_err());
+        assert_eq!(client.outbound_permits.available_permits(), 8);
     }
 
     #[tokio::test]
@@ -5874,6 +6457,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_dcutr_updates_active_history_metrics_and_transfer_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::open(temp.path(), Seed::from_bytes([64; 32])).unwrap();
+        let local_id = node.keys().node_id();
+        let (_client, mut event_loop) =
+            build_p2p(Arc::new(Mutex::new(node)), config(local_id)).unwrap();
+        let peer = KeyMaterial::from_seed(&Seed::from_bytes([65; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let connection = ConnectionId::new_unchecked(700);
+        event_loop
+            .persistent_addresses
+            .insert(peer, BTreeSet::new());
+        event_loop
+            .connection_paths
+            .insert(connection, (peer, P2pPath::Relayed));
+        event_loop.record_session_open(
+            connection,
+            peer,
+            P2pPath::Relayed,
+            P2pSessionDirection::Outbound,
+        );
+        event_loop.record_transfer(peer, Some(P2pPath::Relayed), 10, 20);
+
+        event_loop.classify_failed_dcutr(peer);
+        event_loop
+            .last_application_paths
+            .insert(peer, P2pPath::RelayFallback);
+        event_loop.record_transfer(peer, Some(P2pPath::RelayFallback), 30, 40);
+
+        let (response, receiver) = oneshot::channel();
+        event_loop
+            .handle_command(Command::Status { response })
+            .unwrap();
+        let status = receiver.await.unwrap();
+        let peer_status = status
+            .peers
+            .iter()
+            .find(|status| status.peer_id == peer.to_string())
+            .unwrap();
+        assert_eq!(peer_status.active_paths, vec![P2pPath::RelayFallback]);
+        assert_eq!(
+            peer_status.last_application_path,
+            Some(P2pPath::RelayFallback)
+        );
+        assert_eq!(status.active_sessions[0].path, P2pPath::RelayFallback);
+        assert_eq!(
+            peer_status.path_transfers,
+            vec![
+                P2pPathTransfer {
+                    path: P2pPath::Relayed,
+                    application_bytes_sent: 10,
+                    application_bytes_received: 20,
+                },
+                P2pPathTransfer {
+                    path: P2pPath::RelayFallback,
+                    application_bytes_sent: 30,
+                    application_bytes_received: 40,
+                },
+            ]
+        );
+
+        event_loop.connection_paths.remove(&connection);
+        event_loop.record_session_close(connection, false);
+        assert_eq!(
+            event_loop.recent_sessions.back().unwrap().path,
+            P2pPath::RelayFallback
+        );
+        assert_eq!(
+            event_loop.path_metrics[&P2pPath::Relayed].sessions_opened,
+            0
+        );
+        assert_eq!(
+            event_loop.path_metrics[&P2pPath::RelayFallback].sessions_opened,
+            1
+        );
+        assert_eq!(
+            event_loop.path_metrics[&P2pPath::RelayFallback].sessions_closed,
+            1
+        );
+        assert_eq!(
+            event_loop.path_metrics[&P2pPath::Relayed].application_bytes_sent,
+            10
+        );
+        assert_eq!(
+            event_loop.path_metrics[&P2pPath::RelayFallback].application_bytes_sent,
+            30
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unhealthy_session_closed_locally_is_recorded_as_a_transport_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::open(temp.path(), Seed::from_bytes([62; 32])).unwrap();
+        let local_id = node.keys().node_id();
+        let (_client, mut event_loop) =
+            build_p2p(Arc::new(Mutex::new(node)), config(local_id)).unwrap();
+        let peer = KeyMaterial::from_seed(&Seed::from_bytes([63; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let connection = ConnectionId::new_unchecked(701);
+        let address: Multiaddr = "/ip4/192.0.2.63/udp/44000/quic-v1".parse().unwrap();
+        let endpoint = ConnectedPoint::Dialer {
+            address,
+            role_override: Endpoint::Dialer,
+            port_use: PortUse::Reuse,
+        };
+        event_loop
+            .connection_paths
+            .insert(connection, (peer, P2pPath::Direct));
+        event_loop.record_session_open(
+            connection,
+            peer,
+            P2pPath::Direct,
+            P2pSessionDirection::Outbound,
+        );
+        event_loop.unhealthy_connections.insert(connection);
+
+        event_loop.handle_swarm_event(SwarmEvent::ConnectionClosed {
+            peer_id: peer,
+            connection_id: connection,
+            endpoint,
+            num_established: 0,
+            cause: None,
+        });
+        assert_eq!(
+            event_loop.recent_sessions.back().unwrap().outcome,
+            P2pSessionOutcome::TransportError
+        );
+        assert_eq!(event_loop.path_metrics[&P2pPath::Direct].sessions_closed, 1);
+    }
+
+    #[tokio::test]
     async fn transfer_history_does_not_retain_unknown_peers() {
         let temp = tempfile::tempdir().unwrap();
         let node = Node::open(temp.path(), Seed::from_bytes([75; 32])).unwrap();
@@ -6017,6 +6735,46 @@ mod tests {
         assert_eq!(
             event_loop.learned_addresses.len(),
             MAX_LEARNED_ENDPOINT_PEERS
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_identify_peers_cannot_consume_authorized_endpoint_quota() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::open(temp.path(), Seed::from_bytes([66; 32])).unwrap();
+        let local_id = node.keys().node_id();
+        let (_client, mut event_loop) =
+            build_p2p(Arc::new(Mutex::new(node)), config(local_id)).unwrap();
+
+        for index in 0..=MAX_LEARNED_ENDPOINT_PEERS {
+            let mut seed = [0_u8; 32];
+            seed[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            let peer = KeyMaterial::from_seed(&Seed::from_bytes(seed))
+                .node_id()
+                .libp2p_peer_id()
+                .unwrap();
+            let address: Multiaddr =
+                format!("/ip4/127.0.0.1/udp/{}/quic-v1", 10_000 + index % 50_000)
+                    .parse()
+                    .unwrap();
+            event_loop.add_identified_address(peer, address).unwrap();
+        }
+        assert!(event_loop.learned_addresses.is_empty());
+
+        let authorized = KeyMaterial::from_seed(&Seed::from_bytes([67; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        event_loop
+            .persistent_addresses
+            .insert(authorized, BTreeSet::new());
+        let address: Multiaddr = "/ip4/127.0.0.1/udp/4400/quic-v1".parse().unwrap();
+        event_loop
+            .add_identified_address(authorized, address.clone())
+            .unwrap();
+        assert_eq!(
+            event_loop.learned_addresses[&authorized].addresses,
+            BTreeSet::from([address])
         );
     }
 
@@ -6439,6 +7197,135 @@ mod tests {
         second_client.shutdown().await.unwrap();
         first_task.await.unwrap().unwrap();
         second_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_request_timeout_quarantines_only_its_connection_and_retries_a_duplicate() {
+        let temp = tempfile::tempdir().unwrap();
+        let target_seed = Seed::from_bytes([86; 32]);
+        let target_id = KeyMaterial::from_seed(&target_seed).node_id();
+        let target_peer = target_id.libp2p_peer_id().unwrap();
+        let client_seed = (87_u8..=u8::MAX)
+            .map(|byte| Seed::from_bytes([byte; 32]))
+            .find(|seed| {
+                KeyMaterial::from_seed(seed)
+                    .node_id()
+                    .libp2p_peer_id()
+                    .unwrap()
+                    > target_peer
+            })
+            .expect("test seeds include a client ordered after the target");
+        let client_node = Node::open(temp.path().join("client"), client_seed).unwrap();
+        let client_id = client_node.keys().node_id();
+        let good_node = Node::open(temp.path().join("good"), target_seed.clone()).unwrap();
+        let blackhole_node = Node::open(temp.path().join("blackhole"), target_seed).unwrap();
+
+        let (client, mut client_loop) =
+            build_p2p(Arc::new(Mutex::new(client_node)), config(client_id)).unwrap();
+        let (good, good_loop) =
+            build_p2p(Arc::new(Mutex::new(good_node)), config(target_id)).unwrap();
+        let (blackhole, mut blackhole_loop) =
+            build_p2p(Arc::new(Mutex::new(blackhole_node)), config(target_id)).unwrap();
+        let good_task = tokio::spawn(good_loop.run());
+        let blackhole_task = tokio::spawn(async move {
+            let mut held_channels = Vec::new();
+            loop {
+                tokio::select! {
+                    Some(command) = blackhole_loop.commands.recv() => {
+                        if blackhole_loop.handle_command(command)? {
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                    }
+                    event = blackhole_loop.swarm.select_next_some() => {
+                        match event {
+                            SwarmEvent::Behaviour(BehaviourEvent::Peer(
+                                request_response::Event::Message {
+                                    message: request_response::Message::Request { channel, .. },
+                                    ..
+                                },
+                            )) => held_channels.push(channel),
+                            event => blackhole_loop.handle_swarm_event(event),
+                        }
+                    }
+                }
+            }
+        });
+
+        let good_address = listening_address(&good).await;
+        let blackhole_address = listening_address(&blackhole).await;
+        for address in [&good_address, &blackhole_address] {
+            client_loop
+                .add_learned_address(
+                    target_peer,
+                    address
+                        .clone()
+                        .with(libp2p::multiaddr::Protocol::P2p(target_peer)),
+                )
+                .unwrap();
+        }
+        for address in [good_address, blackhole_address] {
+            client_loop
+                .swarm
+                .dial(
+                    SwarmDialOpts::peer_id(target_peer)
+                        .addresses(vec![address])
+                        .condition(PeerCondition::Always)
+                        .build(),
+                )
+                .unwrap();
+        }
+        let client_task = tokio::spawn(client_loop.run());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let active = client
+                    .status()
+                    .await
+                    .unwrap()
+                    .active_sessions
+                    .into_iter()
+                    .filter(|session| session.peer_id == target_peer.to_string())
+                    .count();
+                if active >= 2 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("client did not establish both same-identity QUIC sessions");
+
+        let calls = (0..4)
+            .map(|_| {
+                let client = client.clone();
+                tokio::spawn(async move { client.profile(target_id).await })
+            })
+            .collect::<Vec<_>>();
+        tokio::time::timeout(Duration::from_secs(35), async {
+            for call in calls {
+                assert_eq!(call.await.unwrap().unwrap().member.node_id, target_id);
+            }
+        })
+        .await
+        .expect("timed-out duplicate requests did not retry on the healthy session");
+        let status = client.status().await.unwrap();
+        let direct = status
+            .path_metrics
+            .iter()
+            .find(|metrics| metrics.path == P2pPath::Direct)
+            .unwrap();
+        assert!(direct.requests_failed >= 1, "no live request timed out");
+        assert!(direct.requests_succeeded >= 4);
+        assert!(status.recent_sessions.iter().any(|session| {
+            session.peer_id == target_peer.to_string()
+                && session.outcome == P2pSessionOutcome::TransportError
+        }));
+
+        client.shutdown().await.unwrap();
+        good.shutdown().await.unwrap();
+        client_task.await.unwrap().unwrap();
+        good_task.await.unwrap().unwrap();
+        blackhole_task.abort();
+        assert!(blackhole_task.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
