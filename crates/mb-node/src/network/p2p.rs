@@ -1657,6 +1657,48 @@ impl P2pEventLoop {
         metrics.sessions_opened = metrics.sessions_opened.saturating_add(1);
     }
 
+    fn classify_dcutr_connection(&mut self, peer: PeerId, connection: ConnectionId) {
+        self.connection_paths
+            .insert(connection, (peer, P2pPath::HolePunched));
+        self.update_session_path(connection, P2pPath::HolePunched);
+
+        // A simultaneous QUIC punch can establish one connection in each
+        // direction.  libp2p's DCUtR event identifies the locally initiated
+        // connection, while duplicate collapse deterministically retains the
+        // direction selected from the two Peer IDs.  When those directions
+        // differ, carry the DCUtR provenance to the newest matching direct
+        // connection so both ends attribute traffic on the retained connection
+        // to the hole punch instead of reporting it as an unrelated direct dial.
+        let local_prefers_dialer = self.swarm.local_peer_id() < &peer;
+        if self.connection_dialers.get(&connection).copied() == Some(local_prefers_dialer) {
+            return;
+        }
+        let counterpart = self
+            .connection_paths
+            .iter()
+            .filter_map(|(candidate, (candidate_peer, path))| {
+                (*candidate != connection
+                    && *candidate_peer == peer
+                    && *path == P2pPath::Direct
+                    && self.connection_dialers.get(candidate).copied()
+                        == Some(local_prefers_dialer))
+                .then_some((
+                    *candidate,
+                    self.sessions
+                        .get(candidate)
+                        .map(|session| session.sequence)
+                        .unwrap_or(0),
+                ))
+            })
+            .max_by_key(|(_, sequence)| *sequence)
+            .map(|(candidate, _)| candidate);
+        if let Some(counterpart) = counterpart {
+            self.connection_paths
+                .insert(counterpart, (peer, P2pPath::HolePunched));
+            self.update_session_path(counterpart, P2pPath::HolePunched);
+        }
+    }
+
     fn record_session_close(&mut self, connection: ConnectionId, transport_error: bool) {
         let Some(session) = self.sessions.remove(&connection) else {
             return;
@@ -2558,9 +2600,7 @@ impl P2pEventLoop {
             SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => {
                 match &event.result {
                     Ok(connection_id) => {
-                        self.connection_paths
-                            .insert(*connection_id, (event.remote_peer_id, P2pPath::HolePunched));
-                        self.update_session_path(*connection_id, P2pPath::HolePunched);
+                        self.classify_dcutr_connection(event.remote_peer_id, *connection_id);
                         self.schedule_duplicate_session_collapse(
                             event.remote_peer_id,
                             *connection_id,
@@ -2705,21 +2745,41 @@ impl P2pEventLoop {
                     .connection_paths
                     .get(&connection_id)
                     .map(|(_, path)| *path);
-                self.connection_paths.insert(
-                    connection_id,
-                    (peer_id, merge_established_path(recorded, path)),
-                );
+                let established_path = merge_established_path(recorded, path);
+                self.connection_paths
+                    .insert(connection_id, (peer_id, established_path));
                 self.connection_dialers.insert(connection_id, dialer);
                 self.record_session_open(
                     connection_id,
                     peer_id,
-                    merge_established_path(recorded, path),
+                    established_path,
                     if dialer {
                         P2pSessionDirection::Outbound
                     } else {
                         P2pSessionDirection::Inbound
                     },
                 );
+                if established_path == P2pPath::Direct {
+                    let local_prefers_dialer = self.swarm.local_peer_id() < &peer_id;
+                    let paired_punch = self.connection_paths.iter().find_map(
+                        |(candidate, (candidate_peer, candidate_path))| {
+                            (*candidate != connection_id
+                                && *candidate_peer == peer_id
+                                && *candidate_path == P2pPath::HolePunched
+                                && self.connection_dialers.get(candidate).copied()
+                                    != Some(local_prefers_dialer))
+                            .then_some(*candidate)
+                        },
+                    );
+                    if let Some(paired_punch) = paired_punch {
+                        self.classify_dcutr_connection(peer_id, paired_punch);
+                    }
+                }
+                let path = self
+                    .connection_paths
+                    .get(&connection_id)
+                    .map(|(_, path)| *path)
+                    .unwrap_or(established_path);
                 let rank = path_preference_rank(self.tor_mode, path);
                 if self
                     .fallback_tiers
