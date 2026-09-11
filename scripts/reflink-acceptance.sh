@@ -6,6 +6,11 @@ if [[ -z "${MUTUALBACKUP_REFLINK_TEST_ROOT:-}" ]]; then
   exit 2
 fi
 
+if ! command -v btrfs >/dev/null 2>&1; then
+  echo "btrfs is required (enter the repository's default Nix development shell)" >&2
+  exit 2
+fi
+
 cargo test -p mb-store anchor::tests::stable_locator_survives_parent_rename --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::nested_btrfs_subvolumes_are_rejected_before_and_during_capture --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::capture_walk_remains_bound_to_the_open_root --locked -- --ignored --exact
