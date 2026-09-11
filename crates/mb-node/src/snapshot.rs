@@ -1705,7 +1705,7 @@ pub(crate) fn resume_restore_publication(
     let Some(ReservedRestoreJob {
         record_id,
         bytes,
-        job,
+        mut job,
     }) = reserved_restore_job(
         control,
         &target,
@@ -1724,6 +1724,14 @@ pub(crate) fn resume_restore_publication(
         parent_identity,
     )?;
     if job.state != RestoreJobState::Publishing {
+        return Ok(false);
+    }
+    if parent.entry_identity(&job.staging_name, true)?.is_none()
+        && parent.entry_identity(&target_name, true)?.is_none()
+    {
+        job.state = RestoreJobState::Building;
+        job.staged_identity = None;
+        replace_restore_job(control, &record_id, &bytes, &job)?;
         return Ok(false);
     }
     finish_durable_restore_publication(control, &record_id, &bytes, &job, &parent, &target_name)?;
@@ -3035,6 +3043,10 @@ mod metadata_compatibility_tests {
         );
         assert!(!temp.path().join(&retired_name).exists());
         assert_eq!(control.records(RESTORE_JOB_KIND).unwrap().len(), 2);
+        let resumed =
+            resume_restore_publication(&control, &keys, guild_id, &retired_revision, &target)
+                .unwrap();
+        assert!(!resumed);
 
         restore_revision(
             &control,
