@@ -99,6 +99,12 @@ For only the five-daemon product acceptance scenario:
 nix develop -c bash scripts/network-smoke.sh /mnt/disposable-btrfs
 ```
 
+This Linux-only gate uses disposable network namespaces, veth interfaces,
+port-preserving NAT, and firewall rules to make direct, successful-DCUtR, and
+relay-only paths real rather than inferred. It requires passwordless `sudo` for
+that network plumbing; daemons are dropped back to the invoking UID/GID, and an
+exit trap removes the namespaces and rules and restores the forwarding setting.
+
 The onion-only recovery gate starts a pinned private Tor network and uses no
 peer IP listener, relay, or hole-punch path:
 

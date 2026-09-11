@@ -28,7 +28,7 @@ jobs:
       - name: Provision disposable Btrfs filesystem
         run: |
           sudo apt-get update
-          sudo apt-get install -y btrfs-progs
+          sudo apt-get install -y btrfs-progs iproute2 iptables procps util-linux
           truncate -s 2G /tmp/mutualbackup-ci.btrfs
           sudo mkfs.btrfs -q -f /tmp/mutualbackup-ci.btrfs
           sudo mkdir -p /mnt/mutualbackup-ci

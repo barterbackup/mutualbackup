@@ -65,13 +65,17 @@
             cargo
             clang
             gnumake
+            iproute2
+            iptables
             openssl
             perl
             pkg-config
+            procps
             rustc
             rustfmt
             clippy
             sqlcipher
+            util-linux
           ];
 
           RUST_BACKTRACE = "1";

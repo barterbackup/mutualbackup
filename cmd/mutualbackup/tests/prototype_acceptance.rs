@@ -32,7 +32,81 @@ struct Daemon {
     args: Vec<OsString>,
     environment: Vec<(OsString, OsString)>,
     log: PathBuf,
+    network_namespace: Option<NetworkNamespace>,
     child: Option<Child>,
+}
+
+#[derive(Clone)]
+struct NetworkNamespace {
+    name: OsString,
+    sudo: PathBuf,
+    ip: PathBuf,
+    setpriv: PathBuf,
+    env: PathBuf,
+    uid: u32,
+    gid: u32,
+}
+
+impl NetworkNamespace {
+    fn new(name: impl AsRef<OsStr>) -> Self {
+        Self {
+            name: os(name),
+            sudo: required_test_program("MUTUALBACKUP_TEST_SUDO"),
+            ip: required_test_program("MUTUALBACKUP_TEST_IP"),
+            setpriv: required_test_program("MUTUALBACKUP_TEST_SETPRIV"),
+            env: required_test_program("MUTUALBACKUP_TEST_ENV"),
+            // SAFETY: these accessors have no preconditions and only return the
+            // invoking test process's real identity.
+            uid: unsafe { libc::getuid() },
+            // SAFETY: see the `getuid` call above.
+            gid: unsafe { libc::getgid() },
+        }
+    }
+
+    fn command(&self, environment: &[(OsString, OsString)]) -> Command {
+        let mut command = Command::new(&self.sudo);
+        command
+            .arg("-n")
+            .arg(&self.ip)
+            .args([OsStr::new("netns"), OsStr::new("exec")])
+            .arg(&self.name)
+            .arg(&self.setpriv)
+            .arg(format!("--reuid={}", self.uid))
+            .arg(format!("--regid={}", self.gid))
+            .arg("--clear-groups")
+            .arg("--inh-caps=-all")
+            .arg("--bounding-set=-all")
+            .arg("--no-new-privs")
+            .arg(&self.env);
+        for (key, value) in environment {
+            let mut assignment = key.clone();
+            assignment.push("=");
+            assignment.push(value);
+            command.arg(assignment);
+        }
+        command.arg(env!("CARGO_BIN_EXE_mutualbackupd"));
+        command
+    }
+
+    fn signal_processes(&self, signal: libc::c_int) {
+        let output = Command::new(&self.sudo)
+            .arg("-n")
+            .arg(&self.ip)
+            .args([OsStr::new("netns"), OsStr::new("pids")])
+            .arg(&self.name)
+            .output();
+        let Ok(output) = output else {
+            return;
+        };
+        for pid in String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .filter_map(|value| value.parse::<libc::pid_t>().ok())
+        {
+            // SAFETY: `pid` came from `ip netns pids`; sending a signal is the
+            // intended best-effort cleanup and the return value is immaterial.
+            let _ = unsafe { libc::kill(pid, signal) };
+        }
+    }
 }
 
 impl Daemon {
@@ -45,6 +119,7 @@ impl Daemon {
             args,
             environment: Vec::new(),
             log,
+            network_namespace: None,
             child: None,
         }
     }
@@ -55,6 +130,11 @@ impl Daemon {
         self.environment.push((key, os(value)));
     }
 
+    fn set_network_namespace(&mut self, namespace: impl AsRef<OsStr>) {
+        assert!(self.child.is_none());
+        self.network_namespace = Some(NetworkNamespace::new(namespace));
+    }
+
     fn start(&mut self) {
         assert!(self.child.is_none());
         let log = OpenOptions::new()
@@ -63,9 +143,15 @@ impl Daemon {
             .open(&self.log)
             .unwrap();
         let stderr = log.try_clone().unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_mutualbackupd"))
+        let mut command = if let Some(namespace) = &self.network_namespace {
+            namespace.command(&self.environment)
+        } else {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_mutualbackupd"));
+            command.envs(self.environment.iter().cloned());
+            command
+        };
+        let child = command
             .args(&self.args)
-            .envs(self.environment.iter().cloned())
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))
@@ -76,6 +162,17 @@ impl Daemon {
 
     fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
+            if let Some(namespace) = &self.network_namespace {
+                namespace.signal_processes(libc::SIGTERM);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline {
+                    if child.try_wait().ok().flatten().is_some() {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                namespace.signal_processes(libc::SIGKILL);
+            }
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -96,6 +193,39 @@ impl Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+struct ProcessNetworkTopology {
+    coordinator_namespace: OsString,
+    punched_namespace: OsString,
+    fallback_namespace: OsString,
+    relay_namespace: OsString,
+    coordinator_ip: String,
+    punched_ip: String,
+    relay_ip: String,
+    host_ip: String,
+}
+
+impl ProcessNetworkTopology {
+    fn from_environment() -> Self {
+        Self {
+            coordinator_namespace: required_test_value("MUTUALBACKUP_TEST_NETNS_COORDINATOR"),
+            punched_namespace: required_test_value("MUTUALBACKUP_TEST_NETNS_PUNCHED"),
+            fallback_namespace: required_test_value("MUTUALBACKUP_TEST_NETNS_FALLBACK"),
+            relay_namespace: required_test_value("MUTUALBACKUP_TEST_NETNS_RELAY"),
+            coordinator_ip: required_test_utf8("MUTUALBACKUP_TEST_COORDINATOR_IP"),
+            punched_ip: required_test_utf8("MUTUALBACKUP_TEST_PUNCHED_IP"),
+            relay_ip: required_test_utf8("MUTUALBACKUP_TEST_RELAY_IP"),
+            host_ip: required_test_utf8("MUTUALBACKUP_TEST_HOST_IP"),
+        }
+    }
+
+    fn transport(&self, loopback_transport: &str, ip: &str) -> String {
+        let suffix = loopback_transport
+            .strip_prefix("/ip4/127.0.0.1/")
+            .expect("acceptance transport must be an IPv4 loopback multiaddress");
+        format!("/ip4/{ip}/{suffix}")
     }
 }
 
@@ -729,6 +859,7 @@ fn daemon_starts_locked_and_rejects_the_wrong_identity_before_opening_storage() 
 #[test]
 #[ignore = "requires an explicitly provisioned reflink test filesystem"]
 fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
+    let topology = ProcessNetworkTopology::from_environment();
     let test_root = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
         .expect("the acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT");
     let run_root = PathBuf::from(test_root).join(format!("process-{}", Uuid::new_v4()));
@@ -1151,24 +1282,36 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     recovered_daemon.stop();
     storage_recovered_daemon.stop();
 
-    let relay = format!("{}/p2p/{}", transports[5], peer_ids[1]);
+    daemons[0].set_network_namespace(&topology.coordinator_namespace);
+    daemons[3].set_network_namespace(&topology.punched_namespace);
+    recovered_daemon.set_network_namespace(&topology.relay_namespace);
+    storage_recovered_daemon.set_network_namespace(&topology.fallback_namespace);
+    let coordinator_transport = topology.transport(&transports[0], &topology.coordinator_ip);
+    let punched_transport = topology.transport(&transports[6], &topology.punched_ip);
+    let relay_transport = topology.transport(&transports[5], &topology.relay_ip);
+    let owner_transport = topology.transport(&transports[2], &topology.host_ip);
+    let relay = format!("{relay_transport}/p2p/{}", peer_ids[1]);
     let coordinator_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[0]);
     let punched_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[3]);
     let fallback_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[4]);
     update_config(&recovered_config, |config| {
-        config.enable_relay_server = true
+        config.p2p_listen_addresses = vec![relay_transport.clone()];
+        config.p2p_external_addresses = vec![relay_transport.clone()];
+        config.enable_relay_server = true;
     });
     update_config(&configs[0], |config| {
-        // Peer exchange is intentionally active in the product. Publish only
-        // the circuit endpoint in this topology so it cannot reveal the
-        // loopback listener and bypass the DCUtR path under test.
+        // Keep production endpoint exchange and Identify active. The harness
+        // makes private listener addresses unroutable across the two NATs, so
+        // only the observed public address exchanged by DCUtR can establish
+        // the upgraded QUIC connection.
+        config.p2p_listen_addresses = vec![coordinator_transport.clone()];
         config.p2p_external_addresses = vec![coordinator_circuit.clone()];
         config.p2p_bootstrap_addresses = vec![punched_circuit.clone(), fallback_circuit.clone()];
         config.p2p_relay_addresses = vec![relay.clone()];
         config.enable_dht_maintenance = false;
     });
     update_config(&configs[3], |config| {
-        config.p2p_listen_addresses = vec![transports[6].clone()];
+        config.p2p_listen_addresses = vec![punched_transport.clone()];
         config.p2p_external_addresses = vec![punched_circuit.clone()];
         config.p2p_bootstrap_addresses.clear();
         config.p2p_relay_addresses = vec![relay.clone()];
@@ -1181,6 +1324,12 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         config.p2p_bootstrap_addresses.clear();
         config.p2p_relay_addresses = vec![relay.clone()];
         config.enable_hole_punching = false;
+        config.enable_dht_maintenance = false;
+    });
+    update_config(&configs[2], |config| {
+        config.p2p_listen_addresses = vec![owner_transport.clone()];
+        config.p2p_external_addresses = vec![owner_transport.clone()];
+        config.p2p_bootstrap_addresses = vec![coordinator_circuit.clone()];
         config.enable_dht_maintenance = false;
     });
 
@@ -1198,13 +1347,18 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     wait_for_status_text(
         &sockets[0],
         &mut daemons[0],
-        "/p2p-circuit",
+        "relay reservations: 1/1",
         Duration::from_secs(45),
     );
     daemons[2].start();
+    wait_for_status_text(
+        &sockets[2],
+        &mut daemons[2],
+        &peer_ids[0],
+        Duration::from_secs(45),
+    );
     daemons[3].start();
     storage_recovered_daemon.start();
-    wait_for_status(&sockets[2], &mut daemons[2], Duration::from_secs(30));
     wait_for_status(&sockets[3], &mut daemons[3], Duration::from_secs(30));
     wait_for_status(
         &storage_recovered_socket,
@@ -1214,19 +1368,25 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     wait_for_status_text(
         &sockets[3],
         &mut daemons[3],
-        "/p2p-circuit",
+        "relay reservations: 1/1",
         Duration::from_secs(45),
     );
     wait_for_status_text(
         &storage_recovered_socket,
         &mut storage_recovered_daemon,
-        "/p2p-circuit",
+        "relay reservations: 1/1",
         Duration::from_secs(45),
     );
     wait_for_status_text(
         &sockets[0],
         &mut daemons[0],
         "HolePunched",
+        Duration::from_secs(45),
+    );
+    wait_for_status_text(
+        &sockets[0],
+        &mut daemons[0],
+        "relay reservations: 1/1",
         Duration::from_secs(45),
     );
 
@@ -1278,13 +1438,14 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     daemons[3].stop();
     storage_recovered_daemon.stop();
     recovered_daemon.stop();
-    let relay = format!("{}/p2p/{}", transports[9], peer_ids[1]);
+    let relay_transport = topology.transport(&transports[9], &topology.relay_ip);
+    let relay = format!("{relay_transport}/p2p/{}", peer_ids[1]);
     let coordinator_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[0]);
     let punched_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[3]);
     let fallback_circuit = format!("{relay}/p2p-circuit/p2p/{}", peer_ids[4]);
     update_config(&recovered_config, |config| {
-        config.p2p_listen_addresses = vec![transports[9].clone()];
-        config.p2p_external_addresses = vec![transports[9].clone()];
+        config.p2p_listen_addresses = vec![relay_transport.clone()];
+        config.p2p_external_addresses = vec![relay_transport.clone()];
     });
     update_config(&configs[3], |config| {
         config.p2p_relay_addresses = vec![relay.clone()];
@@ -1309,7 +1470,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     wait_for_status_text(
         &sockets[0],
         &mut daemons[0],
-        "/p2p-circuit",
+        "relay reservations: 1/1",
         Duration::from_secs(45),
     );
     daemons[3].start();
@@ -1317,13 +1478,13 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     wait_for_status_text(
         &sockets[3],
         &mut daemons[3],
-        "/p2p-circuit",
+        "relay reservations: 1/1",
         Duration::from_secs(45),
     );
     wait_for_status_text(
         &storage_recovered_socket,
         &mut storage_recovered_daemon,
-        "/p2p-circuit",
+        "relay reservations: 1/1",
         Duration::from_secs(45),
     );
     wait_for_status_text(
@@ -1370,6 +1531,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     set_private(&outsider_dir);
     let outsider_socket = outsider_dir.join("c");
     let outsider_config = outsider_dir.join("node.toml");
+    let outsider_transport = topology.transport(&transports[8], &topology.host_ip);
     run_cli(
         &[
             os("--socket"),
@@ -1393,9 +1555,9 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
             control_socket: outsider_socket.clone(),
             failure_domain: Some("outsider".to_owned()),
             parity_budget_bytes: 10 * 1024 * 1024 * 1024,
-            p2p_listen_addresses: vec![transports[8].clone()],
+            p2p_listen_addresses: vec![outsider_transport.clone()],
             clear_p2p_listen_addresses: false,
-            p2p_external_addresses: vec![transports[8].clone()],
+            p2p_external_addresses: vec![outsider_transport],
             clear_p2p_external_addresses: false,
             p2p_bootstrap_addresses: vec![bootstrap],
             clear_p2p_bootstrap_addresses: false,
@@ -2124,6 +2286,25 @@ fn unix_seconds() -> u64 {
 
 fn os(value: impl AsRef<OsStr>) -> OsString {
     value.as_ref().to_owned()
+}
+
+fn required_test_value(name: &str) -> OsString {
+    std::env::var_os(name).unwrap_or_else(|| panic!("the acceptance harness must set {name}"))
+}
+
+fn required_test_utf8(name: &str) -> String {
+    required_test_value(name)
+        .into_string()
+        .unwrap_or_else(|_| panic!("the acceptance harness must set {name} to UTF-8"))
+}
+
+fn required_test_program(name: &str) -> PathBuf {
+    let path = PathBuf::from(required_test_value(name));
+    assert!(
+        path.is_absolute() && path.is_file(),
+        "the acceptance harness must set {name} to an absolute executable path"
+    );
+    path
 }
 
 fn cli<const N: usize>(socket: &Path, args: [&str; N], timeout: Duration) -> String {
