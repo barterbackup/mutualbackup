@@ -76,19 +76,17 @@ source-only reviews found initialization, startup rollback, recovery resumption,
 address-lifetime, path-attribution, capture, quota, and Docker crash-safety
 defects that the original suite did not expose. Repeated corrective reviews
 closed the descriptor-traversal, crash-resumption, Docker-namespace,
-build-source, and bounded-resource gaps then known in this draft. A follow-up
-at `d52b193` found remaining capture-name, restore-job integration,
-completed-retry, and destructive seed-validation defects. The corrective slice
-addressed those direct cases with focused regressions. The final corrective
-slice makes ordinary restore publication exclusive and
-compare-and-transitioned, reconciles multiple legacy jobs, permits a public
-post-rename retry without sector access, keeps completed recovery verification
-read-only, and closes Docker recovery-name and bootstrap-failover holes. Its
-completion audit also removed every newly found unbound-staging deletion. The
-locked workspace, full Btrfs/reflink and real-network acceptance, static Nix
-artifact, and real Docker/Btrfs erase-and-seed-recovery gates all passed. No
-additional high-confidence Milestone 2 defect was found in the closing
-source-only review; Milestone 3 is now admitted.
+build-source, and bounded-resource gaps then known in this draft. The closing
+corrective pass also makes a legacy `Publishing` restore whose staging and
+target were both lost safely rebuildable through both local and peer restore
+paths; cancels abandoned shard-request state and permits while avoiding the
+same unhealthy holder across later coding groups; rotates Docker recovery away
+from a live but unusable bootstrap without erasing the recovered image; and
+makes destructive restore-name validation ASCII and byte-exact. Focused
+regressions and the locked workspace, full Btrfs/reflink and real-network
+acceptance, static Nix artifact, and real Docker/Btrfs erase-and-seed-recovery
+gates all pass. No additional high-confidence Milestone 2 defect was found in
+the closing source-only review; Milestone 3 is admitted.
 Application-transfer acceptance attributes post-baseline bulk bytes to the
 exact direct, DCUtR, or relay-fallback connection used.
 
@@ -651,22 +649,19 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 and 1 are passed. Milestone 2's implementation
-and earlier runtime gates completed, but the latest source-only re-audit reopened
-its corrective gate with four high-confidence defects: legacy restore migration
-can strand a `Publishing` journal across a crash; abandoned shard requests can
-starve outbound permits during a large recoverable restore; Docker recovery can
-retry one live but P2P-unreachable bootstrap forever; and destructive restore
-name validation is not locale-independent or reliably byte-bounded. The exact
-fix and regression contracts are in `TODO.md`; no Milestone 3 work should begin
-until they are closed and reviewed.
+**Current position:** Milestones 0, 1, and 2 are passed. The latest corrective
+slice closed the four restore, request-cancellation, Docker-bootstrap, and
+destructive-name defects from the last re-audit. Their focused regressions and
+the complete locked workspace, Btrfs/reflink, real QUIC/DHT recovery, static
+Nix artifact, and five-container erase-and-seed-recovery gates pass. The closing
+source-only review found no additional high-confidence Milestone 2 defect, and
+`TODO.md` now contains only later guild/coding work.
 
-The next run is one final Milestone 2 corrective slice. Fix the four blocking
-items in `TODO.md`, add their focused crash/network/locale regressions, then run
-the complete locked workspace, Btrfs/reflink, real QUIC/DHT recovery, static Nix
-artifact, and five-container erase-and-seed-recovery gates. Pause for another
-source-only closure review. Only after that gate passes should Milestone 3 pin
-and review Arti and write the transport/key-lifecycle ADR.
+The next run begins Milestone 3. First pin and source-review the maintained Arti
+release and write the transport, identity-key, onion-service-key, discovery,
+and cache lifecycle ADR. Then integrate Tor behind the existing bounded session
+and endpoint abstractions and stop at the private-Tor recovery gate below for
+another focused review.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
 
@@ -712,7 +707,7 @@ The Milestone 2 gate included inherited stabilization regressions that the first
 acceptance pass did not expose; they remain part of the mandatory regression
 contract.
 
-### Milestone 2 — operator configuration and identity-state separation (corrective gate reopened)
+### Milestone 2 — operator configuration and identity-state separation (passed)
 
 - Replace duplicated daemon parsing with one typed options model consumed by
   optional TOML and equivalent nonsecret command-line flags. Test flag-over-file
@@ -773,18 +768,22 @@ exclusive compare-and-transition restore state, atomic legacy reconciliation,
 data-independent publication retry, non-mutating completed-recovery
 verification, safe restoring-phase bootstrap replacement, and destructive-name
 preflight. The complete locked, Btrfs, network, packaging, and real Docker lab
-gates were rerun successfully, and the closing source-only audit found no new
-high-confidence Milestone 2 defect. A subsequent source-only re-audit found the
-four current blockers recorded in `TODO.md`; those findings supersede the prior
-closure verdict but do not invalidate the other completed fixes or gate results.
+gates were rerun successfully. The last re-audit then found four more defects.
+The final corrective pass makes missing legacy publication state rebuildable in
+both local and peer restore entry points, releases abandoned P2P request state
+and outbound permits while carrying unhealthy-holder knowledge across a large
+repair, advances Docker recovery past a control-responsive but P2P-unusable
+bootstrap without replacing its recovered Btrfs image, and validates destructive
+restore names as ASCII bytes before mutation. Focused regressions and every full
+gate were rerun, and the closing source-only audit found no new high-confidence
+Milestone 2 defect.
 
 ### Milestone 3 — Tor and robust connectivity beta
 
-Entry condition: not yet satisfied because the Milestone 2 corrective gate is
-reopened for the four blockers in `TODO.md`. No Milestone 3 implementation has
-begun. After Milestone 2 closes again, start by pinning and reviewing the
-maintained Arti version and writing the transport/key lifecycle ADR before
-integrating it with the bounded IP endpoint lifecycle.
+Entry condition: satisfied. Milestone 2 is closed and no Milestone 3
+implementation has begun. Start by pinning and reviewing the maintained Arti
+version and writing the transport/key lifecycle ADR before integrating it with
+the bounded IP endpoint lifecycle.
 
 - Adapt the narrow, useful BarterBackup `nettor` principles to a maintained Arti
   release: outbound onion dialing, an inbound v3 onion service, persistent Tor
