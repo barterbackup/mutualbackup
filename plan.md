@@ -22,12 +22,13 @@ them as ADRs and test vectors before promising wire compatibility.
   prototype instantiates one parity database; later, one database per configured
   filesystem lets volumes be added, drained, or lost independently.
 - Use one stable seed-derived Ed25519 **peer identity** across direct QUIC,
-  hole-punched, relayed, and Kademlia sessions, with a deterministic verified
-  mapping between the Node ID and libp2p Peer ID. Keep revision, mailbox,
-  metadata, and `(user, guild)` data keys domain-separated. Reserve the same
-  identity mapping for a later Arti onion transport, but do not implement or
-  require Tor in the first usable prototype. Treat one live node as the writer
-  for that identity until writer fencing is added later.
+  hole-punched, relayed, onion, and Kademlia sessions, with a deterministic
+  verified mapping among the Node ID, libp2p Peer ID, and v3 onion identity.
+  Keep revision, mailbox, metadata, and `(user, guild)` data keys
+  domain-separated. The embedded Arti transport injects the seed-derived onion
+  identity into an ephemeral keystore while retaining non-identity Tor state.
+  Treat one live node as the writer for that identity until writer fencing is
+  added later.
 - Treat one normalized printable recovery string as the sole root secret. Generate
   the recommended form as 24 English words with the maintained Rust `bip39`
   crate and the OS CSPRNG, but use the words only as a high-entropy printable
@@ -55,7 +56,7 @@ them as ADRs and test vectors before promising wire compatibility.
   checkpoints. Leave a compatible authorization interface for later quorum
   policies and FROST once membership and recovery policy are stable.
 
-### Implemented baseline — first usable IP prototype
+### Implemented baseline — first usable product through Tor beta
 
 The first usable architectural prototype and the Milestone 2
 operator-configuration and identity-state slice are implemented and passed.
@@ -89,6 +90,12 @@ gates all pass. No additional high-confidence Milestone 2 defect was found in
 the closing source-only review; Milestone 3 is admitted.
 Application-transfer acceptance attributes post-baseline bulk bytes to the
 exact direct, DCUtR, or relay-fallback connection used.
+
+Milestone 3 adds an embedded, seed-bound Arti v3 onion transport to the same
+libp2p swarm, signed onion discovery and peer exchange, explicit transport
+policy, supervised Tor readiness, automatic request fallback across transport
+tiers, and optional gateway port mapping. Its private-Tor gate performs a real
+five-daemon, onion-only, seed-only recovery with no peer IP application path.
 
 The baseline deliberately remains one guild and one reflink root per member,
 one parity database, Linux only, fixed 64 KiB sectors and `3+2`, unanimous
@@ -164,7 +171,7 @@ the regression contract.
 | User revisions | Signed by an identity-authorized revision key and replicated with recoverable guild state |
 | Guild state | Prototype members retain the signed genesis, every authenticated checkpoint/revision, and enough explicit layout and recovery-locator metadata to rebuild a lost member. Later event tails and recovery-key envelopes support rotation, and old history may be safely compacted |
 | Coordinator state | The genesis records which member serializes prototype proposals, but five signatures authorize a checkpoint. Its work inputs/staging are temporary and never authoritative |
-| DHT and relay | Kademlia stores independently published, short-lived provider advertisements, public signed endpoint records, and signed recovery bundles sealed to their subjects. The relay function retains no forwarded payload or authority, though the same daemon may separately hold assigned parity. Onion endpoints are added only by the later Tor milestone |
+| DHT, relay, and Tor | Kademlia stores independently published, short-lived provider advertisements, public signed direct/relay/onion endpoint records, and signed recovery bundles sealed to their subjects. The relay function retains no forwarded payload or authority, though the same daemon may separately hold assigned parity. Arti retains directory, guard, and cache state locally, while the seed-derived onion secret is injected only after unlock and is not persisted as a second identity |
 
 Proposed simplification: a `UserRevision` describes only that user's logical
 data. Membership, revision heads, coding groups, and parity assignments belong
@@ -296,7 +303,7 @@ Later partial-range transfer must supply proofs to that same authority.
   provider of `mailbox(subject)`. Recovery obtains several provider Peer IDs;
   each publisher owns `recovery-bundle(subject,publisher)`, a bounded sealed set
   of locators for every guild the pair shares, and a public signed
-  `endpoint(publisher)` record containing direct QUIC and relay circuit
+  `endpoint(publisher)` record containing direct QUIC, relay circuit, and onion
   multiaddresses. Both record types carry a durable per-kind publisher sequence
   and expiry. The highest valid sequence wins; differing values at the same
   sequence are a fork and are rejected/reported. Before publishing after
@@ -308,7 +315,7 @@ Later partial-range transfer must supply proofs to that same authority.
   checkpoint becomes `seed-recovery-ready` only after a nonlocal lookup returns
   its current bundles from at least three independent guild publishers. DHT
   metadata never proves that bytes are stored and never becomes protocol
-  authority. A formal recovery capsule/event tail and onion endpoints are later extensions.
+  authority. A formal recovery capsule/event tail remains a later extension.
 
 ## 4. Local source snapshots, persistence, and storage volumes
 
@@ -434,8 +441,9 @@ expected-identity check, bounded worker ownership, and formal wire contracts are
 implemented. Human configuration and application-owned identity state are also
 separate. A strictly checked recovery-string file remains an explicit
 unattended auto-unlock option rather than a daemon prerequisite. Milestone 2 is
-closed; only the reviewed Milestone 3 ADRs may now change the current wire and
-durable-state boundaries.
+closed. Milestone 3 is a completion candidate whose final repository gate must
+be rerun after the closing test-harness correction; later wire or durable-state
+changes require the review and gate of the milestone that owns them.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -528,9 +536,9 @@ durable-state boundaries.
    resume are not needed yet.
 6. **Cold recover:** seed → Node ID/libp2p Peer ID and recovery key → generic
    Kademlia bootstrap → `mailbox(subject)` providers → publisher endpoint and
-   sealed recovery bundles → authenticated direct, DCUtR-punched, or relay
-   sessions → quorum-valid checkpoint and explicit layouts → any three valid
-   shards → verify/reconstruct/decrypt → staged restore → rebuild `control.db`
+   sealed recovery bundles → authenticated direct, DCUtR-punched, relay, or
+   onion sessions → quorum-valid checkpoint and explicit layouts → any three
+   valid shards → verify/reconstruct/decrypt → staged restore → rebuild `control.db`
    and rejoin at the new endpoint after reading the greatest valid prior
    publisher sequence and advancing it. The test supplies no guild ID, peer
    list, checkpoint, endpoint cache, or old node configuration.
@@ -565,7 +573,7 @@ and requests best-effort removal.
 
 ## 6. Networking and hole punching
 
-### Implemented IP connectivity profile and stabilization target
+### Implemented robust connectivity profile
 
 - Use rust-libp2p rather than extending the temporary TCP stack: QUIC, Identify,
   Kademlia, request/response or stream protocols, circuit relay v2, AutoNAT, and
@@ -573,52 +581,51 @@ and requests best-effort removal.
   and encrypts the live session; existing canonical application signatures stay
   authoritative for stored, relayed, or later replayed protocol records.
 - Hide paths behind one authenticated session interface keyed by Node ID. Keep a
-  small guild peer-exchange overlay and a signed, expiring endpoint set per peer.
-  Reuse sessions, fetch independent shards in parallel, and retry complete
-  64 KiB sectors. Range resume and a second custom hole-punch protocol are not
-  part of the prototype.
-- Try paths with bounded budgets in this order: an existing or direct QUIC
-  session over IPv6, LAN, or a known public address; a relay-v2 circuit followed
-  by a DCUtR simultaneous QUIC punch; then retain the authenticated relay circuit
-  if the punch fails. Cache the working path and deterministically collapse
-  duplicate simultaneous sessions. PCP, NAT-PMP, and UPnP mapping come later.
+  bounded guild peer-exchange overlay and a signed, expiring endpoint set per
+  peer. Reuse sessions, fetch independent shards in parallel, and retry the same
+  signed idempotent request when transport policy advances to a fallback tier.
+  Range resume and a second custom hole-punch protocol are not part of the
+  prototype.
+- Under the default `auto` policy, try paths with bounded budgets in this order:
+  an existing or direct QUIC session over IPv6, LAN, or a known public address;
+  a relay-v2 circuit followed by a DCUtR simultaneous QUIC punch; retain the
+  authenticated relay circuit if the punch fails; then use onion connectivity.
+  `prefer-tor` reverses the transport-tier preference, `require-tor` excludes IP
+  paths, and `disable-tor` does not start Arti. Cache the working path,
+  deterministically collapse duplicate simultaneous sessions, and optionally
+  request PCP, NAT-PMP, or UPnP gateway mappings without making them a readiness
+  prerequisite.
 - Reachable guild daemons may opt into a bounded relay role and admit
   reservations/circuits for authenticated guild members. Configured community
   bootstrap relays may provide the initial circuit. The relay function forwards
   opaque bytes without retaining the payload or gaining storage authority, and
   enforces connection, time, and byte limits; the daemon may separately store
   its assigned parity.
-- Keep and complete the Kademlia mailbox/provider/bundle/endpoint scheme from section 3.
-  Daemons refresh records before their finite TTL and gossip fresher signed
-  endpoints inside the guild. Ship several replaceable generic IP bootstrap
-  multiaddresses. DHT routing/cache state is disposable; the DHT is discovery,
-  never authority or bulk storage.
+- Keep and complete the Kademlia mailbox/provider/bundle/endpoint scheme from
+  section 3. Daemons refresh records before their finite TTL and gossip fresher
+  signed endpoints inside the guild. Configured replaceable bootstrap addresses
+  may be IP or onion multiaddresses; DHT routing/cache state is disposable, and
+  the DHT is discovery, never authority or bulk storage.
 - Seed-only recovery still requires at least one working bootstrap/routing path
   and enough reachable shard holders. Test topology must make alternatives
   impossible and assert the daemon-reported selected path: direct QUIC; no
   initial direct route followed by successful DCUtR; and forced punch failure
   with the complete transfer carried over the relay circuit.
-- Tor/Arti and onion endpoints are not built, advertised, or required by this
-  prototype. Keep endpoint and session enums extensible so adding them later
-  does not alter the application protocol.
-
-### Later Tor/onion connectivity milestone
-
 - Embed maintained Arti for outbound onion dials and an inbound Tor v3 onion
-  service. Use the same seed-derived Ed25519 identity, verify that its onion
-  hostname maps to the Node ID, keep Arti directory/cache state persistent, and
-  inject the service identity through an ephemeral keystore at startup.
-- Add the onion multiaddress to signed DHT/gossip endpoint sets and implement
-  `auto`, `prefer-tor`, `require-tor`, and `disable-tor` policies. Start Arti in
-  the background so automatic fallback is ready before IP paths fail; expose Tor
-  readiness independently and reuse long-lived authenticated sessions.
-- Make discovery itself onion-reachable, either by running Kademlia through an
-  Arti-backed libp2p transport or through several onion-reachable DHT gateways.
-  A DHT that merely contains onion addresses is insufficient when IP bootstrap
-  is blocked.
-- Gate this separate milestone with a private Tor test: block all peer IP paths,
-  bootstrap from only replaceable onion endpoints, recover from the seed, and
-  verify the stable onion identity across daemon restarts.
+  service. Onion streams carry Noise, yamux, Kademlia, Identify, and the same
+  bounded request/response protocol as IP sessions. Verify that the deterministic
+  onion hostname maps to the Node ID, retain Arti directory/cache state, and
+  inject the service identity through an ephemeral keystore after unlock.
+- Advertise onion multiaddresses only while the service is reachable. Signed
+  endpoint records, sealed recovery locators, and peer exchange carry onion
+  paths under the same sequence, expiry, signature, and identity checks as IP
+  paths. Tor bootstrap and service reachability are supervised independently;
+  policy and degradation are visible through daemon status.
+- The reproducible private-Tor gate pins Chutney, Tor, and Arti, removes every
+  peer IP application path, restarts onion-serving peers, and recovers an erased
+  node from its seed and one replaceable onion bootstrap address. It verifies
+  the stable onion identity, Tor path attribution, RS recovery after another
+  shard-holder loss, and byte-exact restore.
 
 ## 7. What to reuse from BarterBackup
 
@@ -626,7 +633,7 @@ and requests best-effort removal.
 | --- | --- |
 | Reuse/extract | `crates/clock` and `ManualClock`; the small filesystem abstraction and temp-file + fsync + rename atomic-write pattern from `crates/storage`; data-dir locking/permissions; Nix, protobuf build, property/fuzz, and Docker harness patterns |
 | Adapt for prototype | The `bbd`/`bbcli` process split and local-control shape; runtime supervision/readiness; transport boundaries, retry budgets, duplicate-session tie-breaking, bounded sessions, CAS read-refresh-retry, recovery-before-publication, durable storage acknowledgement, and failure injection; use `netmock` only for focused tests, never the acceptance path |
-| Defer | `crates/nettor`'s Arti client, deterministic onion service, stream adapter, cache/ephemeral-key split, runtime supervision, and Chutney test lane; revisit these only for the separate Tor milestone |
+| Adapted for Milestone 3 | `crates/nettor`'s narrow principles for one shared Arti client, deterministic onion service, stream adaptation, persistent-cache/ephemeral-key split, runtime supervision, and a private-Tor test lane; the product uses a maintained exact Arti pin and its own libp2p transport boundary rather than copying the old fork |
 | Replace | `crates/content`, most of `storage::Store`, old peer/stored schemas, monolithic `crates/node`, wall-clock lineage recovery, 4 MiB whole-blob RPC model, the Tor-only/onion-string connector, and peer scoring as the placement core |
 
 Keep the domain-separated KDF and test-vector principles from `crates/keys`, but
@@ -637,10 +644,10 @@ authenticated transport and retain signed application records. BarterBackup has
 no DHT, QUIC, DCUtR, or relay implementation to transplant. Copied code must
 retain the older repository's MIT notice.
 
-When the Tor milestone begins, adapt only `nettor`'s conversion to `HsIdKeypair`,
-shared inbound/outbound `TorClient`, persistent-cache/ephemeral-key split, and
-runtime supervision. Use a maintained Arti release and revalidate state handling
-instead of copying its custom fork or hard-coded cleanup paths blindly.
+The Tor integration adapted only `nettor`'s conversion to `HsIdKeypair`, shared
+inbound/outbound `TorClient`, persistent-cache/ephemeral-key split, and runtime
+supervision. It uses a maintained exact Arti release and revalidated state
+handling instead of copying the custom fork or hard-coded cleanup paths.
 
 ## 8. Delivery milestones and review gates
 
@@ -649,26 +656,20 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0, 1, and 2 are passed. The latest corrective
-slice closed the four restore, request-cancellation, Docker-bootstrap, and
-destructive-name defects from the last re-audit. Their focused regressions and
-the complete locked workspace, Btrfs/reflink, real QUIC/DHT recovery, static
-Nix artifact, and five-container erase-and-seed-recovery gates pass. The closing
-source-only review found no additional high-confidence Milestone 2 defect, and
-`TODO.md` now contains only later guild/coding work. The latest source-only
-re-audit through `1637de6` traced the closing restore-reconciliation, P2P
-request-cancellation/recovery, and Docker reinitialization changes and found no
-new high-confidence defect. The only commits after the reviewed Milestone 2
-closure are its planning closeout and the Milestone 3 transport ADR; neither
-changes Milestone 2 product code. This re-audit deliberately did not rerun
-builds or tests, so the previously passing gates remain the runtime evidence.
-No Milestone 2 corrective slice is queued; proceed with Milestone 3.
+**Current position:** Milestones 0 through 2 are passed. The closing source-only
+review of the recent Milestone 2 corrective commits found no additional
+high-confidence Milestone 2 defect, so `TODO.md` remains limited to later
+guild/coding work. No Milestone 2 corrective slice is queued.
 
-Milestone 3 is now in progress. ADR 0001 pins and source-reviews Arti 0.46.0 and
-fixes the transport, identity-key, onion-service-key, discovery, policy, and
-cache lifecycle boundary. The current implementation slice integrates that
-transport behind the existing bounded session and endpoint abstractions and
-stops at the private-Tor recovery gate below for another focused review.
+Milestone 3 is implemented as a completion candidate with exact-pinned Arti
+0.46.0 behind the existing bounded libp2p session and endpoint abstractions.
+Its focused tests, Btrfs/reflink and real IP-network regressions, and reproducible
+private-Tor onion-only seed-recovery gate pass. The final static Nix gate exposed
+only a timing-sensitive fixed-duration DCUtR assertion; that test now waits on a
+bounded deadline and reports the terminal status. Because this review is
+source-only, the corrected full repository gate has not been rerun here. The
+next step is the Milestone 3 closeout gate and review, not another Milestone 2
+slice; proceed to Milestone 4 only after that gate passes.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
 
@@ -785,25 +786,26 @@ restore names as ASCII bytes before mutation. Focused regressions and every full
 gate were rerun, and the closing source-only audit found no new high-confidence
 Milestone 2 defect.
 
-### Milestone 3 — Tor and robust connectivity beta
+### Milestone 3 — Tor and robust connectivity beta (completion candidate)
 
-Entry condition: satisfied; implementation is in progress. ADR 0001 records the
-maintained Arti pin and the transport/key lifecycle decision before integration
-with the bounded IP endpoint lifecycle.
-
-- Adapt the narrow, useful BarterBackup `nettor` principles to a maintained Arti
-  release: outbound onion dialing, an inbound v3 onion service, persistent Tor
-  cache, ephemeral service-key injection, and supervised readiness.
-- Bind the onion service to the same seed-derived identity, publish signed onion
-  endpoints through DHT and peer exchange, and support `auto`, `prefer-tor`,
-  `require-tor`, and `disable-tor`. Make bootstrap/discovery itself onion
-  reachable; an onion address found only through blocked IP infrastructure is
-  not sufficient.
-- Finish replaceable bootstrap deployment, detailed path/session history and
-  metrics beyond the corrected acceptance telemetry, peer exchange,
-  duplicate-session collapse, and optional PCP/NAT-PMP/UPnP mappings.
-  Gate with a private-Tor seed-recovery test in which all peer IP paths are
-  blocked and the onion identity survives restarts.
+- ADR 0001 pins and source-reviews Arti 0.46.0 and fixes the transport,
+  identity-key, onion-service-key, discovery, policy, and cache lifecycle
+  boundary. The implementation supplies outbound onion dialing, an inbound v3
+  onion service, persistent non-identity Tor state, ephemeral service-key
+  injection, supervised readiness, and clean shutdown.
+- The onion service is bound to the same seed-derived identity. Signed onion
+  endpoints flow through DHT recovery records and bounded peer exchange under
+  `auto`, `prefer-tor`, `require-tor`, and `disable-tor`; bootstrap/discovery can
+  therefore remain onion-only when every peer IP path is unavailable.
+- Connection selection collapses redundant sessions, records bounded path,
+  byte, latency, and failure telemetry, retries an in-flight idempotent request
+  when its transport tier fails, and optionally requests PCP, NAT-PMP, or UPnP
+  gateway mappings.
+- The gate starts a pinned private Tor network and five real daemons, excludes
+  peer IP application paths, restarts onion services, erases the owner and a
+  shard holder, and proves byte-exact seed-only recovery through one onion
+  bootstrap address. The recovered node begins without its old guild, endpoint,
+  source, database, or Tor cache state.
 
 ### Milestone 4 — durable operations and multi-volume storage beta
 
