@@ -679,6 +679,8 @@ fn daemon_starts_locked_and_rejects_the_wrong_identity_before_opening_storage() 
             os("locked-daemon-test"),
             os("--listen"),
             os("/ip4/127.0.0.1/udp/0/quic-v1"),
+            os("--tor-mode"),
+            os("disable-tor"),
         ],
         temp.path().join("daemon.log"),
     );
