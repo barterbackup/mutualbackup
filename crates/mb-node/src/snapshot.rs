@@ -32,6 +32,8 @@ type RestoreRenameHook = Box<dyn FnOnce() -> Result<()>>;
 thread_local! {
     static INTERRUPT_RECOVERY_ANCHOR_AFTER_CAPTURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static INTERRUPT_AFTER_LEGACY_RESTORE_RETIRE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     static AFTER_RESTORE_RENAME: std::cell::RefCell<Option<RestoreRenameHook>> =
         std::cell::RefCell::new(None);
 }
@@ -1611,14 +1613,26 @@ where
         bail!("restore parent directory changed since the durable job was created");
     }
     if job.state == RestoreJobState::Publishing {
-        return finish_durable_restore_publication(
-            control,
-            &record_id,
-            &bytes,
-            &job,
-            &parent,
-            &target_name,
-        );
+        let staging_identity = parent.entry_identity(&job.staging_name, true)?;
+        let target_identity = parent.entry_identity(&target_name, true)?;
+        if staging_identity.is_none() && target_identity.is_none() {
+            // An older multi-job reconciliation could stop after durably
+            // removing this job's staging tree but before retiring its journal
+            // row. Nothing remains to publish or adopt, so return the signed
+            // revision to Building and reconstruct it under a fresh name.
+            job.state = RestoreJobState::Building;
+            job.staged_identity = None;
+            bytes = replace_restore_job(control, &record_id, &bytes, &job)?;
+        } else {
+            return finish_durable_restore_publication(
+                control,
+                &record_id,
+                &bytes,
+                &job,
+                &parent,
+                &target_name,
+            );
+        }
     }
 
     let prior_staging_identity = parent.entry_identity(&job.staging_name, true)?;
@@ -1928,11 +1942,26 @@ fn retire_legacy_restore_staging(parent: &PinnedDirectory, job: &RestoreJob) -> 
         Some(expected) if expected == actual => {
             parent.remove_child_directory(&job.staging_name, expected)?;
             parent.sync_all()?;
-            Ok(())
+            run_after_legacy_restore_retire_hook()
         }
         Some(_) => bail!("legacy restore staging directory was replaced"),
         None => Ok(()),
     }
+}
+
+#[cfg(test)]
+fn run_after_legacy_restore_retire_hook() -> Result<()> {
+    INTERRUPT_AFTER_LEGACY_RESTORE_RETIRE.with(|interrupt| {
+        if interrupt.replace(false) {
+            bail!("injected interruption after legacy restore retirement");
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+fn run_after_legacy_restore_retire_hook() -> Result<()> {
+    Ok(())
 }
 
 pub(crate) fn build_revision_restore<F>(
@@ -2936,6 +2965,89 @@ mod metadata_compatibility_tests {
             fs::read(temp.path().join(retired_name).join("must-survive")).unwrap(),
             b"unbound staging"
         );
+        assert!(control.records(RESTORE_JOB_KIND).unwrap().is_empty());
+    }
+
+    #[test]
+    fn retired_legacy_publishing_job_rebuilds_after_reconciliation_crash() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([239; 32]));
+        let guild_id = [240; 32];
+        let control = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let (first_revision, first_ciphertexts) =
+            restore_fixture(&keys, guild_id, Vec::new(), Vec::new());
+        let (retired_revision, retired_ciphertexts) =
+            restore_fixture(&keys, guild_id, Vec::new(), Vec::new());
+        let target = temp.path().join("restored");
+        let parent = PinnedDirectory::open(temp.path()).unwrap();
+        let first_name = format!(".mutualbackup-restore-{}", Uuid::new_v4());
+        let retired_name = format!(".mutualbackup-restore-{}", Uuid::new_v4());
+        let first_staging = parent.create_child_directory(&first_name).unwrap();
+        let retired_staging = parent.create_child_directory(&retired_name).unwrap();
+        parent.sync_all().unwrap();
+        let canonical_target = temp.path().canonicalize().unwrap().join("restored");
+        let first_job = RestoreJob {
+            format_version: 1,
+            guild_id,
+            revision_id: first_revision.value.revision_id,
+            target: canonical_target.clone(),
+            parent_identity: parent.identity().unwrap(),
+            staging_name: first_name.clone(),
+            staged_identity: Some(first_staging.identity().unwrap()),
+            state: RestoreJobState::Building,
+        };
+        let retired_job = RestoreJob {
+            format_version: 1,
+            guild_id,
+            revision_id: retired_revision.value.revision_id,
+            target: canonical_target,
+            parent_identity: parent.identity().unwrap(),
+            staging_name: retired_name.clone(),
+            staged_identity: Some(retired_staging.identity().unwrap()),
+            state: RestoreJobState::Publishing,
+        };
+        control
+            .put_record(
+                RESTORE_JOB_KIND,
+                first_revision.value.revision_id.as_bytes(),
+                &canonical_bytes(&first_job).unwrap(),
+            )
+            .unwrap();
+        control
+            .put_record(
+                RESTORE_JOB_KIND,
+                retired_revision.value.revision_id.as_bytes(),
+                &canonical_bytes(&retired_job).unwrap(),
+            )
+            .unwrap();
+
+        INTERRUPT_AFTER_LEGACY_RESTORE_RETIRE.with(|interrupt| interrupt.set(true));
+        assert!(
+            restore_revision(
+                &control,
+                &keys,
+                guild_id,
+                &first_revision,
+                &first_ciphertexts,
+                &target,
+            )
+            .is_err()
+        );
+        assert!(!temp.path().join(&retired_name).exists());
+        assert_eq!(control.records(RESTORE_JOB_KIND).unwrap().len(), 2);
+
+        restore_revision(
+            &control,
+            &keys,
+            guild_id,
+            &retired_revision,
+            &retired_ciphertexts,
+            &target,
+        )
+        .unwrap();
+
+        assert!(target.is_dir());
+        assert!(!temp.path().join(first_name).exists());
         assert!(control.records(RESTORE_JOB_KIND).unwrap().is_empty());
     }
 
