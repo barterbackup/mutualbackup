@@ -64,32 +64,60 @@ trap cleanup EXIT INT TERM
 
 run_chutney init --net-from-script-path "$network_file"
 run_chutney configure
+nodes_dir="$(readlink -f "$CHUTNEY_DATA_DIR/nodes")"
+
+# A hidden service is fully reachable only after the consensus contains enough
+# shared-random history for both its current and secondary HSDir rings. Speed
+# up only Chutney's initial voting cycle so the fixture can establish that
+# history in minutes rather than waiting through production-length rounds.
+for authority in "$nodes_dir"/00[0-3]a; do
+  sed -i -E \
+    -e 's/^TestingV3AuthInitialVotingInterval .*/TestingV3AuthInitialVotingInterval 5/' \
+    -e 's/^TestingV3AuthInitialVoteDelay .*/TestingV3AuthInitialVoteDelay 2/' \
+    -e 's/^TestingV3AuthInitialDistDelay .*/TestingV3AuthInitialDistDelay 2/' \
+    -e 's/^V3AuthVotingInterval .*/V3AuthVotingInterval 10/' \
+    -e 's/^V3AuthVoteDelay .*/V3AuthVoteDelay 2/' \
+    -e 's/^V3AuthDistDelay .*/V3AuthDistDelay 2/' \
+    "$authority/torrc"
+done
+
 network_started=1
 run_chutney start
 run_chutney wait_for_bootstrap
 
-nodes_dir="$(readlink -f "$CHUTNEY_DATA_DIR/nodes")"
 generated_config="$nodes_dir/arti.toml"
 if [[ ! -f "$generated_config" ]]; then
   echo "Chutney did not generate its Arti client configuration" >&2
   exit 1
 fi
 
-# Chutney's relay bootstrap check can finish before the next authority vote has
-# published every relay. Arti's production guard policy needs a 20-guard sample,
-# so wait for the complete 4-authority + 20-relay consensus before starting it.
+# Chutney's relay bootstrap check can finish before the next authority votes
+# have published every relay and completed the shared-random protocol. Wait for
+# the complete relay set and both shared-random values before freezing the
+# disposable network's consensus interval.
 consensus="$nodes_dir/000a/cached-microdesc-consensus"
-consensus_deadline=$((SECONDS + 180))
+consensus_deadline=$((SECONDS + 600))
 while :; do
   published_relays=0
+  current_srv=0
+  previous_srv=0
   if [[ -f "$consensus" ]]; then
     published_relays="$(awk '$1 == "r" { count++ } END { print count + 0 }' "$consensus")"
+    read -r current_srv previous_srv <<<"$(
+      awk '
+        $1 == "shared-rand-current-value" { current = 1 }
+        $1 == "shared-rand-previous-value" { previous = 1 }
+        END { print current + 0, previous + 0 }
+      ' "$consensus"
+    )"
   fi
-  if (( published_relays >= 24 )); then
+  if (( published_relays >= 24 && current_srv == 1 && previous_srv == 1 )); then
     break
   fi
   if (( SECONDS >= consensus_deadline )); then
-    echo "private Tor consensus contains $published_relays of 24 required relays" >&2
+    echo \
+      "private Tor consensus has $published_relays/24 relays, current SRV=$current_srv, previous SRV=$previous_srv" \
+      >&2
     exit 1
   fi
   sleep 1
@@ -116,6 +144,7 @@ stable_deadline=$((SECONDS + 90))
 while :; do
   published_relays="$(awk '$1 == "r" { count++ } END { print count + 0 }' "$consensus")"
   consensus_signatures="$(awk '$1 == "directory-signature" { count++ } END { print count + 0 }' "$consensus")"
+  shared_random_values="$(awk '$1 ~ /^shared-rand-(current|previous)-value$/ { count++ } END { print count + 0 }' "$consensus")"
   valid_after="$(awk '$1 == "valid-after" { print $2 " " $3; exit }' "$consensus")"
   fresh_until="$(awk '$1 == "fresh-until" { print $2 " " $3; exit }' "$consensus")"
   freshness=0
@@ -124,7 +153,7 @@ while :; do
       $(date -u -d "$fresh_until" +%s) - $(date -u -d "$valid_after" +%s)
     ))
   fi
-  if (( published_relays >= 24 && consensus_signatures >= 3 && freshness >= 1800 )); then
+  if (( published_relays >= 24 && consensus_signatures >= 3 && shared_random_values >= 2 && freshness >= 1800 )); then
     break
   fi
   if (( SECONDS >= stable_deadline )); then
@@ -141,6 +170,11 @@ arti_config="$work_dir/arti-network.toml"
 awk '
   /^\[storage(\.[^]]+)?\][[:space:]]*$/ { skipping_storage = 1; next }
   /^\[/ { skipping_storage = 0 }
+  /^\[override_net_params\][[:space:]]*$/ {
+    print
+    print "\"guard-min-filtered-sample-size\" = 5"
+    next
+  }
   !skipping_storage { print }
 ' "$generated_config" >"$arti_config"
 

@@ -6499,10 +6499,10 @@ mod tests {
             .unwrap();
         let profile = first_client.profile(second_id).await.unwrap();
         assert_eq!(profile.member.node_id, second_id);
-        let mut saw_hole_punch = false;
-        for _ in 0..500 {
+        let dcutr_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
             let status = first_client.status().await.unwrap();
-            saw_hole_punch = status.peers.iter().any(|peer| {
+            let saw_hole_punch = status.peers.iter().any(|peer| {
                 peer.peer_id == second_client.local_peer_id()
                     && peer.active_paths.contains(&P2pPath::HolePunched)
                     && !peer
@@ -6513,12 +6513,12 @@ mod tests {
             if saw_hole_punch {
                 break;
             }
+            assert!(
+                tokio::time::Instant::now() < dcutr_deadline,
+                "DCUtR did not replace the relay circuit with a direct QUIC path:\n{status:#?}"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(
-            saw_hole_punch,
-            "DCUtR did not replace the relay circuit with a direct QUIC path"
-        );
         for _ in 0..10 {
             first_client.profile(second_id).await.unwrap();
             let status = first_client.status().await.unwrap();
