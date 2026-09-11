@@ -7,10 +7,11 @@ codewords, store parity in HMAC-protected SQLCipher databases, publish recovery
 state through Kademlia, and recover a lost member from its offline seed.
 
 Peer traffic uses authenticated QUIC with Identify, circuit relay v2,
-AutoNAT/DCUtR hole punching, and one recovery-string-derived identity. Tor/Arti is
-deliberately outside this milestone, as are non-reflink source backends,
-membership changes, audits, repair, and garbage collection. Do not entrust
-unique data to this prototype.
+AutoNAT/DCUtR hole punching, optional gateway port mapping, and embedded Arti
+onion services. Every path authenticates the same recovery-string-derived
+identity. Non-reflink source backends, membership changes, audits, repair, and
+garbage collection remain outside this milestone. Do not entrust unique data
+to this prototype.
 
 ## Programs
 
@@ -23,8 +24,10 @@ For a no-build, step-by-step walkthrough using the packaged Linux binaries,
 including a five-daemon lab and recovery-string-only recovery, see
 [`docs/getting-started.md`](docs/getting-started.md). A commented daemon config
 is available as [`mutualbackup.example.toml`](mutualbackup.example.toml).
+The [Tor and onion guide](docs/tor.md) covers operating modes, bootstrap
+addresses, state, status, and the reproducible private-network acceptance gate.
 The accepted [Tor transport ADR](docs/adr/0001-tor-libp2p-transport.md) records
-the Milestone 3 identity, state, policy, discovery, and private-network gate.
+the underlying identity, transport, and discovery decisions.
 
 For an isolated five-container environment with one disposable loop-backed
 Btrfs filesystem per node, automatic seed/config management, host-visible file
@@ -94,6 +97,14 @@ For only the five-daemon product acceptance scenario:
 
 ```sh
 nix develop -c bash scripts/network-smoke.sh /mnt/disposable-btrfs
+```
+
+The onion-only recovery gate starts a pinned private Tor network and uses no
+peer IP listener, relay, or hole-punch path:
+
+```sh
+MUTUALBACKUP_REFLINK_TEST_ROOT=/mnt/disposable-btrfs \
+  nix develop .#private-tor -c bash scripts/private-tor-acceptance.sh
 ```
 
 The product test creates checkpoint generations for two owners, resumes a

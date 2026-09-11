@@ -394,5 +394,6 @@ the loopback `p2p_external_addresses` with addresses reachable by the other
 peers. At least one reachable peer should be listed as a bootstrap node; a
 publicly reachable peer can also enable relay service. Keep the `/p2p/PEER_ID`
 suffix on bootstrap and relay addresses. Direct QUIC, circuit relay, AutoNAT,
-and DCUtR hole punching are active; Tor fallback is deliberately not part of
-this prototype milestone.
+DCUtR hole punching, and embedded Arti onion connectivity are available. See
+the [Tor and onion guide](tor.md) for policy modes, onion bootstrap, and status
+checks.

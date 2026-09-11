@@ -1514,25 +1514,26 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
         configs.push(config);
     }
 
-    let mut daemons = configs
-        .iter()
-        .enumerate()
-        .map(|(index, config)| {
-            let mut daemon = Daemon::new(config.clone(), run_root.join(format!("p{index}.log")));
-            daemon.set_env("RUST_LOG", "warn");
-            daemon.start();
-            daemon
-        })
-        .collect::<Vec<_>>();
+    // A private test consensus has a deliberately small circuit pool. Stagger
+    // service publication so this gate exercises five live services without
+    // creating an artificial all-at-once introduction-circuit stampede.
+    let mut daemons = Vec::with_capacity(5);
     for index in 0..5 {
+        let mut daemon = Daemon::new(
+            configs[index].clone(),
+            run_root.join(format!("p{index}.log")),
+        );
+        daemon.set_env("RUST_LOG", "warn");
+        daemon.start();
         let status = wait_for_status_text(
             &sockets[index],
-            &mut daemons[index],
+            &mut daemon,
             "configured=true reachable=true",
             Duration::from_secs(240),
         );
         assert_onion_only_status(&status);
         assert_stable_onion_is_advertised(&status, &onion_endpoints[index]);
+        daemons.push(daemon);
     }
 
     cli(&sockets[0], ["guild", "create"], Duration::from_secs(60));
@@ -1566,10 +1567,8 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
     for daemon in &mut daemons {
         daemon.stop();
     }
-    for daemon in &mut daemons {
-        daemon.start();
-    }
     for index in 0..5 {
+        daemons[index].start();
         let status = wait_for_status_text(
             &sockets[index],
             &mut daemons[index],

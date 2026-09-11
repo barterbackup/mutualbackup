@@ -38,3 +38,33 @@ jobs:
         env:
           MUTUALBACKUP_REFLINK_TEST_ROOT: /mnt/mutualbackup-ci
         run: bash scripts/reflink-acceptance.sh
+
+  private-tor-acceptance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Provision disposable Btrfs filesystem
+        run: |
+          truncate -s 6G /tmp/mutualbackup-tor-ci.btrfs
+          nix develop .#private-tor -c bash -c \
+            'sudo "$(command -v mkfs.btrfs)" -q -f /tmp/mutualbackup-tor-ci.btrfs'
+          sudo mkdir -p /mnt/mutualbackup-tor-ci
+          sudo mount -o loop,user_subvol_rm_allowed \
+            /tmp/mutualbackup-tor-ci.btrfs /mnt/mutualbackup-tor-ci
+          sudo chown "$USER":"$USER" /mnt/mutualbackup-tor-ci
+      - name: Prove onion-only seed recovery
+        env:
+          CARGO_INCREMENTAL: 0
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+          MUTUALBACKUP_REFLINK_TEST_ROOT: /mnt/mutualbackup-tor-ci
+        run: >-
+          nix develop .#private-tor -c bash
+          scripts/private-tor-acceptance.sh
+      - name: Unmount disposable filesystem
+        if: always()
+        run: |
+          if mountpoint -q /mnt/mutualbackup-tor-ci; then
+            sudo umount /mnt/mutualbackup-tor-ci
+          fi

@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "chutney": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1775661649,
+        "narHash": "sha256-fW4MJ04DzRewxQ7VNhSHMKn3WXmNRD8Rp/IkGkFSSgQ=",
+        "ref": "refs/heads/main",
+        "rev": "9ca2446f4837c1730d31cf9be8ebb7865ebe8fc3",
+        "revCount": 1292,
+        "type": "git",
+        "url": "https://gitlab.torproject.org/tpo/core/chutney.git"
+      },
+      "original": {
+        "rev": "9ca2446f4837c1730d31cf9be8ebb7865ebe8fc3",
+        "type": "git",
+        "url": "https://gitlab.torproject.org/tpo/core/chutney.git"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1788614874,
@@ -18,7 +35,25 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "chutney": "chutney",
+        "nixpkgs": "nixpkgs",
+        "tor-nixpkgs": "tor-nixpkgs"
+      }
+    },
+    "tor-nixpkgs": {
+      "locked": {
+        "lastModified": 1789073787,
+        "narHash": "sha256-xfX/toC2QV707s06GbP4II/TxYF0fNQj7s5/LClNDKc=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "aff8a0b28396750446e5537a96461bc4facdb287",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "aff8a0b28396750446e5537a96461bc4facdb287",
+        "type": "github"
       }
     }
   },

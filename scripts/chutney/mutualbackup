@@ -1,0 +1,9 @@
+# Arti's guard manager targets a 20-guard filtered sample. Keep at least that
+# many non-authority relays so the private network exercises the production
+# guard policy instead of relying on undersized-network behavior. MutualBackup
+# starts its five clients and services in sequence, so no Chutney-managed client
+# or onion service is needed.
+ConfigureNodes(
+    Node(tag="a", authority=1, relay=1).getN(4)
+    + Node(tag="r", relay=1, exit=1).getN(20)
+)
