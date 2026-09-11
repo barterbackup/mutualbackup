@@ -385,6 +385,7 @@ validate_node() {
 
 validate_restore_name() {
     local name=$1
+    local LC_ALL=C
     [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
         die "restore NAME must be a simple relative directory name"
     ((${#name} <= MAX_RESTORE_NAME_BYTES)) ||
@@ -1215,22 +1216,35 @@ guild_id() {
 validate_recovery_survivors() {
     local recovering_node=$1
     local expected_guild=$2
-    local count=0 candidate first=
+    local failed_bootstrap=${3:-}
+    local count=0 candidate first= next=
+    [[ -z $failed_bootstrap || $failed_bootstrap =~ ^[0-4]$ ]] ||
+        die "invalid failed recovery bootstrap: $failed_bootstrap"
     for candidate in 0 1 2 3 4; do
         if ((candidate != recovering_node)) && container_running "$candidate" &&
             cli_raw "$candidate" status >/dev/null 2>&1 &&
             [[ $(guild_phase "$candidate") == Active ]] &&
             [[ $(guild_id "$candidate") == "$expected_guild" ]]; then
             ((count += 1))
-            [[ -n $first ]] || first=$candidate
+            if [[ $candidate != "$failed_bootstrap" ]]; then
+                [[ -n $first ]] || first=$candidate
+                if [[ -n $failed_bootstrap ]] && ((candidate > failed_bootstrap)); then
+                    [[ -n $next ]] || next=$candidate
+                fi
+            fi
         fi
     done
     ((count >= 3)) ||
         die "reinit requires at least three responsive members of guild $expected_guild"
-    if [[ $RECOVERY_BOOTSTRAP_NODE == "$recovering_node" ]] ||
+    if [[ -n $failed_bootstrap && -n $next ]]; then
+        first=$next
+    fi
+    if [[ $RECOVERY_BOOTSTRAP_NODE == "$failed_bootstrap" ]] ||
+        [[ $RECOVERY_BOOTSTRAP_NODE == "$recovering_node" ]] ||
         ! container_running "$RECOVERY_BOOTSTRAP_NODE" ||
         [[ $(guild_phase "$RECOVERY_BOOTSTRAP_NODE") != Active ]] ||
         [[ $(guild_id "$RECOVERY_BOOTSTRAP_NODE") != "$expected_guild" ]]; then
+        [[ -n $first ]] || die "reinit has no alternate responsive bootstrap member"
         RECOVERY_BOOTSTRAP_NODE=$first
         if [[ -e "$(node_recovery_intent "$recovering_node")" ]]; then
             remove_container "$recovering_node"
@@ -1357,7 +1371,7 @@ finish_recovery_restore_attempt() {
 
 resume_recovery_transaction() {
     local node=$1
-    local intent expected_guild restore_name
+    local intent expected_guild restore_name failed_bootstrap
     intent=$(node_recovery_intent "$node")
     load_recovery_intent "$intent" || die "node $node has no recovery transaction to resume"
     ensure_recovery_identity_binding "$node"
@@ -1371,7 +1385,8 @@ resume_recovery_transaction() {
             return
         fi
         say "local recovery retry did not complete; checking for another bootstrap member" >&2
-        validate_recovery_survivors "$node" "$expected_guild"
+        failed_bootstrap=$RECOVERY_BOOTSTRAP_NODE
+        validate_recovery_survivors "$node" "$expected_guild" "$failed_bootstrap"
     else
         validate_recovery_survivors "$node" "$expected_guild"
     fi

@@ -321,6 +321,35 @@ grep -Fqx 'original image' "$overlong_root/images/node0.btrfs"
 [[ ! -e $overlong_root/seeds/node0.recovery-intent ]]
 [[ ! -e $overlong_root/prepare-called ]]
 
+boundary_root=$TEST_ROOT/reinit-boundary-name
+initialize_namespace "$boundary_root"
+printf -v boundary_name '%*s' 255 ''
+boundary_name=${boundary_name// /a}
+MUTUALBACKUP_DOCKER_LAB_ROOT=$boundary_root bash -c '
+    source "$1"
+    prepare_host() { printf called >"$LAB_ROOT/prepare-called"; exit 0; }
+    command_reinit 0 "$2" --yes
+' bash "$LAB" "$boundary_name" >"$TEST_ROOT/stdout" 2>"$TEST_ROOT/stderr"
+[[ -e $boundary_root/prepare-called ]]
+
+multibyte_root=$TEST_ROOT/reinit-multibyte-name
+initialize_namespace "$multibyte_root"
+printf 'original image\n' >"$multibyte_root/images/node0.btrfs"
+printf -v multibyte_name '%*s' 128 ''
+multibyte_name=${multibyte_name// /é}
+if LC_ALL=C.UTF-8 MUTUALBACKUP_DOCKER_LAB_ROOT=$multibyte_root bash -c '
+    source "$1"
+    prepare_host() { printf called >"$LAB_ROOT/prepare-called"; }
+    command_reinit 0 "$2" --yes
+' bash "$LAB" "$multibyte_name" >"$TEST_ROOT/stdout" 2>"$TEST_ROOT/stderr"; then
+    printf 'reinit accepted a multibyte restore name\n' >&2
+    exit 1
+fi
+grep -Fq 'restore NAME must be a simple relative directory name' "$TEST_ROOT/stderr"
+grep -Fqx 'original image' "$multibyte_root/images/node0.btrfs"
+[[ ! -e $multibyte_root/seeds/node0.recovery-intent ]]
+[[ ! -e $multibyte_root/prepare-called ]]
+
 failover_root=$TEST_ROOT/reinit-restoring-failover
 initialize_namespace "$failover_root"
 printf 'node-a\n' >"$failover_root/seeds/node0.seed"
@@ -361,6 +390,53 @@ MUTUALBACKUP_DOCKER_LAB_ROOT=$failover_root FAKE_GUILD=$guild FAKE_NODE_A=$node_
 [[ $(<"$failover_root/remove-log") == 0 ]]
 [[ ! -e $failover_root/seeds/node0.recovery-intent ]]
 grep -Fqx 'original image' "$failover_root/images/node0.btrfs"
+
+live_failover_root=$TEST_ROOT/reinit-restoring-live-p2p-failover
+initialize_namespace "$live_failover_root"
+printf 'node-a\n' >"$live_failover_root/seeds/node0.seed"
+printf 'format=2\nphase=restoring\nbootstrap_node=1\nrestore_name=recovered\nguild_id=%s\nexpected_node_id=%s\n' \
+    "$guild" "$node_a" >"$live_failover_root/seeds/node0.recovery-intent"
+chmod 600 "$live_failover_root/seeds/node0.seed" \
+    "$live_failover_root/seeds/node0.recovery-intent"
+printf 'original image\n' >"$live_failover_root/images/node0.btrfs"
+MUTUALBACKUP_DOCKER_LAB_ROOT=$live_failover_root FAKE_GUILD=$guild FAKE_NODE_A=$node_a \
+    bash -c '
+        source "$1"
+        ensure_recovery_identity_binding() { :; }
+        prepare_recovery_container() {
+            printf "%s\n" "$RECOVERY_BOOTSTRAP_NODE" >>"$LAB_ROOT/prepare-log"
+        }
+        start_node_internal() { :; }
+        daemon_node_id() { printf "%s\n" "$FAKE_NODE_A"; }
+        container_running() { [[ $1 == 1 || $1 == 2 || $1 == 3 || $1 == 4 ]]; }
+        guild_phase() { printf "Active\n"; }
+        guild_id() { printf "%s\n" "$FAKE_GUILD"; }
+        cli_raw() {
+            local node=$1 command=$2 attempts
+            if [[ $command == status ]]; then
+                return 0
+            fi
+            [[ $command == restore ]] || return 90
+            attempts=0
+            [[ ! -e $LAB_ROOT/restore-attempts ]] || attempts=$(<"$LAB_ROOT/restore-attempts")
+            ((attempts += 1))
+            printf "%s\n" "$attempts" >"$LAB_ROOT/restore-attempts"
+            ((attempts >= 4))
+        }
+        remove_container() { printf "%s\n" "$1" >>"$LAB_ROOT/remove-log"; }
+        resume_recovery_transaction 0 || true
+        resume_recovery_transaction 0
+    ' bash "$LAB" >"$TEST_ROOT/stdout" 2>"$TEST_ROOT/stderr"
+[[ $(<"$live_failover_root/restore-attempts") == 4 ]]
+[[ $(sed -n '1p' "$live_failover_root/prepare-log") == 1 ]]
+[[ $(sed -n '2p' "$live_failover_root/prepare-log") == 2 ]]
+[[ $(sed -n '3p' "$live_failover_root/prepare-log") == 2 ]]
+[[ $(sed -n '4p' "$live_failover_root/prepare-log") == 3 ]]
+[[ $(wc -l <"$live_failover_root/remove-log") == 2 ]]
+[[ $(sed -n '1p' "$live_failover_root/remove-log") == 0 ]]
+[[ $(sed -n '2p' "$live_failover_root/remove-log") == 0 ]]
+[[ ! -e $live_failover_root/seeds/node0.recovery-intent ]]
+grep -Fqx 'original image' "$live_failover_root/images/node0.btrfs"
 
 local_retry_root=$TEST_ROOT/reinit-restoring-local-retry
 initialize_namespace "$local_retry_root"
