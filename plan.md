@@ -655,7 +655,12 @@ destructive-name defects from the last re-audit. Their focused regressions and
 the complete locked workspace, Btrfs/reflink, real QUIC/DHT recovery, static
 Nix artifact, and five-container erase-and-seed-recovery gates pass. The closing
 source-only review found no additional high-confidence Milestone 2 defect, and
-`TODO.md` now contains only later guild/coding work.
+`TODO.md` now contains only later guild/coding work. A subsequent source-only
+re-audit through `13abc19` traced the closing restore-reconciliation, P2P
+request-cancellation/recovery, and Docker reinitialization changes and found no
+new high-confidence defect. That re-audit deliberately did not rerun builds or
+tests; the previously passing gates remain the runtime evidence. No Milestone 2
+corrective slice is queued.
 
 The next run begins Milestone 3. First pin and source-review the maintained Arti
 release and write the transport, identity-key, onion-service-key, discovery,
