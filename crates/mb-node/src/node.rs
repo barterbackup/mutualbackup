@@ -10,8 +10,8 @@ use mb_core::{
     MemberSignature, NodeId, QuorumCheckpoint, QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN,
     RecoveryBundle, RecoveryLocator, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, Seed,
     ShardRole, SignedRecord, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
-    V1_MAX_CATALOG_PAGES, canonical_bytes, decode_canonical, open_recovery_record,
-    seal_recovery_record, sector_root, synthetic_filler_sector,
+    V1_MAX_CATALOG_PAGES, V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes, decode_canonical,
+    open_recovery_record, seal_recovery_record, sector_root, synthetic_filler_sector,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
@@ -3531,26 +3531,15 @@ fn summary_from_draft(draft: &GuildDraft) -> GuildSummary {
 }
 
 fn validate_endpoint_set(node_id: NodeId, endpoints: &[String]) -> Result<()> {
-    use libp2p::multiaddr::Protocol;
-
-    if endpoints.is_empty() || endpoints.len() > 8 {
+    if endpoints.is_empty() || endpoints.len() > V1_MAX_ENDPOINTS_PER_PEER {
         anyhow::bail!("a guild peer must advertise between one and eight endpoints");
     }
-    let expected = node_id.libp2p_peer_id()?;
     let mut unique = std::collections::BTreeSet::new();
     for endpoint in endpoints {
-        if endpoint.len() > 512 || !unique.insert(endpoint) {
-            anyhow::bail!("guild endpoint is duplicated or too long");
+        if !unique.insert(endpoint) {
+            anyhow::bail!("guild endpoint is duplicated");
         }
-        let address: libp2p::Multiaddr = endpoint
-            .parse()
-            .with_context(|| format!("invalid guild endpoint {endpoint}"))?;
-        if address.iter().last() != Some(Protocol::P2p(expected)) {
-            anyhow::bail!("guild endpoint is not bound to its seed-derived peer identity");
-        }
-        if !crate::network::onion_address_matches_node(&address, node_id) {
-            anyhow::bail!("guild onion endpoint differs from its seed-derived node identity");
-        }
+        crate::network::validate_published_endpoint(node_id, endpoint)?;
     }
     Ok(())
 }

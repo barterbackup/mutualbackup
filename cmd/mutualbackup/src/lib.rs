@@ -1111,6 +1111,37 @@ p2p_listen_addresses = ["/ip4/127.0.0.1/udp/1/quic-v1"]
     }
 
     #[test]
+    fn daemon_options_reject_unpublishable_external_addresses() {
+        let seed = Seed::from_recovery_string("correct-horse-battery-staple-2026!").unwrap();
+        let identity = IdentityManifest {
+            format_version: 1,
+            expected_node_id: mb_core::KeyMaterial::from_seed(&seed).node_id(),
+            intent: InitializationIntent::New,
+        };
+        for external in [
+            "/memory/1",
+            "/ip4/0.0.0.0/udp/44000/quic-v1",
+            "/ip4/198.51.100.1/udp/0/quic-v1",
+        ] {
+            let options = read_daemon_options([
+                "mutualbackupd",
+                "--data-dir",
+                "state",
+                "--failure-domain",
+                "disk-a",
+                "--listen",
+                "/ip4/127.0.0.1/udp/44000/quic-v1",
+                "--external-address",
+                external,
+                "--tor-mode",
+                "disable-tor",
+            ])
+            .unwrap();
+            assert!(options.validate(&identity).is_err(), "accepted {external}");
+        }
+    }
+
+    #[test]
     fn tor_only_daemon_needs_no_ip_listener_and_resolves_arti_paths() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("node.toml");

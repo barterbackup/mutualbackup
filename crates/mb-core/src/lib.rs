@@ -32,6 +32,10 @@ pub const V1_SECTOR_SIZE: usize = 64 * 1024;
 pub const V1_CIPHER_PROFILE: u16 = 1;
 pub const V1_RS_DATA_SHARDS: u16 = 3;
 pub const V1_RS_PARITY_SHARDS: u16 = 2;
+/// Maximum number of dial locations carried for one peer by the v1 protocol.
+pub const V1_MAX_ENDPOINTS_PER_PEER: usize = 8;
+/// Maximum UTF-8 byte length of one canonical, peer-qualified v1 endpoint.
+pub const V1_MAX_ENDPOINT_BYTES: usize = 512;
 pub const STORAGE_ACKNOWLEDGEMENT_DOMAIN: &[u8] = b"mutualbackup/storage-acknowledgement/v1";
 pub const RECOVERY_LOCATOR_DOMAIN: &[u8] = b"mutualbackup/recovery-locator/v1";
 

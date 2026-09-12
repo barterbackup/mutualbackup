@@ -6,8 +6,8 @@ use uuid::Uuid;
 use crate::keys::{KeyMaterial, NodeId, RecoveryPublicKey, signing_payload};
 use crate::recovery::{RecoveryLocator, SealedRecoveryRecord};
 use crate::{
-    V1_CIPHER_PROFILE, V1_MAX_CODING_GROUPS, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS,
-    V1_SECTOR_SIZE, encode_3_2, sector_root,
+    V1_CIPHER_PROFILE, V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER,
+    V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, encode_3_2, sector_root,
 };
 
 pub type SectorId = [u8; 32];
@@ -445,11 +445,11 @@ impl GuildInvite {
         if self.format_version != 1
             || self.guild_id == [0; 32]
             || self.coordinator_endpoints.is_empty()
-            || self.coordinator_endpoints.len() > 8
+            || self.coordinator_endpoints.len() > V1_MAX_ENDPOINTS_PER_PEER
             || self
                 .coordinator_endpoints
                 .iter()
-                .any(|endpoint| endpoint.is_empty() || endpoint.len() > 512)
+                .any(|endpoint| endpoint.is_empty() || endpoint.len() > V1_MAX_ENDPOINT_BYTES)
             || self.nonce == [0; 16]
             || self.expires_at_unix_seconds == 0
             || validate_members(std::slice::from_ref(&self.coordinator)).is_err()
@@ -546,11 +546,11 @@ impl QuorumCheckpoint {
             || locator.subject_endpoint_sequence_floor == u64::MAX
             || locator.expires_at_unix_seconds == 0
             || locator.endpoints.is_empty()
-            || locator.endpoints.len() > 8
+            || locator.endpoints.len() > V1_MAX_ENDPOINTS_PER_PEER
             || locator
                 .endpoints
                 .iter()
-                .any(|endpoint| endpoint.len() > 512)
+                .any(|endpoint| endpoint.is_empty() || endpoint.len() > V1_MAX_ENDPOINT_BYTES)
             || member.recovery_public_key != keys.recovery_public_key()
             || !self
                 .checkpoint
@@ -970,6 +970,13 @@ mod tests {
         checkpoint
             .validate_recovery_authority(&keys[4], &locator, keys[0].node_id())
             .unwrap();
+        let mut empty_endpoint = locator.clone();
+        empty_endpoint.endpoints = vec![String::new()];
+        assert!(
+            checkpoint
+                .validate_recovery_authority(&keys[4], &empty_endpoint, keys[0].node_id())
+                .is_err()
+        );
 
         let mut chained = checkpoint.checkpoint.clone();
         let previous = chained.revisions[0].value.hash().unwrap();

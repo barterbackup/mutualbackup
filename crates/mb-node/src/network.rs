@@ -49,6 +49,7 @@ mod port_mapping;
 mod tor;
 mod wire;
 pub(crate) use p2p::restore_snapshot_with_p2p;
+pub(crate) use p2p::validate_published_endpoint;
 pub use p2p::{
     DhtRecord, DhtRecoveryResult, P2pActiveSession, P2pClient, P2pConfig, P2pEventLoop, P2pPath,
     P2pPathMetrics, P2pPathTransfer, P2pPeerProfile, P2pPeerStatus, P2pSessionDirection,

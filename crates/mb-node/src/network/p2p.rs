@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
@@ -29,9 +30,9 @@ use mb_core::{
     MemberSignature, NodeId, ParityRole, QuorumCheckpoint, QuorumGuildGenesis,
     RECOVERY_LOCATOR_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole,
     SignedRecord, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
-    V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_RS_DATA_SHARDS,
-    V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, canonical_bytes, decode_canonical, encode_3_2,
-    open_recovery_record, sector_root,
+    V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES,
+    V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE,
+    canonical_bytes, decode_canonical, encode_3_2, open_recovery_record, sector_root,
 };
 use mb_store::ParityObject;
 use uuid::Uuid;
@@ -71,7 +72,8 @@ const MAX_DHT_RECORDS_PER_QUERY: usize = 64;
 const MAX_DHT_PROVIDERS_PER_QUERY: usize = 64;
 const MAX_LEARNED_ENDPOINT_PEERS: usize = 1_024;
 const MAX_OPPORTUNISTIC_ENDPOINT_PEERS: usize = 256;
-const MAX_ENDPOINTS_PER_PEER: usize = 8;
+const MAX_ENDPOINTS_PER_PEER: usize = V1_MAX_ENDPOINTS_PER_PEER;
+const MAX_ENDPOINT_BYTES: usize = V1_MAX_ENDPOINT_BYTES;
 const MAX_RECOVERY_ADDRESS_SCOPES: usize = 4;
 const MAX_RECOVERY_ADDRESS_PEERS: usize = 64;
 const MAX_RECOVERY_QUARANTINED_PEERS: usize =
@@ -780,6 +782,135 @@ fn status_advertised_addresses(
     advertised
 }
 
+fn valid_advertised_ipv4(address: Ipv4Addr) -> bool {
+    !address.is_unspecified() && !address.is_multicast() && !address.is_broadcast()
+}
+
+fn valid_advertised_ipv6(address: Ipv6Addr) -> bool {
+    !address.is_unspecified() && !address.is_multicast() && !address.is_unicast_link_local()
+}
+
+/// Accept exactly the address shapes implemented by the composed transport.
+/// The terminal local `/p2p` component is added and checked separately.
+fn supported_advertised_transport(address: &Multiaddr) -> bool {
+    if is_canonical_onion_address(address) {
+        return true;
+    }
+
+    let mut protocols = address.iter();
+    let ip_is_usable = match protocols.next() {
+        Some(libp2p::multiaddr::Protocol::Ip4(address)) => valid_advertised_ipv4(address),
+        Some(libp2p::multiaddr::Protocol::Ip6(address)) => valid_advertised_ipv6(address),
+        _ => false,
+    };
+    let port_is_usable = matches!(
+        protocols.next(),
+        Some(libp2p::multiaddr::Protocol::Udp(port)) if port != 0
+    );
+    if !ip_is_usable
+        || !port_is_usable
+        || !matches!(protocols.next(), Some(libp2p::multiaddr::Protocol::QuicV1))
+    {
+        return false;
+    }
+    match protocols.next() {
+        None => true,
+        Some(libp2p::multiaddr::Protocol::P2p(_)) => {
+            matches!(
+                protocols.next(),
+                Some(libp2p::multiaddr::Protocol::P2pCircuit)
+            ) && protocols.next().is_none()
+        }
+        _ => false,
+    }
+}
+
+fn validate_published_endpoint_for_peer(expected_peer: PeerId, value: &str) -> Result<Multiaddr> {
+    if value.is_empty() || value.len() > MAX_ENDPOINT_BYTES {
+        bail!("advertised endpoint is empty or too long");
+    }
+    let mut address: Multiaddr = value
+        .parse()
+        .with_context(|| format!("invalid advertised endpoint {value}"))?;
+    if address.iter().last() != Some(libp2p::multiaddr::Protocol::P2p(expected_peer)) {
+        bail!("advertised endpoint is not bound to its seed-derived peer identity");
+    }
+    if !onion_address_matches_peer(&address, expected_peer) {
+        bail!("advertised onion endpoint differs from its peer identity");
+    }
+    address.pop();
+    if !supported_advertised_transport(&address) {
+        bail!("advertised endpoint is not usable by the configured libp2p transports");
+    }
+    let canonical = address.with(libp2p::multiaddr::Protocol::P2p(expected_peer));
+    if canonical.to_string() != value {
+        bail!("advertised endpoint is not in canonical multiaddress form");
+    }
+    Ok(canonical)
+}
+
+/// Validate one exact peer-qualified value at the signed protocol boundary.
+pub(crate) fn validate_published_endpoint(node_id: NodeId, value: &str) -> Result<Multiaddr> {
+    validate_published_endpoint_for_peer(node_id.libp2p_peer_id()?, value)
+}
+
+fn canonical_published_endpoint(node_id: NodeId, address: &Multiaddr) -> Result<String> {
+    let endpoint = address
+        .clone()
+        .with(libp2p::multiaddr::Protocol::P2p(node_id.libp2p_peer_id()?))
+        .to_string();
+    validate_published_endpoint(node_id, &endpoint)?;
+    Ok(endpoint)
+}
+
+/// Validate one QUIC listener and return the longest peer-publishable address
+/// it can produce. Wildcard listeners are valid bind points but are not
+/// themselves dialable endpoints. Port zero is replaced by the longest valid
+/// `u16` representation so the final protocol length check is conservative.
+fn listener_publication_candidate(address: &Multiaddr) -> Result<Option<Multiaddr>> {
+    let mut protocols = address.iter();
+    let ip = match protocols.next() {
+        Some(libp2p::multiaddr::Protocol::Ip4(address))
+            if !address.is_multicast() && !address.is_broadcast() =>
+        {
+            if address.is_unspecified() {
+                None
+            } else {
+                Some(libp2p::multiaddr::Protocol::Ip4(address))
+            }
+        }
+        Some(libp2p::multiaddr::Protocol::Ip6(address))
+            if !address.is_multicast() && !address.is_unicast_link_local() =>
+        {
+            if address.is_unspecified() {
+                None
+            } else {
+                Some(libp2p::multiaddr::Protocol::Ip6(address))
+            }
+        }
+        _ => bail!("libp2p listener must start with a unicast IP address or wildcard"),
+    };
+    let port = match protocols.next() {
+        Some(libp2p::multiaddr::Protocol::Udp(port)) => port,
+        _ => bail!("libp2p listener must use UDP"),
+    };
+    if !matches!(protocols.next(), Some(libp2p::multiaddr::Protocol::QuicV1))
+        || protocols.next().is_some()
+    {
+        bail!("libp2p listener must be an IP/UDP/QUIC-v1 address");
+    }
+    Ok(ip.map(|ip| {
+        Multiaddr::empty()
+            .with(ip)
+            .with(libp2p::multiaddr::Protocol::Udp(if port == 0 {
+                u16::MAX
+            } else {
+                port
+            }))
+            .with(libp2p::multiaddr::Protocol::QuicV1)
+    }))
+}
+
 /// Validate every configured local endpoint against the seed-derived identity,
 /// strip a redundant terminal local peer ID, and reserve room for each
 /// runtime-generated endpoint that can be published concurrently.
@@ -793,6 +924,7 @@ pub fn validate_local_advertised_endpoints(
 ) -> Result<Vec<Multiaddr>> {
     let expected_peer = node_id.libp2p_peer_id()?;
     let mut canonical_external = BTreeSet::new();
+    let mut planned = BTreeSet::new();
     for configured in external_addresses {
         let mut address = configured.clone();
         if let Some(libp2p::multiaddr::Protocol::P2p(peer)) = address.iter().last() {
@@ -801,36 +933,39 @@ pub fn validate_local_advertised_endpoints(
             }
             address.pop();
         }
-        if address.is_empty() || address.to_string().len() > 512 {
-            bail!("advertised endpoint is empty or too long");
-        }
         if !onion_address_matches_node(&address, node_id) {
             bail!("advertised onion endpoint differs from the seed-derived identity");
         }
+        let published = canonical_published_endpoint(node_id, &address)?;
         if address_allowed_by_tor_mode(mode, &address) {
+            planned.insert(published);
             canonical_external.insert(address);
         }
     }
 
-    let mut planned = if canonical_external.is_empty() {
-        listen_addresses
-            .iter()
-            .filter(|address| address_allowed_by_tor_mode(mode, address))
-            .cloned()
-            .collect::<BTreeSet<_>>()
-    } else {
-        canonical_external.clone()
-    };
-    if !mode.requires_tor() {
-        planned.extend(
-            relay_reservation_addresses
-                .iter()
-                .cloned()
-                .map(|address| address.with(libp2p::multiaddr::Protocol::P2pCircuit)),
-        );
+    for listener in listen_addresses {
+        let candidate = listener_publication_candidate(listener)?;
+        if !mode.requires_tor()
+            && canonical_external.is_empty()
+            && let Some(candidate) = candidate
+        {
+            planned.insert(canonical_published_endpoint(node_id, &candidate)?);
+        }
+    }
+    for relay in relay_reservation_addresses {
+        let relay_peer = terminal_peer_id(relay)?;
+        if relay.iter().last() != Some(libp2p::multiaddr::Protocol::P2p(relay_peer)) {
+            bail!("relay reservation address must end in its relay peer identity");
+        }
+        let candidate = relay.clone().with(libp2p::multiaddr::Protocol::P2pCircuit);
+        let published = canonical_published_endpoint(node_id, &candidate)?;
+        if !mode.requires_tor() {
+            planned.insert(published);
+        }
     }
     if mode.enabled() {
-        planned.insert(super::onion_listener_address(node_id)?);
+        let onion = super::onion_listener_address(node_id)?;
+        planned.insert(canonical_published_endpoint(node_id, &onion)?);
     }
     let maximum = planned
         .len()
@@ -839,6 +974,9 @@ pub fn validate_local_advertised_endpoints(
         bail!(
             "local endpoint configuration can advertise {maximum} addresses; protocol limit is {MAX_ENDPOINTS_PER_PEER}"
         );
+    }
+    if maximum == 0 {
+        bail!("local endpoint configuration has no publishable address");
     }
     Ok(canonical_external.into_iter().collect())
 }
@@ -1893,6 +2031,23 @@ impl P2pEventLoop {
         self.path_transfer_counters.remove(&peer);
     }
 
+    fn retains_transport_selection(&self, peer: PeerId) -> bool {
+        !self.retained_peer_addresses(peer).is_empty()
+            || self
+                .connection_paths
+                .values()
+                .any(|(candidate, _)| *candidate == peer)
+            || self.policy_dials.values().any(|dial| dial.peer == peer)
+            || self.has_outstanding_request(peer)
+            || self.transport_promotions.contains_key(&peer)
+    }
+
+    fn forget_transport_selection_if_unretained(&mut self, peer: PeerId) {
+        if !self.retains_transport_selection(peer) {
+            self.fallback_tiers.remove(&peer);
+        }
+    }
+
     fn record_transfer(&mut self, peer: PeerId, path: Option<P2pPath>, sent: u64, received: u64) {
         if let Some(path) = path {
             let metrics = self.path_metrics.entry(path).or_default();
@@ -2276,7 +2431,9 @@ impl P2pEventLoop {
             .iter()
             .position(|pending| pending.cancellation_id == cancellation_id)
         {
-            self.queued_requests.remove(position);
+            if let Some(pending) = self.queued_requests.remove(position) {
+                self.forget_transport_selection_if_unretained(pending.peer);
+            }
             return;
         }
         if let Some(pending) = self
@@ -2294,15 +2451,18 @@ impl P2pEventLoop {
 
     fn maintain_requests(&mut self) {
         let now = tokio::time::Instant::now();
+        let mut released_peers = BTreeSet::new();
         let queued = self.queued_requests.len();
         for _ in 0..queued {
             let Some(mut pending) = self.queued_requests.pop_front() else {
                 break;
             };
             if !pending.caller_waiting() {
+                released_peers.insert(pending.peer);
                 continue;
             }
             if pending.deadline <= now {
+                released_peers.insert(pending.peer);
                 pending.finish(Err(anyhow::anyhow!("libp2p request deadline expired")));
             } else {
                 self.queued_requests.push_back(pending);
@@ -2323,6 +2483,9 @@ impl P2pEventLoop {
             .collect::<BTreeSet<_>>();
         for peer in peers {
             self.drain_queued_requests(peer);
+        }
+        for peer in released_peers {
+            self.forget_transport_selection_if_unretained(peer);
         }
     }
 
@@ -2526,6 +2689,7 @@ impl P2pEventLoop {
         if !desired.is_empty() {
             self.installed_policy_addresses.insert(peer, desired);
         }
+        self.forget_transport_selection_if_unretained(peer);
     }
 
     fn replace_mapped_external_address(&mut self, address: Option<Multiaddr>) -> Result<()> {
@@ -2723,6 +2887,7 @@ impl P2pEventLoop {
                 self.retire_non_policy_connections(peer);
             }
             self.drain_queued_requests(peer);
+            self.forget_transport_selection_if_unretained(peer);
         }
     }
 
@@ -2769,10 +2934,12 @@ impl P2pEventLoop {
         // healthy established tier instead of redialing a worse endpoint and
         // leaving requests queued behind it.
         if let Some(best) = self.best_healthy_connection_tier(peer)
-            && best < selected
+            && best <= selected
         {
-            self.transport_promotions.remove(&peer);
-            self.set_transport_tier(peer, best);
+            if best < selected {
+                self.transport_promotions.remove(&peer);
+                self.set_transport_tier(peer, best);
+            }
             self.retire_non_policy_connections(peer);
             return;
         }
@@ -2798,6 +2965,7 @@ impl P2pEventLoop {
                 self.queued_requests.push_back(pending);
             }
         }
+        self.forget_transport_selection_if_unretained(peer);
     }
 
     fn retry_relay_reservations(&mut self) {
@@ -2950,7 +3118,7 @@ impl P2pEventLoop {
         if !address_allowed_by_tor_mode(self.tor_mode, &address) {
             return Ok(());
         }
-        if address.to_string().len() > 512
+        if address.to_string().len() > MAX_ENDPOINT_BYTES
             || address
                 .iter()
                 .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2p(_)))
@@ -3566,6 +3734,7 @@ impl P2pEventLoop {
                 ..
             } => {
                 let policy_dial = self.policy_dials.remove(&connection_id);
+                let policy_dial_peer = policy_dial.as_ref().map(|dial| dial.peer);
                 let path = connected_point_path(&endpoint);
                 let dialer = matches!(&endpoint, ConnectedPoint::Dialer { .. });
                 // DCUtR may report the upgraded connection before or after the
@@ -3618,7 +3787,7 @@ impl P2pEventLoop {
                     tracing::warn!(%peer_id, ?path, "closing a transport-policy-forbidden session");
                     return;
                 }
-                if let Some(dial) = policy_dial
+                if let Some(dial) = &policy_dial
                     && (dial.peer != peer_id
                         || path_preference_rank(self.tor_mode, path) != dial.tier)
                 {
@@ -3633,6 +3802,11 @@ impl P2pEventLoop {
                 self.observe_established_transport(peer_id, connection_id);
                 self.schedule_duplicate_session_collapse(peer_id, connection_id);
                 self.drain_queued_requests(peer_id);
+                if let Some(dial_peer) = policy_dial_peer
+                    && dial_peer != peer_id
+                {
+                    self.forget_transport_selection_if_unretained(dial_peer);
+                }
                 tracing::info!(peer = %peer_id, ?endpoint, "libp2p connection established");
             }
             SwarmEvent::ConnectionClosed {
@@ -3695,8 +3869,10 @@ impl P2pEventLoop {
                         );
                     }
                     self.drain_queued_requests(dial.peer);
+                    self.forget_transport_selection_if_unretained(dial.peer);
                 } else if let Some(peer) = peer_id {
                     self.record_dial_failure(peer);
+                    self.forget_transport_selection_if_unretained(peer);
                 }
             }
             _ => {}
@@ -3791,6 +3967,7 @@ impl P2pEventLoop {
                     } => {
                         let response_bytes = cbor_wire_len(&response).ok();
                         if let Some(pending) = self.pending_requests.remove(&request_id) {
+                            let request_peer = pending.peer;
                             if pending.peer == peer {
                                 self.record_transfer(
                                     peer,
@@ -3820,6 +3997,7 @@ impl P2pEventLoop {
                             }
                             let mut pending = pending;
                             pending.finish(result);
+                            self.forget_transport_selection_if_unretained(request_peer);
                         }
                     }
                 }
@@ -3831,6 +4009,7 @@ impl P2pEventLoop {
                 error,
             } => {
                 if let Some(mut pending) = self.pending_requests.remove(&request_id) {
+                    let request_peer = pending.peer;
                     let path = self.request_failure_path(peer, connection_id);
                     self.record_request_result(
                         path.or_else(|| self.selected_path_hint(peer)),
@@ -3858,6 +4037,7 @@ impl P2pEventLoop {
                     }
 
                     if !pending.caller_waiting() {
+                        self.forget_transport_selection_if_unretained(request_peer);
                         return;
                     }
                     if used_wrong_tier {
@@ -3870,6 +4050,7 @@ impl P2pEventLoop {
                         );
                         self.ensure_selected_transport(peer);
                         self.queue_or_dispatch_request(pending);
+                        self.forget_transport_selection_if_unretained(request_peer);
                         return;
                     }
                     let advanced = !healthy_duplicate
@@ -3881,6 +4062,7 @@ impl P2pEventLoop {
                     } else {
                         pending.finish(Err(anyhow::anyhow!("libp2p request failed: {error}")));
                     }
+                    self.forget_transport_selection_if_unretained(request_peer);
                 }
             }
             request_response::Event::InboundFailure {
@@ -5266,18 +5448,10 @@ fn valid_endpoint_values(publisher: NodeId, endpoints: &[String]) -> bool {
     if endpoints.is_empty() || endpoints.len() > MAX_ENDPOINTS_PER_PEER {
         return false;
     }
-    let Ok(expected) = publisher.libp2p_peer_id() else {
-        return false;
-    };
     let mut unique = BTreeSet::new();
-    endpoints.iter().all(|value| {
-        value.len() <= 512
-            && unique.insert(value)
-            && value.parse::<Multiaddr>().is_ok_and(|address| {
-                address.iter().last() == Some(libp2p::multiaddr::Protocol::P2p(expected))
-                    && onion_address_matches_node(&address, publisher)
-            })
-    })
+    endpoints
+        .iter()
+        .all(|value| unique.insert(value) && validate_published_endpoint(publisher, value).is_ok())
 }
 
 fn highest_endpoint_sequence(publisher: NodeId, records: Vec<DhtRecord>) -> Result<Option<u64>> {
@@ -5711,7 +5885,8 @@ async fn available_p2p_endpoints(p2p: &P2pClient) -> Result<Vec<String>> {
             }
             _ => address.push(libp2p::multiaddr::Protocol::P2p(peer_id)),
         }
-        endpoints.push(address.to_string());
+        endpoints
+            .push(validate_published_endpoint_for_peer(peer_id, &address.to_string())?.to_string());
     }
     endpoints.sort();
     endpoints.dedup();
@@ -6562,6 +6737,83 @@ mod tests {
             .is_err()
         );
 
+        for unusable in [
+            "/memory/1",
+            "/ip4/198.51.100.3/tcp/44000",
+            "/ip4/0.0.0.0/udp/44000/quic-v1",
+            "/ip4/198.51.100.3/udp/0/quic-v1",
+            "/ip4/224.0.0.1/udp/44000/quic-v1",
+            "/ip6/ff02::1/udp/44000/quic-v1",
+            "/ip6/fe80::1/udp/44000/quic-v1",
+        ] {
+            let unusable = unusable.parse::<Multiaddr>().unwrap();
+            assert!(
+                validate_local_advertised_endpoints(
+                    node_id,
+                    TorMode::DisableTor,
+                    &[],
+                    &[unusable],
+                    &[],
+                    false,
+                )
+                .is_err()
+            );
+        }
+
+        let peer_suffix = format!("/p2p/{peer}");
+        let dns_prefix = "/dns4/";
+        let quic_suffix = "/udp/44000/quic-v1";
+        let target_base_len = MAX_ENDPOINT_BYTES - peer_suffix.len() + 1;
+        let host_len = target_base_len - dns_prefix.len() - quic_suffix.len();
+        let overlong_base = format!("{dns_prefix}{}{quic_suffix}", "a".repeat(host_len));
+        assert!(overlong_base.len() <= MAX_ENDPOINT_BYTES);
+        assert!(overlong_base.len() + peer_suffix.len() > MAX_ENDPOINT_BYTES);
+        let error = validate_local_advertised_endpoints(
+            node_id,
+            TorMode::DisableTor,
+            &[],
+            &[overlong_base.parse().unwrap()],
+            &[],
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("too long"));
+
+        let noncanonical = format!("/ip6/0:0:0:0:0:0:0:1/udp/44000/quic-v1/p2p/{peer}");
+        assert!(validate_published_endpoint(node_id, &noncanonical).is_err());
+
+        let wildcard: Multiaddr = "/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap();
+        assert!(
+            validate_local_advertised_endpoints(
+                node_id,
+                TorMode::DisableTor,
+                std::slice::from_ref(&wildcard),
+                &[],
+                &[],
+                false,
+            )
+            .is_err(),
+            "a wildcard listener alone can never become a signed endpoint"
+        );
+        validate_local_advertised_endpoints(
+            node_id,
+            TorMode::DisableTor,
+            std::slice::from_ref(&wildcard),
+            &[],
+            &[],
+            true,
+        )
+        .unwrap();
+        validate_local_advertised_endpoints(
+            node_id,
+            TorMode::DisableTor,
+            &["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
+            &[],
+            &[],
+            false,
+        )
+        .unwrap();
+
         let eight = (0..MAX_ENDPOINTS_PER_PEER)
             .map(|index| {
                 format!("/ip4/198.51.100.3/udp/{}/quic-v1", 44000 + index)
@@ -6596,6 +6848,24 @@ mod tests {
         );
         assert_eq!(overflow.len(), MAX_ENDPOINTS_PER_PEER);
         assert!(overflow.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[tokio::test]
+    async fn publication_revalidates_runtime_advertised_endpoints() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([204; 32]);
+        let node_id = KeyMaterial::from_seed(&seed).node_id();
+        let node = Node::open(temp.path().join("node"), seed).unwrap();
+        let (client, mut event_loop) =
+            build_p2p(Arc::new(Mutex::new(node)), config(node_id)).unwrap();
+        event_loop.advertised_addresses = vec!["/ip4/198.51.100.9/udp/0/quic-v1".parse().unwrap()];
+        let task = tokio::spawn(event_loop.run());
+
+        let error = available_p2p_endpoints(&client).await.unwrap_err();
+        assert!(error.to_string().contains("not usable"));
+
+        client.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -7319,6 +7589,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_close_reuses_same_tier_duplicate_before_request_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([106; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([107; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        let relay = KeyMaterial::from_seed(&Seed::from_bytes([108; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let direct: Multiaddr = format!("/ip4/192.0.2.106/udp/44000/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+        let relayed: Multiaddr =
+            format!("/ip4/192.0.2.107/udp/44001/quic-v1/p2p/{relay}/p2p-circuit/p2p/{peer}")
+                .parse()
+                .unwrap();
+        for address in [direct.clone(), relayed] {
+            event_loop.add_learned_address(peer, address).unwrap();
+        }
+        let selected = ConnectionId::new_unchecked(1061);
+        let duplicate = ConnectionId::new_unchecked(1062);
+        event_loop
+            .connection_paths
+            .insert(selected, (peer, P2pPath::Direct));
+        event_loop
+            .connection_paths
+            .insert(duplicate, (peer, P2pPath::Direct));
+
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(target, PeerRequest::Profile).await }
+        });
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+        let request_id = *event_loop.pending_requests.keys().next().unwrap();
+        event_loop.duplicate_retirement.insert(
+            duplicate,
+            (peer, tokio::time::Instant::now() + Duration::from_secs(1)),
+        );
+
+        event_loop.handle_swarm_event(SwarmEvent::ConnectionClosed {
+            peer_id: peer,
+            connection_id: selected,
+            endpoint: ConnectedPoint::Dialer {
+                address: direct,
+                role_override: Endpoint::Dialer,
+                port_use: PortUse::Reuse,
+            },
+            num_established: 1,
+            cause: None,
+        });
+        assert_eq!(event_loop.selected_transport_tier(peer), 0);
+        assert!(event_loop.healthy_connection_at_tier(peer, 0, None));
+        assert!(!event_loop.duplicate_retirement.contains_key(&duplicate));
+        assert!(event_loop.policy_dials.values().all(|dial| dial.tier == 0));
+
+        event_loop.handle_peer_event(request_response::Event::OutboundFailure {
+            peer,
+            connection_id: selected,
+            request_id,
+            error: request_response::OutboundFailure::ConnectionClosed,
+        });
+        assert_eq!(event_loop.selected_transport_tier(peer), 0);
+        assert_eq!(event_loop.pending_requests.len(), 1);
+        assert!(event_loop.queued_requests.is_empty());
+
+        drop(event_loop);
+        assert!(call.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
     async fn failed_preferred_promotion_keeps_the_retained_fallback() {
         let temp = tempfile::tempdir().unwrap();
         let local_seed = Seed::from_bytes([98; 32]);
@@ -7860,6 +8204,7 @@ mod tests {
         let local_id = node.keys().node_id();
         let (_client, mut event_loop) =
             build_p2p(Arc::new(Mutex::new(node)), config(local_id)).unwrap();
+        event_loop.tor_mode = TorMode::PreferTor;
         let peer = mb_core::KeyMaterial::from_seed(&Seed::from_bytes([72; 32]))
             .node_id()
             .libp2p_peer_id()
@@ -7872,6 +8217,7 @@ mod tests {
             .unwrap();
 
         event_loop.add_learned_address(peer, first.clone()).unwrap();
+        assert_eq!(event_loop.fallback_tiers.get(&peer), Some(&1));
         assert!(!event_loop.persistent_addresses.contains_key(&peer));
         assert_eq!(event_loop.learned_addresses[&peer].addresses.len(), 1);
         event_loop
@@ -7901,6 +8247,7 @@ mod tests {
             .expires_at = tokio::time::Instant::now();
         event_loop.expire_learned_addresses();
         assert!(!event_loop.learned_addresses.contains_key(&peer));
+        assert!(!event_loop.fallback_tiers.contains_key(&peer));
         assert!(!event_loop.transfer_counters.contains_key(&peer));
         assert!(!event_loop.path_transfer_counters.contains_key(&peer));
 
@@ -8008,13 +8355,10 @@ mod tests {
         let local_id = node.keys().node_id();
         let (_client, mut event_loop) =
             build_p2p(Arc::new(Mutex::new(node)), config(local_id)).unwrap();
-        let peer = KeyMaterial::from_seed(&Seed::from_bytes([68; 32]))
-            .node_id()
-            .libp2p_peer_id()
-            .unwrap();
-        let address: Multiaddr = format!("/ip4/127.0.0.1/udp/4300/quic-v1/p2p/{peer}")
-            .parse()
-            .unwrap();
+        event_loop.tor_mode = TorMode::Auto;
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([68; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        let address = onion_listener_address(target).unwrap();
         let identified: Multiaddr = "/ip4/127.0.0.1/udp/4301/quic-v1".parse().unwrap();
         let scope = Uuid::new_v4();
 
@@ -8026,6 +8370,7 @@ mod tests {
             .unwrap();
 
         assert!(event_loop.recovery_addresses.contains_key(&scope));
+        assert_eq!(event_loop.fallback_tiers.get(&peer), Some(&2));
         assert!(!event_loop.learned_addresses.contains_key(&peer));
         assert!(event_loop.recovery_addresses[&scope].addresses[&peer].contains(&identified));
         event_loop.clear_recovery_addresses(scope);
@@ -8034,7 +8379,67 @@ mod tests {
         assert!(event_loop.recovery_quarantine.contains_key(&peer));
         assert!(!event_loop.learned_addresses.contains_key(&peer));
         assert!(!event_loop.opportunistic_addresses.contains_key(&peer));
+        assert!(!event_loop.fallback_tiers.contains_key(&peer));
         assert!(!event_loop.retains_transfer_history(peer));
+    }
+
+    #[tokio::test]
+    async fn fallback_tier_lives_until_the_closed_request_is_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([109; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        event_loop.tor_mode = TorMode::Auto;
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([110; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        let onion = onion_listener_address(target).unwrap();
+        let scope = Uuid::new_v4();
+
+        event_loop
+            .add_recovery_addresses(scope, peer, vec![onion.clone()], unix_seconds() + 300)
+            .unwrap();
+        let connection = ConnectionId::new_unchecked(1101);
+        event_loop
+            .connection_paths
+            .insert(connection, (peer, P2pPath::Tor));
+
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(target, PeerRequest::Profile).await }
+        });
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+        let request_id = *event_loop.pending_requests.keys().next().unwrap();
+
+        event_loop.clear_recovery_addresses(scope);
+        assert_eq!(event_loop.fallback_tiers.get(&peer), Some(&2));
+        assert!(event_loop.retained_peer_addresses(peer).is_empty());
+
+        event_loop.handle_swarm_event(SwarmEvent::ConnectionClosed {
+            peer_id: peer,
+            connection_id: connection,
+            endpoint: ConnectedPoint::Dialer {
+                address: onion,
+                role_override: Endpoint::Dialer,
+                port_use: PortUse::Reuse,
+            },
+            num_established: 0,
+            cause: None,
+        });
+        assert_eq!(event_loop.fallback_tiers.get(&peer), Some(&2));
+        assert!(event_loop.closed_connection_paths.contains_key(&connection));
+
+        event_loop.handle_peer_event(request_response::Event::OutboundFailure {
+            peer,
+            connection_id: connection,
+            request_id,
+            error: request_response::OutboundFailure::ConnectionClosed,
+        });
+        assert!(!event_loop.fallback_tiers.contains_key(&peer));
+        assert!(event_loop.pending_requests.is_empty());
+        assert!(event_loop.queued_requests.is_empty());
+        assert!(call.await.unwrap().is_err());
     }
 
     async fn listening_address(client: &P2pClient) -> Multiaddr {
