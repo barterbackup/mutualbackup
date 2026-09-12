@@ -1669,6 +1669,14 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
     assert!(arti_config.is_file());
     let run_root = PathBuf::from(test_root).join(format!("private-tor-{}", Uuid::new_v4()));
     fs::create_dir_all(&run_root).unwrap();
+    // Keep local-control endpoints independent of the potentially long Btrfs
+    // acceptance path. Linux Unix-domain sockets have a small fixed pathname
+    // limit, while only the captured data and databases need reflink storage.
+    let socket_root = tempfile::Builder::new()
+        .prefix("mbtor-sockets.")
+        .tempdir()
+        .unwrap();
+    set_private(socket_root.path());
     let seed_dir = run_root.join("offline");
     fs::create_dir(&seed_dir).unwrap();
     set_private(&seed_dir);
@@ -1683,7 +1691,7 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
         fs::create_dir(&peer_dir).unwrap();
         set_private(&peer_dir);
         let seed_file = seed_dir.join(format!("p{index}.seed"));
-        let socket = peer_dir.join("control.sock");
+        let socket = socket_root.path().join(format!("p{index}.sock"));
         let output = run_cli(
             &[
                 os("--socket"),
@@ -1890,7 +1898,7 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
     let recovered_dir = run_root.join("recovered-p1");
     fs::create_dir(&recovered_dir).unwrap();
     set_private(&recovered_dir);
-    let recovered_socket = recovered_dir.join("control.sock");
+    let recovered_socket = socket_root.path().join("recovered-p1.sock");
     run_cli(
         &[
             os("--socket"),
