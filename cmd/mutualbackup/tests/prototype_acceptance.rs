@@ -729,6 +729,79 @@ fn manual_unlock_returns_to_locked_after_network_startup_failure() {
 }
 
 #[test]
+fn manual_unlock_returns_to_locked_when_tor_state_is_already_in_use() {
+    let temp = tempfile::tempdir().unwrap();
+    set_private(temp.path());
+    let data_dir = temp.path().join("state");
+    let socket = temp.path().join("control.sock");
+    let tor_state = temp.path().join("tor-state");
+    let tor_cache = temp.path().join("tor-cache");
+    let recovery = "manual-tor-lock-recovery-string-2027!";
+    run_cli_with_input(
+        &[
+            os("init"),
+            os("--seed-stdin"),
+            os("--data-dir"),
+            data_dir.as_os_str().to_owned(),
+        ],
+        recovery.as_bytes(),
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+
+    fs::create_dir(&tor_state).unwrap();
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(tor_state.join("mutualbackup.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+
+    let mut daemon = Daemon::with_args(
+        vec![
+            os("--data-dir"),
+            data_dir.as_os_str().to_owned(),
+            os("--control-socket"),
+            socket.as_os_str().to_owned(),
+            os("--failure-domain"),
+            os("manual-tor-lock-test"),
+            os("--tor-state-dir"),
+            tor_state.as_os_str().to_owned(),
+            os("--tor-cache-dir"),
+            tor_cache.as_os_str().to_owned(),
+            os("--listen"),
+            os("/ip4/127.0.0.1/udp/0/quic-v1"),
+        ],
+        temp.path().join("daemon.log"),
+    );
+    daemon.start();
+    assert!(wait_for_status(&socket, &mut daemon, CLI_TIMEOUT).contains("Locked"));
+
+    let error = run_cli_with_input(
+        &[
+            os("--socket"),
+            socket.as_os_str().to_owned(),
+            os("unlock"),
+            os("--seed-stdin"),
+        ],
+        recovery.as_bytes(),
+        Duration::from_secs(10),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("already in use"),
+        "unexpected error: {error}"
+    );
+    daemon.assert_running();
+    assert!(wait_for_status(&socket, &mut daemon, CLI_TIMEOUT).contains("Locked"));
+}
+
+#[test]
 fn daemon_accepts_config_only_and_flag_overrides() {
     let temp = tempfile::tempdir().unwrap();
     set_private(temp.path());

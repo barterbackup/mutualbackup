@@ -720,6 +720,7 @@ fn selected_policy_addresses(
         .unwrap_or((0, BTreeSet::new()))
 }
 
+#[cfg(test)]
 fn next_preferred_addresses(
     tiers: &BTreeMap<u8, BTreeSet<Multiaddr>>,
     current_tier: u8,
@@ -775,7 +776,71 @@ fn status_advertised_addresses(
     }
     advertised.sort();
     advertised.dedup();
+    advertised.truncate(MAX_ENDPOINTS_PER_PEER);
     advertised
+}
+
+/// Validate every configured local endpoint against the seed-derived identity,
+/// strip a redundant terminal local peer ID, and reserve room for each
+/// runtime-generated endpoint that can be published concurrently.
+pub fn validate_local_advertised_endpoints(
+    node_id: NodeId,
+    mode: TorMode,
+    listen_addresses: &[Multiaddr],
+    external_addresses: &[Multiaddr],
+    relay_reservation_addresses: &[Multiaddr],
+    enable_port_mapping: bool,
+) -> Result<Vec<Multiaddr>> {
+    let expected_peer = node_id.libp2p_peer_id()?;
+    let mut canonical_external = BTreeSet::new();
+    for configured in external_addresses {
+        let mut address = configured.clone();
+        if let Some(libp2p::multiaddr::Protocol::P2p(peer)) = address.iter().last() {
+            if peer != expected_peer {
+                bail!("advertised endpoint contains another peer identity");
+            }
+            address.pop();
+        }
+        if address.is_empty() || address.to_string().len() > 512 {
+            bail!("advertised endpoint is empty or too long");
+        }
+        if !onion_address_matches_node(&address, node_id) {
+            bail!("advertised onion endpoint differs from the seed-derived identity");
+        }
+        if address_allowed_by_tor_mode(mode, &address) {
+            canonical_external.insert(address);
+        }
+    }
+
+    let mut planned = if canonical_external.is_empty() {
+        listen_addresses
+            .iter()
+            .filter(|address| address_allowed_by_tor_mode(mode, address))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    } else {
+        canonical_external.clone()
+    };
+    if !mode.requires_tor() {
+        planned.extend(
+            relay_reservation_addresses
+                .iter()
+                .cloned()
+                .map(|address| address.with(libp2p::multiaddr::Protocol::P2pCircuit)),
+        );
+    }
+    if mode.enabled() {
+        planned.insert(super::onion_listener_address(node_id)?);
+    }
+    let maximum = planned
+        .len()
+        .saturating_add(usize::from(enable_port_mapping));
+    if maximum > MAX_ENDPOINTS_PER_PEER {
+        bail!(
+            "local endpoint configuration can advertise {maximum} addresses; protocol limit is {MAX_ENDPOINTS_PER_PEER}"
+        );
+    }
+    Ok(canonical_external.into_iter().collect())
 }
 
 pub fn build_p2p(
@@ -788,7 +853,7 @@ pub fn build_p2p(
 
 pub fn build_p2p_with_tor(
     node: Arc<Mutex<Node>>,
-    config: P2pConfig,
+    mut config: P2pConfig,
     tor_transport: Option<TorTransport>,
 ) -> Result<(P2pClient, P2pEventLoop)> {
     if config.enable_port_mapping {
@@ -806,6 +871,19 @@ pub fn build_p2p_with_tor(
     {
         bail!("invalid libp2p configuration");
     }
+    let local_node_id = node
+        .lock()
+        .map_err(|_| anyhow::anyhow!("node state lock is poisoned"))?
+        .keys()
+        .node_id();
+    config.external_addresses = validate_local_advertised_endpoints(
+        local_node_id,
+        config.tor_mode,
+        &config.listen_addresses,
+        &config.external_addresses,
+        &config.relay_reservation_addresses,
+        config.enable_port_mapping,
+    )?;
     let (identity, reader_config, relay_member_ids) = {
         let mut node = node
             .lock()
@@ -6408,6 +6486,98 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(advertised, expected);
+    }
+
+    #[test]
+    fn local_endpoint_configuration_is_identity_bound_canonical_and_bounded() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([201; 32]));
+        let node_id = keys.node_id();
+        let peer = node_id.libp2p_peer_id().unwrap();
+        let other = KeyMaterial::from_seed(&Seed::from_bytes([202; 32])).node_id();
+        let direct: Multiaddr = format!("/ip4/198.51.100.1/udp/44000/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+        let canonical = validate_local_advertised_endpoints(
+            node_id,
+            TorMode::DisableTor,
+            &[],
+            &[direct.clone(), direct],
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            canonical,
+            vec![
+                "/ip4/198.51.100.1/udp/44000/quic-v1"
+                    .parse::<Multiaddr>()
+                    .unwrap()
+            ]
+        );
+
+        let wrong_peer: Multiaddr = format!(
+            "/ip4/198.51.100.2/udp/44000/quic-v1/p2p/{}",
+            other.libp2p_peer_id().unwrap()
+        )
+        .parse()
+        .unwrap();
+        assert!(
+            validate_local_advertised_endpoints(
+                node_id,
+                TorMode::DisableTor,
+                &[],
+                &[wrong_peer],
+                &[],
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_local_advertised_endpoints(
+                node_id,
+                TorMode::Auto,
+                &[],
+                &[onion_listener_address(other).unwrap()],
+                &[],
+                false,
+            )
+            .is_err()
+        );
+
+        let eight = (0..MAX_ENDPOINTS_PER_PEER)
+            .map(|index| {
+                format!("/ip4/198.51.100.3/udp/{}/quic-v1", 44000 + index)
+                    .parse::<Multiaddr>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            validate_local_advertised_endpoints(node_id, TorMode::Auto, &[], &eight, &[], false,)
+                .is_err(),
+            "the generated onion endpoint must have a reserved protocol slot"
+        );
+        assert!(
+            validate_local_advertised_endpoints(
+                node_id,
+                TorMode::DisableTor,
+                &[],
+                &eight,
+                &[],
+                true,
+            )
+            .is_err(),
+            "the runtime gateway mapping must have a reserved protocol slot"
+        );
+
+        let overflow = status_advertised_addresses(
+            &[],
+            None,
+            &(0..MAX_ENDPOINTS_PER_PEER + 3)
+                .map(|index| format!("/ip4/203.0.113.1/udp/{}/quic-v1", 45000 + index))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(overflow.len(), MAX_ENDPOINTS_PER_PEER);
+        assert!(overflow.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[tokio::test]

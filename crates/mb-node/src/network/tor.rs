@@ -110,6 +110,24 @@ impl PreparedTorTransportConfig {
     }
 }
 
+/// Prepared Arti configuration whose MutualBackup state directory is
+/// exclusively owned by this constructor attempt.
+///
+/// Keeping the claim outside the asynchronous constructor lets the daemon
+/// distinguish a failure to acquire another process's state from a launch it
+/// owns and must drain after cancellation.
+pub struct ClaimedTorTransportConfig {
+    loaded: LoadedArtiConfig,
+    max_inbound_streams: usize,
+    state_lock: Arc<File>,
+}
+
+impl ClaimedTorTransportConfig {
+    pub fn state_dir(&self) -> &Path {
+        &self.loaded.state_dir
+    }
+}
+
 struct TorTaskTracker {
     active: AtomicUsize,
     notify: Notify,
@@ -226,12 +244,9 @@ impl TorTransport {
         Self::new_prepared(prepared, identity_seed, node_id).await
     }
 
-    pub async fn new_prepared(
+    pub fn claim_prepared(
         prepared: PreparedTorTransportConfig,
-        identity_seed: Zeroizing<[u8; 32]>,
-        node_id: NodeId,
-    ) -> Result<Self> {
-        let max_inbound_streams = prepared.max_inbound_streams;
+    ) -> Result<ClaimedTorTransportConfig> {
         let loaded = prepared.loaded;
         prepare_private_directory(&loaded.state_dir, "Tor state")?;
         prepare_private_directory(&loaded.cache_dir, "Tor cache")?;
@@ -245,6 +260,30 @@ impl TorTransport {
         }
         let state_lock = Arc::new(lock_tor_state(&loaded.state_dir)?);
         validate_onion_service_state(&loaded.state_dir)?;
+        Ok(ClaimedTorTransportConfig {
+            loaded,
+            max_inbound_streams: prepared.max_inbound_streams,
+            state_lock,
+        })
+    }
+
+    pub async fn new_prepared(
+        prepared: PreparedTorTransportConfig,
+        identity_seed: Zeroizing<[u8; 32]>,
+        node_id: NodeId,
+    ) -> Result<Self> {
+        let claimed = Self::claim_prepared(prepared)?;
+        Self::new_claimed(claimed, identity_seed, node_id).await
+    }
+
+    pub async fn new_claimed(
+        claimed: ClaimedTorTransportConfig,
+        identity_seed: Zeroizing<[u8; 32]>,
+        node_id: NodeId,
+    ) -> Result<Self> {
+        let max_inbound_streams = claimed.max_inbound_streams;
+        let loaded = claimed.loaded;
+        let state_lock = claimed.state_lock;
 
         let client = TorClient::<PreferredRuntime>::builder()
             .config(loaded.config)
@@ -1084,6 +1123,31 @@ mod tests {
         symlink(&outside, state.join("hss")).unwrap();
         assert!(validate_onion_service_state(&state).is_err());
         assert!(outside.exists());
+    }
+
+    #[test]
+    fn claimed_configuration_distinguishes_state_already_in_use() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let cache = temp.path().join("cache");
+        let prepare = || {
+            TorTransport::prepare_config(&TorTransportConfig {
+                state_dir: state.clone(),
+                cache_dir: cache.clone(),
+                arti_config_file: None,
+                max_inbound_streams: 1,
+            })
+            .unwrap()
+        };
+
+        let claimed = TorTransport::claim_prepared(prepare()).unwrap();
+        let error = match TorTransport::claim_prepared(prepare()) {
+            Ok(_) => panic!("a second constructor claimed live Tor state"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("already in use"));
+        drop(claimed);
+        TorTransport::claim_prepared(prepare()).unwrap();
     }
 
     #[cfg(unix)]

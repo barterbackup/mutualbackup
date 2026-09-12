@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use conf::Conf;
 use libp2p::Multiaddr;
 use mb_core::{NodeId, Seed};
-use mb_node::{TorMode, validate_port_mapping_listeners};
+use mb_node::{TorMode, validate_local_advertised_endpoints, validate_port_mapping_listeners};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -176,19 +176,32 @@ impl DaemonOptions {
         {
             bail!("at least one --listen or --relay address is required when Tor is disabled");
         }
-        if self.enable_port_mapping {
-            if self.tor_mode.requires_tor() {
-                bail!("port mapping cannot be enabled in require-tor mode");
-            }
-            let listeners = self
-                .p2p_listen_addresses
+        let parse_addresses = |values: &[String], label: &str| {
+            values
                 .iter()
                 .map(|value| {
                     value
                         .parse::<Multiaddr>()
-                        .with_context(|| format!("invalid listen multiaddress {value}"))
+                        .with_context(|| format!("invalid {label} multiaddress {value}"))
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()
+        };
+        let listeners = parse_addresses(&self.p2p_listen_addresses, "listen")?;
+        let external = parse_addresses(&self.p2p_external_addresses, "external")?;
+        let relays = parse_addresses(&self.p2p_relay_addresses, "relay")?;
+        parse_addresses(&self.p2p_bootstrap_addresses, "bootstrap")?;
+        validate_local_advertised_endpoints(
+            identity.expected_node_id,
+            self.tor_mode,
+            &listeners,
+            &external,
+            &relays,
+            self.enable_port_mapping,
+        )?;
+        if self.enable_port_mapping {
+            if self.tor_mode.requires_tor() {
+                bail!("port mapping cannot be enabled in require-tor mode");
+            }
             validate_port_mapping_listeners(&listeners)?;
         }
         if self.max_connections == 0 {
