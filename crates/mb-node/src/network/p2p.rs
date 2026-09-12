@@ -85,6 +85,12 @@ const SHARD_FETCH_ATTEMPTS: usize = 3;
 const PEER_EXCHANGE_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_EXCHANGED_ENDPOINT_RECORDS: usize = 64;
 const PREFERRED_PATH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const LOGICAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+const REQUEST_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_REQUEST_TRANSPORT_ATTEMPTS: u8 = 6;
+const CLOSED_CONNECTION_PATH_RETENTION: Duration = Duration::from_secs(40);
+const TRANSPORT_PROMOTION_GRACE: Duration = Duration::from_millis(500);
 const MAX_SESSION_HISTORY: usize = 256;
 
 type RelayMembers = Arc<RwLock<BTreeSet<PeerId>>>;
@@ -329,13 +335,17 @@ pub struct P2pEventLoop {
     persistent_addresses: HashMap<PeerId, BTreeSet<Multiaddr>>,
     installed_policy_addresses: HashMap<PeerId, BTreeSet<Multiaddr>>,
     fallback_tiers: HashMap<PeerId, u8>,
+    policy_dials: HashMap<ConnectionId, PolicyDial>,
+    transport_promotions: HashMap<PeerId, TransportPromotion>,
     preferred_path_retry: tokio::time::Interval,
+    request_maintenance: tokio::time::Interval,
     learned_addresses: HashMap<PeerId, LearnedAddresses>,
     opportunistic_addresses: HashMap<PeerId, LearnedAddresses>,
     recovery_addresses: HashMap<Uuid, RecoveryAddresses>,
     recovery_quarantine: HashMap<PeerId, tokio::time::Instant>,
     learned_endpoint_expiry: tokio::time::Interval,
     connection_paths: HashMap<ConnectionId, (PeerId, P2pPath)>,
+    closed_connection_paths: HashMap<ConnectionId, ClosedConnectionPath>,
     connection_dialers: HashMap<ConnectionId, bool>,
     duplicate_retirement: HashMap<ConnectionId, (PeerId, tokio::time::Instant)>,
     next_session_sequence: u64,
@@ -440,9 +450,25 @@ struct PendingRequest {
     request_hash: [u8; 32],
     request_bytes: u64,
     transport_tier: u8,
+    attempts: u8,
+    deadline: tokio::time::Instant,
     started_at: tokio::time::Instant,
-    response: oneshot::Sender<Result<PeerResponse>>,
+    response: Option<oneshot::Sender<Result<PeerResponse>>>,
     _permit: OwnedSemaphorePermit,
+}
+
+impl PendingRequest {
+    fn caller_waiting(&self) -> bool {
+        self.response
+            .as_ref()
+            .is_some_and(|response| !response.is_closed())
+    }
+
+    fn finish(&mut self, result: Result<PeerResponse>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(result);
+        }
+    }
 }
 
 struct RequestCancellation {
@@ -486,6 +512,33 @@ struct LearnedAddresses {
 
 struct RecoveryAddresses {
     addresses: HashMap<PeerId, BTreeSet<Multiaddr>>,
+    expires_at: tokio::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PolicyDialKind {
+    Selected,
+    PreferredProbe,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PolicyDial {
+    peer: PeerId,
+    tier: u8,
+    path: P2pPath,
+    kind: PolicyDialKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TransportPromotion {
+    tier: u8,
+    deadline: tokio::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClosedConnectionPath {
+    peer: PeerId,
+    path: P2pPath,
     expires_at: tokio::time::Instant,
 }
 
@@ -845,8 +898,7 @@ pub fn build_p2p_with_tor(
                 peer: request_response::cbor::Behaviour::with_codec(
                     peer_codec(),
                     [(P2P_PROTOCOL, request_response::ProtocolSupport::Full)],
-                    request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(20)),
+                    request_response::Config::default().with_request_timeout(REQUEST_TIMEOUT),
                 ),
                 identify: identify::Behaviour::new(identify::Config::new(
                     IDENTIFY_PROTOCOL.to_owned(),
@@ -951,6 +1003,7 @@ pub fn build_p2p_with_tor(
     }
     let mut installed_policy_addresses = HashMap::new();
     let mut fallback_tiers = HashMap::new();
+    let mut policy_dials = HashMap::new();
     for (peer, addresses) in &persistent_addresses {
         let (selected_tier, selected) =
             selected_policy_addresses(config.tor_mode, addresses.iter().cloned(), 0);
@@ -982,8 +1035,32 @@ pub fn build_p2p_with_tor(
             .addresses(addresses)
             .condition(PeerCondition::DisconnectedAndNotDialing)
             .build();
-        if let Err(error) = swarm.dial(dial) {
-            tracing::warn!(%peer, %error, "initial libp2p dial was rejected");
+        let connection_id = dial.connection_id();
+        let tier = installed_policy_addresses
+            .get(&peer)
+            .and_then(|addresses| addresses.iter().next())
+            .map(|address| path_preference_rank(config.tor_mode, address_path(address)))
+            .unwrap_or(0);
+        let path = installed_policy_addresses
+            .get(&peer)
+            .and_then(|addresses| addresses.iter().next())
+            .map(address_path)
+            .unwrap_or(P2pPath::Direct);
+        match swarm.dial(dial) {
+            Ok(()) => {
+                policy_dials.insert(
+                    connection_id,
+                    PolicyDial {
+                        peer,
+                        tier,
+                        path,
+                        kind: PolicyDialKind::Selected,
+                    },
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%peer, %error, "initial libp2p dial was rejected");
+            }
         }
     }
     if config.enable_dht_maintenance
@@ -1063,13 +1140,17 @@ pub fn build_p2p_with_tor(
             persistent_addresses,
             installed_policy_addresses,
             fallback_tiers,
+            policy_dials,
+            transport_promotions: HashMap::new(),
             preferred_path_retry: retry_interval(PREFERRED_PATH_RETRY_INTERVAL),
+            request_maintenance: retry_interval(REQUEST_MAINTENANCE_INTERVAL),
             learned_addresses: HashMap::new(),
             opportunistic_addresses: HashMap::new(),
             recovery_addresses: HashMap::new(),
             recovery_quarantine: HashMap::new(),
             learned_endpoint_expiry: retry_interval(LEARNED_ENDPOINT_EXPIRY_INTERVAL),
             connection_paths: HashMap::new(),
+            closed_connection_paths: HashMap::new(),
             connection_dialers: HashMap::new(),
             duplicate_retirement: HashMap::new(),
             next_session_sequence: 1,
@@ -1659,10 +1740,58 @@ impl P2pEventLoop {
     fn application_path(&self, connection_id: ConnectionId) -> Option<P2pPath> {
         self.connection_paths
             .get(&connection_id)
-            .map(|(_, path)| match path {
-                P2pPath::Relayed => P2pPath::RelayFallback,
-                path => *path,
+            .map(|(_, path)| *path)
+            .or_else(|| {
+                self.closed_connection_paths
+                    .get(&connection_id)
+                    .map(|closed| closed.path)
             })
+            .map(|path| match path {
+                P2pPath::Relayed => P2pPath::RelayFallback,
+                path => path,
+            })
+    }
+
+    fn request_failure_path(&self, peer: PeerId, connection_id: ConnectionId) -> Option<P2pPath> {
+        self.connection_paths
+            .get(&connection_id)
+            .filter(|(candidate, _)| *candidate == peer)
+            .map(|(_, path)| *path)
+            .or_else(|| {
+                self.closed_connection_paths
+                    .get(&connection_id)
+                    .filter(|closed| closed.peer == peer)
+                    .map(|closed| closed.path)
+            })
+            .map(|path| match path {
+                P2pPath::Relayed => P2pPath::RelayFallback,
+                path => path,
+            })
+    }
+
+    fn remember_closed_connection_path(
+        &mut self,
+        connection_id: ConnectionId,
+        peer: PeerId,
+        path: P2pPath,
+    ) {
+        if self.closed_connection_paths.len() >= MAX_SESSION_HISTORY
+            && let Some(oldest) = self
+                .closed_connection_paths
+                .iter()
+                .min_by_key(|(_, closed)| closed.expires_at)
+                .map(|(connection, _)| *connection)
+        {
+            self.closed_connection_paths.remove(&oldest);
+        }
+        self.closed_connection_paths.insert(
+            connection_id,
+            ClosedConnectionPath {
+                peer,
+                path,
+                expires_at: tokio::time::Instant::now() + CLOSED_CONNECTION_PATH_RETENTION,
+            },
+        );
     }
 
     fn retains_transfer_history(&self, peer: PeerId) -> bool {
@@ -1876,21 +2005,39 @@ impl P2pEventLoop {
     }
 
     fn peer_has_unsettled_connections(&self, peer: PeerId) -> bool {
+        self.transport_promotions.contains_key(&peer)
+            || self
+                .connection_paths
+                .iter()
+                .any(|(connection, (candidate, _))| {
+                    *candidate == peer && self.connection_is_retiring_or_unhealthy(*connection)
+                })
+    }
+
+    fn healthy_connection_at_tier(
+        &self,
+        peer: PeerId,
+        tier: u8,
+        excluded: Option<ConnectionId>,
+    ) -> bool {
         self.connection_paths
             .iter()
-            .any(|(connection, (candidate, _))| {
-                *candidate == peer && self.connection_is_retiring_or_unhealthy(*connection)
+            .any(|(connection, (candidate, path))| {
+                *candidate == peer
+                    && excluded != Some(*connection)
+                    && !self.connection_is_retiring_or_unhealthy(*connection)
+                    && path_preference_rank(self.tor_mode, *path) == tier
             })
     }
 
-    fn healthy_duplicate_exists(&self, peer: PeerId, failed: ConnectionId) -> bool {
+    fn best_healthy_connection_tier(&self, peer: PeerId) -> Option<u8> {
         self.connection_paths
             .iter()
-            .any(|(connection, (candidate, _))| {
-                *candidate == peer
-                    && *connection != failed
-                    && !self.connection_is_retiring_or_unhealthy(*connection)
+            .filter_map(|(connection, (candidate, path))| {
+                (*candidate == peer && !self.connection_is_retiring_or_unhealthy(*connection))
+                    .then_some(path_preference_rank(self.tor_mode, *path))
             })
+            .min()
     }
 
     fn healthy_path_exists(&self, peer: PeerId, expected_path: P2pPath) -> bool {
@@ -1919,24 +2066,30 @@ impl P2pEventLoop {
             })
     }
 
-    fn selected_transport_tier(&self, peer: PeerId) -> Option<u8> {
-        let requested = self.fallback_tiers.get(&peer).copied().unwrap_or(0);
-        let (tier, addresses) =
-            selected_policy_addresses(self.tor_mode, self.retained_peer_addresses(peer), requested);
-        (!addresses.is_empty()).then_some(tier)
+    fn selected_transport_tier(&self, peer: PeerId) -> u8 {
+        self.fallback_tiers.get(&peer).copied().unwrap_or(0)
+    }
+
+    fn set_transport_tier(&mut self, peer: PeerId, tier: u8) {
+        let previous = self.selected_transport_tier(peer);
+        if tier == 0 {
+            self.fallback_tiers.remove(&peer);
+        } else {
+            self.fallback_tiers.insert(peer, tier);
+        }
+        if previous != tier {
+            tracing::info!(%peer, mode = %self.tor_mode, previous, tier, "changed peer transport tier");
+        }
+        self.reconcile_policy_addresses(peer);
     }
 
     fn retire_non_policy_connections(&mut self, peer: PeerId) {
         let selected_tier = self.selected_transport_tier(peer);
-        let selected_connection_exists = selected_tier.is_some_and(|tier| {
-            self.connection_paths
-                .iter()
-                .any(|(connection, (candidate, path))| {
-                    *candidate == peer
-                        && !self.connection_is_retiring_or_unhealthy(*connection)
-                        && path_preference_rank(self.tor_mode, *path) == tier
-                })
-        });
+        let promotion_tier = self
+            .transport_promotions
+            .get(&peer)
+            .map(|promotion| promotion.tier);
+        let selected_connection_exists = self.healthy_connection_at_tier(peer, selected_tier, None);
         let connections = self
             .connection_paths
             .iter()
@@ -1951,28 +2104,41 @@ impl P2pEventLoop {
                 // preferred-tier replacement actually exists; otherwise both
                 // sides can enter a close/redial loop without ever carrying
                 // an application request.
-                should_retire_non_policy_connection(
-                    self.tor_mode,
-                    *path,
-                    selected_tier,
-                    selected_connection_exists,
-                )
+                let tier = path_preference_rank(self.tor_mode, *path);
+                (promotion_tier != Some(tier)
+                    && should_retire_non_policy_connection(
+                        self.tor_mode,
+                        *path,
+                        Some(selected_tier),
+                        selected_connection_exists,
+                    ))
                 .then_some(*connection)
             })
             .collect::<Vec<_>>();
         for connection in connections {
-            self.collapsing_connections.insert(connection);
-            if !self.swarm.close_connection(connection) {
-                self.collapsing_connections.remove(&connection);
-            }
+            self.duplicate_retirement.entry(connection).or_insert((
+                peer,
+                tokio::time::Instant::now() + TRANSPORT_PROMOTION_GRACE,
+            ));
         }
     }
 
     fn dispatch_request(&mut self, mut pending: PendingRequest) {
-        if pending.response.is_closed() {
+        if !pending.caller_waiting() {
             return;
         }
-        pending.transport_tier = self.fallback_tiers.get(&pending.peer).copied().unwrap_or(0);
+        if pending.deadline <= tokio::time::Instant::now() {
+            pending.finish(Err(anyhow::anyhow!("libp2p request deadline expired")));
+            return;
+        }
+        if pending.attempts >= MAX_REQUEST_TRANSPORT_ATTEMPTS {
+            pending.finish(Err(anyhow::anyhow!(
+                "libp2p request exhausted its transport attempt budget"
+            )));
+            return;
+        }
+        pending.transport_tier = self.selected_transport_tier(pending.peer);
+        pending.attempts = pending.attempts.saturating_add(1);
         pending.started_at = tokio::time::Instant::now();
         let outbound_id = self
             .swarm
@@ -1982,12 +2148,30 @@ impl P2pEventLoop {
         self.pending_requests.insert(outbound_id, pending);
     }
 
-    fn queue_or_dispatch_request(&mut self, pending: PendingRequest) {
-        if pending.response.is_closed() {
+    fn queue_or_dispatch_request(&mut self, mut pending: PendingRequest) {
+        if !pending.caller_waiting() {
             return;
         }
-        self.retire_non_policy_connections(pending.peer);
-        if self.peer_has_unsettled_connections(pending.peer) {
+        if pending.deadline <= tokio::time::Instant::now() {
+            pending.finish(Err(anyhow::anyhow!("libp2p request deadline expired")));
+            return;
+        }
+        if pending.attempts >= MAX_REQUEST_TRANSPORT_ATTEMPTS {
+            pending.finish(Err(anyhow::anyhow!(
+                "libp2p request exhausted its transport attempt budget"
+            )));
+            return;
+        }
+        let peer = pending.peer;
+        self.reconcile_policy_addresses(peer);
+        let selected_tier = self.selected_transport_tier(peer);
+        let selected_connection_exists = self.healthy_connection_at_tier(peer, selected_tier, None);
+        if selected_connection_exists {
+            self.retire_non_policy_connections(peer);
+        } else {
+            self.ensure_selected_transport(peer);
+        }
+        if !selected_connection_exists || self.peer_has_unsettled_connections(peer) {
             self.queued_requests.push_back(pending);
         } else {
             self.dispatch_request(pending);
@@ -2015,11 +2199,53 @@ impl P2pEventLoop {
             .position(|pending| pending.cancellation_id == cancellation_id)
         {
             self.queued_requests.remove(position);
+            return;
+        }
+        if let Some(pending) = self
+            .pending_requests
+            .values_mut()
+            .find(|pending| pending.cancellation_id == cancellation_id)
+        {
+            pending.response.take();
         }
         // libp2p request-response has no cancellation primitive. Keep a
         // dispatched request and its permit until its terminal event so a
         // caller cannot evade the configured in-flight bound by dropping its
-        // response future. The closed response channel suppresses retries.
+        // response future. Removing the response sender suppresses retries.
+    }
+
+    fn maintain_requests(&mut self) {
+        let now = tokio::time::Instant::now();
+        let queued = self.queued_requests.len();
+        for _ in 0..queued {
+            let Some(mut pending) = self.queued_requests.pop_front() else {
+                break;
+            };
+            if !pending.caller_waiting() {
+                continue;
+            }
+            if pending.deadline <= now {
+                pending.finish(Err(anyhow::anyhow!("libp2p request deadline expired")));
+            } else {
+                self.queued_requests.push_back(pending);
+            }
+        }
+        for pending in self.pending_requests.values_mut() {
+            if pending.deadline <= now && pending.caller_waiting() {
+                pending.finish(Err(anyhow::anyhow!("libp2p request deadline expired")));
+            }
+        }
+        self.closed_connection_paths
+            .retain(|_, closed| closed.expires_at > now);
+
+        let peers = self
+            .queued_requests
+            .iter()
+            .map(|pending| pending.peer)
+            .collect::<BTreeSet<_>>();
+        for peer in peers {
+            self.drain_queued_requests(peer);
+        }
     }
 
     async fn run_inner(&mut self) -> Result<()> {
@@ -2065,17 +2291,21 @@ impl P2pEventLoop {
                 _ = self.relay_retry.tick(), if !self.relay_reservations.is_empty() => {
                     self.retry_relay_reservations();
                 }
-                _ = self.relay_retirement_tick.tick(), if !self.relay_retirement.is_empty() || !self.duplicate_retirement.is_empty() => {
+                _ = self.relay_retirement_tick.tick(), if !self.relay_retirement.is_empty() || !self.duplicate_retirement.is_empty() || !self.transport_promotions.is_empty() => {
+                    self.process_transport_promotions();
                     self.retire_idle_relay_connections();
                     self.retire_duplicate_sessions();
                 }
-                _ = self.preferred_path_retry.tick(), if !self.fallback_tiers.is_empty() => {
+                _ = self.preferred_path_retry.tick(), if !self.fallback_tiers.is_empty() || !self.connection_paths.is_empty() => {
                     self.retry_preferred_paths();
                 }
                 _ = self.learned_endpoint_expiry.tick(), if !self.learned_addresses.is_empty() || !self.opportunistic_addresses.is_empty() || !self.recovery_addresses.is_empty() || !self.recovery_quarantine.is_empty() => {
                     self.expire_learned_addresses();
                     self.expire_opportunistic_addresses();
                     self.expire_recovery_addresses();
+                }
+                _ = self.request_maintenance.tick(), if !self.queued_requests.is_empty() || !self.pending_requests.is_empty() || !self.closed_connection_paths.is_empty() => {
+                    self.maintain_requests();
                 }
                 event = self.swarm.select_next_some() => {
                     self.handle_swarm_event(event);
@@ -2152,10 +2382,7 @@ impl P2pEventLoop {
             // A circuit address contains both the relay and destination peer
             // IDs. Connectivity to the relay does not mean the destination is
             // connected, so retries must key off the terminal identity.
-            if self.swarm.is_connected(&peer) {
-                continue;
-            }
-            self.dial_selected_addresses(peer, PeerCondition::DisconnectedAndNotDialing);
+            self.ensure_selected_transport(peer);
         }
         if self.enable_dht_maintenance
             && let Err(error) = self.swarm.behaviour_mut().kademlia.bootstrap()
@@ -2182,12 +2409,26 @@ impl P2pEventLoop {
 
     fn reconcile_policy_addresses(&mut self, peer: PeerId) {
         let retained = self.retained_peer_addresses(peer);
-        let requested_tier = self.fallback_tiers.get(&peer).copied().unwrap_or(0);
-        let (selected_tier, desired) =
-            selected_policy_addresses(self.tor_mode, retained, requested_tier);
+        let tiers = policy_address_tiers(self.tor_mode, retained);
+        let requested_tier = self.selected_transport_tier(peer);
+        let requested_is_available = tiers.contains_key(&requested_tier)
+            || self.healthy_connection_at_tier(peer, requested_tier, None)
+            || self.policy_dial_exists(peer, requested_tier);
+        let selected_tier = if requested_is_available {
+            requested_tier
+        } else {
+            tiers
+                .range(requested_tier..)
+                .next()
+                .or_else(|| tiers.first_key_value())
+                .map(|(tier, _)| *tier)
+                .or_else(|| self.best_healthy_connection_tier(peer))
+                .unwrap_or(requested_tier)
+        };
+        let desired = tiers.get(&selected_tier).cloned().unwrap_or_default();
         if selected_tier == 0 {
             self.fallback_tiers.remove(&peer);
-        } else if !desired.is_empty() {
+        } else {
             self.fallback_tiers.insert(peer, selected_tier);
         }
         let previous = self
@@ -2233,24 +2474,70 @@ impl P2pEventLoop {
         Ok(())
     }
 
-    fn dial_selected_addresses(&mut self, peer: PeerId, condition: PeerCondition) {
+    fn policy_dial_exists(&self, peer: PeerId, tier: u8) -> bool {
+        self.policy_dials
+            .values()
+            .any(|dial| dial.peer == peer && dial.tier == tier)
+    }
+
+    fn start_policy_dial(
+        &mut self,
+        peer: PeerId,
+        tier: u8,
+        addresses: Vec<Multiaddr>,
+        kind: PolicyDialKind,
+    ) -> bool {
+        if addresses.is_empty() || self.policy_dial_exists(peer, tier) {
+            return false;
+        }
+        let path = address_path(&addresses[0]);
+        debug_assert!(
+            addresses
+                .iter()
+                .all(|address| path_preference_rank(self.tor_mode, address_path(address)) == tier)
+        );
+        let dial = SwarmDialOpts::peer_id(peer)
+            .addresses(addresses)
+            // Policy dials must not be suppressed by a retained fallback or
+            // an unrelated behaviour-originated dial. The map above bounds us
+            // to one explicit dial per peer/tier.
+            .condition(PeerCondition::Always)
+            .build();
+        let connection_id = dial.connection_id();
+        match self.swarm.dial(dial) {
+            Ok(()) => {
+                self.policy_dials.insert(
+                    connection_id,
+                    PolicyDial {
+                        peer,
+                        tier,
+                        path,
+                        kind,
+                    },
+                );
+                true
+            }
+            Err(error) => {
+                tracing::debug!(%peer, tier, %error, "policy-selected libp2p dial was rejected");
+                false
+            }
+        }
+    }
+
+    fn ensure_selected_transport(&mut self, peer: PeerId) {
+        let tier = self.selected_transport_tier(peer);
+        if self.healthy_connection_at_tier(peer, tier, None) || self.policy_dial_exists(peer, tier)
+        {
+            return;
+        }
         let addresses = self
             .installed_policy_addresses
             .get(&peer)
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .collect::<Vec<_>>();
-        if addresses.is_empty() {
-            return;
-        }
-        let dial = SwarmDialOpts::peer_id(peer)
-            .addresses(addresses)
-            .condition(condition)
-            .build();
-        if let Err(error) = self.swarm.dial(dial) {
-            tracing::debug!(%peer, %error, "policy-selected libp2p dial was rejected");
-        }
+            .collect();
+        self.start_policy_dial(peer, tier, addresses, PolicyDialKind::Selected);
     }
 
     fn selected_path_hint(&self, peer: PeerId) -> Option<P2pPath> {
@@ -2260,47 +2547,159 @@ impl P2pEventLoop {
 
     fn record_dial_failure(&mut self, peer: PeerId) {
         if let Some(path) = self.selected_path_hint(peer) {
-            let metrics = self.path_metrics.entry(path).or_default();
-            metrics.dial_failures = metrics.dial_failures.saturating_add(1);
+            self.record_dial_failure_path(path);
         }
     }
 
-    fn activate_fallback(&mut self, peer: PeerId) {
-        let tiers = policy_address_tiers(self.tor_mode, self.retained_peer_addresses(peer));
-        let current = self
-            .fallback_tiers
-            .get(&peer)
-            .copied()
-            .or_else(|| tiers.first_key_value().map(|(tier, _)| *tier))
-            .unwrap_or(0);
-        let Some(next) = tiers.keys().copied().find(|tier| *tier > current) else {
-            return;
+    fn record_dial_failure_path(&mut self, path: P2pPath) {
+        let metrics = self.path_metrics.entry(path).or_default();
+        metrics.dial_failures = metrics.dial_failures.saturating_add(1);
+    }
+
+    fn activate_fallback(&mut self, peer: PeerId) -> bool {
+        let current = self.selected_transport_tier(peer);
+        let mut tiers = policy_address_tiers(self.tor_mode, self.retained_peer_addresses(peer))
+            .into_keys()
+            .collect::<BTreeSet<_>>();
+        tiers.extend(
+            self.connection_paths
+                .iter()
+                .filter_map(|(connection, (candidate, path))| {
+                    (*candidate == peer && !self.connection_is_retiring_or_unhealthy(*connection))
+                        .then_some(path_preference_rank(self.tor_mode, *path))
+                }),
+        );
+        let Some(next) = tiers.into_iter().find(|tier| *tier > current) else {
+            return false;
         };
-        if self.fallback_tiers.insert(peer, next) != Some(next) {
-            tracing::info!(%peer, mode = %self.tor_mode, tier = next, "switching peer to fallback transport tier");
-            self.reconcile_policy_addresses(peer);
+        self.transport_promotions.remove(&peer);
+        self.set_transport_tier(peer, next);
+        if self.healthy_connection_at_tier(peer, next, None) {
+            self.retire_non_policy_connections(peer);
+        } else {
+            self.ensure_selected_transport(peer);
         }
-        self.dial_selected_addresses(peer, PeerCondition::DisconnectedAndNotDialing);
+        true
     }
 
     fn retry_preferred_paths(&mut self) {
         let peers = self
             .fallback_tiers
-            .iter()
-            .map(|(peer, tier)| (*peer, *tier))
-            .collect::<Vec<_>>();
-        for (peer, current_tier) in peers {
-            let tiers = policy_address_tiers(self.tor_mode, self.retained_peer_addresses(peer));
-            let addresses = next_preferred_addresses(&tiers, current_tier);
-            if addresses.is_empty() {
-                continue;
+            .keys()
+            .copied()
+            .chain(self.connection_paths.values().map(|(peer, _)| *peer))
+            .collect::<BTreeSet<_>>();
+        for peer in peers {
+            let current_tier = self.selected_transport_tier(peer);
+            if !self.healthy_connection_at_tier(peer, current_tier, None) {
+                self.ensure_selected_transport(peer);
             }
-            let dial = SwarmDialOpts::peer_id(peer)
-                .addresses(addresses)
-                .condition(PeerCondition::NotDialing)
-                .build();
-            if let Err(error) = self.swarm.dial(dial) {
-                tracing::debug!(%peer, %error, "preferred-path probe was rejected");
+            let tiers = policy_address_tiers(self.tor_mode, self.retained_peer_addresses(peer));
+            for (tier, addresses) in tiers.range(..current_tier) {
+                self.start_policy_dial(
+                    peer,
+                    *tier,
+                    addresses.iter().cloned().collect(),
+                    PolicyDialKind::PreferredProbe,
+                );
+            }
+        }
+    }
+
+    fn schedule_transport_promotion(&mut self, peer: PeerId, tier: u8) {
+        if tier >= self.selected_transport_tier(peer) {
+            return;
+        }
+        let promotion = TransportPromotion {
+            tier,
+            deadline: tokio::time::Instant::now() + TRANSPORT_PROMOTION_GRACE,
+        };
+        match self.transport_promotions.entry(peer) {
+            std::collections::hash_map::Entry::Occupied(mut entry) if tier < entry.get().tier => {
+                entry.insert(promotion);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(promotion);
+            }
+            _ => {}
+        }
+    }
+
+    fn process_transport_promotions(&mut self) {
+        let now = tokio::time::Instant::now();
+        let ready = self
+            .transport_promotions
+            .iter()
+            .filter_map(|(peer, promotion)| {
+                (promotion.deadline <= now).then_some((*peer, promotion.tier))
+            })
+            .collect::<Vec<_>>();
+        for (peer, tier) in ready {
+            self.transport_promotions.remove(&peer);
+            if self.healthy_connection_at_tier(peer, tier, None) {
+                self.set_transport_tier(peer, tier);
+                self.retire_non_policy_connections(peer);
+            }
+            self.drain_queued_requests(peer);
+        }
+    }
+
+    fn observe_established_transport(&mut self, peer: PeerId, connection: ConnectionId) {
+        self.reconcile_policy_addresses(peer);
+        let Some((_, path)) = self.connection_paths.get(&connection) else {
+            return;
+        };
+        let tier = path_preference_rank(self.tor_mode, *path);
+        let selected = self.selected_transport_tier(peer);
+        if tier < selected {
+            self.schedule_transport_promotion(peer, tier);
+        } else if tier > selected {
+            self.ensure_selected_transport(peer);
+        }
+        self.retire_non_policy_connections(peer);
+    }
+
+    fn restore_selected_transport_after_close(
+        &mut self,
+        peer: PeerId,
+        closed_path: Option<P2pPath>,
+    ) {
+        let selected = self.selected_transport_tier(peer);
+        if self.healthy_connection_at_tier(peer, selected, None) {
+            return;
+        }
+
+        // A retirement marker means "close once a replacement remains
+        // healthy". If that replacement disappeared before close began, the
+        // retained connection becomes eligible again.
+        self.duplicate_retirement
+            .retain(|connection, (candidate, _)| {
+                *candidate != peer || self.collapsing_connections.contains(connection)
+            });
+        if !self.healthy_path_exists(peer, P2pPath::HolePunched) {
+            self.relay_retirement
+                .retain(|_, (candidate, _)| *candidate != peer);
+        }
+
+        if closed_path.is_some_and(|path| path_preference_rank(self.tor_mode, path) == selected)
+            && self.activate_fallback(peer)
+        {
+            return;
+        }
+        self.reconcile_policy_addresses(peer);
+        self.ensure_selected_transport(peer);
+    }
+
+    fn fail_queued_requests(&mut self, peer: PeerId, message: &str) {
+        let queued = self.queued_requests.len();
+        for _ in 0..queued {
+            let Some(mut pending) = self.queued_requests.pop_front() else {
+                break;
+            };
+            if pending.peer == peer {
+                pending.finish(Err(anyhow::anyhow!(message.to_owned())));
+            } else {
+                self.queued_requests.push_back(pending);
             }
         }
     }
@@ -2708,8 +3107,8 @@ impl P2pEventLoop {
                         match request_hash {
                             Ok(request_hash) => {
                                 let request_bytes = cbor_wire_len(&request).unwrap_or(0);
-                                let transport_tier =
-                                    self.fallback_tiers.get(&peer).copied().unwrap_or(0);
+                                let now = tokio::time::Instant::now();
+                                let transport_tier = self.selected_transport_tier(peer);
                                 self.queue_or_dispatch_request(PendingRequest {
                                     cancellation_id,
                                     peer,
@@ -2720,8 +3119,10 @@ impl P2pEventLoop {
                                     request_hash,
                                     request_bytes,
                                     transport_tier,
-                                    started_at: tokio::time::Instant::now(),
-                                    response,
+                                    attempts: 0,
+                                    deadline: now + LOGICAL_REQUEST_TIMEOUT,
+                                    started_at: now,
+                                    response: Some(response),
                                     _permit: permit,
                                 });
                             }
@@ -2936,6 +3337,7 @@ impl P2pEventLoop {
                 match &event.result {
                     Ok(connection_id) => {
                         self.classify_dcutr_connection(event.remote_peer_id, *connection_id);
+                        self.observe_established_transport(event.remote_peer_id, *connection_id);
                         self.schedule_duplicate_session_collapse(
                             event.remote_peer_id,
                             *connection_id,
@@ -3067,6 +3469,7 @@ impl P2pEventLoop {
                 endpoint,
                 ..
             } => {
+                let policy_dial = self.policy_dials.remove(&connection_id);
                 let path = connected_point_path(&endpoint);
                 let dialer = matches!(&endpoint, ConnectedPoint::Dialer { .. });
                 // DCUtR may report the upgraded connection before or after the
@@ -3119,22 +3522,21 @@ impl P2pEventLoop {
                     tracing::warn!(%peer_id, ?path, "closing a transport-policy-forbidden session");
                     return;
                 }
-                let rank = path_preference_rank(self.tor_mode, path);
-                if self
-                    .fallback_tiers
-                    .get(&peer_id)
-                    .is_some_and(|current| rank < *current)
+                if let Some(dial) = policy_dial
+                    && (dial.peer != peer_id
+                        || path_preference_rank(self.tor_mode, path) != dial.tier)
                 {
-                    if rank == 0 {
-                        self.fallback_tiers.remove(&peer_id);
-                    } else {
-                        self.fallback_tiers.insert(peer_id, rank);
-                    }
-                    self.reconcile_policy_addresses(peer_id);
-                    tracing::info!(peer = %peer_id, ?path, "peer returned to its preferred transport path");
+                    tracing::warn!(
+                        peer = %peer_id,
+                        expected_peer = %dial.peer,
+                        expected_tier = dial.tier,
+                        ?path,
+                        "policy dial established on an unexpected peer or transport tier"
+                    );
                 }
+                self.observe_established_transport(peer_id, connection_id);
                 self.schedule_duplicate_session_collapse(peer_id, connection_id);
-                self.retire_non_policy_connections(peer_id);
+                self.drain_queued_requests(peer_id);
                 tracing::info!(peer = %peer_id, ?endpoint, "libp2p connection established");
             }
             SwarmEvent::ConnectionClosed {
@@ -3148,6 +3550,10 @@ impl P2pEventLoop {
                     .connection_paths
                     .remove(&connection_id)
                     .map(|(_, path)| path);
+                if let Some(path) = closed_path {
+                    self.remember_closed_connection_path(connection_id, peer_id, path);
+                }
+                self.policy_dials.remove(&connection_id);
                 self.connection_dialers.remove(&connection_id);
                 self.relay_retirement.remove(&connection_id);
                 self.duplicate_retirement.remove(&connection_id);
@@ -3163,26 +3569,38 @@ impl P2pEventLoop {
                 }
                 if num_established == 0 {
                     self.last_application_paths.remove(&peer_id);
-                    let current_tier = self.fallback_tiers.get(&peer_id).copied().unwrap_or(0);
-                    if !self.has_outstanding_request(peer_id)
-                        && closed_path.is_some_and(|path| {
-                            path_preference_rank(self.tor_mode, path) == current_tier
-                        })
-                    {
-                        self.activate_fallback(peer_id);
-                    }
                 }
+                if let Some(promotion) = self.transport_promotions.get(&peer_id)
+                    && !self.healthy_connection_at_tier(peer_id, promotion.tier, None)
+                {
+                    self.transport_promotions.remove(&peer_id);
+                }
+                self.restore_selected_transport_after_close(peer_id, closed_path);
                 self.drain_queued_requests(peer_id);
             }
-            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+            SwarmEvent::OutgoingConnectionError {
+                connection_id,
+                peer_id,
+                error,
+                ..
+            } => {
                 tracing::warn!(peer = ?peer_id, %error, "libp2p outgoing connection failed");
-                if let Some(peer) = peer_id
-                    && !self.swarm.is_connected(&peer)
-                {
-                    self.record_dial_failure(peer);
-                    if !self.has_outstanding_request(peer) {
-                        self.activate_fallback(peer);
+                if let Some(dial) = self.policy_dials.remove(&connection_id) {
+                    self.record_dial_failure_path(dial.path);
+                    if dial.kind == PolicyDialKind::Selected
+                        && self.selected_transport_tier(dial.peer) == dial.tier
+                        && !self.healthy_connection_at_tier(dial.peer, dial.tier, None)
+                        && !self.activate_fallback(dial.peer)
+                        && self.has_outstanding_request(dial.peer)
+                    {
+                        self.fail_queued_requests(
+                            dial.peer,
+                            "libp2p exhausted every configured transport tier",
+                        );
                     }
+                    self.drain_queued_requests(dial.peer);
+                } else if let Some(peer) = peer_id {
+                    self.record_dial_failure(peer);
                 }
             }
             _ => {}
@@ -3291,7 +3709,21 @@ impl P2pEventLoop {
                                 Err(anyhow::anyhow!("libp2p response came from the wrong peer"))
                             };
                             self.record_request_result(path, pending.started_at, result.is_ok());
-                            let _ = pending.response.send(result);
+                            if let Some(path) = path {
+                                let actual_tier = path_preference_rank(self.tor_mode, path);
+                                if actual_tier != pending.transport_tier {
+                                    tracing::warn!(
+                                        %peer,
+                                        expected_tier = pending.transport_tier,
+                                        actual_tier,
+                                        ?path,
+                                        "request succeeded on a non-selected transport tier"
+                                    );
+                                    self.observe_established_transport(peer, connection_id);
+                                }
+                            }
+                            let mut pending = pending;
+                            pending.finish(result);
                         }
                     }
                 }
@@ -3302,18 +3734,22 @@ impl P2pEventLoop {
                 request_id,
                 error,
             } => {
-                if let Some(pending) = self.pending_requests.remove(&request_id) {
-                    let path = self
-                        .application_path(connection_id)
-                        .or_else(|| self.selected_path_hint(peer));
-                    self.record_request_result(path, pending.started_at, false);
+                if let Some(mut pending) = self.pending_requests.remove(&request_id) {
+                    let path = self.request_failure_path(peer, connection_id);
+                    self.record_request_result(
+                        path.or_else(|| self.selected_path_hint(peer)),
+                        pending.started_at,
+                        false,
+                    );
 
                     let attempted_tier = pending.transport_tier;
-                    let used_wrong_tier = path.is_some_and(|path| {
-                        path_preference_rank(self.tor_mode, path) != attempted_tier
-                    });
+                    let actual_tier = path
+                        .map(|path| path_preference_rank(self.tor_mode, path))
+                        .unwrap_or(attempted_tier);
+                    let used_wrong_tier = actual_tier != attempted_tier;
 
-                    let healthy_duplicate = self.healthy_duplicate_exists(peer, connection_id);
+                    let healthy_duplicate =
+                        self.healthy_connection_at_tier(peer, attempted_tier, Some(connection_id));
                     if self
                         .connection_paths
                         .get(&connection_id)
@@ -3325,22 +3761,29 @@ impl P2pEventLoop {
                         }
                     }
 
-                    if pending.response.is_closed() {
+                    if !pending.caller_waiting() {
                         return;
                     }
-                    if !healthy_duplicate
-                        && !used_wrong_tier
-                        && self.fallback_tiers.get(&peer).copied().unwrap_or(0) <= attempted_tier
-                    {
-                        self.activate_fallback(peer);
+                    if used_wrong_tier {
+                        tracing::warn!(
+                            %peer,
+                            attempted_tier,
+                            actual_tier,
+                            ?path,
+                            "request failed on a non-selected transport tier"
+                        );
+                        self.ensure_selected_transport(peer);
+                        self.queue_or_dispatch_request(pending);
+                        return;
                     }
-                    let selected_tier = self.fallback_tiers.get(&peer).copied().unwrap_or(0);
-                    if healthy_duplicate || used_wrong_tier || selected_tier > attempted_tier {
+                    let advanced = !healthy_duplicate
+                        && self.selected_transport_tier(peer) <= attempted_tier
+                        && self.activate_fallback(peer);
+                    let selected_tier = self.selected_transport_tier(peer);
+                    if healthy_duplicate || advanced || selected_tier != attempted_tier {
                         self.queue_or_dispatch_request(pending);
                     } else {
-                        let _ = pending
-                            .response
-                            .send(Err(anyhow::anyhow!("libp2p request failed: {error}")));
+                        pending.finish(Err(anyhow::anyhow!("libp2p request failed: {error}")));
                     }
                 }
             }
@@ -3435,20 +3878,15 @@ impl P2pEventLoop {
             .min()
             .expect("two connections have a best rank");
         let deadline = tokio::time::Instant::now() + RELAY_RETIREMENT_GRACE;
-        for (connection, path, _) in &connections {
-            if path_preference_rank(self.tor_mode, *path) > best_rank {
-                self.duplicate_retirement
-                    .insert(*connection, (peer, deadline));
-            }
-        }
 
         // A relay reservation is tied to the exact outbound connection that
         // created its virtual listener, but libp2p does not expose that
         // connection ID with the listener event.  Keep equal-rank duplicate
         // sessions to configured relays: direction-based collapse could
         // otherwise select an inbound application/DHT connection and close
-        // the outbound reservation underneath every circuit using it.  Worse
-        // transport tiers remain safe to retire above.
+        // the outbound reservation underneath every circuit using it.
+        // Different transport tiers are retired separately, only after the
+        // selected-tier promotion has survived its health grace period.
         if self.relay_reservation_peers.contains(&peer) {
             return;
         }
@@ -6167,6 +6605,10 @@ mod tests {
         p2p_config.max_connections = 2;
         let (client, mut event_loop) = build_p2p(node, p2p_config).unwrap();
         let peer = KeyMaterial::from_seed(&Seed::from_bytes([80; 32])).node_id();
+        let peer_id = peer.libp2p_peer_id().unwrap();
+        event_loop
+            .connection_paths
+            .insert(ConnectionId::new_unchecked(780), (peer_id, P2pPath::Direct));
 
         let started = tokio::spawn({
             let client = client.clone();
@@ -6374,6 +6816,10 @@ mod tests {
         for address in [direct, relayed, onion] {
             event_loop.add_learned_address(peer, address).unwrap();
         }
+        let healthy_direct = ConnectionId::new_unchecked(800);
+        event_loop
+            .connection_paths
+            .insert(healthy_direct, (peer, P2pPath::Direct));
 
         let call = tokio::spawn({
             let client = client.clone();
@@ -6388,10 +6834,8 @@ mod tests {
 
         // A connection-selection race onto a non-selected tier is quarantined
         // and retried at the original tier rather than skipping a fallback.
-        let wrong_tier = ConnectionId::new_unchecked(800);
-        event_loop
-            .connection_paths
-            .insert(wrong_tier, (peer, P2pPath::RelayFallback));
+        let wrong_tier = ConnectionId::new_unchecked(801);
+        event_loop.remember_closed_connection_path(wrong_tier, peer, P2pPath::RelayFallback);
         event_loop.handle_peer_event(request_response::Event::OutboundFailure {
             peer,
             connection_id: wrong_tier,
@@ -6407,16 +6851,9 @@ mod tests {
             canonical_bytes(&event_loop.pending_requests[&after_wrong_tier].request).unwrap(),
             signed_request
         );
-        event_loop.connection_paths.clear();
 
-        let failed = ConnectionId::new_unchecked(801);
-        let healthy = ConnectionId::new_unchecked(802);
-        event_loop
-            .connection_paths
-            .insert(failed, (peer, P2pPath::Direct));
-        event_loop
-            .connection_paths
-            .insert(healthy, (peer, P2pPath::Direct));
+        let failed = ConnectionId::new_unchecked(802);
+        event_loop.remember_closed_connection_path(failed, peer, P2pPath::Direct);
         event_loop.handle_peer_event(request_response::Event::OutboundFailure {
             peer,
             connection_id: failed,
@@ -6438,14 +6875,16 @@ mod tests {
             protocol_request_id
         );
 
-        event_loop.connection_paths.clear();
-        let relay_failure = ConnectionId::new_unchecked(803);
+        event_loop.connection_paths.remove(&healthy_direct);
+        let direct_failure = ConnectionId::new_unchecked(803);
+        event_loop.remember_closed_connection_path(direct_failure, peer, P2pPath::Direct);
+        let healthy_relay = ConnectionId::new_unchecked(804);
         event_loop
             .connection_paths
-            .insert(relay_failure, (peer, P2pPath::Direct));
+            .insert(healthy_relay, (peer, P2pPath::RelayFallback));
         event_loop.handle_peer_event(request_response::Event::OutboundFailure {
             peer,
-            connection_id: relay_failure,
+            connection_id: direct_failure,
             request_id: second_outbound,
             error: request_response::OutboundFailure::Timeout,
         });
@@ -6456,14 +6895,16 @@ mod tests {
             signed_request
         );
 
-        event_loop.connection_paths.clear();
-        let tor_failure = ConnectionId::new_unchecked(804);
+        event_loop.connection_paths.remove(&healthy_relay);
+        let relay_failure = ConnectionId::new_unchecked(805);
+        event_loop.remember_closed_connection_path(relay_failure, peer, P2pPath::RelayFallback);
+        let healthy_tor = ConnectionId::new_unchecked(806);
         event_loop
             .connection_paths
-            .insert(tor_failure, (peer, P2pPath::RelayFallback));
+            .insert(healthy_tor, (peer, P2pPath::Tor));
         event_loop.handle_peer_event(request_response::Event::OutboundFailure {
             peer,
-            connection_id: tor_failure,
+            connection_id: relay_failure,
             request_id: third_outbound,
             error: request_response::OutboundFailure::Timeout,
         });
@@ -6473,16 +6914,313 @@ mod tests {
             canonical_bytes(&event_loop.pending_requests[&fourth_outbound].request).unwrap(),
             signed_request
         );
+        assert_eq!(event_loop.pending_requests[&fourth_outbound].attempts, 5);
 
-        event_loop.connection_paths.clear();
+        event_loop.connection_paths.remove(&healthy_tor);
+        let tor_failure = ConnectionId::new_unchecked(807);
+        event_loop.remember_closed_connection_path(tor_failure, peer, P2pPath::Tor);
         event_loop.handle_peer_event(request_response::Event::OutboundFailure {
             peer,
-            connection_id: ConnectionId::new_unchecked(805),
+            connection_id: tor_failure,
             request_id: fourth_outbound,
             error: request_response::OutboundFailure::Timeout,
         });
         assert!(event_loop.pending_requests.is_empty());
         assert!(call.await.unwrap().is_err());
+        assert_eq!(client.outbound_permits.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn prefer_tor_does_not_dispatch_on_a_retained_direct_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([90; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        event_loop.tor_mode = TorMode::PreferTor;
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([91; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        let direct: Multiaddr = format!("/ip4/192.0.2.90/udp/44000/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+        for address in [direct, onion_listener_address(target).unwrap()] {
+            event_loop.add_learned_address(peer, address).unwrap();
+        }
+        event_loop.set_transport_tier(peer, 0);
+        let direct_connection = ConnectionId::new_unchecked(901);
+        event_loop
+            .connection_paths
+            .insert(direct_connection, (peer, P2pPath::Direct));
+        event_loop.observe_established_transport(peer, direct_connection);
+
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(target, PeerRequest::Profile).await }
+        });
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+
+        assert!(event_loop.pending_requests.is_empty());
+        assert_eq!(event_loop.queued_requests.len(), 1);
+        assert!(event_loop.policy_dials.values().any(|dial| {
+            dial.peer == peer && dial.tier == 0 && dial.kind == PolicyDialKind::Selected
+        }));
+
+        drop(event_loop);
+        assert!(call.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn fallback_dials_advance_in_order_despite_a_retained_worse_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([92; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        event_loop.tor_mode = TorMode::Auto;
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([93; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        let relay = KeyMaterial::from_seed(&Seed::from_bytes([94; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let direct: Multiaddr = format!("/ip4/192.0.2.92/udp/44000/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+        let relayed: Multiaddr =
+            format!("/ip4/192.0.2.93/udp/44001/quic-v1/p2p/{relay}/p2p-circuit/p2p/{peer}")
+                .parse()
+                .unwrap();
+        for address in [direct, relayed, onion_listener_address(target).unwrap()] {
+            event_loop.add_learned_address(peer, address).unwrap();
+        }
+        event_loop
+            .connection_paths
+            .insert(ConnectionId::new_unchecked(921), (peer, P2pPath::Tor));
+
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(target, PeerRequest::Profile).await }
+        });
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+        assert_eq!(event_loop.queued_requests.len(), 1);
+        let direct_dial = event_loop
+            .policy_dials
+            .iter()
+            .find_map(|(connection, dial)| {
+                (dial.peer == peer && dial.tier == 0).then_some(*connection)
+            })
+            .unwrap();
+
+        event_loop.handle_swarm_event(SwarmEvent::OutgoingConnectionError {
+            connection_id: direct_dial,
+            peer_id: Some(peer),
+            error: libp2p::swarm::DialError::Aborted,
+        });
+        assert_eq!(event_loop.selected_transport_tier(peer), 1);
+        assert_eq!(event_loop.queued_requests.len(), 1);
+        let relay_dial = event_loop
+            .policy_dials
+            .iter()
+            .find_map(|(connection, dial)| {
+                (dial.peer == peer && dial.tier == 1).then_some(*connection)
+            })
+            .unwrap();
+
+        let stale_direct_dial = ConnectionId::new_unchecked(922);
+        event_loop.policy_dials.insert(
+            stale_direct_dial,
+            PolicyDial {
+                peer,
+                tier: 0,
+                path: P2pPath::Direct,
+                kind: PolicyDialKind::Selected,
+            },
+        );
+        event_loop.handle_swarm_event(SwarmEvent::OutgoingConnectionError {
+            connection_id: stale_direct_dial,
+            peer_id: Some(peer),
+            error: libp2p::swarm::DialError::Aborted,
+        });
+        assert_eq!(event_loop.selected_transport_tier(peer), 1);
+        assert!(event_loop.policy_dials.contains_key(&relay_dial));
+
+        event_loop.handle_swarm_event(SwarmEvent::OutgoingConnectionError {
+            connection_id: relay_dial,
+            peer_id: Some(peer),
+            error: libp2p::swarm::DialError::Aborted,
+        });
+        assert_eq!(event_loop.selected_transport_tier(peer), 2);
+        assert!(event_loop.queued_requests.is_empty());
+        assert_eq!(event_loop.pending_requests.len(), 1);
+
+        drop(event_loop);
+        assert!(call.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_connection_path_survives_until_outbound_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([95; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([96; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        let relay = KeyMaterial::from_seed(&Seed::from_bytes([97; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let direct: Multiaddr = format!("/ip4/192.0.2.95/udp/44000/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+        let relayed: Multiaddr =
+            format!("/ip4/192.0.2.96/udp/44001/quic-v1/p2p/{relay}/p2p-circuit/p2p/{peer}")
+                .parse()
+                .unwrap();
+        for address in [direct.clone(), relayed] {
+            event_loop.add_learned_address(peer, address).unwrap();
+        }
+        let connection = ConnectionId::new_unchecked(951);
+        event_loop
+            .connection_paths
+            .insert(connection, (peer, P2pPath::Direct));
+
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(target, PeerRequest::Profile).await }
+        });
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+        let request_id = *event_loop.pending_requests.keys().next().unwrap();
+
+        event_loop.handle_swarm_event(SwarmEvent::ConnectionClosed {
+            peer_id: peer,
+            connection_id: connection,
+            endpoint: ConnectedPoint::Dialer {
+                address: direct,
+                role_override: Endpoint::Dialer,
+                port_use: PortUse::Reuse,
+            },
+            num_established: 0,
+            cause: None,
+        });
+        assert_eq!(event_loop.selected_transport_tier(peer), 1);
+        assert!(event_loop.closed_connection_paths.contains_key(&connection));
+
+        event_loop.handle_peer_event(request_response::Event::OutboundFailure {
+            peer,
+            connection_id: connection,
+            request_id,
+            error: request_response::OutboundFailure::ConnectionClosed,
+        });
+        assert_eq!(event_loop.path_metrics[&P2pPath::Direct].requests_failed, 1);
+        assert_eq!(
+            event_loop
+                .path_metrics
+                .get(&P2pPath::RelayFallback)
+                .map_or(0, |metrics| metrics.requests_failed),
+            0
+        );
+        assert!(event_loop.pending_requests.is_empty());
+        assert_eq!(event_loop.queued_requests.len(), 1);
+
+        drop(event_loop);
+        assert!(call.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_preferred_promotion_keeps_the_retained_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([98; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (_client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([99; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        let direct: Multiaddr = format!("/ip4/192.0.2.98/udp/44000/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+        let relay = KeyMaterial::from_seed(&Seed::from_bytes([100; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let relayed: Multiaddr =
+            format!("/ip4/192.0.2.99/udp/44001/quic-v1/p2p/{relay}/p2p-circuit/p2p/{peer}")
+                .parse()
+                .unwrap();
+        for address in [direct.clone(), relayed] {
+            event_loop.add_learned_address(peer, address).unwrap();
+        }
+        event_loop.set_transport_tier(peer, 1);
+        let relay_connection = ConnectionId::new_unchecked(981);
+        let direct_connection = ConnectionId::new_unchecked(982);
+        event_loop
+            .connection_paths
+            .insert(relay_connection, (peer, P2pPath::RelayFallback));
+        event_loop
+            .connection_paths
+            .insert(direct_connection, (peer, P2pPath::Direct));
+        event_loop.observe_established_transport(peer, direct_connection);
+
+        assert_eq!(event_loop.selected_transport_tier(peer), 1);
+        assert_eq!(event_loop.transport_promotions[&peer].tier, 0);
+        assert!(
+            !event_loop
+                .duplicate_retirement
+                .contains_key(&direct_connection)
+        );
+
+        event_loop.handle_swarm_event(SwarmEvent::ConnectionClosed {
+            peer_id: peer,
+            connection_id: direct_connection,
+            endpoint: ConnectedPoint::Dialer {
+                address: direct,
+                role_override: Endpoint::Dialer,
+                port_use: PortUse::Reuse,
+            },
+            num_established: 1,
+            cause: None,
+        });
+        assert_eq!(event_loop.selected_transport_tier(peer), 1);
+        assert!(event_loop.transport_promotions.get(&peer).is_none());
+        assert!(event_loop.healthy_connection_at_tier(peer, 1, None));
+
+        event_loop.retry_preferred_paths();
+        assert!(event_loop.policy_dials.values().any(|dial| {
+            dial.peer == peer && dial.tier == 0 && dial.kind == PolicyDialKind::PreferredProbe
+        }));
+    }
+
+    #[tokio::test]
+    async fn logical_request_attempt_budget_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([101; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([102; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        event_loop
+            .connection_paths
+            .insert(ConnectionId::new_unchecked(1001), (peer, P2pPath::Direct));
+
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(target, PeerRequest::Profile).await }
+        });
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+        let request_id = *event_loop.pending_requests.keys().next().unwrap();
+        let mut pending = event_loop.pending_requests.remove(&request_id).unwrap();
+        pending.attempts = MAX_REQUEST_TRANSPORT_ATTEMPTS;
+        event_loop.queue_or_dispatch_request(pending);
+
+        let error = call.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("transport attempt budget"));
+        assert!(event_loop.pending_requests.is_empty());
+        assert!(event_loop.queued_requests.is_empty());
         assert_eq!(client.outbound_permits.available_permits(), 8);
     }
 
