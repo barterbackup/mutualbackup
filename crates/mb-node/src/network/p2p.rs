@@ -1893,6 +1893,32 @@ impl P2pEventLoop {
             })
     }
 
+    fn healthy_path_exists(&self, peer: PeerId, expected_path: P2pPath) -> bool {
+        self.connection_paths
+            .iter()
+            .any(|(connection, (candidate, path))| {
+                *candidate == peer
+                    && *path == expected_path
+                    && !self.connection_is_retiring_or_unhealthy(*connection)
+            })
+    }
+
+    fn healthy_replacement_exists(
+        &self,
+        peer: PeerId,
+        retiring: ConnectionId,
+        maximum_rank: u8,
+    ) -> bool {
+        self.connection_paths
+            .iter()
+            .any(|(connection, (candidate, path))| {
+                *connection != retiring
+                    && *candidate == peer
+                    && !self.connection_is_retiring_or_unhealthy(*connection)
+                    && path_preference_rank(self.tor_mode, *path) <= maximum_rank
+            })
+    }
+
     fn selected_transport_tier(&self, peer: PeerId) -> Option<u8> {
         let requested = self.fallback_tiers.get(&peer).copied().unwrap_or(0);
         let (tier, addresses) =
@@ -3344,27 +3370,25 @@ impl P2pEventLoop {
 
     fn retire_idle_relay_connections(&mut self) {
         let now = tokio::time::Instant::now();
-        let finished =
-            self.relay_retirement
-                .iter()
-                .filter_map(|(connection_id, (peer, deadline))| {
-                    let still_punched = self.connection_paths.values().any(|(candidate, path)| {
-                        candidate == peer && *path == P2pPath::HolePunched
-                    });
-                    if !still_punched {
-                        return Some((*connection_id, *peer, false));
-                    }
-                    let busy = self
-                        .pending_requests
+        let finished = self
+            .relay_retirement
+            .iter()
+            .filter_map(|(connection_id, (peer, deadline))| {
+                let still_punched = self.healthy_path_exists(*peer, P2pPath::HolePunched);
+                if !still_punched {
+                    return Some((*connection_id, *peer, false));
+                }
+                let busy = self
+                    .pending_requests
+                    .values()
+                    .any(|pending| pending.peer == *peer)
+                    || self
+                        .active_inbound_requests
                         .values()
-                        .any(|pending| pending.peer == *peer)
-                        || self
-                            .active_inbound_requests
-                            .values()
-                            .any(|candidate| *candidate == *peer);
-                    (*deadline <= now && !busy).then_some((*connection_id, *peer, true))
-                })
-                .collect::<Vec<_>>();
+                        .any(|candidate| *candidate == *peer);
+                (*deadline <= now && !busy).then_some((*connection_id, *peer, true))
+            })
+            .collect::<Vec<_>>();
         for (connection_id, peer, should_close) in finished {
             self.relay_retirement.remove(&connection_id);
             let mut awaiting_close = false;
@@ -3493,13 +3517,10 @@ impl P2pEventLoop {
                 let Some((_, path)) = self.connection_paths.get(connection) else {
                     return Some((*connection, *peer, false));
                 };
-                let replacement_exists = self.connection_paths.iter().any(
-                    |(candidate_connection, (candidate_peer, candidate_path))| {
-                        *candidate_connection != *connection
-                            && *candidate_peer == *peer
-                            && path_preference_rank(self.tor_mode, *candidate_path)
-                                <= path_preference_rank(self.tor_mode, *path)
-                    },
+                let replacement_exists = self.healthy_replacement_exists(
+                    *peer,
+                    *connection,
+                    path_preference_rank(self.tor_mode, *path),
                 );
                 Some((*connection, *peer, replacement_exists))
             })
@@ -6271,6 +6292,57 @@ mod tests {
         event_loop.schedule_duplicate_session_collapse(relay, inbound_duplicate);
 
         assert!(event_loop.duplicate_retirement.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retiring_and_unhealthy_connections_are_not_collapse_replacements() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([88; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let peer = KeyMaterial::from_seed(&Seed::from_bytes([89; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let (_client, mut event_loop) = build_p2p(
+            Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap())),
+            config(local_id),
+        )
+        .unwrap();
+        let retiring = ConnectionId::new_unchecked(811);
+        let candidate = ConnectionId::new_unchecked(812);
+        event_loop
+            .connection_paths
+            .insert(retiring, (peer, P2pPath::RelayFallback));
+        event_loop
+            .connection_paths
+            .insert(candidate, (peer, P2pPath::HolePunched));
+
+        assert!(event_loop.healthy_path_exists(peer, P2pPath::HolePunched));
+        assert!(event_loop.healthy_replacement_exists(
+            peer,
+            retiring,
+            path_preference_rank(event_loop.tor_mode, P2pPath::RelayFallback),
+        ));
+
+        event_loop.duplicate_retirement.insert(
+            candidate,
+            (peer, tokio::time::Instant::now() + Duration::from_secs(1)),
+        );
+        assert!(!event_loop.healthy_path_exists(peer, P2pPath::HolePunched));
+        assert!(!event_loop.healthy_replacement_exists(
+            peer,
+            retiring,
+            path_preference_rank(event_loop.tor_mode, P2pPath::RelayFallback),
+        ));
+
+        event_loop.duplicate_retirement.remove(&candidate);
+        event_loop.unhealthy_connections.insert(candidate);
+        assert!(!event_loop.healthy_path_exists(peer, P2pPath::HolePunched));
+        assert!(!event_loop.healthy_replacement_exists(
+            peer,
+            retiring,
+            path_preference_rank(event_loop.tor_mode, P2pPath::RelayFallback),
+        ));
     }
 
     #[tokio::test]
