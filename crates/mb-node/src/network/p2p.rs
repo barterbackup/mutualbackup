@@ -319,6 +319,7 @@ pub struct P2pEventLoop {
     enable_dht_maintenance: bool,
     bootstrap_retry: tokio::time::Interval,
     relay_reservations: Vec<Multiaddr>,
+    relay_reservation_peers: HashSet<PeerId>,
     relay_listeners: HashMap<ListenerId, Multiaddr>,
     active_relay_listeners: HashSet<ListenerId>,
     relay_retry: tokio::time::Interval,
@@ -609,6 +610,17 @@ fn path_preference_rank(mode: TorMode, path: P2pPath) -> u8 {
             P2pPath::Tor => 2,
         },
     }
+}
+
+fn should_retire_non_policy_connection(
+    mode: TorMode,
+    path: P2pPath,
+    selected_tier: Option<u8>,
+    selected_connection_exists: bool,
+) -> bool {
+    !transport_path_allowed(mode, path)
+        || selected_connection_exists
+            && selected_tier.is_some_and(|tier| path_preference_rank(mode, path) != tier)
 }
 
 fn address_path(address: &Multiaddr) -> P2pPath {
@@ -915,6 +927,7 @@ pub fn build_p2p_with_tor(
         bootstrap_peers.insert(peer);
     }
     let mut relay_reservations = Vec::new();
+    let mut relay_reservation_peers = HashSet::new();
     let mut relay_listeners = HashMap::new();
     for address in config
         .relay_reservation_addresses
@@ -927,6 +940,7 @@ pub fn build_p2p_with_tor(
             .entry(peer)
             .or_default()
             .insert(normalized);
+        relay_reservation_peers.insert(peer);
         let reservation = address
             .clone()
             .with(libp2p::multiaddr::Protocol::P2pCircuit);
@@ -1040,6 +1054,7 @@ pub fn build_p2p_with_tor(
             enable_dht_maintenance: config.enable_dht_maintenance,
             bootstrap_retry: retry_interval(BOOTSTRAP_RETRY_INTERVAL),
             relay_reservations,
+            relay_reservation_peers,
             relay_listeners,
             active_relay_listeners: HashSet::new(),
             relay_retry: retry_interval(RELAY_RESERVATION_RETRY_INTERVAL),
@@ -1888,6 +1903,15 @@ impl P2pEventLoop {
 
     fn retire_non_policy_connections(&mut self, peer: PeerId) {
         let selected_tier = self.selected_transport_tier(peer);
+        let selected_connection_exists = selected_tier.is_some_and(|tier| {
+            self.connection_paths
+                .iter()
+                .any(|(connection, (candidate, path))| {
+                    *candidate == peer
+                        && !self.connection_is_retiring_or_unhealthy(*connection)
+                        && path_preference_rank(self.tor_mode, *path) == tier
+                })
+        });
         let connections = self
             .connection_paths
             .iter()
@@ -1895,10 +1919,20 @@ impl P2pEventLoop {
                 if *candidate != peer || self.connection_is_retiring_or_unhealthy(*connection) {
                     return None;
                 }
-                let forbidden = !transport_path_allowed(self.tor_mode, *path);
-                let wrong_tier = selected_tier
-                    .is_some_and(|tier| path_preference_rank(self.tor_mode, *path) != tier);
-                (forbidden || wrong_tier).then_some(*connection)
+                // Address preference governs our outbound attempts.  A peer
+                // may legitimately reach us over a fallback while every
+                // preferred address we know for it is stale or unreachable.
+                // Retire that established fallback only after a healthy
+                // preferred-tier replacement actually exists; otherwise both
+                // sides can enter a close/redial loop without ever carrying
+                // an application request.
+                should_retire_non_policy_connection(
+                    self.tor_mode,
+                    *path,
+                    selected_tier,
+                    selected_connection_exists,
+                )
+                .then_some(*connection)
             })
             .collect::<Vec<_>>();
         for connection in connections {
@@ -3383,6 +3417,17 @@ impl P2pEventLoop {
                 self.duplicate_retirement
                     .insert(*connection, (peer, deadline));
             }
+        }
+
+        // A relay reservation is tied to the exact outbound connection that
+        // created its virtual listener, but libp2p does not expose that
+        // connection ID with the listener event.  Keep equal-rank duplicate
+        // sessions to configured relays: direction-based collapse could
+        // otherwise select an inbound application/DHT connection and close
+        // the outbound reservation underneath every circuit using it.  Worse
+        // transport tiers remain safe to retire above.
+        if self.relay_reservation_peers.contains(&peer) {
+            return;
         }
 
         let local_prefers_dialer = self.swarm.local_peer_id() < &peer;
@@ -5706,6 +5751,28 @@ mod tests {
         assert_eq!(next_preferred_addresses(&tiers, 1), vec![ip]);
     }
 
+    #[test]
+    fn fallback_session_waits_for_a_live_preferred_replacement_before_retirement() {
+        assert!(!should_retire_non_policy_connection(
+            TorMode::Auto,
+            P2pPath::RelayFallback,
+            Some(0),
+            false,
+        ));
+        assert!(should_retire_non_policy_connection(
+            TorMode::Auto,
+            P2pPath::RelayFallback,
+            Some(0),
+            true,
+        ));
+        assert!(should_retire_non_policy_connection(
+            TorMode::RequireTor,
+            P2pPath::RelayFallback,
+            Some(0),
+            false,
+        ));
+    }
+
     #[derive(Clone, Default)]
     struct RecordingTransport {
         dialed: Arc<Mutex<Vec<Multiaddr>>>,
@@ -6165,6 +6232,46 @@ mod tests {
 
         drop(event_loop);
         assert!(call.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn duplicate_collapse_preserves_the_connection_owning_a_relay_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([86; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let relay = KeyMaterial::from_seed(&Seed::from_bytes([87; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let relay_address: Multiaddr = format!("/ip4/192.0.2.87/udp/44000/quic-v1/p2p/{relay}")
+            .parse()
+            .unwrap();
+        let mut p2p_config = config(local_id);
+        p2p_config.relay_reservation_addresses = vec![relay_address];
+        let (_client, mut event_loop) = build_p2p(
+            Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap())),
+            p2p_config,
+        )
+        .unwrap();
+
+        let reservation_connection = ConnectionId::new_unchecked(801);
+        let inbound_duplicate = ConnectionId::new_unchecked(802);
+        event_loop
+            .connection_paths
+            .insert(reservation_connection, (relay, P2pPath::Direct));
+        event_loop
+            .connection_dialers
+            .insert(reservation_connection, true);
+        event_loop
+            .connection_paths
+            .insert(inbound_duplicate, (relay, P2pPath::Direct));
+        event_loop
+            .connection_dialers
+            .insert(inbound_duplicate, false);
+
+        event_loop.schedule_duplicate_session_collapse(relay, inbound_duplicate);
+
+        assert!(event_loop.duplicate_retirement.is_empty());
     }
 
     #[tokio::test]
