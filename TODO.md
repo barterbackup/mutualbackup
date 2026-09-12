@@ -1,5 +1,58 @@
 # Product TODO
 
+## Milestone 3 closeout — required before Milestone 4
+
+- Replace the peer-wide fallback counter plus unconstrained
+  `request_response::send_request` dispatch with transport-attempt state that is
+  bound to the connection and path actually used. Today an inbound or
+  behaviour-originated lower-priority connection can carry successful traffic
+  without entering `fallback_tiers`, so `prefer-tor` can remain on IP forever;
+  advancing fallback uses `DisconnectedAndNotDialing`, which cannot dial the
+  newly selected tier while any retained connection exists; and the retry may
+  then run over a different live tier while being labelled as the selected one.
+  Ensure that each sequential tier is genuinely attempted, reconcile every
+  established path with policy, handle successful wrong-tier traffic, and give
+  one logical request a bounded total attempt/deadline budget. Gate the direct
+  → relay → onion races with simultaneous retained and closing sessions.
+- Preserve an exact closed-connection path tombstone until all request-response
+  terminal events for that connection have been handled. Libp2p queues its
+  `OutboundFailure` while closing the connection but exposes the public
+  `ConnectionClosed` first; the current handler removes `connection_paths` and
+  later substitutes the current selected-address hint. That can charge failure
+  to the wrong transport and advance fallback even though the selected tier was
+  never tried. Test event ordering, metrics, and policy transitions rather than
+  calling the handlers in an impossible order.
+- Make a preferred-path upgrade tentative until replacement health is stable.
+  Establishing a better path currently clears or lowers the fallback tier
+  immediately. If that path dies before the retained fallback is retired, the
+  fallback is correctly kept alive but its tier is never restored, so all
+  preferred-path probing stops. Recompute active policy state after every
+  connection transition and prove that direct/DCUtR and relay upgrades resume
+  after a short-lived replacement.
+- Put the complete Arti/P2P construction phase under shutdown and timeout
+  supervision, not only the later readiness wait. Always drain an Arti runtime
+  after a readiness-channel close even when joining the P2P task returns a
+  panic, and distinguish a constructor attempt that actually launched/owns an
+  onion service from an early state-lock failure so cleanup neither races a
+  second unlock nor masks the original error. Add signal-during-construction,
+  P2P-startup-panic, failed-manual-unlock, and state-already-in-use regressions.
+- Give an acquired gateway mapping one cleanup path that runs on every exit.
+  `run_port_mapping` currently deactivates and acknowledges release only on its
+  explicit shutdown-watch branch; a P2P publication error or mapper-service
+  termination drops the client without invalidating an active PCP/NAT-PMP/UPnP
+  lease. Withdraw the libp2p address and attempt an acknowledged mapping release
+  before returning the original error, including daemon-shutdown races, and
+  cover those exits in the real mapper fixture.
+- Validate and canonicalize the complete local advertised endpoint set before
+  it is accepted for publication. Configured external onion addresses are not
+  currently checked against the seed-derived identity, a configured terminal
+  `/p2p` component may name another peer, and eight configured addresses plus
+  the generated onion or mapped address can exceed the signed protocol limit.
+  Fail invalid configuration before readiness and define deterministic bounded
+  selection/replacement for runtime-generated endpoints so guild creation,
+  join, DHT refresh, and peer exchange cannot enter a permanent publication
+  failure loop.
+
 ## Later guild geometry and coding protocol
 
 - Treat failure domain as a human-supplied correlation claim, never a generated

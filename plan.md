@@ -56,11 +56,13 @@ them as ADRs and test vectors before promising wire compatibility.
   checkpoints. Leave a compatible authorization interface for later quorum
   policies and FROST once membership and recovery policy are stable.
 
-### Implemented baseline — first usable product through the Tor beta
+### Implemented baseline — first usable product and Tor beta candidate
 
-The first usable architectural prototype, the Milestone 2 operator-configuration
-and identity-state slice, and the Milestone 3 robust-connectivity beta have
-passed their review gates. Milestone 4 is the next implementation slice.
+The first usable architectural prototype and the Milestone 2
+operator-configuration and identity-state slice have passed their review gates.
+The Milestone 3 robust-connectivity implementation and its acceptance machinery
+exist, but its closeout is reopened by the source-only review at `2ec34b3`.
+Finish the bounded corrective slice in `TODO.md` before starting Milestone 4.
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
 reflink capture, owner encryption, actual `3+2` RS, remote SQLCipher
@@ -99,7 +101,7 @@ after that repair.
 Application-transfer acceptance attributes post-baseline bulk bytes to the
 exact direct, DCUtR, or relay-fallback connection used.
 
-Milestone 3 adds an embedded, seed-bound Arti v3 onion transport to the same
+The Milestone 3 candidate adds an embedded, seed-bound Arti v3 onion transport to the same
 libp2p swarm, signed onion discovery and peer exchange, explicit transport
 policy, supervised Tor readiness, automatic request fallback across transport
 tiers, and optional gateway port mapping. Its private-Tor gate performs a real
@@ -449,7 +451,9 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 2 and 3 have passed; later wire or
+than a daemon prerequisite. Milestone 2 has passed. Milestone 3 remains the
+active closeout after a later source-only review found transport-state,
+startup-cleanup, gateway-lease, and endpoint-publication defects; later wire or
 durable-state changes require the review and gate of the milestone that owns
 them.
 
@@ -664,22 +668,28 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 3 are passed. The Milestone 3
-closeout put transport policy at the real dial/session boundary, made request
-fallback connection-aware, probed every better transport tier, required a
-healthy live replacement before retiring fallback sessions, unified
-DCUtR/session telemetry, strictly validated onion endpoints, bounded untrusted
-routing hints separately, synchronized the local-control schema, and made
-daemon, Arti, and gateway-mapping shutdown explicit. The final review also
-corrected signal handling while the daemon is locked or starting and repaired
-the private-Tor acceptance path itself.
+**Current position:** Milestones 0 through 2 are passed. Milestone 3 is the
+active corrective slice. Its implementation puts policy at the composed
+transport boundary, provides Arti onion service and dialing, DHT endpoint
+exchange, direct/relay/DCUtR/onion telemetry, optional gateway mapping, and real
+acceptance environments. The source-only re-audit at `2ec34b3` nevertheless
+found that the request API is not bound to the connection tier recorded for the
+attempt; retained sessions can suppress or skip the selected fallback tier;
+closed connections lose path provenance before request failure; and a failed
+short-lived preferred replacement can strand a live fallback without further
+upgrade probes. It also found unsupervised early Arti construction and panic
+cleanup, incomplete gateway-lease cleanup on error, and late rejection of
+invalid or oversized local endpoint sets. These are current-path correctness
+defects, not deferred production hardening.
 
 The locked workspace, disposable-Btrfs/reflink and isolated IP/NAT gates, mixed
 DHT policy and three-tier fallback regressions, custom Arti-state restart, real
 NAT-PMP lifecycle, static Nix artifact, no-build Docker erase-and-seed recovery,
 and five-daemon private-Tor seed-recovery gate form the Milestone 3 acceptance
-contract. With those gates clean and no remaining high-confidence Milestone 3
-source defect, Milestone 4 is next. Guild geometry and coding-protocol changes
+contract. The next run must fix the six closeout items in `TODO.md`, add focused
+regressions for their real event order and failure schedules, rerun that complete
+contract, and pause for another source-only review. Only then may Milestone 3 be
+marked passed and Milestone 4 begin. Guild geometry and coding-protocol changes
 remain Milestone 5.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
@@ -800,7 +810,7 @@ replaced by isolated network namespaces and port-preserving NAT without
 disabling production discovery. The final source-only review found no new
 high-confidence Milestone 2 defect, and the full remote gate passed.
 
-### Milestone 3 — Tor and robust connectivity beta (passed)
+### Milestone 3 — Tor and robust connectivity beta (closeout reopened)
 
 - ADR 0001 pins and source-reviews Arti 0.46.0 and defines the transport,
   identity-key, onion-service-key, discovery, policy, and cache lifecycle
@@ -822,14 +832,17 @@ high-confidence Milestone 2 defect, and the full remote gate passed.
   bootstrap address. The recovered node begins without its old guild, endpoint,
   source, database, or Tor cache state.
 
-The corrective closeout covers behaviour-originated policy bypass, unhealthy
+The implemented corrective work covers behaviour-originated policy bypass, unhealthy
 and duplicate established sessions, single-step fallback advancement, custom
 Arti state paths, locked/startup/runtime process shutdown, canonical onion
 address handling, bounded untrusted DHT hints, and a real gateway mapper. Its
 focused regressions and complete remote acceptance contract above passed before
-the milestone was closed.
+the milestone was provisionally closed. The later source-only review found the
+remaining connection/tier state-machine, event-provenance, startup cleanup,
+gateway release, and local endpoint validation defects recorded in `TODO.md`;
+that list now defines the final corrective slice and gate.
 
-### Milestone 4 — durable operations and multi-volume storage beta (next)
+### Milestone 4 — durable operations and multi-volume storage beta (blocked by Milestone 3 closeout)
 
 - Add writer-incarnation fencing before supporting concurrent loss/recovery;
   then add retention and tombstones, safe GC, audits/scrubs, repair and emergency
