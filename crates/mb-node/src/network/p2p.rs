@@ -70,6 +70,7 @@ const LEARNED_ENDPOINT_EXPIRY_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_DHT_RECORDS_PER_QUERY: usize = 64;
 const MAX_DHT_PROVIDERS_PER_QUERY: usize = 64;
 const MAX_LEARNED_ENDPOINT_PEERS: usize = 1_024;
+const MAX_OPPORTUNISTIC_ENDPOINT_PEERS: usize = 256;
 const MAX_ENDPOINTS_PER_PEER: usize = 8;
 const MAX_RECOVERY_ADDRESS_SCOPES: usize = 4;
 const MAX_RECOVERY_ADDRESS_PEERS: usize = 64;
@@ -329,6 +330,7 @@ pub struct P2pEventLoop {
     fallback_tiers: HashMap<PeerId, u8>,
     preferred_path_retry: tokio::time::Interval,
     learned_addresses: HashMap<PeerId, LearnedAddresses>,
+    opportunistic_addresses: HashMap<PeerId, LearnedAddresses>,
     recovery_addresses: HashMap<Uuid, RecoveryAddresses>,
     recovery_quarantine: HashMap<PeerId, tokio::time::Instant>,
     learned_endpoint_expiry: tokio::time::Interval,
@@ -1049,6 +1051,7 @@ pub fn build_p2p_with_tor(
             fallback_tiers,
             preferred_path_retry: retry_interval(PREFERRED_PATH_RETRY_INTERVAL),
             learned_addresses: HashMap::new(),
+            opportunistic_addresses: HashMap::new(),
             recovery_addresses: HashMap::new(),
             recovery_quarantine: HashMap::new(),
             learned_endpoint_expiry: retry_interval(LEARNED_ENDPOINT_EXPIRY_INTERVAL),
@@ -2010,8 +2013,9 @@ impl P2pEventLoop {
                 _ = self.preferred_path_retry.tick(), if !self.fallback_tiers.is_empty() => {
                     self.retry_preferred_paths();
                 }
-                _ = self.learned_endpoint_expiry.tick(), if !self.learned_addresses.is_empty() || !self.recovery_addresses.is_empty() || !self.recovery_quarantine.is_empty() => {
+                _ = self.learned_endpoint_expiry.tick(), if !self.learned_addresses.is_empty() || !self.opportunistic_addresses.is_empty() || !self.recovery_addresses.is_empty() || !self.recovery_quarantine.is_empty() => {
                     self.expire_learned_addresses();
+                    self.expire_opportunistic_addresses();
                     self.expire_recovery_addresses();
                 }
                 event = self.swarm.select_next_some() => {
@@ -2336,6 +2340,57 @@ impl P2pEventLoop {
         Ok(())
     }
 
+    fn remove_opportunistic_addresses(&mut self, peer: PeerId) {
+        let Some(removed) = self.opportunistic_addresses.remove(&peer) else {
+            return;
+        };
+        let retained = self
+            .installed_policy_addresses
+            .get(&peer)
+            .cloned()
+            .unwrap_or_default();
+        for address in removed.addresses.difference(&retained) {
+            self.swarm
+                .behaviour_mut()
+                .kademlia
+                .remove_address(&peer, address);
+        }
+    }
+
+    fn add_opportunistic_address(&mut self, peer: PeerId, address: Multiaddr) {
+        if !self.opportunistic_addresses.contains_key(&peer)
+            && self.opportunistic_addresses.len() >= MAX_OPPORTUNISTIC_ENDPOINT_PEERS
+            && let Some(evicted) = self
+                .opportunistic_addresses
+                .iter()
+                .min_by_key(|(_, addresses)| addresses.expires_at)
+                .map(|(peer, _)| *peer)
+        {
+            self.remove_opportunistic_addresses(evicted);
+        }
+        let addresses =
+            self.opportunistic_addresses
+                .entry(peer)
+                .or_insert_with(|| LearnedAddresses {
+                    addresses: BTreeSet::new(),
+                    expires_at: tokio::time::Instant::now() + DHT_TTL,
+                });
+        if !addresses.addresses.contains(&address)
+            && addresses.addresses.len() >= MAX_ENDPOINTS_PER_PEER
+        {
+            return;
+        }
+        addresses.addresses.insert(address.clone());
+        addresses.expires_at = tokio::time::Instant::now() + DHT_TTL;
+        // Keep these hints private to Kademlia. They let an authenticated DHT
+        // neighbour route provider and record traffic without granting that
+        // unknown peer a durable application-dial slot.
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .add_address(&peer, address);
+    }
+
     fn add_identified_address(&mut self, peer: PeerId, address: Multiaddr) -> Result<()> {
         let address = normalize_known_address(peer, address)?;
         if !address_allowed_by_tor_mode(self.tor_mode, &address) {
@@ -2354,6 +2409,7 @@ impl P2pEventLoop {
                 .read()
                 .is_ok_and(|members| members.contains(&peer));
         if authorized {
+            self.remove_opportunistic_addresses(peer);
             return self.add_learned_address(peer, address);
         }
 
@@ -2365,11 +2421,14 @@ impl P2pEventLoop {
             })
             .collect::<Vec<_>>();
         if scopes.is_empty() {
+            if self.recovery_quarantine.contains_key(&peer) {
+                return Ok(());
+            }
             // An authenticated libp2p session proves control of this Peer ID,
-            // not guild membership or authority to consume the endpoint cache.
-            // The current connection remains usable; discard its unsolicited
-            // Identify hints unless a configured/guild or recovery scope owns
-            // a bounded slot for this peer.
+            // not guild membership or authority to consume the durable
+            // endpoint cache. Retain a separately bounded, expendable
+            // Kademlia-only hint so ordinary DHT routing still works.
+            self.add_opportunistic_address(peer, address);
             return Ok(());
         }
         for scope_id in &scopes {
@@ -2382,6 +2441,7 @@ impl P2pEventLoop {
                 bail!("Identify supplied too many attempt-scoped recovery endpoints");
             }
         }
+        self.remove_opportunistic_addresses(peer);
         for scope_id in scopes {
             self.recovery_addresses
                 .get_mut(&scope_id)
@@ -2493,6 +2553,18 @@ impl P2pEventLoop {
             };
             self.reconcile_policy_addresses(peer);
             self.forget_transfer_history_if_unretained(peer);
+        }
+    }
+
+    fn expire_opportunistic_addresses(&mut self) {
+        let now = tokio::time::Instant::now();
+        let expired = self
+            .opportunistic_addresses
+            .iter()
+            .filter_map(|(peer, addresses)| (addresses.expires_at <= now).then_some(*peer))
+            .collect::<Vec<_>>();
+        for peer in expired {
+            self.remove_opportunistic_addresses(peer);
         }
     }
 
@@ -6760,6 +6832,10 @@ mod tests {
             event_loop.add_identified_address(peer, address).unwrap();
         }
         assert!(event_loop.learned_addresses.is_empty());
+        assert_eq!(
+            event_loop.opportunistic_addresses.len(),
+            MAX_OPPORTUNISTIC_ENDPOINT_PEERS
+        );
 
         let authorized = KeyMaterial::from_seed(&Seed::from_bytes([67; 32]))
             .node_id()
@@ -6776,6 +6852,7 @@ mod tests {
             event_loop.learned_addresses[&authorized].addresses,
             BTreeSet::from([address])
         );
+        assert!(!event_loop.opportunistic_addresses.contains_key(&authorized));
     }
 
     #[tokio::test]
@@ -6810,6 +6887,7 @@ mod tests {
         assert!(!event_loop.recovery_addresses.contains_key(&scope));
         assert!(event_loop.recovery_quarantine.contains_key(&peer));
         assert!(!event_loop.learned_addresses.contains_key(&peer));
+        assert!(!event_loop.opportunistic_addresses.contains_key(&peer));
         assert!(!event_loop.retains_transfer_history(peer));
     }
 
