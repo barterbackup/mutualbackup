@@ -7372,7 +7372,7 @@ mod tests {
             cause: None,
         });
         assert_eq!(event_loop.selected_transport_tier(peer), 1);
-        assert!(event_loop.transport_promotions.get(&peer).is_none());
+        assert!(!event_loop.transport_promotions.contains_key(&peer));
         assert!(event_loop.healthy_connection_at_tier(peer, 1, None));
 
         event_loop.retry_preferred_paths();
