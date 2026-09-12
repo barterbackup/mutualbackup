@@ -1,4 +1,5 @@
 use std::future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -37,29 +38,53 @@ async fn main() -> Result<()> {
     }
     let locked_data_dir = Node::lock_data_dir(&config.data_dir)?;
     let listener = bind_local_control(&config.control_socket)?;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     let (node, p2p_client, mut p2p_task, startup, tor_shutdown) = match &config.seed_file {
         Some(seed_file) => {
             let seed_file = seed_file.clone();
             let open_config = config.clone();
             let open_identity = identity.clone();
-            let node = tokio::task::spawn_blocking(move || {
+            let mut open_task = tokio::task::spawn_blocking(move || {
                 let seed =
                     read_seed(&seed_file).context("automatic recovery-string unlock failed")?;
                 open_configured_node(&open_config, &open_identity, locked_data_dir, seed)
-            })
-            .await
-            .context("automatic unlock worker failed")??;
-            start_ready_runtime(&config, &identity, node).await?
+            });
+            let node = tokio::select! {
+                result = &mut open_task => {
+                    result.context("automatic unlock worker failed")??
+                }
+                result = shutdown.as_mut() => {
+                    // A blocking task may already be running and cannot be
+                    // cancelled safely. Wait for it to release the data-dir
+                    // lock before allowing process shutdown to complete.
+                    open_task.abort();
+                    let _ = open_task.await;
+                    return result;
+                }
+            };
+            let Some(runtime) =
+                start_ready_runtime(&config, &identity, node, shutdown.as_mut()).await?
+            else {
+                return Ok(());
+            };
+            runtime
         }
         None => {
             println!("node {} locked", identity.expected_node_id);
             println!("control socket: {}", config.control_socket.display());
             loop {
-                let (node, connection) =
-                    await_manual_node(&config, &identity, locked_data_dir.clone(), &listener)
-                        .await?;
-                match start_ready_runtime(&config, &identity, node).await {
-                    Ok(runtime) => {
+                let (node, connection) = tokio::select! {
+                    result = await_manual_node(
+                        &config,
+                        &identity,
+                        locked_data_dir.clone(),
+                        &listener,
+                    ) => result?,
+                    result = shutdown.as_mut() => return result,
+                };
+                match start_ready_runtime(&config, &identity, node, shutdown.as_mut()).await {
+                    Ok(Some(runtime)) => {
                         if let Err(error) = connection
                             .respond(LocalResponse::Unlocked {
                                 node_id: identity.expected_node_id,
@@ -70,6 +95,7 @@ async fn main() -> Result<()> {
                         }
                         break runtime;
                     }
+                    Ok(None) => return Ok(()),
                     Err(error) => {
                         tracing::warn!(%error, "manual daemon unlock could not reach network readiness");
                         if let Err(response_error) = connection
@@ -126,7 +152,7 @@ async fn main() -> Result<()> {
                 .context("libp2p event-loop task failed")
                 .and_then(|result| result)
         },
-        result = shutdown_signal() => result,
+        result = shutdown.as_mut() => result,
     };
 
     if let Some(shutdown) = port_mapping_shutdown {
@@ -200,17 +226,23 @@ fn absorb_cleanup(result: &mut Result<()>, cleanup: Result<()>, operation: &'sta
     }
 }
 
-async fn start_ready_runtime(
+async fn start_ready_runtime<F>(
     config: &DaemonOptions,
     identity: &IdentityManifest,
     node: Node,
-) -> Result<(
-    Arc<Mutex<Node>>,
-    mb_node::P2pClient,
-    tokio::task::JoinHandle<Result<()>>,
-    P2pStartup,
-    Option<TorShutdownHandle>,
-)> {
+    mut shutdown: Pin<&mut F>,
+) -> Result<
+    Option<(
+        Arc<Mutex<Node>>,
+        mb_node::P2pClient,
+        tokio::task::JoinHandle<Result<()>>,
+        P2pStartup,
+        Option<TorShutdownHandle>,
+    )>,
+>
+where
+    F: future::Future<Output = Result<()>> + ?Sized,
+{
     let (node, client, mut event_loop, tor_shutdown) =
         start_node_runtime(config, identity, node).await?;
     let startup_receiver = event_loop.take_startup_receiver()?;
@@ -220,7 +252,33 @@ async fn start_ready_runtime(
     } else {
         Duration::from_secs(30)
     };
-    let startup = match tokio::time::timeout(startup_timeout, startup_receiver).await {
+    let startup_result = tokio::select! {
+        result = tokio::time::timeout(startup_timeout, startup_receiver) => result,
+        signal = shutdown.as_mut() => {
+            let mut result = signal;
+            absorb_cleanup(
+                &mut result,
+                client.shutdown().await,
+                "request libp2p shutdown during startup",
+            );
+            absorb_cleanup(
+                &mut result,
+                task.await
+                    .context("libp2p event-loop task failed during startup shutdown")
+                    .and_then(|result| result),
+                "join libp2p shutdown during startup",
+            );
+            if let Some(tor_shutdown) = tor_shutdown.as_ref() {
+                absorb_cleanup(
+                    &mut result,
+                    tor_shutdown.wait_stopped().await,
+                    "join Arti onion-service shutdown during startup",
+                );
+            }
+            return result.map(|()| None);
+        }
+    };
+    let startup = match startup_result {
         Ok(Ok(Ok(startup))) => startup,
         Ok(Ok(Err(error))) => {
             stop_failed_network_runtime(task, tor_shutdown.as_ref()).await?;
@@ -243,7 +301,7 @@ async fn start_ready_runtime(
             );
         }
     };
-    Ok((node, client, task, startup, tor_shutdown))
+    Ok(Some((node, client, task, startup, tor_shutdown)))
 }
 
 async fn stop_failed_network_runtime(

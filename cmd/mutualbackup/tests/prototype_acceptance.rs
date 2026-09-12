@@ -878,6 +878,45 @@ fn daemon_starts_locked_and_rejects_the_wrong_identity_before_opening_storage() 
     assert!(data_dir.join("control.db").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn locked_daemon_exits_cleanly_on_sigterm() {
+    let temp = tempfile::tempdir().unwrap();
+    set_private(temp.path());
+    let data_dir = temp.path().join("state");
+    let socket = temp.path().join("control.sock");
+    run_cli_with_input(
+        &[
+            os("init"),
+            os("--seed-stdin"),
+            os("--data-dir"),
+            data_dir.as_os_str().to_owned(),
+        ],
+        b"locked-signal-clean-shutdown-recovery-string-2027!",
+        CLI_TIMEOUT,
+    )
+    .unwrap();
+
+    let mut daemon = Daemon::with_args(
+        vec![
+            os("--data-dir"),
+            data_dir.as_os_str().to_owned(),
+            os("--control-socket"),
+            socket.as_os_str().to_owned(),
+            os("--failure-domain"),
+            os("locked-signal-test"),
+            os("--tor-mode"),
+            os("disable-tor"),
+            os("--listen"),
+            os("/ip4/127.0.0.1/udp/0/quic-v1"),
+        ],
+        temp.path().join("daemon.log"),
+    );
+    daemon.start();
+    assert!(wait_for_status(&socket, &mut daemon, CLI_TIMEOUT).contains("Locked"));
+    daemon.stop_gracefully();
+}
+
 #[test]
 #[ignore = "requires an explicitly provisioned reflink test filesystem"]
 fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
@@ -1743,7 +1782,7 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
             run_root.join(format!("p{index}.log")),
         );
         if index == 0 {
-            daemon.args.push(os("--start-locked"));
+            daemon.args.push(os("--locked"));
         }
         daemon.set_env("RUST_LOG", "warn");
         daemon.start();
@@ -1784,7 +1823,7 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
             .unwrap();
             daemon
                 .args
-                .retain(|argument| argument != OsStr::new("--start-locked"));
+                .retain(|argument| argument != OsStr::new("--locked"));
         }
         let status = wait_for_status_text(
             &sockets[index],
