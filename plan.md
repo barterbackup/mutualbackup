@@ -60,9 +60,11 @@ them as ADRs and test vectors before promising wire compatibility.
 
 The first usable architectural prototype and the Milestone 2
 operator-configuration and identity-state slice have passed their review gates.
-The Milestone 3 robust-connectivity implementation has also passed its repeated
-source review and full acceptance contract after its final corrective pass.
-Milestone 4 is the next implementation slice.
+The Milestone 3 robust-connectivity implementation and its earlier acceptance
+contract are complete, but a repeat source-only review at `d335984` reopened its
+gate for the focused connectivity defects recorded in `TODO.md`. Milestone 4 is
+blocked until that corrective slice passes another source review and the full
+Milestone 3 acceptance gate.
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
 reflink capture, owner encryption, actual `3+2` RS, remote SQLCipher
@@ -451,9 +453,10 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 2 and 3 have passed, and Milestone 4 is
-next. Later wire or durable-state changes require the review and gate of the
-milestone that owns them.
+than a daemon prerequisite. Milestone 2 has passed; Milestone 3 is reopened for
+its narrow connectivity corrections, and Milestone 4 is blocked until those
+corrections pass review. Later wire or durable-state changes require the review
+and gate of the milestone that owns them.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -666,8 +669,9 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 3 are passed. Milestone 4 is the next
-implementation slice. Milestone 3 puts policy at the composed
+**Current position:** Milestones 0 through 2 are passed. Milestone 3 is
+implemented but its gate is reopened; the next implementation slice is its
+corrective follow-up, not Milestone 4. Milestone 3 puts policy at the composed
 transport boundary, provides Arti onion service and dialing, DHT endpoint
 exchange, direct/relay/DCUtR/onion telemetry, optional gateway mapping, and
 real acceptance environments. Its final corrective pass binds logical requests
@@ -680,9 +684,15 @@ established preferred probe and equal-tier duplicate retirement, the
 mapper-cleanup race when its command queue was full, stale transport-tier state
 after ephemeral peer expiry or final disconnect, and incomplete validation of
 the final signed local endpoint. Focused event-order, expiry, startup, and
-publication regressions cover those corrections. The repeat source review found
-no remaining high-confidence Milestone 3 defect, and the full acceptance
-contract passed.
+publication regressions cover those corrections, and the prior full acceptance
+contract passed. The repeat review at `d335984` found that runtime endpoint
+selection can still lose Tor or suppress publication, static externals can
+misrepresent live onion/circuit reachability, bootstrap policy and shape are not
+strictly preflighted, mappings can outlive their listener, relay-reservation
+connections can be retired by transport policy, and a three-session close can
+leave redundant connections uncollapsed. Fix the high-confidence items in
+`TODO.md`, add their focused lifecycle regressions, then repeat source review
+and the complete Milestone 3 acceptance contract before opening Milestone 4.
 
 The locked workspace, disposable-Btrfs/reflink and isolated IP/NAT gates, mixed
 DHT policy and three-tier fallback regressions, custom Arti-state restart, real
@@ -809,7 +819,7 @@ replaced by isolated network namespaces and port-preserving NAT without
 disabling production discovery. The final source-only review found no new
 high-confidence Milestone 2 defect, and the full remote gate passed.
 
-### Milestone 3 — Tor and robust connectivity beta (passed)
+### Milestone 3 — Tor and robust connectivity beta (corrective follow-up required)
 
 - ADR 0001 pins and source-reviews Arti 0.46.0 and defines the transport,
   identity-key, onion-service-key, discovery, policy, and cache lifecycle
@@ -841,13 +851,16 @@ The source-only corrective passes also closed the
 established-preferred/fallback-close and equal-tier duplicate-retirement races,
 the saturated mapper-command-queue cleanup race, stale transport-tier state
 after ephemeral endpoint expiry or final disconnect, and incomplete validation
-of canonical signed local endpoints. Focused regressions, the repeated source
-review, and the full remote acceptance contract passed; no high-confidence
-Milestone 3 defect remains open.
+of canonical signed local endpoints. Focused regressions and the prior full
+remote acceptance contract passed. The later source-only review at `d335984`
+found the remaining endpoint-selection, static reachability, bootstrap,
+mapping/listener, reservation-connection, and multi-duplicate lifecycle defects
+recorded in `TODO.md`; Milestone 3 remains open until they are fixed and the
+gate is repeated.
 
 ### Milestone 4 — durable operations and multi-volume storage beta
 
-This is the next implementation milestone.
+Blocked until Milestone 3 re-closes.
 
 - Add writer-incarnation fencing before supporting concurrent loss/recovery;
   then add retention and tombstones, safe GC, audits/scrubs, repair and emergency
