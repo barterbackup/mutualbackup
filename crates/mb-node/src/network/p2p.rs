@@ -3847,6 +3847,7 @@ impl P2pEventLoop {
                 }
                 self.restore_selected_transport_after_close(peer_id, closed_path);
                 self.drain_queued_requests(peer_id);
+                self.forget_transport_selection_if_unretained(peer_id);
             }
             SwarmEvent::OutgoingConnectionError {
                 connection_id,
@@ -8440,6 +8441,45 @@ mod tests {
         assert!(event_loop.pending_requests.is_empty());
         assert!(event_loop.queued_requests.is_empty());
         assert!(call.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn fallback_tier_is_removed_when_its_last_endpoint_and_connection_are_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([111; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (_client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        event_loop.tor_mode = TorMode::Auto;
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([112; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        let onion = onion_listener_address(target).unwrap();
+        let scope = Uuid::new_v4();
+
+        event_loop
+            .add_recovery_addresses(scope, peer, vec![onion.clone()], unix_seconds() + 300)
+            .unwrap();
+        let connection = ConnectionId::new_unchecked(1102);
+        event_loop
+            .connection_paths
+            .insert(connection, (peer, P2pPath::Tor));
+
+        event_loop.clear_recovery_addresses(scope);
+        assert_eq!(event_loop.fallback_tiers.get(&peer), Some(&2));
+
+        event_loop.handle_swarm_event(SwarmEvent::ConnectionClosed {
+            peer_id: peer,
+            connection_id: connection,
+            endpoint: ConnectedPoint::Dialer {
+                address: onion,
+                role_override: Endpoint::Dialer,
+                port_use: PortUse::Reuse,
+            },
+            num_established: 0,
+            cause: None,
+        });
+
+        assert!(!event_loop.fallback_tiers.contains_key(&peer));
     }
 
     async fn listening_address(client: &P2pClient) -> Multiaddr {
