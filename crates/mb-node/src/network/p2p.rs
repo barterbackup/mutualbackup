@@ -2674,12 +2674,16 @@ impl P2pEventLoop {
             }
             let tiers = policy_address_tiers(self.tor_mode, self.retained_peer_addresses(peer));
             for (tier, addresses) in tiers.range(..current_tier) {
-                self.start_policy_dial(
-                    peer,
-                    *tier,
-                    addresses.iter().cloned().collect(),
-                    PolicyDialKind::PreferredProbe,
-                );
+                if self.healthy_connection_at_tier(peer, *tier, None) {
+                    self.schedule_transport_promotion(peer, *tier);
+                } else {
+                    self.start_policy_dial(
+                        peer,
+                        *tier,
+                        addresses.iter().cloned().collect(),
+                        PolicyDialKind::PreferredProbe,
+                    );
+                }
             }
         }
     }
@@ -2757,6 +2761,20 @@ impl P2pEventLoop {
         if !self.healthy_path_exists(peer, P2pPath::HolePunched) {
             self.relay_retirement
                 .retain(|_, (candidate, _)| *candidate != peer);
+        }
+
+        // A preferred probe may already have produced a usable connection
+        // when the selected fallback disappears. There is no older selected
+        // session left to protect with the promotion grace, so adopt the best
+        // healthy established tier instead of redialing a worse endpoint and
+        // leaving requests queued behind it.
+        if let Some(best) = self.best_healthy_connection_tier(peer)
+            && best < selected
+        {
+            self.transport_promotions.remove(&peer);
+            self.set_transport_tier(peer, best);
+            self.retire_non_policy_connections(peer);
+            return;
         }
 
         if closed_path.is_some_and(|path| path_preference_rank(self.tor_mode, path) == selected)
@@ -7361,6 +7379,48 @@ mod tests {
         assert!(event_loop.policy_dials.values().any(|dial| {
             dial.peer == peer && dial.tier == 0 && dial.kind == PolicyDialKind::PreferredProbe
         }));
+    }
+
+    #[tokio::test]
+    async fn selected_fallback_close_adopts_an_established_preferred_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([103; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (_client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        event_loop.tor_mode = TorMode::Auto;
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([104; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        let relay = KeyMaterial::from_seed(&Seed::from_bytes([105; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let relayed: Multiaddr =
+            format!("/ip4/192.0.2.104/udp/44001/quic-v1/p2p/{relay}/p2p-circuit/p2p/{peer}")
+                .parse()
+                .unwrap();
+        for address in [relayed, onion_listener_address(target).unwrap()] {
+            event_loop.add_learned_address(peer, address).unwrap();
+        }
+        event_loop.set_transport_tier(peer, 2);
+        let relay_connection = ConnectionId::new_unchecked(1031);
+        event_loop
+            .connection_paths
+            .insert(relay_connection, (peer, P2pPath::RelayFallback));
+        event_loop.duplicate_retirement.insert(
+            relay_connection,
+            (peer, tokio::time::Instant::now() + Duration::from_secs(1)),
+        );
+
+        event_loop.restore_selected_transport_after_close(peer, Some(P2pPath::Tor));
+
+        assert_eq!(event_loop.selected_transport_tier(peer), 1);
+        assert!(event_loop.healthy_connection_at_tier(peer, 1, None));
+        assert!(
+            !event_loop
+                .duplicate_retirement
+                .contains_key(&relay_connection)
+        );
     }
 
     #[tokio::test]
