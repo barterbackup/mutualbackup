@@ -673,9 +673,8 @@ fn next_preferred_addresses(
 ) -> Vec<Multiaddr> {
     tiers
         .range(..current_tier)
-        .next_back()
-        .map(|(_, addresses)| addresses.iter().cloned().collect())
-        .unwrap_or_default()
+        .flat_map(|(_, addresses)| addresses.iter().cloned())
+        .collect()
 }
 
 fn connected_point_path(endpoint: &ConnectedPoint) -> P2pPath {
@@ -5747,7 +5746,7 @@ mod tests {
             (2, BTreeSet::from([onion]))
         );
         let tiers = policy_address_tiers(TorMode::Auto, all);
-        assert_eq!(next_preferred_addresses(&tiers, 2), vec![relay.clone()]);
+        assert_eq!(next_preferred_addresses(&tiers, 2), vec![ip.clone(), relay]);
         assert_eq!(next_preferred_addresses(&tiers, 1), vec![ip]);
     }
 
