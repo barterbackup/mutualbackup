@@ -1,5 +1,35 @@
 # Product TODO
 
+## Milestone 3 corrective follow-up — required before Milestone 4
+
+- Validate the final canonical local endpoints that will be signed and
+  published, not only the configured address before its local `/p2p` suffix is
+  added. The current preflight accepts addresses unsupported by the composed
+  transport, unspecified IP addresses, and zero transport ports. A configured
+  external address also suppresses ordinary direct listener publication, so
+  these inputs can leave a ready daemon with no publishable endpoint or can
+  publish an endpoint that peers cannot dial. The current 512-byte check can
+  likewise pass a base address whose peer-qualified form is rejected by the
+  signed endpoint validator, causing permanent DHT and peer-exchange retries.
+  Reject unusable shapes and placeholders before network startup, enforce the
+  limit after canonical peer binding, and cover each failure mode with focused
+  startup/publication regressions.
+- Re-evaluate the selected tier after a connection close cancels obsolete
+  duplicate-retirement markers. If selected same-tier connection A closes
+  while live connection B is marked for duplicate retirement, the initial
+  health check excludes B; cleanup makes B eligible again, but the current
+  restoration path recognizes only a strictly better tier and falls through to
+  relay or onion fallback. Keep the selected tier when an equal-tier healthy
+  session becomes reusable, and reproduce the real `ConnectionClosed` then
+  request-response terminal-event order in a regression.
+- Remove transport-selection state when the last ephemeral endpoint and live
+  session for a peer disappear. Clearing or expiring a recovery/learned onion
+  endpoint currently leaves its nonzero entry in `fallback_tiers`; sequential
+  scopes with new peer IDs therefore grow this map without bound, and the
+  preferred-path timer scans every stale peer indefinitely. Preserve state only
+  while an address, connection, dial, or outstanding request still owns it, and
+  add clear/expiry regressions.
+
 ## Later guild geometry and coding protocol
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
