@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 namespace="mbpm-$$"
+gateway_namespace="mbpm-gateway-$$"
 host_veth="mph$$"
 peer_veth="mpn$$"
 fixture_pid=""
@@ -16,18 +17,25 @@ cleanup() {
     wait "$fixture_pid" 2>/dev/null
   fi
   sudo ip netns del "$namespace" 2>/dev/null
+  sudo ip netns del "$gateway_namespace" 2>/dev/null
   sudo ip link del "$host_veth" 2>/dev/null
   unlink "$events" 2>/dev/null
   rmdir "$scratch" 2>/dev/null
 }
 trap cleanup EXIT INT TERM
 
-for command in awk cargo find ip python3 sort sudo; do
+for command in awk cargo env find ip python3 setpriv sort sudo; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 1
   }
 done
+
+env_program=$(command -v env)
+python_program=$(command -v python3)
+setpriv_program=$(command -v setpriv)
+test_uid=$(id -u)
+test_gid=$(id -g)
 
 cd "$repo"
 
@@ -45,17 +53,23 @@ test_binary=$(
 }
 
 sudo ip netns add "$namespace"
+sudo ip netns add "$gateway_namespace"
 sudo ip link add "$host_veth" type veth peer name "$peer_veth"
-sudo ip addr add 10.254.93.1/30 dev "$host_veth"
-sudo ip link set "$host_veth" up
+sudo ip link set "$host_veth" netns "$gateway_namespace"
 sudo ip link set "$peer_veth" netns "$namespace"
+sudo ip netns exec "$gateway_namespace" ip link set lo up
+sudo ip netns exec "$gateway_namespace" ip addr add 10.254.93.1/30 dev "$host_veth"
+sudo ip netns exec "$gateway_namespace" ip link set "$host_veth" up
 sudo ip netns exec "$namespace" ip link set lo up
 sudo ip netns exec "$namespace" ip addr add 10.254.93.2/30 dev "$peer_veth"
 sudo ip netns exec "$namespace" ip link set "$peer_veth" up
 sudo ip netns exec "$namespace" ip route add default via 10.254.93.1
 
-python3 "$repo/scripts/nat-pmp-fixture.py" \
-  --bind 10.254.93.1 --events "$events" &
+: >"$events"
+sudo ip netns exec "$gateway_namespace" \
+  "$setpriv_program" --reuid "$test_uid" --regid "$test_gid" --clear-groups \
+  "$python_program" "$repo/scripts/nat-pmp-fixture.py" \
+    --bind 10.254.93.1 --events "$events" &
 fixture_pid=$!
 for _ in $(seq 1 50); do
   [[ -s "$events" ]] && break
@@ -66,7 +80,9 @@ done
   exit 1
 }
 
-sudo ip netns exec "$namespace" env \
+sudo ip netns exec "$namespace" \
+  "$setpriv_program" --reuid "$test_uid" --regid "$test_gid" --clear-groups \
+  "$env_program" \
   MUTUALBACKUP_NAT_PMP_CONTROL=10.254.93.1:5352 \
   MUTUALBACKUP_NAT_PMP_EVENTS="$events" \
   "$test_binary" \
