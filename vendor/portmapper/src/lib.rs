@@ -48,6 +48,11 @@ const SERVICE_CHANNEL_CAPACITY: usize = 32; // should be plenty
 /// we allow trying a mapping using said protocol.
 const UNAVAILABILITY_TRUST_DURATION: Duration = Duration::from_secs(5);
 
+/// Maximum time a port change waits for an in-flight acquisition. After this
+/// deadline a cleanup task retains the acquisition and releases any late
+/// successful result without delaying listener shutdown.
+const MAPPING_TASK_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Output of a port mapping probe.
 #[derive(Debug, Clone, PartialEq, Eq, derive_more::Display)]
 #[display("portmap={{ UPnP: {upnp}, PMP: {nat_pmp}, PCP: {pcp} }}")]
@@ -115,7 +120,9 @@ enum Message {
     /// [`Client::watch_external_address`].
     /// A value of `None` will deactivate port mapping.
     UpdateLocalPort { local_port: Option<NonZeroU16> },
-    /// Deactivate port mapping and acknowledge release of every granted lease.
+    /// Deactivate port mapping and acknowledge release of the active lease.
+    /// An acquisition that cannot settle promptly retains independent cleanup
+    /// ownership so that any late successful result is also released.
     Deactivate {
         #[debug("_")]
         result_tx: oneshot::Sender<Result<(), String>>,
@@ -269,9 +276,10 @@ impl Client {
         }
     }
 
-    /// Deactivate port mapping and wait until every acquired mapping has been
-    /// released, including a mapping whose acquisition result has not yet been
-    /// consumed by the background service.
+    /// Deactivate port mapping and wait for the active mapping to be released.
+    /// An in-flight acquisition is settled for a bounded period; if it remains
+    /// stalled, a background cleanup task retains it and releases any late
+    /// successful result.
     pub async fn deactivate_and_wait(&self) -> Result<(), DeactivateError> {
         let (result_tx, result_rx) = oneshot::channel();
         self.service_tx
@@ -487,8 +495,8 @@ pub struct Service {
     full_probe: Probe,
     /// Task attempting to get a port mapping.
     ///
-    /// A request to change the local port settles this task and releases any
-    /// mapping it acquired before the new port is applied.
+    /// A request to change the local port releases the active mapping, then
+    /// settles this task or transfers it to bounded background cleanup.
     mapping_task: Option<AbortOnDropHandle<Result<mapping::Mapping, mapping::Error>>>,
     /// Task probing the necessary protocols.
     ///
@@ -535,23 +543,29 @@ impl Service {
         Ok(())
     }
 
-    /// Settle an acquisition before changing the requested port. A successful
-    /// task may already hold a gateway lease even though `run` has not selected
-    /// its completion branch yet, so dropping the handle is not sufficient.
+    /// Settle an acquisition after withdrawing the known active lease. A
+    /// successful task may already hold a gateway lease even though `run` has
+    /// not selected its completion branch yet, so dropping the handle is not
+    /// sufficient.
     async fn settle_mapping_task(&mut self) -> Result<(), mapping::Error> {
-        let Some(task) = self.mapping_task.take() else {
+        let Some(mut task) = self.mapping_task.take() else {
             return Ok(());
         };
-        match task.await {
-            Ok(Ok(mapping)) => mapping.release().await,
-            Ok(Err(e)) => {
-                debug!("failed to get a port mapping {e}");
-                self.metrics.mapping_failures.inc();
-                Ok(())
-            }
-            Err(e) => {
-                debug!("failed to get a port mapping {e}");
-                self.metrics.mapping_failures.inc();
+        match tokio::time::timeout(MAPPING_TASK_SETTLE_TIMEOUT, &mut task).await {
+            Ok(result) => release_mapping_task_result(result, &self.metrics).await,
+            Err(_) => {
+                debug!(
+                    "mapping acquisition did not settle within {:?}; cleanup will continue in the background",
+                    MAPPING_TASK_SETTLE_TIMEOUT
+                );
+                let metrics = self.metrics.clone();
+                std::mem::drop(tokio::spawn(async move {
+                    if let Err(error) =
+                        release_mapping_task_result(task.detach().await, &metrics).await
+                    {
+                        debug!("failed to release a late port mapping {error}");
+                    }
+                }));
                 Ok(())
             }
         }
@@ -675,24 +689,21 @@ impl Service {
         if local_port != self.local_port {
             self.metrics.local_port_updates.inc();
             let old_port = std::mem::replace(&mut self.local_port, local_port);
-            let mut release_error = self.settle_mapping_task().await.err();
-            debug!(
-                "settled mapping task due to local port update. Old: {:?} New: {:?}",
-                old_port, self.local_port
-            );
-
             // get the current external port if any to try to get it again
             let external_addr = self.current_mapping.external();
 
-            // since the port has changed, the current mapping is no longer valid and should be
-            // released
-
-            if external_addr.is_some()
-                && let Err(error) = self.invalidate_mapping().await
+            // Withdraw and release the known active lease before waiting for a
+            // renewal attempt, which may be stalled in a gateway request.
+            let mut release_error = self.invalidate_mapping().await.err();
+            if let Err(error) = self.settle_mapping_task().await
                 && release_error.is_none()
             {
                 release_error = Some(error);
             }
+            debug!(
+                "settled mapping state due to local port update. Old: {:?} New: {:?}",
+                old_port, self.local_port
+            );
 
             // start a new mapping task to account for the new port if necessary
             self.get_mapping(external_addr);
@@ -848,6 +859,25 @@ impl Service {
     }
 }
 
+async fn release_mapping_task_result(
+    result: Result<Result<mapping::Mapping, mapping::Error>, tokio::task::JoinError>,
+    metrics: &Metrics,
+) -> Result<(), mapping::Error> {
+    match result {
+        Ok(Ok(mapping)) => mapping.release().await,
+        Ok(Err(error)) => {
+            debug!("failed to get a port mapping {error}");
+            metrics.mapping_failures.inc();
+            Ok(())
+        }
+        Err(error) => {
+            debug!("failed to get a port mapping {error}");
+            metrics.mapping_failures.inc();
+            Ok(())
+        }
+    }
+}
+
 /// Gets the local ip and gateway address for port mapping.
 fn ip_and_gateway() -> Result<(Ipv4Addr, Ipv4Addr), ProbeError> {
     let Some(HomeRouter { gateway, my_ip }) = HomeRouter::new() else {
@@ -875,6 +905,111 @@ fn ip_and_gateway() -> Result<(Ipv4Addr, Ipv4Addr), ProbeError> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn deactivation_releases_an_active_lease_before_a_stalled_renewal() {
+        let gateway = Ipv4Addr::new(127, 0, 0, 3);
+        let local_ip = Ipv4Addr::new(127, 0, 0, 4);
+        let local_port = NonZeroU16::new(39_452).unwrap();
+        let external_port = 45_001_u16;
+        let gateway_socket = tokio::net::UdpSocket::bind((gateway, 5351)).await.unwrap();
+        let (active_deleted_tx, active_deleted_rx) = oneshot::channel();
+        let (renewed_deleted_tx, renewed_deleted_rx) = oneshot::channel();
+        let gateway_task = tokio::spawn(async move {
+            let mut active_deleted_tx = Some(active_deleted_tx);
+            let mut renewed_deleted_tx = Some(renewed_deleted_tx);
+            let mut packet = [0_u8; 64];
+            for acquisition in 0..2 {
+                let (read, peer) = gateway_socket.recv_from(&mut packet).await.unwrap();
+                assert_eq!(&packet[..read], &[0, 0]);
+                let mut public_response = vec![0, 128, 0, 0];
+                public_response.extend_from_slice(&0_u32.to_be_bytes());
+                public_response.extend_from_slice(&[198, 51, 100, 8]);
+                gateway_socket
+                    .send_to(&public_response, peer)
+                    .await
+                    .unwrap();
+
+                let (read, peer) = gateway_socket.recv_from(&mut packet).await.unwrap();
+                assert_eq!(read, 12);
+                assert_eq!(&packet[..4], &[0, 1, 0, 0]);
+                assert_eq!(u16::from_be_bytes([packet[4], packet[5]]), local_port.get());
+                assert_ne!(u32::from_be_bytes(packet[8..12].try_into().unwrap()), 0);
+                let mut mapping_response = vec![0, 129, 0, 0];
+                mapping_response.extend_from_slice(&0_u32.to_be_bytes());
+                mapping_response.extend_from_slice(&local_port.get().to_be_bytes());
+                mapping_response.extend_from_slice(&external_port.to_be_bytes());
+                mapping_response.extend_from_slice(&7_200_u32.to_be_bytes());
+                gateway_socket
+                    .send_to(&mapping_response, peer)
+                    .await
+                    .unwrap();
+
+                let (read, _) = gateway_socket.recv_from(&mut packet).await.unwrap();
+                assert_eq!(read, 12);
+                assert_eq!(&packet[..4], &[0, 1, 0, 0]);
+                assert_eq!(u16::from_be_bytes([packet[4], packet[5]]), local_port.get());
+                assert_eq!(u16::from_be_bytes([packet[6], packet[7]]), 0);
+                assert_eq!(u32::from_be_bytes(packet[8..12].try_into().unwrap()), 0);
+                if acquisition == 0 {
+                    let _ = active_deleted_tx.take().unwrap().send(());
+                } else {
+                    let _ = renewed_deleted_tx.take().unwrap().send(());
+                }
+            }
+        });
+
+        let mapping =
+            mapping::Mapping::new_nat_pmp(Protocol::Udp, local_ip, local_port, gateway, None)
+                .await
+                .unwrap();
+        let (_service_tx, service_rx) = mpsc::channel(SERVICE_CHANNEL_CAPACITY);
+        let (mut service, external) =
+            Service::new(Config::default(), service_rx, Default::default());
+        service.local_port = Some(local_port);
+        service.current_mapping.update(Some(mapping));
+        assert!(external.borrow().is_some());
+
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let renewal = async move {
+            let _ = resume_rx.await;
+            mapping::Mapping::new_nat_pmp(
+                Protocol::Udp,
+                local_ip,
+                local_port,
+                gateway,
+                Some((
+                    Ipv4Addr::new(198, 51, 100, 8),
+                    external_port.try_into().unwrap(),
+                )),
+            )
+            .await
+        };
+        service.mapping_task = Some(AbortOnDropHandle::new(tokio::spawn(renewal)));
+
+        let cleanup_task = tokio::spawn(async move { service.update_local_port(None).await });
+        tokio::time::timeout(Duration::from_secs(1), active_deleted_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(external.borrow().is_none());
+        assert!(!cleanup_task.is_finished());
+
+        tokio::time::timeout(
+            MAPPING_TASK_SETTLE_TIMEOUT + Duration::from_secs(1),
+            cleanup_task,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        resume_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), renewed_deleted_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        gateway_task.await.unwrap();
+    }
 
     #[tokio::test]
     async fn deactivation_releases_a_nat_pmp_lease_while_acquisition_is_paused_after_grant() {
