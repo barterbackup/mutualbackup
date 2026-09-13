@@ -11,7 +11,7 @@ use mb_node::{
     WireError, bind_local_control, build_p2p_with_tor, onion_listener_address,
     run_coordinator_jobs, run_dht_publications, run_peer_exchange, run_port_mapping,
     run_relay_membership_sync, run_root_watcher, serve_local_control_on,
-    wait_for_onion_service_shutdown,
+    validate_bootstrap_addresses, wait_for_onion_service_shutdown,
 };
 use mutualbackup::{
     DaemonOptions, DaemonOptionsError, IdentityManifest, InitializationIntent, read_daemon_options,
@@ -462,7 +462,8 @@ async fn start_node_runtime(
     // validation before launching Arti.
     let listen_addresses = parse_addresses(&config.p2p_listen_addresses)?;
     let mut external_addresses = parse_addresses(&config.p2p_external_addresses)?;
-    let bootstrap_addresses = parse_addresses(&config.p2p_bootstrap_addresses)?;
+    let bootstrap_addresses =
+        validate_bootstrap_addresses(config.tor_mode, &config.p2p_bootstrap_addresses)?;
     let relay_reservation_addresses = parse_addresses(&config.p2p_relay_addresses)?;
     external_addresses = mb_node::validate_local_advertised_endpoints(
         identity.expected_node_id,

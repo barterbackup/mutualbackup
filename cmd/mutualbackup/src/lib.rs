@@ -7,7 +7,10 @@ use anyhow::{Context, Result, bail};
 use conf::Conf;
 use libp2p::Multiaddr;
 use mb_core::{NodeId, Seed};
-use mb_node::{TorMode, validate_local_advertised_endpoints, validate_port_mapping_listeners};
+use mb_node::{
+    TorMode, validate_bootstrap_addresses, validate_local_advertised_endpoints,
+    validate_port_mapping_listeners,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -189,7 +192,10 @@ impl DaemonOptions {
         let listeners = parse_addresses(&self.p2p_listen_addresses, "listen")?;
         let external = parse_addresses(&self.p2p_external_addresses, "external")?;
         let relays = parse_addresses(&self.p2p_relay_addresses, "relay")?;
-        parse_addresses(&self.p2p_bootstrap_addresses, "bootstrap")?;
+        let bootstrap = validate_bootstrap_addresses(self.tor_mode, &self.p2p_bootstrap_addresses)?;
+        if identity.intent == InitializationIntent::Recovery && bootstrap.is_empty() {
+            bail!("recovery startup requires at least one usable bootstrap/routing peer");
+        }
         validate_local_advertised_endpoints(
             identity.expected_node_id,
             self.tor_mode,
@@ -1142,6 +1148,45 @@ p2p_listen_addresses = ["/ip4/127.0.0.1/udp/1/quic-v1"]
     }
 
     #[test]
+    fn daemon_options_preflight_bootstrap_paths_and_require_one_for_recovery() {
+        let seed = Seed::from_recovery_string("correct-horse-battery-staple-2026!").unwrap();
+        let expected_node_id = mb_core::KeyMaterial::from_seed(&seed).node_id();
+        let recovery_identity = IdentityManifest {
+            format_version: 1,
+            expected_node_id,
+            intent: InitializationIntent::Recovery,
+        };
+        let mut options = read_daemon_options([
+            "mutualbackupd",
+            "--data-dir",
+            "state",
+            "--listen",
+            "/ip4/127.0.0.1/udp/44000/quic-v1",
+            "--tor-mode",
+            "disable-tor",
+        ])
+        .unwrap();
+        let error = options.validate(&recovery_identity).unwrap_err();
+        assert!(error.to_string().contains("bootstrap/routing peer"));
+
+        let peer = mb_core::KeyMaterial::from_seed(&Seed::from_bytes([43; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        options.p2p_bootstrap_addresses =
+            vec![format!("/ip4/198.51.100.1/udp/44000/quic-v1/p2p/{peer}")];
+        options.validate(&recovery_identity).unwrap();
+
+        options.p2p_bootstrap_addresses =
+            vec![format!("/ip4/0.0.0.0/udp/44000/quic-v1/p2p/{peer}")];
+        assert!(options.validate(&recovery_identity).is_err());
+        options.p2p_bootstrap_addresses =
+            vec![format!("/ip4/198.51.100.1/udp/44000/quic-v1/p2p/{peer}")];
+        options.tor_mode = TorMode::RequireTor;
+        assert!(options.validate(&recovery_identity).is_err());
+    }
+
+    #[test]
     fn tor_only_daemon_needs_no_ip_listener_and_resolves_arti_paths() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("node.toml");
@@ -1266,7 +1311,7 @@ misspelled_budget = 1024
 
     #[test]
     fn initialization_intent_controls_failure_domain_requirement() {
-        let options = read_daemon_options([
+        let mut options = read_daemon_options([
             "mutualbackupd",
             "--data-dir",
             "state",
@@ -1286,6 +1331,12 @@ misspelled_budget = 1024
             intent: InitializationIntent::Recovery,
             ..new_identity
         };
+        let bootstrap_peer = mb_core::KeyMaterial::from_seed(&Seed::from_bytes([42; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        options.p2p_bootstrap_addresses =
+            vec![format!("/ip4/127.0.0.1/udp/2/quic-v1/p2p/{bootstrap_peer}")];
         options.validate(&recovery_identity).unwrap();
     }
 

@@ -74,6 +74,7 @@ const MAX_LEARNED_ENDPOINT_PEERS: usize = 1_024;
 const MAX_OPPORTUNISTIC_ENDPOINT_PEERS: usize = 256;
 const MAX_ENDPOINTS_PER_PEER: usize = V1_MAX_ENDPOINTS_PER_PEER;
 const MAX_ENDPOINT_BYTES: usize = V1_MAX_ENDPOINT_BYTES;
+const MAX_BOOTSTRAP_ADDRESSES: usize = 64;
 const MAX_RECOVERY_ADDRESS_SCOPES: usize = 4;
 const MAX_RECOVERY_ADDRESS_PEERS: usize = 64;
 const MAX_RECOVERY_QUARANTINED_PEERS: usize =
@@ -748,12 +749,55 @@ fn connected_point_path(endpoint: &ConnectedPoint) -> P2pPath {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PublishedTransportClass {
+    Direct,
+    Relay,
+    Onion,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct AdvertisedEndpointSelection {
+    addresses: Vec<String>,
+    rejected: Vec<String>,
+}
+
+fn published_transport_class(address: &Multiaddr) -> PublishedTransportClass {
+    if is_onion_address(address) {
+        PublishedTransportClass::Onion
+    } else if address
+        .iter()
+        .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::P2pCircuit))
+    {
+        PublishedTransportClass::Relay
+    } else {
+        PublishedTransportClass::Direct
+    }
+}
+
+fn validate_local_publication_candidate(
+    peer: PeerId,
+    value: &str,
+) -> Result<(String, PublishedTransportClass)> {
+    let mut address: Multiaddr = value
+        .parse()
+        .with_context(|| format!("invalid advertised endpoint {value}"))?;
+    if address.iter().last() != Some(libp2p::multiaddr::Protocol::P2p(peer)) {
+        address.push(libp2p::multiaddr::Protocol::P2p(peer));
+    }
+    let mut address = validate_published_endpoint_for_peer(peer, &address.to_string())?;
+    address.pop();
+    let class = published_transport_class(&address);
+    Ok((address.to_string(), class))
+}
+
 fn status_advertised_addresses(
+    local_peer: PeerId,
     configured: &[Multiaddr],
     mapped: Option<&Multiaddr>,
     listen_addresses: &[String],
-) -> Vec<String> {
-    let mut advertised = if configured.is_empty() {
+) -> AdvertisedEndpointSelection {
+    let mut candidates = if configured.is_empty() {
         listen_addresses.to_vec()
     } else {
         let mut addresses = configured
@@ -774,12 +818,49 @@ fn status_advertised_addresses(
         addresses
     };
     if let Some(mapped) = mapped {
-        advertised.push(mapped.to_string());
+        candidates.push(mapped.to_string());
     }
-    advertised.sort();
-    advertised.dedup();
-    advertised.truncate(MAX_ENDPOINTS_PER_PEER);
-    advertised
+    candidates.sort();
+    candidates.dedup();
+
+    let mut valid = BTreeMap::<PublishedTransportClass, BTreeSet<String>>::new();
+    let mut rejected = Vec::new();
+    for candidate in candidates {
+        match validate_local_publication_candidate(local_peer, &candidate) {
+            Ok((address, class)) => {
+                valid.entry(class).or_default().insert(address);
+            }
+            Err(error) => rejected.push(format!(
+                "advertised endpoint candidate {candidate} was rejected: {error}"
+            )),
+        }
+    }
+
+    // Keep one deterministic address for every available transport class
+    // before filling the remaining protocol slots. Onion comes first so an
+    // enabled live fallback cannot be displaced by relay address expansion.
+    let mut selected = BTreeSet::new();
+    for class in [
+        PublishedTransportClass::Onion,
+        PublishedTransportClass::Relay,
+        PublishedTransportClass::Direct,
+    ] {
+        if let Some(address) = valid.get(&class).and_then(|addresses| addresses.first()) {
+            selected.insert(address.clone());
+        }
+    }
+    for address in valid.into_values().flatten() {
+        if selected.len() == MAX_ENDPOINTS_PER_PEER {
+            break;
+        }
+        selected.insert(address);
+    }
+    rejected.sort();
+    rejected.dedup();
+    AdvertisedEndpointSelection {
+        addresses: selected.into_iter().collect(),
+        rejected,
+    }
 }
 
 fn valid_advertised_ipv4(address: Ipv4Addr) -> bool {
@@ -794,6 +875,10 @@ fn valid_advertised_ipv6(address: Ipv6Addr) -> bool {
 /// The terminal local `/p2p` component is added and checked separately.
 fn supported_advertised_transport(address: &Multiaddr) -> bool {
     if is_canonical_onion_address(address) {
+        return true;
+    }
+
+    if supported_direct_quic_transport(address) {
         return true;
     }
 
@@ -813,16 +898,28 @@ fn supported_advertised_transport(address: &Multiaddr) -> bool {
     {
         return false;
     }
-    match protocols.next() {
-        None => true,
-        Some(libp2p::multiaddr::Protocol::P2p(_)) => {
-            matches!(
-                protocols.next(),
-                Some(libp2p::multiaddr::Protocol::P2pCircuit)
-            ) && protocols.next().is_none()
-        }
+    matches!(protocols.next(), Some(libp2p::multiaddr::Protocol::P2p(_)))
+        && matches!(
+            protocols.next(),
+            Some(libp2p::multiaddr::Protocol::P2pCircuit)
+        )
+        && protocols.next().is_none()
+}
+
+fn supported_direct_quic_transport(address: &Multiaddr) -> bool {
+    let mut protocols = address.iter();
+    let ip_is_usable = match protocols.next() {
+        Some(libp2p::multiaddr::Protocol::Ip4(address)) => valid_advertised_ipv4(address),
+        Some(libp2p::multiaddr::Protocol::Ip6(address)) => valid_advertised_ipv6(address),
         _ => false,
-    }
+    };
+    ip_is_usable
+        && matches!(
+            protocols.next(),
+            Some(libp2p::multiaddr::Protocol::Udp(port)) if port != 0
+        )
+        && matches!(protocols.next(), Some(libp2p::multiaddr::Protocol::QuicV1))
+        && protocols.next().is_none()
 }
 
 fn validate_published_endpoint_for_peer(expected_peer: PeerId, value: &str) -> Result<Multiaddr> {
@@ -852,6 +949,37 @@ fn validate_published_endpoint_for_peer(expected_peer: PeerId, value: &str) -> R
 /// Validate one exact peer-qualified value at the signed protocol boundary.
 pub(crate) fn validate_published_endpoint(node_id: NodeId, value: &str) -> Result<Multiaddr> {
     validate_published_endpoint_for_peer(node_id.libp2p_peer_id()?, value)
+}
+
+/// Strictly validate configured entry points before any network runtime starts.
+pub fn validate_bootstrap_addresses(mode: TorMode, values: &[String]) -> Result<Vec<Multiaddr>> {
+    if values.len() > MAX_BOOTSTRAP_ADDRESSES {
+        bail!(
+            "configured {} bootstrap addresses; limit is {MAX_BOOTSTRAP_ADDRESSES}",
+            values.len()
+        );
+    }
+    let mut validated = BTreeSet::new();
+    for value in values {
+        if value.is_empty() || value.len() > MAX_ENDPOINT_BYTES {
+            bail!("bootstrap address is empty or too long");
+        }
+        let address: Multiaddr = value
+            .parse()
+            .with_context(|| format!("invalid bootstrap multiaddress {value}"))?;
+        if address.to_string() != *value {
+            bail!("bootstrap address is not in canonical multiaddress form: {value}");
+        }
+        let peer = terminal_peer_id(&address)
+            .with_context(|| format!("bootstrap address has no destination peer ID: {value}"))?;
+        validate_published_endpoint_for_peer(peer, value)
+            .with_context(|| format!("invalid bootstrap address {value}"))?;
+        if !address_allowed_by_tor_mode(mode, &address) {
+            bail!("bootstrap address is incompatible with Tor mode {mode}: {value}");
+        }
+        validated.insert(address);
+    }
+    Ok(validated.into_iter().collect())
 }
 
 fn canonical_published_endpoint(node_id: NodeId, address: &Multiaddr) -> Result<String> {
@@ -911,9 +1039,9 @@ fn listener_publication_candidate(address: &Multiaddr) -> Result<Option<Multiadd
     }))
 }
 
-/// Validate every configured local endpoint against the seed-derived identity,
-/// strip a redundant terminal local peer ID, and reserve room for each
-/// runtime-generated endpoint that can be published concurrently.
+/// Validate every operator-asserted direct endpoint against the seed-derived
+/// identity and strip a redundant terminal local peer ID. Onion and relay
+/// circuit endpoints are derived only from their live runtime listeners.
 pub fn validate_local_advertised_endpoints(
     node_id: NodeId,
     mode: TorMode,
@@ -924,7 +1052,6 @@ pub fn validate_local_advertised_endpoints(
 ) -> Result<Vec<Multiaddr>> {
     let expected_peer = node_id.libp2p_peer_id()?;
     let mut canonical_external = BTreeSet::new();
-    let mut planned = BTreeSet::new();
     for configured in external_addresses {
         let mut address = configured.clone();
         if let Some(libp2p::multiaddr::Protocol::P2p(peer)) = address.iter().last() {
@@ -933,24 +1060,34 @@ pub fn validate_local_advertised_endpoints(
             }
             address.pop();
         }
-        if !onion_address_matches_node(&address, node_id) {
-            bail!("advertised onion endpoint differs from the seed-derived identity");
+        if !supported_direct_quic_transport(&address) {
+            bail!("configured external address must be a concrete IP/UDP/QUIC-v1 endpoint");
         }
-        let published = canonical_published_endpoint(node_id, &address)?;
-        if address_allowed_by_tor_mode(mode, &address) {
-            planned.insert(published);
-            canonical_external.insert(address);
+        canonical_published_endpoint(node_id, &address)?;
+        if mode.requires_tor() {
+            bail!("configured external address is incompatible with require-tor mode");
         }
+        canonical_external.insert(address);
+    }
+    if canonical_external.len() > MAX_ENDPOINTS_PER_PEER {
+        bail!(
+            "configured {} external addresses; protocol limit is {MAX_ENDPOINTS_PER_PEER}",
+            canonical_external.len()
+        );
     }
 
+    let mut has_publishable_candidate = !canonical_external.is_empty();
     for listener in listen_addresses {
         let candidate = listener_publication_candidate(listener)?;
-        if !mode.requires_tor()
-            && canonical_external.is_empty()
-            && let Some(candidate) = candidate
-        {
-            planned.insert(canonical_published_endpoint(node_id, &candidate)?);
+        if !mode.requires_tor() && canonical_external.is_empty() && candidate.is_some() {
+            has_publishable_candidate = true;
         }
+    }
+    if relay_reservation_addresses.len() > MAX_ENDPOINTS_PER_PEER {
+        bail!(
+            "configured {} relay reservation addresses; limit is {MAX_ENDPOINTS_PER_PEER}",
+            relay_reservation_addresses.len()
+        );
     }
     for relay in relay_reservation_addresses {
         let relay_peer = terminal_peer_id(relay)?;
@@ -958,24 +1095,20 @@ pub fn validate_local_advertised_endpoints(
             bail!("relay reservation address must end in its relay peer identity");
         }
         let candidate = relay.clone().with(libp2p::multiaddr::Protocol::P2pCircuit);
-        let published = canonical_published_endpoint(node_id, &candidate)?;
+        canonical_published_endpoint(node_id, &candidate)?;
         if !mode.requires_tor() {
-            planned.insert(published);
+            has_publishable_candidate = true;
         }
     }
     if mode.enabled() {
         let onion = super::onion_listener_address(node_id)?;
-        planned.insert(canonical_published_endpoint(node_id, &onion)?);
+        canonical_published_endpoint(node_id, &onion)?;
+        has_publishable_candidate = true;
     }
-    let maximum = planned
-        .len()
-        .saturating_add(usize::from(enable_port_mapping));
-    if maximum > MAX_ENDPOINTS_PER_PEER {
-        bail!(
-            "local endpoint configuration can advertise {maximum} addresses; protocol limit is {MAX_ENDPOINTS_PER_PEER}"
-        );
+    if enable_port_mapping {
+        has_publishable_candidate = true;
     }
-    if maximum == 0 {
+    if !has_publishable_candidate {
         bail!("local endpoint configuration has no publishable address");
     }
     Ok(canonical_external.into_iter().collect())
@@ -994,6 +1127,14 @@ pub fn build_p2p_with_tor(
     mut config: P2pConfig,
     tor_transport: Option<TorTransport>,
 ) -> Result<(P2pClient, P2pEventLoop)> {
+    config.bootstrap_addresses = validate_bootstrap_addresses(
+        config.tor_mode,
+        &config
+            .bootstrap_addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+    )?;
     if config.enable_port_mapping {
         if config.tor_mode.requires_tor() {
             bail!("port mapping cannot be enabled in require-tor mode");
@@ -1177,12 +1318,7 @@ pub fn build_p2p_with_tor(
         swarm.add_external_address(address.clone());
     }
     let mut persistent_addresses = HashMap::<PeerId, BTreeSet<Multiaddr>>::new();
-    let bootstrap_addresses = config
-        .bootstrap_addresses
-        .iter()
-        .filter(|address| address_allowed_by_tor_mode(config.tor_mode, address))
-        .cloned()
-        .collect::<Vec<_>>();
+    let bootstrap_addresses = config.bootstrap_addresses.clone();
     let mut bootstrap_peers = BTreeSet::new();
     for address in &bootstrap_addresses {
         let peer = terminal_peer_id(address)?;
@@ -2568,6 +2704,20 @@ impl P2pEventLoop {
         }
     }
 
+    fn current_advertised_endpoints(&self) -> AdvertisedEndpointSelection {
+        let listen_addresses = self
+            .swarm
+            .listeners()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        status_advertised_addresses(
+            *self.swarm.local_peer_id(),
+            &self.advertised_addresses,
+            self.mapped_external_address.as_ref(),
+            &listen_addresses,
+        )
+    }
+
     fn transport_degradation(&self) -> Vec<String> {
         let mut degraded = Vec::new();
         if self.active_direct_listeners.len() < self.direct_listeners.len() {
@@ -2590,6 +2740,7 @@ impl P2pEventLoop {
         if self.port_mapping_enabled && self.mapped_external_address.is_none() {
             degraded.push("automatic gateway port mapping is not active".to_owned());
         }
+        degraded.extend(self.current_advertised_endpoints().rejected);
         degraded
     }
 
@@ -3407,11 +3558,14 @@ impl P2pEventLoop {
                     .map(ToString::to_string)
                     .collect::<Vec<_>>();
                 listen_addresses.sort();
-                let advertised_addresses = status_advertised_addresses(
-                    &self.advertised_addresses,
-                    self.mapped_external_address.as_ref(),
-                    &listen_addresses,
-                );
+                let endpoint_selection = self.current_advertised_endpoints();
+                let mut degraded = self.transport_degradation();
+                // `transport_degradation` independently reports the same
+                // rejected set. Keep status stable if this command observes a
+                // listener transition between the two snapshots.
+                degraded.extend(endpoint_selection.rejected);
+                degraded.sort();
+                degraded.dedup();
                 let mut known_peers = self
                     .swarm
                     .connected_peers()
@@ -3501,9 +3655,9 @@ impl P2pEventLoop {
                         .mapped_external_address
                         .as_ref()
                         .map(ToString::to_string),
-                    degraded: self.transport_degradation(),
+                    degraded,
                     listen_addresses,
-                    advertised_addresses,
+                    advertised_addresses: endpoint_selection.addresses,
                     peers,
                     active_sessions,
                     recent_sessions,
@@ -6668,6 +6822,7 @@ mod tests {
         let external: Multiaddr = "/ip4/198.51.100.7/udp/44000/quic-v1".parse().unwrap();
         let mapped: Multiaddr = "/ip4/203.0.113.8/udp/44002/quic-v1".parse().unwrap();
         let advertised = status_advertised_addresses(
+            keys.node_id().libp2p_peer_id().unwrap(),
             std::slice::from_ref(&external),
             Some(&mapped),
             &[direct_listener, onion.clone(), relay_listener.clone()],
@@ -6679,7 +6834,8 @@ mod tests {
             relay_listener,
         ];
         expected.sort();
-        assert_eq!(advertised, expected);
+        assert_eq!(advertised.addresses, expected);
+        assert!(advertised.rejected.is_empty());
     }
 
     #[test]
@@ -6737,6 +6893,23 @@ mod tests {
             )
             .is_err()
         );
+        let configured_circuit: Multiaddr = format!(
+            "/ip4/198.51.100.2/udp/44000/quic-v1/p2p/{}/p2p-circuit",
+            other.libp2p_peer_id().unwrap()
+        )
+        .parse()
+        .unwrap();
+        assert!(
+            validate_local_advertised_endpoints(
+                node_id,
+                TorMode::Auto,
+                &[],
+                &[configured_circuit],
+                &[],
+                false,
+            )
+            .is_err()
+        );
 
         for unusable in [
             "/memory/1",
@@ -6769,15 +6942,8 @@ mod tests {
         let overlong_base = format!("{dns_prefix}{}{quic_suffix}", "a".repeat(host_len));
         assert!(overlong_base.len() <= MAX_ENDPOINT_BYTES);
         assert!(overlong_base.len() + peer_suffix.len() > MAX_ENDPOINT_BYTES);
-        let error = validate_local_advertised_endpoints(
-            node_id,
-            TorMode::DisableTor,
-            &[],
-            &[overlong_base.parse().unwrap()],
-            &[],
-            false,
-        )
-        .unwrap_err();
+        let error = validate_published_endpoint(node_id, &format!("{overlong_base}{peer_suffix}"))
+            .unwrap_err();
         assert!(error.to_string().contains("too long"));
 
         let noncanonical = format!("/ip6/0:0:0:0:0:0:0:1/udp/44000/quic-v1/p2p/{peer}");
@@ -6822,48 +6988,150 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        assert!(
-            validate_local_advertised_endpoints(node_id, TorMode::Auto, &[], &eight, &[], false,)
-                .is_err(),
-            "the generated onion endpoint must have a reserved protocol slot"
-        );
+        validate_local_advertised_endpoints(node_id, TorMode::Auto, &[], &eight, &[], false)
+            .unwrap();
+        validate_local_advertised_endpoints(node_id, TorMode::DisableTor, &[], &eight, &[], true)
+            .unwrap();
+        let mut too_many = eight.clone();
+        too_many.push("/ip4/198.51.100.3/udp/45000/quic-v1".parse().unwrap());
         assert!(
             validate_local_advertised_endpoints(
                 node_id,
                 TorMode::DisableTor,
                 &[],
-                &eight,
+                &too_many,
                 &[],
-                true,
+                false,
             )
-            .is_err(),
-            "the runtime gateway mapping must have a reserved protocol slot"
+            .is_err()
         );
 
         let overflow = status_advertised_addresses(
+            peer,
             &[],
             None,
             &(0..MAX_ENDPOINTS_PER_PEER + 3)
                 .map(|index| format!("/ip4/203.0.113.1/udp/{}/quic-v1", 45000 + index))
                 .collect::<Vec<_>>(),
         );
-        assert_eq!(overflow.len(), MAX_ENDPOINTS_PER_PEER);
-        assert!(overflow.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(overflow.addresses.len(), MAX_ENDPOINTS_PER_PEER);
+        assert!(overflow.addresses.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn runtime_endpoint_selection_preserves_classes_and_rejects_candidates_independently() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([210; 32]));
+        let local_peer = keys.node_id().libp2p_peer_id().unwrap();
+        let onion = onion_listener_address(keys.node_id()).unwrap().to_string();
+        let direct = "/ip4/198.51.100.40/udp/44000/quic-v1".to_owned();
+        let mut listeners = vec![
+            direct.clone(),
+            onion.clone(),
+            "/ip4/0.0.0.0/udp/44000/quic-v1".to_owned(),
+        ];
+        for index in 0_u8..10 {
+            let relay_peer = KeyMaterial::from_seed(&Seed::from_bytes([index + 1; 32]))
+                .node_id()
+                .libp2p_peer_id()
+                .unwrap();
+            listeners.push(format!(
+                "/ip4/192.0.2.{}/udp/{}/quic-v1/p2p/{relay_peer}/p2p-circuit",
+                index + 1,
+                45000 + u16::from(index)
+            ));
+        }
+
+        let selected = status_advertised_addresses(local_peer, &[], None, &listeners);
+        assert_eq!(selected.addresses.len(), MAX_ENDPOINTS_PER_PEER);
+        assert!(selected.addresses.contains(&onion));
+        assert!(selected.addresses.contains(&direct));
+        assert!(
+            selected
+                .addresses
+                .iter()
+                .any(|address| address.contains("/p2p-circuit"))
+        );
+        assert_eq!(selected.rejected.len(), 1);
+        assert!(selected.rejected[0].contains("0.0.0.0"));
+    }
+
+    #[test]
+    fn bootstrap_addresses_are_canonical_bounded_supported_and_policy_compatible() -> Result<()> {
+        let destination = KeyMaterial::from_seed(&Seed::from_bytes([211; 32]));
+        let destination_peer = destination.node_id().libp2p_peer_id().unwrap();
+        let relay_peer = KeyMaterial::from_seed(&Seed::from_bytes([212; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let direct = format!("/ip4/198.51.100.10/udp/44000/quic-v1/p2p/{destination_peer}");
+        let circuit = format!(
+            "/ip4/198.51.100.11/udp/44001/quic-v1/p2p/{relay_peer}/p2p-circuit/p2p/{destination_peer}"
+        );
+        let onion = onion_listener_address(destination.node_id())?
+            .with(libp2p::multiaddr::Protocol::P2p(destination_peer))
+            .to_string();
+
+        assert_eq!(
+            validate_bootstrap_addresses(
+                TorMode::Auto,
+                &[direct.clone(), circuit.clone(), onion.clone()]
+            )?
+            .len(),
+            3
+        );
+        for invalid in [
+            "/ip4/198.51.100.10/udp/44000/quic-v1".to_owned(),
+            format!("/ip4/198.51.100.10/p2p/{destination_peer}/udp/44000/quic-v1"),
+            format!("/ip4/0.0.0.0/udp/44000/quic-v1/p2p/{destination_peer}"),
+            format!("/ip4/198.51.100.10/udp/0/quic-v1/p2p/{destination_peer}"),
+            format!("/ip4/198.51.100.10/tcp/44000/p2p/{destination_peer}"),
+            format!("/ip6/0:0:0:0:0:0:0:1/udp/44000/quic-v1/p2p/{destination_peer}"),
+        ] {
+            assert!(
+                validate_bootstrap_addresses(TorMode::Auto, &[invalid.clone()]).is_err(),
+                "accepted {invalid}"
+            );
+        }
+
+        let wrong_onion = onion_listener_address(destination.node_id())?
+            .with(libp2p::multiaddr::Protocol::P2p(relay_peer))
+            .to_string();
+        assert!(validate_bootstrap_addresses(TorMode::Auto, &[wrong_onion]).is_err());
+        assert!(validate_bootstrap_addresses(TorMode::RequireTor, &[direct.clone()]).is_err());
+        assert!(validate_bootstrap_addresses(TorMode::DisableTor, &[onion]).is_err());
+        assert!(
+            validate_bootstrap_addresses(TorMode::Auto, &vec![direct; MAX_BOOTSTRAP_ADDRESSES + 1])
+                .is_err()
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn publication_revalidates_runtime_advertised_endpoints() {
+    async fn publication_rejects_one_bad_runtime_candidate_without_suppressing_valid_ones() {
         let temp = tempfile::tempdir().unwrap();
         let seed = Seed::from_bytes([204; 32]);
         let node_id = KeyMaterial::from_seed(&seed).node_id();
         let node = Node::open(temp.path().join("node"), seed).unwrap();
         let (client, mut event_loop) =
             build_p2p(Arc::new(Mutex::new(node)), config(node_id)).unwrap();
-        event_loop.advertised_addresses = vec!["/ip4/198.51.100.9/udp/0/quic-v1".parse().unwrap()];
+        event_loop.advertised_addresses = vec![
+            "/ip4/198.51.100.8/udp/44000/quic-v1".parse().unwrap(),
+            "/ip4/198.51.100.9/udp/0/quic-v1".parse().unwrap(),
+        ];
         let task = tokio::spawn(event_loop.run());
 
-        let error = available_p2p_endpoints(&client).await.unwrap_err();
-        assert!(error.to_string().contains("not usable"));
+        let endpoints = available_p2p_endpoints(&client).await.unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert!(endpoints[0].contains("198.51.100.8"));
+        assert!(
+            client
+                .status()
+                .await
+                .unwrap()
+                .degraded
+                .iter()
+                .any(|reason| reason.contains("198.51.100.9"))
+        );
 
         client.shutdown().await.unwrap();
         task.await.unwrap().unwrap();

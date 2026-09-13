@@ -56,7 +56,7 @@ pub use p2p::{
     P2pSessionHistory, P2pSessionOutcome, P2pStartup, P2pStartupReceiver, P2pStatus, build_p2p,
     build_p2p_with_tor, endpoint_record_key, recover_from_dht, recovery_bundle_key,
     recovery_mailbox_key, run_coordinator_jobs, run_dht_publications, run_peer_exchange,
-    run_relay_membership_sync, validate_local_advertised_endpoints,
+    run_relay_membership_sync, validate_bootstrap_addresses, validate_local_advertised_endpoints,
 };
 pub use port_mapping::{run_port_mapping, validate_port_mapping_listeners};
 pub use tor::{
