@@ -60,9 +60,11 @@ them as ADRs and test vectors before promising wire compatibility.
 
 The first usable architectural prototype and the Milestone 2
 operator-configuration and identity-state slice have passed their review gates.
-The Milestone 3 robust-connectivity beta has also passed its closure gate after
-correcting the three lifecycle schedules found by the source-only review of
-`a364d34..9bc793a`. Milestone 4 is next.
+The Milestone 3 robust-connectivity beta is reopened after the source-only
+review of `7d3946e..baee214` found two remaining lifecycle blockers: request
+failure can undo selection of a healthy preferred connection, and detached
+gateway cleanup does not survive daemon runtime shutdown. Resolve the
+corrective follow-up in `TODO.md` before starting Milestone 4.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -101,12 +103,14 @@ disposable-Btrfs, static-package, no-build Docker, and private-Tor gates passed
 after that repair.
 Application-transfer acceptance attributes post-baseline bulk bytes to the
 exact direct, DCUtR, or relay-fallback connection used.
-The final Milestone 3 corrective pass revives usable retiring duplicates before
+The latest Milestone 3 corrective pass revives usable retiring duplicates before
 request fallback selection, coalesces all configured addresses for one relay
 peer into one reservation lifecycle while retaining each address for dialing
 and publication, and releases an active gateway lease before bounded settlement
 of a stalled renewal. Its focused regressions and complete local closure gate
-passed.
+were recorded as passed, but the follow-up source review found that preferred
+selection can still be reversed by a later request failure and that background
+mapping cleanup is not joined before runtime teardown.
 
 Milestone 3 adds an embedded, seed-bound Arti v3 onion transport to the same
 libp2p swarm, signed onion discovery and peer exchange, explicit transport
@@ -458,10 +462,10 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 3 have passed, and Milestone 4
-is next. Later wire or durable-state changes require the review and gate of the
-milestone that owns them. Build and run all subsequent validation locally; do
-not use a remote compilation server.
+than a daemon prerequisite. Milestones 0 through 2 have passed; Milestone 3 is
+reopened for the two blockers in `TODO.md`. Later wire or durable-state changes
+require the review and gate of the milestone that owns them. Build and run all
+subsequent validation locally; do not use a remote compilation server.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -674,7 +678,8 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 3 are passed. Milestone 4 is next.
+**Current position:** Milestones 0 through 2 are passed. Milestone 3 is reopened;
+its two corrective blockers must be closed before Milestone 4.
 Milestone 3 puts policy at the composed transport boundary, provides Arti onion
 service and dialing, DHT endpoint exchange, direct/relay/DCUtR/onion telemetry,
 optional gateway mapping, and real acceptance environments. An earlier
@@ -682,12 +687,15 @@ corrective pass serializes request-scoped relay reservation lifecycles, binds
 application requests to the selected connection while retaining reservation
 fallbacks, reconciles every redundant session in the surviving duplicate set,
 and acknowledges settlement and release of gateway leases granted during
-acquisition. The final corrective pass revives retiring duplicates before
+acquisition. The latest corrective pass revives retiring duplicates before
 request fallback selection, gives multiple addresses for one relay a single
 reservation lifecycle with complete dial and publication alternatives, and
 withdraws an active gateway lease before a bounded wait on renewal. The
-follow-up source review of `7d3946e..4d48ddd` found no remaining
-high-confidence Milestone 3 blocker.
+follow-up source review of `7d3946e..baee214` found two remaining blockers:
+terminal request failure can reverse an already recovered preferred selection,
+and detached gateway cleanup can be cancelled by daemon runtime shutdown.
+`TODO.md` records the event orders, impact, and required regressions. This review
+used source only and did not rerun the earlier validation gates.
 
 The locked workspace, disposable-Btrfs/reflink and isolated IP/NAT gates, mixed
 DHT policy and three-tier fallback regressions, custom Arti-state restart, real
@@ -814,7 +822,7 @@ replaced by isolated network namespaces and port-preserving NAT without
 disabling production discovery. The final source-only review found no new
 high-confidence Milestone 2 defect, and the full remote gate passed.
 
-### Milestone 3 — Tor and robust connectivity beta (passed)
+### Milestone 3 — Tor and robust connectivity beta (reopened)
 
 - ADR 0001 pins and source-reviews Arti 0.46.0 and defines the transport,
   identity-key, onion-service-key, discovery, policy, and cache lifecycle
@@ -841,7 +849,8 @@ duplicate established sessions, sequential fallback advancement,
 request-to-transport binding, exact closed-path provenance, tentative preferred
 promotion and rollback, custom Arti state paths, supervised
 locked/startup/runtime process shutdown, initial endpoint canonicalization and
-bounds, and a real gateway mapper with acknowledged cleanup on every exit.
+bounds, and a real gateway mapper with an acknowledged cleanup path whose
+runtime-shutdown ownership still needs correction.
 Corrective passes also closed the established-preferred/fallback-close and
 equal-tier duplicate-retirement races, the saturated mapper-command-queue
 cleanup race, stale transport-tier state after ephemeral endpoint expiry or
@@ -851,22 +860,32 @@ relay reservations, dispatch application requests on an exact selected
 connection while preserving relay fallbacks, reconcile the whole surviving
 duplicate-session set, and settle and release in-flight or completed gateway
 mapping acquisitions before deactivation. Deterministic regressions cover the
-reviewed event orders and failure schedules. The closing pass also revives a
-usable retiring duplicate before timeout fallback selection, coalesces every
+previously reviewed event orders and failure schedules. The latest pass also
+revives a usable retiring duplicate before timeout fallback selection, coalesces every
 configured endpoint for one relay peer under one reservation while publishing
 all alternatives, and withdraws an active gateway lease before bounded renewal
 settlement transfers a late result to independent cleanup.
 
-The final source review of `7d3946e..4d48ddd` found no remaining
-high-confidence Milestone 3 blocker. The locked workspace tests and clippy,
-forced-local static Nix build, Docker controller safety suite,
+The follow-up source review of `7d3946e..baee214` reopens this gate. A selected
+fallback can close after a preferred probe is established; the later terminal
+request failure advances from the recovered preferred tier back to a fallback,
+potentially failing the caller despite a healthy session. Gateway deactivation
+can also acknowledge success while detached cleanup still awaits an allocation
+response; daemon runtime teardown cancels that work and can leave a granted
+lease behind. Resolve both `TODO.md` blockers, add coverage for those schedules,
+and repeat the local closure gate before marking Milestone 3 passed.
+
+Earlier validation remains historical evidence: the locked workspace tests and
+clippy, forced-local static Nix build, Docker controller safety suite,
 disposable-Btrfs and multi-process recovery suites, isolated network and
 gateway-mapping tests, private-Tor onion-only five-daemon recovery, and
-no-build Docker/Btrfs erase-and-seed recovery all passed on 2026-09-13.
+no-build Docker/Btrfs erase-and-seed recovery were recorded as passed on
+2026-09-13. No builds, tests, or acceptance environments were run for this
+source-only follow-up review.
 
 ### Milestone 4 — durable operations and multi-volume storage beta
 
-This follows the passed Milestone 3 gate.
+This follows closure of the reopened Milestone 3 gate.
 
 - Add writer-incarnation fencing before supporting concurrent loss/recovery;
   then add retention and tombstones, safe GC, audits/scrubs, repair and emergency
