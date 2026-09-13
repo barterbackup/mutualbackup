@@ -1434,19 +1434,20 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         config.enable_relay_server = true;
     });
     update_config(&configs[0], |config| {
-        // Keep production endpoint exchange and Identify active. The harness
-        // makes private listener addresses unroutable across the two NATs, so
-        // only the observed public address exchanged by DCUtR can establish
-        // the upgraded QUIC connection.
+        // Keep production endpoint exchange and Identify active. The live
+        // relay reservation publishes the circuit endpoint; the harness makes
+        // private listener addresses unroutable across the two NATs, so only
+        // the observed public address exchanged by DCUtR can establish the
+        // upgraded QUIC connection.
         config.p2p_listen_addresses = vec![coordinator_transport.clone()];
-        config.p2p_external_addresses = vec![coordinator_circuit.clone()];
+        config.p2p_external_addresses.clear();
         config.p2p_bootstrap_addresses = vec![punched_circuit.clone(), fallback_circuit.clone()];
         config.p2p_relay_addresses = vec![relay.clone()];
         config.enable_dht_maintenance = false;
     });
     update_config(&configs[3], |config| {
         config.p2p_listen_addresses = vec![punched_transport.clone()];
-        config.p2p_external_addresses = vec![punched_circuit.clone()];
+        config.p2p_external_addresses.clear();
         config.p2p_bootstrap_addresses.clear();
         config.p2p_relay_addresses = vec![relay.clone()];
         config.enable_hole_punching = true;
