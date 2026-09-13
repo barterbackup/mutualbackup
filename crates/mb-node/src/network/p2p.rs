@@ -4481,13 +4481,25 @@ impl P2pEventLoop {
             .connection_paths
             .iter()
             .filter_map(|(connection, (candidate, path))| {
-                (*candidate == peer).then_some((
+                (*candidate == peer
+                    && !self.unhealthy_connections.contains(connection)
+                    && !self.collapsing_connections.contains(connection)
+                    && !self.relay_retirement.contains_key(connection))
+                .then_some((
                     *connection,
                     *path,
                     self.connection_dialers
                         .get(connection)
                         .copied()
                         .unwrap_or(false),
+                    self.sessions
+                        .get(connection)
+                        .map(|session| session.sequence)
+                        .unwrap_or(if *connection == new_connection {
+                            u64::MAX
+                        } else {
+                            0
+                        }),
                 ))
             })
             .collect::<Vec<_>>();
@@ -4496,7 +4508,7 @@ impl P2pEventLoop {
         }
         let best_rank = connections
             .iter()
-            .map(|(_, path, _)| path_preference_rank(self.tor_mode, *path))
+            .map(|(_, path, _, _)| path_preference_rank(self.tor_mode, *path))
             .min()
             .expect("two connections have a best rank");
         let deadline = tokio::time::Instant::now() + RELAY_RETIREMENT_GRACE;
@@ -4504,11 +4516,11 @@ impl P2pEventLoop {
         // An active reservation fixes the survivor choice: keep every exact
         // owner and retire unrelated same-tier sessions around it. This rule
         // takes precedence over the ordinary peer-ID/direction tie-break.
-        if connections.iter().any(|(connection, path, _)| {
+        if connections.iter().any(|(connection, path, _, _)| {
             path_preference_rank(self.tor_mode, *path) == best_rank
                 && self.connection_owns_relay_reservation(*connection)
         }) {
-            for (connection, path, _) in &connections {
+            for (connection, path, _, _) in &connections {
                 if path_preference_rank(self.tor_mode, *path) == best_rank
                     && !self.connection_owns_relay_reservation(*connection)
                 {
@@ -4520,14 +4532,14 @@ impl P2pEventLoop {
         }
 
         let local_prefers_dialer = self.swarm.local_peer_id() < &peer;
-        let preferred_direction_exists = connections.iter().any(|(_, path, dialer)| {
+        let preferred_direction_exists = connections.iter().any(|(_, path, dialer, _)| {
             path_preference_rank(self.tor_mode, *path) == best_rank
                 && *dialer == local_prefers_dialer
         });
         if !preferred_direction_exists {
             return;
         }
-        for (connection, path, dialer) in &connections {
+        for (connection, path, dialer, _) in &connections {
             if path_preference_rank(self.tor_mode, *path) == best_rank
                 && *dialer != local_prefers_dialer
                 && !self.connection_owns_relay_reservation(*connection)
@@ -4537,36 +4549,35 @@ impl P2pEventLoop {
             }
         }
         if local_prefers_dialer {
-            let older_preferred_exists = connections.iter().any(|(connection, path, dialer)| {
-                *connection != new_connection
-                    && path_preference_rank(self.tor_mode, *path) == best_rank
-                    && *dialer
-            });
-            if older_preferred_exists
-                && self
-                    .connection_dialers
-                    .get(&new_connection)
-                    .copied()
-                    .unwrap_or(false)
-                && self
-                    .connection_paths
-                    .get(&new_connection)
-                    .is_some_and(|(_, path)| {
-                        path_preference_rank(self.tor_mode, *path) == best_rank
-                    })
-                && !self.connection_owns_relay_reservation(new_connection)
-            {
-                self.duplicate_retirement
-                    .insert(new_connection, (peer, deadline));
+            let survivor = connections
+                .iter()
+                .filter(|(connection, path, dialer, _)| {
+                    path_preference_rank(self.tor_mode, *path) == best_rank
+                        && *dialer
+                        && !self.connection_owns_relay_reservation(*connection)
+                })
+                .min_by_key(|(connection, _, _, sequence)| (*sequence, *connection))
+                .map(|(connection, _, _, _)| *connection);
+            if let Some(survivor) = survivor {
+                self.duplicate_retirement.remove(&survivor);
+                for (connection, path, dialer, _) in &connections {
+                    if *connection != survivor
+                        && path_preference_rank(self.tor_mode, *path) == best_rank
+                        && *dialer
+                        && !self.connection_owns_relay_reservation(*connection)
+                    {
+                        self.duplicate_retirement
+                            .insert(*connection, (peer, deadline));
+                    }
+                }
             }
         }
     }
 
     fn reconcile_duplicate_sessions(&mut self, peer: PeerId) {
         // Real sessions always have an opening sequence. Use the newest live
-        // candidate as the trigger so the ordinary duplicate rule retains the
-        // older preferred-direction session when more than one survives a
-        // selected-session close.
+        // candidate as the incremental trigger; the collapse routine ranks the
+        // full set and retains the oldest preferred-direction survivor.
         let newest = self
             .connection_paths
             .iter()
@@ -8241,7 +8252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selected_close_reselects_one_of_two_retiring_duplicates_without_losing_request() {
+    async fn selected_close_reselects_one_of_three_retiring_duplicates_without_losing_request() {
         let temp = tempfile::tempdir().unwrap();
         let local_seed = Seed::from_bytes([106; 32]);
         let local_id = KeyMaterial::from_seed(&local_seed).node_id();
@@ -8266,6 +8277,7 @@ mod tests {
         let selected = ConnectionId::new_unchecked(1061);
         let survivor = ConnectionId::new_unchecked(1062);
         let duplicate = ConnectionId::new_unchecked(1063);
+        let second_duplicate = ConnectionId::new_unchecked(1064);
         event_loop
             .connection_paths
             .insert(selected, (peer, P2pPath::Direct));
@@ -8275,6 +8287,9 @@ mod tests {
         event_loop
             .connection_paths
             .insert(duplicate, (peer, P2pPath::Direct));
+        event_loop
+            .connection_paths
+            .insert(second_duplicate, (peer, P2pPath::Direct));
         let local_prefers_dialer = event_loop.swarm.local_peer_id() < &peer;
         assert!(local_prefers_dialer);
         event_loop
@@ -8286,6 +8301,9 @@ mod tests {
         event_loop
             .connection_dialers
             .insert(duplicate, local_prefers_dialer);
+        event_loop
+            .connection_dialers
+            .insert(second_duplicate, local_prefers_dialer);
         event_loop.record_session_open(
             selected,
             peer,
@@ -8316,6 +8334,16 @@ mod tests {
                 P2pSessionDirection::Inbound
             },
         );
+        event_loop.record_session_open(
+            second_duplicate,
+            peer,
+            P2pPath::Direct,
+            if local_prefers_dialer {
+                P2pSessionDirection::Outbound
+            } else {
+                P2pSessionDirection::Inbound
+            },
+        );
 
         let call = tokio::spawn({
             let client = client.clone();
@@ -8330,6 +8358,10 @@ mod tests {
         );
         event_loop.duplicate_retirement.insert(
             duplicate,
+            (peer, tokio::time::Instant::now() + Duration::from_secs(1)),
+        );
+        event_loop.duplicate_retirement.insert(
+            second_duplicate,
             (peer, tokio::time::Instant::now() + Duration::from_secs(1)),
         );
 
@@ -8359,6 +8391,11 @@ mod tests {
         );
         assert!(!event_loop.duplicate_retirement.contains_key(&survivor));
         assert!(event_loop.duplicate_retirement.contains_key(&duplicate));
+        assert!(
+            event_loop
+                .duplicate_retirement
+                .contains_key(&second_duplicate)
+        );
         assert_eq!(event_loop.pending_requests.len(), 1);
         assert!(event_loop.policy_dials.values().all(|dial| dial.tier == 0));
 
@@ -8377,6 +8414,19 @@ mod tests {
             connection_id: duplicate,
             endpoint: ConnectedPoint::Listener {
                 local_addr: direct.clone(),
+                send_back_addr: direct.clone(),
+            },
+            num_established: 1,
+            cause: None,
+        });
+        assert!(event_loop.pending_requests.is_empty());
+        assert_eq!(event_loop.queued_requests.len(), 1);
+
+        event_loop.handle_swarm_event(SwarmEvent::ConnectionClosed {
+            peer_id: peer,
+            connection_id: second_duplicate,
+            endpoint: ConnectedPoint::Listener {
+                local_addr: direct.clone(),
                 send_back_addr: direct,
             },
             num_established: 1,
@@ -8388,6 +8438,64 @@ mod tests {
 
         drop(event_loop);
         assert!(call.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn selected_close_reconciles_duplicates_when_local_peer_prefers_listener() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([107; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (_client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        let peer = KeyMaterial::from_seed(&Seed::from_bytes([106; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        assert!(event_loop.swarm.local_peer_id() > &peer);
+
+        let selected = ConnectionId::new_unchecked(1071);
+        let survivor = ConnectionId::new_unchecked(1072);
+        let duplicate = ConnectionId::new_unchecked(1073);
+        let second_duplicate = ConnectionId::new_unchecked(1074);
+        for (connection, dialer) in [
+            (selected, false),
+            (survivor, false),
+            (duplicate, true),
+            (second_duplicate, true),
+        ] {
+            event_loop
+                .connection_paths
+                .insert(connection, (peer, P2pPath::Direct));
+            event_loop.connection_dialers.insert(connection, dialer);
+            event_loop.record_session_open(
+                connection,
+                peer,
+                P2pPath::Direct,
+                if dialer {
+                    P2pSessionDirection::Outbound
+                } else {
+                    P2pSessionDirection::Inbound
+                },
+            );
+        }
+        event_loop.connection_paths.remove(&selected);
+        event_loop.record_session_close(selected, false);
+        for connection in [survivor, duplicate, second_duplicate] {
+            event_loop.duplicate_retirement.insert(
+                connection,
+                (peer, tokio::time::Instant::now() + Duration::from_secs(1)),
+            );
+        }
+
+        event_loop.restore_selected_transport_after_close(peer, Some(P2pPath::Direct));
+
+        assert!(!event_loop.duplicate_retirement.contains_key(&survivor));
+        assert!(event_loop.duplicate_retirement.contains_key(&duplicate));
+        assert!(
+            event_loop
+                .duplicate_retirement
+                .contains_key(&second_duplicate)
+        );
     }
 
     #[tokio::test]
