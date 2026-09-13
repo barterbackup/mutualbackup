@@ -8350,8 +8350,9 @@ mod tests {
                 error: request_response::OutboundFailure::ConnectionClosed,
             });
             assert_eq!(event_loop.selected_transport_tier(peer), 1);
-            assert!(event_loop.pending_requests.is_empty());
-            assert_eq!(event_loop.queued_requests.len(), 1);
+            assert_eq!(next_request_dispatch(&mut event_loop).await, direct);
+            assert_eq!(event_loop.pending_requests.len(), 1);
+            assert!(event_loop.queued_requests.is_empty());
             event_loop.handle_swarm_event(SwarmEvent::ConnectionClosed {
                 peer_id: peer,
                 connection_id: tor,
@@ -8363,7 +8364,6 @@ mod tests {
                 num_established: 1,
                 cause: None,
             });
-            assert_eq!(next_request_dispatch(&mut event_loop).await, direct);
             assert_eq!(event_loop.pending_requests.len(), 1);
             assert!(event_loop.queued_requests.is_empty());
             assert!(event_loop.connection_owns_relay_reservation(direct));
