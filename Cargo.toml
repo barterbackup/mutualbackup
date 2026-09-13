@@ -71,3 +71,9 @@ zxcvbn = { version = "=3.1.1", default-features = false }
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[patch.crates-io]
+# rust-libp2p 0.56 does not expose the connection that owns a relay-v2
+# reservation.  The local patch adds that ID to reservation lifecycle events
+# so the node can fence only the owning connection during session collapse.
+libp2p-relay = { path = "vendor/libp2p-relay" }

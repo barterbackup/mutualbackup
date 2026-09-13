@@ -339,7 +339,8 @@ pub struct P2pEventLoop {
     enable_dht_maintenance: bool,
     bootstrap_retry: tokio::time::Interval,
     relay_reservations: Vec<Multiaddr>,
-    relay_reservation_peers: HashSet<PeerId>,
+    client_relay_reservation_connections: HashSet<ConnectionId>,
+    server_relay_reservation_connections: HashSet<ConnectionId>,
     relay_listeners: HashMap<ListenerId, Multiaddr>,
     active_relay_listeners: HashSet<ListenerId>,
     relay_retry: tokio::time::Interval,
@@ -1352,7 +1353,6 @@ pub fn build_p2p_with_tor(
         bootstrap_peers.insert(peer);
     }
     let mut relay_reservations = Vec::new();
-    let mut relay_reservation_peers = HashSet::new();
     let mut relay_listeners = HashMap::new();
     for address in config
         .relay_reservation_addresses
@@ -1365,7 +1365,6 @@ pub fn build_p2p_with_tor(
             .entry(peer)
             .or_default()
             .insert(normalized);
-        relay_reservation_peers.insert(peer);
         let reservation = address
             .clone()
             .with(libp2p::multiaddr::Protocol::P2pCircuit);
@@ -1510,7 +1509,8 @@ pub fn build_p2p_with_tor(
             enable_dht_maintenance: config.enable_dht_maintenance,
             bootstrap_retry: retry_interval(BOOTSTRAP_RETRY_INTERVAL),
             relay_reservations,
-            relay_reservation_peers,
+            client_relay_reservation_connections: HashSet::new(),
+            server_relay_reservation_connections: HashSet::new(),
             relay_listeners,
             active_relay_listeners: HashSet::new(),
             relay_retry: retry_interval(RELAY_RESERVATION_RETRY_INTERVAL),
@@ -2410,6 +2410,35 @@ impl P2pEventLoop {
             .any(|pending| pending.peer == peer)
     }
 
+    fn connection_owns_relay_reservation(&self, connection: ConnectionId) -> bool {
+        self.client_relay_reservation_connections
+            .contains(&connection)
+            || self
+                .server_relay_reservation_connections
+                .contains(&connection)
+    }
+
+    fn protect_relay_reservation_connection(
+        &mut self,
+        peer: PeerId,
+        connection: ConnectionId,
+        client: bool,
+    ) {
+        if client {
+            self.client_relay_reservation_connections.insert(connection);
+        } else {
+            self.server_relay_reservation_connections.insert(connection);
+        }
+        self.duplicate_retirement.remove(&connection);
+        self.relay_retirement.remove(&connection);
+        tracing::debug!(
+            %peer,
+            ?connection,
+            role = if client { "client" } else { "server" },
+            "fenced relay reservation connection from transport retirement"
+        );
+    }
+
     fn connection_is_retiring_or_unhealthy(&self, connection: ConnectionId) -> bool {
         self.unhealthy_connections.contains(&connection)
             || self.collapsing_connections.contains(&connection)
@@ -2508,6 +2537,9 @@ impl P2pEventLoop {
             .iter()
             .filter_map(|(connection, (candidate, path))| {
                 if *candidate != peer || self.connection_is_retiring_or_unhealthy(*connection) {
+                    return None;
+                }
+                if self.connection_owns_relay_reservation(*connection) {
                     return None;
                 }
                 // Address preference governs our outbound attempts.  A peer
@@ -3854,13 +3886,15 @@ impl P2pEventLoop {
                             })
                             .collect::<Vec<_>>();
                         for relayed_connection in relayed_connections {
-                            self.relay_retirement.insert(
-                                relayed_connection,
-                                (
-                                    event.remote_peer_id,
-                                    tokio::time::Instant::now() + RELAY_RETIREMENT_GRACE,
-                                ),
-                            );
+                            if !self.connection_owns_relay_reservation(relayed_connection) {
+                                self.relay_retirement.insert(
+                                    relayed_connection,
+                                    (
+                                        event.remote_peer_id,
+                                        tokio::time::Instant::now() + RELAY_RETIREMENT_GRACE,
+                                    ),
+                                );
+                            }
                         }
                     }
                     Err(_) => {
@@ -3870,9 +3904,42 @@ impl P2pEventLoop {
                 tracing::info!(?event, "DCUtR event");
             }
             SwarmEvent::Behaviour(BehaviourEvent::RelayClient(event)) => {
+                match &event {
+                    relay::client::Event::ReservationReqAccepted {
+                        relay_peer_id,
+                        connection_id,
+                        ..
+                    } => self.protect_relay_reservation_connection(
+                        *relay_peer_id,
+                        *connection_id,
+                        true,
+                    ),
+                    relay::client::Event::ReservationClosed { connection_id, .. } => {
+                        self.client_relay_reservation_connections
+                            .remove(connection_id);
+                    }
+                    _ => {}
+                }
                 tracing::info!(?event, "relay client event");
             }
             SwarmEvent::Behaviour(BehaviourEvent::RelayServer(event)) => {
+                match &event {
+                    relay::Event::ReservationReqAccepted {
+                        src_peer_id,
+                        connection_id,
+                        ..
+                    } => self.protect_relay_reservation_connection(
+                        *src_peer_id,
+                        *connection_id,
+                        false,
+                    ),
+                    relay::Event::ReservationClosed { connection_id, .. }
+                    | relay::Event::ReservationTimedOut { connection_id, .. } => {
+                        self.server_relay_reservation_connections
+                            .remove(connection_id);
+                    }
+                    _ => {}
+                }
                 tracing::info!(?event, "relay server event");
             }
             SwarmEvent::Behaviour(BehaviourEvent::Autonat(event)) => {
@@ -4067,6 +4134,10 @@ impl P2pEventLoop {
                 self.connection_dialers.remove(&connection_id);
                 self.relay_retirement.remove(&connection_id);
                 self.duplicate_retirement.remove(&connection_id);
+                self.client_relay_reservation_connections
+                    .remove(&connection_id);
+                self.server_relay_reservation_connections
+                    .remove(&connection_id);
                 let unhealthy = self.unhealthy_connections.remove(&connection_id);
                 self.record_session_close(connection_id, cause.is_some() || unhealthy);
                 if !self
@@ -4354,7 +4425,7 @@ impl P2pEventLoop {
         for (connection_id, peer, should_close) in finished {
             self.relay_retirement.remove(&connection_id);
             let mut awaiting_close = false;
-            if should_close {
+            if should_close && !self.connection_owns_relay_reservation(connection_id) {
                 self.collapsing_connections.insert(connection_id);
                 if self.swarm.close_connection(connection_id) {
                     awaiting_close = true;
@@ -4398,18 +4469,6 @@ impl P2pEventLoop {
             .expect("two connections have a best rank");
         let deadline = tokio::time::Instant::now() + RELAY_RETIREMENT_GRACE;
 
-        // A relay reservation is tied to the exact outbound connection that
-        // created its virtual listener, but libp2p does not expose that
-        // connection ID with the listener event.  Keep equal-rank duplicate
-        // sessions to configured relays: direction-based collapse could
-        // otherwise select an inbound application/DHT connection and close
-        // the outbound reservation underneath every circuit using it.
-        // Different transport tiers are retired separately, only after the
-        // selected-tier promotion has survived its health grace period.
-        if self.relay_reservation_peers.contains(&peer) {
-            return;
-        }
-
         let local_prefers_dialer = self.swarm.local_peer_id() < &peer;
         let preferred_direction_exists = connections.iter().any(|(_, path, dialer)| {
             path_preference_rank(self.tor_mode, *path) == best_rank
@@ -4421,6 +4480,7 @@ impl P2pEventLoop {
         for (connection, path, dialer) in &connections {
             if path_preference_rank(self.tor_mode, *path) == best_rank
                 && *dialer != local_prefers_dialer
+                && !self.connection_owns_relay_reservation(*connection)
             {
                 self.duplicate_retirement
                     .insert(*connection, (peer, deadline));
@@ -4444,6 +4504,7 @@ impl P2pEventLoop {
                     .is_some_and(|(_, path)| {
                         path_preference_rank(self.tor_mode, *path) == best_rank
                     })
+                && !self.connection_owns_relay_reservation(new_connection)
             {
                 self.duplicate_retirement
                     .insert(new_connection, (peer, deadline));
@@ -4485,7 +4546,7 @@ impl P2pEventLoop {
         for (connection, peer, should_close) in finished {
             self.duplicate_retirement.remove(&connection);
             let mut awaiting_close = false;
-            if should_close {
+            if should_close && !self.connection_owns_relay_reservation(connection) {
                 self.collapsing_connections.insert(connection);
                 if self.swarm.close_connection(connection) {
                     awaiting_close = true;
@@ -7552,7 +7613,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_collapse_preserves_the_connection_owning_a_relay_reservation() {
+    async fn duplicate_collapse_fences_only_the_connection_owning_a_relay_reservation() {
         let temp = tempfile::tempdir().unwrap();
         let local_seed = Seed::from_bytes([86; 32]);
         let local_id = KeyMaterial::from_seed(&local_seed).node_id();
@@ -7560,14 +7621,9 @@ mod tests {
             .node_id()
             .libp2p_peer_id()
             .unwrap();
-        let relay_address: Multiaddr = format!("/ip4/192.0.2.87/udp/44000/quic-v1/p2p/{relay}")
-            .parse()
-            .unwrap();
-        let mut p2p_config = config(local_id);
-        p2p_config.relay_reservation_addresses = vec![relay_address];
         let (_client, mut event_loop) = build_p2p(
             Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap())),
-            p2p_config,
+            config(local_id),
         )
         .unwrap();
 
@@ -7576,19 +7632,141 @@ mod tests {
         event_loop
             .connection_paths
             .insert(reservation_connection, (relay, P2pPath::Direct));
+        let local_prefers_dialer = event_loop.swarm.local_peer_id() < &relay;
         event_loop
             .connection_dialers
-            .insert(reservation_connection, true);
+            .insert(reservation_connection, local_prefers_dialer);
         event_loop
             .connection_paths
             .insert(inbound_duplicate, (relay, P2pPath::Direct));
         event_loop
             .connection_dialers
-            .insert(inbound_duplicate, false);
+            .insert(inbound_duplicate, !local_prefers_dialer);
+        event_loop.protect_relay_reservation_connection(relay, reservation_connection, true);
 
         event_loop.schedule_duplicate_session_collapse(relay, inbound_duplicate);
 
-        assert!(event_loop.duplicate_retirement.is_empty());
+        assert!(
+            !event_loop
+                .duplicate_retirement
+                .contains_key(&reservation_connection)
+        );
+        assert!(
+            event_loop
+                .duplicate_retirement
+                .contains_key(&inbound_duplicate)
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_reservation_events_fence_client_and_server_connection_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([109; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let peer = KeyMaterial::from_seed(&Seed::from_bytes([110; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let (_client, mut event_loop) = build_p2p(
+            Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap())),
+            config(local_id),
+        )
+        .unwrap();
+        let client_connection = ConnectionId::new_unchecked(1091);
+        let server_connection = ConnectionId::new_unchecked(1092);
+        event_loop
+            .duplicate_retirement
+            .insert(client_connection, (peer, tokio::time::Instant::now()));
+        event_loop
+            .relay_retirement
+            .insert(server_connection, (peer, tokio::time::Instant::now()));
+
+        event_loop.handle_swarm_event(SwarmEvent::Behaviour(BehaviourEvent::RelayClient(
+            relay::client::Event::ReservationReqAccepted {
+                relay_peer_id: peer,
+                connection_id: client_connection,
+                renewal: false,
+                limit: None,
+            },
+        )));
+        event_loop.handle_swarm_event(SwarmEvent::Behaviour(BehaviourEvent::RelayServer(
+            relay::Event::ReservationReqAccepted {
+                src_peer_id: peer,
+                connection_id: server_connection,
+                renewed: false,
+            },
+        )));
+
+        assert!(event_loop.connection_owns_relay_reservation(client_connection));
+        assert!(event_loop.connection_owns_relay_reservation(server_connection));
+        assert!(
+            !event_loop
+                .duplicate_retirement
+                .contains_key(&client_connection)
+        );
+        assert!(!event_loop.relay_retirement.contains_key(&server_connection));
+
+        event_loop.handle_swarm_event(SwarmEvent::Behaviour(BehaviourEvent::RelayServer(
+            relay::Event::ReservationTimedOut {
+                src_peer_id: peer,
+                connection_id: server_connection,
+            },
+        )));
+        assert!(!event_loop.connection_owns_relay_reservation(server_connection));
+        assert!(event_loop.connection_owns_relay_reservation(client_connection));
+
+        event_loop.handle_swarm_event(SwarmEvent::Behaviour(BehaviourEvent::RelayClient(
+            relay::client::Event::ReservationClosed {
+                relay_peer_id: peer,
+                connection_id: client_connection,
+            },
+        )));
+        assert!(!event_loop.connection_owns_relay_reservation(client_connection));
+    }
+
+    #[tokio::test]
+    async fn cross_tier_cleanup_waits_for_an_inbound_relay_reservation_to_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([111; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let peer = KeyMaterial::from_seed(&Seed::from_bytes([112; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let (_client, mut event_loop) = build_p2p(
+            Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap())),
+            config(local_id),
+        )
+        .unwrap();
+        event_loop.tor_mode = TorMode::PreferTor;
+        let tor_connection = ConnectionId::new_unchecked(1111);
+        let reservation_connection = ConnectionId::new_unchecked(1112);
+        event_loop
+            .connection_paths
+            .insert(tor_connection, (peer, P2pPath::Tor));
+        event_loop
+            .connection_paths
+            .insert(reservation_connection, (peer, P2pPath::Direct));
+        event_loop
+            .server_relay_reservation_connections
+            .insert(reservation_connection);
+
+        event_loop.retire_non_policy_connections(peer);
+        assert!(
+            !event_loop
+                .duplicate_retirement
+                .contains_key(&reservation_connection)
+        );
+
+        event_loop
+            .server_relay_reservation_connections
+            .remove(&reservation_connection);
+        event_loop.retire_non_policy_connections(peer);
+        assert!(
+            event_loop
+                .duplicate_retirement
+                .contains_key(&reservation_connection)
+        );
     }
 
     #[tokio::test]
