@@ -1,12 +1,11 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::num::NonZeroU16;
 
 use anyhow::{Context, Result, bail};
 use libp2p::Multiaddr;
 use libp2p::multiaddr::Protocol;
 use tokio::sync::watch;
 
-use super::P2pClient;
+use super::{P2pClient, p2p::PortMappingListenerState};
 
 const MAPPING_WITHDRAW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAPPING_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -31,20 +30,26 @@ pub fn validate_port_mapping_listeners(addresses: &[Multiaddr]) -> Result<()> {
 /// Maintain a real PCP, NAT-PMP, or UPnP mapping for the active QUIC listener
 /// and feed every resulting external-address transition into libp2p.
 pub async fn run_port_mapping(p2p: P2pClient, mut shutdown: watch::Receiver<bool>) -> Result<()> {
-    let status = p2p.status().await?;
-    let mut ports = status
-        .listen_addresses
-        .iter()
-        .filter_map(|value| value.parse::<Multiaddr>().ok())
-        .filter_map(|address| ipv4_quic_listener(&address).map(|(_, port)| port));
-    let local_port = ports
-        .next()
-        .and_then(NonZeroU16::new)
-        .context("active IPv4 QUIC listener has no allocated UDP port")?;
-    if ports.next().is_some() {
-        bail!("active port-mapping listener is ambiguous");
-    }
-
+    let mut listener_state = p2p.port_mapping_listener_state();
+    let local_port = loop {
+        match *listener_state.borrow_and_update() {
+            PortMappingListenerState::Active(port) => break port,
+            PortMappingListenerState::Closed => {
+                bail!("automatic gateway mapping listener closed before mapping started")
+            }
+            PortMappingListenerState::Pending => {}
+        }
+        tokio::select! {
+            changed = listener_state.changed() => {
+                changed.context("libp2p listener state stopped before gateway mapping started")?;
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+        }
+    };
     let client = portmapper::Client::new(portmapper::Config {
         enable_upnp: true,
         enable_pcp: true,
@@ -91,6 +96,26 @@ pub async fn run_port_mapping(p2p: P2pClient, mut shutdown: watch::Receiver<bool
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break Ok(());
+                }
+            }
+            changed = listener_state.changed() => {
+                if changed.is_err() {
+                    break Err(anyhow::anyhow!(
+                        "publish automatic gateway mapping: libp2p listener state stopped"
+                    ));
+                }
+                match *listener_state.borrow_and_update() {
+                    PortMappingListenerState::Closed => break Err(anyhow::anyhow!(
+                        "automatic gateway mapping listener closed"
+                    )),
+                    PortMappingListenerState::Active(port) if port != local_port => break Err(anyhow::anyhow!(
+                        "automatic gateway mapping listener changed UDP port from {} to {}",
+                        local_port.get(), port.get()
+                    )),
+                    PortMappingListenerState::Pending => break Err(anyhow::anyhow!(
+                        "automatic gateway mapping listener returned to pending state"
+                    )),
+                    PortMappingListenerState::Active(_) => {}
                 }
             }
             _ = retry.tick(), if installed.is_none() => {
@@ -194,14 +219,19 @@ async fn probe_gateway_mapping_protocols(client: &portmapper::Client) {
     }
 }
 
-fn ipv4_quic_listener(address: &Multiaddr) -> Option<(Ipv4Addr, u16)> {
+pub(super) fn ipv4_quic_listener(address: &Multiaddr) -> Option<(Ipv4Addr, u16)> {
+    let (ip, port) = ipv4_quic_listener_socket(address)?;
+    if ip.is_loopback() || ip.is_multicast() || ip.is_broadcast() {
+        return None;
+    }
+    Some((ip, port))
+}
+
+fn ipv4_quic_listener_socket(address: &Multiaddr) -> Option<(Ipv4Addr, u16)> {
     let mut protocols = address.iter();
     let Protocol::Ip4(ip) = protocols.next()? else {
         return None;
     };
-    if ip.is_loopback() || ip.is_multicast() || ip.is_broadcast() {
-        return None;
-    }
     let Protocol::Udp(port) = protocols.next()? else {
         return None;
     };
@@ -261,7 +291,15 @@ mod tests {
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("mapping did not converge to external port {expected_port:?}"));
+        .unwrap_or_else(|_| {
+            let events = std::env::var("MUTUALBACKUP_NAT_PMP_EVENTS")
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .unwrap_or_default();
+            panic!(
+                "mapping did not converge to external port {expected_port:?}; fixture events: {events:?}"
+            )
+        });
     }
 
     #[test]
@@ -408,5 +446,86 @@ mod tests {
         })
         .await
         .expect("NAT-PMP fixture did not observe deletion after publication failure");
+
+        // A fresh runtime keeps an IPv6 ingress path active while its exact
+        // mapped IPv4 listener is closed. The mapping task must acknowledge a
+        // real gateway delete before returning its deliberate fatal result.
+        fixture_control("restore").await;
+        let listener_node = Node::open(
+            temp.path().join("listener-loss"),
+            Seed::from_bytes([62; 32]),
+        )
+        .unwrap();
+        let listener_node_id = listener_node.keys().node_id();
+        let listener_config = P2pConfig {
+            listen_addresses: vec![
+                "/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap(),
+                "/ip6/::1/udp/0/quic-v1".parse().unwrap(),
+            ],
+            external_addresses: Vec::new(),
+            bootstrap_addresses: Vec::new(),
+            relay_reservation_addresses: Vec::new(),
+            enable_dht_maintenance: false,
+            enable_relay_server: false,
+            enable_hole_punching: false,
+            enable_port_mapping: true,
+            public_endpoint: "/ip6/::1/udp/0/quic-v1".to_owned(),
+            failure_domain: listener_node_id.to_string(),
+            configure_failure_domain: true,
+            max_connections: 4,
+            tor_mode: TorMode::DisableTor,
+        };
+        let (listener_client, mut listener_loop) =
+            build_p2p(Arc::new(Mutex::new(listener_node)), listener_config).unwrap();
+        let listener_startup = listener_loop.take_startup_receiver().unwrap();
+        let listener_task = tokio::spawn(listener_loop.run());
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener_startup)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let (_listener_shutdown, listener_receiver) = watch::channel(false);
+        let listener_mapping_task =
+            tokio::spawn(run_port_mapping(listener_client.clone(), listener_receiver));
+        wait_for_mapping(&listener_client, Some(45_002)).await;
+        std::fs::write(&events_path, "").unwrap();
+
+        listener_client.close_port_mapping_listener().await.unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(15), listener_mapping_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("mapping listener closed"));
+        wait_for_mapping(&listener_client, None).await;
+        let status = listener_client.status().await.unwrap();
+        assert!(
+            status.network_ready,
+            "alternate ingress path was not retained"
+        );
+        assert!(status.direct_listeners_active > 0);
+        assert!(status.port_mapping_external_address.is_none());
+        assert!(
+            status
+                .degraded
+                .iter()
+                .any(|reason| reason.contains("direct listeners active"))
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if std::fs::read_to_string(&events_path)
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|line| line.starts_with("delete "))
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("NAT-PMP fixture did not observe deletion after listener loss");
+        listener_client.shutdown().await.unwrap();
+        listener_task.await.unwrap().unwrap();
     }
 }

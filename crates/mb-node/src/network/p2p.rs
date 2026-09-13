@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU16, NonZeroUsize};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context as TaskContext, Poll};
@@ -23,7 +23,7 @@ use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder, autonat, dcutr, identify, kad, noise, ping, quic,
     relay, request_response, yamux,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use mb_core::{
     CodingGroup, GuildCheckpoint, GuildGenesis, GuildInvite, InformationRole, Member,
@@ -285,6 +285,13 @@ pub struct P2pStartup {
 
 pub type P2pStartupReceiver = oneshot::Receiver<std::result::Result<P2pStartup, String>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PortMappingListenerState {
+    Pending,
+    Active(NonZeroU16),
+    Closed,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DhtRecord {
     pub publisher: Option<String>,
@@ -298,6 +305,7 @@ pub struct P2pClient {
     request_cancellations: mpsc::UnboundedSender<Uuid>,
     outbound_permits: Arc<Semaphore>,
     cold_recovery_permit: Arc<Semaphore>,
+    port_mapping_listener_state: watch::Receiver<PortMappingListenerState>,
 }
 
 pub struct P2pEventLoop {
@@ -318,6 +326,9 @@ pub struct P2pEventLoop {
     advertised_addresses: Vec<Multiaddr>,
     port_mapping_enabled: bool,
     mapped_external_address: Option<Multiaddr>,
+    port_mapping_listener: Option<ListenerId>,
+    port_mapping_listener_active: bool,
+    port_mapping_listener_state: watch::Sender<PortMappingListenerState>,
     direct_listeners: HashMap<ListenerId, Multiaddr>,
     active_direct_listeners: HashSet<ListenerId>,
     closed_direct_listeners: HashSet<ListenerId>,
@@ -410,6 +421,10 @@ enum Command {
     },
     SetMappedExternalAddress {
         address: Option<Multiaddr>,
+        response: oneshot::Sender<Result<()>>,
+    },
+    #[cfg(test)]
+    ClosePortMappingListener {
         response: oneshot::Sender<Result<()>>,
     },
     Request {
@@ -1283,6 +1298,7 @@ pub fn build_p2p_with_tor(
         .build();
 
     let mut direct_listeners = HashMap::new();
+    let mut port_mapping_listener = None;
     for address in config
         .listen_addresses
         .iter()
@@ -1291,6 +1307,12 @@ pub fn build_p2p_with_tor(
         let listener = swarm
             .listen_on(address.clone())
             .with_context(|| format!("cannot listen on {address}"))?;
+        if config.enable_port_mapping
+            && super::port_mapping::ipv4_quic_listener(address)
+                .is_some_and(|(ip, _)| ip.is_unspecified())
+        {
+            port_mapping_listener = Some(listener);
+        }
         direct_listeners.insert(listener, address.clone());
     }
     let tor_listener = match tor_listen_address {
@@ -1443,6 +1465,8 @@ pub fn build_p2p_with_tor(
     let (request_cancellation_sender, request_cancellations) = mpsc::unbounded_channel();
     let (inbound_sender, inbound_results) = mpsc::channel(COMMAND_CAPACITY);
     let (startup_sender, startup_receiver) = oneshot::channel();
+    let (port_mapping_listener_sender, port_mapping_listener_receiver) =
+        watch::channel(PortMappingListenerState::Pending);
     Ok((
         P2pClient {
             local_peer_id,
@@ -1450,6 +1474,7 @@ pub fn build_p2p_with_tor(
             request_cancellations: request_cancellation_sender,
             outbound_permits: Arc::new(Semaphore::new(config.max_connections)),
             cold_recovery_permit: Arc::new(Semaphore::new(1)),
+            port_mapping_listener_state: port_mapping_listener_receiver,
         },
         P2pEventLoop {
             swarm,
@@ -1472,6 +1497,9 @@ pub fn build_p2p_with_tor(
                 .collect(),
             port_mapping_enabled: config.enable_port_mapping,
             mapped_external_address: None,
+            port_mapping_listener,
+            port_mapping_listener_active: false,
+            port_mapping_listener_state: port_mapping_listener_sender,
             direct_listeners,
             active_direct_listeners: HashSet::new(),
             closed_direct_listeners: HashSet::new(),
@@ -1620,6 +1648,22 @@ impl P2pClient {
         receiver
             .await
             .context("libp2p port-mapping command was lost")?
+    }
+
+    pub(super) fn port_mapping_listener_state(&self) -> watch::Receiver<PortMappingListenerState> {
+        self.port_mapping_listener_state.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn close_port_mapping_listener(&self) -> Result<()> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(Command::ClosePortMappingListener { response })
+            .await
+            .context("libp2p event loop stopped")?;
+        receiver
+            .await
+            .context("libp2p listener-close command was lost")?
     }
 
     pub async fn profile(&self, peer: NodeId) -> Result<P2pPeerProfile> {
@@ -2847,6 +2891,9 @@ impl P2pEventLoop {
         if address == self.mapped_external_address {
             return Ok(());
         }
+        if address.is_some() && self.port_mapping_enabled && !self.port_mapping_listener_active {
+            bail!("cannot publish a gateway mapping for an inactive QUIC listener");
+        }
         if let Some(address) = &address
             && !super::port_mapping::valid_mapped_external_address(address)
         {
@@ -2865,6 +2912,22 @@ impl P2pEventLoop {
             self.mapped_external_address = Some(address);
         }
         Ok(())
+    }
+
+    fn observe_port_mapping_listener_closed(&mut self, listener: ListenerId) {
+        if self.port_mapping_listener != Some(listener) {
+            return;
+        }
+        self.port_mapping_listener_active = false;
+        if let Err(error) = self.replace_mapped_external_address(None) {
+            self.fatal_error = Some(format!(
+                "failed to withdraw gateway mapping after listener closure: {error}"
+            ));
+        }
+        // The mapper begins acknowledged gateway deletion only after the
+        // signed/runtime endpoint has been withdrawn above.
+        self.port_mapping_listener_state
+            .send_replace(PortMappingListenerState::Closed);
     }
 
     fn policy_dial_exists(&self, peer: PeerId, tier: u8) -> bool {
@@ -3499,6 +3562,20 @@ impl P2pEventLoop {
                 let result = self.replace_mapped_external_address(address);
                 let _ = response.send(result);
             }
+            #[cfg(test)]
+            Command::ClosePortMappingListener { response } => {
+                let result = self
+                    .port_mapping_listener
+                    .context("automatic gateway mapping has no owned listener")
+                    .and_then(|listener| {
+                        if self.swarm.remove_listener(listener) {
+                            Ok(())
+                        } else {
+                            bail!("automatic gateway mapping listener is already closed")
+                        }
+                    });
+                let _ = response.send(result);
+            }
             Command::Request {
                 cancellation_id,
                 peer,
@@ -3808,6 +3885,14 @@ impl P2pEventLoop {
                 if self.direct_listeners.contains_key(&listener_id) {
                     self.active_direct_listeners.insert(listener_id);
                 }
+                if self.port_mapping_listener == Some(listener_id)
+                    && let Some(port) = super::port_mapping::ipv4_quic_listener(&address)
+                        .and_then(|(_, port)| NonZeroU16::new(port))
+                {
+                    self.port_mapping_listener_active = true;
+                    self.port_mapping_listener_state
+                        .send_replace(PortMappingListenerState::Active(port));
+                }
                 if self.relay_listeners.contains_key(&listener_id) {
                     self.active_relay_listeners.insert(listener_id);
                 }
@@ -3847,6 +3932,7 @@ impl P2pEventLoop {
                     self.active_direct_listeners.remove(&listener_id);
                     self.closed_direct_listeners.insert(listener_id);
                 }
+                self.observe_port_mapping_listener_closed(listener_id);
                 if self.relay_listeners.remove(&listener_id).is_some() {
                     self.active_relay_listeners.remove(&listener_id);
                 }
@@ -7154,6 +7240,7 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("port mapping"))
         );
+        event_loop.port_mapping_listener_active = true;
         let first: Multiaddr = "/ip4/198.51.100.8/udp/44000/quic-v1".parse().unwrap();
         event_loop
             .replace_mapped_external_address(Some(first.clone()))
@@ -7179,6 +7266,47 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("port mapping"))
         );
+    }
+
+    #[tokio::test]
+    async fn mapped_listener_close_withdraws_the_endpoint_before_mapper_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([213; 32]);
+        let keys = KeyMaterial::from_seed(&seed);
+        let node = Node::open(temp.path().join("node"), seed).unwrap();
+        let mut p2p_config = config(keys.node_id());
+        p2p_config.listen_addresses = vec![
+            "/ip4/0.0.0.0/udp/44000/quic-v1".parse().unwrap(),
+            "/ip6/::1/udp/44001/quic-v1".parse().unwrap(),
+        ];
+        p2p_config.enable_port_mapping = true;
+        let (client, mut event_loop) = build_p2p(Arc::new(Mutex::new(node)), p2p_config).unwrap();
+        let listener = event_loop.port_mapping_listener.unwrap();
+        let port = NonZeroU16::new(44000).unwrap();
+        event_loop.port_mapping_listener_active = true;
+        event_loop
+            .port_mapping_listener_state
+            .send_replace(PortMappingListenerState::Active(port));
+        let mapped: Multiaddr = "/ip4/198.51.100.8/udp/44000/quic-v1".parse().unwrap();
+        event_loop
+            .replace_mapped_external_address(Some(mapped.clone()))
+            .unwrap();
+        let mut listener_state = client.port_mapping_listener_state();
+
+        event_loop.observe_port_mapping_listener_closed(listener);
+
+        assert!(event_loop.mapped_external_address.is_none());
+        assert_eq!(
+            *listener_state.borrow_and_update(),
+            PortMappingListenerState::Closed
+        );
+        assert!(
+            event_loop
+                .replace_mapped_external_address(Some(mapped))
+                .is_err(),
+            "a late mapper update must not revive the closed listener endpoint"
+        );
+        assert!(event_loop.fatal_error.is_none());
     }
 
     const LEGACY_MEMBER_POISON_SEQUENCE: u64 = u64::MAX - 1;
