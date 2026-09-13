@@ -1456,7 +1456,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     update_config(&storage_recovered_config, |config| {
         config.p2p_listen_addresses.clear();
         config.p2p_external_addresses.clear();
-        config.p2p_bootstrap_addresses.clear();
+        config.p2p_bootstrap_addresses = vec![relay.clone()];
         config.p2p_relay_addresses = vec![relay.clone()];
         config.enable_hole_punching = false;
         config.enable_dht_maintenance = false;
@@ -1586,6 +1586,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         config.p2p_relay_addresses = vec![relay.clone()];
     });
     update_config(&storage_recovered_config, |config| {
+        config.p2p_bootstrap_addresses = vec![relay.clone()];
         config.p2p_relay_addresses = vec![relay.clone()];
     });
     recovered_daemon.start();
