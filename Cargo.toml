@@ -4,6 +4,7 @@ members = [
     "crates/mb-store",
     "crates/mb-node",
     "cmd/mutualbackup",
+    "vendor/libp2p-relay",
 ]
 resolver = "2"
 

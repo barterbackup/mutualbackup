@@ -130,6 +130,7 @@ async fn new_reservation_to_same_relay_replaces_old() {
     // - new reservation to be accepted
     // - new listener address to be reported
     let mut old_listener_closed = false;
+    let mut old_external_address_expired = false;
     let mut new_reservation_accepted = false;
     let mut new_listener_address_reported = false;
     loop {
@@ -143,7 +144,10 @@ async fn new_reservation_to_same_relay_replaces_old() {
                 assert_eq!(listener_id, old_listener);
 
                 old_listener_closed = true;
-                if new_reservation_accepted && new_listener_address_reported {
+                if old_external_address_expired
+                    && new_reservation_accepted
+                    && new_listener_address_reported
+                {
                     break;
                 }
             }
@@ -156,7 +160,10 @@ async fn new_reservation_to_same_relay_replaces_old() {
                 assert_eq!(relay_peer_id, peer_id);
 
                 new_reservation_accepted = true;
-                if old_listener_closed && new_listener_address_reported {
+                if old_listener_closed
+                    && old_external_address_expired
+                    && new_listener_address_reported
+                {
                     break;
                 }
             }
@@ -168,7 +175,7 @@ async fn new_reservation_to_same_relay_replaces_old() {
                 assert_eq!(listener_id, new_listener);
 
                 new_listener_address_reported = true;
-                if old_listener_closed && new_reservation_accepted {
+                if old_listener_closed && old_external_address_expired && new_reservation_accepted {
                     break;
                 }
             }
@@ -177,6 +184,17 @@ async fn new_reservation_to_same_relay_replaces_old() {
                     address,
                     client_addr.clone().with(Protocol::P2p(client_peer_id))
                 );
+            }
+            SwarmEvent::ExternalAddrExpired { address } => {
+                assert_eq!(
+                    address,
+                    client_addr.clone().with(Protocol::P2p(client_peer_id))
+                );
+                old_external_address_expired = true;
+                if old_listener_closed && new_reservation_accepted && new_listener_address_reported
+                {
+                    break;
+                }
             }
             SwarmEvent::Behaviour(ClientEvent::Ping(_)) => {}
             e => panic!("{e:?}"),

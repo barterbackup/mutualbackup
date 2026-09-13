@@ -42,7 +42,7 @@ use libp2p_swarm::{
 use crate::{
     client::Connection,
     priv_client,
-    priv_client::{transport, transport::ToListenerMsg},
+    priv_client::{transport, transport::ToListenerMsg, ReservationId},
     proto,
     protocol::{self, inbound_stop, outbound_hop},
     HOP_PROTOCOL_NAME, STOP_PROTOCOL_NAME,
@@ -59,6 +59,7 @@ const STREAM_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub enum In {
     Reserve {
+        reservation_id: ReservationId,
         to_listener: mpsc::Sender<transport::ToListenerMsg>,
     },
     EstablishCircuit {
@@ -70,7 +71,13 @@ pub enum In {
 impl fmt::Debug for In {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            In::Reserve { to_listener: _ } => f.debug_struct("In::Reserve").finish(),
+            In::Reserve {
+                reservation_id,
+                to_listener: _,
+            } => f
+                .debug_struct("In::Reserve")
+                .field("reservation_id", reservation_id)
+                .finish(),
             In::EstablishCircuit {
                 dst_peer_id,
                 to_dial: _,
@@ -85,14 +92,23 @@ impl fmt::Debug for In {
 #[derive(Debug)]
 pub enum Event {
     ReservationReqAccepted {
+        reservation_id: ReservationId,
         /// Indicates whether the request replaces an existing reservation.
         renewal: bool,
         limit: Option<protocol::Limit>,
     },
     /// The reservation ended while the relay connection remained open.
-    ReservationClosed,
+    ReservationReqFailed {
+        reservation_id: ReservationId,
+        reservation_closed: bool,
+    },
+    ReservationClosed {
+        reservation_id: ReservationId,
+    },
     /// An outbound circuit has been established.
-    OutboundCircuitEstablished { limit: Option<protocol::Limit> },
+    OutboundCircuitEstablished {
+        limit: Option<protocol::Limit>,
+    },
     /// An inbound circuit has been established.
     InboundCircuitEstablished {
         src_peer_id: PeerId,
@@ -118,7 +134,7 @@ pub struct Handler {
 
     inflight_reserve_requests: futures_bounded::FuturesTupleSet<
         Result<outbound_hop::Reservation, outbound_hop::ReserveError>,
-        mpsc::Sender<transport::ToListenerMsg>,
+        PendingReservationRequest,
     >,
 
     inflight_outbound_connect_requests: futures_bounded::FuturesTupleSet<
@@ -133,6 +149,12 @@ pub struct Handler {
         futures_bounded::FuturesSet<Result<(), inbound_stop::Error>>,
 
     reservation: Reservation,
+    pending_reservation_requests: VecDeque<PendingReservationRequest>,
+}
+
+struct PendingReservationRequest {
+    reservation_id: ReservationId,
+    to_listener: Sender<ToListenerMsg>,
 }
 
 impl Handler {
@@ -160,6 +182,7 @@ impl Handler {
                 MAX_NUMBER_DENYING_CIRCUIT,
             ),
             reservation: Reservation::None,
+            pending_reservation_requests: VecDeque::new(),
         }
     }
 
@@ -178,7 +201,18 @@ impl Handler {
         }
     }
 
-    fn make_new_reservation(&mut self, to_listener: Sender<ToListenerMsg>) {
+    fn make_new_reservation(&mut self, request: PendingReservationRequest) {
+        self.pending_reservation_requests.push_back(request);
+        self.start_next_reservation_if_idle();
+    }
+
+    fn start_next_reservation_if_idle(&mut self) {
+        if !self.inflight_reserve_requests.is_empty() {
+            return;
+        }
+        let Some(request) = self.pending_reservation_requests.pop_front() else {
+            return;
+        };
         let (sender, receiver) = oneshot::channel();
 
         self.pending_streams.push_back(sender);
@@ -197,7 +231,7 @@ impl Handler {
 
                 Ok(reservation)
             },
-            to_listener,
+            request,
         );
 
         if result.is_err() {
@@ -249,8 +283,14 @@ impl ConnectionHandler for Handler {
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
         match event {
-            In::Reserve { to_listener } => {
-                self.make_new_reservation(to_listener);
+            In::Reserve {
+                reservation_id,
+                to_listener,
+            } => {
+                self.make_new_reservation(PendingReservationRequest {
+                    reservation_id,
+                    to_listener,
+                });
             }
             In::EstablishCircuit {
                 to_dial,
@@ -271,6 +311,7 @@ impl ConnectionHandler for Handler {
         cx: &mut Context<'_>,
     ) -> Poll<ConnectionHandlerEvent<Self::OutboundProtocol, (), Self::ToBehaviour>> {
         loop {
+            self.start_next_reservation_if_idle();
             // Reservations
             match self.inflight_reserve_requests.poll_unpin(cx) {
                 Poll::Ready((
@@ -279,40 +320,50 @@ impl ConnectionHandler for Handler {
                         addrs,
                         limit,
                     })),
-                    to_listener,
+                    request,
                 )) => {
                     return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
                         self.reservation.accepted(
+                            request.reservation_id,
                             renewal_timeout,
                             addrs,
-                            to_listener,
+                            request.to_listener,
                             self.local_peer_id,
                             limit,
                         ),
                     ));
                 }
-                Poll::Ready((Ok(Err(error)), mut to_listener)) => {
-                    if let Err(e) =
-                        to_listener.try_send(transport::ToListenerMsg::Reservation(Err(error)))
+                Poll::Ready((Ok(Err(error)), mut request)) => {
+                    if let Err(e) = request
+                        .to_listener
+                        .try_send(transport::ToListenerMsg::Reservation(Err(error)))
                     {
                         tracing::debug!("Unable to send error to listener: {}", e.into_send_error())
                     }
-                    self.reservation.failed();
+                    let reservation_closed = self.reservation.failed(request.reservation_id);
                     return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
-                        Event::ReservationClosed,
+                        Event::ReservationReqFailed {
+                            reservation_id: request.reservation_id,
+                            reservation_closed,
+                        },
                     ));
                 }
-                Poll::Ready((Err(futures_bounded::Timeout { .. }), mut to_listener)) => {
+                Poll::Ready((Err(futures_bounded::Timeout { .. }), mut request)) => {
                     if let Err(e) =
-                        to_listener.try_send(transport::ToListenerMsg::Reservation(Err(
-                            outbound_hop::ReserveError::Io(io::ErrorKind::TimedOut.into()),
-                        )))
+                        request
+                            .to_listener
+                            .try_send(transport::ToListenerMsg::Reservation(Err(
+                                outbound_hop::ReserveError::Io(io::ErrorKind::TimedOut.into()),
+                            )))
                     {
                         tracing::debug!("Unable to send error to listener: {}", e.into_send_error())
                     }
-                    self.reservation.failed();
+                    let reservation_closed = self.reservation.failed(request.reservation_id);
                     return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
-                        Event::ReservationClosed,
+                        Event::ReservationReqFailed {
+                            reservation_id: request.reservation_id,
+                            reservation_closed,
+                        },
                     ));
                 }
                 Poll::Pending => {}
@@ -357,7 +408,6 @@ impl ConnectionHandler for Handler {
                     {
                         tracing::debug!("Unable to send error to dialer")
                     }
-                    self.reservation.failed();
                     continue;
                 }
                 Poll::Pending => {}
@@ -405,14 +455,16 @@ impl ConnectionHandler for Handler {
                 Poll::Pending => {}
             }
 
-            match self.reservation.poll(cx) {
-                Poll::Ready(Some(to_listener)) => {
-                    self.make_new_reservation(to_listener);
+            let allow_renewal = self.inflight_reserve_requests.is_empty()
+                && self.pending_reservation_requests.is_empty();
+            match self.reservation.poll(cx, allow_renewal) {
+                Poll::Ready(ReservationPoll::Renew(request)) => {
+                    self.make_new_reservation(request);
                     continue;
                 }
-                Poll::Ready(None) => {
+                Poll::Ready(ReservationPoll::Closed(reservation_id)) => {
                     return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
-                        Event::ReservationClosed,
+                        Event::ReservationClosed { reservation_id },
                     ));
                 }
                 Poll::Pending => {}
@@ -472,6 +524,7 @@ impl ConnectionHandler for Handler {
 enum Reservation {
     /// The Reservation is accepted by the relay.
     Accepted {
+        reservation_id: ReservationId,
         renewal_timeout: Delay,
         /// Buffer of messages to be send to the transport listener.
         pending_msgs: VecDeque<transport::ToListenerMsg>,
@@ -479,6 +532,7 @@ enum Reservation {
     },
     /// The reservation is being renewed with the relay.
     Renewing {
+        reservation_id: ReservationId,
         /// Buffer of messages to be send to the transport listener.
         pending_msgs: VecDeque<transport::ToListenerMsg>,
     },
@@ -488,6 +542,7 @@ enum Reservation {
 impl Reservation {
     fn accepted(
         &mut self,
+        reservation_id: ReservationId,
         renewal_timeout: Delay,
         addrs: Vec<Multiaddr>,
         to_listener: mpsc::Sender<transport::ToListenerMsg>,
@@ -513,12 +568,17 @@ impl Reservation {
         )));
 
         *self = Reservation::Accepted {
+            reservation_id,
             renewal_timeout,
             pending_msgs,
             to_listener,
         };
 
-        Event::ReservationReqAccepted { renewal, limit }
+        Event::ReservationReqAccepted {
+            reservation_id,
+            renewal,
+            limit,
+        }
     }
 
     fn is_some(&self) -> bool {
@@ -526,12 +586,29 @@ impl Reservation {
     }
 
     /// Marks the current reservation as failed.
-    fn failed(&mut self) {
-        *self = Reservation::None;
+    fn failed(&mut self, reservation_id: ReservationId) -> bool {
+        let closes_active = matches!(
+            self,
+            Reservation::Accepted {
+                reservation_id: active,
+                ..
+            } | Reservation::Renewing {
+                reservation_id: active,
+                ..
+            } if *active == reservation_id
+        );
+        if closes_active {
+            *self = Reservation::None;
+        }
+        closes_active
     }
 
-    fn forward_messages_to_transport_listener(&mut self, cx: &mut Context<'_>) -> bool {
+    fn forward_messages_to_transport_listener(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Option<ReservationId> {
         if let Reservation::Accepted {
+            reservation_id,
             pending_msgs,
             to_listener,
             ..
@@ -544,43 +621,50 @@ impl Reservation {
                             .start_send(pending_msgs.pop_front().expect("Called !is_empty()."))
                         {
                             tracing::debug!("Failed to sent pending message to listener: {:?}", e);
+                            let reservation_id = *reservation_id;
                             *self = Reservation::None;
-                            return true;
+                            return Some(reservation_id);
                         }
                     }
                     Poll::Ready(Err(e)) => {
                         tracing::debug!("Channel to listener failed: {:?}", e);
+                        let reservation_id = *reservation_id;
                         *self = Reservation::None;
-                        return true;
+                        return Some(reservation_id);
                     }
                     Poll::Pending => {}
                 }
             }
         }
-        false
+        None
     }
 
-    fn poll(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<mpsc::Sender<transport::ToListenerMsg>>> {
-        if self.forward_messages_to_transport_listener(cx) {
-            return Poll::Ready(None);
+    fn poll(&mut self, cx: &mut Context<'_>, allow_renewal: bool) -> Poll<ReservationPoll> {
+        if let Some(reservation_id) = self.forward_messages_to_transport_listener(cx) {
+            return Poll::Ready(ReservationPoll::Closed(reservation_id));
         }
 
         // Check renewal timeout if any.
         let (next_reservation, poll_val) = match std::mem::replace(self, Reservation::None) {
             Reservation::Accepted {
+                reservation_id,
                 mut renewal_timeout,
                 pending_msgs,
                 to_listener,
             } => match renewal_timeout.poll_unpin(cx) {
-                Poll::Ready(()) => (
-                    Reservation::Renewing { pending_msgs },
-                    Poll::Ready(Some(to_listener)),
+                Poll::Ready(()) if allow_renewal => (
+                    Reservation::Renewing {
+                        reservation_id,
+                        pending_msgs,
+                    },
+                    Poll::Ready(ReservationPoll::Renew(PendingReservationRequest {
+                        reservation_id,
+                        to_listener,
+                    })),
                 ),
-                Poll::Pending => (
+                _ => (
                     Reservation::Accepted {
+                        reservation_id,
                         renewal_timeout,
                         pending_msgs,
                         to_listener,
@@ -594,6 +678,11 @@ impl Reservation {
 
         poll_val
     }
+}
+
+enum ReservationPoll {
+    Renew(PendingReservationRequest),
+    Closed(ReservationId),
 }
 
 fn into_reserve_error(e: StreamUpgradeError<Infallible>) -> outbound_hop::ReserveError {
@@ -615,5 +704,29 @@ fn into_connect_error(e: StreamUpgradeError<Infallible>) -> outbound_hop::Connec
         StreamUpgradeError::Apply(never) => libp2p_core::util::unreachable(never),
         StreamUpgradeError::NegotiationFailed => outbound_hop::ConnectError::Unsupported,
         StreamUpgradeError::Io(e) => outbound_hop::ConnectError::Io(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reservation_requests_are_serialized_per_connection() {
+        let mut handler = Handler::new(PeerId::random(), PeerId::random(), Multiaddr::empty());
+        let (first, _) = mpsc::channel(0);
+        let (second, _) = mpsc::channel(0);
+
+        handler.on_behaviour_event(In::Reserve {
+            reservation_id: ReservationId(1),
+            to_listener: first,
+        });
+        handler.on_behaviour_event(In::Reserve {
+            reservation_id: ReservationId(2),
+            to_listener: second,
+        });
+
+        assert_eq!(handler.inflight_reserve_requests.len(), 1);
+        assert_eq!(handler.pending_reservation_requests.len(), 1);
     }
 }
