@@ -6,6 +6,7 @@ members = [
     "cmd/mutualbackup",
     "vendor/libp2p-relay",
     "vendor/libp2p-request-response",
+    "vendor/portmapper",
 ]
 resolver = "2"
 
@@ -82,3 +83,6 @@ libp2p-relay = { path = "vendor/libp2p-relay" }
 # Application transport policy needs to keep relay-reservation connections
 # alive while choosing the exact established connection for each request.
 libp2p-request-response = { path = "vendor/libp2p-request-response" }
+# Mapping shutdown must settle and release leases that were granted while an
+# acquisition task was still waiting to be consumed by the service.
+portmapper = { path = "vendor/portmapper" }

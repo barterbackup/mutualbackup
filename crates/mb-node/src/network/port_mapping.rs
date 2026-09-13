@@ -9,7 +9,6 @@ use super::{P2pClient, p2p::PortMappingListenerState};
 
 const MAPPING_WITHDRAW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAPPING_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-const MAPPING_QUEUE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Validate that automatic gateway mapping has one unambiguous wildcard IPv4
@@ -144,16 +143,10 @@ async fn withdraw_gateway_mapping(
     let deadline = tokio::time::Instant::now() + MAPPING_WITHDRAW_TIMEOUT;
 
     let release_result: Result<()> = async {
-        // `deactivate` uses a silent nonblocking enqueue. First wait until an
-        // accepted probe has drained every older command; with this client no
-        // other producer can refill the queue before the following enqueue.
-        // The second accepted probe is an ordering barrier after deactivation
-        // and therefore acknowledges the protocol-specific delete attempt.
-        await_mapping_command_barrier(client, deadline, "preparing the gateway mapping release")
-            .await?;
-        client.deactivate();
-        await_mapping_command_barrier(client, deadline, "waiting for the gateway mapping release")
-            .await?;
+        tokio::time::timeout_at(deadline, client.deactivate_and_wait())
+            .await
+            .context("timed out withdrawing automatic gateway mapping")?
+            .context("port-mapping service failed to release its gateway mapping")?;
         while external.borrow().is_some() {
             tokio::time::timeout_at(deadline, external.changed())
                 .await
@@ -174,34 +167,6 @@ async fn withdraw_gateway_mapping(
         (Ok(()), Ok(())) => {
             tracing::info!("automatic gateway mapping withdrawn");
             Ok(())
-        }
-    }
-}
-
-async fn await_mapping_command_barrier(
-    client: &portmapper::Client,
-    deadline: tokio::time::Instant,
-    operation: &'static str,
-) -> Result<()> {
-    loop {
-        let result = tokio::time::timeout_at(deadline, client.probe())
-            .await
-            .with_context(|| format!("timed out {operation}"))?
-            .with_context(|| format!("port-mapping service stopped while {operation}"))?;
-        match result {
-            Ok(_) => return Ok(()),
-            Err(portmapper::ProbeError::ChannelFull { .. }) => {
-                tokio::time::sleep_until(
-                    deadline.min(tokio::time::Instant::now() + MAPPING_QUEUE_RETRY_INTERVAL),
-                )
-                .await;
-            }
-            Err(portmapper::ProbeError::ChannelClosed { .. }) => {
-                bail!("port-mapping service stopped while {operation}");
-            }
-            // Any protocol-level result proves that this probe was accepted
-            // and processed after all commands queued before it.
-            Err(_) => return Ok(()),
         }
     }
 }
@@ -321,7 +286,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn mapping_barrier_waits_until_a_full_command_queue_accepts_it() {
+    async fn mapping_deactivation_waits_until_a_full_command_queue_accepts_it() {
         let client = portmapper::Client::new(portmapper::Config {
             enable_upnp: false,
             enable_pcp: false,
@@ -334,12 +299,12 @@ mod tests {
             client.procure_mapping();
         }
 
-        await_mapping_command_barrier(
-            &client,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-            "testing a saturated queue",
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.deactivate_and_wait(),
         )
         .await
+        .unwrap()
         .unwrap();
     }
 
