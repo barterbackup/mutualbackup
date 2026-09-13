@@ -4414,18 +4414,43 @@ impl P2pEventLoop {
                         .unwrap_or(attempted_tier);
                     let used_wrong_tier = actual_tier != attempted_tier;
 
-                    let healthy_duplicate =
-                        self.healthy_connection_at_tier(peer, attempted_tier, Some(connection_id));
                     if self
                         .connection_paths
                         .get(&connection_id)
                         .is_some_and(|(candidate, _)| *candidate == peer)
                     {
                         self.unhealthy_connections.insert(connection_id);
-                        if !self.swarm.close_connection(connection_id) {
+                        let close_started = self.swarm.close_connection(connection_id);
+                        if !close_started {
+                            if let Some((_, failed_path)) =
+                                self.connection_paths.remove(&connection_id)
+                            {
+                                self.remember_closed_connection_path(
+                                    connection_id,
+                                    peer,
+                                    failed_path,
+                                );
+                            }
+                            self.policy_dials.remove(&connection_id);
+                            self.connection_dialers.remove(&connection_id);
+                            self.relay_retirement.remove(&connection_id);
+                            self.duplicate_retirement.remove(&connection_id);
+                            self.client_relay_reservation_connections
+                                .remove(&connection_id);
+                            self.server_relay_reservation_connections
+                                .remove(&connection_id);
                             self.unhealthy_connections.remove(&connection_id);
+                            self.record_session_close(connection_id, true);
                         }
+                        // Request-response can report the terminal failure
+                        // before Swarm reports ConnectionClosed. Reconcile
+                        // while this exact connection is quarantined so a
+                        // viable duplicate or relay fallback is revived in
+                        // time to retain the logical request.
+                        self.restore_selected_transport_after_close(peer, path);
                     }
+                    let healthy_duplicate =
+                        self.healthy_connection_at_tier(peer, attempted_tier, Some(connection_id));
 
                     if !pending.caller_waiting() {
                         self.forget_transport_selection_if_unretained(request_peer);
@@ -8137,6 +8162,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_timeout_revives_a_retiring_duplicate_before_connection_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([106; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([107; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        assert!(event_loop.swarm.local_peer_id() < &peer);
+
+        let selected = ConnectionId::new_unchecked(808);
+        let duplicate = ConnectionId::new_unchecked(809);
+        for connection in [selected, duplicate] {
+            event_loop
+                .connection_paths
+                .insert(connection, (peer, P2pPath::Direct));
+            event_loop.connection_dialers.insert(connection, true);
+            event_loop.record_session_open(
+                connection,
+                peer,
+                P2pPath::Direct,
+                P2pSessionDirection::Outbound,
+            );
+            register_request_connection(&mut event_loop, peer, connection);
+        }
+
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(target, PeerRequest::Profile).await }
+        });
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+        let outbound = *event_loop.pending_requests.keys().next().unwrap();
+        let signed_request =
+            canonical_bytes(&event_loop.pending_requests[&outbound].request).unwrap();
+        event_loop.duplicate_retirement.insert(
+            duplicate,
+            (peer, tokio::time::Instant::now() + Duration::from_secs(1)),
+        );
+
+        event_loop.handle_peer_event(request_response::Event::OutboundFailure {
+            peer,
+            connection_id: selected,
+            request_id: outbound,
+            error: request_response::OutboundFailure::Timeout,
+        });
+
+        assert!(!call.is_finished(), "timeout failed the logical request");
+        assert_eq!(event_loop.selected_transport_tier(peer), 0);
+        assert!(!event_loop.duplicate_retirement.contains_key(&duplicate));
+        assert!(!event_loop.connection_paths.contains_key(&selected));
+        assert!(event_loop.queued_requests.is_empty());
+        assert_eq!(event_loop.pending_requests.len(), 1);
+        let retried = event_loop.pending_requests.values().next().unwrap();
+        assert_eq!(canonical_bytes(&retried.request).unwrap(), signed_request);
+        assert_eq!(retried.attempts, 2);
+        assert!(!call.is_finished());
+
+        drop(event_loop);
+        assert!(call.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
     async fn prefer_tor_does_not_dispatch_on_a_retained_direct_connection() {
         let temp = tempfile::tempdir().unwrap();
         let local_seed = Seed::from_bytes([90; 32]);
@@ -9881,16 +9969,17 @@ mod tests {
         let target_seed = Seed::from_bytes([86; 32]);
         let target_id = KeyMaterial::from_seed(&target_seed).node_id();
         let target_peer = target_id.libp2p_peer_id().unwrap();
-        let client_seed = (87_u8..=u8::MAX)
+        let client_seed = (0_u8..=u8::MAX)
+            .filter(|byte| *byte != 86)
             .map(|byte| Seed::from_bytes([byte; 32]))
             .find(|seed| {
                 KeyMaterial::from_seed(seed)
                     .node_id()
                     .libp2p_peer_id()
                     .unwrap()
-                    > target_peer
+                    < target_peer
             })
-            .expect("test seeds include a client ordered after the target");
+            .expect("test seeds include a client ordered before the target");
         let client_node = Node::open(temp.path().join("client"), client_seed).unwrap();
         let client_id = client_node.keys().node_id();
         let good_node = Node::open(temp.path().join("good"), target_seed.clone()).unwrap();
