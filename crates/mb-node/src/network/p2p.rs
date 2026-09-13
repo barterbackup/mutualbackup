@@ -339,6 +339,7 @@ pub struct P2pEventLoop {
     enable_dht_maintenance: bool,
     bootstrap_retry: tokio::time::Interval,
     relay_reservations: Vec<Multiaddr>,
+    relay_reservation_endpoints: BTreeMap<PeerId, BTreeSet<Multiaddr>>,
     client_relay_reservation_connections: HashSet<ConnectionId>,
     server_relay_reservation_connections: HashSet<ConnectionId>,
     relay_listeners: HashMap<ListenerId, Multiaddr>,
@@ -1354,6 +1355,11 @@ pub fn build_p2p_with_tor(
     }
     let mut relay_reservations = Vec::new();
     let mut relay_listeners = HashMap::new();
+    // A relay reservation belongs to the relay peer, not to one of its
+    // transport addresses. Multiple listeners for the same peer replace each
+    // other inside libp2p-relay, so keep one lifecycle and retain every
+    // endpoint as a dial and publication alternative.
+    let mut relay_reservation_candidates = BTreeMap::<PeerId, BTreeSet<Multiaddr>>::new();
     for address in config
         .relay_reservation_addresses
         .iter()
@@ -1368,9 +1374,21 @@ pub fn build_p2p_with_tor(
         let reservation = address
             .clone()
             .with(libp2p::multiaddr::Protocol::P2pCircuit);
+        relay_reservation_candidates
+            .entry(peer)
+            .or_default()
+            .insert(reservation);
+    }
+    for (peer, candidates) in &relay_reservation_candidates {
+        let reservation = candidates
+            .iter()
+            .next()
+            .cloned()
+            .expect("configured relay peer has at least one address");
         let listener = swarm
             .listen_on(reservation.clone())
             .with_context(|| format!("cannot request relay reservation through {reservation}"))?;
+        tracing::debug!(%peer, %reservation, "requesting relay reservation");
         relay_reservations.push(reservation.clone());
         relay_listeners.insert(listener, reservation);
     }
@@ -1509,6 +1527,7 @@ pub fn build_p2p_with_tor(
             enable_dht_maintenance: config.enable_dht_maintenance,
             bootstrap_retry: retry_interval(BOOTSTRAP_RETRY_INTERVAL),
             relay_reservations,
+            relay_reservation_endpoints: relay_reservation_candidates,
             client_relay_reservation_connections: HashSet::new(),
             server_relay_reservation_connections: HashSet::new(),
             relay_listeners,
@@ -2851,11 +2870,23 @@ impl P2pEventLoop {
     }
 
     fn current_advertised_endpoints(&self) -> AdvertisedEndpointSelection {
-        let listen_addresses = self
+        let mut listen_addresses = self
             .swarm
             .listeners()
             .map(ToString::to_string)
             .collect::<Vec<_>>();
+        for listener in &self.active_relay_listeners {
+            let Some(peer) = self
+                .relay_listeners
+                .get(listener)
+                .and_then(|reservation| terminal_peer_id(reservation).ok())
+            else {
+                continue;
+            };
+            if let Some(endpoints) = self.relay_reservation_endpoints.get(&peer) {
+                listen_addresses.extend(endpoints.iter().map(ToString::to_string));
+            }
+        }
         status_advertised_addresses(
             *self.swarm.local_peer_id(),
             &self.advertised_addresses,
@@ -9846,6 +9877,56 @@ mod tests {
             .into_iter()
             .map(|node| Arc::try_unwrap(node).ok().unwrap().into_inner().unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn relay_endpoints_for_one_peer_share_one_reservation_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::open(temp.path().join("member"), Seed::from_bytes([92; 32])).unwrap();
+        let node_id = node.keys().node_id();
+        let relay_peer = KeyMaterial::from_seed(&Seed::from_bytes([93; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let first: Multiaddr = format!("/ip4/127.0.0.1/udp/41001/quic-v1/p2p/{relay_peer}")
+            .parse()
+            .unwrap();
+        let second: Multiaddr = format!("/ip4/127.0.0.1/udp/41002/quic-v1/p2p/{relay_peer}")
+            .parse()
+            .unwrap();
+        let mut member_config = config(node_id);
+        member_config.enable_relay_server = false;
+        member_config.relay_reservation_addresses = vec![second.clone(), first.clone()];
+
+        let (_client, mut event_loop) =
+            build_p2p(Arc::new(Mutex::new(node)), member_config).unwrap();
+
+        assert_eq!(event_loop.relay_reservations.len(), 1);
+        assert_eq!(event_loop.relay_listeners.len(), 1);
+        assert_eq!(
+            event_loop.persistent_addresses.get(&relay_peer).unwrap(),
+            &BTreeSet::from([
+                normalize_known_address(relay_peer, first).unwrap(),
+                normalize_known_address(relay_peer, second).unwrap(),
+            ])
+        );
+
+        let initial_listeners = event_loop.relay_listeners.clone();
+        event_loop
+            .active_relay_listeners
+            .extend(initial_listeners.keys().copied());
+        for _ in 0..3 {
+            event_loop.retry_relay_reservations();
+            assert_eq!(event_loop.relay_listeners, initial_listeners);
+            assert_eq!(event_loop.active_relay_listeners.len(), 1);
+        }
+        let relay_endpoints = event_loop
+            .current_advertised_endpoints()
+            .addresses
+            .into_iter()
+            .filter(|address| address.contains("/p2p-circuit"))
+            .collect::<Vec<_>>();
+        assert_eq!(relay_endpoints.len(), 2);
     }
 
     #[tokio::test]
