@@ -2588,6 +2588,25 @@ impl P2pEventLoop {
         }
     }
 
+    fn selected_application_connection(&self, peer: PeerId, tier: u8) -> Option<ConnectionId> {
+        self.connection_paths
+            .iter()
+            .filter_map(|(connection, (candidate, path))| {
+                (*candidate == peer
+                    && path_preference_rank(self.tor_mode, *path) == tier
+                    && !self.connection_is_retiring_or_unhealthy(*connection))
+                .then_some((
+                    *connection,
+                    self.sessions
+                        .get(connection)
+                        .map(|session| session.sequence)
+                        .unwrap_or(u64::MAX),
+                ))
+            })
+            .min_by_key(|(connection, sequence)| (*sequence, *connection))
+            .map(|(connection, _)| connection)
+    }
+
     fn dispatch_request(&mut self, mut pending: PendingRequest) {
         if !pending.caller_waiting() {
             return;
@@ -2602,15 +2621,46 @@ impl P2pEventLoop {
             )));
             return;
         }
-        pending.transport_tier = self.selected_transport_tier(pending.peer);
-        pending.attempts = pending.attempts.saturating_add(1);
-        pending.started_at = tokio::time::Instant::now();
-        let outbound_id = self
-            .swarm
-            .behaviour_mut()
-            .peer
-            .send_request(&pending.peer, pending.request.clone());
-        self.pending_requests.insert(outbound_id, pending);
+        let peer = pending.peer;
+        let tier = self.selected_transport_tier(peer);
+        let Some(connection) = self.selected_application_connection(peer, tier) else {
+            self.queued_requests.push_back(pending);
+            self.ensure_selected_transport(peer);
+            return;
+        };
+        let outbound_id = self.swarm.behaviour_mut().peer.send_request_on_connection(
+            &peer,
+            connection,
+            pending.request.clone(),
+        );
+        match outbound_id {
+            Ok(outbound_id) => {
+                pending.transport_tier = tier;
+                pending.attempts = pending.attempts.saturating_add(1);
+                pending.started_at = tokio::time::Instant::now();
+                self.pending_requests.insert(outbound_id, pending);
+            }
+            Err(_) => {
+                // The composed request-response behaviour should observe the
+                // same Swarm lifecycle before this event loop. Treat any
+                // mismatch as a stale path and re-establish the selected tier.
+                self.unhealthy_connections.insert(connection);
+                if !self.swarm.close_connection(connection) {
+                    self.connection_paths.remove(&connection);
+                    self.connection_dialers.remove(&connection);
+                    self.duplicate_retirement.remove(&connection);
+                    self.relay_retirement.remove(&connection);
+                    self.client_relay_reservation_connections
+                        .remove(&connection);
+                    self.server_relay_reservation_connections
+                        .remove(&connection);
+                    self.unhealthy_connections.remove(&connection);
+                    self.record_session_close(connection, true);
+                }
+                self.queued_requests.push_back(pending);
+                self.ensure_selected_transport(peer);
+            }
+        }
     }
 
     fn queue_or_dispatch_request(&mut self, mut pending: PendingRequest) {
@@ -3890,12 +3940,9 @@ impl P2pEventLoop {
                             event.remote_peer_id,
                             *connection_id,
                         );
-                        // request-response does not expose per-request
-                        // connection selection and may otherwise keep using
-                        // the older relay circuit indefinitely. Schedule only
-                        // duplicate relayed sessions for retirement after
-                        // DCUtR has produced a direct one. A grace period and
-                        // in-flight tracking avoid cutting off the request
+                        // Schedule duplicate relayed sessions for retirement
+                        // after DCUtR has produced a direct one. A grace period
+                        // and in-flight tracking avoid cutting off the request
                         // which caused the peers to meet over the relay.
                         let relayed_connections = self
                             .connection_paths
@@ -6808,6 +6855,38 @@ mod tests {
         }
     }
 
+    fn register_request_connection(
+        event_loop: &mut P2pEventLoop,
+        peer: PeerId,
+        connection: ConnectionId,
+    ) {
+        let address: Multiaddr = "/memory/1".parse().unwrap();
+        let _handler = event_loop
+            .swarm
+            .behaviour_mut()
+            .peer
+            .handle_established_outbound_connection(
+                connection,
+                peer,
+                &address,
+                Endpoint::Dialer,
+                PortUse::Reuse,
+            )
+            .unwrap();
+    }
+
+    async fn next_request_dispatch(event_loop: &mut P2pEventLoop) -> ConnectionId {
+        futures::future::poll_fn(|cx| match event_loop.swarm.behaviour_mut().peer.poll(cx) {
+            Poll::Ready(libp2p::swarm::ToSwarm::NotifyHandler {
+                handler: libp2p::swarm::NotifyHandler::One(connection),
+                ..
+            }) => Poll::Ready(connection),
+            Poll::Ready(event) => panic!("unexpected request-response action: {event:?}"),
+            Poll::Pending => Poll::Pending,
+        })
+        .await
+    }
+
     #[test]
     fn tor_policy_selects_one_transport_class_and_a_bounded_fallback() {
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([201; 32]));
@@ -7610,9 +7689,11 @@ mod tests {
         let (client, mut event_loop) = build_p2p(node, p2p_config).unwrap();
         let peer = KeyMaterial::from_seed(&Seed::from_bytes([80; 32])).node_id();
         let peer_id = peer.libp2p_peer_id().unwrap();
+        let connection = ConnectionId::new_unchecked(780);
         event_loop
             .connection_paths
-            .insert(ConnectionId::new_unchecked(780), (peer_id, P2pPath::Direct));
+            .insert(connection, (peer_id, P2pPath::Direct));
+        register_request_connection(&mut event_loop, peer_id, connection);
 
         let started = tokio::spawn({
             let client = client.clone();
@@ -7678,6 +7759,7 @@ mod tests {
         event_loop
             .connection_paths
             .insert(retiring, (peer, P2pPath::Direct));
+        register_request_connection(&mut event_loop, peer, retiring);
         event_loop.duplicate_retirement.insert(
             retiring,
             (peer, tokio::time::Instant::now() - Duration::from_secs(1)),
@@ -7941,6 +8023,7 @@ mod tests {
         event_loop
             .connection_paths
             .insert(healthy_direct, (peer, P2pPath::Direct));
+        register_request_connection(&mut event_loop, peer, healthy_direct);
 
         let call = tokio::spawn({
             let client = client.clone();
@@ -8003,6 +8086,7 @@ mod tests {
         event_loop
             .connection_paths
             .insert(healthy_relay, (peer, P2pPath::RelayFallback));
+        register_request_connection(&mut event_loop, peer, healthy_relay);
         event_loop.handle_peer_event(request_response::Event::OutboundFailure {
             peer,
             connection_id: direct_failure,
@@ -8023,6 +8107,7 @@ mod tests {
         event_loop
             .connection_paths
             .insert(healthy_tor, (peer, P2pPath::Tor));
+        register_request_connection(&mut event_loop, peer, healthy_tor);
         event_loop.handle_peer_event(request_response::Event::OutboundFailure {
             peer,
             connection_id: relay_failure,
@@ -8092,6 +8177,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefer_tor_dispatches_on_tor_while_each_reservation_role_retains_direct_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        for (index, client_reservation) in [true, false].into_iter().enumerate() {
+            let local_seed = Seed::from_bytes([120 + index as u8; 32]);
+            let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+            let node = Arc::new(Mutex::new(
+                Node::open(temp.path().join(index.to_string()), local_seed).unwrap(),
+            ));
+            let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+            event_loop.tor_mode = TorMode::PreferTor;
+            let target =
+                KeyMaterial::from_seed(&Seed::from_bytes([130 + index as u8; 32])).node_id();
+            let peer = target.libp2p_peer_id().unwrap();
+            let direct_address: Multiaddr =
+                format!("/ip4/192.0.2.120/udp/44000/quic-v1/p2p/{peer}")
+                    .parse()
+                    .unwrap();
+            let onion_address = onion_listener_address(target).unwrap();
+            for address in [direct_address.clone(), onion_address.clone()] {
+                event_loop.add_learned_address(peer, address).unwrap();
+            }
+            event_loop.set_transport_tier(peer, 0);
+
+            let direct = ConnectionId::new_unchecked(1201 + index * 10);
+            let tor = ConnectionId::new_unchecked(1202 + index * 10);
+            for (connection, path) in [(direct, P2pPath::Direct), (tor, P2pPath::Tor)] {
+                event_loop.connection_paths.insert(connection, (peer, path));
+                event_loop.connection_dialers.insert(connection, true);
+                event_loop.record_session_open(
+                    connection,
+                    peer,
+                    path,
+                    P2pSessionDirection::Outbound,
+                );
+                register_request_connection(&mut event_loop, peer, connection);
+            }
+            event_loop.protect_relay_reservation_connection(peer, direct, client_reservation);
+
+            let call = tokio::spawn({
+                let client = client.clone();
+                async move { client.call(target, PeerRequest::Profile).await }
+            });
+            let command = event_loop.commands.recv().await.unwrap();
+            event_loop.handle_command(command).unwrap();
+            assert_eq!(next_request_dispatch(&mut event_loop).await, tor);
+            let request_id = *event_loop.pending_requests.keys().next().unwrap();
+
+            event_loop.handle_peer_event(request_response::Event::OutboundFailure {
+                peer,
+                connection_id: tor,
+                request_id,
+                error: request_response::OutboundFailure::ConnectionClosed,
+            });
+            assert_eq!(event_loop.selected_transport_tier(peer), 1);
+            assert!(event_loop.pending_requests.is_empty());
+            assert_eq!(event_loop.queued_requests.len(), 1);
+            event_loop.handle_swarm_event(SwarmEvent::ConnectionClosed {
+                peer_id: peer,
+                connection_id: tor,
+                endpoint: ConnectedPoint::Dialer {
+                    address: onion_address,
+                    role_override: Endpoint::Dialer,
+                    port_use: PortUse::Reuse,
+                },
+                num_established: 1,
+                cause: None,
+            });
+            assert_eq!(next_request_dispatch(&mut event_loop).await, direct);
+            assert_eq!(event_loop.pending_requests.len(), 1);
+            assert!(event_loop.queued_requests.is_empty());
+            assert!(event_loop.connection_owns_relay_reservation(direct));
+
+            drop(event_loop);
+            assert!(call.await.unwrap().is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn fallback_dials_advance_in_order_despite_a_retained_worse_connection() {
         let temp = tempfile::tempdir().unwrap();
         let local_seed = Seed::from_bytes([92; 32]);
@@ -8115,9 +8278,11 @@ mod tests {
         for address in [direct, relayed, onion_listener_address(target).unwrap()] {
             event_loop.add_learned_address(peer, address).unwrap();
         }
+        let tor_connection = ConnectionId::new_unchecked(921);
         event_loop
             .connection_paths
-            .insert(ConnectionId::new_unchecked(921), (peer, P2pPath::Tor));
+            .insert(tor_connection, (peer, P2pPath::Tor));
+        register_request_connection(&mut event_loop, peer, tor_connection);
 
         let call = tokio::spawn({
             let client = client.clone();
@@ -8207,6 +8372,7 @@ mod tests {
         event_loop
             .connection_paths
             .insert(connection, (peer, P2pPath::Direct));
+        register_request_connection(&mut event_loop, peer, connection);
 
         let call = tokio::spawn({
             let client = client.clone();
@@ -8344,6 +8510,9 @@ mod tests {
                 P2pSessionDirection::Inbound
             },
         );
+        for connection in [selected, survivor, duplicate, second_duplicate] {
+            register_request_connection(&mut event_loop, peer, connection);
+        }
 
         let call = tokio::spawn({
             let client = client.clone();
@@ -8612,9 +8781,11 @@ mod tests {
         let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
         let target = KeyMaterial::from_seed(&Seed::from_bytes([102; 32])).node_id();
         let peer = target.libp2p_peer_id().unwrap();
+        let connection = ConnectionId::new_unchecked(1001);
         event_loop
             .connection_paths
-            .insert(ConnectionId::new_unchecked(1001), (peer, P2pPath::Direct));
+            .insert(connection, (peer, P2pPath::Direct));
+        register_request_connection(&mut event_loop, peer, connection);
 
         let call = tokio::spawn({
             let client = client.clone();
@@ -9239,6 +9410,7 @@ mod tests {
         event_loop
             .connection_paths
             .insert(connection, (peer, P2pPath::Tor));
+        register_request_connection(&mut event_loop, peer, connection);
 
         let call = tokio::spawn({
             let client = client.clone();
@@ -9767,17 +9939,39 @@ mod tests {
                 )
                 .unwrap();
         }
-        for address in [good_address, blackhole_address] {
-            client_loop
-                .swarm
-                .dial(
-                    SwarmDialOpts::peer_id(target_peer)
-                        .addresses(vec![address])
-                        .condition(PeerCondition::Always)
-                        .build(),
-                )
-                .unwrap();
-        }
+        // Establish the blackhole first so exact-connection dispatch selects
+        // it deterministically. The healthy duplicate is then available for
+        // the retry after the request timeout quarantines that first session.
+        client_loop
+            .swarm
+            .dial(
+                SwarmDialOpts::peer_id(target_peer)
+                    .addresses(vec![blackhole_address])
+                    .condition(PeerCondition::Always)
+                    .build(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !client_loop
+                .connection_paths
+                .values()
+                .any(|(peer, _)| *peer == target_peer)
+            {
+                let event = client_loop.swarm.select_next_some().await;
+                client_loop.handle_swarm_event(event);
+            }
+        })
+        .await
+        .expect("client did not establish the blackhole session first");
+        client_loop
+            .swarm
+            .dial(
+                SwarmDialOpts::peer_id(target_peer)
+                    .addresses(vec![good_address])
+                    .condition(PeerCondition::Always)
+                    .build(),
+            )
+            .unwrap();
         let client_task = tokio::spawn(client_loop.run());
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {

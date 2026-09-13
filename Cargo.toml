@@ -5,6 +5,7 @@ members = [
     "crates/mb-node",
     "cmd/mutualbackup",
     "vendor/libp2p-relay",
+    "vendor/libp2p-request-response",
 ]
 resolver = "2"
 
@@ -78,3 +79,6 @@ strip = "symbols"
 # reservation.  The local patch adds that ID to reservation lifecycle events
 # so the node can fence only the owning connection during session collapse.
 libp2p-relay = { path = "vendor/libp2p-relay" }
+# Application transport policy needs to keep relay-reservation connections
+# alive while choosing the exact established connection for each request.
+libp2p-request-response = { path = "vendor/libp2p-request-response" }

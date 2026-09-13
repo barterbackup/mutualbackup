@@ -2166,6 +2166,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures_ringbuf"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6628abb6eb1fc74beaeb20cd0670c43d158b0150f7689b38c3eaf663f99bdec7"
+dependencies = [
+ "futures",
+ "log",
+ "ringbuf",
+ "rustc_version",
+]
+
+[[package]]
 name = "generator"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3603,20 +3615,24 @@ dependencies = [
 [[package]]
 name = "libp2p-request-response"
 version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9f1cca83488b90102abac7b67d5c36fc65bc02ed47620228af7ed002e6a1478"
 dependencies = [
+ "anyhow",
  "async-trait",
  "cbor4ii",
  "futures",
  "futures-bounded",
+ "futures_ringbuf",
  "libp2p-core",
  "libp2p-identity",
  "libp2p-swarm",
+ "libp2p-swarm-test",
  "rand 0.8.8",
  "serde",
+ "serde_json",
  "smallvec",
+ "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -5565,6 +5581,15 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "ringbuf"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79abed428d1fd2a128201cec72c5f6938e2da607c6f3745f769fabea399d950a"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]
