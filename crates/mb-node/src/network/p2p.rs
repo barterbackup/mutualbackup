@@ -7308,7 +7308,8 @@ mod tests {
             format!("/ip6/0:0:0:0:0:0:0:1/udp/44000/quic-v1/p2p/{destination_peer}"),
         ] {
             assert!(
-                validate_bootstrap_addresses(TorMode::Auto, &[invalid.clone()]).is_err(),
+                validate_bootstrap_addresses(TorMode::Auto, std::slice::from_ref(&invalid))
+                    .is_err(),
                 "accepted {invalid}"
             );
         }
@@ -7317,7 +7318,10 @@ mod tests {
             .with(libp2p::multiaddr::Protocol::P2p(relay_peer))
             .to_string();
         assert!(validate_bootstrap_addresses(TorMode::Auto, &[wrong_onion]).is_err());
-        assert!(validate_bootstrap_addresses(TorMode::RequireTor, &[direct.clone()]).is_err());
+        assert!(
+            validate_bootstrap_addresses(TorMode::RequireTor, std::slice::from_ref(&direct))
+                .is_err()
+        );
         assert!(validate_bootstrap_addresses(TorMode::DisableTor, &[onion]).is_err());
         assert!(
             validate_bootstrap_addresses(TorMode::Auto, &vec![direct; MAX_BOOTSTRAP_ADDRESSES + 1])
