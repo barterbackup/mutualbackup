@@ -58,10 +58,12 @@ them as ADRs and test vectors before promising wire compatibility.
 
 ### Implemented baseline — first usable product and Tor connectivity beta
 
-The first usable architectural prototype, the Milestone 2
-operator-configuration and identity-state slice, and the Milestone 3
-robust-connectivity beta have passed their review gates. Milestone 4 is the
-next development stage.
+The first usable architectural prototype and the Milestone 2
+operator-configuration and identity-state slice have passed their review gates.
+The Milestone 3 robust-connectivity beta is implemented, but its gate is
+reopened: source-only review of `a364d34..9bc793a` found three remaining
+connectivity lifecycle blockers, recorded in `TODO.md`. Close them before
+beginning Milestone 4.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -451,10 +453,11 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 3 have passed, and Milestone 4
-is next. Later wire or durable-state changes require the review and gate of the
-milestone that owns them. Build and run all subsequent validation locally; do
-not use a remote compilation server.
+than a daemon prerequisite. Milestones 0 through 2 have passed. Milestone 3
+requires the corrective follow-up in `TODO.md` before Milestone 4 begins. Later
+wire or durable-state changes require the review and gate of the milestone
+that owns them. Build and run all subsequent validation locally; do not use a
+remote compilation server.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -667,16 +670,22 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 3 are passed. Milestone 4 is next.
+**Current position:** Milestones 0 through 2 are passed. Milestone 3 is
+implemented with its gate reopened; Milestone 4 waits for the corrective
+follow-up in `TODO.md`.
 Milestone 3 puts policy at the composed transport boundary, provides Arti onion
 service and dialing, DHT endpoint exchange, direct/relay/DCUtR/onion telemetry,
-optional gateway mapping, and real acceptance environments. Its final
+optional gateway mapping, and real acceptance environments. Its latest
 corrective pass serializes request-scoped relay reservation lifecycles, binds
 application requests to the selected connection while retaining reservation
 fallbacks, reconciles every redundant session in the surviving duplicate set,
 and acknowledges settlement and release of gateway leases granted during
-acquisition. A fresh source audit found no high-confidence Milestone 3 blocker,
-and the complete local regression contract passed.
+acquisition. The subsequent source-only review of `a364d34..9bc793a` found
+premature request failure before retiring duplicates are revived, reservation
+churn between configured endpoints for the same relay, and failure to delete
+an existing gateway lease when renewal stalls. The recorded local regression
+contract passed before this review but does not cover these schedules. This
+review ran no builds, tests, or acceptance environments.
 
 The locked workspace, disposable-Btrfs/reflink and isolated IP/NAT gates, mixed
 DHT policy and three-tier fallback regressions, custom Arti-state restart, real
@@ -803,7 +812,7 @@ replaced by isolated network namespaces and port-preserving NAT without
 disabling production discovery. The final source-only review found no new
 high-confidence Milestone 2 defect, and the full remote gate passed.
 
-### Milestone 3 — Tor and robust connectivity beta (passed)
+### Milestone 3 — Tor and robust connectivity beta (implemented; gate reopened)
 
 - ADR 0001 pins and source-reviews Arti 0.46.0 and defines the transport,
   identity-key, onion-service-key, discovery, policy, and cache lifecycle
@@ -835,22 +844,36 @@ Corrective passes also closed the established-preferred/fallback-close and
 equal-tier duplicate-retirement races, the saturated mapper-command-queue
 cleanup race, stale transport-tier state after ephemeral endpoint expiry or
 final disconnect, and incomplete validation of canonical signed local
-endpoints. The final pass vendors pinned patches that serialize request-scoped
+endpoints. The latest pass vendors pinned patches that serialize request-scoped
 relay reservations, dispatch application requests on an exact selected
 connection while preserving relay fallbacks, reconcile the whole surviving
 duplicate-session set, and settle and release in-flight or completed gateway
 mapping acquisitions before deactivation. Deterministic regressions cover the
 reviewed event orders and failure schedules.
 
-A fresh source audit found no new high-confidence Milestone 3 defect. The
-locked workspace tests and clippy, static local Nix build, disposable-Btrfs and
-multi-process recovery suites, isolated network and gateway-mapping tests,
+The locked workspace tests and clippy, static local Nix build, disposable-Btrfs
+and multi-process recovery suites, isolated network and gateway-mapping tests,
 private-Tor onion-only five-daemon recovery, and no-build Docker/Btrfs
-erase-and-seed recovery all passed locally.
+erase-and-seed recovery passed in the preceding local gate. The subsequent
+source-only review of `a364d34..9bc793a` found three uncovered schedules, so
+Milestone 3 is not finished:
+
+1. Reconcile usable retiring sessions before an outbound timeout fails the
+   caller or advances transport tiers, including timeout before connection
+   closure with the local Peer ID smaller than the remote.
+2. Make multiple configured endpoints for one relay converge without closing
+   and recreating each other's reservation listeners or consuming the relay's
+   reservation rate limit indefinitely.
+3. Delete an already-active gateway lease during shutdown or listener loss
+   even if an in-flight renewal stalls before it can return a mapping.
+
+Implement the fixes and focused regressions in `TODO.md`, then repeat the
+source review and required regression contract locally before closing this
+gate. No runtime validation was performed during this source-only review.
 
 ### Milestone 4 — durable operations and multi-volume storage beta
 
-This follows the passed Milestone 3 gate.
+This follows closure of the reopened Milestone 3 gate.
 
 - Add writer-incarnation fencing before supporting concurrent loss/recovery;
   then add retention and tombstones, safe GC, audits/scrubs, repair and emergency

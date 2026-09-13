@@ -1,5 +1,51 @@
 # Product TODO
 
+## Milestone 3 corrective follow-up — required before Milestone 4
+
+Source-only review of `a364d34..9bc793a` found three remaining blockers. No
+builds, tests, or acceptance environments were run for this review.
+
+- **P2 — revive usable retiring sessions before failing an outbound request.**
+  In `crates/mb-node/src/network/p2p.rs`, `OutboundFailure` checks
+  `healthy_connection_at_tier` before reconciling retirement markers. With the
+  local Peer ID smaller than the remote, a healthy outbound duplicate B that
+  arrives while a request uses A is marked for retirement but kept open by
+  that request. If A times out before `ConnectionClosed`, B is excluded from
+  the retry decision. With no lower transport tier, the caller fails after the
+  20-second attempt timeout despite B being usable and most of the 90-second
+  logical deadline remaining. The later close revives B after the request has
+  been dropped. Quarantine the failed connection and reconcile viable
+  survivors before retry/fallback selection. Add a timeout-before-close
+  regression with a retiring duplicate and this Peer-ID ordering; the current
+  live timeout test deliberately uses the opposite ordering.
+- **P2 — make multiple endpoint addresses for one relay converge.** In
+  `vendor/libp2p-relay/src/priv_client/handler.rs`, accepting a new reservation
+  replaces the previous listener sender. Multiple configured addresses for
+  one relay Peer ID can use the same existing connection, so accepting one
+  closes the other's listener. `retry_relay_reservations` in
+  `crates/mb-node/src/network/p2p.rs` recreates the missing listener every five
+  seconds, repeatedly replacing the remaining listener. This leaves status
+  degraded at one of two reservations and consumes the relay's default
+  reservation rate limit, delaying legitimate reconnection. Coalesce these
+  endpoints into one reservation lifecycle with consistent listener/status
+  ownership, or explicitly reject duplicate-relay configurations. Regress two
+  same-peer endpoint addresses through several retry intervals and ensure
+  reservation requests stop once reachability is established.
+- **P2 — release an active gateway lease even when renewal stalls.** In
+  `vendor/portmapper/src/lib.rs`, `update_local_port(None)` now awaits
+  `settle_mapping_task` before invalidating the existing mapping. An active
+  UPnP lease can be halfway through its lifetime while renewal hangs in
+  `get_external_ip`; pinned `igd-next` has no timeout around that HTTP request.
+  Shutdown or listener loss waits ten seconds in
+  `crates/mb-node/src/network/port_mapping.rs`, then drops the last mapper
+  client and aborts the service before the known active lease receives any
+  delete request. Attempt known-lease cleanup independently of a stalled
+  acquisition, with bounded settlement that preserves cleanup ownership.
+  Add a gateway regression with an installed lease, stalled renewal, and
+  shutdown/listener loss; assert that the gateway receives the deletion even
+  when renewal cannot finish. The new paused-acquisition test has no existing
+  lease and resumes acquisition promptly, so it does not cover this schedule.
+
 ## Later guild geometry and coding protocol
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
