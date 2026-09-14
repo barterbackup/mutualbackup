@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use uuid::Uuid;
@@ -12,6 +12,8 @@ use crate::{
 
 pub type SectorId = [u8; 32];
 pub type CodingGroupId = [u8; 32];
+pub const USER_REVISION_DOMAIN: &[u8] = b"mutualbackup/user-revision/v2";
+const WRITER_REVISION_DOMAIN: &[u8] = b"mutualbackup/writer-revision/v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Member {
@@ -54,6 +56,13 @@ pub struct StorageAcknowledgement {
     pub row: u16,
     pub root: [u8; 32],
     pub holder: NodeId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WriterFence {
+    pub owner: NodeId,
+    pub epoch: u64,
+    pub public_key: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -211,6 +220,7 @@ pub struct GuildCheckpoint {
     pub generation: u64,
     pub parent: Option<[u8; 32]>,
     pub members: Vec<Member>,
+    pub writer_fences: Vec<WriterFence>,
     pub revisions: Vec<SignedRecord<UserRevision>>,
     pub coding_groups: Vec<CodingGroup>,
 }
@@ -229,7 +239,7 @@ pub struct QuorumCheckpoint {
 
 impl GuildCheckpoint {
     pub fn validate(&self) -> Result<(), ModelError> {
-        if self.format_version != 1
+        if self.format_version != 2
             || self.genesis_hash == [0; 32]
             || self.generation == 0
             || self.generation > i64::MAX as u64
@@ -265,9 +275,31 @@ impl GuildCheckpoint {
         let mut revision_ids = std::collections::BTreeSet::new();
         let mut revision_order = None;
         let mut revision_sectors = std::collections::BTreeMap::new();
-        let mut revision_heads = std::collections::BTreeMap::<NodeId, (u64, [u8; 32])>::new();
+        let mut revision_heads = std::collections::BTreeMap::<NodeId, (u64, [u8; 32], u64)>::new();
+        let mut fences = std::collections::BTreeMap::<(NodeId, u64), [u8; 32]>::new();
+        let mut latest_fences = std::collections::BTreeMap::<NodeId, u64>::new();
+        let mut previous_fence = None;
+        for fence in &self.writer_fences {
+            let order = (fence.owner, fence.epoch);
+            let key = VerifyingKey::from_bytes(&fence.public_key)?;
+            if previous_fence.is_some_and(|previous| previous >= order)
+                || !member_ids.contains(&fence.owner)
+                || fence.epoch == 0
+                || key.is_weak()
+                || fences.insert(order, fence.public_key).is_some()
+            {
+                return Err(ModelError::InvalidCheckpoint);
+            }
+            match latest_fences.insert(fence.owner, fence.epoch) {
+                Some(previous) if previous.checked_add(1) == Some(fence.epoch) => {}
+                None if fence.epoch == 1 => {}
+                _ => return Err(ModelError::InvalidCheckpoint),
+            }
+            previous_fence = Some(order);
+        }
         for revision in &self.revisions {
-            revision.verify(b"mutualbackup/user-revision/v1")?;
+            revision.verify(USER_REVISION_DOMAIN)?;
+            revision.value.verify_writer()?;
             let order = (
                 revision.value.owner,
                 revision.value.sequence,
@@ -276,7 +308,7 @@ impl GuildCheckpoint {
             if revision_order.is_some_and(|previous| previous >= order)
                 || revision.signer != revision.value.owner
                 || !member_ids.contains(&revision.signer)
-                || revision.value.format_version != 1
+                || revision.value.format_version != 2
                 || revision.value.guild_id != self.guild_id
                 || revision.value.cipher_profile != V1_CIPHER_PROFILE
                 || revision.value.sequence == 0
@@ -285,10 +317,16 @@ impl GuildCheckpoint {
             {
                 return Err(ModelError::InvalidCheckpoint);
             }
+            if fences.get(&(revision.value.owner, revision.value.writer_epoch))
+                != Some(&revision.value.writer_public_key)
+            {
+                return Err(ModelError::InvalidCheckpoint);
+            }
             match revision_heads.get(&revision.value.owner) {
-                Some((previous_sequence, previous_hash))
+                Some((previous_sequence, previous_hash, previous_writer_epoch))
                     if previous_sequence.checked_add(1) == Some(revision.value.sequence)
-                        && revision.value.parent == Some(*previous_hash) => {}
+                        && revision.value.parent == Some(*previous_hash)
+                        && revision.value.writer_epoch >= *previous_writer_epoch => {}
                 None if revision.value.sequence == 1 && revision.value.parent.is_none() => {}
                 _ => return Err(ModelError::InvalidCheckpoint),
             }
@@ -309,9 +347,21 @@ impl GuildCheckpoint {
             }
             revision_heads.insert(
                 revision.value.owner,
-                (revision.value.sequence, revision.value.hash()?),
+                (
+                    revision.value.sequence,
+                    revision.value.hash()?,
+                    revision.value.writer_epoch,
+                ),
             );
             revision_order = Some(order);
+        }
+        for (owner, (_, _, head_writer_epoch)) in &revision_heads {
+            let Some(latest) = latest_fences.get(owner) else {
+                return Err(ModelError::InvalidCheckpoint);
+            };
+            if head_writer_epoch != latest {
+                return Err(ModelError::InvalidCheckpoint);
+            }
         }
 
         let mut group_ids = std::collections::BTreeSet::new();
@@ -578,6 +628,9 @@ pub struct UserRevision {
     pub cipher_profile: u16,
     pub revision_id: Uuid,
     pub owner: NodeId,
+    pub writer_epoch: u64,
+    pub writer_public_key: [u8; 32],
+    pub writer_signature: Vec<u8>,
     pub sequence: u64,
     pub parent: Option<[u8; 32]>,
     pub metadata_sectors: Vec<SectorRef>,
@@ -585,9 +638,40 @@ pub struct UserRevision {
 }
 
 impl UserRevision {
+    pub fn sign_writer(&mut self, signing_key: &SigningKey) -> Result<(), ModelError> {
+        if signing_key.verifying_key().to_bytes() != self.writer_public_key {
+            return Err(ModelError::InvalidWriterFence);
+        }
+        self.writer_signature.clear();
+        self.writer_signature = signing_key
+            .sign(&signing_payload(
+                WRITER_REVISION_DOMAIN,
+                &canonical_bytes(self)?,
+            ))
+            .to_vec();
+        Ok(())
+    }
+
+    pub fn verify_writer(&self) -> Result<(), ModelError> {
+        if self.writer_epoch == 0 || self.writer_signature.len() != 64 {
+            return Err(ModelError::InvalidWriterFence);
+        }
+        let key = VerifyingKey::from_bytes(&self.writer_public_key)?;
+        if key.is_weak() {
+            return Err(ModelError::WeakPublicKey);
+        }
+        let mut unsigned = self.clone();
+        unsigned.writer_signature.clear();
+        key.verify_strict(
+            &signing_payload(WRITER_REVISION_DOMAIN, &canonical_bytes(&unsigned)?),
+            &Signature::from_slice(&self.writer_signature)?,
+        )?;
+        Ok(())
+    }
+
     /// Stable identity used by the next revision's `parent` field.
     pub fn hash(&self) -> Result<[u8; 32], ModelError> {
-        let mut hasher = blake3::Hasher::new_derive_key("mutualbackup user revision body v1");
+        let mut hasher = blake3::Hasher::new_derive_key("mutualbackup user revision body v2");
         hasher.update(&canonical_bytes(self)?);
         Ok(*hasher.finalize().as_bytes())
     }
@@ -648,6 +732,8 @@ pub enum ModelError {
     InvalidInvite,
     #[error("invalid parity storage acknowledgement")]
     InvalidStorageAcknowledgement,
+    #[error("revision is not authorized by its writer incarnation")]
+    InvalidWriterFence,
     #[error("weak Ed25519 public key is not accepted")]
     WeakPublicKey,
     #[error("checkpoint is not authorized by the recovering seed")]
@@ -914,31 +1000,37 @@ mod tests {
             roles,
         };
         group.id = group.calculate_id().unwrap();
-        let revision = SignedRecord::sign(
-            b"mutualbackup/user-revision/v1",
-            UserRevision {
-                format_version: 1,
-                guild_id,
-                cipher_profile: V1_CIPHER_PROFILE,
-                revision_id: Uuid::from_u128(1),
-                owner: keys[0].node_id(),
-                sequence: 1,
-                parent: None,
-                metadata_sectors: vec![target],
-                data_sectors: Vec::new(),
-            },
-            &keys[0],
-        )
-        .unwrap();
+        let writer = SigningKey::from_bytes(&[77; 32]);
+        let mut revision_body = UserRevision {
+            format_version: 2,
+            guild_id,
+            cipher_profile: V1_CIPHER_PROFILE,
+            revision_id: Uuid::from_u128(1),
+            owner: keys[0].node_id(),
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![target],
+            data_sectors: Vec::new(),
+        };
+        revision_body.sign_writer(&writer).unwrap();
+        let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision_body, &keys[0]).unwrap();
         members.sort_by_key(|member| member.node_id);
         let mut checkpoint = QuorumCheckpoint {
             checkpoint: GuildCheckpoint {
-                format_version: 1,
+                format_version: 2,
                 guild_id,
                 genesis_hash: [10; 32],
                 generation: 1,
                 parent: None,
                 members,
+                writer_fences: vec![WriterFence {
+                    owner: keys[0].node_id(),
+                    epoch: 1,
+                    public_key: writer.verifying_key().to_bytes(),
+                }],
                 revisions: vec![revision],
                 coding_groups: vec![group],
             },
@@ -955,6 +1047,16 @@ mod tests {
             checkpoint.add_signature(key).unwrap();
         }
         checkpoint.verify().unwrap();
+
+        let mut tampered_writer = checkpoint.checkpoint.clone();
+        tampered_writer.revisions[0].value.writer_signature[0] ^= 1;
+        tampered_writer.revisions[0] = SignedRecord::sign(
+            USER_REVISION_DOMAIN,
+            tampered_writer.revisions[0].value.clone(),
+            &keys[0],
+        )
+        .unwrap();
+        assert!(tampered_writer.validate().is_err());
 
         let locator = RecoveryLocator {
             format_version: 1,
@@ -985,24 +1087,24 @@ mod tests {
             root: [11; 32],
             logical_len: 1,
         };
-        chained.revisions.push(
-            SignedRecord::sign(
-                b"mutualbackup/user-revision/v1",
-                UserRevision {
-                    format_version: 1,
-                    guild_id,
-                    cipher_profile: V1_CIPHER_PROFILE,
-                    revision_id: Uuid::from_u128(2),
-                    owner: keys[0].node_id(),
-                    sequence: 2,
-                    parent: Some(previous),
-                    metadata_sectors: vec![next_target.clone()],
-                    data_sectors: Vec::new(),
-                },
-                &keys[0],
-            )
-            .unwrap(),
-        );
+        let mut next_revision = UserRevision {
+            format_version: 2,
+            guild_id,
+            cipher_profile: V1_CIPHER_PROFILE,
+            revision_id: Uuid::from_u128(2),
+            owner: keys[0].node_id(),
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 2,
+            parent: Some(previous),
+            metadata_sectors: vec![next_target.clone()],
+            data_sectors: Vec::new(),
+        };
+        next_revision.sign_writer(&writer).unwrap();
+        chained
+            .revisions
+            .push(SignedRecord::sign(USER_REVISION_DOMAIN, next_revision, &keys[0]).unwrap());
         let mut next_group = chained.coding_groups[0].clone();
         let ShardRole::Information(next_information) = &mut next_group.roles[0] else {
             unreachable!();
@@ -1030,11 +1132,53 @@ mod tests {
         chained.coding_groups.push(next_group);
         chained.coding_groups.sort_by_key(|group| group.id);
         chained.validate().unwrap();
+
+        let replacement_writer = SigningKey::from_bytes(&[78; 32]);
+        let mut recovered = chained.clone();
+        recovered.writer_fences.push(WriterFence {
+            owner: keys[0].node_id(),
+            epoch: 2,
+            public_key: replacement_writer.verifying_key().to_bytes(),
+        });
+        recovered
+            .writer_fences
+            .sort_by_key(|fence| (fence.owner, fence.epoch));
+        recovered.revisions[1].value.writer_epoch = 2;
+        recovered.revisions[1].value.writer_public_key =
+            replacement_writer.verifying_key().to_bytes();
+        recovered.revisions[1]
+            .value
+            .sign_writer(&replacement_writer)
+            .unwrap();
+        recovered.revisions[1] = SignedRecord::sign(
+            USER_REVISION_DOMAIN,
+            recovered.revisions[1].value.clone(),
+            &keys[0],
+        )
+        .unwrap();
+        recovered.validate().unwrap();
+        let mut stale_writer = recovered.clone();
+        stale_writer.revisions[1].value.writer_epoch = 1;
+        stale_writer.revisions[1].value.writer_public_key = writer.verifying_key().to_bytes();
+        stale_writer.revisions[1]
+            .value
+            .sign_writer(&writer)
+            .unwrap();
+        stale_writer.revisions[1] = SignedRecord::sign(
+            USER_REVISION_DOMAIN,
+            stale_writer.revisions[1].value.clone(),
+            &keys[0],
+        )
+        .unwrap();
+        assert!(matches!(
+            stale_writer.validate(),
+            Err(ModelError::InvalidCheckpoint)
+        ));
         let mut invalid_revision = chained.revisions[1].value.clone();
         invalid_revision.parent = Some([99; 32]);
+        invalid_revision.sign_writer(&writer).unwrap();
         chained.revisions[1] =
-            SignedRecord::sign(b"mutualbackup/user-revision/v1", invalid_revision, &keys[0])
-                .unwrap();
+            SignedRecord::sign(USER_REVISION_DOMAIN, invalid_revision, &keys[0]).unwrap();
         assert!(matches!(
             chained.validate(),
             Err(ModelError::InvalidCheckpoint)

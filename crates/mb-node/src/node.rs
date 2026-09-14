@@ -9,9 +9,10 @@ use mb_core::{
     EndpointRecord, GuildCheckpoint, GuildGenesis, GuildInvite, KeyMaterial, Member,
     MemberSignature, NodeId, QuorumCheckpoint, QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN,
     RecoveryBundle, RecoveryLocator, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, Seed,
-    ShardRole, SignedRecord, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
-    V1_MAX_CATALOG_PAGES, V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes, decode_canonical,
-    open_recovery_record, seal_recovery_record, sector_root, synthetic_filler_sector,
+    ShardRole, SignedRecord, StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision,
+    V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes,
+    decode_canonical, open_recovery_record, seal_recovery_record, sector_root,
+    synthetic_filler_sector,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
@@ -19,14 +20,15 @@ use mb_store::{
 };
 use rand::RngCore;
 use uuid::Uuid;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::control::{NodeStatus, ProtectedRoot};
 use crate::snapshot::{
-    abandon_recovered_anchor_capture, build_revision_restore, install_inline_recipe,
-    install_recovered_sector_recipe, make_restore_root_private_at, prepare_revision,
-    publish_owned_restore, reanchor_recovered_revision, reconcile_pending_captures,
-    recovered_recipe_is_stable, render_sector, restore_revision_from_source,
-    restore_signed_root_metadata_at, resume_restore_publication,
+    WriterCredentials, abandon_recovered_anchor_capture, build_revision_restore,
+    install_inline_recipe, install_recovered_sector_recipe, make_restore_root_private_at,
+    prepare_revision, publish_owned_restore, reanchor_recovered_revision,
+    reconcile_pending_captures, recovered_recipe_is_stable, render_sector,
+    restore_revision_from_source, restore_signed_root_metadata_at, resume_restore_publication,
 };
 use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open_control_store};
 
@@ -256,6 +258,15 @@ struct RootDirtyState {
     reason: String,
 }
 
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize, Zeroize, ZeroizeOnDrop)]
+struct LocalWriterIncarnation {
+    format_version: u16,
+    epoch: u64,
+    public_key: [u8; 32],
+    secret_key: [u8; 32],
+    base_checkpoint: Option<[u8; 32]>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct SeedRecoveryReadiness {
     format_version: u16,
@@ -435,7 +446,8 @@ impl NodeReader {
             .get_record("user-revision", revision_id.as_bytes())?
             .context("prepared revision is unavailable")?;
         let revision: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
-        revision.verify(b"mutualbackup/user-revision/v1")?;
+        revision.verify(USER_REVISION_DOMAIN)?;
+        revision.value.verify_writer()?;
         if revision.value.guild_id != *guild_id || revision.value.revision_id != revision_id {
             anyhow::bail!("prepared revision does not belong to the authorized guild");
         }
@@ -475,14 +487,16 @@ impl Node {
         reconcile_pending_captures(&control)?;
         let mut volumes = StorageVolumes::open(&data_dir, keys.clone(), &control)?;
         volumes.reconcile(&control)?;
-        Ok(Self {
+        let mut node = Self {
             data_dir,
             _data_dir_lock: locked,
             keys,
             control,
             control_database_key,
             volumes,
-        })
+        };
+        node.reconcile_certified_writer_head()?;
+        Ok(node)
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -1336,7 +1350,8 @@ impl Node {
             .get_record("user-revision", revision_id.as_bytes())?
             .context("prepared revision is unavailable")?;
         let revision: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
-        revision.verify(b"mutualbackup/user-revision/v1")?;
+        revision.verify(USER_REVISION_DOMAIN)?;
+        revision.value.verify_writer()?;
         if revision.value.guild_id != guild_id || revision.value.revision_id != revision_id {
             anyhow::bail!("prepared revision has the wrong guild or revision identity");
         }
@@ -1575,6 +1590,7 @@ impl Node {
         sequence: u64,
         operation_id: Option<[u8; 16]>,
     ) -> Result<SignedRecord<UserRevision>> {
+        let writer = self.writer_incarnation(guild_id)?;
         prepare_revision(
             &mut self.control,
             &self.keys,
@@ -1582,7 +1598,68 @@ impl Node {
             source_root,
             sequence,
             operation_id.map(Uuid::from_bytes),
+            WriterCredentials {
+                epoch: writer.epoch,
+                secret: &writer.secret_key,
+            },
         )
+    }
+
+    fn writer_incarnation(&mut self, guild_id: [u8; 32]) -> Result<LocalWriterIncarnation> {
+        let current = self.current_checkpoint(guild_id)?;
+        let current_hash = current.as_ref().map(QuorumCheckpoint::hash).transpose()?;
+        let latest = current
+            .as_ref()
+            .and_then(|checkpoint| {
+                checkpoint
+                    .checkpoint
+                    .writer_fences
+                    .iter()
+                    .filter(|fence| fence.owner == self.keys.node_id())
+                    .max_by_key(|fence| fence.epoch)
+            })
+            .cloned();
+        if let Some(bytes) = self.control.get_record("writer-incarnation", &guild_id)? {
+            let writer: LocalWriterIncarnation = decode_canonical(&bytes)?;
+            let derived = ed25519_dalek::SigningKey::from_bytes(&writer.secret_key)
+                .verifying_key()
+                .to_bytes();
+            if writer.format_version != 1 || writer.epoch == 0 || writer.public_key != derived {
+                anyhow::bail!("durable writer incarnation is invalid");
+            }
+            let is_current = latest.as_ref().is_some_and(|fence| {
+                fence.epoch == writer.epoch && fence.public_key == writer.public_key
+            });
+            let is_pending = writer.base_checkpoint == current_hash
+                && latest.as_ref().map_or(writer.epoch == 1, |fence| {
+                    fence.epoch.checked_add(1) == Some(writer.epoch)
+                });
+            if is_current || is_pending {
+                return Ok(writer);
+            }
+        }
+
+        let epoch = latest
+            .as_ref()
+            .map(|fence| fence.epoch)
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("writer incarnation epoch exhausted")?;
+        let mut secret_key = [0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut secret_key);
+        let public_key = ed25519_dalek::SigningKey::from_bytes(&secret_key)
+            .verifying_key()
+            .to_bytes();
+        let writer = LocalWriterIncarnation {
+            format_version: 1,
+            epoch,
+            public_key,
+            secret_key,
+            base_checkpoint: current_hash,
+        };
+        self.control
+            .put_record("writer-incarnation", &guild_id, &canonical_bytes(&writer)?)?;
+        Ok(writer)
     }
 
     pub fn ensure_filler(
@@ -1753,6 +1830,9 @@ impl Node {
             true,
         )?;
         self.clear_root_dirty_if_committed(checkpoint)?;
+        if self.reconcile_local_revision_head(checkpoint)? {
+            self.mark_root_dirty("a recovered writer incarnation replaced a local draft")?;
+        }
         Ok(hash)
     }
 
@@ -1907,6 +1987,46 @@ impl Node {
         } else {
             decode_canonical::<QuorumCheckpoint>(&bytes)?.checkpoint
         };
+        if !previous
+            .writer_fences
+            .iter()
+            .all(|fence| checkpoint.writer_fences.contains(fence))
+        {
+            anyhow::bail!("checkpoint transition drops or changes a writer fence");
+        }
+        for member in &checkpoint.members {
+            let previous_epoch = previous
+                .writer_fences
+                .iter()
+                .filter(|fence| fence.owner == member.node_id)
+                .map(|fence| fence.epoch)
+                .max()
+                .unwrap_or(0);
+            let current_epoch = checkpoint
+                .writer_fences
+                .iter()
+                .filter(|fence| fence.owner == member.node_id)
+                .map(|fence| fence.epoch)
+                .max()
+                .unwrap_or(0);
+            if current_epoch > previous_epoch
+                && (previous_epoch.checked_add(1) != Some(current_epoch)
+                    || !checkpoint.revisions.iter().any(|revision| {
+                        revision.value.owner == member.node_id
+                            && revision.value.writer_epoch == current_epoch
+                            && !previous.revisions.contains(revision)
+                    }))
+            {
+                anyhow::bail!("checkpoint advances a writer fence without its next revision");
+            }
+            if checkpoint.revisions.iter().any(|revision| {
+                revision.value.owner == member.node_id
+                    && !previous.revisions.contains(revision)
+                    && revision.value.writer_epoch != current_epoch
+            }) {
+                anyhow::bail!("checkpoint adds a revision from a superseded writer incarnation");
+            }
+        }
         if !previous.members.iter().all(|item| {
             checkpoint
                 .members
@@ -1987,6 +2107,66 @@ impl Node {
             )?;
         }
         Ok(())
+    }
+
+    fn reconcile_certified_writer_head(&mut self) -> Result<()> {
+        let Some(installed) = self.installed_guild()? else {
+            return Ok(());
+        };
+        let Some(checkpoint) = self.current_checkpoint(installed.certificate.genesis.guild_id)?
+        else {
+            return Ok(());
+        };
+        checkpoint.verify()?;
+        if self.reconcile_local_revision_head(&checkpoint)? {
+            self.mark_root_dirty("a recovered writer incarnation replaced a local draft")?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_local_revision_head(&mut self, checkpoint: &QuorumCheckpoint) -> Result<bool> {
+        let local_id = self.keys.node_id();
+        let Some(fence) = checkpoint
+            .checkpoint
+            .writer_fences
+            .iter()
+            .filter(|fence| fence.owner == local_id)
+            .max_by_key(|fence| fence.epoch)
+        else {
+            return Ok(false);
+        };
+        let local_head = self
+            .control
+            .get_record("user-revision-head", &checkpoint.checkpoint.guild_id)?
+            .map(|bytes| decode_canonical::<SignedRecord<UserRevision>>(&bytes))
+            .transpose()?;
+        if local_head.as_ref().is_some_and(|revision| {
+            revision.value.writer_epoch == fence.epoch
+                && revision.value.writer_public_key == fence.public_key
+        }) {
+            return Ok(false);
+        }
+        let certified = checkpoint
+            .checkpoint
+            .revisions
+            .iter()
+            .filter(|revision| revision.value.owner == local_id)
+            .max_by_key(|revision| revision.value.sequence)
+            .context("writer fence has no certified local revision")?;
+        let bytes = canonical_bytes(certified)?;
+        self.control.put_records(&[
+            (
+                "user-revision".to_owned(),
+                certified.value.revision_id.as_bytes().to_vec(),
+                bytes.clone(),
+            ),
+            (
+                "user-revision-head".to_owned(),
+                checkpoint.checkpoint.guild_id.to_vec(),
+                bytes,
+            ),
+        ])?;
+        Ok(local_head.as_ref() != Some(certified))
     }
 
     pub fn recovery_record(
@@ -3887,22 +4067,23 @@ mod tests {
             mb_core::encrypted_sector(&node.keys().guild_data_key(&guild_id), id, &plaintext)
                 .unwrap();
         install_inline_recipe(&mut node.control, guild_id, reference.clone(), plaintext).unwrap();
-        SignedRecord::sign(
-            b"mutualbackup/user-revision/v1",
-            UserRevision {
-                format_version: 1,
-                guild_id,
-                cipher_profile: mb_core::V1_CIPHER_PROFILE,
-                revision_id,
-                owner: node.keys().node_id(),
-                sequence: 1,
-                parent: None,
-                metadata_sectors: vec![reference],
-                data_sectors: Vec::new(),
-            },
-            node.keys(),
-        )
-        .unwrap()
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[71; 32]);
+        let mut revision = UserRevision {
+            format_version: 2,
+            guild_id,
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id,
+            owner: node.keys().node_id(),
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![reference],
+            data_sectors: Vec::new(),
+        };
+        revision.sign_writer(&writer).unwrap();
+        SignedRecord::sign(USER_REVISION_DOMAIN, revision, node.keys()).unwrap()
     }
 
     fn signed_recovery_checkpoint_fixture() -> (Vec<Seed>, QuorumCheckpoint) {
@@ -3967,31 +4148,37 @@ mod tests {
             roles,
         };
         group.id = group.calculate_id().unwrap();
-        let revision = SignedRecord::sign(
-            b"mutualbackup/user-revision/v1",
-            UserRevision {
-                format_version: 1,
-                guild_id,
-                cipher_profile: mb_core::V1_CIPHER_PROFILE,
-                revision_id: Uuid::from_bytes([140; 16]),
-                owner: keys[0].node_id(),
-                sequence: 1,
-                parent: None,
-                metadata_sectors: vec![target],
-                data_sectors: Vec::new(),
-            },
-            &keys[0],
-        )
-        .unwrap();
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[72; 32]);
+        let mut revision_body = UserRevision {
+            format_version: 2,
+            guild_id,
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id: Uuid::from_bytes([140; 16]),
+            owner: keys[0].node_id(),
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![target],
+            data_sectors: Vec::new(),
+        };
+        revision_body.sign_writer(&writer).unwrap();
+        let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision_body, &keys[0]).unwrap();
         members.sort_by_key(|member| member.node_id);
         let mut checkpoint = QuorumCheckpoint {
             checkpoint: GuildCheckpoint {
-                format_version: 1,
+                format_version: 2,
                 guild_id,
                 genesis_hash: [141; 32],
                 generation: 1,
                 parent: None,
                 members,
+                writer_fences: vec![mb_core::WriterFence {
+                    owner: keys[0].node_id(),
+                    epoch: 1,
+                    public_key: writer.verifying_key().to_bytes(),
+                }],
                 revisions: vec![revision],
                 coding_groups: vec![group],
             },
@@ -4142,12 +4329,17 @@ mod tests {
         group.id = group.calculate_id().unwrap();
         let mut checkpoint = QuorumCheckpoint {
             checkpoint: GuildCheckpoint {
-                format_version: 1,
+                format_version: 2,
                 guild_id,
                 genesis_hash: certificate.hash().unwrap(),
                 generation: 1,
                 parent: None,
                 members,
+                writer_fences: vec![mb_core::WriterFence {
+                    owner: revision.value.owner,
+                    epoch: revision.value.writer_epoch,
+                    public_key: revision.value.writer_public_key,
+                }],
                 revisions: vec![revision.clone()],
                 coding_groups: vec![group],
             },
@@ -4189,6 +4381,22 @@ mod tests {
         assert!(Node::open(temp.path(), Seed::from_bytes([91; 32])).is_err());
         drop(first);
         Node::open(temp.path(), Seed::from_bytes([91; 32])).unwrap();
+    }
+
+    #[test]
+    fn recovery_creates_and_reuses_the_next_writer_incarnation() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([226; 32]);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        let prior = install_public_restore_fixture(&mut node, &seed);
+        let guild_id = prior.value.guild_id;
+        let writer = node.writer_incarnation(guild_id).unwrap();
+        assert_eq!(writer.epoch, 2);
+        assert_ne!(writer.public_key, prior.value.writer_public_key);
+        drop(node);
+
+        let mut reopened = Node::open(temp.path(), seed).unwrap();
+        assert!(reopened.writer_incarnation(guild_id).unwrap() == writer);
     }
 
     #[test]
@@ -4331,22 +4539,24 @@ mod tests {
         let node = Node::open(temp.path(), Seed::from_bytes([88; 32])).unwrap();
         let guild_id = [87; 32];
         let revision_id = Uuid::from_bytes([86; 16]);
-        let revision = SignedRecord::sign(
-            b"mutualbackup/user-revision/v1",
-            UserRevision {
-                format_version: 1,
-                guild_id,
-                cipher_profile: mb_core::V1_CIPHER_PROFILE,
-                revision_id,
-                owner: node.keys().node_id(),
-                sequence: 1,
-                parent: None,
-                metadata_sectors: Vec::new(),
-                data_sectors: Vec::new(),
-            },
-            node.keys(),
-        )
-        .unwrap();
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[73; 32]);
+        let mut revision_body = UserRevision {
+            format_version: 2,
+            guild_id,
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id,
+            owner: node.keys().node_id(),
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: Vec::new(),
+            data_sectors: Vec::new(),
+        };
+        revision_body.sign_writer(&writer).unwrap();
+        let revision =
+            SignedRecord::sign(USER_REVISION_DOMAIN, revision_body, node.keys()).unwrap();
         node.control
             .put_record(
                 "user-revision",
@@ -4876,22 +5086,24 @@ mod tests {
                 &canonical_bytes(&job).unwrap(),
             )
             .unwrap();
-        let revision = SignedRecord::sign(
-            b"mutualbackup/user-revision/v1",
-            UserRevision {
-                format_version: 1,
-                guild_id,
-                cipher_profile: mb_core::V1_CIPHER_PROFILE,
-                revision_id,
-                owner: node.keys().node_id(),
-                sequence: 1,
-                parent: None,
-                metadata_sectors: Vec::new(),
-                data_sectors: Vec::new(),
-            },
-            node.keys(),
-        )
-        .unwrap();
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[74; 32]);
+        let mut revision_body = UserRevision {
+            format_version: 2,
+            guild_id,
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id,
+            owner: node.keys().node_id(),
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: Vec::new(),
+            data_sectors: Vec::new(),
+        };
+        revision_body.sign_writer(&writer).unwrap();
+        let revision =
+            SignedRecord::sign(USER_REVISION_DOMAIN, revision_body, node.keys()).unwrap();
 
         node.restore_recovered_revision(&checkpoint_hash, guild_id, &revision, &target)
             .unwrap();

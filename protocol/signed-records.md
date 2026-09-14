@@ -12,12 +12,13 @@ Postcard's variable-length representation. A `SignedRecord<T>` is ordered as
 | `GuildInvite` | `format_version`, `guild_id`, `coordinator`, `coordinator_endpoints`, `nonce`, `expires_at_unix_seconds` | `mutualbackup/guild-invite/v1` |
 | `GuildGenesis` | `format_version`, `guild_id`, `coordinator`, `members` | `mutualbackup/guild-genesis/v1`; hash derive-key context `mutualbackup guild genesis v1` |
 | `QuorumGuildGenesis` | `genesis`, `signatures` | certificate of genesis signatures |
-| `UserRevision` | `format_version`, `guild_id`, `cipher_profile`, `revision_id`, `owner`, `sequence`, `parent`, `metadata_sectors`, `data_sectors` | `mutualbackup/user-revision/v1`; hash derive-key context `mutualbackup user revision body v1` |
+| `UserRevision` | `format_version`, `guild_id`, `cipher_profile`, `revision_id`, `owner`, `writer_epoch`, `writer_public_key`, `writer_signature`, `sequence`, `parent`, `metadata_sectors`, `data_sectors` | stable signature `mutualbackup/user-revision/v2`; writer signature `mutualbackup/writer-revision/v1`; hash derive-key context `mutualbackup user revision body v2` |
+| `WriterFence` | `owner`, `epoch`, `public_key` | embedded value; epochs for each owner are contiguous and permanently certified by checkpoints |
 | `SectorRef` | `id`, `root`, `logical_len` | embedded value; sector root is BLAKE3 of exact RS-level bytes |
 | `CodingGroup` | `id`, `format_version`, `guild_id`, `data_shards`, `parity_shards`, `shard_size`, five ordered `roles` | ID is BLAKE3 of the same fields except `id` |
 | `InformationRole` | `owner`, `sector` | embedded value |
 | `ParityRole` | `holder`, `row`, `root` | embedded value |
-| `GuildCheckpoint` | `format_version`, `guild_id`, `genesis_hash`, `generation`, `parent`, `members`, `revisions`, `coding_groups` | `mutualbackup/guild-checkpoint/v1`; hash is BLAKE3 of canonical bytes |
+| `GuildCheckpoint` | `format_version`, `guild_id`, `genesis_hash`, `generation`, `parent`, `members`, `writer_fences`, `revisions`, `coding_groups` | `mutualbackup/guild-checkpoint/v1`; hash is BLAKE3 of canonical bytes |
 | `QuorumCheckpoint` | `checkpoint`, `signatures` | certificate of checkpoint signatures |
 | `MemberSignature` | `signer`, `signature` | signature domain belongs to containing certificate |
 | `StorageAcknowledgement` | `format_version`, `operation_id`, `guild_id`, `group_id`, `shard_index`, `row`, `root`, `holder` | `mutualbackup/storage-acknowledgement/v1` |

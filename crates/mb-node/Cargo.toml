@@ -11,6 +11,7 @@ arti-client.workspace = true
 blake3.workspace = true
 cbor4ii.workspace = true
 data-encoding.workspace = true
+ed25519-dalek.workspace = true
 futures.workspace = true
 filetime.workspace = true
 fs2.workspace = true

@@ -4,11 +4,12 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use ed25519_dalek::SigningKey;
 use fs2::FileExt;
 use mb_core::{
-    KeyMaterial, SectorId, SectorPurpose, SectorRef, SignedRecord, UserRevision, V1_CIPHER_PROFILE,
-    V1_MAX_CATALOG_BYTES, V1_MAX_CODING_GROUPS, V1_SECTOR_SIZE, canonical_bytes, crypt_sector,
-    decode_canonical, encrypted_sector, make_sector_id, sector_root,
+    KeyMaterial, SectorId, SectorPurpose, SectorRef, SignedRecord, USER_REVISION_DOMAIN,
+    UserRevision, V1_CIPHER_PROFILE, V1_MAX_CATALOG_BYTES, V1_MAX_CODING_GROUPS, V1_SECTOR_SIZE,
+    canonical_bytes, crypt_sector, decode_canonical, encrypted_sector, make_sector_id, sector_root,
 };
 use mb_store::{
     AnchorFileLocator, CapturedEntry, ControlStore, FileExtent, NativeFileId, PinnedDirectory,
@@ -308,6 +309,11 @@ impl Drop for PendingAnchor {
     }
 }
 
+pub(crate) struct WriterCredentials<'a> {
+    pub epoch: u64,
+    pub secret: &'a [u8; 32],
+}
+
 pub(crate) fn prepare_revision(
     control: &mut ControlStore,
     keys: &KeyMaterial,
@@ -315,15 +321,24 @@ pub(crate) fn prepare_revision(
     source_root: &Path,
     sequence: u64,
     revision_id: Option<Uuid>,
+    writer: WriterCredentials<'_>,
 ) -> Result<SignedRecord<UserRevision>> {
+    let writer_epoch = writer.epoch;
+    let writer_secret = writer.secret;
     let revision_id = revision_id.unwrap_or_else(Uuid::new_v4);
     if let Some(bytes) = control.get_record("user-revision", revision_id.as_bytes())? {
         let existing: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
-        existing.verify(b"mutualbackup/user-revision/v1")?;
+        existing.verify(USER_REVISION_DOMAIN)?;
+        existing.value.verify_writer()?;
         if existing.value.revision_id != revision_id
             || existing.value.owner != keys.node_id()
             || existing.value.guild_id != guild_id
             || existing.value.sequence != sequence
+            || existing.value.writer_epoch != writer_epoch
+            || existing.value.writer_public_key
+                != SigningKey::from_bytes(writer_secret)
+                    .verifying_key()
+                    .to_bytes()
         {
             bail!("persisted revision does not match the retried operation");
         }
@@ -332,11 +347,12 @@ pub(crate) fn prepare_revision(
     let parent = match control.get_record("user-revision-head", &guild_id)? {
         Some(bytes) => {
             let previous: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
-            previous.verify(b"mutualbackup/user-revision/v1")?;
+            previous.verify(USER_REVISION_DOMAIN)?;
+            previous.value.verify_writer()?;
             if previous.signer != keys.node_id()
                 || previous.value.owner != keys.node_id()
                 || previous.value.guild_id != guild_id
-                || previous.value.format_version != 1
+                || previous.value.format_version != 2
                 || previous.value.cipher_profile != V1_CIPHER_PROFILE
                 || previous.value.sequence.checked_add(1) != Some(sequence)
             {
@@ -545,21 +561,23 @@ pub(crate) fn prepare_revision(
             )?;
         }
 
-        let revision = SignedRecord::sign(
-            b"mutualbackup/user-revision/v1",
-            UserRevision {
-                format_version: 1,
-                guild_id,
-                cipher_profile: V1_CIPHER_PROFILE,
-                revision_id,
-                owner: keys.node_id(),
-                sequence,
-                parent,
-                metadata_sectors: metadata_references,
-                data_sectors: data_references,
-            },
-            keys,
-        )?;
+        let writer = SigningKey::from_bytes(writer_secret);
+        let mut revision = UserRevision {
+            format_version: 2,
+            guild_id,
+            cipher_profile: V1_CIPHER_PROFILE,
+            revision_id,
+            owner: keys.node_id(),
+            writer_epoch,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence,
+            parent,
+            metadata_sectors: metadata_references,
+            data_sectors: data_references,
+        };
+        revision.sign_writer(&writer)?;
+        let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, keys)?;
         if canonical_bytes(&revision)?.len() > V1_MAX_CATALOG_BYTES {
             bail!("revision catalog exceeds the v1 bounded-object limit");
         }
@@ -810,7 +828,8 @@ pub(crate) fn reanchor_recovered_revision(
     revision: &SignedRecord<UserRevision>,
     restored_root: &Path,
 ) -> Result<()> {
-    revision.verify(b"mutualbackup/user-revision/v1")?;
+    revision.verify(USER_REVISION_DOMAIN)?;
+    revision.value.verify_writer()?;
     if revision.signer != keys.node_id()
         || revision.value.owner != keys.node_id()
         || revision.value.guild_id != guild_id
@@ -1743,11 +1762,12 @@ fn validate_restore_revision(
     guild_id: [u8; 32],
     revision: &SignedRecord<UserRevision>,
 ) -> Result<()> {
-    revision.verify(b"mutualbackup/user-revision/v1")?;
+    revision.verify(USER_REVISION_DOMAIN)?;
+    revision.value.verify_writer()?;
     if revision.signer != keys.node_id()
         || revision.value.owner != keys.node_id()
         || revision.value.guild_id != guild_id
-        || revision.value.format_version != 1
+        || revision.value.format_version != 2
         || revision.value.cipher_profile != V1_CIPHER_PROFILE
     {
         bail!("revision does not belong to the recovering seed and guild");
@@ -1983,11 +2003,12 @@ pub(crate) fn build_revision_restore<F>(
 where
     F: FnMut(&SectorId) -> Result<Vec<u8>>,
 {
-    revision.verify(b"mutualbackup/user-revision/v1")?;
+    revision.verify(USER_REVISION_DOMAIN)?;
+    revision.value.verify_writer()?;
     if revision.signer != keys.node_id()
         || revision.value.owner != keys.node_id()
         || revision.value.guild_id != guild_id
-        || revision.value.format_version != 1
+        || revision.value.format_version != 2
         || revision.value.cipher_profile != V1_CIPHER_PROFILE
     {
         bail!("revision does not belong to the recovering seed and guild");
@@ -2595,22 +2616,23 @@ mod metadata_compatibility_tests {
             metadata_sectors.push(reference);
             ciphertexts.insert(id, ciphertext);
         }
-        let revision = SignedRecord::sign(
-            b"mutualbackup/user-revision/v1",
-            UserRevision {
-                format_version: 1,
-                guild_id,
-                cipher_profile: V1_CIPHER_PROFILE,
-                revision_id,
-                owner: keys.node_id(),
-                sequence: 1,
-                parent: None,
-                metadata_sectors,
-                data_sectors,
-            },
-            keys,
-        )
-        .unwrap();
+        let writer = SigningKey::from_bytes(&[75; 32]);
+        let mut revision_body = UserRevision {
+            format_version: 2,
+            guild_id,
+            cipher_profile: V1_CIPHER_PROFILE,
+            revision_id,
+            owner: keys.node_id(),
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors,
+            data_sectors,
+        };
+        revision_body.sign_writer(&writer).unwrap();
+        let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision_body, keys).unwrap();
         (revision, ciphertexts)
     }
 
@@ -3264,8 +3286,11 @@ mod metadata_compatibility_tests {
         let (mut revision, mut ciphertexts) = restore_fixture(&keys, guild_id, entries, Vec::new());
         revision.value.revision_id = revision_id;
         revision.value.data_sectors = vec![data_reference];
-        revision =
-            SignedRecord::sign(b"mutualbackup/user-revision/v1", revision.value, &keys).unwrap();
+        revision
+            .value
+            .sign_writer(&SigningKey::from_bytes(&[75; 32]))
+            .unwrap();
+        revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision.value, &keys).unwrap();
         ciphertexts.insert(data_id, data_ciphertext);
         let control = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
         let target = temp.path().join("restored");
@@ -3357,7 +3382,18 @@ mod metadata_compatibility_tests {
             ControlStore::open(run_root.join("control.db"), &keys).expect("open control store");
         let guild_id = [42; 32];
         let revision_id = Uuid::from_bytes([43; 16]);
-        let first = prepare_revision(&mut control, &keys, guild_id, &source, 1, Some(revision_id));
+        let first = prepare_revision(
+            &mut control,
+            &keys,
+            guild_id,
+            &source,
+            1,
+            Some(revision_id),
+            WriterCredentials {
+                epoch: 1,
+                secret: &[17; 32],
+            },
+        );
         assert!(first.is_err());
         assert!(
             control
@@ -3367,8 +3403,19 @@ mod metadata_compatibility_tests {
         );
 
         fs::remove_file(&fifo).unwrap();
-        let revision =
-            prepare_revision(&mut control, &keys, guild_id, &source, 1, Some(revision_id)).unwrap();
+        let revision = prepare_revision(
+            &mut control,
+            &keys,
+            guild_id,
+            &source,
+            1,
+            Some(revision_id),
+            WriterCredentials {
+                epoch: 1,
+                secret: &[17; 32],
+            },
+        )
+        .unwrap();
         assert_eq!(revision.value.revision_id, revision_id);
         let manifest: mb_store::StableAnchorManifest = decode_canonical(
             &control
@@ -3398,7 +3445,19 @@ mod metadata_compatibility_tests {
         let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([47; 32]));
         let mut control = ControlStore::open(run_root.join("control.db"), &keys).unwrap();
         let guild_id = [48; 32];
-        let revision = prepare_revision(&mut control, &keys, guild_id, &source, 1, None).unwrap();
+        let revision = prepare_revision(
+            &mut control,
+            &keys,
+            guild_id,
+            &source,
+            1,
+            None,
+            WriterCredentials {
+                epoch: 1,
+                secret: &[18; 32],
+            },
+        )
+        .unwrap();
         restore_revision_from_source(
             &control,
             &keys,
@@ -3499,7 +3558,19 @@ mod metadata_compatibility_tests {
         let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([49; 32]));
         let mut control = ControlStore::open(run_root.join("control.db"), &keys).unwrap();
         let guild_id = [50; 32];
-        let revision = prepare_revision(&mut control, &keys, guild_id, &source, 1, None).unwrap();
+        let revision = prepare_revision(
+            &mut control,
+            &keys,
+            guild_id,
+            &source,
+            1,
+            None,
+            WriterCredentials {
+                epoch: 1,
+                secret: &[19; 32],
+            },
+        )
+        .unwrap();
         restore_revision_from_source(
             &control,
             &keys,

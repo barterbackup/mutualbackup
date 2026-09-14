@@ -252,12 +252,17 @@ impl PrototypeGuild {
 
         let mut checkpoint = QuorumCheckpoint {
             checkpoint: GuildCheckpoint {
-                format_version: 1,
+                format_version: 2,
                 guild_id: self.guild_id,
                 genesis_hash: *blake3::hash(&canonical_bytes(&self.members)?).as_bytes(),
                 generation: 1,
                 parent: None,
                 members: checkpoint_members,
+                writer_fences: vec![mb_core::WriterFence {
+                    owner: revision.value.owner,
+                    epoch: revision.value.writer_epoch,
+                    public_key: revision.value.writer_public_key,
+                }],
                 revisions: vec![revision],
                 coding_groups: groups,
             },

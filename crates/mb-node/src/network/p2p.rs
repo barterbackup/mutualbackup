@@ -6462,7 +6462,8 @@ async fn commit_backup_job(
     }
 
     let revision = fetch_p2p_revision(node.clone(), p2p, local_id, &job.descriptor).await?;
-    revision.verify(b"mutualbackup/user-revision/v1")?;
+    revision.verify(mb_core::USER_REVISION_DOMAIN)?;
+    revision.value.verify_writer()?;
     if revision.signer != job.descriptor.owner
         || revision.value.owner != job.descriptor.owner
         || revision.value.guild_id != guild_id
@@ -6569,7 +6570,7 @@ async fn commit_backup_job(
         new_groups.push(group);
     }
 
-    let (generation, parent, mut revisions, mut coding_groups) = match previous {
+    let (generation, parent, mut writer_fences, mut revisions, mut coding_groups) = match previous {
         Some(previous) => {
             previous.verify()?;
             (
@@ -6579,12 +6580,14 @@ async fn commit_backup_job(
                     .checked_add(1)
                     .context("checkpoint generation exhausted")?,
                 Some(previous.hash()?),
+                previous.checkpoint.writer_fences,
                 previous.checkpoint.revisions,
                 previous.checkpoint.coding_groups,
             )
         }
-        None => (1, None, Vec::new(), Vec::new()),
+        None => (1, None, Vec::new(), Vec::new(), Vec::new()),
     };
+    include_writer_fence(&mut writer_fences, &revision.value)?;
     revisions.push(revision);
     revisions.sort_by_key(|revision| {
         (
@@ -6596,12 +6599,13 @@ async fn commit_backup_job(
     coding_groups.extend(new_groups);
     coding_groups.sort_by_key(|group| group.id);
     let checkpoint = GuildCheckpoint {
-        format_version: 1,
+        format_version: 2,
         guild_id,
         genesis_hash: certificate.hash()?,
         generation,
         parent,
         members: certificate.genesis.members.clone(),
+        writer_fences,
         revisions,
         coding_groups,
     };
@@ -6659,6 +6663,35 @@ async fn commit_backup_job(
     })
     .await?;
     Ok(checkpoint_hash)
+}
+
+fn include_writer_fence(
+    writer_fences: &mut Vec<mb_core::WriterFence>,
+    revision: &UserRevision,
+) -> Result<()> {
+    revision.verify_writer()?;
+    let latest = writer_fences
+        .iter()
+        .filter(|fence| fence.owner == revision.owner)
+        .max_by_key(|fence| fence.epoch);
+    match latest {
+        Some(fence)
+            if fence.epoch == revision.writer_epoch
+                && fence.public_key == revision.writer_public_key =>
+        {
+            return Ok(());
+        }
+        Some(fence) if fence.epoch.checked_add(1) == Some(revision.writer_epoch) => {}
+        None if revision.writer_epoch == 1 => {}
+        _ => bail!("revision was signed by a stale or conflicting writer incarnation"),
+    }
+    writer_fences.push(mb_core::WriterFence {
+        owner: revision.owner,
+        epoch: revision.writer_epoch,
+        public_key: revision.writer_public_key,
+    });
+    writer_fences.sort_by_key(|fence| (fence.owner, fence.epoch));
+    Ok(())
 }
 
 async fn fetch_p2p_revision(
@@ -6963,6 +6996,37 @@ mod tests {
             Poll::Pending => Poll::Pending,
         })
         .await
+    }
+
+    #[test]
+    fn writer_fence_rejects_a_superseded_incarnation() {
+        fn revision(owner: NodeId, epoch: u64, writer: &ed25519_dalek::SigningKey) -> UserRevision {
+            let mut revision = UserRevision {
+                format_version: 2,
+                guild_id: [201; 32],
+                cipher_profile: mb_core::V1_CIPHER_PROFILE,
+                revision_id: Uuid::new_v4(),
+                owner,
+                writer_epoch: epoch,
+                writer_public_key: writer.verifying_key().to_bytes(),
+                writer_signature: Vec::new(),
+                sequence: epoch,
+                parent: None,
+                metadata_sectors: Vec::new(),
+                data_sectors: Vec::new(),
+            };
+            revision.sign_writer(writer).unwrap();
+            revision
+        }
+
+        let owner = KeyMaterial::from_seed(&Seed::from_bytes([200; 32])).node_id();
+        let first = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+        let recovered = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let mut fences = Vec::new();
+        include_writer_fence(&mut fences, &revision(owner, 1, &first)).unwrap();
+        include_writer_fence(&mut fences, &revision(owner, 2, &recovered)).unwrap();
+        let error = include_writer_fence(&mut fences, &revision(owner, 1, &first)).unwrap_err();
+        assert!(error.to_string().contains("stale"));
     }
 
     #[test]
@@ -9235,6 +9299,7 @@ mod tests {
                 generation: 1,
                 parent: None,
                 members: Vec::new(),
+                writer_fences: Vec::new(),
                 revisions: Vec::new(),
                 coding_groups: vec![first_group.clone(), second_group.clone()],
             },

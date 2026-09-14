@@ -1252,7 +1252,8 @@ pub async fn commit_source_over_network_with_intent(
         object_hash,
     )
     .await?;
-    revision.verify(b"mutualbackup/user-revision/v1")?;
+    revision.verify(mb_core::USER_REVISION_DOMAIN)?;
+    revision.value.verify_writer()?;
     if revision.value.owner != coordinator_keys.node_id() {
         bail!("prepared revision owner does not match coordinator");
     }
@@ -1392,12 +1393,17 @@ pub async fn commit_source_over_network_with_intent(
     checkpoint_members.sort_by_key(|member| member.node_id);
 
     let checkpoint_body = GuildCheckpoint {
-        format_version: 1,
+        format_version: 2,
         guild_id,
         genesis_hash: *blake3::hash(&canonical_bytes(&checkpoint_members)?).as_bytes(),
         generation: 1,
         parent: None,
         members: checkpoint_members,
+        writer_fences: vec![mb_core::WriterFence {
+            owner: revision.value.owner,
+            epoch: revision.value.writer_epoch,
+            public_key: revision.value.writer_public_key,
+        }],
         revisions: vec![revision],
         coding_groups: groups,
     };
