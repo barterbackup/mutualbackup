@@ -53,8 +53,8 @@ pub(crate) use p2p::validate_published_endpoint;
 pub use p2p::{
     DhtRecord, DhtRecoveryResult, P2pActiveSession, P2pClient, P2pConfig, P2pEventLoop, P2pPath,
     P2pPathMetrics, P2pPathTransfer, P2pPeerProfile, P2pPeerStatus, P2pSessionDirection,
-    P2pSessionHistory, P2pSessionOutcome, P2pStartup, P2pStartupReceiver, P2pStatus, build_p2p,
-    build_p2p_with_tor, endpoint_record_key, recover_from_dht, recovery_bundle_key,
+    P2pSessionHistory, P2pSessionOutcome, P2pStartup, P2pStartupReceiver, P2pStatus, audit_guild,
+    build_p2p, build_p2p_with_tor, endpoint_record_key, recover_from_dht, recovery_bundle_key,
     recovery_mailbox_key, run_coordinator_jobs, run_dht_publications, run_peer_exchange,
     run_relay_membership_sync, validate_bootstrap_addresses, validate_local_advertised_endpoints,
 };
@@ -661,10 +661,12 @@ fn process_peer_request(
             .transpose()?
             .flatten()
             == Some(caller);
-        let member_submission = matches!(&request, PeerRequest::SubmitBackup { .. })
-            && request
-                .guild_scope()
-                .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
+        let member_submission = matches!(
+            &request,
+            PeerRequest::SubmitBackup { .. } | PeerRequest::StoreRepairShard { .. }
+        ) && request
+            .guild_scope()
+            .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
         if mutation_kind.is_some()
             && caller != config.trusted_coordinator
             && !certified_coordinator
@@ -935,6 +937,21 @@ fn execute_peer_request(
                 &object,
             )?,
         )),
+        PeerRequest::StoreRepairShard {
+            repair_id,
+            guild_id: _,
+            checkpoint_hash,
+            group_id,
+            shard_index,
+            emergency,
+            bytes,
+        } => {
+            if repair_id == [0; 16] {
+                bail!("repair operation ID must not be zero");
+            }
+            node.install_repaired_shard(checkpoint_hash, group_id, shard_index, &bytes, emergency)?;
+            Ok(PeerResponse::Ack)
+        }
         PeerRequest::GetParity {
             guild_id,
             group_id,

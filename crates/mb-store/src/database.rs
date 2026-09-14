@@ -5,6 +5,7 @@ use mb_core::{
     KeyMaterial, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_SECTOR_SIZE,
     sector_root,
 };
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
@@ -13,6 +14,13 @@ use crate::SCHEMA_VERSION;
 const CONTROL_DATABASE_ID: &[u8] = b"control.db";
 pub type CheckpointRow = (u64, [u8; 32], Vec<u8>);
 pub type ProtocolRecordRow = (Vec<u8>, Vec<u8>);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DatabaseShellResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub affected_rows: Option<u64>,
+}
 
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -75,6 +83,14 @@ impl ControlStore {
     pub fn make_query_only(&self) -> Result<(), DatabaseError> {
         self.connection.pragma_update(None, "query_only", true)?;
         Ok(())
+    }
+
+    pub fn database_shell_statement(
+        &self,
+        sql: &str,
+        query_only: bool,
+    ) -> Result<DatabaseShellResult, DatabaseError> {
+        database_shell_statement(&self.connection, sql, query_only)
     }
 
     pub fn put_record(
@@ -1204,6 +1220,14 @@ impl ParityStore {
         cipher_integrity_check(&self.connection)
     }
 
+    pub fn database_shell_statement(
+        &self,
+        sql: &str,
+        query_only: bool,
+    ) -> Result<DatabaseShellResult, DatabaseError> {
+        database_shell_statement(&self.connection, sql, query_only)
+    }
+
     pub fn used_bytes(&self) -> Result<u64, DatabaseError> {
         let used: i64 = self.connection.query_row(
             "SELECT coalesce(sum(byte_length), 0) FROM parity_objects
@@ -2077,6 +2101,52 @@ fn open_encrypted(path: &Path, key: &[u8; 32]) -> Result<Connection, DatabaseErr
     Ok(connection)
 }
 
+fn database_shell_statement(
+    connection: &Connection,
+    sql: &str,
+    query_only: bool,
+) -> Result<DatabaseShellResult, DatabaseError> {
+    if query_only {
+        connection.pragma_update(None, "query_only", true)?;
+    }
+    let mut statement = connection.prepare(sql)?;
+    let column_count = statement.column_count();
+    if column_count == 0 {
+        let affected_rows = statement.execute([])?;
+        return Ok(DatabaseShellResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            affected_rows: Some(affected_rows as u64),
+        });
+    }
+    let columns = statement
+        .column_names()
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect();
+    let mut query = statement.query([])?;
+    let mut rows = Vec::new();
+    while let Some(row) = query.next()? {
+        let mut values = Vec::with_capacity(column_count);
+        for index in 0..column_count {
+            let value = match row.get_ref(index)? {
+                ValueRef::Null => "NULL".to_owned(),
+                ValueRef::Integer(value) => value.to_string(),
+                ValueRef::Real(value) => value.to_string(),
+                ValueRef::Text(value) => String::from_utf8_lossy(value).into_owned(),
+                ValueRef::Blob(value) => format!("x'{}'", hex::encode(value)),
+            };
+            values.push(value);
+        }
+        rows.push(values);
+    }
+    Ok(DatabaseShellResult {
+        columns,
+        rows,
+        affected_rows: None,
+    })
+}
+
 fn cipher_integrity_check(connection: &Connection) -> Result<(), DatabaseError> {
     let mut statement = connection.prepare("PRAGMA cipher_integrity_check")?;
     let failures = statement
@@ -2141,6 +2211,41 @@ mod tests {
         assert!(store.get_record("test", b"id").unwrap().is_some());
         let wrong = KeyMaterial::from_seed(&Seed::from_bytes([2; 32]));
         assert!(ControlStore::open(&path, &wrong).is_err());
+    }
+
+    #[test]
+    fn database_shell_is_query_only_unless_explicitly_writable() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([42; 32]));
+        let store = ControlStore::open(&path, &keys).unwrap();
+        let result = store
+            .database_shell_statement("SELECT value FROM meta WHERE key = 'database_kind'", true)
+            .unwrap();
+        assert_eq!(result.columns, vec!["value"]);
+        assert_eq!(result.rows, vec![vec!["x'636f6e74726f6c'".to_owned()]]);
+        assert!(
+            store
+                .database_shell_statement("CREATE TABLE forbidden(value TEXT)", true)
+                .is_err()
+        );
+        drop(store);
+
+        let store = ControlStore::open(&path, &keys).unwrap();
+        assert_eq!(
+            store
+                .database_shell_statement("CREATE TABLE permitted(value TEXT)", false)
+                .unwrap()
+                .affected_rows,
+            Some(0)
+        );
+        let tables = store
+            .database_shell_statement(
+                "SELECT name FROM sqlite_schema WHERE name = 'permitted'",
+                false,
+            )
+            .unwrap();
+        assert_eq!(tables.rows, vec![vec!["permitted".to_owned()]]);
     }
 
     #[test]

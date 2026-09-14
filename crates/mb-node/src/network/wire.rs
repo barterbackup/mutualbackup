@@ -82,6 +82,15 @@ pub(super) enum PeerRequest {
         group_id: [u8; 32],
         shard_index: u8,
     },
+    StoreRepairShard {
+        repair_id: [u8; 16],
+        guild_id: [u8; 32],
+        checkpoint_hash: [u8; 32],
+        group_id: [u8; 32],
+        shard_index: u8,
+        emergency: bool,
+        bytes: Vec<u8>,
+    },
     PutCheckpointPage {
         object_kind: CheckpointObjectKind,
         guild_id: [u8; 32],
@@ -179,6 +188,7 @@ impl PeerRequest {
             Self::PrepareSource { .. } => Some("prepare-source"),
             Self::EnsureFiller { .. } => Some("ensure-filler"),
             Self::PublishParity { .. } => Some("publish-parity"),
+            Self::StoreRepairShard { .. } => Some("store-repair-shard"),
             Self::PutCheckpointPage { .. } => Some("put-checkpoint-page"),
             Self::SignCheckpoint { .. } => Some("sign-checkpoint"),
             Self::FinalizeCheckpoint { .. } => Some("finalize-checkpoint"),
@@ -204,6 +214,7 @@ impl PeerRequest {
             | Self::EnsureFiller { guild_id, .. }
             | Self::GetSector { guild_id, .. }
             | Self::GetParity { guild_id, .. }
+            | Self::StoreRepairShard { guild_id, .. }
             | Self::PutCheckpointPage { guild_id, .. }
             | Self::SignCheckpoint { guild_id, .. }
             | Self::FinalizeCheckpoint { guild_id, .. }

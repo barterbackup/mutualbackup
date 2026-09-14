@@ -257,6 +257,7 @@ struct RootDirtyState {
     format_version: u16,
     dirty: bool,
     reason: String,
+    change_sequence: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -271,6 +272,84 @@ struct GarbageCandidate {
     first_unreachable_generation: u64,
     checkpoint_hash: [u8; 32],
     parity_root: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AutomaticBackupPolicy {
+    pub enabled: bool,
+    pub quiet_period_seconds: u64,
+    pub minimum_interval_seconds: u64,
+    pub full_reconcile_interval_seconds: u64,
+    pub daily_backup_limit: u32,
+    pub daily_byte_limit: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AutomaticBackupStatus {
+    pub enabled: bool,
+    pub dirty_since_unix_seconds: Option<u64>,
+    pub last_attempt_unix_seconds: Option<u64>,
+    pub last_success_unix_seconds: Option<u64>,
+    pub in_flight_revision: Option<Uuid>,
+    pub window_backup_count: u32,
+    pub window_bytes: u64,
+    pub retry_at_unix_seconds: Option<u64>,
+    pub blocked_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProtectionState {
+    Unknown,
+    Healthy,
+    Degraded,
+    Emergency,
+    Unrecoverable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GuildAuditReport {
+    pub format_version: u16,
+    pub checkpoint_hash: [u8; 32],
+    pub checkpoint_generation: u64,
+    pub audited_at_unix_seconds: u64,
+    pub state: ProtectionState,
+    pub checked_groups: u64,
+    pub assigned_shards_unavailable: u64,
+    pub assigned_shards_repaired: u64,
+    pub emergency_copies_created: u64,
+    pub emergency_copies_removed: u64,
+    pub issues: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct EmergencyShardRecord {
+    format_version: u16,
+    checkpoint_hash: [u8; 32],
+    group_id: [u8; 32],
+    shard_index: u8,
+    root: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct AutomaticBackupState {
+    format_version: u16,
+    dirty_since_unix_seconds: Option<u64>,
+    last_full_reconcile_unix_seconds: Option<u64>,
+    last_attempt_unix_seconds: Option<u64>,
+    last_success_unix_seconds: Option<u64>,
+    window_started_unix_seconds: u64,
+    window_backup_count: u32,
+    window_bytes: u64,
+    in_flight_revision: Option<Uuid>,
+    retry_at_unix_seconds: Option<u64>,
+    blocked_reason: Option<String>,
+}
+
+pub(crate) enum AutomaticBackupPoll {
+    Idle,
+    InFlight(Uuid),
+    Start { estimated_bytes: u64 },
 }
 
 #[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -524,6 +603,26 @@ impl Node {
     }
 
     pub fn status(&self) -> Result<NodeStatus> {
+        let last_audit = self.last_guild_audit()?;
+        let storage_volumes = self.volumes.statuses()?;
+        let storage_degraded = storage_volumes.iter().any(|volume| {
+            matches!(
+                volume.state,
+                crate::StorageVolumeState::Offline | crate::StorageVolumeState::Failed
+            )
+        });
+        let current_checkpoint_hash = match self.installed_guild()? {
+            Some(guild) => self
+                .current_checkpoint(guild.certificate.genesis.guild_id)?
+                .map(|checkpoint| checkpoint.hash())
+                .transpose()?,
+            None => None,
+        };
+        let protection_state = match &last_audit {
+            Some(audit) if Some(audit.checkpoint_hash) == current_checkpoint_hash => audit.state,
+            _ if storage_degraded => ProtectionState::Degraded,
+            _ => ProtectionState::Unknown,
+        };
         Ok(NodeStatus {
             format_version: 1,
             node_id: self.keys.node_id(),
@@ -532,7 +631,10 @@ impl Node {
             checkpoint_count: self.control.checkpoint_head_certificates()?.len() as u64,
             seed_recovery_ready: self.seed_recovery_ready()?,
             root_dirty: self.root_dirty()?,
-            storage_volumes: self.volumes.statuses()?,
+            automatic_backup: self.automatic_backup_status()?,
+            protection_state,
+            last_audit,
+            storage_volumes,
             network: None,
         })
     }
@@ -603,29 +705,287 @@ impl Node {
     }
 
     pub fn mark_root_dirty(&mut self, reason: &str) -> Result<()> {
+        self.mark_root_dirty_at(reason, false, unix_seconds())
+    }
+
+    pub fn mark_root_changed(&mut self, reason: &str) -> Result<()> {
+        self.mark_root_dirty_at(reason, true, unix_seconds())
+    }
+
+    fn mark_root_dirty_at(&mut self, reason: &str, changed: bool, now: u64) -> Result<()> {
         let mut reason = reason.to_owned();
         reason.truncate(512);
+        let previous = self.root_dirty_state()?;
+        let change_sequence = previous
+            .as_ref()
+            .map(|state| state.change_sequence)
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("protected-root change sequence exhausted")?;
         self.control.put_record(
             "node-state",
             b"root-dirty",
             &canonical_bytes(&RootDirtyState {
-                format_version: 1,
+                format_version: 2,
                 dirty: true,
                 reason,
+                change_sequence,
             })?,
         )?;
+        let mut automation = self.automatic_backup_state(now)?;
+        if changed || automation.dirty_since_unix_seconds.is_none() {
+            automation.dirty_since_unix_seconds = Some(now);
+        }
+        self.store_automatic_backup_state(&automation)?;
         Ok(())
     }
 
     pub fn root_dirty(&self) -> Result<bool> {
-        let Some(bytes) = self.control.get_record("node-state", b"root-dirty")? else {
-            return Ok(self.protected_root()?.is_some());
-        };
-        let state: RootDirtyState = decode_canonical(&bytes)?;
-        if state.format_version != 1 {
+        Ok(self
+            .root_dirty_state()?
+            .map(|state| state.dirty)
+            .unwrap_or(self.protected_root()?.is_some()))
+    }
+
+    fn root_dirty_state(&self) -> Result<Option<RootDirtyState>> {
+        let state = self
+            .control
+            .get_record("node-state", b"root-dirty")?
+            .map(|bytes| decode_canonical::<RootDirtyState>(&bytes))
+            .transpose()?;
+        if state
+            .as_ref()
+            .is_some_and(|state| state.format_version != 2)
+        {
             anyhow::bail!("unsupported root dirty-state version");
         }
-        Ok(state.dirty)
+        Ok(state)
+    }
+
+    pub fn configure_automatic_backup(&self, policy: &AutomaticBackupPolicy) -> Result<()> {
+        validate_automatic_backup_policy(policy)?;
+        self.control.put_record(
+            "node-config",
+            b"automatic-backup",
+            &canonical_bytes(policy)?,
+        )?;
+        Ok(())
+    }
+
+    fn automatic_backup_policy(&self) -> Result<AutomaticBackupPolicy> {
+        let policy = self
+            .control
+            .get_record("node-config", b"automatic-backup")?
+            .map(|bytes| decode_canonical::<AutomaticBackupPolicy>(&bytes))
+            .transpose()?
+            .unwrap_or(AutomaticBackupPolicy {
+                enabled: false,
+                quiet_period_seconds: 300,
+                minimum_interval_seconds: 3_600,
+                full_reconcile_interval_seconds: 86_400,
+                daily_backup_limit: 24,
+                daily_byte_limit: 100 * 1024 * 1024 * 1024,
+            });
+        validate_automatic_backup_policy(&policy)?;
+        Ok(policy)
+    }
+
+    fn automatic_backup_state(&self, now: u64) -> Result<AutomaticBackupState> {
+        let state = self
+            .control
+            .get_record("node-state", b"automatic-backup")?
+            .map(|bytes| decode_canonical::<AutomaticBackupState>(&bytes))
+            .transpose()?
+            .unwrap_or(AutomaticBackupState {
+                format_version: 1,
+                dirty_since_unix_seconds: None,
+                last_full_reconcile_unix_seconds: None,
+                last_attempt_unix_seconds: None,
+                last_success_unix_seconds: None,
+                window_started_unix_seconds: now,
+                window_backup_count: 0,
+                window_bytes: 0,
+                in_flight_revision: None,
+                retry_at_unix_seconds: None,
+                blocked_reason: None,
+            });
+        if state.format_version != 1 {
+            anyhow::bail!("unsupported automatic-backup state version");
+        }
+        Ok(state)
+    }
+
+    fn store_automatic_backup_state(&self, state: &AutomaticBackupState) -> Result<()> {
+        self.control
+            .put_record("node-state", b"automatic-backup", &canonical_bytes(state)?)?;
+        Ok(())
+    }
+
+    pub fn automatic_backup_status(&self) -> Result<AutomaticBackupStatus> {
+        let policy = self.automatic_backup_policy()?;
+        let state = self.automatic_backup_state(unix_seconds())?;
+        Ok(AutomaticBackupStatus {
+            enabled: policy.enabled,
+            dirty_since_unix_seconds: state.dirty_since_unix_seconds,
+            last_attempt_unix_seconds: state.last_attempt_unix_seconds,
+            last_success_unix_seconds: state.last_success_unix_seconds,
+            in_flight_revision: state.in_flight_revision,
+            window_backup_count: state.window_backup_count,
+            window_bytes: state.window_bytes,
+            retry_at_unix_seconds: state.retry_at_unix_seconds,
+            blocked_reason: state.blocked_reason,
+        })
+    }
+
+    pub(crate) fn poll_automatic_backup(&mut self, now: u64) -> Result<AutomaticBackupPoll> {
+        let policy = self.automatic_backup_policy()?;
+        if !policy.enabled {
+            return Ok(AutomaticBackupPoll::Idle);
+        }
+        let mut state = self.automatic_backup_state(now)?;
+        if now.saturating_sub(state.window_started_unix_seconds) >= 24 * 60 * 60 {
+            state.window_started_unix_seconds = now;
+            state.window_backup_count = 0;
+            state.window_bytes = 0;
+            state.retry_at_unix_seconds = None;
+            state.blocked_reason = None;
+        }
+        let reconciliation_due = state
+            .last_full_reconcile_unix_seconds
+            .is_none_or(|last| now.saturating_sub(last) >= policy.full_reconcile_interval_seconds);
+        if reconciliation_due {
+            state.last_full_reconcile_unix_seconds = Some(now);
+            self.store_automatic_backup_state(&state)?;
+            self.mark_root_dirty_at("scheduled full reconciliation", false, now)?;
+            state = self.automatic_backup_state(now)?;
+        }
+        if let Some(revision_id) = state.in_flight_revision {
+            return Ok(AutomaticBackupPoll::InFlight(revision_id));
+        }
+        if !self.root_dirty()? {
+            self.store_automatic_backup_state(&state)?;
+            return Ok(AutomaticBackupPoll::Idle);
+        }
+        if state.retry_at_unix_seconds.is_some_and(|retry| retry > now)
+            || state.blocked_reason.is_some() && state.retry_at_unix_seconds.is_none()
+        {
+            self.store_automatic_backup_state(&state)?;
+            return Ok(AutomaticBackupPoll::Idle);
+        }
+        let quiet_until = state
+            .dirty_since_unix_seconds
+            .unwrap_or(now)
+            .saturating_add(policy.quiet_period_seconds);
+        let interval_until = state
+            .last_attempt_unix_seconds
+            .unwrap_or(0)
+            .saturating_add(policy.minimum_interval_seconds);
+        if now < quiet_until || now < interval_until {
+            self.store_automatic_backup_state(&state)?;
+            return Ok(AutomaticBackupPoll::Idle);
+        }
+        if self.protected_root()?.is_none() || self.installed_guild()?.is_none() {
+            state.blocked_reason = Some("automatic backup needs a protected root and guild".into());
+            state.retry_at_unix_seconds = None;
+            self.store_automatic_backup_state(&state)?;
+            return Ok(AutomaticBackupPoll::Idle);
+        }
+        let estimated_bytes = self.protected_root_logical_bytes()?;
+        if state.window_backup_count >= policy.daily_backup_limit {
+            state.blocked_reason = Some("daily automatic-backup count limit reached".into());
+            state.retry_at_unix_seconds = Some(
+                state
+                    .window_started_unix_seconds
+                    .saturating_add(24 * 60 * 60),
+            );
+            self.store_automatic_backup_state(&state)?;
+            return Ok(AutomaticBackupPoll::Idle);
+        }
+        if estimated_bytes > policy.daily_byte_limit.saturating_sub(state.window_bytes) {
+            state.blocked_reason = Some("daily automatic-backup byte limit reached".into());
+            state.retry_at_unix_seconds = Some(
+                state
+                    .window_started_unix_seconds
+                    .saturating_add(24 * 60 * 60),
+            );
+            self.store_automatic_backup_state(&state)?;
+            return Ok(AutomaticBackupPoll::Idle);
+        }
+        state.last_attempt_unix_seconds = Some(now);
+        state.window_backup_count += 1;
+        state.window_bytes = state.window_bytes.saturating_add(estimated_bytes);
+        state.retry_at_unix_seconds = None;
+        state.blocked_reason = None;
+        self.store_automatic_backup_state(&state)?;
+        Ok(AutomaticBackupPoll::Start { estimated_bytes })
+    }
+
+    pub(crate) fn automatic_backup_submitted(&self, revision_id: Uuid) -> Result<()> {
+        let mut state = self.automatic_backup_state(unix_seconds())?;
+        state.in_flight_revision = Some(revision_id);
+        state.blocked_reason = None;
+        state.retry_at_unix_seconds = None;
+        self.store_automatic_backup_state(&state)
+    }
+
+    pub(crate) fn automatic_backup_finished(
+        &self,
+        revision_id: Option<Uuid>,
+        succeeded: bool,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let now = unix_seconds();
+        let mut state = self.automatic_backup_state(now)?;
+        if revision_id.is_some() && state.in_flight_revision != revision_id {
+            anyhow::bail!("automatic-backup completion conflicts with its durable revision");
+        }
+        state.in_flight_revision = None;
+        if succeeded {
+            state.last_success_unix_seconds = Some(now);
+            state.blocked_reason = None;
+            state.retry_at_unix_seconds = None;
+        } else {
+            let mut message = error.unwrap_or("automatic backup failed").to_owned();
+            message.truncate(512);
+            let hard = message.contains("budget")
+                || message.contains("capacity")
+                || message.contains("space");
+            state.blocked_reason = Some(message);
+            state.retry_at_unix_seconds = (!hard).then(|| {
+                now.saturating_add(
+                    self.automatic_backup_policy()
+                        .map(|policy| policy.minimum_interval_seconds)
+                        .unwrap_or(60),
+                )
+            });
+        }
+        self.store_automatic_backup_state(&state)
+    }
+
+    pub fn clear_automatic_backup_block(&self) -> Result<()> {
+        let mut state = self.automatic_backup_state(unix_seconds())?;
+        state.blocked_reason = None;
+        state.retry_at_unix_seconds = None;
+        self.store_automatic_backup_state(&state)
+    }
+
+    fn protected_root_logical_bytes(&self) -> Result<u64> {
+        let root = self
+            .protected_root()?
+            .context("automatic backup has no protected root")?;
+        let mut total = 0_u64;
+        for entry in walkdir::WalkDir::new(&root.path).follow_links(false) {
+            let entry = entry.context("automatic full reconciliation could not enumerate root")?;
+            let metadata = entry
+                .metadata()
+                .context("automatic full reconciliation could not inspect an entry")?;
+            if metadata.is_file() {
+                total = total
+                    .checked_add(metadata.len())
+                    .context("protected-root logical size overflow")?;
+            }
+        }
+        Ok(total)
     }
 
     pub(crate) fn reader_config(&self) -> NodeReaderConfig {
@@ -728,8 +1088,71 @@ impl Node {
         self.volumes.statuses()
     }
 
+    pub fn database_shell_statement(
+        &self,
+        volume_id: Option<Uuid>,
+        sql: &str,
+        writable: bool,
+    ) -> Result<mb_store::DatabaseShellResult> {
+        if sql.trim().is_empty() {
+            anyhow::bail!("database statement is empty");
+        }
+        match volume_id {
+            Some(volume_id) => self
+                .volumes
+                .database_shell_statement(volume_id, sql, !writable),
+            None => Ok(self.control.database_shell_statement(sql, !writable)?),
+        }
+    }
+
     pub fn scrub_storage(&mut self) -> Result<Vec<StorageScrubReport>> {
         self.volumes.scrub(&self.control)
+    }
+
+    pub fn last_guild_audit(&self) -> Result<Option<GuildAuditReport>> {
+        let report = self
+            .control
+            .get_record("node-state", b"guild-audit")?
+            .map(|bytes| decode_canonical::<GuildAuditReport>(&bytes))
+            .transpose()?;
+        if report
+            .as_ref()
+            .is_some_and(|report| report.format_version != 1)
+        {
+            anyhow::bail!("unsupported guild-audit report version");
+        }
+        Ok(report)
+    }
+
+    pub(crate) fn guild_audit_due(&self, now: u64, interval_seconds: u64) -> Result<bool> {
+        let Some(guild) = self.installed_guild()? else {
+            return Ok(false);
+        };
+        let Some(checkpoint) = self.current_checkpoint(guild.certificate.genesis.guild_id)? else {
+            return Ok(false);
+        };
+        let checkpoint_hash = checkpoint.hash()?;
+        let last = self.last_guild_audit()?;
+        let storage_degraded = self.volumes.statuses()?.iter().any(|volume| {
+            matches!(
+                volume.state,
+                crate::StorageVolumeState::Offline | crate::StorageVolumeState::Failed
+            )
+        });
+        Ok(last.as_ref().is_none_or(|report| {
+            report.checkpoint_hash != checkpoint_hash
+                || now.saturating_sub(report.audited_at_unix_seconds) >= interval_seconds
+                || storage_degraded && report.state == ProtectionState::Healthy
+        }))
+    }
+
+    pub(crate) fn record_guild_audit(&self, report: &GuildAuditReport) -> Result<()> {
+        if report.format_version != 1 || report.issues.len() > 256 {
+            anyhow::bail!("invalid guild-audit report");
+        }
+        self.control
+            .put_record("node-state", b"guild-audit", &canonical_bytes(report)?)?;
+        Ok(())
     }
 
     pub fn drain_storage_volume(&mut self, volume_id: Uuid) -> Result<()> {
@@ -737,11 +1160,14 @@ impl Node {
     }
 
     pub fn migrate_draining_volumes(&mut self) -> Result<u64> {
-        self.volumes.migrate_draining(&self.control)
+        let migrated = self.volumes.migrate_draining(&self.control)?;
+        self.clear_automatic_backup_block()?;
+        Ok(migrated)
     }
 
     pub fn reconcile_storage(&mut self) -> Result<()> {
-        self.volumes.reconcile(&self.control)
+        self.volumes.reconcile(&self.control)?;
+        self.clear_automatic_backup_block()
     }
 
     pub fn create_guild(&mut self, endpoints: Vec<String>) -> Result<GuildSummary> {
@@ -1189,6 +1615,10 @@ impl Node {
     }
 
     pub fn prepare_protected_backup(&mut self) -> Result<BackupDescriptor> {
+        let captured_change_sequence = self
+            .root_dirty_state()?
+            .map(|state| state.change_sequence)
+            .unwrap_or(0);
         let installed = self
             .installed_guild()?
             .context("this node has no active guild")?;
@@ -1253,6 +1683,20 @@ impl Node {
             sequence,
             Some(*revision_id.as_bytes()),
         )?;
+        if self
+            .control
+            .get_record(
+                "revision-root-change",
+                revision.value.revision_id.as_bytes(),
+            )?
+            .is_none()
+        {
+            self.control.put_record(
+                "revision-root-change",
+                revision.value.revision_id.as_bytes(),
+                &canonical_bytes(&captured_change_sequence)?,
+            )?;
+        }
         let bytes = canonical_bytes(&revision)?;
         let total_pages = bytes.len().div_ceil(V1_CATALOG_PAGE_BYTES);
         if total_pages == 0 || total_pages > V1_MAX_CATALOG_PAGES as usize {
@@ -1751,8 +2195,42 @@ impl Node {
     }
 
     #[cfg(test)]
+    pub(crate) fn forget_local_parity(
+        &mut self,
+        group: &mb_core::CodingGroup,
+        shard_index: u8,
+    ) -> Result<()> {
+        let role = group
+            .roles
+            .get(shard_index as usize)
+            .context("test parity index is outside its group")?;
+        let ShardRole::Parity(parity) = role else {
+            anyhow::bail!("test parity removal requires a parity role");
+        };
+        if parity.holder != self.keys.node_id() {
+            anyhow::bail!("test parity removal is not assigned to the local node");
+        }
+        if !self
+            .volumes
+            .remove_unreachable(&self.control, &group.id, shard_index, &parity.root)?
+        {
+            anyhow::bail!("test parity volume is offline");
+        }
+        self.control.delete_record(
+            "local-parity-proof",
+            &parity_proof_id(&group.id, shard_index),
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn restore_job_count(&self) -> Result<usize> {
         Ok(self.control.records("restore-job")?.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn emergency_shard_count(&self) -> Result<usize> {
+        Ok(self.control.records("emergency-shard")?.len())
     }
 
     pub fn publish_verified_parity(
@@ -1854,6 +2332,174 @@ impl Node {
             anyhow::bail!("parity object does not belong to the requested guild");
         }
         Ok(object.bytes)
+    }
+
+    pub(crate) fn local_assigned_shard(
+        &self,
+        group: &mb_core::CodingGroup,
+        shard_index: usize,
+    ) -> Result<Vec<u8>> {
+        let role = group
+            .roles
+            .get(shard_index)
+            .context("audit shard index is outside its group")?;
+        match role {
+            ShardRole::Information(information) if information.owner == self.keys.node_id() => {
+                self.sector_for_guild(&group.guild_id, &information.sector.id)
+            }
+            ShardRole::Parity(parity) if parity.holder == self.keys.node_id() => {
+                self.parity_for_guild(&group.guild_id, &group.id, shard_index as u8)
+            }
+            _ => anyhow::bail!("audit shard is not assigned to the local node"),
+        }
+    }
+
+    pub(crate) fn install_repaired_shard(
+        &mut self,
+        checkpoint_hash: [u8; 32],
+        group_id: [u8; 32],
+        shard_index: u8,
+        bytes: &[u8],
+        emergency: bool,
+    ) -> Result<()> {
+        let checkpoint = self
+            .current_checkpoint_from_hash(checkpoint_hash)?
+            .context("repair checkpoint is unavailable")?;
+        let group = checkpoint
+            .checkpoint
+            .coding_groups
+            .iter()
+            .find(|group| group.id == group_id)
+            .context("repair group is not active in the current checkpoint")?;
+        let role = group
+            .roles
+            .get(shard_index as usize)
+            .context("repair shard index is outside its group")?;
+        let expected_root = match role {
+            ShardRole::Information(information) => information.sector.root,
+            ShardRole::Parity(parity) => parity.root,
+        };
+        if bytes.len() != group.shard_size as usize || sector_root(bytes) != expected_root {
+            anyhow::bail!("repaired shard failed its certified size or root");
+        }
+        let assigned_locally = match role {
+            ShardRole::Information(information) => information.owner == self.keys.node_id(),
+            ShardRole::Parity(parity) => parity.holder == self.keys.node_id(),
+        };
+        if !emergency && !assigned_locally {
+            anyhow::bail!("ordinary repair is not assigned to the local node");
+        }
+        if emergency && assigned_locally {
+            anyhow::bail!("an assigned holder cannot store its own emergency copy");
+        }
+        if !emergency && let ShardRole::Information(information) = role {
+            return self.install_repaired_information_sector(
+                group.guild_id,
+                information.sector.clone(),
+                bytes,
+            );
+        }
+        let object = ParityObject {
+            format_version: group.format_version,
+            guild_id: group.guild_id,
+            group_id,
+            shard_index,
+            root: expected_root,
+            bytes: bytes.to_vec(),
+        };
+        self.volumes.store_repair(&self.control, &object)?;
+        self.control.put_record(
+            "local-parity-proof",
+            &parity_proof_id(&group_id, shard_index),
+            &canonical_bytes(group)?,
+        )?;
+        if emergency {
+            self.control.put_record(
+                "emergency-shard",
+                &parity_proof_id(&group_id, shard_index),
+                &canonical_bytes(&EmergencyShardRecord {
+                    format_version: 1,
+                    checkpoint_hash,
+                    group_id,
+                    shard_index,
+                    root: expected_root,
+                })?,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_local_emergency_shards(
+        &mut self,
+        checkpoint_hash: [u8; 32],
+        group: &mb_core::CodingGroup,
+    ) -> Result<u64> {
+        let current = self
+            .current_checkpoint_from_hash(checkpoint_hash)?
+            .context("emergency cleanup checkpoint is unavailable")?;
+        if !current
+            .checkpoint
+            .coding_groups
+            .iter()
+            .any(|candidate| candidate == group)
+        {
+            anyhow::bail!("emergency cleanup group is not active");
+        }
+        let mut removed = 0_u64;
+        for (record_id, bytes) in self.control.records("emergency-shard")? {
+            let marker: EmergencyShardRecord = decode_canonical(&bytes)?;
+            if marker.format_version != 1
+                || marker.checkpoint_hash != checkpoint_hash
+                || marker.group_id != group.id
+            {
+                continue;
+            }
+            let role = group
+                .roles
+                .get(marker.shard_index as usize)
+                .context("emergency marker shard index is invalid")?;
+            let expected_root = match role {
+                ShardRole::Information(information) => information.sector.root,
+                ShardRole::Parity(parity) => parity.root,
+            };
+            if marker.root != expected_root
+                || record_id != parity_proof_id(&group.id, marker.shard_index)
+            {
+                anyhow::bail!("emergency marker conflicts with its certified group");
+            }
+            if !self.volumes.remove_unreachable(
+                &self.control,
+                &group.id,
+                marker.shard_index,
+                &marker.root,
+            )? {
+                continue;
+            }
+            self.control
+                .delete_record("local-parity-proof", &record_id)?;
+            self.control.delete_record("emergency-shard", &record_id)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    fn current_checkpoint_from_hash(
+        &self,
+        checkpoint_hash: [u8; 32],
+    ) -> Result<Option<QuorumCheckpoint>> {
+        let Some(installed) = self.installed_guild()? else {
+            return Ok(None);
+        };
+        let checkpoint = self.current_checkpoint(installed.certificate.genesis.guild_id)?;
+        if checkpoint
+            .as_ref()
+            .map(QuorumCheckpoint::hash)
+            .transpose()?
+            != Some(checkpoint_hash)
+        {
+            return Ok(None);
+        }
+        Ok(checkpoint)
     }
 
     pub fn store_checkpoint(&mut self, checkpoint: &QuorumCheckpoint) -> Result<[u8; 32]> {
@@ -2195,15 +2841,34 @@ impl Node {
         };
         let local_head: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
         if checkpoint.checkpoint.revisions.contains(&local_head) {
+            let state = self.root_dirty_state()?;
+            let captured_change_sequence = self
+                .control
+                .get_record(
+                    "revision-root-change",
+                    local_head.value.revision_id.as_bytes(),
+                )?
+                .map(|bytes| decode_canonical::<u64>(&bytes))
+                .transpose()?;
+            if state.as_ref().is_some_and(|state| {
+                captured_change_sequence.is_some_and(|captured| captured != state.change_sequence)
+            }) {
+                return Ok(());
+            }
+            let change_sequence = state.map(|state| state.change_sequence).unwrap_or(0);
             self.control.put_record(
                 "node-state",
                 b"root-dirty",
                 &canonical_bytes(&RootDirtyState {
-                    format_version: 1,
+                    format_version: 2,
                     dirty: false,
                     reason: "latest local revision is committed".to_owned(),
+                    change_sequence,
                 })?,
             )?;
+            let mut automation = self.automatic_backup_state(unix_seconds())?;
+            automation.dirty_since_unix_seconds = None;
+            self.store_automatic_backup_state(&automation)?;
         }
         Ok(())
     }
@@ -2461,6 +3126,10 @@ impl Node {
                         if removed {
                             self.control.delete_record(
                                 "local-parity-proof",
+                                &parity_proof_id(&group_id, shard_index),
+                            )?;
+                            self.control.delete_record(
+                                "emergency-shard",
                                 &parity_proof_id(&group_id, shard_index),
                             )?;
                         }
@@ -4110,6 +4779,25 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
+fn validate_automatic_backup_policy(policy: &AutomaticBackupPolicy) -> Result<()> {
+    if policy.quiet_period_seconds == 0
+        || policy.minimum_interval_seconds == 0
+        || policy.full_reconcile_interval_seconds == 0
+        || policy.daily_backup_limit == 0
+        || policy.daily_byte_limit == 0
+    {
+        anyhow::bail!("automatic-backup intervals and budgets must be greater than zero");
+    }
+    if policy.quiet_period_seconds > 24 * 60 * 60
+        || policy.minimum_interval_seconds > 30 * 24 * 60 * 60
+        || policy.full_reconcile_interval_seconds > 30 * 24 * 60 * 60
+        || policy.daily_backup_limit > 10_000
+    {
+        anyhow::bail!("automatic-backup policy exceeds its supported bounds");
+    }
+    Ok(())
+}
+
 fn recovery_observation_record_id(subject: NodeId, provider_peer_id: &str) -> [u8; 64] {
     let mut record_id = [0_u8; 64];
     record_id[..32].copy_from_slice(&subject.0);
@@ -4707,6 +5395,125 @@ mod tests {
 
         let mut reopened = Node::open(temp.path(), seed).unwrap();
         assert!(reopened.writer_incarnation(guild_id).unwrap() == writer);
+    }
+
+    #[test]
+    fn automatic_backup_schedule_is_quiet_bounded_and_durable() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("payload"), b"four").unwrap();
+        let state = temp.path().join("state");
+        let (seed, certificate, peers) = recovery_guild_fixture();
+        let mut node = Node::open(&state, seed.clone()).unwrap();
+        node.adopt_recovered_guild(certificate, peers).unwrap();
+        let filesystem = filesystem_identity(&root).unwrap();
+        node.control
+            .put_record(
+                "node-config",
+                b"protected-root",
+                &canonical_bytes(&ProtectedRoot {
+                    format_version: 3,
+                    root_id: Uuid::new_v4(),
+                    path: root,
+                    filesystem_id: filesystem.stable_id,
+                    root_inode: fs::metadata(temp.path().join("root")).unwrap().ino(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let mut policy = AutomaticBackupPolicy {
+            enabled: true,
+            quiet_period_seconds: 10,
+            minimum_interval_seconds: 100,
+            full_reconcile_interval_seconds: 60,
+            daily_backup_limit: 1,
+            daily_byte_limit: 3,
+        };
+        node.configure_automatic_backup(&policy).unwrap();
+        node.mark_root_dirty_at("changed", true, 100).unwrap();
+        assert!(matches!(
+            node.poll_automatic_backup(109).unwrap(),
+            AutomaticBackupPoll::Idle
+        ));
+        assert!(matches!(
+            node.poll_automatic_backup(110).unwrap(),
+            AutomaticBackupPoll::Idle
+        ));
+        assert!(
+            node.automatic_backup_status()
+                .unwrap()
+                .blocked_reason
+                .unwrap()
+                .contains("byte limit")
+        );
+
+        policy.daily_byte_limit = 100;
+        node.configure_automatic_backup(&policy).unwrap();
+        node.clear_automatic_backup_block().unwrap();
+        assert!(matches!(
+            node.poll_automatic_backup(110).unwrap(),
+            AutomaticBackupPoll::Start { estimated_bytes: 4 }
+        ));
+        let revision_id = Uuid::new_v4();
+        node.automatic_backup_submitted(revision_id).unwrap();
+        drop(node);
+
+        let mut reopened = Node::open(&state, seed).unwrap();
+        assert!(matches!(
+            reopened.poll_automatic_backup(111).unwrap(),
+            AutomaticBackupPoll::InFlight(actual) if actual == revision_id
+        ));
+        reopened
+            .automatic_backup_finished(Some(revision_id), false, Some("capacity exhausted"))
+            .unwrap();
+        let status = reopened.automatic_backup_status().unwrap();
+        assert!(status.blocked_reason.unwrap().contains("capacity"));
+        assert!(status.retry_at_unix_seconds.is_none());
+    }
+
+    #[test]
+    fn guild_audit_schedule_is_checkpoint_bound_and_durable() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([242; 32]);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        let revision = install_public_restore_fixture(&mut node, &seed);
+        let checkpoint = node
+            .current_checkpoint(revision.value.guild_id)
+            .unwrap()
+            .unwrap();
+        let checkpoint_hash = checkpoint.hash().unwrap();
+        assert!(node.guild_audit_due(1_000, 600).unwrap());
+        node.record_guild_audit(&GuildAuditReport {
+            format_version: 1,
+            checkpoint_hash,
+            checkpoint_generation: checkpoint.checkpoint.generation,
+            audited_at_unix_seconds: 1_000,
+            state: ProtectionState::Healthy,
+            checked_groups: checkpoint.checkpoint.coding_groups.len() as u64,
+            assigned_shards_unavailable: 0,
+            assigned_shards_repaired: 0,
+            emergency_copies_created: 0,
+            emergency_copies_removed: 0,
+            issues: Vec::new(),
+        })
+        .unwrap();
+        assert!(!node.guild_audit_due(1_599, 600).unwrap());
+        assert!(node.guild_audit_due(1_600, 600).unwrap());
+        drop(node);
+
+        let reopened = Node::open(temp.path(), seed).unwrap();
+        assert_eq!(
+            reopened
+                .last_guild_audit()
+                .unwrap()
+                .unwrap()
+                .checkpoint_hash,
+            checkpoint_hash
+        );
+        assert!(!reopened.guild_audit_due(1_599, 600).unwrap());
     }
 
     #[test]

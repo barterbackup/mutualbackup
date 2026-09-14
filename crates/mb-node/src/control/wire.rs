@@ -7,7 +7,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{NodeStatus, ProtectedRoot};
 use crate::{
-    BackupJob, DhtRecoveryResult, GuildSummary, SnapshotInfo, StorageScrubReport,
+    BackupJob, DhtRecoveryResult, GuildAuditReport, GuildSummary, SnapshotInfo, StorageScrubReport,
     StorageVolumeStatus, WireError,
 };
 
@@ -37,6 +37,9 @@ pub enum LocalRequest {
     },
     StorageMigrate,
     StorageReconcile,
+    GuildAudit {
+        repair: bool,
+    },
     Unlock {
         secret: UnlockSecret,
     },
@@ -83,6 +86,7 @@ pub enum LocalResponse {
         objects: u64,
     },
     StorageReconciled,
+    GuildAudited(GuildAuditReport),
     RootAdded(ProtectedRoot),
     Guild(Option<GuildSummary>),
     GuildInvite {

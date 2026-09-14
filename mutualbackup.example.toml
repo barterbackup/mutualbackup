@@ -32,6 +32,18 @@ parity_budget_bytes = 10737418240
 # certified in a checkpoint; collection waits for a later checkpoint.
 retention_revisions = 30
 
+# Automatic backup is opt-in. Events only reset the quiet timer; every admitted
+# run performs an authoritative full scan and immutable capture.
+automatic_backup = false
+backup_quiet_seconds = 300
+backup_minimum_interval_seconds = 3600
+full_reconcile_interval_seconds = 86400
+daily_backup_limit = 24
+daily_backup_byte_limit = 107374182400
+
+# Verify all assigned shards, scrub local parity databases, and attempt repairs.
+audit_interval_seconds = 21600
+
 # QUIC uses UDP. The external address below makes this example reachable only
 # from this same host; replace it with a genuinely reachable address for peers
 # on other machines.

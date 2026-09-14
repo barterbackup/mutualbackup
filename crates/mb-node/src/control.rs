@@ -20,7 +20,8 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    BackupJob, BackupJobState, Node, P2pClient, P2pStatus, StorageVolumeStatus, WireError,
+    AutomaticBackupStatus, BackupJob, BackupJobState, GuildAuditReport, Node, P2pClient, P2pStatus,
+    ProtectionState, StorageVolumeStatus, WireError, audit_guild,
     network::restore_snapshot_with_p2p, recover_from_dht,
 };
 
@@ -60,6 +61,9 @@ pub struct NodeStatus {
     pub checkpoint_count: u64,
     pub seed_recovery_ready: bool,
     pub root_dirty: bool,
+    pub automatic_backup: AutomaticBackupStatus,
+    pub protection_state: ProtectionState,
+    pub last_audit: Option<GuildAuditReport>,
     pub storage_volumes: Vec<StorageVolumeStatus>,
     pub network: Option<P2pStatus>,
 }
@@ -317,6 +321,9 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GuildAudit { repair } => audit_guild(node, &p2p, repair)
+            .await
+            .map(LocalResponse::GuildAudited),
         LocalRequest::AddRoot { path } => {
             blocking_node(node, move |node| {
                 node.add_protected_root(&path).map(LocalResponse::RootAdded)
@@ -425,50 +432,9 @@ async fn handle_request(
             })
             .await
         }
-        LocalRequest::Backup { wait } => {
-            let (descriptor, guild, local_id) = blocking_node(node.clone(), |node| {
-                let descriptor = node.prepare_protected_backup()?;
-                let guild = node
-                    .guild_summary()?
-                    .context("this node has no active guild")?;
-                Ok((descriptor, guild, node.keys().node_id()))
-            })
-            .await?;
-            let coordinator = guild
-                .peers
-                .iter()
-                .find(|peer| peer.member.node_id == guild.coordinator)
-                .context("guild endpoint roster omits the coordinator")?;
-            let mut job = if guild.coordinator == local_id {
-                let descriptor = descriptor.clone();
-                blocking_node(node.clone(), move |node| {
-                    node.enqueue_backup(local_id, descriptor)
-                })
-                .await?
-            } else {
-                add_peer_endpoints(&p2p, guild.coordinator, &coordinator.endpoints).await?;
-                p2p.submit_backup(guild.coordinator, descriptor.clone())
-                    .await?
-            };
-            while wait
-                && !matches!(
-                    job.state,
-                    BackupJobState::Committed | BackupJobState::Failed
-                )
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                job = query_backup_job(
-                    node.clone(),
-                    &p2p,
-                    local_id,
-                    guild.coordinator,
-                    descriptor.guild_id,
-                    descriptor.revision_id,
-                )
-                .await?;
-            }
-            Ok(LocalResponse::BackupJob(job))
-        }
+        LocalRequest::Backup { wait } => submit_local_backup(node, &p2p, wait)
+            .await
+            .map(LocalResponse::BackupJob),
         LocalRequest::BackupStatus { revision_id } => {
             let (guild, local_id) = blocking_node(node.clone(), |node| {
                 Ok((
@@ -514,6 +480,79 @@ async fn handle_request(
             .await
             .map(LocalResponse::SnapshotRestored),
     }
+}
+
+pub(crate) async fn submit_local_backup(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    wait: bool,
+) -> Result<BackupJob> {
+    let (descriptor, guild, local_id) = blocking_node(node.clone(), |node| {
+        let descriptor = node.prepare_protected_backup()?;
+        let guild = node
+            .guild_summary()?
+            .context("this node has no active guild")?;
+        Ok((descriptor, guild, node.keys().node_id()))
+    })
+    .await?;
+    let coordinator = guild
+        .peers
+        .iter()
+        .find(|peer| peer.member.node_id == guild.coordinator)
+        .context("guild endpoint roster omits the coordinator")?;
+    let mut job = if guild.coordinator == local_id {
+        let descriptor = descriptor.clone();
+        blocking_node(node.clone(), move |node| {
+            node.enqueue_backup(local_id, descriptor)
+        })
+        .await?
+    } else {
+        add_peer_endpoints(p2p, guild.coordinator, &coordinator.endpoints).await?;
+        p2p.submit_backup(guild.coordinator, descriptor.clone())
+            .await?
+    };
+    while wait
+        && !matches!(
+            job.state,
+            BackupJobState::Committed | BackupJobState::Failed
+        )
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        job = query_local_backup_job(node.clone(), p2p, descriptor.revision_id).await?;
+    }
+    Ok(job)
+}
+
+pub(crate) async fn query_local_backup_job(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    revision_id: Uuid,
+) -> Result<BackupJob> {
+    let (guild, local_id) = blocking_node(node.clone(), |node| {
+        Ok((
+            node.guild_summary()?
+                .context("this node has no active guild")?,
+            node.keys().node_id(),
+        ))
+    })
+    .await?;
+    let coordinator = guild
+        .peers
+        .iter()
+        .find(|peer| peer.member.node_id == guild.coordinator)
+        .context("guild endpoint roster omits the coordinator")?;
+    if guild.coordinator != local_id {
+        add_peer_endpoints(p2p, guild.coordinator, &coordinator.endpoints).await?;
+    }
+    query_backup_job(
+        node,
+        p2p,
+        local_id,
+        guild.coordinator,
+        guild.guild_id,
+        revision_id,
+    )
+    .await
 }
 
 async fn complete_guild_join(

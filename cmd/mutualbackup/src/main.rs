@@ -1,12 +1,12 @@
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mb_core::{KeyMaterial, Seed};
-use mb_node::{LocalRequest, LocalResponse, UnlockSecret, local_control_call};
-use mb_store::probe_reflink;
+use mb_node::{LocalRequest, LocalResponse, Node, UnlockSecret, local_control_call};
+use mb_store::{DatabaseShellResult, probe_reflink};
 #[cfg(test)]
 use mutualbackup::read_seed;
 use mutualbackup::{
@@ -55,12 +55,35 @@ enum Command {
     },
     /// Check whether a directory passes the complete reflink COW probe.
     ReflinkProbe { path: PathBuf },
+    /// Inspect an encrypted application database using the linked SQLCipher build.
+    DbShell {
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Inspect a parity database instead of control.db.
+        #[arg(long)]
+        volume: Option<Uuid>,
+        /// Permit SQL statements that change the selected database.
+        #[arg(long)]
+        write: bool,
+        /// Execute one statement and exit.
+        #[arg(long)]
+        execute: Option<String>,
+        #[arg(long)]
+        seed_file: Option<PathBuf>,
+        #[arg(long, conflicts_with = "seed_file", requires = "execute")]
+        seed_stdin: bool,
+    },
     /// Show the persistent local daemon state.
     Status,
     /// Inspect and maintain parity storage volumes.
     Storage {
         #[command(subcommand)]
         command: StorageCommand,
+    },
+    /// Verify the current guild layout and optionally repair missing shards.
+    Audit {
+        #[arg(long)]
+        repair: bool,
     },
     /// Unlock a running daemon using a recovery string.
     Unlock {
@@ -232,6 +255,25 @@ async fn main() -> Result<()> {
             probe_reflink(&path)?;
             println!("reflink COW probe passed: {}", path.display());
         }
+        Command::DbShell {
+            data_dir,
+            volume,
+            write,
+            execute,
+            seed_file,
+            seed_stdin,
+        } => {
+            let recovery = recovery_input(seed_file.as_deref(), seed_stdin).await?;
+            let seed = derive_seed(&recovery).await?;
+            let mut node = Node::open(&data_dir, seed)
+                .with_context(|| format!("cannot open {}", data_dir.display()))?;
+            if let Some(sql) = execute {
+                let result = node.database_shell_statement(volume, &sql, write)?;
+                print_database_result(&result);
+            } else {
+                run_database_shell(&mut node, volume, write)?;
+            }
+        }
         Command::Status => {
             let response = local_control_call(&control_socket, &LocalRequest::Status).await?;
             if let LocalResponse::Locked { expected_node_id } = response {
@@ -247,6 +289,32 @@ async fn main() -> Result<()> {
             println!("checkpoints:   {}", status.checkpoint_count);
             println!("recovery ready: {}", status.seed_recovery_ready);
             println!("root dirty:     {}", status.root_dirty);
+            println!(
+                "automatic backup: enabled={} in-flight={} window={}/{} bytes",
+                status.automatic_backup.enabled,
+                status
+                    .automatic_backup
+                    .in_flight_revision
+                    .map(|revision| revision.to_string())
+                    .unwrap_or_else(|| "none".to_owned()),
+                status.automatic_backup.window_backup_count,
+                status.automatic_backup.window_bytes,
+            );
+            if let Some(reason) = &status.automatic_backup.blocked_reason {
+                println!("backup blocked: {reason}");
+            }
+            println!("protection:     {:?}", status.protection_state);
+            if let Some(audit) = &status.last_audit {
+                println!(
+                    "last audit:     generation={} groups={} unavailable={} repaired={} emergency={} removed={}",
+                    audit.checkpoint_generation,
+                    audit.checked_groups,
+                    audit.assigned_shards_unavailable,
+                    audit.assigned_shards_repaired,
+                    audit.emergency_copies_created,
+                    audit.emergency_copies_removed,
+                );
+            }
             for volume in status.storage_volumes {
                 print_storage_volume(&volume);
             }
@@ -374,6 +442,28 @@ async fn main() -> Result<()> {
                 }
                 LocalResponse::StorageReconciled => println!("storage reconciliation complete"),
                 _ => bail!("daemon returned the wrong response to storage request"),
+            }
+        }
+        Command::Audit { repair } => {
+            let response =
+                local_control_call(&control_socket, &LocalRequest::GuildAudit { repair }).await?;
+            let LocalResponse::GuildAudited(report) = response else {
+                bail!("daemon returned the wrong response to audit request");
+            };
+            println!("protection: {:?}", report.state);
+            println!("groups checked: {}", report.checked_groups);
+            println!(
+                "assigned shards unavailable: {}",
+                report.assigned_shards_unavailable
+            );
+            println!("assigned repairs: {}", report.assigned_shards_repaired);
+            println!("emergency copies: {}", report.emergency_copies_created);
+            println!(
+                "emergency copies removed: {}",
+                report.emergency_copies_removed
+            );
+            for issue in report.issues {
+                println!("issue: {issue}");
             }
         }
         Command::Unlock {
@@ -558,6 +648,81 @@ fn print_storage_volume(volume: &mb_node::StorageVolumeStatus) {
     );
     if let Some(error) = &volume.last_error {
         println!("storage degraded: {error}");
+    }
+}
+
+fn run_database_shell(node: &mut Node, volume: Option<Uuid>, writable: bool) -> Result<()> {
+    let interactive = std::io::stdin().is_terminal();
+    if interactive {
+        eprintln!(
+            "MutualBackup SQLCipher shell ({}, {}; one statement per line; .help for commands)",
+            volume
+                .map(|id| format!("volume {id}"))
+                .unwrap_or_else(|| "control.db".to_owned()),
+            if writable { "writable" } else { "query-only" },
+        );
+    }
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    loop {
+        if interactive {
+            eprint!("mbdb> ");
+            std::io::stderr().flush()?;
+        }
+        let Some(line) = lines.next() else {
+            break;
+        };
+        let line = line?;
+        match line.trim() {
+            "" => continue,
+            ".quit" | ".exit" => break,
+            ".help" => {
+                eprintln!(".tables  list tables");
+                eprintln!(".schema  show table definitions");
+                eprintln!(".quit    exit");
+                eprintln!("Enter one SQL statement per line.");
+                continue;
+            }
+            ".tables" => {
+                let result = node.database_shell_statement(
+                    volume,
+                    "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name",
+                    writable,
+                )?;
+                print_database_result(&result);
+                continue;
+            }
+            ".schema" => {
+                let result = node.database_shell_statement(
+                    volume,
+                    "SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name",
+                    writable,
+                )?;
+                print_database_result(&result);
+                continue;
+            }
+            command if command.starts_with('.') => {
+                eprintln!("unknown shell command: {command}");
+                continue;
+            }
+            sql => match node.database_shell_statement(volume, sql, writable) {
+                Ok(result) => print_database_result(&result),
+                Err(error) => eprintln!("error: {error:#}"),
+            },
+        }
+    }
+    Ok(())
+}
+
+fn print_database_result(result: &DatabaseShellResult) {
+    if !result.columns.is_empty() {
+        println!("{}", result.columns.join("\t"));
+    }
+    for row in &result.rows {
+        println!("{}", row.join("\t"));
+    }
+    if let Some(affected) = result.affected_rows {
+        println!("rows affected: {affected}");
     }
 }
 

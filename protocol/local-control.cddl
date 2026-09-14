@@ -20,6 +20,7 @@ local-request =
   / { "StorageDrain": { volume_id: uuid-text } }
   / "StorageMigrate"
   / "StorageReconcile"
+  / { "GuildAudit": { repair: bool } }
   / { "Unlock": { secret: bytes32-array } }
   / { "AddRoot": { path: tstr } }
   / "GuildStatus"
@@ -43,6 +44,7 @@ local-response =
   / { "StorageScrubbed": [* storage-scrub-report] }
   / { "StorageMigrated": { objects: uint } }
   / "StorageReconciled"
+  / { "GuildAudited": guild-audit-report }
   / { "RootAdded": protected-root }
   / { "Guild": null / guild-summary }
   / { "GuildInvite": { token: tstr, expires_at_unix_seconds: uint } }
@@ -50,6 +52,20 @@ local-response =
   / { "Recovered": dht-recovery-result }
   / { "Snapshots": [* snapshot-info] }
   / { "SnapshotRestored": snapshot-info }
+
+guild-audit-report = {
+  format_version: uint,
+  checkpoint_hash: bytes32-array,
+  checkpoint_generation: uint,
+  audited_at_unix_seconds: uint,
+  state: "unknown" / "healthy" / "degraded" / "emergency" / "unrecoverable",
+  checked_groups: uint,
+  assigned_shards_unavailable: uint,
+  assigned_shards_repaired: uint,
+  emergency_copies_created: uint,
+  emergency_copies_removed: uint,
+  issues: [* tstr]
+}
 
 node-status = {
   format_version: uint,
@@ -59,8 +75,23 @@ node-status = {
   checkpoint_count: uint,
   seed_recovery_ready: bool,
   root_dirty: bool,
+  automatic_backup: automatic-backup-status,
+  protection_state: "unknown" / "healthy" / "degraded" / "emergency" / "unrecoverable",
+  last_audit: null / guild-audit-report,
   storage_volumes: [* storage-volume-status],
   network: null / p2p-status
+}
+
+automatic-backup-status = {
+  enabled: bool,
+  dirty_since_unix_seconds: null / uint,
+  last_attempt_unix_seconds: null / uint,
+  last_success_unix_seconds: null / uint,
+  in_flight_revision: null / uuid-text,
+  window_backup_count: uint,
+  window_bytes: uint,
+  retry_at_unix_seconds: null / uint,
+  blocked_reason: null / tstr
 }
 
 storage-volume-status = {

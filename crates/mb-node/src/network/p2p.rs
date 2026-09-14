@@ -308,6 +308,16 @@ pub struct P2pClient {
     port_mapping_listener_state: watch::Receiver<PortMappingListenerState>,
 }
 
+struct ShardRepair {
+    repair_id: [u8; 16],
+    guild_id: [u8; 32],
+    checkpoint_hash: [u8; 32],
+    group_id: [u8; 32],
+    shard_index: u8,
+    emergency: bool,
+    bytes: Vec<u8>,
+}
+
 pub struct P2pEventLoop {
     swarm: Swarm<Behaviour>,
     commands: mpsc::Receiver<Command>,
@@ -1879,6 +1889,36 @@ impl P2pClient {
             bail!("peer returned the wrong parity response");
         };
         Ok(bytes)
+    }
+
+    async fn store_repair_shard(&self, peer: NodeId, repair: ShardRepair) -> Result<()> {
+        let ShardRepair {
+            repair_id,
+            guild_id,
+            checkpoint_hash,
+            group_id,
+            shard_index,
+            emergency,
+            bytes,
+        } = repair;
+        let response = self
+            .call(
+                peer,
+                PeerRequest::StoreRepairShard {
+                    repair_id,
+                    guild_id,
+                    checkpoint_hash,
+                    group_id,
+                    shard_index,
+                    emergency,
+                    bytes,
+                },
+            )
+            .await?;
+        if !matches!(response, PeerResponse::Ack) {
+            bail!("peer returned the wrong repair-storage response");
+        }
+        Ok(())
     }
 
     pub(crate) async fn guild_genesis(
@@ -6075,6 +6115,272 @@ async fn fetch_p2p_checkpoint(
     Ok(checkpoint)
 }
 
+pub async fn audit_guild(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    repair: bool,
+) -> Result<crate::GuildAuditReport> {
+    let (checkpoint, roster, local_id) = node_blocking(node.clone(), |node| {
+        let guild = node
+            .guild_summary()?
+            .context("guild audit requires an installed guild")?;
+        let checkpoint = node
+            .current_checkpoint(guild.guild_id)?
+            .context("guild audit requires a committed checkpoint")?;
+        Ok((checkpoint, guild.peers, node.keys().node_id()))
+    })
+    .await?;
+    checkpoint.verify()?;
+    let checkpoint_hash = checkpoint.hash()?;
+    for peer in &roster {
+        for endpoint in &peer.endpoints {
+            if let Ok(address) = endpoint.parse::<Multiaddr>() {
+                let _ = p2p.add_peer_address(peer.member.node_id, address).await;
+            }
+        }
+    }
+
+    let mut report = crate::GuildAuditReport {
+        format_version: 1,
+        checkpoint_hash,
+        checkpoint_generation: checkpoint.checkpoint.generation,
+        audited_at_unix_seconds: unix_seconds(),
+        state: crate::ProtectionState::Healthy,
+        checked_groups: 0,
+        assigned_shards_unavailable: 0,
+        assigned_shards_repaired: 0,
+        emergency_copies_created: 0,
+        emergency_copies_removed: 0,
+        issues: Vec::new(),
+    };
+    for group in &checkpoint.checkpoint.coding_groups {
+        report.checked_groups += 1;
+        let mut shards = vec![None; group.roles.len()];
+        let mut assigned_available = vec![false; group.roles.len()];
+        for (index, role) in group.roles.iter().enumerate() {
+            let (holder, expected_root) = shard_holder_and_root(role);
+            let assigned =
+                fetch_audit_shard(node.clone(), p2p, local_id, holder, group, index, false).await;
+            if let Ok(bytes) = assigned
+                && bytes.len() == group.shard_size as usize
+                && sector_root(&bytes) == expected_root
+            {
+                assigned_available[index] = true;
+                shards[index] = Some(bytes);
+                continue;
+            }
+            report.assigned_shards_unavailable += 1;
+            if report.issues.len() < 256 {
+                report.issues.push(format!(
+                    "group {} shard {index} unavailable from assigned holder {holder}",
+                    hex::encode(group.id)
+                ));
+            }
+            for alternate in roster
+                .iter()
+                .map(|peer| peer.member.node_id)
+                .filter(|alternate| *alternate != holder)
+            {
+                let candidate =
+                    fetch_audit_shard(node.clone(), p2p, local_id, alternate, group, index, true)
+                        .await;
+                if let Ok(bytes) = candidate
+                    && bytes.len() == group.shard_size as usize
+                    && sector_root(&bytes) == expected_root
+                {
+                    shards[index] = Some(bytes);
+                    break;
+                }
+            }
+        }
+
+        if repair {
+            for index in 0..group.roles.len() {
+                if assigned_available[index]
+                    || shards.iter().filter(|shard| shard.is_some()).count()
+                        < usize::from(V1_RS_DATA_SHARDS)
+                {
+                    continue;
+                }
+                let mut reconstructed = shards.clone();
+                reconstructed[index] = None;
+                mb_core::reconstruct_3_2(&mut reconstructed)?;
+                let bytes = reconstructed[index]
+                    .take()
+                    .context("audit did not reconstruct the missing shard")?;
+                let (assigned_holder, expected_root) = shard_holder_and_root(&group.roles[index]);
+                if sector_root(&bytes) != expected_root {
+                    bail!("audit reconstruction failed the certified shard root");
+                }
+                let repair_id = *Uuid::new_v4().as_bytes();
+                let assigned_repair = if assigned_holder == local_id {
+                    let payload = bytes.clone();
+                    let group_id = group.id;
+                    node_blocking(node.clone(), move |node| {
+                        node.install_repaired_shard(
+                            checkpoint_hash,
+                            group_id,
+                            index as u8,
+                            &payload,
+                            false,
+                        )
+                    })
+                    .await
+                } else {
+                    p2p.store_repair_shard(
+                        assigned_holder,
+                        ShardRepair {
+                            repair_id,
+                            guild_id: group.guild_id,
+                            checkpoint_hash,
+                            group_id: group.id,
+                            shard_index: index as u8,
+                            emergency: false,
+                            bytes: bytes.clone(),
+                        },
+                    )
+                    .await
+                };
+                if assigned_repair.is_ok() {
+                    assigned_available[index] = true;
+                    shards[index] = Some(bytes);
+                    report.assigned_shards_repaired += 1;
+                    continue;
+                }
+                let mut alternates = roster
+                    .iter()
+                    .map(|peer| peer.member.node_id)
+                    .filter(|candidate| *candidate != assigned_holder)
+                    .collect::<Vec<_>>();
+                alternates.sort();
+                let mut stored = false;
+                for alternate in alternates {
+                    let result = if alternate == local_id {
+                        let payload = bytes.clone();
+                        let group_id = group.id;
+                        node_blocking(node.clone(), move |node| {
+                            node.install_repaired_shard(
+                                checkpoint_hash,
+                                group_id,
+                                index as u8,
+                                &payload,
+                                true,
+                            )
+                        })
+                        .await
+                    } else {
+                        p2p.store_repair_shard(
+                            alternate,
+                            ShardRepair {
+                                repair_id,
+                                guild_id: group.guild_id,
+                                checkpoint_hash,
+                                group_id: group.id,
+                                shard_index: index as u8,
+                                emergency: true,
+                                bytes: bytes.clone(),
+                            },
+                        )
+                        .await
+                    };
+                    if result.is_ok() {
+                        stored = true;
+                        break;
+                    }
+                }
+                if stored {
+                    shards[index] = Some(bytes);
+                    report.emergency_copies_created += 1;
+                }
+            }
+        }
+        if assigned_available.iter().all(|available| *available) {
+            let group = group.clone();
+            report.emergency_copies_removed += node_blocking(node.clone(), move |node| {
+                node.remove_local_emergency_shards(checkpoint_hash, &group)
+            })
+            .await?;
+        }
+        let available = shards.iter().filter(|shard| shard.is_some()).count();
+        let group_state = if assigned_available.iter().all(|available| *available) {
+            crate::ProtectionState::Healthy
+        } else if available >= 4 {
+            crate::ProtectionState::Degraded
+        } else if available == usize::from(V1_RS_DATA_SHARDS) {
+            crate::ProtectionState::Emergency
+        } else {
+            crate::ProtectionState::Unrecoverable
+        };
+        report.state = worse_protection_state(report.state, group_state);
+    }
+    let durable_report = report.clone();
+    node_blocking(node, move |node| node.record_guild_audit(&durable_report)).await?;
+    Ok(report)
+}
+
+fn shard_holder_and_root(role: &ShardRole) -> (NodeId, [u8; 32]) {
+    match role {
+        ShardRole::Information(information) => (information.owner, information.sector.root),
+        ShardRole::Parity(parity) => (parity.holder, parity.root),
+    }
+}
+
+async fn fetch_audit_shard(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    local_id: NodeId,
+    holder: NodeId,
+    group: &CodingGroup,
+    index: usize,
+    emergency: bool,
+) -> Result<Vec<u8>> {
+    if holder == local_id {
+        let group = group.clone();
+        return node_blocking(node, move |node| {
+            if emergency {
+                node.parity_for_guild(&group.guild_id, &group.id, index as u8)
+            } else {
+                node.local_assigned_shard(&group, index)
+            }
+        })
+        .await;
+    }
+    if emergency {
+        p2p.parity(holder, group.guild_id, group.id, index as u8)
+            .await
+    } else {
+        match &group.roles[index] {
+            ShardRole::Information(information) => {
+                p2p.sector(holder, group.guild_id, information.sector.id)
+                    .await
+            }
+            ShardRole::Parity(_) => {
+                p2p.parity(holder, group.guild_id, group.id, index as u8)
+                    .await
+            }
+        }
+    }
+}
+
+fn worse_protection_state(
+    left: crate::ProtectionState,
+    right: crate::ProtectionState,
+) -> crate::ProtectionState {
+    use crate::ProtectionState::{Degraded, Emergency, Healthy, Unknown, Unrecoverable};
+    let rank = |state| match state {
+        Unknown => 0,
+        Healthy => 1,
+        Degraded => 2,
+        Emergency => 3,
+        Unrecoverable => 4,
+    };
+    if rank(right) > rank(left) {
+        right
+    } else {
+        left
+    }
+}
+
 async fn recover_p2p_local_shards(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
@@ -6082,10 +6388,13 @@ async fn recover_p2p_local_shards(
     roster: &[GuildPeer],
 ) -> Result<()> {
     let deferred_holders = Arc::new(Mutex::new(BTreeSet::new()));
-    recover_local_shards_with(node, checkpoint, |group, target_index| {
+    let reconstruction_node = node.clone();
+    recover_local_shards_with(node, checkpoint, move |group, target_index| {
         let deferred_holders = deferred_holders.clone();
+        let node = reconstruction_node.clone();
         async move {
-            reconstruct_shard_from_peers(p2p, &group, target_index, roster, &deferred_holders).await
+            reconstruct_shard_from_peers(node, p2p, &group, target_index, roster, &deferred_holders)
+                .await
         }
     })
     .await
@@ -6153,6 +6462,7 @@ where
 }
 
 async fn reconstruct_shard_from_peers(
+    node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
     group: &CodingGroup,
     target_index: usize,
@@ -6162,6 +6472,7 @@ async fn reconstruct_shard_from_peers(
     if target_index >= group.roles.len() {
         bail!("target shard index is outside its coding group");
     }
+    let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
     for peer in roster {
         for endpoint in &peer.endpoints {
             let Ok(address) = endpoint.parse::<Multiaddr>() else {
@@ -6211,14 +6522,12 @@ async fn reconstruct_shard_from_peers(
         for (index, holder, root, sector_id) in candidates.into_iter().take(request_count) {
             issued.push((index, holder));
             let client = p2p.clone();
-            let guild_id = group.guild_id;
-            let group_id = group.id;
+            let node = node.clone();
+            let group = group.clone();
             requests.push(async move {
-                let result = if let Some(sector_id) = sector_id {
-                    client.sector(holder, guild_id, sector_id).await
-                } else {
-                    client.parity(holder, guild_id, group_id, index as u8).await
-                };
+                let result =
+                    fetch_audit_shard(node, &client, local_id, holder, &group, index, false).await;
+                debug_assert_eq!(sector_id.is_some(), index < usize::from(V1_RS_DATA_SHARDS));
                 (index, holder, root, result)
             });
         }
@@ -6270,6 +6579,38 @@ async fn reconstruct_shard_from_peers(
         }
         if attempt + 1 < SHARD_FETCH_ATTEMPTS {
             tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    if shards.iter().filter(|shard| shard.is_some()).count() < usize::from(V1_RS_DATA_SHARDS) {
+        for (index, role) in group.roles.iter().enumerate() {
+            if index == target_index || shards[index].is_some() {
+                continue;
+            }
+            let (assigned, root) = shard_holder_and_root(role);
+            for peer in roster.iter().filter(|peer| peer.member.node_id != assigned) {
+                let Ok(bytes) = fetch_audit_shard(
+                    node.clone(),
+                    p2p,
+                    local_id,
+                    peer.member.node_id,
+                    group,
+                    index,
+                    true,
+                )
+                .await
+                else {
+                    continue;
+                };
+                if bytes.len() == group.shard_size as usize && sector_root(&bytes) == root {
+                    shards[index] = Some(bytes);
+                    break;
+                }
+            }
+            if shards.iter().filter(|shard| shard.is_some()).count()
+                >= usize::from(V1_RS_DATA_SHARDS)
+            {
+                break;
+            }
         }
     }
     if shards.iter().filter(|shard| shard.is_some()).count() < usize::from(V1_RS_DATA_SHARDS) {
@@ -6341,9 +6682,15 @@ pub(crate) async fn restore_snapshot_with_p2p(
                     .map(|(index, _)| (group, index))
             })
             .context("snapshot sector is not present in the certified coding catalog")?;
-        let bytes =
-            reconstruct_shard_from_peers(p2p, group, target_index, &roster, &deferred_holders)
-                .await?;
+        let bytes = reconstruct_shard_from_peers(
+            node.clone(),
+            p2p,
+            group,
+            target_index,
+            &roster,
+            &deferred_holders,
+        )
+        .await?;
         let reference_for_install = reference.clone();
         node_blocking(node.clone(), move |node| {
             node.install_repaired_information_sector(guild_id, reference_for_install, &bytes)
@@ -10912,6 +11259,313 @@ mod tests {
             relay_members
                 .iter()
                 .all(|members| members.read().is_ok_and(|members| members.len() == 5))
+        );
+
+        for client in &clients {
+            client.shutdown().await.unwrap();
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_repairs_assignments_and_emergency_parity_survives_more_losses() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds = (211_u8..=215)
+            .map(|value| Seed::from_bytes([value; 32]))
+            .collect::<Vec<_>>();
+        let mut nodes = Vec::new();
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for (index, seed) in seeds.iter().cloned().enumerate() {
+            let node = Node::open(temp.path().join(format!("node-{index}")), seed).unwrap();
+            let node_id = node.keys().node_id();
+            let node = Arc::new(Mutex::new(node));
+            let (client, event_loop) = build_p2p(node.clone(), config(node_id)).unwrap();
+            nodes.push(node);
+            clients.push(client);
+            tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let addresses = futures::future::join_all(clients.iter().map(listening_address)).await;
+        let endpoints = clients
+            .iter()
+            .zip(addresses.iter().cloned())
+            .map(|(client, address)| peer_endpoint(client, address))
+            .collect::<Vec<_>>();
+        let certificate = form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+        let guild_id = certificate.genesis.guild_id;
+
+        let mut revisions = Vec::new();
+        let mut writer_fences = Vec::new();
+        let mut references = Vec::new();
+        let mut information = Vec::new();
+        for (index, node) in nodes.iter().take(3).enumerate() {
+            let revision_id = Uuid::from_bytes([220 + index as u8; 16]);
+            let mut node = node.lock().unwrap();
+            let sector_id = mb_core::make_sector_id(
+                node.keys().node_id(),
+                revision_id,
+                mb_core::SectorPurpose::Metadata,
+                0,
+            );
+            let (reference, bytes) = mb_core::encrypted_sector(
+                &node.keys().guild_data_key(&guild_id),
+                sector_id,
+                &[index as u8 + 1],
+            )
+            .unwrap();
+            node.install_repaired_information_sector(guild_id, reference.clone(), &bytes)
+                .unwrap();
+            let writer = ed25519_dalek::SigningKey::from_bytes(&[230 + index as u8; 32]);
+            let mut revision = UserRevision {
+                format_version: 2,
+                guild_id,
+                cipher_profile: mb_core::V1_CIPHER_PROFILE,
+                revision_id,
+                owner: node.keys().node_id(),
+                writer_epoch: 1,
+                writer_public_key: writer.verifying_key().to_bytes(),
+                writer_signature: Vec::new(),
+                sequence: 1,
+                parent: None,
+                metadata_sectors: vec![reference.clone()],
+                data_sectors: Vec::new(),
+            };
+            revision.sign_writer(&writer).unwrap();
+            writer_fences.push(mb_core::WriterFence {
+                owner: revision.owner,
+                epoch: 1,
+                public_key: revision.writer_public_key,
+            });
+            revisions.push(
+                SignedRecord::sign(mb_core::USER_REVISION_DOMAIN, revision, node.keys()).unwrap(),
+            );
+            references.push(reference);
+            information.push(bytes);
+        }
+        revisions.sort_by_key(|revision| {
+            (
+                revision.value.owner,
+                revision.value.sequence,
+                revision.value.revision_id,
+            )
+        });
+        writer_fences.sort_by_key(|fence| (fence.owner, fence.epoch));
+        let information: [Vec<u8>; 3] = information.try_into().unwrap();
+        let encoded = encode_3_2(information.clone()).unwrap();
+        let mut group = CodingGroup {
+            id: [0; 32],
+            format_version: 1,
+            guild_id,
+            data_shards: V1_RS_DATA_SHARDS,
+            parity_shards: V1_RS_PARITY_SHARDS,
+            shard_size: V1_SECTOR_SIZE as u32,
+            roles: [
+                ShardRole::Information(InformationRole {
+                    owner: nodes[0].lock().unwrap().keys().node_id(),
+                    sector: references[0].clone(),
+                }),
+                ShardRole::Information(InformationRole {
+                    owner: nodes[1].lock().unwrap().keys().node_id(),
+                    sector: references[1].clone(),
+                }),
+                ShardRole::Information(InformationRole {
+                    owner: nodes[2].lock().unwrap().keys().node_id(),
+                    sector: references[2].clone(),
+                }),
+                ShardRole::Parity(ParityRole {
+                    holder: nodes[3].lock().unwrap().keys().node_id(),
+                    row: 0,
+                    root: sector_root(&encoded[3]),
+                }),
+                ShardRole::Parity(ParityRole {
+                    holder: nodes[4].lock().unwrap().keys().node_id(),
+                    row: 1,
+                    root: sector_root(&encoded[4]),
+                }),
+            ],
+        };
+        group.id = group.calculate_id().unwrap();
+        for index in 3..5 {
+            nodes[index]
+                .lock()
+                .unwrap()
+                .publish_verified_parity(
+                    &group,
+                    &information,
+                    &ParityObject {
+                        format_version: 1,
+                        guild_id,
+                        group_id: group.id,
+                        shard_index: index as u8,
+                        root: sector_root(&encoded[index]),
+                        bytes: encoded[index].clone(),
+                    },
+                )
+                .unwrap();
+        }
+        let checkpoint_body = GuildCheckpoint {
+            format_version: 3,
+            guild_id,
+            genesis_hash: certificate.hash().unwrap(),
+            generation: 1,
+            parent: None,
+            members: certificate.genesis.members.clone(),
+            writer_fences,
+            revision_tombstones: Vec::new(),
+            revisions,
+            coding_groups: vec![group.clone()],
+        };
+        checkpoint_body.validate().unwrap();
+        let mut signatures = Vec::new();
+        for node in &nodes {
+            signatures.push(
+                node.lock()
+                    .unwrap()
+                    .sign_checkpoint(&checkpoint_body)
+                    .unwrap(),
+            );
+        }
+        signatures.sort_by_key(|signature| signature.signer);
+        let checkpoint = QuorumCheckpoint {
+            checkpoint: checkpoint_body,
+            signatures,
+        };
+        checkpoint.verify().unwrap();
+        for node in &nodes {
+            node.lock().unwrap().store_checkpoint(&checkpoint).unwrap();
+        }
+
+        let healthy = audit_guild(nodes[0].clone(), &clients[0], false)
+            .await
+            .unwrap();
+        assert_eq!(healthy.state, crate::ProtectionState::Healthy);
+        nodes[1]
+            .lock()
+            .unwrap()
+            .forget_local_sector(&references[1].id)
+            .unwrap();
+        let repaired = audit_guild(nodes[0].clone(), &clients[0], true)
+            .await
+            .unwrap();
+        assert_eq!(repaired.state, crate::ProtectionState::Healthy);
+        assert_eq!(repaired.assigned_shards_repaired, 1);
+        assert_eq!(
+            nodes[1]
+                .lock()
+                .unwrap()
+                .sector_for_guild(&guild_id, &references[1].id)
+                .unwrap(),
+            encoded[1]
+        );
+
+        nodes[4]
+            .lock()
+            .unwrap()
+            .forget_local_parity(&group, 4)
+            .unwrap();
+        nodes[4].lock().unwrap().configure_parity_budget(1).unwrap();
+        let emergency = audit_guild(nodes[0].clone(), &clients[0], true)
+            .await
+            .unwrap();
+        assert_eq!(emergency.state, crate::ProtectionState::Degraded);
+        assert_eq!(emergency.emergency_copies_created, 1);
+        let emergency_holder = (0..4)
+            .find(|index| {
+                nodes[*index]
+                    .lock()
+                    .unwrap()
+                    .parity_for_guild(&guild_id, &group.id, 4)
+                    .is_ok_and(|bytes| bytes == encoded[4])
+            })
+            .unwrap();
+        assert_eq!(
+            nodes[emergency_holder]
+                .lock()
+                .unwrap()
+                .emergency_shard_count()
+                .unwrap(),
+            1
+        );
+
+        nodes[1]
+            .lock()
+            .unwrap()
+            .forget_local_sector(&references[1].id)
+            .unwrap();
+        let after_one_more_loss = audit_guild(nodes[0].clone(), &clients[0], false)
+            .await
+            .unwrap();
+        assert_eq!(after_one_more_loss.state, crate::ProtectionState::Degraded);
+        nodes[2]
+            .lock()
+            .unwrap()
+            .forget_local_sector(&references[2].id)
+            .unwrap();
+        let emergency_after_second_loss = audit_guild(nodes[0].clone(), &clients[0], false)
+            .await
+            .unwrap();
+        assert_eq!(
+            emergency_after_second_loss.state,
+            crate::ProtectionState::Emergency
+        );
+        let roster = nodes[0]
+            .lock()
+            .unwrap()
+            .guild_summary()
+            .unwrap()
+            .unwrap()
+            .peers;
+        let rebuilt = reconstruct_shard_from_peers(
+            nodes[1].clone(),
+            &clients[1],
+            &group,
+            1,
+            &roster,
+            &Mutex::new(BTreeSet::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rebuilt, encoded[1]);
+
+        nodes[4]
+            .lock()
+            .unwrap()
+            .configure_parity_budget((2 * V1_SECTOR_SIZE) as u64)
+            .unwrap();
+        let restored = audit_guild(nodes[0].clone(), &clients[0], true)
+            .await
+            .unwrap();
+        assert_eq!(restored.state, crate::ProtectionState::Healthy);
+        assert_eq!(
+            nodes[1]
+                .lock()
+                .unwrap()
+                .sector_for_guild(&guild_id, &references[1].id)
+                .unwrap(),
+            encoded[1]
+        );
+        let removed = if emergency_holder == 0 {
+            restored.emergency_copies_removed
+        } else {
+            let cleanup = audit_guild(
+                nodes[emergency_holder].clone(),
+                &clients[emergency_holder],
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(cleanup.state, crate::ProtectionState::Healthy);
+            cleanup.emergency_copies_removed
+        };
+        assert_eq!(removed, 1);
+        assert!(
+            nodes[emergency_holder]
+                .lock()
+                .unwrap()
+                .parity_for_guild(&guild_id, &group.id, 4)
+                .is_err()
         );
 
         for client in &clients {

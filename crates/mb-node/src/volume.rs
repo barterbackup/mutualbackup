@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use mb_core::{
     KeyMaterial, NodeId, SignedRecord, WrappedDatabaseKey, canonical_bytes, decode_canonical,
 };
-use mb_store::{ControlStore, DatabaseError, ParityObject, ParityStore};
+use mb_store::{ControlStore, DatabaseError, DatabaseShellResult, ParityObject, ParityStore};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -361,6 +361,39 @@ impl StorageVolumes {
         object: &ParityObject,
         acknowledgement: &[u8],
     ) -> Result<VolumeReceipt> {
+        self.store_with_headroom(control, object, acknowledgement, true)
+    }
+
+    pub(crate) fn store_repair(
+        &mut self,
+        control: &ControlStore,
+        object: &ParityObject,
+    ) -> Result<VolumeReceipt> {
+        if let Some(receipt) = self.receipt(control, &object.group_id, object.shard_index)? {
+            let reusable = self.volumes.get(&receipt.volume_id).is_some_and(|volume| {
+                volume.store.is_some()
+                    && matches!(
+                        volume.record.state,
+                        StorageVolumeState::Online | StorageVolumeState::Draining
+                    )
+            });
+            if !reusable {
+                control.delete_record(
+                    "volume-receipt",
+                    &volume_object_id(&object.group_id, object.shard_index),
+                )?;
+            }
+        }
+        self.store_with_headroom(control, object, &[], false)
+    }
+
+    fn store_with_headroom(
+        &mut self,
+        control: &ControlStore,
+        object: &ParityObject,
+        acknowledgement: &[u8],
+        reserve_headroom: bool,
+    ) -> Result<VolumeReceipt> {
         if let Some(receipt) = self.receipt(control, &object.group_id, object.shard_index)? {
             let volume = self
                 .volumes
@@ -383,10 +416,12 @@ impl StorageVolumes {
                     return None;
                 }
                 let used = volume.store.as_ref()?.used_bytes().ok()?;
-                let writable = volume
-                    .record
-                    .budget_bytes
-                    .saturating_sub(volume.record.headroom_bytes);
+                let reserved = if reserve_headroom {
+                    volume.record.headroom_bytes
+                } else {
+                    0
+                };
+                let writable = volume.record.budget_bytes.saturating_sub(reserved);
                 (used.saturating_add(required) <= writable).then_some((*id, used))
             })
             .min_by_key(|(id, used)| (*used, *id))
@@ -484,6 +519,23 @@ impl StorageVolumes {
         Ok(reports)
     }
 
+    pub(crate) fn database_shell_statement(
+        &self,
+        volume_id: Uuid,
+        sql: &str,
+        query_only: bool,
+    ) -> Result<DatabaseShellResult> {
+        let volume = self
+            .volumes
+            .get(&volume_id)
+            .context("unknown parity volume")?;
+        let store = volume
+            .store
+            .as_ref()
+            .context("parity volume is not online")?;
+        Ok(store.database_shell_statement(sql, query_only)?)
+    }
+
     pub(crate) fn mark_draining(&mut self, control: &ControlStore, volume_id: Uuid) -> Result<()> {
         let volume = self
             .volumes
@@ -522,11 +574,12 @@ impl StorageVolumes {
                 // Remove the source receipt before selecting a destination, while
                 // retaining a write intent that makes an interruption recoverable.
                 control.delete_record("volume-receipt", &record_id)?;
-                let destination = match self.store(control, &object, &acknowledgement) {
-                    Ok(receipt) if receipt.volume_id != source_id => receipt,
-                    Ok(_) => bail!("draining migration selected its source volume"),
-                    Err(error) => return Err(error),
-                };
+                let destination =
+                    match self.store_with_headroom(control, &object, &acknowledgement, false) {
+                        Ok(receipt) if receipt.volume_id != source_id => receipt,
+                        Ok(_) => bail!("draining migration selected its source volume"),
+                        Err(error) => return Err(error),
+                    };
                 self.volumes
                     .get_mut(&source_id)
                     .and_then(|volume| volume.store.as_mut())
@@ -959,6 +1012,45 @@ mod tests {
                 .filter_map(|status| status.object_count)
                 .sum::<u64>(),
             1
+        );
+    }
+
+    #[test]
+    fn repair_can_consume_reserved_headroom_while_normal_placement_cannot() {
+        let temp = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([64; 32])));
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[],
+                V1_SECTOR_SIZE as u64,
+                V1_SECTOR_SIZE as u64 / 2,
+            )
+            .unwrap();
+        let bytes = vec![45; V1_SECTOR_SIZE];
+        let object = ParityObject {
+            format_version: 1,
+            guild_id: [46; 32],
+            group_id: [47; 32],
+            shard_index: 4,
+            root: sector_root(&bytes),
+            bytes,
+        };
+        assert!(matches!(
+            volumes.store(&control, &object, b"ack"),
+            Err(error) if matches!(
+                error.downcast_ref::<DatabaseError>(),
+                Some(DatabaseError::CapacityExceeded)
+            )
+        ));
+        volumes.store_repair(&control, &object).unwrap();
+        assert_eq!(
+            volumes
+                .load_ready(&object.group_id, object.shard_index)
+                .unwrap(),
+            object
         );
     }
 }

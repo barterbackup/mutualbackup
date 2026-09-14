@@ -9,9 +9,8 @@ state through Kademlia, and recover a lost member from its offline seed.
 Peer traffic uses authenticated QUIC with Identify, circuit relay v2,
 AutoNAT/DCUtR hole punching, optional gateway port mapping, and embedded Arti
 onion services. Every path authenticates the same recovery-string-derived
-identity. Non-reflink source backends, membership changes, audits, repair, and
-garbage collection remain outside this milestone. Do not entrust unique data
-to this prototype.
+identity. Non-reflink source backends, membership changes, and cross-user
+packing remain later work. Do not entrust unique data to this prototype.
 
 ## Programs
 
@@ -58,6 +57,8 @@ mutualbackup snapshot list
 mutualbackup snapshot restore TARGET [--revision UUID]
 mutualbackup restore TARGET
 mutualbackup storage list|scrub|drain|migrate|reconcile
+mutualbackup audit [--repair]
+mutualbackup db-shell --data-dir STATE [--volume UUID] [--write]
 ```
 
 Parity may span several configured filesystems. Each volume has a signed UUID,
@@ -69,6 +70,22 @@ from durable control receipts, while an absent disk remains visibly offline.
 prefixes remain represented by checkpoint tombstones, and local anchors and
 shards are collected only after a later checkpoint confirms they stayed
 unreachable.
+
+Automatic backup is disabled by default. When enabled, watcher events coalesce
+behind a quiet period, startup and periodic deadlines force full reconciliation,
+and minimum-interval plus daily count/byte limits are durable across restarts.
+`status` keeps the root visibly dirty and prints the blocking reason when a
+limit or storage capacity prevents publication.
+
+The daemon periodically scrubs every online parity database and audits the
+current guild layout. Missing assigned shards are reconstructed from any three
+valid shards; when the assigned peer is unavailable, a verified emergency copy
+uses reserved repair headroom on another member. `status` reports the last
+durable result as healthy, degraded, emergency, or unrecoverable.
+
+`db-shell` uses the application's SQLCipher connection and wrapped keys. It is
+query-only unless `--write` is supplied, and opening it requires the node data
+directory lock so a writable shell cannot race the daemon.
 
 The CLI and daemon use a same-user Unix control socket. Pass `--socket` when a
 configuration does not use the default location below `XDG_RUNTIME_DIR`.

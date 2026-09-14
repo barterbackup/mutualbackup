@@ -51,6 +51,15 @@ peer-request =
         object: parity-object
       } }
   / { "GetParity": { guild_id: bytes32-array, group_id: bytes32-array, shard_index: uint8 } }
+  / { "StoreRepairShard": {
+        repair_id: bytes16-array,
+        guild_id: bytes32-array,
+        checkpoint_hash: bytes32-array,
+        group_id: bytes32-array,
+        shard_index: uint8,
+        emergency: bool,
+        bytes: byte-vector
+      } }
   / { "PutCheckpointPage": {
         object_kind: "Body" / "Certificate",
         guild_id: bytes32-array,

@@ -23,6 +23,12 @@ const DEFAULT_PARITY_BUDGET_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_PARITY_HEADROOM_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_MAX_CONNECTIONS: usize = 32;
 const DEFAULT_RETENTION_REVISIONS: u32 = 30;
+const DEFAULT_BACKUP_QUIET_SECONDS: u64 = 300;
+const DEFAULT_BACKUP_MINIMUM_INTERVAL_SECONDS: u64 = 3_600;
+const DEFAULT_FULL_RECONCILE_INTERVAL_SECONDS: u64 = 86_400;
+const DEFAULT_DAILY_BACKUP_LIMIT: u32 = 24;
+const DEFAULT_DAILY_BACKUP_BYTE_LIMIT: u64 = 100 * 1024 * 1024 * 1024;
+const DEFAULT_AUDIT_INTERVAL_SECONDS: u64 = 6 * 60 * 60;
 
 /// Human-owned daemon options, populated from flags over an optional TOML file.
 #[derive(Clone, Debug, Eq, PartialEq, Conf, Serialize)]
@@ -74,6 +80,34 @@ pub struct DaemonOptions {
     /// Number of committed snapshots retained per guild member.
     #[conf(parameter, long, default(DEFAULT_RETENTION_REVISIONS))]
     pub retention_revisions: u32,
+
+    /// Enable quiet-period automatic full backups.
+    #[conf(parameter, long, default(false))]
+    pub automatic_backup: bool,
+
+    /// Seconds without a filesystem change before an automatic backup.
+    #[conf(parameter, long, default(DEFAULT_BACKUP_QUIET_SECONDS))]
+    pub backup_quiet_seconds: u64,
+
+    /// Minimum seconds between automatic backup attempts.
+    #[conf(parameter, long, default(DEFAULT_BACKUP_MINIMUM_INTERVAL_SECONDS))]
+    pub backup_minimum_interval_seconds: u64,
+
+    /// Seconds between authoritative full reconciliation scans.
+    #[conf(parameter, long, default(DEFAULT_FULL_RECONCILE_INTERVAL_SECONDS))]
+    pub full_reconcile_interval_seconds: u64,
+
+    /// Maximum automatic backup attempts in one 24-hour accounting window.
+    #[conf(parameter, long, default(DEFAULT_DAILY_BACKUP_LIMIT))]
+    pub daily_backup_limit: u32,
+
+    /// Maximum source bytes admitted in one 24-hour accounting window.
+    #[conf(parameter, long, default(DEFAULT_DAILY_BACKUP_BYTE_LIMIT))]
+    pub daily_backup_byte_limit: u64,
+
+    /// Seconds between full guild audits and local parity scrubs.
+    #[conf(parameter, long, default(DEFAULT_AUDIT_INTERVAL_SECONDS))]
+    pub audit_interval_seconds: u64,
 
     /// Clear parity volumes inherited from the configuration file.
     #[conf(flag, long = "clear-parity-volumes", serde(skip))]
@@ -200,6 +234,29 @@ impl DaemonOptions {
         }
         if self.retention_revisions == 0 || self.retention_revisions > 1_024 {
             bail!("retention_revisions must be between 1 and 1024");
+        }
+        let automatic_policy = mb_node::AutomaticBackupPolicy {
+            enabled: self.automatic_backup,
+            quiet_period_seconds: self.backup_quiet_seconds,
+            minimum_interval_seconds: self.backup_minimum_interval_seconds,
+            full_reconcile_interval_seconds: self.full_reconcile_interval_seconds,
+            daily_backup_limit: self.daily_backup_limit,
+            daily_byte_limit: self.daily_backup_byte_limit,
+        };
+        if automatic_policy.quiet_period_seconds == 0
+            || automatic_policy.quiet_period_seconds > 24 * 60 * 60
+            || automatic_policy.minimum_interval_seconds == 0
+            || automatic_policy.minimum_interval_seconds > 30 * 24 * 60 * 60
+            || automatic_policy.full_reconcile_interval_seconds == 0
+            || automatic_policy.full_reconcile_interval_seconds > 30 * 24 * 60 * 60
+            || automatic_policy.daily_backup_limit == 0
+            || automatic_policy.daily_backup_limit > 10_000
+            || automatic_policy.daily_byte_limit == 0
+        {
+            bail!("automatic-backup intervals and budgets are outside supported bounds");
+        }
+        if self.audit_interval_seconds == 0 || self.audit_interval_seconds > 30 * 24 * 60 * 60 {
+            bail!("audit_interval_seconds must be between 1 second and 30 days");
         }
         if self.tor_mode == TorMode::DisableTor
             && self.p2p_listen_addresses.is_empty()

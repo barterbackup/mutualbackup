@@ -41,6 +41,7 @@ pub async fn run_root_watcher(node: Arc<Mutex<Node>>) -> Result<()> {
         mark_dirty(
             node.clone(),
             "startup or watcher restart reconciliation required",
+            false,
         )
         .await;
 
@@ -58,6 +59,7 @@ pub async fn run_root_watcher(node: Arc<Mutex<Node>>) -> Result<()> {
         mark_dirty(
             node.clone(),
             "protected root watcher unavailable; reconciliation required",
+            false,
         )
         .await;
         tokio::time::sleep(retry_delay).await;
@@ -103,7 +105,12 @@ async fn watch_once(node: Arc<Mutex<Node>>, root: &ProtectedRoot) -> Result<()> 
         tokio::select! {
             signal = receiver.recv() => match signal {
                 Some(()) => {
-                    mark_dirty(node.clone(), "filesystem changed; reconciliation required").await;
+                    mark_dirty(
+                        node.clone(),
+                        "filesystem changed; reconciliation required",
+                        true,
+                    )
+                    .await;
                 }
                 None => anyhow::bail!("filesystem watcher callback stopped"),
             },
@@ -157,8 +164,16 @@ fn watched_root_identity(root: &ProtectedRoot) -> Result<WatchedRootIdentity> {
     })
 }
 
-async fn mark_dirty(node: Arc<Mutex<Node>>, reason: &'static str) {
-    if let Err(error) = node_blocking(node, move |node| node.mark_root_dirty(reason)).await {
+async fn mark_dirty(node: Arc<Mutex<Node>>, reason: &'static str, changed: bool) {
+    if let Err(error) = node_blocking(node, move |node| {
+        if changed {
+            node.mark_root_changed(reason)
+        } else {
+            node.mark_root_dirty(reason)
+        }
+    })
+    .await
+    {
         tracing::error!(%error, "cannot persist protected-root dirty state");
     }
 }
