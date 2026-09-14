@@ -32,10 +32,16 @@ pub enum LocalRequest {
     Status,
     StorageStatus,
     StorageScrub,
+    StorageReclaim {
+        volume_id: Option<Uuid>,
+    },
     StorageDrain {
         volume_id: Uuid,
     },
     StorageMigrate,
+    StorageReactivate {
+        volume_id: Uuid,
+    },
     StorageReconcile,
     GuildAudit {
         repair: bool,
@@ -82,9 +88,13 @@ pub enum LocalResponse {
     Status(Box<NodeStatus>),
     StorageVolumes(Vec<StorageVolumeStatus>),
     StorageScrubbed(Vec<StorageScrubReport>),
+    StorageReclaimed {
+        bytes: u64,
+    },
     StorageMigrated {
         objects: u64,
     },
+    StorageReactivated,
     StorageReconciled,
     GuildAudited(GuildAuditReport),
     RootAdded(ProtectedRoot),

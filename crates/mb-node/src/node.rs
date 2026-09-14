@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -388,6 +388,7 @@ pub struct Node {
     control: ControlStore,
     control_database_key: [u8; 32],
     volumes: StorageVolumes,
+    volume_readers: Arc<RwLock<Vec<VolumeReaderConfig>>>,
 }
 
 #[derive(Clone)]
@@ -395,13 +396,13 @@ pub(crate) struct NodeReaderConfig {
     keys: Arc<KeyMaterial>,
     control_path: PathBuf,
     control_database_key: [u8; 32],
-    volumes: Vec<VolumeReaderConfig>,
+    volume_readers: Arc<RwLock<Vec<VolumeReaderConfig>>>,
 }
 
 pub(crate) struct NodeReader {
     keys: Arc<KeyMaterial>,
     control: ControlStore,
-    parity: Vec<ParityStore>,
+    volume_readers: Arc<RwLock<Vec<VolumeReaderConfig>>>,
 }
 
 impl NodeReaderConfig {
@@ -409,17 +410,7 @@ impl NodeReaderConfig {
         Ok(NodeReader {
             keys: self.keys.clone(),
             control: ControlStore::open_with_key(&self.control_path, &self.control_database_key)?,
-            parity: self
-                .volumes
-                .iter()
-                .map(|volume| {
-                    ParityStore::open_with_key(
-                        &volume.path,
-                        volume.volume_id.as_bytes(),
-                        &volume.database_key,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?,
+            volume_readers: self.volume_readers.clone(),
         })
     }
 
@@ -504,16 +495,39 @@ impl NodeReader {
         group_id: &[u8; 32],
         shard_index: u8,
     ) -> Result<Vec<u8>> {
-        let object = self
-            .parity
-            .iter()
-            .find_map(|store| match store.load_ready(group_id, shard_index) {
-                Ok(object) => Some(Ok(object)),
-                Err(DatabaseError::NotReady) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .transpose()?
-            .ok_or(DatabaseError::NotReady)?;
+        let volumes = self
+            .volume_readers
+            .read()
+            .map_err(|_| anyhow::anyhow!("volume reader configuration lock was poisoned"))?;
+        let mut first_error = None;
+        let mut object = None;
+        for volume in volumes.iter() {
+            let store = match ParityStore::open_existing_with_key(
+                &volume.path,
+                volume.volume_id.as_bytes(),
+                &volume.database_key,
+            ) {
+                Ok(store) => store,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
+            match store.load_ready(group_id, shard_index) {
+                Ok(found) => {
+                    object = Some(found);
+                    break;
+                }
+                Err(DatabaseError::NotReady) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        let object = match object {
+            Some(object) => object,
+            None => return Err(first_error.unwrap_or(DatabaseError::NotReady).into()),
+        };
         if object.guild_id != *guild_id {
             anyhow::bail!("parity object does not belong to the requested guild");
         }
@@ -581,6 +595,7 @@ impl Node {
         reconcile_pending_captures(&control)?;
         let mut volumes = StorageVolumes::open(&data_dir, keys.clone(), &control)?;
         volumes.reconcile(&control)?;
+        let volume_readers = Arc::new(RwLock::new(volumes.reader_configs()));
         let mut node = Self {
             data_dir,
             _data_dir_lock: locked,
@@ -588,6 +603,7 @@ impl Node {
             control,
             control_database_key,
             volumes,
+            volume_readers,
         };
         node.reconcile_certified_writer_head()?;
         node.reconcile_garbage_collection()?;
@@ -999,8 +1015,17 @@ impl Node {
             keys: self.keys.clone(),
             control_path: self.control.path().to_path_buf(),
             control_database_key: self.control_database_key,
-            volumes: self.volumes.reader_configs(),
+            volume_readers: self.volume_readers.clone(),
         }
+    }
+
+    fn refresh_volume_readers(&self) -> Result<()> {
+        *self
+            .volume_readers
+            .write()
+            .map_err(|_| anyhow::anyhow!("volume reader configuration lock was poisoned"))? =
+            self.volumes.reader_configs();
+        Ok(())
     }
 
     pub fn member(&self, failure_domain: impl Into<String>) -> Member {
@@ -1058,7 +1083,8 @@ impl Node {
         headroom_bytes: u64,
     ) -> Result<()> {
         self.volumes
-            .configure(&self.control, paths, budget_bytes, headroom_bytes)
+            .configure(&self.control, paths, budget_bytes, headroom_bytes)?;
+        self.refresh_volume_readers()
     }
 
     pub fn configure_retention(&self, revisions_per_owner: u32) -> Result<()> {
@@ -1112,7 +1138,17 @@ impl Node {
     }
 
     pub fn scrub_storage(&mut self) -> Result<Vec<StorageScrubReport>> {
-        self.volumes.scrub(&self.control)
+        let reports = self.volumes.scrub(&self.control)?;
+        self.refresh_volume_readers()?;
+        Ok(reports)
+    }
+
+    pub fn reclaim_storage(&mut self, volume_id: Option<Uuid>) -> Result<u64> {
+        let _readers = self
+            .volume_readers
+            .write()
+            .map_err(|_| anyhow::anyhow!("volume reader configuration lock was poisoned"))?;
+        self.volumes.reclaim(volume_id)
     }
 
     pub fn last_guild_audit(&self) -> Result<Option<GuildAuditReport>> {
@@ -1162,12 +1198,20 @@ impl Node {
 
     pub fn migrate_draining_volumes(&mut self) -> Result<u64> {
         let migrated = self.volumes.migrate_draining(&self.control)?;
+        self.refresh_volume_readers()?;
         self.clear_automatic_backup_block()?;
         Ok(migrated)
     }
 
+    pub fn reactivate_storage_volume(&mut self, volume_id: Uuid) -> Result<()> {
+        self.volumes.reactivate(&self.control, volume_id)?;
+        self.refresh_volume_readers()?;
+        self.clear_automatic_backup_block()
+    }
+
     pub fn reconcile_storage(&mut self) -> Result<()> {
         self.volumes.reconcile(&self.control)?;
+        self.refresh_volume_readers()?;
         self.clear_automatic_backup_block()
     }
 
@@ -6068,6 +6112,136 @@ mod tests {
                 .prepared_revision_page(&[85; 32], revision_id, 0)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn live_reader_releases_a_retired_volume_before_detach() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut node = Node::open(temp.path(), Seed::from_bytes([225; 32])).unwrap();
+        node.configure_storage_volumes(
+            &[first.path().to_path_buf(), second.path().to_path_buf()],
+            (mb_core::V1_SECTOR_SIZE * 2) as u64,
+            0,
+        )
+        .unwrap();
+        let bytes = vec![226; mb_core::V1_SECTOR_SIZE];
+        let object = ParityObject {
+            format_version: 1,
+            guild_id: [227; 32],
+            group_id: [228; 32],
+            shard_index: 4,
+            root: sector_root(&bytes),
+            bytes: bytes.clone(),
+        };
+        let receipt = node.volumes.store(&node.control, &object, b"ack").unwrap();
+        let source_path = node
+            .storage_status()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.volume_id == receipt.volume_id)
+            .unwrap()
+            .path;
+        let reader = node.reader_config().open().unwrap();
+        assert_eq!(
+            reader
+                .parity_for_guild(&object.guild_id, &object.group_id, object.shard_index)
+                .unwrap(),
+            bytes
+        );
+
+        node.drain_storage_volume(receipt.volume_id).unwrap();
+        assert_eq!(node.migrate_draining_volumes().unwrap(), 1);
+        fs::remove_dir_all(&source_path).unwrap();
+
+        assert_eq!(
+            reader
+                .parity_for_guild(&object.guild_id, &object.group_id, object.shard_index)
+                .unwrap(),
+            object.bytes
+        );
+        assert_eq!(
+            reader.advertised_member("fallback").unwrap().node_id,
+            node.keys().node_id()
+        );
+        let fresh_reader = node.reader_config().open().unwrap();
+        assert_eq!(
+            fresh_reader
+                .parity_for_guild(&object.guild_id, &object.group_id, object.shard_index)
+                .unwrap(),
+            object.bytes
+        );
+        assert!(!source_path.exists());
+    }
+
+    #[test]
+    fn pooled_reader_skips_a_corrupt_copy_in_either_volume_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([229; 32]);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        node.configure_storage_volumes(
+            &[first.path().to_path_buf(), second.path().to_path_buf()],
+            (mb_core::V1_SECTOR_SIZE * 2) as u64,
+            0,
+        )
+        .unwrap();
+        let bytes = vec![230; mb_core::V1_SECTOR_SIZE];
+        let object = ParityObject {
+            format_version: 1,
+            guild_id: [231; 32],
+            group_id: [232; 32],
+            shard_index: 3,
+            root: sector_root(&bytes),
+            bytes: bytes.clone(),
+        };
+        let receipt = node.volumes.store(&node.control, &object, b"ack").unwrap();
+        let mut configs = node.volumes.reader_configs();
+        let source_index = configs
+            .iter()
+            .position(|config| config.volume_id == receipt.volume_id)
+            .unwrap();
+        let source = configs.remove(source_index);
+        let destination = configs.pop().unwrap();
+        ParityStore::open_existing_with_key(
+            &destination.path,
+            destination.volume_id.as_bytes(),
+            &destination.database_key,
+        )
+        .unwrap()
+        .stage_and_publish(&object)
+        .unwrap();
+        node.database_shell_statement(
+            Some(source.volume_id),
+            "UPDATE parity_objects SET bytes = zeroblob(65536)",
+            true,
+        )
+        .unwrap();
+        *node.volume_readers.write().unwrap() = vec![source, destination];
+        let reader = node.reader_config().open().unwrap();
+
+        assert_eq!(
+            reader
+                .parity_for_guild(&object.guild_id, &object.group_id, object.shard_index)
+                .unwrap(),
+            bytes
+        );
+        assert!(node.storage_status().is_ok());
+        drop(reader);
+        drop(node);
+
+        let node = Node::open(temp.path(), seed).unwrap();
+        assert_eq!(
+            node.reader_config()
+                .open()
+                .unwrap()
+                .parity_for_guild(&object.guild_id, &object.group_id, object.shard_index)
+                .unwrap(),
+            object.bytes
+        );
+        assert!(node.storage_status().is_ok());
     }
 
     #[test]

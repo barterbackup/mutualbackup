@@ -57,7 +57,7 @@ and their regression gates before advancing to Milestone 5.
   indices. Consume verified target bytes directly. Cover audit, restore, and
   recovery with each emergency index as the target and exactly three surviving
   indices, including emergency information shards.
-- [ ] **M4-06 / P1 — Isolate corruption from healthy copies and status.**
+- [x] **M4-06 / P1 — Isolate corruption from healthy copies and status.**
   Scrub marks a corrupt volume Failed but retains its store
   (`crates/mb-node/src/volume.rs:649`). Local and pooled network readers stop
   on its first integrity error (`volume.rs:446`,
@@ -67,7 +67,7 @@ and their regression gates before advancing to Milestone 5.
   and keep failure/status reporting available. Cover corruption, scrub,
   replacement repair, local/network reads, and restart with either ordering
   of source/replacement UUIDs.
-- [ ] **M4-07 / P1 — Retire network readers before declaring a disk removable.**
+- [x] **M4-07 / P1 — Retire network readers before declaring a disk removable.**
   P2P snapshots the volume reader configuration at startup
   (`crates/mb-node/src/network/p2p.rs:1209`); checkout reuses pooled handles or
   that fixed configuration (`crates/mb-node/src/network.rs:197`). Migration
@@ -79,7 +79,7 @@ and their regression gates before advancing to Milestone 5.
   membership, evict retired handles, and use noncreating reader opens. Cover
   live drain, physical detach, and continued profile/checkpoint/parity reads
   without restarting the daemon.
-- [ ] **M4-08 / P1 — Detect loss of an established parity database.**
+- [x] **M4-08 / P1 — Detect loss of an established parity database.**
   `open_volume_store` verifies the manifest but opens a missing database with
   creation enabled (`crates/mb-node/src/volume.rs:921`,
   `crates/mb-store/src/database.rs:2113`). A database truncated to zero bytes is
@@ -89,7 +89,7 @@ and their regression gates before advancing to Milestone 5.
   instead of silently recreating it. Test removal and truncation of only an
   established database while retaining its manifest and control receipts;
   require explicit replacement/reconciliation and visible degradation.
-- [ ] **M4-09 / P2 — Migrate repaired and emergency objects.**
+- [x] **M4-09 / P2 — Migrate repaired and emergency objects.**
   `store_repair` stores valid objects with an empty acknowledgement
   (`crates/mb-node/src/volume.rs:536`), but migration always calls
   `load_acknowledgement` (`volume.rs:720`), which rejects empty values
@@ -97,7 +97,7 @@ and their regression gates before advancing to Milestone 5.
   of a drain. Preserve the distinct acknowledgement semantics of ordinary
   publication and repair, and cover migration of assigned repairs plus
   emergency information and parity objects.
-- [ ] **M4-10 / P2 — Resume migration without reserving duplicate capacity.**
+- [x] **M4-10 / P2 — Resume migration without reserving duplicate capacity.**
   An interruption after destination commit leaves both copies and a receipt
   naming the destination. Retry deletes that receipt
   (`crates/mb-node/src/volume.rs:729`) and demands space for another whole
@@ -106,7 +106,7 @@ and their regression gates before advancing to Milestone 5.
   commit with a destination budget exactly equal to the copied payload,
   followed by reopen/reconcile and successful drain; the existing interruption
   fixture allows twice that capacity (`volume.rs:1473`).
-- [ ] **M4-11 / P2 — Preserve completed drains through daemon configuration.**
+- [x] **M4-11 / P2 — Preserve completed drains through daemon configuration.**
   Migration persists Offline/configured=false (`crates/mb-node/src/volume.rs:753`),
   but daemon startup reapplies the TOML volume paths
   (`cmd/mutualbackup/src/bin/mutualbackupd.rs:563`) and `configure` makes the
@@ -125,14 +125,14 @@ and their regression gates before advancing to Milestone 5.
   group/root and collect emergency copies of every role after the certified
   grace period. Cover checkpoint advance, assigned repair, group retirement,
   restart, and capacity reclamation for information and parity copies.
-- [ ] **M4-13 / P1 — Bound memory for storage status and migration.**
+- [x] **M4-13 / P1 — Bound memory for storage status and migration.**
   `ready_objects` collects all full shard payloads into one vector
   (`crates/mb-store/src/database.rs:1241`). Both status and migration use it
   (`crates/mb-node/src/volume.rs:386`, `volume.rs:713`), so a routine status
   request can exhaust daemon memory when stored parity exceeds RAM. Count
   metadata without loading payloads and migrate verified objects in bounded
   batches. Verify memory bounds independently of total stored volume size.
-- [ ] **M4-14 / P2 — Implement physical-space accounting and reclamation.**
+- [x] **M4-14 / P2 — Implement physical-space accounting and reclamation.**
   The volume requirements in `plan.md` distinguish logical quota from physical
   allocation and require reclaim plus operational headroom. Current accounting
   only sums payload lengths (`crates/mb-store/src/database.rs:1231`), placement

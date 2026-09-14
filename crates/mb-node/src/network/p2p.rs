@@ -11458,6 +11458,24 @@ mod tests {
         for node in &nodes {
             node.lock().unwrap().store_checkpoint(&checkpoint).unwrap();
         }
+        let mut advanced = QuorumCheckpoint {
+            checkpoint: checkpoint.checkpoint.clone(),
+            signatures: Vec::new(),
+        };
+        advanced.checkpoint.generation = 2;
+        advanced.checkpoint.parent = Some(checkpoint.hash().unwrap());
+        for node in &nodes {
+            advanced.signatures.push(
+                node.lock()
+                    .unwrap()
+                    .sign_checkpoint(&advanced.checkpoint)
+                    .unwrap(),
+            );
+        }
+        advanced
+            .signatures
+            .sort_by_key(|signature| signature.signer);
+        advanced.verify().unwrap();
 
         let healthy = audit_guild(nodes[0].clone(), &clients[0], false)
             .await
@@ -11511,16 +11529,6 @@ mod tests {
             1
         );
 
-        let mut advanced = QuorumCheckpoint {
-            checkpoint: checkpoint.checkpoint.clone(),
-            signatures: Vec::new(),
-        };
-        advanced.checkpoint.generation = 2;
-        advanced.checkpoint.parent = Some(checkpoint.hash().unwrap());
-        for node in &nodes {
-            advanced.add_signature(node.lock().unwrap().keys()).unwrap();
-        }
-        advanced.verify().unwrap();
         for node in &nodes {
             node.lock().unwrap().store_checkpoint(&advanced).unwrap();
         }

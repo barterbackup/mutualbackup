@@ -169,10 +169,17 @@ enum StorageCommand {
     List,
     /// Verify SQLCipher pages and every stored parity root.
     Scrub,
+    /// Return unused database pages and WAL allocation to the filesystem.
+    Reclaim {
+        #[arg(long)]
+        volume: Option<Uuid>,
+    },
     /// Stop new placement on a volume and mark it for evacuation.
     Drain { volume_id: Uuid },
     /// Copy verified objects off every draining volume.
     Migrate,
+    /// Explicitly return a completed retired volume to service.
+    Reactivate { volume_id: Uuid },
     /// Finish interrupted cross-database writes.
     Reconcile,
 }
@@ -416,8 +423,14 @@ async fn main() -> Result<()> {
             let request = match command {
                 StorageCommand::List => LocalRequest::StorageStatus,
                 StorageCommand::Scrub => LocalRequest::StorageScrub,
+                StorageCommand::Reclaim { volume } => {
+                    LocalRequest::StorageReclaim { volume_id: volume }
+                }
                 StorageCommand::Drain { volume_id } => LocalRequest::StorageDrain { volume_id },
                 StorageCommand::Migrate => LocalRequest::StorageMigrate,
+                StorageCommand::Reactivate { volume_id } => {
+                    LocalRequest::StorageReactivate { volume_id }
+                }
                 StorageCommand::Reconcile => LocalRequest::StorageReconcile,
             };
             match local_control_call(&control_socket, &request).await? {
@@ -437,9 +450,13 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
+                LocalResponse::StorageReclaimed { bytes } => {
+                    println!("reclaimed physical storage bytes: {bytes}");
+                }
                 LocalResponse::StorageMigrated { objects } => {
                     println!("migrated parity objects: {objects}");
                 }
+                LocalResponse::StorageReactivated => println!("storage volume reactivated"),
                 LocalResponse::StorageReconciled => println!("storage reconciliation complete"),
                 _ => bail!("daemon returned the wrong response to storage request"),
             }
@@ -635,7 +652,7 @@ fn print_identity(seed: &Seed) {
 
 fn print_storage_volume(volume: &mb_node::StorageVolumeStatus) {
     println!(
-        "storage volume: {} {:?} used={}/{} headroom={} path={}",
+        "storage volume: {} {:?} used={}/{} allocated={} available={} headroom={} path={}",
         volume.volume_id,
         volume.state,
         volume
@@ -643,6 +660,14 @@ fn print_storage_volume(volume: &mb_node::StorageVolumeStatus) {
             .map(|bytes| bytes.to_string())
             .unwrap_or_else(|| "unknown".to_owned()),
         volume.budget_bytes,
+        volume
+            .allocated_bytes
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        volume
+            .available_bytes
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
         volume.headroom_bytes,
         volume.path.display()
     );

@@ -56,7 +56,7 @@ mutualbackup backup --wait
 mutualbackup snapshot list
 mutualbackup snapshot restore TARGET [--revision UUID]
 mutualbackup restore TARGET
-mutualbackup storage list|scrub|drain|migrate|reconcile
+mutualbackup storage list|scrub|reclaim|drain|migrate|reactivate|reconcile
 mutualbackup audit [--repair]
 mutualbackup db-shell --data-dir STATE [--volume UUID] [--write]
 ```
@@ -64,8 +64,13 @@ mutualbackup db-shell --data-dir STATE [--volume UUID] [--write]
 Parity may span several configured filesystems. Each volume has a signed UUID,
 an independently wrapped SQLCipher key, a byte budget and repair headroom.
 `storage drain` stops new placement; `storage migrate` copies and verifies each
-object before removing its source. Interrupted writes and moves are reconciled
-from durable control receipts, while an absent disk remains visibly offline.
+object before retiring its source. A retired volume remains retired across
+daemon restarts even if its path stays configured; `storage reactivate UUID`
+explicitly returns an attached retired volume to service. Interrupted writes
+and moves are reconciled from durable control receipts, while an absent disk
+remains visibly offline. `storage list` reports logical use, physical database
+allocation, and filesystem availability; `storage reclaim [--volume UUID]`
+returns unused database and WAL allocation to the filesystem.
 `retention_revisions` keeps a signed suffix of each member's history. Retired
 prefixes remain represented by checkpoint tombstones, and local anchors and
 shards are collected only after a later checkpoint confirms they stayed

@@ -6,7 +6,7 @@ use mb_core::{
     sector_root,
 };
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use thiserror::Error;
 
 use crate::SCHEMA_VERSION;
@@ -1210,6 +1210,27 @@ impl ParityStore {
         })
     }
 
+    pub fn open_existing_with_key(
+        path: impl AsRef<Path>,
+        volume_id: &[u8; 16],
+        database_key: &[u8; 32],
+    ) -> Result<Self, DatabaseError> {
+        let path = path.as_ref();
+        let metadata = fs::metadata(path)?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(DatabaseError::Integrity);
+        }
+        let mut connection = open_encrypted_existing(path, database_key)?;
+        if !database_has_tables(&connection)? {
+            return Err(DatabaseError::Integrity);
+        }
+        initialize_or_validate_parity(&mut connection, volume_id)?;
+        Ok(Self {
+            connection,
+            path: path.to_path_buf(),
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -1236,6 +1257,77 @@ impl ParityStore {
             |row| row.get(0),
         )?;
         u64::try_from(used).map_err(|_| DatabaseError::Integrity)
+    }
+
+    pub fn ready_object_count(&self) -> Result<u64, DatabaseError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT count(*) FROM parity_objects WHERE state = 'READY'",
+            [],
+            |row| row.get(0),
+        )?;
+        u64::try_from(count).map_err(|_| DatabaseError::Integrity)
+    }
+
+    pub fn first_ready_object(&self) -> Result<Option<ParityObject>, DatabaseError> {
+        let identity = self
+            .connection
+            .query_row(
+                "SELECT group_id, shard_index FROM parity_objects
+                 WHERE state = 'READY' ORDER BY group_id, shard_index LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((group_id, shard_index)) = identity else {
+            return Ok(None);
+        };
+        let group_id: [u8; 32] = group_id.try_into().map_err(|_| DatabaseError::Integrity)?;
+        let shard_index = u8::try_from(shard_index).map_err(|_| DatabaseError::Integrity)?;
+        self.load_ready(&group_id, shard_index).map(Some)
+    }
+
+    pub fn allocated_bytes(&self) -> Result<u64, DatabaseError> {
+        ["", "-wal", "-shm"]
+            .into_iter()
+            .try_fold(0_u64, |total, suffix| {
+                let mut path = self.path.as_os_str().to_os_string();
+                path.push(suffix);
+                match fs::metadata(PathBuf::from(path)) {
+                    Ok(metadata) => total
+                        .checked_add(allocated_file_bytes(&metadata))
+                        .ok_or(DatabaseError::Integrity),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(total),
+                    Err(error) => Err(error.into()),
+                }
+            })
+    }
+
+    pub fn reclaim_space(&self) -> Result<(), DatabaseError> {
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let mode: i64 = self
+            .connection
+            .pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+        if mode == 2 {
+            self.connection
+                .execute_batch("PRAGMA incremental_vacuum;")?;
+        } else {
+            self.connection.execute_batch("VACUUM;")?;
+        }
+        Ok(())
+    }
+
+    fn reclaim_deleted_pages(&self) -> Result<(), DatabaseError> {
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let mode: i64 = self
+            .connection
+            .pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+        if mode == 2 {
+            self.connection
+                .execute_batch("PRAGMA incremental_vacuum;")?;
+        }
+        Ok(())
     }
 
     pub fn ready_objects(&self) -> Result<Vec<ParityObject>, DatabaseError> {
@@ -1350,6 +1442,7 @@ impl ParityStore {
             params![group_id.as_slice(), shard_index],
         )?;
         transaction.commit()?;
+        self.reclaim_deleted_pages()?;
         Ok(true)
     }
 
@@ -1471,6 +1564,18 @@ impl ParityStore {
         group_id: &[u8; 32],
         shard_index: u8,
     ) -> Result<Vec<u8>, DatabaseError> {
+        let bytes = self.load_stored_acknowledgement(group_id, shard_index)?;
+        if bytes.is_empty() {
+            return Err(DatabaseError::Integrity);
+        }
+        Ok(bytes)
+    }
+
+    pub fn load_stored_acknowledgement(
+        &self,
+        group_id: &[u8; 32],
+        shard_index: u8,
+    ) -> Result<Vec<u8>, DatabaseError> {
         let bytes = self
             .connection
             .query_row(
@@ -1481,7 +1586,7 @@ impl ParityStore {
             )
             .optional()?
             .ok_or(DatabaseError::NotReady)?;
-        if bytes.is_empty() || bytes.len() > 4096 {
+        if bytes.len() > 4096 {
             return Err(DatabaseError::Integrity);
         }
         Ok(bytes)
@@ -1617,6 +1722,7 @@ fn initialize_or_validate_parity(
         validate_parity_schema(connection)?;
         return Ok(());
     }
+    connection.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
     let transaction = connection.transaction()?;
     transaction.execute_batch(
         "CREATE TABLE meta (
@@ -2111,6 +2217,21 @@ fn open_encrypted(path: &Path, key: &[u8; 32]) -> Result<Connection, DatabaseErr
         set_private_directory(parent)?;
     }
     let connection = Connection::open(path)?;
+    configure_encrypted(connection, key)
+}
+
+fn open_encrypted_existing(path: &Path, key: &[u8; 32]) -> Result<Connection, DatabaseError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    configure_encrypted(connection, key)
+}
+
+fn configure_encrypted(
+    connection: Connection,
+    key: &[u8; 32],
+) -> Result<Connection, DatabaseError> {
     connection.pragma_update(None, "key", hex::encode(key))?;
     connection.execute_batch(
         "PRAGMA cipher_compatibility = 4;
@@ -2139,6 +2260,17 @@ fn open_encrypted(path: &Path, key: &[u8; 32]) -> Result<Connection, DatabaseErr
     }
     connection.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))?;
     Ok(connection)
+}
+
+#[cfg(unix)]
+fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
+    metadata.len()
 }
 
 fn database_shell_statement(
@@ -3296,6 +3428,70 @@ mod tests {
             store.stage_and_publish(&replacement),
             Err(DatabaseError::Conflict)
         ));
+    }
+
+    #[test]
+    fn existing_parity_open_refuses_missing_and_empty_files() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("parity.db");
+        let key = [10; 32];
+        assert!(ParityStore::open_existing_with_key(&path, &[11; 16], &key).is_err());
+        assert!(!path.exists());
+
+        fs::write(&path, []).unwrap();
+        assert!(matches!(
+            ParityStore::open_existing_with_key(&path, &[11; 16], &key),
+            Err(DatabaseError::Integrity)
+        ));
+        assert_eq!(fs::metadata(path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn parity_metadata_is_bounded_and_deleted_pages_are_reclaimed() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("parity.db");
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([12; 32]));
+        let mut store = ParityStore::open(&path, &[13; 16], &keys).unwrap();
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "auto_vacuum", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let mut objects = Vec::new();
+        for index in 0_u8..5 {
+            let bytes = vec![14 + index; V1_SECTOR_SIZE];
+            let object = ParityObject {
+                format_version: 1,
+                guild_id: [15; 32],
+                group_id: [16 + index; 32],
+                shard_index: index,
+                root: sector_root(&bytes),
+                bytes,
+            };
+            store.stage_and_publish(&object).unwrap();
+            objects.push(object);
+        }
+        assert_eq!(store.ready_object_count().unwrap(), 5);
+        assert_eq!(
+            store.first_ready_object().unwrap(),
+            Some(objects[0].clone())
+        );
+        let allocated_before = store.allocated_bytes().unwrap();
+
+        for object in &objects {
+            assert!(
+                store
+                    .remove_ready(&object.group_id, object.shard_index, &object.root)
+                    .unwrap()
+            );
+        }
+        store.reclaim_space().unwrap();
+
+        assert_eq!(store.ready_object_count().unwrap(), 0);
+        assert_eq!(store.first_ready_object().unwrap(), None);
+        assert!(store.allocated_bytes().unwrap() < allocated_before);
     }
 
     #[test]

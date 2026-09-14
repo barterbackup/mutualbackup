@@ -300,6 +300,13 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::StorageReclaim { volume_id } => {
+            blocking_node(node, move |node| {
+                node.reclaim_storage(volume_id)
+                    .map(|bytes| LocalResponse::StorageReclaimed { bytes })
+            })
+            .await
+        }
         LocalRequest::StorageDrain { volume_id } => {
             blocking_node(node, move |node| {
                 node.drain_storage_volume(volume_id)?;
@@ -311,6 +318,13 @@ async fn handle_request(
             blocking_node(node, |node| {
                 node.migrate_draining_volumes()
                     .map(|objects| LocalResponse::StorageMigrated { objects })
+            })
+            .await
+        }
+        LocalRequest::StorageReactivate { volume_id } => {
+            blocking_node(node, move |node| {
+                node.reactivate_storage_volume(volume_id)?;
+                Ok(LocalResponse::StorageReactivated)
             })
             .await
         }
