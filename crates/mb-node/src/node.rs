@@ -28,6 +28,7 @@ use crate::snapshot::{
     recovered_recipe_is_stable, render_sector, restore_revision_from_source,
     restore_signed_root_metadata_at, resume_restore_publication,
 };
+use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open_control_store};
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 enum RecoveryJobState {
@@ -280,30 +281,40 @@ pub struct Node {
     _data_dir_lock: LockedDataDir,
     keys: Arc<KeyMaterial>,
     control: ControlStore,
-    parity: ParityStore,
-    parity_budget_bytes: u64,
+    control_database_key: [u8; 32],
+    volumes: StorageVolumes,
 }
 
 #[derive(Clone)]
 pub(crate) struct NodeReaderConfig {
     keys: Arc<KeyMaterial>,
     control_path: PathBuf,
-    parity_path: PathBuf,
-    volume_id: [u8; 16],
+    control_database_key: [u8; 32],
+    volumes: Vec<VolumeReaderConfig>,
 }
 
 pub(crate) struct NodeReader {
     keys: Arc<KeyMaterial>,
     control: ControlStore,
-    parity: ParityStore,
+    parity: Vec<ParityStore>,
 }
 
 impl NodeReaderConfig {
     pub(crate) fn open(&self) -> Result<NodeReader> {
         Ok(NodeReader {
             keys: self.keys.clone(),
-            control: ControlStore::open(&self.control_path, &self.keys)?,
-            parity: ParityStore::open(&self.parity_path, &self.volume_id, &self.keys)?,
+            control: ControlStore::open_with_key(&self.control_path, &self.control_database_key)?,
+            parity: self
+                .volumes
+                .iter()
+                .map(|volume| {
+                    ParityStore::open_with_key(
+                        &volume.path,
+                        volume.volume_id.as_bytes(),
+                        &volume.database_key,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 
@@ -388,7 +399,16 @@ impl NodeReader {
         group_id: &[u8; 32],
         shard_index: u8,
     ) -> Result<Vec<u8>> {
-        let object = self.parity.load_ready(group_id, shard_index)?;
+        let object = self
+            .parity
+            .iter()
+            .find_map(|store| match store.load_ready(group_id, shard_index) {
+                Ok(object) => Some(Ok(object)),
+                Err(DatabaseError::NotReady) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .transpose()?
+            .ok_or(DatabaseError::NotReady)?;
         if object.guild_id != *guild_id {
             anyhow::bail!("parity object does not belong to the requested guild");
         }
@@ -450,19 +470,18 @@ impl Node {
     pub fn open_locked(locked: LockedDataDir, seed: Seed) -> Result<Self> {
         let data_dir = locked.path.clone();
         let keys = Arc::new(KeyMaterial::from_seed(&seed));
-        let mut volume_id = [0_u8; 16];
-        volume_id.copy_from_slice(&blake3::hash(&keys.node_id().0).as_bytes()[..16]);
-        let mut control = ControlStore::open(data_dir.join("control.db"), &keys)?;
+        let (mut control, control_database_key) = open_control_store(&data_dir, &keys)?;
         control.clear_recomputable_operations()?;
         reconcile_pending_captures(&control)?;
-        let parity = ParityStore::open(data_dir.join("parity.db"), &volume_id, &keys)?;
+        let mut volumes = StorageVolumes::open(&data_dir, keys.clone(), &control)?;
+        volumes.reconcile(&control)?;
         Ok(Self {
             data_dir,
             _data_dir_lock: locked,
             keys,
             control,
-            parity,
-            parity_budget_bytes: u64::MAX,
+            control_database_key,
+            volumes,
         })
     }
 
@@ -483,6 +502,7 @@ impl Node {
             checkpoint_count: self.control.checkpoint_head_certificates()?.len() as u64,
             seed_recovery_ready: self.seed_recovery_ready()?,
             root_dirty: self.root_dirty()?,
+            storage_volumes: self.volumes.statuses()?,
             network: None,
         })
     }
@@ -579,13 +599,11 @@ impl Node {
     }
 
     pub(crate) fn reader_config(&self) -> NodeReaderConfig {
-        let mut volume_id = [0_u8; 16];
-        volume_id.copy_from_slice(&blake3::hash(&self.keys.node_id().0).as_bytes()[..16]);
         NodeReaderConfig {
             keys: self.keys.clone(),
             control_path: self.control.path().to_path_buf(),
-            parity_path: self.parity.path().to_path_buf(),
-            volume_id,
+            control_database_key: self.control_database_key,
+            volumes: self.volumes.reader_configs(),
         }
     }
 
@@ -634,11 +652,37 @@ impl Node {
     }
 
     pub fn configure_parity_budget(&mut self, budget_bytes: u64) -> Result<()> {
-        if budget_bytes == 0 {
-            anyhow::bail!("parity storage budget must be greater than zero");
-        }
-        self.parity_budget_bytes = budget_bytes;
-        Ok(())
+        self.volumes.set_uniform_budget(&self.control, budget_bytes)
+    }
+
+    pub fn configure_storage_volumes(
+        &mut self,
+        paths: &[PathBuf],
+        budget_bytes: u64,
+        headroom_bytes: u64,
+    ) -> Result<()> {
+        self.volumes
+            .configure(&self.control, paths, budget_bytes, headroom_bytes)
+    }
+
+    pub fn storage_status(&self) -> Result<Vec<crate::StorageVolumeStatus>> {
+        self.volumes.statuses()
+    }
+
+    pub fn scrub_storage(&mut self) -> Result<Vec<StorageScrubReport>> {
+        self.volumes.scrub(&self.control)
+    }
+
+    pub fn drain_storage_volume(&mut self, volume_id: Uuid) -> Result<()> {
+        self.volumes.mark_draining(&self.control, volume_id)
+    }
+
+    pub fn migrate_draining_volumes(&mut self) -> Result<u64> {
+        self.volumes.migrate_draining(&self.control)
+    }
+
+    pub fn reconcile_storage(&mut self) -> Result<()> {
+        self.volumes.reconcile(&self.control)
     }
 
     pub fn create_guild(&mut self, endpoints: Vec<String>) -> Result<GuildSummary> {
@@ -1625,11 +1669,8 @@ impl Node {
         acknowledgement.validate()?;
         let acknowledgement =
             SignedRecord::sign(STORAGE_ACKNOWLEDGEMENT_DOMAIN, acknowledgement, &self.keys)?;
-        self.parity.stage_and_publish_ack(
-            object,
-            &canonical_bytes(&acknowledgement)?,
-            self.parity_budget_bytes,
-        )?;
+        self.volumes
+            .store(&self.control, object, &canonical_bytes(&acknowledgement)?)?;
         self.control.put_record(
             "local-parity-proof",
             &parity_proof_id(&group.id, object.shard_index),
@@ -1643,8 +1684,7 @@ impl Node {
         group: &mb_core::CodingGroup,
         object: &ParityObject,
     ) -> Result<()> {
-        self.parity
-            .stage_and_publish_ack(object, &[], self.parity_budget_bytes)?;
+        self.volumes.store(&self.control, object, &[])?;
         self.control.put_record(
             "local-parity-proof",
             &parity_proof_id(&group.id, object.shard_index),
@@ -1678,7 +1718,7 @@ impl Node {
     }
 
     pub fn parity(&self, group_id: &[u8; 32], shard_index: u8) -> Result<Vec<u8>> {
-        Ok(self.parity.load_ready(group_id, shard_index)?.bytes)
+        Ok(self.volumes.load_ready(group_id, shard_index)?.bytes)
     }
 
     pub fn parity_for_guild(
@@ -1687,7 +1727,7 @@ impl Node {
         group_id: &[u8; 32],
         shard_index: u8,
     ) -> Result<Vec<u8>> {
-        let object = self.parity.load_ready(group_id, shard_index)?;
+        let object = self.volumes.load_ready(group_id, shard_index)?;
         if object.guild_id != *guild_id {
             anyhow::bail!("parity object does not belong to the requested guild");
         }
@@ -1904,7 +1944,7 @@ impl Node {
                         }
                     }
                     ShardRole::Parity(parity) if parity.holder == self.keys.node_id() => {
-                        let object = self.parity.load_ready(&group.id, index as u8)?;
+                        let object = self.volumes.load_ready(&group.id, index as u8)?;
                         let proof = self
                             .control
                             .get_record(
@@ -4374,10 +4414,7 @@ mod tests {
             error.downcast_ref::<DatabaseError>(),
             Some(DatabaseError::CapacityExceeded)
         ));
-        assert!(matches!(
-            node.parity.load_ready(&group.id, 3),
-            Err(DatabaseError::NotReady)
-        ));
+        assert!(node.volumes.load_ready(&group.id, 3).is_err());
     }
 
     #[test]

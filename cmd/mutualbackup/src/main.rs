@@ -57,6 +57,11 @@ enum Command {
     ReflinkProbe { path: PathBuf },
     /// Show the persistent local daemon state.
     Status,
+    /// Inspect and maintain parity storage volumes.
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
+    },
     /// Unlock a running daemon using a recovery string.
     Unlock {
         #[arg(long)]
@@ -133,6 +138,20 @@ enum SnapshotCommand {
         #[arg(long)]
         revision: Option<Uuid>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum StorageCommand {
+    /// List configured volumes and their durable state.
+    List,
+    /// Verify SQLCipher pages and every stored parity root.
+    Scrub,
+    /// Stop new placement on a volume and mark it for evacuation.
+    Drain { volume_id: Uuid },
+    /// Copy verified objects off every draining volume.
+    Migrate,
+    /// Finish interrupted cross-database writes.
+    Reconcile,
 }
 
 #[tokio::main]
@@ -228,6 +247,9 @@ async fn main() -> Result<()> {
             println!("checkpoints:   {}", status.checkpoint_count);
             println!("recovery ready: {}", status.seed_recovery_ready);
             println!("root dirty:     {}", status.root_dirty);
+            for volume in status.storage_volumes {
+                print_storage_volume(&volume);
+            }
             match status.protected_root {
                 Some(root) => println!("protected root: {}", root.path.display()),
                 None => println!("protected root: (not configured)"),
@@ -320,6 +342,38 @@ async fn main() -> Result<()> {
                         session.duration_millis
                     );
                 }
+            }
+        }
+        Command::Storage { command } => {
+            let request = match command {
+                StorageCommand::List => LocalRequest::StorageStatus,
+                StorageCommand::Scrub => LocalRequest::StorageScrub,
+                StorageCommand::Drain { volume_id } => LocalRequest::StorageDrain { volume_id },
+                StorageCommand::Migrate => LocalRequest::StorageMigrate,
+                StorageCommand::Reconcile => LocalRequest::StorageReconcile,
+            };
+            match local_control_call(&control_socket, &request).await? {
+                LocalResponse::StorageVolumes(volumes) => {
+                    for volume in volumes {
+                        print_storage_volume(&volume);
+                    }
+                }
+                LocalResponse::StorageScrubbed(reports) => {
+                    for report in reports {
+                        println!(
+                            "volume {}: checked {} objects / {} bytes; corrupt={}",
+                            report.volume_id,
+                            report.checked_objects,
+                            report.checked_bytes,
+                            report.corrupt_objects.len()
+                        );
+                    }
+                }
+                LocalResponse::StorageMigrated { objects } => {
+                    println!("migrated parity objects: {objects}");
+                }
+                LocalResponse::StorageReconciled => println!("storage reconciliation complete"),
+                _ => bail!("daemon returned the wrong response to storage request"),
             }
         }
         Command::Unlock {
@@ -487,6 +541,24 @@ fn print_identity(seed: &Seed) {
         "recovery key:   {}",
         hex::encode(keys.recovery_public_key().0)
     );
+}
+
+fn print_storage_volume(volume: &mb_node::StorageVolumeStatus) {
+    println!(
+        "storage volume: {} {:?} used={}/{} headroom={} path={}",
+        volume.volume_id,
+        volume.state,
+        volume
+            .used_bytes
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        volume.budget_bytes,
+        volume.headroom_bytes,
+        volume.path.display()
+    );
+    if let Some(error) = &volume.last_error {
+        println!("storage degraded: {error}");
+    }
 }
 
 async fn recovery_input(

@@ -3,9 +3,12 @@ use std::str::FromStr;
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use bip39::{Language, Mnemonic};
+use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use sha3::{Digest, Sha3_256};
@@ -64,6 +67,24 @@ impl RecoveryPublicKey {
             .diffie_hellman(&X25519PublicKey::from(self.0))
             .was_contributory()
     }
+}
+
+/// A random database key encrypted by the seed-derived local storage key.
+/// The database identifier is authenticated as associated data, so envelopes
+/// cannot be moved between control and parity databases or between volumes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WrappedDatabaseKey {
+    pub format_version: u16,
+    pub nonce: [u8; 12],
+    pub ciphertext: Vec<u8>,
+}
+
+#[derive(Debug, Error)]
+pub enum DatabaseKeyError {
+    #[error("database-key envelope is malformed or belongs to another database")]
+    InvalidEnvelope,
+    #[error("database-key encryption failed")]
+    Encryption,
 }
 
 /// Derived high-entropy root secret used by the deterministic key hierarchy.
@@ -234,6 +255,63 @@ impl KeyMaterial {
         derive_with_context(&self.storage_key, b"local/database/v1", database_id)
     }
 
+    pub fn wrap_database_key(
+        &self,
+        database_id: &[u8],
+        database_key: &[u8; 32],
+    ) -> Result<WrappedDatabaseKey, DatabaseKeyError> {
+        let wrapping_key = derive_with_context(
+            &self.storage_key,
+            b"local/database-key-wrap/v1",
+            database_id,
+        );
+        let cipher = ChaCha20Poly1305::new((&wrapping_key).into());
+        let mut nonce = [0_u8; 12];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: database_key,
+                    aad: database_id,
+                },
+            )
+            .map_err(|_| DatabaseKeyError::Encryption)?;
+        Ok(WrappedDatabaseKey {
+            format_version: 1,
+            nonce,
+            ciphertext,
+        })
+    }
+
+    pub fn unwrap_database_key(
+        &self,
+        database_id: &[u8],
+        envelope: &WrappedDatabaseKey,
+    ) -> Result<[u8; 32], DatabaseKeyError> {
+        if envelope.format_version != 1 || envelope.ciphertext.len() != 48 {
+            return Err(DatabaseKeyError::InvalidEnvelope);
+        }
+        let wrapping_key = derive_with_context(
+            &self.storage_key,
+            b"local/database-key-wrap/v1",
+            database_id,
+        );
+        let cipher = ChaCha20Poly1305::new((&wrapping_key).into());
+        let plaintext = cipher
+            .decrypt(
+                Nonce::from_slice(&envelope.nonce),
+                Payload {
+                    msg: &envelope.ciphertext,
+                    aad: database_id,
+                },
+            )
+            .map_err(|_| DatabaseKeyError::InvalidEnvelope)?;
+        plaintext
+            .try_into()
+            .map_err(|_| DatabaseKeyError::InvalidEnvelope)
+    }
+
     pub fn guild_data_key(&self, guild_id: &[u8; 32]) -> [u8; 32] {
         derive_with_context(self.signing.as_bytes(), b"guild/data/v1", guild_id)
     }
@@ -362,6 +440,30 @@ mod tests {
         let phrase = Seed::generate_recovery_string().unwrap();
         assert_eq!(phrase.split_ascii_whitespace().count(), 24);
         Seed::from_recovery_string(&phrase).unwrap();
+    }
+
+    #[test]
+    fn wrapped_database_keys_are_context_and_identity_bound() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([73; 32]));
+        let database_key = [91; 32];
+        let envelope = keys
+            .wrap_database_key(b"parity/volume-a", &database_key)
+            .unwrap();
+        assert_eq!(
+            keys.unwrap_database_key(b"parity/volume-a", &envelope)
+                .unwrap(),
+            database_key
+        );
+        assert!(
+            keys.unwrap_database_key(b"parity/volume-b", &envelope)
+                .is_err()
+        );
+        let other = KeyMaterial::from_seed(&Seed::from_bytes([74; 32]));
+        assert!(
+            other
+                .unwrap_database_key(b"parity/volume-a", &envelope)
+                .is_err()
+        );
     }
 
     #[test]

@@ -57,7 +57,14 @@ mutualbackup backup --wait
 mutualbackup snapshot list
 mutualbackup snapshot restore TARGET [--revision UUID]
 mutualbackup restore TARGET
+mutualbackup storage list|scrub|drain|migrate|reconcile
 ```
+
+Parity may span several configured filesystems. Each volume has a signed UUID,
+an independently wrapped SQLCipher key, a byte budget and repair headroom.
+`storage drain` stops new placement; `storage migrate` copies and verifies each
+object before removing its source. Interrupted writes and moves are reconciled
+from durable control receipts, while an absent disk remains visibly offline.
 
 The CLI and daemon use a same-user Unix control socket. Pass `--socket` when a
 configuration does not use the default location below `XDG_RUNTIME_DIR`.

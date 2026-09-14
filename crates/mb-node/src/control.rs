@@ -20,7 +20,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    BackupJob, BackupJobState, Node, P2pClient, P2pStatus, WireError,
+    BackupJob, BackupJobState, Node, P2pClient, P2pStatus, StorageVolumeStatus, WireError,
     network::restore_snapshot_with_p2p, recover_from_dht,
 };
 
@@ -60,6 +60,7 @@ pub struct NodeStatus {
     pub checkpoint_count: u64,
     pub seed_recovery_ready: bool,
     pub root_dirty: bool,
+    pub storage_volumes: Vec<StorageVolumeStatus>,
     pub network: Option<P2pStatus>,
 }
 
@@ -282,6 +283,39 @@ async fn handle_request(
             let mut status = blocking_node(node, |node| node.status()).await?;
             status.network = Some(p2p.status().await?);
             Ok(LocalResponse::Status(Box::new(status)))
+        }
+        LocalRequest::StorageStatus => {
+            blocking_node(node, |node| {
+                node.storage_status().map(LocalResponse::StorageVolumes)
+            })
+            .await
+        }
+        LocalRequest::StorageScrub => {
+            blocking_node(node, |node| {
+                node.scrub_storage().map(LocalResponse::StorageScrubbed)
+            })
+            .await
+        }
+        LocalRequest::StorageDrain { volume_id } => {
+            blocking_node(node, move |node| {
+                node.drain_storage_volume(volume_id)?;
+                node.storage_status().map(LocalResponse::StorageVolumes)
+            })
+            .await
+        }
+        LocalRequest::StorageMigrate => {
+            blocking_node(node, |node| {
+                node.migrate_draining_volumes()
+                    .map(|objects| LocalResponse::StorageMigrated { objects })
+            })
+            .await
+        }
+        LocalRequest::StorageReconcile => {
+            blocking_node(node, |node| {
+                node.reconcile_storage()?;
+                Ok(LocalResponse::StorageReconciled)
+            })
+            .await
         }
         LocalRequest::AddRoot { path } => {
             blocking_node(node, move |node| {

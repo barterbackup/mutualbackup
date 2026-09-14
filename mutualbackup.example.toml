@@ -3,7 +3,7 @@
 # Relative paths are resolved relative to this file.
 
 # Private local state. `mutualbackup init --data-dir ...` creates its public
-# identity manifest; the daemon later creates control.db and parity.db here.
+# identity manifest; the daemon later creates its encrypted databases here.
 data_dir = ".mutualbackup/node/state"
 
 # Optional unattended auto-unlock. Omit this field to start locked and unlock
@@ -18,6 +18,15 @@ failure_domain = "host-a/disk-a"
 
 # Maximum locally stored parity: 10 GiB.
 parity_budget_bytes = 10737418240
+
+# Optional independent parity filesystems. Each directory receives a signed
+# volume manifest and its own SQLCipher database. An absent configured volume
+# is reported offline and is never interpreted as empty. When omitted, parity
+# remains beside control.db for a single-volume installation.
+# parity_volumes = ["/srv/mutualbackup-a", "/srv/mutualbackup-b"]
+# Reserve per-volume space for repair, migration, and garbage collection. The
+# default is 5% of the budget, capped at 128 MiB.
+# parity_headroom_bytes = 134217728
 
 # QUIC uses UDP. The external address below makes this example reachable only
 # from this same host; replace it with a genuinely reachable address for peers

@@ -14,7 +14,8 @@ pub use anchor::{
     filesystem_identity, probe_reflink, remove_owned_directory_tree,
 };
 pub use database::{
-    CheckpointRow, ControlStore, DatabaseError, ParityObject, ParityStore, ProtocolRecordRow,
+    CheckpointRow, ControlStore, DatabaseError, ParityObject, ParityScrubReport, ParityStore,
+    ProtocolRecordRow,
 };
 
 pub const SCHEMA_VERSION: u32 = 6;

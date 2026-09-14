@@ -6,6 +6,7 @@ mod lab;
 mod network;
 mod node;
 mod snapshot;
+mod volume;
 mod watcher;
 mod wire;
 
@@ -35,5 +36,6 @@ pub use snapshot::{
     PrivateDataExtent, PrivateEntry, PrivateMetadata, restore_revision,
     restore_revision_from_source,
 };
+pub use volume::{StorageScrubReport, StorageVolumeState, StorageVolumeStatus};
 pub use watcher::run_root_watcher;
 pub use wire::{WireError, WireErrorCode};

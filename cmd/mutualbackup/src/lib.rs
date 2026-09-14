@@ -20,6 +20,7 @@ const IDENTITY_MANIFEST_FILE: &str = "identity.toml";
 const MAX_IDENTITY_MANIFEST_BYTES: usize = 16 * 1024;
 const MAX_RECOVERY_FILE_BYTES: usize = 16 * 1024;
 const DEFAULT_PARITY_BUDGET_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_PARITY_HEADROOM_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_MAX_CONNECTIONS: usize = 32;
 
 /// Human-owned daemon options, populated from flags over an optional TOML file.
@@ -60,6 +61,19 @@ pub struct DaemonOptions {
     /// Maximum number of locally stored parity bytes.
     #[conf(parameter, long, default(DEFAULT_PARITY_BUDGET_BYTES))]
     pub parity_budget_bytes: u64,
+
+    /// Existing filesystem directories used as independent parity volumes.
+    #[conf(repeat, long = "parity-volume", serde(rename = "parity_volumes"))]
+    pub parity_volumes: Vec<PathBuf>,
+
+    /// Bytes reserved on each parity volume for repair, migration, and GC.
+    #[conf(parameter, long)]
+    pub parity_headroom_bytes: Option<u64>,
+
+    /// Clear parity volumes inherited from the configuration file.
+    #[conf(flag, long = "clear-parity-volumes", serde(skip))]
+    #[serde(skip)]
+    pub clear_parity_volumes: bool,
 
     /// QUIC listen multiaddress; repeat for multiple listeners.
     #[conf(repeat, long = "listen", serde(rename = "p2p_listen_addresses"))]
@@ -155,6 +169,9 @@ impl DaemonOptions {
         if self.clear_p2p_relay_addresses {
             self.p2p_relay_addresses.clear();
         }
+        if self.clear_parity_volumes {
+            self.parity_volumes.clear();
+        }
     }
 
     pub fn validate(&self, identity: &IdentityManifest) -> Result<()> {
@@ -172,6 +189,9 @@ impl DaemonOptions {
         }
         if self.parity_budget_bytes == 0 {
             bail!("parity_budget_bytes must be greater than zero");
+        }
+        if self.effective_parity_headroom_bytes() >= self.parity_budget_bytes {
+            bail!("parity_headroom_bytes must be smaller than parity_budget_bytes");
         }
         if self.tor_mode == TorMode::DisableTor
             && self.p2p_listen_addresses.is_empty()
@@ -237,6 +257,12 @@ impl DaemonOptions {
         self.tor_state_dir
             .clone()
             .unwrap_or_else(|| self.data_dir.join("tor/state"))
+    }
+
+    pub fn effective_parity_headroom_bytes(&self) -> u64 {
+        self.parity_headroom_bytes.unwrap_or_else(|| {
+            (self.parity_budget_bytes / 20).min(DEFAULT_MAX_PARITY_HEADROOM_BYTES)
+        })
     }
 
     pub fn effective_tor_cache_dir(&self) -> PathBuf {
@@ -821,6 +847,26 @@ fn resolve_document_paths(document: &mut toml::Value, base: &Path) -> Result<()>
                     .context("resolved TOML path is not valid UTF-8")?
                     .to_owned(),
             );
+        }
+    }
+    if let Some(value) = table.get_mut("parity_volumes") {
+        let paths = value
+            .as_array_mut()
+            .context("daemon config parity_volumes must be an array of path strings")?;
+        for value in paths {
+            let text = value
+                .as_str()
+                .context("daemon config parity_volumes must contain only path strings")?;
+            let path = Path::new(text);
+            if path.is_relative() {
+                let resolved = base.join(path);
+                *value = toml::Value::String(
+                    resolved
+                        .to_str()
+                        .context("resolved TOML parity volume is not valid UTF-8")?
+                        .to_owned(),
+                );
+            }
         }
     }
     Ok(())

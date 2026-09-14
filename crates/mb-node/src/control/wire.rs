@@ -6,7 +6,10 @@ use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{NodeStatus, ProtectedRoot};
-use crate::{BackupJob, DhtRecoveryResult, GuildSummary, SnapshotInfo, WireError};
+use crate::{
+    BackupJob, DhtRecoveryResult, GuildSummary, SnapshotInfo, StorageScrubReport,
+    StorageVolumeStatus, WireError,
+};
 
 pub(super) const LOCAL_WIRE_FORMAT_VERSION: u16 = 1;
 
@@ -27,6 +30,13 @@ pub struct LocalResponseEnvelope {
 #[derive(Serialize, Deserialize)]
 pub enum LocalRequest {
     Status,
+    StorageStatus,
+    StorageScrub,
+    StorageDrain {
+        volume_id: Uuid,
+    },
+    StorageMigrate,
+    StorageReconcile,
     Unlock {
         secret: UnlockSecret,
     },
@@ -67,6 +77,12 @@ pub enum LocalResponse {
         node_id: NodeId,
     },
     Status(Box<NodeStatus>),
+    StorageVolumes(Vec<StorageVolumeStatus>),
+    StorageScrubbed(Vec<StorageScrubReport>),
+    StorageMigrated {
+        objects: u64,
+    },
+    StorageReconciled,
     RootAdded(ProtectedRoot),
     Guild(Option<GuildSummary>),
     GuildInvite {

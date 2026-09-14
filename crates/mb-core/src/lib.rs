@@ -15,7 +15,10 @@ pub use content::{
     ContentError, SectorPurpose, crypt_sector, encrypted_sector, make_sector_id,
     synthetic_filler_sector,
 };
-pub use keys::{KeyIdentityError, KeyMaterial, NodeId, RecoveryPublicKey, Seed, SeedParseError};
+pub use keys::{
+    DatabaseKeyError, KeyIdentityError, KeyMaterial, NodeId, RecoveryPublicKey, Seed,
+    SeedParseError, WrappedDatabaseKey,
+};
 pub use model::{
     CodingGroup, CodingGroupId, EndpointRecord, GuildCheckpoint, GuildGenesis, GuildInvite,
     InformationRole, Member, MemberSignature, ModelError, ParityRole, QuorumCheckpoint,

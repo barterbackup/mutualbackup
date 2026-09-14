@@ -15,6 +15,11 @@ local-response-envelope = {
 
 local-request =
     "Status"
+  / "StorageStatus"
+  / "StorageScrub"
+  / { "StorageDrain": { volume_id: uuid-text } }
+  / "StorageMigrate"
+  / "StorageReconcile"
   / { "Unlock": { secret: bytes32-array } }
   / { "AddRoot": { path: tstr } }
   / "GuildStatus"
@@ -34,6 +39,10 @@ local-response =
     { "Locked": { expected_node_id: bytes32-array } }
   / { "Unlocked": { node_id: bytes32-array } }
   / { "Status": node-status }
+  / { "StorageVolumes": [* storage-volume-status] }
+  / { "StorageScrubbed": [* storage-scrub-report] }
+  / { "StorageMigrated": { objects: uint } }
+  / "StorageReconciled"
   / { "RootAdded": protected-root }
   / { "Guild": null / guild-summary }
   / { "GuildInvite": { token: tstr, expires_at_unix_seconds: uint } }
@@ -50,7 +59,26 @@ node-status = {
   checkpoint_count: uint,
   seed_recovery_ready: bool,
   root_dirty: bool,
+  storage_volumes: [* storage-volume-status],
   network: null / p2p-status
+}
+
+storage-volume-status = {
+  volume_id: uuid-text,
+  path: tstr,
+  state: "online" / "offline" / "draining" / "failed",
+  budget_bytes: uint,
+  headroom_bytes: uint,
+  used_bytes: null / uint,
+  object_count: null / uint,
+  last_error: null / tstr
+}
+
+storage-scrub-report = {
+  volume_id: uuid-text,
+  checked_objects: uint,
+  checked_bytes: uint,
+  corrupt_objects: [* [bytes32-array, uint8]]
 }
 
 protected-root = {

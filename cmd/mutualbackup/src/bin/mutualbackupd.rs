@@ -553,7 +553,11 @@ fn open_configured_node(
     if identity.intent == InitializationIntent::New {
         node.configure_failure_domain(&config.effective_failure_domain(identity))?;
     }
-    node.configure_parity_budget(config.parity_budget_bytes)?;
+    node.configure_storage_volumes(
+        &config.parity_volumes,
+        config.parity_budget_bytes,
+        config.effective_parity_headroom_bytes(),
+    )?;
     Ok(node)
 }
 

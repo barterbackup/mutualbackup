@@ -44,7 +44,15 @@ pub struct ControlStore {
 impl ControlStore {
     pub fn open(path: impl AsRef<Path>, keys: &KeyMaterial) -> Result<Self, DatabaseError> {
         let path = path.as_ref();
-        let mut connection = open_encrypted(path, &keys.database_key(CONTROL_DATABASE_ID))?;
+        Self::open_with_key(path, &keys.database_key(CONTROL_DATABASE_ID))
+    }
+
+    pub fn open_with_key(
+        path: impl AsRef<Path>,
+        database_key: &[u8; 32],
+    ) -> Result<Self, DatabaseError> {
+        let path = path.as_ref();
+        let mut connection = open_encrypted(path, database_key)?;
         initialize_or_validate_control(&mut connection)?;
         Ok(Self {
             connection,
@@ -54,6 +62,12 @@ impl ControlStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn rekey(&self, database_key: &[u8; 32]) -> Result<(), DatabaseError> {
+        self.connection
+            .pragma_update(None, "rekey", hex::encode(database_key))?;
+        cipher_integrity_check(&self.connection)
     }
 
     /// Prevent this connection from changing database state. This is useful
@@ -1117,6 +1131,13 @@ pub struct ParityObject {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParityScrubReport {
+    pub checked_objects: usize,
+    pub checked_bytes: u64,
+    pub corrupt_objects: Vec<([u8; 32], u8)>,
+}
+
 pub struct ParityStore {
     connection: Connection,
     path: PathBuf,
@@ -1131,7 +1152,16 @@ impl ParityStore {
         let path = path.as_ref();
         let mut database_id = b"parity.db/".to_vec();
         database_id.extend_from_slice(volume_id);
-        let mut connection = open_encrypted(path, &keys.database_key(&database_id))?;
+        Self::open_with_key(path, volume_id, &keys.database_key(&database_id))
+    }
+
+    pub fn open_with_key(
+        path: impl AsRef<Path>,
+        volume_id: &[u8; 16],
+        database_key: &[u8; 32],
+    ) -> Result<Self, DatabaseError> {
+        let path = path.as_ref();
+        let mut connection = open_encrypted(path, database_key)?;
         initialize_or_validate_parity(&mut connection, volume_id)?;
         Ok(Self {
             connection,
@@ -1141,6 +1171,137 @@ impl ParityStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn rekey(&self, database_key: &[u8; 32]) -> Result<(), DatabaseError> {
+        self.connection
+            .pragma_update(None, "rekey", hex::encode(database_key))?;
+        cipher_integrity_check(&self.connection)
+    }
+
+    pub fn used_bytes(&self) -> Result<u64, DatabaseError> {
+        let used: i64 = self.connection.query_row(
+            "SELECT coalesce(sum(byte_length), 0) FROM parity_objects
+             WHERE state IN ('STAGED', 'READY')",
+            [],
+            |row| row.get(0),
+        )?;
+        u64::try_from(used).map_err(|_| DatabaseError::Integrity)
+    }
+
+    pub fn ready_objects(&self) -> Result<Vec<ParityObject>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT format_version, guild_id, group_id, shard_index, root,
+                    byte_length, bytes
+             FROM parity_objects WHERE state = 'READY'
+             ORDER BY group_id, shard_index",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+            ))
+        })?;
+        let mut objects = Vec::new();
+        for row in rows {
+            let (format_version, guild_id, group_id, shard_index, root, byte_length, bytes) = row?;
+            let object = ParityObject {
+                format_version: u16::try_from(format_version)
+                    .map_err(|_| DatabaseError::Integrity)?,
+                guild_id: guild_id.try_into().map_err(|_| DatabaseError::Integrity)?,
+                group_id: group_id.try_into().map_err(|_| DatabaseError::Integrity)?,
+                shard_index: u8::try_from(shard_index).map_err(|_| DatabaseError::Integrity)?,
+                root: root.try_into().map_err(|_| DatabaseError::Integrity)?,
+                bytes,
+            };
+            if object.format_version != 1
+                || !(3..=4).contains(&object.shard_index)
+                || byte_length != object.bytes.len() as i64
+                || object.bytes.len() != V1_SECTOR_SIZE
+                || sector_root(&object.bytes) != object.root
+            {
+                return Err(DatabaseError::Integrity);
+            }
+            objects.push(object);
+        }
+        Ok(objects)
+    }
+
+    pub fn scrub(&self) -> Result<ParityScrubReport, DatabaseError> {
+        self.cipher_integrity_check()?;
+        let mut statement = self.connection.prepare(
+            "SELECT group_id, shard_index, root, byte_length, bytes
+             FROM parity_objects WHERE state = 'READY'
+             ORDER BY group_id, shard_index",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ))
+        })?;
+        let mut report = ParityScrubReport {
+            checked_objects: 0,
+            checked_bytes: 0,
+            corrupt_objects: Vec::new(),
+        };
+        for row in rows {
+            let (group_id, shard_index, root, byte_length, bytes) = row?;
+            let group_id: [u8; 32] = group_id.try_into().map_err(|_| DatabaseError::Integrity)?;
+            let shard_index = u8::try_from(shard_index).map_err(|_| DatabaseError::Integrity)?;
+            let root: [u8; 32] = root.try_into().map_err(|_| DatabaseError::Integrity)?;
+            report.checked_objects += 1;
+            report.checked_bytes = report
+                .checked_bytes
+                .checked_add(bytes.len() as u64)
+                .ok_or(DatabaseError::Integrity)?;
+            if !(3..=4).contains(&shard_index)
+                || byte_length != bytes.len() as i64
+                || bytes.len() != V1_SECTOR_SIZE
+                || sector_root(&bytes) != root
+            {
+                report.corrupt_objects.push((group_id, shard_index));
+            }
+        }
+        Ok(report)
+    }
+
+    pub fn remove_ready(
+        &mut self,
+        group_id: &[u8; 32],
+        shard_index: u8,
+        expected_root: &[u8; 32],
+    ) -> Result<bool, DatabaseError> {
+        let transaction = self.connection.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT root, state FROM parity_objects
+                 WHERE group_id = ?1 AND shard_index = ?2",
+                params![group_id.as_slice(), shard_index],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((root, state)) = existing else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        if root.as_slice() != expected_root || state != "READY" {
+            return Err(DatabaseError::Conflict);
+        }
+        transaction.execute(
+            "DELETE FROM parity_objects WHERE group_id = ?1 AND shard_index = ?2",
+            params![group_id.as_slice(), shard_index],
+        )?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     pub fn stage_and_publish(&mut self, object: &ParityObject) -> Result<(), DatabaseError> {
