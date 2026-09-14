@@ -1269,7 +1269,7 @@ impl ParityStore {
                 bytes,
             };
             if object.format_version != 1
-                || !(3..=4).contains(&object.shard_index)
+                || object.shard_index > 4
                 || byte_length != object.bytes.len() as i64
                 || object.bytes.len() != V1_SECTOR_SIZE
                 || sector_root(&object.bytes) != object.root
@@ -1312,7 +1312,7 @@ impl ParityStore {
                 .checked_bytes
                 .checked_add(bytes.len() as u64)
                 .ok_or(DatabaseError::Integrity)?;
-            if !(3..=4).contains(&shard_index)
+            if shard_index > 4
                 || byte_length != bytes.len() as i64
                 || bytes.len() != V1_SECTOR_SIZE
                 || sector_root(&bytes) != root
@@ -1365,7 +1365,7 @@ impl ParityStore {
     ) -> Result<(), DatabaseError> {
         if object.format_version != 1
             || object.bytes.len() != V1_SECTOR_SIZE
-            || !(3..=4).contains(&object.shard_index)
+            || object.shard_index > 4
             || sector_root(&object.bytes) != object.root
             || acknowledgement.len() > 4096
         {
@@ -1627,7 +1627,7 @@ fn initialize_or_validate_parity(
             format_version INTEGER NOT NULL CHECK(format_version = 1),
             guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
             group_id BLOB NOT NULL CHECK(length(group_id) = 32),
-            shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 3 AND 4),
+            shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 0 AND 4),
             root BLOB NOT NULL CHECK(length(root) = 32),
             byte_length INTEGER NOT NULL CHECK(byte_length = 65536),
             state TEXT NOT NULL CHECK(state IN ('STAGED', 'READY')),
@@ -1660,7 +1660,7 @@ fn migrate_control(connection: &mut Connection) -> Result<(), DatabaseError> {
     if version == SCHEMA_VERSION {
         return validate_control_schema(connection, version);
     }
-    if !matches!(version, 1..=3 | 5) {
+    if !matches!(version, 1..=3 | 5..=6) {
         return Err(DatabaseError::IncompatibleSchema);
     }
     if version >= 2 && meta_value(connection, "database_kind")?.as_deref() != Some(b"control") {
@@ -1749,23 +1749,50 @@ fn migrate_parity(connection: &mut Connection, volume_id: &[u8; 16]) -> Result<(
     if version == SCHEMA_VERSION {
         return validate_parity_schema(connection);
     }
-    if !matches!(version, 2..=3 | 5)
+    if !matches!(version, 2..=3 | 5..=6)
         || meta_value(connection, "database_kind")?.as_deref() != Some(b"parity")
         || meta_value(connection, "volume_id")?.as_deref() != Some(volume_id.as_slice())
     {
         return Err(DatabaseError::IncompatibleSchema);
     }
+    let prior_schema = if version == 6 {
+        PARITY_OBJECTS_BEFORE_V7_SCHEMA
+    } else {
+        PARITY_OBJECTS_BEFORE_V6_SCHEMA
+    };
     require_exact_tables(
         connection,
-        &[
-            ("meta", META_SCHEMA),
-            ("parity_objects", PARITY_OBJECTS_BEFORE_V6_SCHEMA),
-        ],
+        &[("meta", META_SCHEMA), ("parity_objects", prior_schema)],
     )?;
     let transaction = connection.transaction()?;
+    if version < 6 {
+        transaction.execute_batch(
+            "ALTER TABLE parity_objects
+             ADD COLUMN acknowledgement BLOB NOT NULL DEFAULT x'';",
+        )?;
+    }
     transaction.execute_batch(
-        "ALTER TABLE parity_objects
-         ADD COLUMN acknowledgement BLOB NOT NULL DEFAULT x'';",
+        "ALTER TABLE parity_objects RENAME TO parity_objects_before_v7;
+         CREATE TABLE parity_objects (
+            format_version INTEGER NOT NULL CHECK(format_version = 1),
+            guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
+            group_id BLOB NOT NULL CHECK(length(group_id) = 32),
+            shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 0 AND 4),
+            root BLOB NOT NULL CHECK(length(root) = 32),
+            byte_length INTEGER NOT NULL CHECK(byte_length = 65536),
+            state TEXT NOT NULL CHECK(state IN ('STAGED', 'READY')),
+            bytes BLOB NOT NULL,
+            acknowledgement BLOB NOT NULL DEFAULT x'',
+            PRIMARY KEY(group_id, shard_index)
+         ) STRICT;
+         INSERT INTO parity_objects(
+            format_version, guild_id, group_id, shard_index, root,
+            byte_length, state, bytes, acknowledgement
+         )
+         SELECT format_version, guild_id, group_id, shard_index, root,
+                byte_length, state, bytes, acknowledgement
+         FROM parity_objects_before_v7;
+         DROP TABLE parity_objects_before_v7;",
     )?;
     transaction.execute(
         "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
@@ -1859,7 +1886,7 @@ const PARITY_OBJECTS_SCHEMA: &str = "CREATE TABLE parity_objects (
     format_version INTEGER NOT NULL CHECK(format_version = 1),
     guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
     group_id BLOB NOT NULL CHECK(length(group_id) = 32),
-    shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 3 AND 4),
+    shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 0 AND 4),
     root BLOB NOT NULL CHECK(length(root) = 32),
     byte_length INTEGER NOT NULL CHECK(byte_length = 65536),
     state TEXT NOT NULL CHECK(state IN ('STAGED', 'READY')),
@@ -1877,6 +1904,19 @@ const PARITY_OBJECTS_BEFORE_V6_SCHEMA: &str = "CREATE TABLE parity_objects (
     byte_length INTEGER NOT NULL CHECK(byte_length = 65536),
     state TEXT NOT NULL CHECK(state IN ('STAGED', 'READY')),
     bytes BLOB NOT NULL,
+    PRIMARY KEY(group_id, shard_index)
+) STRICT";
+
+const PARITY_OBJECTS_BEFORE_V7_SCHEMA: &str = "CREATE TABLE parity_objects (
+    format_version INTEGER NOT NULL CHECK(format_version = 1),
+    guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
+    group_id BLOB NOT NULL CHECK(length(group_id) = 32),
+    shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 3 AND 4),
+    root BLOB NOT NULL CHECK(length(root) = 32),
+    byte_length INTEGER NOT NULL CHECK(byte_length = 65536),
+    state TEXT NOT NULL CHECK(state IN ('STAGED', 'READY')),
+    bytes BLOB NOT NULL,
+    acknowledgement BLOB NOT NULL DEFAULT x'',
     PRIMARY KEY(group_id, shard_index)
 ) STRICT";
 
@@ -1901,7 +1941,7 @@ fn validate_control_schema(connection: &Connection, version: u32) -> Result<(), 
             ("checkpoint_signature_locks", CHECKPOINT_LOCKS_SCHEMA),
             ("checkpoint_heads", CHECKPOINT_HEADS_SCHEMA),
         ],
-        5 | SCHEMA_VERSION => vec![
+        5 | 6 | SCHEMA_VERSION => vec![
             ("meta", META_SCHEMA),
             ("protocol_records", PROTOCOL_RECORDS_SCHEMA),
             ("operations", OPERATIONS_SCHEMA),
@@ -2906,6 +2946,30 @@ mod tests {
     }
 
     #[test]
+    fn exact_version_six_control_schema_migrates_without_data_loss() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([33; 32]));
+        let store = ControlStore::open(&path, &keys).unwrap();
+        store.put_record("test", b"id", b"preserved").unwrap();
+        drop(store);
+        let connection = open_encrypted(&path, &keys.database_key(CONTROL_DATABASE_ID)).unwrap();
+        connection
+            .execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                [6_u32.to_be_bytes().as_slice()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = ControlStore::open(&path, &keys).unwrap();
+        assert_eq!(
+            store.get_record("test", b"id").unwrap().unwrap(),
+            b"preserved"
+        );
+    }
+
+    #[test]
     fn unknown_newer_schema_is_rejected() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("control.db");
@@ -3139,6 +3203,74 @@ mod tests {
     }
 
     #[test]
+    fn exact_version_six_parity_schema_migrates_with_data_and_acknowledgement() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("parity.db");
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([25; 32]));
+        let volume_id = [26; 16];
+        let mut database_id = b"parity.db/".to_vec();
+        database_id.extend_from_slice(&volume_id);
+        let bytes = vec![27; V1_SECTOR_SIZE];
+        let root = sector_root(&bytes);
+        {
+            let connection = open_encrypted(&path, &keys.database_key(&database_id)).unwrap();
+            connection.execute_batch(META_SCHEMA).unwrap();
+            connection
+                .execute_batch(PARITY_OBJECTS_BEFORE_V7_SCHEMA)
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO meta(key, value) VALUES ('database_kind', ?1)",
+                    [b"parity".as_slice()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
+                    [6_u32.to_be_bytes().as_slice()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO meta(key, value) VALUES ('volume_id', ?1)",
+                    [volume_id.as_slice()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO parity_objects(
+                        format_version, guild_id, group_id, shard_index, root,
+                        byte_length, state, bytes, acknowledgement
+                     ) VALUES (1, ?1, ?2, 3, ?3, 65536, 'READY', ?4, ?5)",
+                    params![
+                        [28_u8; 32].as_slice(),
+                        [29_u8; 32].as_slice(),
+                        root.as_slice(),
+                        bytes,
+                        b"version-six-ack"
+                    ],
+                )
+                .unwrap();
+        }
+        let mut store = ParityStore::open(&path, &volume_id, &keys).unwrap();
+        assert_eq!(
+            store.load_acknowledgement(&[29; 32], 3).unwrap(),
+            b"version-six-ack"
+        );
+        let emergency_bytes = vec![30; V1_SECTOR_SIZE];
+        let emergency = ParityObject {
+            format_version: 1,
+            guild_id: [31; 32],
+            group_id: [32; 32],
+            shard_index: 0,
+            root: sector_root(&emergency_bytes),
+            bytes: emergency_bytes,
+        };
+        store.stage_and_publish(&emergency).unwrap();
+        assert_eq!(store.load_ready(&[32; 32], 0).unwrap(), emergency);
+    }
+
+    #[test]
     fn parity_publication_is_immutable_and_verified() {
         let temp = tempdir().unwrap();
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([4; 32]));
@@ -3163,6 +3295,49 @@ mod tests {
         assert!(matches!(
             store.stage_and_publish(&replacement),
             Err(DatabaseError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn parity_scrub_reports_logically_corrupt_ready_objects() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([43; 32]));
+        let mut store = ParityStore::open(temp.path().join("parity.db"), &[44; 16], &keys).unwrap();
+        let bytes = vec![45; V1_SECTOR_SIZE];
+        let object = ParityObject {
+            format_version: 1,
+            guild_id: [46; 32],
+            group_id: [47; 32],
+            shard_index: 4,
+            root: sector_root(&bytes),
+            bytes,
+        };
+        store.stage_and_publish(&object).unwrap();
+        let mut corrupt_bytes = object.bytes.clone();
+        corrupt_bytes[0] ^= 1;
+        store
+            .connection
+            .execute(
+                "UPDATE parity_objects SET bytes = ?1
+                 WHERE group_id = ?2 AND shard_index = ?3",
+                params![
+                    corrupt_bytes,
+                    object.group_id.as_slice(),
+                    object.shard_index
+                ],
+            )
+            .unwrap();
+
+        let report = store.scrub().unwrap();
+        assert_eq!(report.checked_objects, 1);
+        assert_eq!(report.checked_bytes, V1_SECTOR_SIZE as u64);
+        assert_eq!(
+            report.corrupt_objects,
+            vec![(object.group_id, object.shard_index)]
+        );
+        assert!(matches!(
+            store.load_ready(&object.group_id, object.shard_index),
+            Err(DatabaseError::Integrity)
         ));
     }
 

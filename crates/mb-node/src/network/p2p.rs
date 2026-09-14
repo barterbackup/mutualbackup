@@ -10868,25 +10868,31 @@ mod tests {
                     .build(),
             )
             .unwrap();
-        let client_task = tokio::spawn(client_loop.run());
         tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let active = client
-                    .status()
-                    .await
-                    .unwrap()
-                    .active_sessions
-                    .into_iter()
-                    .filter(|session| session.peer_id == target_peer.to_string())
-                    .count();
-                if active >= 2 {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            while client_loop
+                .connection_paths
+                .values()
+                .filter(|(peer, _)| *peer == target_peer)
+                .count()
+                < 2
+            {
+                let event = client_loop.swarm.select_next_some().await;
+                client_loop.handle_swarm_event(event);
             }
         })
         .await
         .expect("client did not establish both same-identity QUIC sessions");
+        assert!(
+            client_loop
+                .duplicate_retirement
+                .values()
+                .any(|(peer, _)| *peer == target_peer),
+            "healthy duplicate was not retained for the timeout regression"
+        );
+        client_loop
+            .duplicate_retirement
+            .retain(|_, (peer, _)| *peer != target_peer);
+        let client_task = tokio::spawn(client_loop.run());
 
         let calls = (0..4)
             .map(|_| {
@@ -11568,8 +11574,42 @@ mod tests {
                 .is_err()
         );
 
-        for client in &clients {
-            client.shutdown().await.unwrap();
+        let offline_information_holder = 2;
+        clients[offline_information_holder]
+            .shutdown()
+            .await
+            .unwrap();
+        let emergency_information = audit_guild(nodes[0].clone(), &clients[0], true)
+            .await
+            .unwrap();
+        assert_eq!(
+            emergency_information.state,
+            crate::ProtectionState::Degraded
+        );
+        assert_eq!(emergency_information.emergency_copies_created, 1);
+        let emergency_information_holder = (0..nodes.len())
+            .filter(|index| *index != offline_information_holder)
+            .find(|index| {
+                nodes[*index]
+                    .lock()
+                    .unwrap()
+                    .parity_for_guild(&guild_id, &group.id, 2)
+                    .is_ok_and(|bytes| bytes == encoded[2])
+            })
+            .unwrap();
+        assert_eq!(
+            nodes[emergency_information_holder]
+                .lock()
+                .unwrap()
+                .emergency_shard_count()
+                .unwrap(),
+            1
+        );
+
+        for (index, client) in clients.iter().enumerate() {
+            if index != offline_information_holder {
+                client.shutdown().await.unwrap();
+            }
         }
         for task in tasks {
             task.await.unwrap().unwrap();

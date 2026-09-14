@@ -18,4 +18,4 @@ pub use database::{
     ParityScrubReport, ParityStore, ProtocolRecordRow,
 };
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;

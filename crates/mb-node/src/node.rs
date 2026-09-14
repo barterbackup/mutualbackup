@@ -605,12 +605,7 @@ impl Node {
     pub fn status(&self) -> Result<NodeStatus> {
         let last_audit = self.last_guild_audit()?;
         let storage_volumes = self.volumes.statuses()?;
-        let storage_degraded = storage_volumes.iter().any(|volume| {
-            matches!(
-                volume.state,
-                crate::StorageVolumeState::Offline | crate::StorageVolumeState::Failed
-            )
-        });
+        let storage_degraded = self.volumes.protection_degraded(&self.control)?;
         let current_checkpoint_hash = match self.installed_guild()? {
             Some(guild) => self
                 .current_checkpoint(guild.certificate.genesis.guild_id)?
@@ -1133,12 +1128,7 @@ impl Node {
         };
         let checkpoint_hash = checkpoint.hash()?;
         let last = self.last_guild_audit()?;
-        let storage_degraded = self.volumes.statuses()?.iter().any(|volume| {
-            matches!(
-                volume.state,
-                crate::StorageVolumeState::Offline | crate::StorageVolumeState::Failed
-            )
-        });
+        let storage_degraded = self.volumes.protection_degraded(&self.control)?;
         Ok(last.as_ref().is_none_or(|report| {
             report.checkpoint_hash != checkpoint_hash
                 || now.saturating_sub(report.audited_at_unix_seconds) >= interval_seconds
