@@ -1,11 +1,11 @@
 # Product TODO
 
-## Milestone 4 completion blockers
+## Milestone 4 completion blockers (closed)
 
 Source review of `7b1114a..b8ffc90` on 2026-09-14 reopened Milestone 4.
 The findings below follow source paths and durable-state transitions; no builds,
-tests, or runtime probes were performed for this review. Close these blockers
-and their regression gates before advancing to Milestone 5.
+tests, or runtime probes were performed for that review. The corrections in
+`d1857b5` through `83ebf83` close every finding and the local correction gate.
 
 - [x] **M4-01 / P1 — Allow seed recovery without historical checkpoints.**
   Recovery downloads the selected head, but `reconcile_garbage_collection`
@@ -143,18 +143,19 @@ and their regression gates before advancing to Milestone 5.
   controlled reclaim. Cover deletion/reclaim and a nearly full filesystem
   independently of the configured logical quota.
 
-- [ ] **Re-run the Milestone 4 closure gate after corrections.** Add the
-  regressions above, including interruptions between control/capture/repair
-  records rather than only the volume helper transitions. Run the required
-  gates locally, including the disposable-Btrfs/reflink and generation-2
-  seed-recovery paths, corruption, live volume detach/replacement, repair
-  followed by a second loss, safe retention/GC, absent-source operation, and
-  partial DHT/network failure. The ignored
-  `repeated_multi_owner_backups_commit_over_quic` already asserts generation-2
-  recovery (`crates/mb-node/src/network/p2p.rs:11834`); its earlier Milestone 3
-  result cannot validate the newly changed recovery/GC path. Do not reuse that
-  result to mark Milestone 4 passed. Runtime validation belongs to the subsequent
-  correction gate.
+- [x] **Re-run the Milestone 4 closure gate after corrections.** On 2026-09-14,
+  the exact corrected source tree passed locked workspace tests and warning-free
+  workspace Clippy. A locally provisioned disposable Btrfs filesystem passed
+  `scripts/reflink-acceptance.sh`, including capture interruptions,
+  generation-2 seed recovery over QUIC, close/reopen and GC, and real
+  five-daemon recovery from seed and DHT after source loss. Focused regressions
+  cover corruption and healthy-copy fallback, live detach/replacement, repair
+  followed by another loss, retention/GC, absent-source operation, partial
+  peer availability, physical headroom/reclaim, retired-volume configuration
+  replay, and nonempty SQLCipher rekey for both control and parity databases.
+  Docker-controller safety and real NAT-PMP lifecycle gates also passed during
+  the correction series. All compilation and execution were local; no remote
+  compilation server was used.
 
 ## Later guild geometry and coding protocol
 
