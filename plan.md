@@ -56,15 +56,15 @@ them as ADRs and test vectors before promising wire compatibility.
   checkpoints. Leave a compatible authorization interface for later quorum
   policies and FROST once membership and recovery policy are stable.
 
-### Implemented baseline — first usable product and Tor connectivity beta
+### Implemented baseline — usable product through durable operations beta
 
 The first usable architectural prototype and the Milestone 2
 operator-configuration and identity-state slice have passed their review gates.
-The Milestone 3 robust-connectivity beta has passed its closure gate. Its final
-corrective follow-ups adopt a healthy preferred connection before declaring a
-selected fallback dial exhausted, distinguish a superseded gateway lease from
-a same-lease refresh, and keep bounded superseded cleanup owned without
-blocking the active mapping lifecycle. Milestone 4 is next.
+The Milestone 3 robust-connectivity beta and Milestone 4 durable-operations and
+multi-volume-storage beta have passed their closure gates. Milestone 4 adds
+automatic backup, fenced recovered writers, certified retention and safe GC,
+independently encrypted volume databases, audits, repair, emergency copies,
+and explicit protection status. Milestone 5 is next.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -470,7 +470,7 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 3 have passed, and Milestone 4
+than a daemon prerequisite. Milestones 0 through 4 have passed, and Milestone 5
 is next. Later wire or durable-state changes require the review and gate of the
 milestone that owns them. Build and run all subsequent validation locally; do
 not use a remote compilation server.
@@ -686,8 +686,13 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 3 are passed. Milestone 4 is next.
-Milestone 3 puts policy at the composed transport boundary, provides Arti onion
+**Current position:** Milestones 0 through 4 are passed. Milestone 5 is next.
+Milestone 4 provides quiet-period automatic backup with durable limits and
+full reconciliation, recovered-writer fencing, certified retention/tombstones
+and delayed GC, independently keyed multi-volume parity storage, drain and
+migration, scrubs, assigned repair, emergency shard copies, and durable
+healthy/degraded/emergency/unrecoverable status. Milestone 3 put policy at the
+composed transport boundary and provided Arti onion
 service and dialing, DHT endpoint exchange, direct/relay/DCUtR/onion telemetry,
 optional gateway mapping, and real acceptance environments. An earlier
 corrective pass serializes request-scoped relay reservation lifecycles, binds
@@ -722,6 +727,24 @@ NAT-PMP lifecycle, static Nix artifact, no-build Docker erase-and-seed recovery,
 and five-daemon private-Tor seed-recovery gate form the Milestone 3 regression
 contract. Focused regressions cover its reviewed event orders and failure
 schedules. Guild geometry and coding-protocol changes remain Milestone 5.
+
+The Milestone 4 source and local-runtime gate covers every durable boundary in
+cross-database volume write, migration, and GC sequences with interruption,
+close/reopen, and convergence checks. It also covers logical shard corruption,
+version-6 SQLCipher migration, headroom isolation, duplicate and lost-volume
+identity, replacement repair, durable automatic-backup limits, writer fencing,
+retention and later-generation collection, and the restricted query-only
+database shell. The closing source follow-up in `cca2020` preserves configured
+intent across volume-registry upgrades, keeps known missing disks offline
+without stopping startup, prevents drained disks from reopening implicitly,
+and permits verified emergency copies of any certified shard. A live five-node
+QUIC audit repairs assigned information,
+creates emergency parity and information copies during capacity and peer
+outages, survives further shard losses, reconstructs from the emergency copy,
+and removes it after assigned protection returns. The locked workspace test and
+warning-free clippy gates passed locally on 2026-09-14. The current filesystem
+does not support reflinks, so the unchanged disposable-Btrfs gates retain their
+most recent local Milestone 3 result. No remote compilation server was used.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
 
@@ -928,9 +951,9 @@ artifact check. The unchanged disposable-Btrfs, isolated-network, private-Tor,
 and Docker gates had passed against its immediate precursor. No remote
 compilation server was used.
 
-### Milestone 4 — durable operations and multi-volume storage beta
+### Milestone 4 — durable operations and multi-volume storage beta (passed)
 
-This follows the passed Milestone 3 gate.
+This passed after the Milestone 3 gate.
 
 - Add writer-incarnation fencing before supporting concurrent loss/recovery;
   then add retention and tombstones, safe GC, audits/scrubs, repair and emergency
