@@ -1699,8 +1699,13 @@ mod tests {
                 Some(DatabaseError::CapacityExceeded)
             )
         ));
-        volumes.store_repair(&control, &object).unwrap();
-        let status = volumes.statuses().unwrap().pop().unwrap();
+        let receipt = volumes.store_repair(&control, &object).unwrap();
+        let status = volumes
+            .statuses()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.volume_id == receipt.volume_id)
+            .unwrap();
         assert_eq!(status.used_bytes, Some(V1_SECTOR_SIZE as u64));
         assert!(status.allocated_bytes.is_some());
         assert!(status.available_bytes.is_some());
