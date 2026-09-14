@@ -891,7 +891,10 @@ pub(crate) fn open_control_store(
                     || format!("control database rejected wrapped key: {new_key_error}"),
                 )?;
                 store.rekey(&database_key)?;
-                return Ok((store, database_key));
+                return Ok((
+                    ControlStore::open_with_key(&database_path, &database_key)?,
+                    database_key,
+                ));
             }
         }
     }
@@ -904,7 +907,10 @@ pub(crate) fn open_control_store(
         let legacy_key = keys.database_key(b"control.db");
         let store = ControlStore::open_with_key(&database_path, &legacy_key)?;
         store.rekey(&database_key)?;
-        Ok((store, database_key))
+        Ok((
+            ControlStore::open_with_key(&database_path, &database_key)?,
+            database_key,
+        ))
     } else {
         Ok((
             ControlStore::open_with_key(&database_path, &database_key)?,
@@ -1030,7 +1036,11 @@ fn open_volume_store(
             )
             .with_context(|| format!("parity database rejected wrapped key: {new_key_error}"))?;
             store.rekey(database_key)?;
-            Ok(store)
+            Ok(ParityStore::open_existing_with_key(
+                &database_path,
+                record.volume_id.as_bytes(),
+                database_key,
+            )?)
         }
     }
 }
@@ -1213,6 +1223,27 @@ mod tests {
             volumes.statuses().unwrap()[0].state,
             StorageVolumeState::Online
         );
+    }
+
+    #[test]
+    fn legacy_nonempty_control_database_is_rekeyed_and_reopened() {
+        let temp = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([62; 32])));
+        {
+            let control = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+            for index in 0_u8..64 {
+                control
+                    .put_record("legacy-record", &[index], &vec![index; 1024])
+                    .unwrap();
+            }
+        }
+
+        let (control, database_key) = open_control_store(temp.path(), &keys).unwrap();
+        assert_eq!(control.records("legacy-record").unwrap().len(), 64);
+        drop(control);
+        let (control, reopened_key) = open_control_store(temp.path(), &keys).unwrap();
+        assert_eq!(reopened_key, database_key);
+        assert_eq!(control.records("legacy-record").unwrap().len(), 64);
     }
 
     #[test]

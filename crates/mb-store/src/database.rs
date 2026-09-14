@@ -72,10 +72,14 @@ impl ControlStore {
         &self.path
     }
 
-    pub fn rekey(&self, database_key: &[u8; 32]) -> Result<(), DatabaseError> {
+    pub fn rekey(self, database_key: &[u8; 32]) -> Result<(), DatabaseError> {
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         self.connection
             .pragma_update(None, "rekey", hex::encode(database_key))?;
-        cipher_integrity_check(&self.connection)
+        let path = self.path.clone();
+        drop(self);
+        verify_rekeyed_database(&path, database_key)
     }
 
     /// Prevent this connection from changing database state. This is useful
@@ -1235,10 +1239,14 @@ impl ParityStore {
         &self.path
     }
 
-    pub fn rekey(&self, database_key: &[u8; 32]) -> Result<(), DatabaseError> {
+    pub fn rekey(self, database_key: &[u8; 32]) -> Result<(), DatabaseError> {
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         self.connection
             .pragma_update(None, "rekey", hex::encode(database_key))?;
-        cipher_integrity_check(&self.connection)
+        let path = self.path.clone();
+        drop(self);
+        verify_rekeyed_database(&path, database_key)
     }
 
     pub fn database_shell_statement(
@@ -2262,6 +2270,11 @@ fn configure_encrypted(
     Ok(connection)
 }
 
+fn verify_rekeyed_database(path: &Path, key: &[u8; 32]) -> Result<(), DatabaseError> {
+    let verification = open_encrypted_existing(path, key)?;
+    cipher_integrity_check(&verification)
+}
+
 #[cfg(unix)]
 fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
@@ -2383,6 +2396,28 @@ mod tests {
         assert!(store.get_record("test", b"id").unwrap().is_some());
         let wrong = KeyMaterial::from_seed(&Seed::from_bytes([2; 32]));
         assert!(ControlStore::open(&path, &wrong).is_err());
+    }
+
+    #[test]
+    fn control_rekey_preserves_a_nonempty_database() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("control.db");
+        let old_key = [3; 32];
+        let new_key = [4; 32];
+        {
+            let store = ControlStore::open_with_key(&path, &old_key).unwrap();
+            for index in 0_u8..64 {
+                store
+                    .put_record("rekey-test", &[index], &vec![index; 1024])
+                    .unwrap();
+            }
+        }
+        let store = ControlStore::open_with_key(&path, &old_key).unwrap();
+        store.rekey(&new_key).unwrap();
+
+        let store = ControlStore::open_with_key(&path, &new_key).unwrap();
+        assert_eq!(store.records("rekey-test").unwrap().len(), 64);
+        store.cipher_integrity_check().unwrap();
     }
 
     #[test]
