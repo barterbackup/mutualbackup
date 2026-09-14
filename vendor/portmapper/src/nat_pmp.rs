@@ -18,6 +18,8 @@ const MAPPING_REQUESTED_LIFETIME_SECONDS: u32 = 60 * 60 * 2;
 /// A mapping successfully registered with a NAT-PMP server.
 #[derive(Debug)]
 pub struct Mapping {
+    /// Transport protocol for this mapping.
+    protocol: MapProtocol,
     /// Local ip used to create this mapping.
     local_ip: Ipv4Addr,
     /// Local port used to create this mapping.
@@ -133,6 +135,7 @@ impl Mapping {
             .map_err(|_| e!(Error::ZeroExternalPort))?;
 
         Ok(Mapping {
+            protocol: proto,
             external_port,
             external_addr,
             lifetime_seconds,
@@ -149,6 +152,7 @@ impl Mapping {
         // Suggested External Port MUST be set to zero by the client on sending
 
         let Mapping {
+            protocol,
             local_ip,
             local_port,
             gateway,
@@ -160,7 +164,7 @@ impl Mapping {
         socket.connect((gateway, protocol::SERVER_PORT).into())?;
 
         let req = Request::Mapping {
-            proto: MapProtocol::Udp,
+            proto: protocol,
             local_port: local_port.into(),
             external_port: 0,
             lifetime_seconds: 0,
@@ -170,6 +174,13 @@ impl Mapping {
 
         // mapping deletion is a notification, no point in waiting for the response
         Ok(())
+    }
+
+    pub(crate) fn same_lease(&self, other: &Self) -> bool {
+        self.protocol == other.protocol
+            && self.local_ip == other.local_ip
+            && self.local_port == other.local_port
+            && self.gateway == other.gateway
     }
 }
 

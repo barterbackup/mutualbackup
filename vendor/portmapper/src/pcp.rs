@@ -73,6 +73,14 @@ impl super::mapping::PortMapped for Mapping {
 }
 
 impl Mapping {
+    pub(crate) fn same_lease(&self, other: &Self) -> bool {
+        self.protocol == other.protocol
+            && self.local_ip == other.local_ip
+            && self.local_port == other.local_port
+            && self.gateway == other.gateway
+            && self.nonce == other.nonce
+    }
+
     /// Attempt to registered a new mapping with the PCP server on the provided gateway.
     pub async fn new(
         protocol: Protocol,

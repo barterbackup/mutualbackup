@@ -59,6 +59,12 @@ pub enum Error {
 }
 
 impl Mapping {
+    pub(crate) fn same_lease(&self, other: &Self) -> bool {
+        self.protocol == other.protocol
+            && self.gateway == other.gateway
+            && self.external_port == other.external_port
+    }
+
     pub(crate) async fn new(
         protocol: Protocol,
         local_addr: Ipv4Addr,

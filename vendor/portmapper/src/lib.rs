@@ -496,6 +496,10 @@ pub struct Service {
     /// Requests for a probe that arrive while this task is still in progress will receive the same
     /// result.
     probing_task: Option<(AbortOnDropHandle<Probe>, Vec<oneshot::Sender<ProbeResult>>)>,
+    /// First failure while releasing a lease superseded by a successful
+    /// replacement. Preserve it until an acknowledged port change can report
+    /// that cleanup was incomplete.
+    mapping_release_error: Option<mapping::Error>,
     metrics: Arc<Metrics>,
 }
 
@@ -522,6 +526,7 @@ impl Service {
             full_probe,
             mapping_task: None,
             probing_task: None,
+            mapping_release_error: None,
             metrics,
         };
 
@@ -569,7 +574,7 @@ impl Service {
                     self.mapping_task = None;
                     // there isn't really a way to react to a join error here. Flatten it to make
                     // it easier to work with
-                    self.on_mapping_result(mapping_result);
+                    self.on_mapping_result(mapping_result).await;
                 }
                 probe_result = util::MaybeFuture{ inner: self.probing_task.as_mut().map(|(fut, _rec)| fut) } => {
                     trace!("tick: probe ready");
@@ -611,13 +616,27 @@ impl Service {
         }
     }
 
-    fn on_mapping_result(
+    async fn on_mapping_result(
         &mut self,
         result: Result<Result<mapping::Mapping, mapping::Error>, tokio::task::JoinError>,
     ) {
         match result {
             Ok(Ok(mapping)) => {
-                self.current_mapping.update(Some(mapping));
+                let same_lease = self
+                    .current_mapping
+                    .mapping()
+                    .is_some_and(|current| current.same_lease(&mapping));
+                let superseded = self.current_mapping.update(Some(mapping));
+                if !same_lease
+                    && let Some(superseded) = superseded
+                    && let Err(error) = superseded.release().await
+                {
+                    debug!("failed to release superseded port mapping {error}");
+                    self.metrics.mapping_failures.inc();
+                    if self.mapping_release_error.is_none() {
+                        self.mapping_release_error = Some(error);
+                    }
+                }
             }
             Ok(Err(e)) => {
                 debug!("failed to get a port mapping {e}");
@@ -670,7 +689,12 @@ impl Service {
 
             // Withdraw and release the known active lease before waiting for a
             // renewal attempt, which may be stalled in a gateway request.
-            let mut release_error = self.invalidate_mapping().await.err();
+            let mut release_error = self.mapping_release_error.take();
+            if let Err(error) = self.invalidate_mapping().await
+                && release_error.is_none()
+            {
+                release_error = Some(error);
+            }
             if let Err(error) = self.settle_mapping_task().await
                 && release_error.is_none()
             {
@@ -881,6 +905,81 @@ fn ip_and_gateway() -> Result<(Ipv4Addr, Ipv4Addr), ProbeError> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn upnp_test_gateway(address: std::net::SocketAddr) -> upnp::Gateway {
+        let mapping_arguments = [
+            "NewRemoteHost",
+            "NewExternalPort",
+            "NewProtocol",
+            "NewInternalPort",
+            "NewInternalClient",
+            "NewEnabled",
+            "NewPortMappingDescription",
+            "NewLeaseDuration",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let delete_arguments = ["NewRemoteHost", "NewExternalPort", "NewProtocol"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        upnp::Gateway {
+            addr: address,
+            root_url: "/".to_owned(),
+            control_url: "/control".to_owned(),
+            control_schema_url: "/schema".to_owned(),
+            control_schema: std::collections::HashMap::from([
+                ("AddPortMapping".to_owned(), mapping_arguments.clone()),
+                ("AddAnyPortMapping".to_owned(), mapping_arguments),
+                ("DeletePortMapping".to_owned(), delete_arguments),
+            ]),
+            provider: igd_next::aio::tokio::Tokio,
+        }
+    }
+
+    async fn receive_upnp_request(
+        listener: &tokio::net::TcpListener,
+    ) -> (tokio::net::TcpStream, String) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut bytes = [0_u8; 2_048];
+            let read = stream.read(&mut bytes).await.unwrap();
+            assert_ne!(read, 0, "UPnP client closed before sending its request");
+            request.extend_from_slice(&bytes[..read]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        (stream, String::from_utf8(request).unwrap())
+    }
+
+    async fn respond_upnp(mut stream: tokio::net::TcpStream, action: &str, contents: &str) {
+        let body = format!(
+            "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:{action} xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\">{contents}</u:{action}></s:Body></s:Envelope>"
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn deactivation_releases_an_active_lease_before_a_stalled_renewal() {
@@ -1066,6 +1165,317 @@ mod lifecycle_tests {
             .unwrap();
         assert!(external.borrow().is_none());
         gateway_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upnp_replacement_releases_both_distinct_leases_before_acknowledgement() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let gateway = upnp_test_gateway(listener.local_addr().unwrap());
+        let local_ip = Ipv4Addr::LOCALHOST;
+        let local_port = NonZeroU16::new(39_500).unwrap();
+        let first_port = 45_100_u16;
+        let replacement_port = 45_101_u16;
+        let (first_deleted_tx, first_deleted_rx) = oneshot::channel();
+        let (replacement_deleted_tx, replacement_deleted_rx) = oneshot::channel();
+        let gateway_task = tokio::spawn(async move {
+            let mut grants = 0_u8;
+            let mut first_deleted_tx = Some(first_deleted_tx);
+            let mut replacement_deleted_tx = Some(replacement_deleted_tx);
+            loop {
+                let (stream, request) = receive_upnp_request(&listener).await;
+                if request.contains("#GetExternalIPAddress\"") {
+                    respond_upnp(
+                        stream,
+                        "GetExternalIPAddressResponse",
+                        "<NewExternalIPAddress>198.51.100.10</NewExternalIPAddress>",
+                    )
+                    .await;
+                } else if request.contains("#AddPortMapping\"") {
+                    assert!(
+                        request
+                            .contains(&format!("<NewExternalPort>{first_port}</NewExternalPort>"))
+                    );
+                    // A transient connection failure does not remove the
+                    // already confirmed first lease. The client falls back to
+                    // requesting another port.
+                    drop(stream);
+                } else if request.contains("#AddAnyPortMapping\"") {
+                    let port = if grants == 0 {
+                        first_port
+                    } else {
+                        replacement_port
+                    };
+                    grants += 1;
+                    respond_upnp(
+                        stream,
+                        "AddAnyPortMappingResponse",
+                        &format!("<NewReservedPort>{port}</NewReservedPort>"),
+                    )
+                    .await;
+                } else if request.contains("#DeletePortMapping\"") {
+                    if request.contains(&format!("<NewExternalPort>{first_port}</NewExternalPort>"))
+                    {
+                        let _ = first_deleted_tx.take().unwrap().send(());
+                    } else if request.contains(&format!(
+                        "<NewExternalPort>{replacement_port}</NewExternalPort>"
+                    )) {
+                        let _ = replacement_deleted_tx.take().unwrap().send(());
+                    } else {
+                        panic!("unexpected UPnP deletion request: {request}");
+                    }
+                    respond_upnp(stream, "DeletePortMappingResponse", "").await;
+                    if first_deleted_tx.is_none() && replacement_deleted_tx.is_none() {
+                        break;
+                    }
+                } else {
+                    panic!("unexpected UPnP request: {request}");
+                }
+            }
+            assert_eq!(grants, 2);
+        });
+
+        let first = mapping::Mapping::new_upnp(
+            Protocol::Udp,
+            local_ip,
+            local_port,
+            Some(gateway.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        let (_service_tx, service_rx) = mpsc::channel(SERVICE_CHANNEL_CAPACITY);
+        let (mut service, external) =
+            Service::new(Config::default(), service_rx, Default::default());
+        service.local_port = Some(local_port);
+        service.current_mapping.update(Some(first));
+
+        let replacement = mapping::Mapping::new_upnp(
+            Protocol::Udp,
+            local_ip,
+            local_port,
+            Some(gateway),
+            Some(first_port.try_into().unwrap()),
+        )
+        .await
+        .unwrap();
+        service.on_mapping_result(Ok(Ok(replacement))).await;
+        tokio::time::timeout(Duration::from_secs(1), first_deleted_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(external.borrow().unwrap().port(), replacement_port);
+
+        let (result_tx, result_rx) = oneshot::channel();
+        service.handle_msg(Message::Deactivate { result_tx }).await;
+        result_rx.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), replacement_deleted_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(external.borrow().is_none());
+        tokio::time::timeout(Duration::from_secs(1), gateway_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upnp_same_port_renewal_keeps_the_renewed_lease_active() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let gateway = upnp_test_gateway(listener.local_addr().unwrap());
+        let local_ip = Ipv4Addr::LOCALHOST;
+        let local_port = NonZeroU16::new(39_501).unwrap();
+        let external_port = 45_102_u16;
+        let (deleted_tx, mut deleted_rx) = oneshot::channel();
+        let gateway_task = tokio::spawn(async move {
+            let mut first_granted = false;
+            let mut renewed = false;
+            let mut deleted_tx = Some(deleted_tx);
+            loop {
+                let (stream, request) = receive_upnp_request(&listener).await;
+                if request.contains("#GetExternalIPAddress\"") {
+                    respond_upnp(
+                        stream,
+                        "GetExternalIPAddressResponse",
+                        "<NewExternalIPAddress>198.51.100.11</NewExternalIPAddress>",
+                    )
+                    .await;
+                } else if request.contains("#AddAnyPortMapping\"") {
+                    assert!(!first_granted);
+                    first_granted = true;
+                    respond_upnp(
+                        stream,
+                        "AddAnyPortMappingResponse",
+                        &format!("<NewReservedPort>{external_port}</NewReservedPort>"),
+                    )
+                    .await;
+                } else if request.contains("#AddPortMapping\"") {
+                    assert!(first_granted);
+                    assert!(!renewed);
+                    assert!(request.contains(&format!(
+                        "<NewExternalPort>{external_port}</NewExternalPort>"
+                    )));
+                    renewed = true;
+                    respond_upnp(stream, "AddPortMappingResponse", "").await;
+                } else if request.contains("#DeletePortMapping\"") {
+                    assert!(renewed);
+                    assert!(request.contains(&format!(
+                        "<NewExternalPort>{external_port}</NewExternalPort>"
+                    )));
+                    let _ = deleted_tx.take().unwrap().send(());
+                    respond_upnp(stream, "DeletePortMappingResponse", "").await;
+                    break;
+                } else {
+                    panic!("unexpected UPnP request: {request}");
+                }
+            }
+        });
+
+        let first = mapping::Mapping::new_upnp(
+            Protocol::Udp,
+            local_ip,
+            local_port,
+            Some(gateway.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        let (_service_tx, service_rx) = mpsc::channel(SERVICE_CHANNEL_CAPACITY);
+        let (mut service, external) =
+            Service::new(Config::default(), service_rx, Default::default());
+        service.local_port = Some(local_port);
+        service.current_mapping.update(Some(first));
+
+        let renewed = mapping::Mapping::new_upnp(
+            Protocol::Udp,
+            local_ip,
+            local_port,
+            Some(gateway),
+            Some(external_port.try_into().unwrap()),
+        )
+        .await
+        .unwrap();
+        service.on_mapping_result(Ok(Ok(renewed))).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut deleted_rx)
+                .await
+                .is_err(),
+            "same-port renewal deleted the active lease"
+        );
+        assert_eq!(external.borrow().unwrap().port(), external_port);
+
+        let (result_tx, result_rx) = oneshot::channel();
+        service.handle_msg(Message::Deactivate { result_tx }).await;
+        result_rx.await.unwrap().unwrap();
+        deleted_rx.await.unwrap();
+        assert!(external.borrow().is_none());
+        tokio::time::timeout(Duration::from_secs(1), gateway_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upnp_superseded_release_failure_is_reported_after_active_cleanup() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let gateway = upnp_test_gateway(listener.local_addr().unwrap());
+        let local_ip = Ipv4Addr::LOCALHOST;
+        let local_port = NonZeroU16::new(39_502).unwrap();
+        let first_port = 45_103_u16;
+        let replacement_port = 45_104_u16;
+        let (replacement_deleted_tx, replacement_deleted_rx) = oneshot::channel();
+        let gateway_task = tokio::spawn(async move {
+            let mut grants = 0_u8;
+            let mut replacement_deleted_tx = Some(replacement_deleted_tx);
+            loop {
+                let (stream, request) = receive_upnp_request(&listener).await;
+                if request.contains("#GetExternalIPAddress\"") {
+                    respond_upnp(
+                        stream,
+                        "GetExternalIPAddressResponse",
+                        "<NewExternalIPAddress>198.51.100.12</NewExternalIPAddress>",
+                    )
+                    .await;
+                } else if request.contains("#AddPortMapping\"") {
+                    drop(stream);
+                } else if request.contains("#AddAnyPortMapping\"") {
+                    let port = if grants == 0 {
+                        first_port
+                    } else {
+                        replacement_port
+                    };
+                    grants += 1;
+                    respond_upnp(
+                        stream,
+                        "AddAnyPortMappingResponse",
+                        &format!("<NewReservedPort>{port}</NewReservedPort>"),
+                    )
+                    .await;
+                } else if request.contains("#DeletePortMapping\"")
+                    && request.contains(&format!("<NewExternalPort>{first_port}</NewExternalPort>"))
+                {
+                    // Losing the response makes cleanup incomplete. The
+                    // service must remember that failure while continuing to
+                    // own and release the replacement lease.
+                    drop(stream);
+                } else if request.contains("#DeletePortMapping\"")
+                    && request.contains(&format!(
+                        "<NewExternalPort>{replacement_port}</NewExternalPort>"
+                    ))
+                {
+                    let _ = replacement_deleted_tx.take().unwrap().send(());
+                    respond_upnp(stream, "DeletePortMappingResponse", "").await;
+                    break;
+                } else {
+                    panic!("unexpected UPnP request: {request}");
+                }
+            }
+        });
+
+        let first = mapping::Mapping::new_upnp(
+            Protocol::Udp,
+            local_ip,
+            local_port,
+            Some(gateway.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        let (_service_tx, service_rx) = mpsc::channel(SERVICE_CHANNEL_CAPACITY);
+        let (mut service, external) =
+            Service::new(Config::default(), service_rx, Default::default());
+        service.local_port = Some(local_port);
+        service.current_mapping.update(Some(first));
+        let replacement = mapping::Mapping::new_upnp(
+            Protocol::Udp,
+            local_ip,
+            local_port,
+            Some(gateway),
+            Some(first_port.try_into().unwrap()),
+        )
+        .await
+        .unwrap();
+        service.on_mapping_result(Ok(Ok(replacement))).await;
+
+        let (result_tx, result_rx) = oneshot::channel();
+        service.handle_msg(Message::Deactivate { result_tx }).await;
+        let error = result_rx.await.unwrap().unwrap_err();
+        assert!(error.contains("UPnP mapping failed"));
+        tokio::time::timeout(Duration::from_secs(1), replacement_deleted_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(external.borrow().is_none());
+        tokio::time::timeout(Duration::from_secs(1), gateway_task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

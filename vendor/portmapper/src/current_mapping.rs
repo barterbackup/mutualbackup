@@ -165,6 +165,10 @@ impl<M: Mapping> CurrentMapping<M> {
             .as_ref()
             .map(|mapping| mapping.mapping.external())
     }
+
+    pub(crate) fn mapping(&self) -> Option<&M> {
+        self.mapping.as_ref().map(|mapping| &mapping.mapping)
+    }
 }
 
 impl<M: Mapping> n0_future::Stream for CurrentMapping<M> {

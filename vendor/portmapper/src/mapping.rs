@@ -38,6 +38,17 @@ pub enum Error {
 }
 
 impl Mapping {
+    /// Whether two handles refer to the same gateway lease. Replacing a handle
+    /// after renewal must not delete the lease that the new handle represents.
+    pub(crate) fn same_lease(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Upnp(left), Self::Upnp(right)) => left.same_lease(right),
+            (Self::Pcp(left), Self::Pcp(right)) => left.same_lease(right),
+            (Self::NatPmp(left), Self::NatPmp(right)) => left.same_lease(right),
+            _ => false,
+        }
+    }
+
     /// Create a new PCP mapping.
     pub(crate) async fn new_pcp(
         protocol: Protocol,
