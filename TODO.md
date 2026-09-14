@@ -1,5 +1,33 @@
 # Product TODO
 
+## Milestone 3 closure blocker
+
+- **P2 — Keep the mapper responsive while releasing a superseded UPnP lease.**
+  Source review of `44287d8..0f36708` found that `8fe9eb4` awaits
+  `Service::on_mapping_result` inside the service event loop
+  (`vendor/portmapper/src/lib.rs:577`). After publishing replacement lease B,
+  that method awaits deletion of superseded lease A (`lib.rs:629–632`).
+  `upnp::Mapping::release` and the pinned `igd-next` 0.17.1 Tokio HTTP path have
+  no response/body deadline. If the gateway accepts A's deletion request but
+  leaves its response incomplete, the service stops processing commands and
+  polling B's renewal/expiry clock. B can expire at the gateway while its
+  address remains advertised indefinitely; the product retries only when no
+  mapping is installed (`crates/mb-node/src/network/port_mapping.rs:120`).
+  The daemon's ten-second shutdown deadline reports incomplete cleanup, but
+  cannot prevent this live outage or make the queued deactivation attempt B's
+  deletion. Bound superseded deletion and retain its failure for acknowledged
+  deactivation, or supervise owned cleanup while continuing to process the
+  active lease and commands. Preserve same-lease renewal and cleanup ownership;
+  do not restore detached cleanup or false-success acknowledgements. Add a
+  local UPnP regression through the running service that grants A then B and
+  holds A's deletion response open: prove B still renews or expires and is
+  withdrawn, deactivation attempts B's deletion within its deadline, and
+  unresolved A cleanup is reported. The cleanup-error regression returns an
+  immediate error for A and calls the handlers sequentially, so it misses this
+  schedule.
+  Re-run the relevant local regression and Milestone 3 gates after correction;
+  this review used source only and ran no builds or tests.
+
 ## Later guild geometry and coding protocol
 
 - Treat failure domain as a human-supplied correlation claim, never a generated

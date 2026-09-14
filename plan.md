@@ -60,11 +60,13 @@ them as ADRs and test vectors before promising wire compatibility.
 
 The first usable architectural prototype and the Milestone 2
 operator-configuration and identity-state slice have passed their review gates.
-The Milestone 3 robust-connectivity beta has passed its closure gate. Its final
-corrective follow-up adopts a healthy preferred connection before declaring a
-selected fallback dial exhausted and releases a distinct gateway lease
-superseded by renewal while preserving a same-lease refresh. Milestone 4 is
-next.
+The Milestone 3 robust-connectivity beta is reopened for one gateway lifecycle
+blocker found in source review of `44287d8..0f36708`. The latest corrective
+follow-up adopts a healthy preferred connection before declaring a selected
+fallback dial exhausted and distinguishes a superseded gateway lease from a
+same-lease refresh. However, waiting for superseded UPnP deletion can freeze
+the mapper's active lease and command processing. Close the blocker in
+`TODO.md` before starting Milestone 4.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -116,7 +118,9 @@ cleanup instead of acknowledging work that runtime teardown would cancel.
 The closing corrective pass also recovers queued logical requests through an
 already established preferred connection when their final fallback dial fails,
 and retains cleanup responsibility for every distinct lease replaced during
-gateway renewal.
+gateway renewal. The latest source review found that this replacement cleanup
+can block the mapper indefinitely when a UPnP deletion response stalls; the
+active replacement then stops renewing or expiring locally.
 
 Milestone 3 adds an embedded, seed-bound Arti v3 onion transport to the same
 libp2p swarm, signed onion discovery and peer exchange, explicit transport
@@ -468,10 +472,11 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 3 have passed, and Milestone 4
-is next. Later wire or durable-state changes require the review and gate of the
-milestone that owns them. Build and run all subsequent validation locally; do
-not use a remote compilation server.
+than a daemon prerequisite. Milestones 0 through 2 have passed; Milestone 3 is
+reopened for the gateway lifecycle blocker in `TODO.md`. Later wire or
+durable-state changes require the review and gate of the milestone that owns
+them. Build and run all subsequent validation locally; do not use a remote
+compilation server.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -684,7 +689,8 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 3 are passed. Milestone 4 is next.
+**Current position:** Milestones 0 through 2 are passed. Milestone 3 is reopened
+for one gateway lifecycle blocker; Milestone 4 waits for its closure.
 Milestone 3 puts policy at the composed transport boundary, provides Arti onion
 service and dialing, DHT endpoint exchange, direct/relay/DCUtR/onion telemetry,
 optional gateway mapping, and real acceptance environments. An earlier
@@ -706,6 +712,12 @@ The closing follow-up in `1b08b03` and `8fe9eb4` adopts a healthy established
 preferred connection before final-tier dial exhaustion rejects queued callers,
 and distinguishes same-lease renewal from replacement so every distinct
 superseded gateway lease is released and cleanup errors reach deactivation.
+Source review of `44287d8..0f36708` confirms the dial-recovery correction, but
+finds that `8fe9eb4` awaits superseded UPnP deletion inside the mapper event
+loop. An incomplete deletion response stops active-lease renewal, expiry, and
+command handling. Record and close this P2 blocker in `TODO.md`, including a
+running-service regression for the stalled-response schedule, before declaring
+Milestone 3 passed again. This review ran no builds or tests.
 
 The locked workspace, disposable-Btrfs/reflink and isolated IP/NAT gates, mixed
 DHT policy and three-tier fallback regressions, custom Arti-state restart, real
@@ -832,7 +844,7 @@ replaced by isolated network namespaces and port-preserving NAT without
 disabling production discovery. The final source-only review found no new
 high-confidence Milestone 2 defect, and the full remote gate passed.
 
-### Milestone 3 — Tor and robust connectivity beta (passed)
+### Milestone 3 — Tor and robust connectivity beta (reopened)
 
 - ADR 0001 pins and source-reviews Arti 0.46.0 and defines the transport,
   identity-key, onion-service-key, discovery, policy, and cache lifecycle
@@ -861,7 +873,8 @@ promotion and rollback, custom Arti state paths, supervised
 locked/startup/runtime process shutdown, initial endpoint canonicalization and
 bounds, and a real gateway mapper that waits for its active lease and an
 in-flight acquisition, releases distinct superseded leases, and reports
-incomplete cleanup before acknowledging deactivation.
+cleanup errors on deactivation. Superseded-lease cleanup still needs the
+responsiveness correction described below.
 Corrective passes also closed the established-preferred/fallback-close and
 equal-tier duplicate-retirement races, the saturated mapper-command-queue
 cleanup race, stale transport-tier state after ephemeral endpoint expiry or
@@ -886,7 +899,7 @@ task, releases any mapping it returns, and cannot report success while that
 acquisition remains unresolved. Its regression models a granted mapping across
 the daemon's bounded wait and actual Tokio runtime teardown.
 
-The closing corrective follow-up handles the remaining dial and renewal
+The latest corrective follow-up handles the previously reported dial and renewal
 schedules. A final-tier `OutgoingConnectionError` now adopts the best healthy
 preferred connection before deciding that transports are exhausted; its
 regression preserves the signed logical request, dispatches it on that exact
@@ -897,15 +910,32 @@ release failure into acknowledged deactivation. Local UPnP regressions cover a
 failed preferred-port renewal that replaces A with B, same-port renewal, and
 cleanup-error propagation after the active replacement is released.
 
+The remaining P2 blocker is a stalled superseded-lease deletion. After
+publishing replacement B, `Service::on_mapping_result` awaits deletion of A
+inside `Service::run`; the UPnP HTTP response/body wait has no deadline. While
+that response remains incomplete, the service cannot poll B's renewal or
+expiry, leaving an expired endpoint advertised, or process deactivation to
+release B. The daemon's outer shutdown deadline reports failure but does not
+protect normal operation. Bound deletion while retaining cleanup errors, or
+supervise owned cleanup concurrently with lease and command processing. The
+closure regression must exercise the running service with A's deletion
+response held open, prove B's renewal or expiry/withdrawal remains live, and
+prove deactivation attempts B's release within its deadline while reporting
+unresolved A cleanup. Preserve the existing same-lease and acquisition-cleanup
+regressions. `TODO.md` records the actionable finding.
+
 The locked workspace tests and clippy, forced-local static Nix build, Docker
 controller safety suite, disposable-Btrfs and multi-process recovery suites,
 isolated network and gateway-mapping tests, private-Tor onion-only five-daemon
 recovery, and no-build Docker/Btrfs erase-and-seed recovery all passed locally
 on 2026-09-14 after these corrections. No remote compilation server was used.
+Those results precede this source-only finding and do not close its untested
+stalled-response schedule. Correct the blocker and repeat the relevant local
+regression and closure gates before marking Milestone 3 passed.
 
 ### Milestone 4 — durable operations and multi-volume storage beta
 
-This follows the passed Milestone 3 gate.
+This follows closure of the reopened Milestone 3 gate.
 
 - Add writer-incarnation fencing before supporting concurrent loss/recovery;
   then add retention and tombstones, safe GC, audits/scrubs, repair and emergency
