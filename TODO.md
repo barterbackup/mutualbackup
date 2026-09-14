@@ -1,5 +1,43 @@
 # Product TODO
 
+## Milestone 3 corrective follow-up — required before Milestone 4
+
+Source-only review of `5b4b486..01bcce1` confirms the two previous fixes but
+finds two remaining blockers in the surrounding connectivity lifecycle. No
+builds, tests, or acceptance environments were run for this review.
+
+- **P2 — use a healthy preferred connection before declaring dial exhaustion.**
+  In `crates/mb-node/src/network/p2p.rs:4282`, `OutgoingConnectionError` checks
+  only for a healthy connection at the failed selected tier before advancing
+  fallback or failing queued requests. In `auto` mode, let a request wait for
+  a Tor tier-2 dial while an inbound direct connection or preferred probe
+  establishes at tier 0. `observe_established_transport` schedules a 500 ms
+  promotion and leaves tier 2 selected. If the Tor dial fails during that
+  grace, no later tier exists and `fail_queued_requests` rejects the caller
+  despite the healthy direct connection. The failed dial produces no later
+  `ConnectionClosed` event to reconcile selection. Adopt a healthy established
+  replacement before deciding the selected dial exhausted all transports.
+  Regress preferred establishment followed by final-tier dial failure before
+  promotion, with queued logical requests; assert they retain their signed
+  bytes, dispatch on the healthy connection, and complete successfully.
+- **P2 — retain and release distinct gateway leases superseded by renewal.**
+  In `vendor/portmapper/src/lib.rs:620`, `on_mapping_result` discards the old
+  `Mapping` returned by `CurrentMapping::update`. UPnP renewal in
+  `vendor/portmapper/src/upnp.rs:100` falls back from the preferred external
+  port to `add_any_port` after any allocation error. An existing two-hour
+  lease can reach its one-hour renewal, encounter a transient connection
+  reset on the preferred-port request, and successfully acquire another port
+  while the original confirmed lease remains live. Replacement drops its
+  cleanup handle; subsequent deactivation deletes only the new lease and
+  acknowledges success, leaving the original until expiry. Distinguish a
+  renewal of the same lease from a distinct replacement, retain ownership of
+  superseded leases until release, and report cleanup failures. Do not delete
+  a successfully renewed lease merely because its old handle was replaced.
+  Regress a local UPnP gateway retaining port A after a failed preferred-port
+  renewal and granting port B: replacement must delete A, deactivation must
+  delete B, and successful cleanup must leave neither. Include same-port
+  renewal to verify the active lease survives replacement of its handle.
+
 ## Later guild geometry and coding protocol
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
