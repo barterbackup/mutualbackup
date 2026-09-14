@@ -3253,6 +3253,23 @@ impl P2pEventLoop {
         self.retire_non_policy_connections(peer);
     }
 
+    fn adopt_best_healthy_transport(&mut self, peer: PeerId) -> bool {
+        let selected = self.selected_transport_tier(peer);
+        let Some(best) = self.best_healthy_connection_tier(peer) else {
+            return false;
+        };
+        if best > selected {
+            return false;
+        }
+        if best < selected {
+            self.transport_promotions.remove(&peer);
+            self.set_transport_tier(peer, best);
+        }
+        self.retire_non_policy_connections(peer);
+        self.reconcile_duplicate_sessions(peer);
+        true
+    }
+
     fn restore_selected_transport_after_close(
         &mut self,
         peer: PeerId,
@@ -3280,15 +3297,7 @@ impl P2pEventLoop {
         // session left to protect with the promotion grace, so adopt the best
         // healthy established tier instead of redialing a worse endpoint and
         // leaving requests queued behind it.
-        if let Some(best) = self.best_healthy_connection_tier(peer)
-            && best <= selected
-        {
-            if best < selected {
-                self.transport_promotions.remove(&peer);
-                self.set_transport_tier(peer, best);
-            }
-            self.retire_non_policy_connections(peer);
-            self.reconcile_duplicate_sessions(peer);
+        if self.adopt_best_healthy_transport(peer) {
             return;
         }
 
@@ -4282,13 +4291,21 @@ impl P2pEventLoop {
                     if dial.kind == PolicyDialKind::Selected
                         && self.selected_transport_tier(dial.peer) == dial.tier
                         && !self.healthy_connection_at_tier(dial.peer, dial.tier, None)
-                        && !self.activate_fallback(dial.peer)
-                        && self.has_outstanding_request(dial.peer)
                     {
-                        self.fail_queued_requests(
-                            dial.peer,
-                            "libp2p exhausted every configured transport tier",
-                        );
+                        // A preferred probe can establish while the selected
+                        // fallback dial is still pending. If that dial then
+                        // fails during promotion grace, it has no later close
+                        // event that could reconcile the usable connection.
+                        let recovered = self.adopt_best_healthy_transport(dial.peer);
+                        if !recovered
+                            && !self.activate_fallback(dial.peer)
+                            && self.has_outstanding_request(dial.peer)
+                        {
+                            self.fail_queued_requests(
+                                dial.peer,
+                                "libp2p exhausted every configured transport tier",
+                            );
+                        }
                     }
                     self.drain_queued_requests(dial.peer);
                     self.forget_transport_selection_if_unretained(dial.peer);
@@ -8607,6 +8624,76 @@ mod tests {
 
         drop(event_loop);
         assert!(call.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn final_fallback_dial_failure_uses_an_established_preferred_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([113; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        event_loop.tor_mode = TorMode::Auto;
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([114; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        for address in [
+            format!("/ip4/192.0.2.113/udp/44000/quic-v1/p2p/{peer}")
+                .parse()
+                .unwrap(),
+            onion_listener_address(target).unwrap(),
+        ] {
+            event_loop.add_learned_address(peer, address).unwrap();
+        }
+        event_loop.set_transport_tier(peer, 2);
+
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(target, PeerRequest::Profile).await }
+        });
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+        assert_eq!(event_loop.queued_requests.len(), 1);
+        let signed_request =
+            canonical_bytes(&event_loop.queued_requests.front().unwrap().request).unwrap();
+        let tor_dial = event_loop
+            .policy_dials
+            .iter()
+            .find_map(|(connection, dial)| {
+                (dial.peer == peer && dial.tier == 2 && dial.kind == PolicyDialKind::Selected)
+                    .then_some(*connection)
+            })
+            .unwrap();
+
+        let direct = ConnectionId::new_unchecked(814);
+        event_loop
+            .connection_paths
+            .insert(direct, (peer, P2pPath::Direct));
+        register_request_connection(&mut event_loop, peer, direct);
+        event_loop.observe_established_transport(peer, direct);
+        event_loop.drain_queued_requests(peer);
+        assert_eq!(event_loop.selected_transport_tier(peer), 2);
+        assert_eq!(event_loop.transport_promotions[&peer].tier, 0);
+        assert_eq!(event_loop.queued_requests.len(), 1);
+        assert!(!call.is_finished());
+
+        event_loop.handle_swarm_event(SwarmEvent::OutgoingConnectionError {
+            connection_id: tor_dial,
+            peer_id: Some(peer),
+            error: libp2p::swarm::DialError::Aborted,
+        });
+
+        assert_eq!(event_loop.selected_transport_tier(peer), 0);
+        assert!(!event_loop.transport_promotions.contains_key(&peer));
+        assert!(event_loop.queued_requests.is_empty());
+        assert_eq!(next_request_dispatch(&mut event_loop).await, direct);
+        let outbound = *event_loop.pending_requests.keys().next().unwrap();
+        assert_eq!(
+            canonical_bytes(&event_loop.pending_requests[&outbound].request).unwrap(),
+            signed_request
+        );
+        let mut completed = event_loop.pending_requests.remove(&outbound).unwrap();
+        completed.finish(Ok(PeerResponse::Ack));
+        assert!(matches!(call.await.unwrap().unwrap(), PeerResponse::Ack));
     }
 
     #[tokio::test]
