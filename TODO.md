@@ -1,47 +1,5 @@
 # Product TODO
 
-## Milestone 3 corrective follow-up — required before Milestone 4
-
-Source-only review of `7d3946e..baee214` found two remaining blockers in the
-recent fixes and their surrounding lifecycle. No builds, tests, or acceptance
-environments were run for this review.
-
-- **P2 — preserve a healthy preferred selection after a fallback request fails.**
-  In `crates/mb-node/src/network/p2p.rs:4503`, `OutboundFailure` may call
-  `activate_fallback` whenever the current tier is less than or equal to the
-  failed attempt's tier. In `auto` mode, let a request use Tor at tier 2 while
-  a healthy direct probe at tier 0 awaits promotion. If Tor closes during the
-  promotion grace, `ConnectionClosed` adopts the direct connection through
-  `restore_selected_transport_after_close` (line 4269). The subsequent terminal
-  request failure checks for a duplicate at the old tier 2, then advances the
-  newly selected tier 0 back to a retained fallback address. There is no later
-  close event for that connection to repair this selection. If the fallback
-  dial fails before the 30-second preferred retry, `OutgoingConnectionError`
-  can fail the queued caller despite the healthy direct session. The new
-  timeout-before-close reconciliation can also immediately undo its own
-  preferred selection through this guard. Base retry/fallback advancement on
-  the reconciled selection and preserve a healthy replacement at a better
-  tier. Regress both close-before-failure and timeout-before-close with an
-  in-flight fallback request, an established preferred probe, and concurrent
-  terminal failures; assert the same signed request uses the healthy survivor.
-- **P2 — retain gateway cleanup ownership through daemon runtime shutdown.**
-  In `vendor/portmapper/src/lib.rs:562`, the five-second acquisition-settlement
-  timeout detaches a cleanup task and returns success. `run_port_mapping`
-  accepts that acknowledgement, and `cmd/mutualbackup/src/bin/mutualbackupd.rs`
-  joins only the mapper wrapper before returning from its Tokio runtime. A
-  UPnP gateway can already have installed the requested two-hour lease while
-  its allocation response remains pending beyond that timeout; the allocation
-  awaits in `vendor/portmapper/src/upnp.rs` have no request timeout. Runtime
-  teardown then cancels both the acquisition and its detached compensating
-  release, leaving the lease behind after reported successful withdrawal.
-  This affects initial acquisition and renewal that allocates a different
-  external port. Give pending cleanup an owner drained by daemon shutdown, or
-  use explicit cancellation/grant handling and report incomplete cleanup when
-  settlement cannot finish. Regress shutdown with a delayed allocation
-  response and actual runtime teardown. The new stalled-renewal regression
-  keeps Tokio alive after deactivation succeeds, so it only proves survival
-  after service drop. Preserve the corrected active-lease-first deletion.
-
 ## Later guild geometry and coding protocol
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
