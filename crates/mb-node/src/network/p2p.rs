@@ -4500,8 +4500,13 @@ impl P2pEventLoop {
                         self.forget_transport_selection_if_unretained(request_peer);
                         return;
                     }
+                    // ConnectionClosed or the quarantine above may already
+                    // have selected a healthy replacement at a better tier.
+                    // Advance only if reconciliation left this request on the
+                    // tier that actually failed; otherwise retry the recovered
+                    // selection instead of walking back toward the failure.
                     let advanced = !healthy_duplicate
-                        && self.selected_transport_tier(peer) <= attempted_tier
+                        && self.selected_transport_tier(peer) == attempted_tier
                         && self.activate_fallback(peer);
                     let selected_tier = self.selected_transport_tier(peer);
                     if healthy_duplicate || advanced || selected_tier != attempted_tier {
@@ -8246,6 +8251,146 @@ mod tests {
         assert!(!event_loop.connection_paths.contains_key(&selected));
         assert!(event_loop.queued_requests.is_empty());
         assert_eq!(event_loop.pending_requests.len(), 1);
+        let retried = event_loop.pending_requests.values().next().unwrap();
+        assert_eq!(canonical_bytes(&retried.request).unwrap(), signed_request);
+        assert_eq!(retried.attempts, 2);
+        assert!(!call.is_finished());
+
+        drop(event_loop);
+        assert!(call.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_fallback_request_retries_an_established_preferred_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([109; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        event_loop.tor_mode = TorMode::Auto;
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([110; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        let direct_address: Multiaddr = format!("/ip4/192.0.2.109/udp/44000/quic-v1/p2p/{peer}")
+            .parse()
+            .unwrap();
+        let tor_address = onion_listener_address(target).unwrap();
+        for address in [direct_address.clone(), tor_address.clone()] {
+            event_loop.add_learned_address(peer, address).unwrap();
+        }
+        event_loop.set_transport_tier(peer, 2);
+
+        let tor = ConnectionId::new_unchecked(810);
+        event_loop
+            .connection_paths
+            .insert(tor, (peer, P2pPath::Tor));
+        register_request_connection(&mut event_loop, peer, tor);
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(target, PeerRequest::Profile).await }
+        });
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+        assert_eq!(next_request_dispatch(&mut event_loop).await, tor);
+        let outbound = *event_loop.pending_requests.keys().next().unwrap();
+        let signed_request =
+            canonical_bytes(&event_loop.pending_requests[&outbound].request).unwrap();
+
+        let direct = ConnectionId::new_unchecked(811);
+        event_loop
+            .connection_paths
+            .insert(direct, (peer, P2pPath::Direct));
+        register_request_connection(&mut event_loop, peer, direct);
+        event_loop.observe_established_transport(peer, direct);
+        assert_eq!(event_loop.transport_promotions[&peer].tier, 0);
+
+        // Swarm publishes ConnectionClosed before request-response emits the
+        // corresponding terminal request failure.
+        event_loop.handle_swarm_event(SwarmEvent::ConnectionClosed {
+            peer_id: peer,
+            connection_id: tor,
+            endpoint: ConnectedPoint::Dialer {
+                address: tor_address,
+                role_override: Endpoint::Dialer,
+                port_use: PortUse::Reuse,
+            },
+            num_established: 1,
+            cause: None,
+        });
+        assert_eq!(event_loop.selected_transport_tier(peer), 0);
+        assert!(!event_loop.transport_promotions.contains_key(&peer));
+
+        event_loop.handle_peer_event(request_response::Event::OutboundFailure {
+            peer,
+            connection_id: tor,
+            request_id: outbound,
+            error: request_response::OutboundFailure::ConnectionClosed,
+        });
+
+        assert_eq!(event_loop.selected_transport_tier(peer), 0);
+        assert_eq!(next_request_dispatch(&mut event_loop).await, direct);
+        let retried = event_loop.pending_requests.values().next().unwrap();
+        assert_eq!(canonical_bytes(&retried.request).unwrap(), signed_request);
+        assert_eq!(retried.attempts, 2);
+        assert!(!call.is_finished());
+
+        drop(event_loop);
+        assert!(call.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn timed_out_fallback_request_keeps_a_recovered_preferred_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([111; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local_seed).unwrap()));
+        let (client, mut event_loop) = build_p2p(node, config(local_id)).unwrap();
+        event_loop.tor_mode = TorMode::Auto;
+        let target = KeyMaterial::from_seed(&Seed::from_bytes([112; 32])).node_id();
+        let peer = target.libp2p_peer_id().unwrap();
+        for address in [
+            format!("/ip4/192.0.2.111/udp/44000/quic-v1/p2p/{peer}")
+                .parse()
+                .unwrap(),
+            onion_listener_address(target).unwrap(),
+        ] {
+            event_loop.add_learned_address(peer, address).unwrap();
+        }
+        event_loop.set_transport_tier(peer, 2);
+
+        let tor = ConnectionId::new_unchecked(812);
+        event_loop
+            .connection_paths
+            .insert(tor, (peer, P2pPath::Tor));
+        register_request_connection(&mut event_loop, peer, tor);
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.call(target, PeerRequest::Profile).await }
+        });
+        let command = event_loop.commands.recv().await.unwrap();
+        event_loop.handle_command(command).unwrap();
+        assert_eq!(next_request_dispatch(&mut event_loop).await, tor);
+        let outbound = *event_loop.pending_requests.keys().next().unwrap();
+        let signed_request =
+            canonical_bytes(&event_loop.pending_requests[&outbound].request).unwrap();
+
+        let direct = ConnectionId::new_unchecked(813);
+        event_loop
+            .connection_paths
+            .insert(direct, (peer, P2pPath::Direct));
+        register_request_connection(&mut event_loop, peer, direct);
+        event_loop.observe_established_transport(peer, direct);
+        assert_eq!(event_loop.transport_promotions[&peer].tier, 0);
+
+        event_loop.handle_peer_event(request_response::Event::OutboundFailure {
+            peer,
+            connection_id: tor,
+            request_id: outbound,
+            error: request_response::OutboundFailure::Timeout,
+        });
+
+        assert_eq!(event_loop.selected_transport_tier(peer), 0);
+        assert!(!event_loop.connection_paths.contains_key(&tor));
+        assert_eq!(next_request_dispatch(&mut event_loop).await, direct);
         let retried = event_loop.pending_requests.values().next().unwrap();
         assert_eq!(canonical_bytes(&retried.request).unwrap(), signed_request);
         assert_eq!(retried.attempts, 2);
