@@ -48,7 +48,7 @@ and their regression gates before advancing to Milestone 5.
   treat missing evidence conservatively. Inject this interruption, edit the
   source, reopen/retry, and verify the root stays dirty until a new capture
   includes the edit.
-- [ ] **M4-05 / P1 — Use a verified emergency copy of the requested shard.**
+- [x] **M4-05 / P1 — Use a verified emergency copy of the requested shard.**
   Audit reconstruction clears the target even when it already contains a
   verified emergency copy (`crates/mb-node/src/network/p2p.rs:6205`). With only
   indices {0,3,4} available and index 0 present only as an emergency copy, this
@@ -114,7 +114,7 @@ and their regression gates before advancing to Milestone 5.
   accept new writes after restart. Preserve retirement until explicit
   reactivation. Test the actual open-and-configure startup sequence with
   unchanged configuration, not only `StorageVolumes::open`.
-- [ ] **M4-12 / P2 — Complete emergency-copy cleanup across checkpoint changes.**
+- [x] **M4-12 / P2 — Complete emergency-copy cleanup across checkpoint changes.**
   Cleanup requires the copy's creation checkpoint to equal the latest hash
   (`crates/mb-node/src/node.rs:2441`), so advancing the checkpoint while keeping
   the group prevents cleanup after assigned protection returns. Separately,

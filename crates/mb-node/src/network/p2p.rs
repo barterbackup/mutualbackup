@@ -6202,12 +6202,16 @@ pub async fn audit_guild(
                 {
                     continue;
                 }
-                let mut reconstructed = shards.clone();
-                reconstructed[index] = None;
-                mb_core::reconstruct_3_2(&mut reconstructed)?;
-                let bytes = reconstructed[index]
-                    .take()
-                    .context("audit did not reconstruct the missing shard")?;
+                let bytes = match &shards[index] {
+                    Some(bytes) => bytes.clone(),
+                    None => {
+                        let mut reconstructed = shards.clone();
+                        mb_core::reconstruct_3_2(&mut reconstructed)?;
+                        reconstructed[index]
+                            .take()
+                            .context("audit did not reconstruct the missing shard")?
+                    }
+                };
                 let (assigned_holder, expected_root) = shard_holder_and_root(&group.roles[index]);
                 if sector_root(&bytes) != expected_root {
                     bail!("audit reconstruction failed the certified shard root");
@@ -6488,10 +6492,13 @@ async fn reconstruct_shard_from_peers(
             .map_err(|_| anyhow::anyhow!("shard holder health lock is poisoned"))?
             .clone();
         let mut candidates = Vec::new();
-        for (index, role) in group.roles.iter().enumerate() {
-            if index == target_index || shards[index].is_some() {
+        for index in std::iter::once(target_index)
+            .chain((0..group.roles.len()).filter(|index| *index != target_index))
+        {
+            if shards[index].is_some() {
                 continue;
             }
+            let role = &group.roles[index];
             let (holder, root, sector_id) = match role {
                 ShardRole::Information(information) => (
                     information.owner,
@@ -6582,10 +6589,13 @@ async fn reconstruct_shard_from_peers(
         }
     }
     if shards.iter().filter(|shard| shard.is_some()).count() < usize::from(V1_RS_DATA_SHARDS) {
-        for (index, role) in group.roles.iter().enumerate() {
-            if index == target_index || shards[index].is_some() {
+        for index in std::iter::once(target_index)
+            .chain((0..group.roles.len()).filter(|index| *index != target_index))
+        {
+            if shards[index].is_some() {
                 continue;
             }
+            let role = &group.roles[index];
             let (assigned, root) = shard_holder_and_root(role);
             for peer in roster.iter().filter(|peer| peer.member.node_id != assigned) {
                 let Ok(bytes) = fetch_audit_shard(
@@ -6602,6 +6612,9 @@ async fn reconstruct_shard_from_peers(
                     continue;
                 };
                 if bytes.len() == group.shard_size as usize && sector_root(&bytes) == root {
+                    if index == target_index {
+                        return Ok(bytes);
+                    }
                     shards[index] = Some(bytes);
                     break;
                 }
@@ -6619,6 +6632,9 @@ async fn reconstruct_shard_from_peers(
             hex::encode(group.id),
             SHARD_FETCH_ATTEMPTS
         );
+    }
+    if let Some(bytes) = shards[target_index].take() {
+        return Ok(bytes);
     }
     mb_core::reconstruct_3_2(&mut shards)?;
     shards[target_index]
@@ -11495,6 +11511,20 @@ mod tests {
             1
         );
 
+        let mut advanced = QuorumCheckpoint {
+            checkpoint: checkpoint.checkpoint.clone(),
+            signatures: Vec::new(),
+        };
+        advanced.checkpoint.generation = 2;
+        advanced.checkpoint.parent = Some(checkpoint.hash().unwrap());
+        for node in &nodes {
+            advanced.add_signature(node.lock().unwrap().keys()).unwrap();
+        }
+        advanced.verify().unwrap();
+        for node in &nodes {
+            node.lock().unwrap().store_checkpoint(&advanced).unwrap();
+        }
+
         nodes[1]
             .lock()
             .unwrap()
@@ -11523,6 +11553,17 @@ mod tests {
             .unwrap()
             .unwrap()
             .peers;
+        let rebuilt_emergency_target = reconstruct_shard_from_peers(
+            nodes[4].clone(),
+            &clients[4],
+            &group,
+            4,
+            &roster,
+            &Mutex::new(BTreeSet::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rebuilt_emergency_target, encoded[4]);
         let rebuilt = reconstruct_shard_from_peers(
             nodes[1].clone(),
             &clients[1],

@@ -2439,10 +2439,7 @@ impl Node {
         let mut removed = 0_u64;
         for (record_id, bytes) in self.control.records("emergency-shard")? {
             let marker: EmergencyShardRecord = decode_canonical(&bytes)?;
-            if marker.format_version != 1
-                || marker.checkpoint_hash != checkpoint_hash
-                || marker.group_id != group.id
-            {
+            if marker.format_version != 1 || marker.group_id != group.id {
                 continue;
             }
             let role = group
@@ -3013,13 +3010,29 @@ impl Node {
             }
             for (index, role) in group.roles.iter().enumerate() {
                 match role {
-                    ShardRole::Information(information) => self.schedule_garbage(
-                        "gc-sector",
-                        &information.sector.id,
-                        generation,
-                        checkpoint_hash,
-                        None,
-                    )?,
+                    ShardRole::Information(information) => {
+                        self.schedule_garbage(
+                            "gc-sector",
+                            &information.sector.id,
+                            generation,
+                            checkpoint_hash,
+                            None,
+                        )?;
+                        let emergency_id = parity_proof_id(&group.id, index as u8);
+                        if self
+                            .control
+                            .get_record("emergency-shard", &emergency_id)?
+                            .is_some()
+                        {
+                            self.schedule_garbage(
+                                "gc-parity",
+                                &emergency_id,
+                                generation,
+                                checkpoint_hash,
+                                Some(information.sector.root),
+                            )?;
+                        }
+                    }
                     ShardRole::Parity(parity) => self.schedule_garbage(
                         "gc-parity",
                         &parity_proof_id(&group.id, index as u8),
@@ -5698,6 +5711,58 @@ mod tests {
             .unwrap();
         let guild_id = retired.value.guild_id;
         let first = node.current_checkpoint(guild_id).unwrap().unwrap();
+        let first_hash = first.hash().unwrap();
+        let retired_group = first.checkpoint.coding_groups[0].clone();
+        let (retired_information_index, retired_information) = retired_group
+            .roles
+            .iter()
+            .enumerate()
+            .find_map(|(index, role)| match role {
+                ShardRole::Information(information)
+                    if information.owner == node.keys().node_id() =>
+                {
+                    Some((index as u8, information.clone()))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let retired_information_bytes = node.sector(&retired_information.sector.id).unwrap();
+        node.volumes
+            .store_repair(
+                &node.control,
+                &ParityObject {
+                    format_version: retired_group.format_version,
+                    guild_id,
+                    group_id: retired_group.id,
+                    shard_index: retired_information_index,
+                    root: retired_information.sector.root,
+                    bytes: retired_information_bytes,
+                },
+            )
+            .unwrap();
+        let retired_information_record =
+            parity_proof_id(&retired_group.id, retired_information_index);
+        node.control
+            .put_record(
+                "local-parity-proof",
+                &retired_information_record,
+                &canonical_bytes(&retired_group).unwrap(),
+            )
+            .unwrap();
+        node.control
+            .put_record(
+                "emergency-shard",
+                &retired_information_record,
+                &canonical_bytes(&EmergencyShardRecord {
+                    format_version: 1,
+                    checkpoint_hash: first_hash,
+                    group_id: retired_group.id,
+                    shard_index: retired_information_index,
+                    root: retired_information.sector.root,
+                })
+                .unwrap(),
+            )
+            .unwrap();
         let mut group = first.checkpoint.coding_groups[0].clone();
         let target_id = [196; 32];
         let plaintext = vec![42];
@@ -5815,6 +5880,16 @@ mod tests {
                 .is_none()
         );
         assert!(node.control.records("gc-sector").unwrap().is_empty());
+        assert!(
+            node.parity_for_guild(&guild_id, &retired_group.id, retired_information_index,)
+                .is_err()
+        );
+        assert!(
+            node.control
+                .get_record("emergency-shard", &retired_information_record)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
