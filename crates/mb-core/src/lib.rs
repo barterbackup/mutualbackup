@@ -22,9 +22,9 @@ pub use keys::{
 pub use model::{
     CodingGroup, CodingGroupId, EndpointRecord, GuildCheckpoint, GuildGenesis, GuildInvite,
     InformationRole, Member, MemberSignature, ModelError, ParityRole, QuorumCheckpoint,
-    QuorumGuildGenesis, RecoveryBundle, SectorId, SectorRef, ShardRole, SignedRecord,
-    StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision, WriterFence, canonical_bytes,
-    coding_group_id, decode_canonical,
+    QuorumGuildGenesis, RecoveryBundle, RevisionTombstone, SectorId, SectorRef, ShardRole,
+    SignedRecord, StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision, WriterFence,
+    canonical_bytes, coding_group_id, decode_canonical,
 };
 pub use recovery::{
     RecoveryCryptoError, RecoveryLocator, SealedRecoveryRecord, open_recovery_record,

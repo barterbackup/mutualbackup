@@ -66,6 +66,15 @@ pub struct WriterFence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RevisionTombstone {
+    pub owner: NodeId,
+    pub through_sequence: u64,
+    pub last_revision_id: Uuid,
+    pub last_revision_hash: [u8; 32],
+    pub retired_at_generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EndpointRecord {
     pub format_version: u16,
     pub publisher: NodeId,
@@ -221,6 +230,7 @@ pub struct GuildCheckpoint {
     pub parent: Option<[u8; 32]>,
     pub members: Vec<Member>,
     pub writer_fences: Vec<WriterFence>,
+    pub revision_tombstones: Vec<RevisionTombstone>,
     pub revisions: Vec<SignedRecord<UserRevision>>,
     pub coding_groups: Vec<CodingGroup>,
 }
@@ -239,7 +249,7 @@ pub struct QuorumCheckpoint {
 
 impl GuildCheckpoint {
     pub fn validate(&self) -> Result<(), ModelError> {
-        if self.format_version != 2
+        if self.format_version != 3
             || self.genesis_hash == [0; 32]
             || self.generation == 0
             || self.generation > i64::MAX as u64
@@ -297,6 +307,22 @@ impl GuildCheckpoint {
             }
             previous_fence = Some(order);
         }
+        let mut tombstones = std::collections::BTreeMap::<NodeId, &RevisionTombstone>::new();
+        let mut previous_tombstone = None;
+        for tombstone in &self.revision_tombstones {
+            if previous_tombstone.is_some_and(|previous| previous >= tombstone.owner)
+                || !member_ids.contains(&tombstone.owner)
+                || tombstone.through_sequence == 0
+                || tombstone.last_revision_id.is_nil()
+                || tombstone.last_revision_hash == [0; 32]
+                || tombstone.retired_at_generation < 2
+                || tombstone.retired_at_generation > self.generation
+                || tombstones.insert(tombstone.owner, tombstone).is_some()
+            {
+                return Err(ModelError::InvalidCheckpoint);
+            }
+            previous_tombstone = Some(tombstone.owner);
+        }
         for revision in &self.revisions {
             revision.verify(USER_REVISION_DOMAIN)?;
             revision.value.verify_writer()?;
@@ -327,8 +353,15 @@ impl GuildCheckpoint {
                     if previous_sequence.checked_add(1) == Some(revision.value.sequence)
                         && revision.value.parent == Some(*previous_hash)
                         && revision.value.writer_epoch >= *previous_writer_epoch => {}
-                None if revision.value.sequence == 1 && revision.value.parent.is_none() => {}
-                _ => return Err(ModelError::InvalidCheckpoint),
+                None => match tombstones.get(&revision.value.owner) {
+                    Some(tombstone)
+                        if tombstone.through_sequence.checked_add(1)
+                            == Some(revision.value.sequence)
+                            && revision.value.parent == Some(tombstone.last_revision_hash) => {}
+                    None if revision.value.sequence == 1 && revision.value.parent.is_none() => {}
+                    _ => return Err(ModelError::InvalidCheckpoint),
+                },
+                Some(_) => return Err(ModelError::InvalidCheckpoint),
             }
             for reference in revision
                 .value
@@ -362,6 +395,12 @@ impl GuildCheckpoint {
             if head_writer_epoch != latest {
                 return Err(ModelError::InvalidCheckpoint);
             }
+        }
+        if !tombstones
+            .keys()
+            .all(|owner| revision_heads.contains_key(owner))
+        {
+            return Err(ModelError::InvalidCheckpoint);
         }
 
         let mut group_ids = std::collections::BTreeSet::new();
@@ -1020,7 +1059,7 @@ mod tests {
         members.sort_by_key(|member| member.node_id);
         let mut checkpoint = QuorumCheckpoint {
             checkpoint: GuildCheckpoint {
-                format_version: 2,
+                format_version: 3,
                 guild_id,
                 genesis_hash: [10; 32],
                 generation: 1,
@@ -1031,6 +1070,7 @@ mod tests {
                     epoch: 1,
                     public_key: writer.verifying_key().to_bytes(),
                 }],
+                revision_tombstones: Vec::new(),
                 revisions: vec![revision],
                 coding_groups: vec![group],
             },
@@ -1132,6 +1172,31 @@ mod tests {
         chained.coding_groups.push(next_group);
         chained.coding_groups.sort_by_key(|group| group.id);
         chained.validate().unwrap();
+
+        let mut retained = chained.clone();
+        let retired = retained.revisions.remove(0);
+        retained.revision_tombstones.push(RevisionTombstone {
+            owner: retired.value.owner,
+            through_sequence: retired.value.sequence,
+            last_revision_id: retired.value.revision_id,
+            last_revision_hash: retired.value.hash().unwrap(),
+            retired_at_generation: 2,
+        });
+        let retained_sector = retained.revisions[0].value.metadata_sectors[0].id;
+        retained.coding_groups.retain(|group| {
+            group.roles.iter().any(|role| {
+                matches!(role, ShardRole::Information(information) if information.sector.id == retained_sector)
+            })
+        });
+        retained.generation = 2;
+        retained.parent = Some(checkpoint.hash().unwrap());
+        retained.validate().unwrap();
+        let mut forged_tombstone = retained.clone();
+        forged_tombstone.revision_tombstones[0].last_revision_hash = [99; 32];
+        assert!(matches!(
+            forged_tombstone.validate(),
+            Err(ModelError::InvalidCheckpoint)
+        ));
 
         let replacement_writer = SigningKey::from_bytes(&[78; 32]);
         let mut recovered = chained.clone();

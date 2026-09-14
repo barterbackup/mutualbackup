@@ -311,6 +311,50 @@ impl StorageVolumes {
         Err(DatabaseError::NotReady.into())
     }
 
+    pub(crate) fn remove_unreachable(
+        &mut self,
+        control: &ControlStore,
+        group_id: &[u8; 32],
+        shard_index: u8,
+        root: &[u8; 32],
+    ) -> Result<bool> {
+        let record_id = volume_object_id(group_id, shard_index);
+        if let Some(receipt) = self.receipt(control, group_id, shard_index)? {
+            let Some(volume) = self.volumes.get_mut(&receipt.volume_id) else {
+                return Ok(false);
+            };
+            let Some(store) = volume.store.as_mut() else {
+                return Ok(false);
+            };
+            match store.load_ready(group_id, shard_index) {
+                Ok(object) => {
+                    if object.root != *root {
+                        bail!("garbage-collection receipt conflicts with parity root");
+                    }
+                    store.remove_ready(group_id, shard_index, root)?;
+                }
+                Err(DatabaseError::NotReady) => {}
+                Err(error) => return Err(error.into()),
+            }
+            control.delete_record("volume-receipt", &record_id)?;
+            return Ok(true);
+        }
+        for volume in self.volumes.values_mut() {
+            let Some(store) = volume.store.as_mut() else {
+                continue;
+            };
+            match store.load_ready(group_id, shard_index) {
+                Ok(object) if object.root == *root => {
+                    store.remove_ready(group_id, shard_index, root)?;
+                }
+                Ok(_) => bail!("garbage-collection object has an unexpected parity root"),
+                Err(DatabaseError::NotReady) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn store(
         &mut self,
         control: &ControlStore,

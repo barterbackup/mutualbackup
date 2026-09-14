@@ -558,6 +558,7 @@ fn open_configured_node(
         config.parity_budget_bytes,
         config.effective_parity_headroom_bytes(),
     )?;
+    node.configure_retention(config.retention_revisions)?;
     Ok(node)
 }
 

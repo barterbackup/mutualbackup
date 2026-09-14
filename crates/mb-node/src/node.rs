@@ -29,6 +29,7 @@ use crate::snapshot::{
     prepare_revision, publish_owned_restore, reanchor_recovered_revision,
     reconcile_pending_captures, recovered_recipe_is_stable, render_sector,
     restore_revision_from_source, restore_signed_root_metadata_at, resume_restore_publication,
+    retire_revision_anchor,
 };
 use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open_control_store};
 
@@ -256,6 +257,20 @@ struct RootDirtyState {
     format_version: u16,
     dirty: bool,
     reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct RetentionPolicy {
+    format_version: u16,
+    revisions_per_owner: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct GarbageCandidate {
+    format_version: u16,
+    first_unreachable_generation: u64,
+    checkpoint_hash: [u8; 32],
+    parity_root: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -496,6 +511,7 @@ impl Node {
             volumes,
         };
         node.reconcile_certified_writer_head()?;
+        node.reconcile_garbage_collection()?;
         Ok(node)
     }
 
@@ -677,6 +693,35 @@ impl Node {
     ) -> Result<()> {
         self.volumes
             .configure(&self.control, paths, budget_bytes, headroom_bytes)
+    }
+
+    pub fn configure_retention(&self, revisions_per_owner: u32) -> Result<()> {
+        if revisions_per_owner == 0 || revisions_per_owner > 1_024 {
+            anyhow::bail!("retention must keep between 1 and 1024 revisions per owner");
+        }
+        self.control.put_record(
+            "node-config",
+            b"retention",
+            &canonical_bytes(&RetentionPolicy {
+                format_version: 1,
+                revisions_per_owner,
+            })?,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn retention_revisions(&self) -> Result<usize> {
+        let Some(bytes) = self.control.get_record("node-config", b"retention")? else {
+            return Ok(30);
+        };
+        let policy: RetentionPolicy = decode_canonical(&bytes)?;
+        if policy.format_version != 1
+            || policy.revisions_per_owner == 0
+            || policy.revisions_per_owner > 1_024
+        {
+            anyhow::bail!("durable retention policy is invalid");
+        }
+        Ok(policy.revisions_per_owner as usize)
     }
 
     pub fn storage_status(&self) -> Result<Vec<crate::StorageVolumeStatus>> {
@@ -1833,6 +1878,7 @@ impl Node {
         if self.reconcile_local_revision_head(checkpoint)? {
             self.mark_root_dirty("a recovered writer incarnation replaced a local draft")?;
         }
+        self.reconcile_garbage_collection()?;
         Ok(hash)
     }
 
@@ -2027,21 +2073,74 @@ impl Node {
                 anyhow::bail!("checkpoint adds a revision from a superseded writer incarnation");
             }
         }
+        for old in &previous.revision_tombstones {
+            let Some(current) = checkpoint
+                .revision_tombstones
+                .iter()
+                .find(|current| current.owner == old.owner)
+            else {
+                anyhow::bail!("checkpoint transition drops a revision tombstone");
+            };
+            if current.through_sequence < old.through_sequence
+                || current.through_sequence == old.through_sequence && current != old
+            {
+                anyhow::bail!("checkpoint transition changes a revision tombstone");
+            }
+        }
+        for current in &checkpoint.revision_tombstones {
+            let previous_floor = previous
+                .revision_tombstones
+                .iter()
+                .find(|old| old.owner == current.owner)
+                .map(|old| old.through_sequence)
+                .unwrap_or(0);
+            if current.through_sequence > previous_floor {
+                let retired = previous.revisions.iter().find(|revision| {
+                    revision.value.owner == current.owner
+                        && revision.value.sequence == current.through_sequence
+                });
+                if current.retired_at_generation != checkpoint.generation
+                    || retired.is_none_or(|revision| {
+                        revision.value.revision_id != current.last_revision_id
+                            || revision.value.hash().ok() != Some(current.last_revision_hash)
+                    })
+                {
+                    anyhow::bail!("checkpoint tombstone does not match retired signed history");
+                }
+            }
+        }
+        let current_revision_sectors = checkpoint
+            .revisions
+            .iter()
+            .flat_map(|revision| {
+                revision
+                    .value
+                    .metadata_sectors
+                    .iter()
+                    .chain(&revision.value.data_sectors)
+            })
+            .map(|reference| reference.id)
+            .collect::<BTreeSet<_>>();
         if !previous.members.iter().all(|item| {
             checkpoint
                 .members
                 .binary_search_by_key(&item.node_id, |entry| entry.node_id)
                 .is_ok_and(|index| checkpoint.members[index] == *item)
-        }) || !previous
-            .revisions
-            .iter()
-            .all(|item| checkpoint.revisions.contains(item))
-            || !previous.coding_groups.iter().all(|item| {
-                checkpoint
-                    .coding_groups
-                    .binary_search_by_key(&item.id, |entry| entry.id)
-                    .is_ok_and(|index| checkpoint.coding_groups[index] == *item)
-            })
+        }) || !previous.revisions.iter().all(|item| {
+            checkpoint.revisions.contains(item)
+                || checkpoint.revision_tombstones.iter().any(|tombstone| {
+                    tombstone.owner == item.value.owner
+                        && tombstone.through_sequence >= item.value.sequence
+                })
+        }) || !previous.coding_groups.iter().all(|item| {
+            checkpoint
+                .coding_groups
+                .binary_search_by_key(&item.id, |entry| entry.id)
+                .is_ok_and(|index| checkpoint.coding_groups[index] == *item)
+                || !item.roles.iter().any(|role| {
+                    matches!(role, ShardRole::Information(information) if current_revision_sectors.contains(&information.sector.id))
+                })
+        })
         {
             anyhow::bail!("checkpoint transition drops or changes active state");
         }
@@ -2167,6 +2266,214 @@ impl Node {
             ),
         ])?;
         Ok(local_head.as_ref() != Some(certified))
+    }
+
+    fn reconcile_garbage_collection(&mut self) -> Result<()> {
+        let Some(installed) = self.installed_guild()? else {
+            return Ok(());
+        };
+        let Some(current) = self.current_checkpoint(installed.certificate.genesis.guild_id)? else {
+            return Ok(());
+        };
+        current.verify()?;
+        let generation = current.checkpoint.generation;
+        let checkpoint_hash = current.hash()?;
+        let live_revisions = current
+            .checkpoint
+            .revisions
+            .iter()
+            .map(|revision| revision.value.revision_id)
+            .collect::<BTreeSet<_>>();
+        let live_sectors = current
+            .checkpoint
+            .coding_groups
+            .iter()
+            .flat_map(|group| &group.roles)
+            .filter_map(|role| match role {
+                ShardRole::Information(information) => Some(information.sector.id),
+                ShardRole::Parity(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let live_groups = current
+            .checkpoint
+            .coding_groups
+            .iter()
+            .map(|group| group.id)
+            .collect::<BTreeSet<_>>();
+
+        self.collect_mature_garbage(generation, &live_revisions, &live_sectors, &live_groups)?;
+
+        let Some(parent_hash) = current.checkpoint.parent else {
+            return Ok(());
+        };
+        let previous = self.checkpoint(&parent_hash)?;
+        for revision in &previous.checkpoint.revisions {
+            if live_revisions.contains(&revision.value.revision_id) {
+                continue;
+            }
+            self.schedule_garbage(
+                "gc-anchor",
+                revision.value.revision_id.as_bytes(),
+                generation,
+                checkpoint_hash,
+                None,
+            )?;
+            self.schedule_garbage(
+                "gc-revision",
+                revision.value.revision_id.as_bytes(),
+                generation,
+                checkpoint_hash,
+                None,
+            )?;
+            for reference in revision
+                .value
+                .metadata_sectors
+                .iter()
+                .chain(&revision.value.data_sectors)
+            {
+                self.schedule_garbage(
+                    "gc-sector",
+                    &reference.id,
+                    generation,
+                    checkpoint_hash,
+                    None,
+                )?;
+            }
+        }
+        for group in &previous.checkpoint.coding_groups {
+            if live_groups.contains(&group.id) {
+                continue;
+            }
+            for (index, role) in group.roles.iter().enumerate() {
+                match role {
+                    ShardRole::Information(information) => self.schedule_garbage(
+                        "gc-sector",
+                        &information.sector.id,
+                        generation,
+                        checkpoint_hash,
+                        None,
+                    )?,
+                    ShardRole::Parity(parity) => self.schedule_garbage(
+                        "gc-parity",
+                        &parity_proof_id(&group.id, index as u8),
+                        generation,
+                        checkpoint_hash,
+                        Some(parity.root),
+                    )?,
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn schedule_garbage(
+        &self,
+        kind: &str,
+        record_id: &[u8],
+        generation: u64,
+        checkpoint_hash: [u8; 32],
+        parity_root: Option<[u8; 32]>,
+    ) -> Result<()> {
+        if self.control.get_record(kind, record_id)?.is_none() {
+            self.control.put_record(
+                kind,
+                record_id,
+                &canonical_bytes(&GarbageCandidate {
+                    format_version: 1,
+                    first_unreachable_generation: generation,
+                    checkpoint_hash,
+                    parity_root,
+                })?,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn collect_mature_garbage(
+        &mut self,
+        generation: u64,
+        live_revisions: &BTreeSet<Uuid>,
+        live_sectors: &BTreeSet<SectorId>,
+        live_groups: &BTreeSet<[u8; 32]>,
+    ) -> Result<()> {
+        for kind in ["gc-anchor", "gc-revision", "gc-sector", "gc-parity"] {
+            for (record_id, bytes) in self.control.records(kind)? {
+                let candidate: GarbageCandidate = decode_canonical(&bytes)?;
+                if candidate.format_version != 1
+                    || candidate.first_unreachable_generation == 0
+                    || candidate.first_unreachable_generation > generation
+                    || candidate.checkpoint_hash == [0; 32]
+                {
+                    anyhow::bail!("durable garbage-collection candidate is invalid");
+                }
+                let live = match kind {
+                    "gc-anchor" | "gc-revision" => Uuid::from_slice(&record_id)
+                        .ok()
+                        .is_some_and(|revision_id| live_revisions.contains(&revision_id)),
+                    "gc-sector" => record_id
+                        .as_slice()
+                        .try_into()
+                        .ok()
+                        .is_some_and(|sector_id: [u8; 32]| live_sectors.contains(&sector_id)),
+                    "gc-parity" => record_id
+                        .get(..32)
+                        .and_then(|id| id.try_into().ok())
+                        .is_some_and(|group_id: [u8; 32]| live_groups.contains(&group_id)),
+                    _ => unreachable!(),
+                };
+                if live {
+                    self.control.delete_record(kind, &record_id)?;
+                    continue;
+                }
+                if generation == candidate.first_unreachable_generation {
+                    continue;
+                }
+                let collected = match kind {
+                    "gc-anchor" => {
+                        retire_revision_anchor(&mut self.control, Uuid::from_slice(&record_id)?)?;
+                        true
+                    }
+                    "gc-revision" => {
+                        self.control.delete_record("user-revision", &record_id)?;
+                        true
+                    }
+                    "gc-sector" => {
+                        self.control.delete_record("local-sector", &record_id)?;
+                        true
+                    }
+                    "gc-parity" => {
+                        let group_id: [u8; 32] = record_id
+                            .get(..32)
+                            .context("parity garbage key is truncated")?
+                            .try_into()?;
+                        let shard_index = *record_id
+                            .get(32)
+                            .context("parity garbage key is truncated")?;
+                        let root = candidate
+                            .parity_root
+                            .context("parity garbage candidate has no root")?;
+                        let removed = self.volumes.remove_unreachable(
+                            &self.control,
+                            &group_id,
+                            shard_index,
+                            &root,
+                        )?;
+                        if removed {
+                            self.control.delete_record(
+                                "local-parity-proof",
+                                &parity_proof_id(&group_id, shard_index),
+                            )?;
+                        }
+                        removed
+                    }
+                    _ => unreachable!(),
+                };
+                if collected {
+                    self.control.delete_record(kind, &record_id)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn recovery_record(
@@ -3091,6 +3398,7 @@ impl Node {
             local_revision.as_deref(),
             local_revision.is_none(),
         )?;
+        self.reconcile_garbage_collection()?;
         Ok(checkpoint_hash)
     }
 
@@ -4168,7 +4476,7 @@ mod tests {
         members.sort_by_key(|member| member.node_id);
         let mut checkpoint = QuorumCheckpoint {
             checkpoint: GuildCheckpoint {
-                format_version: 2,
+                format_version: 3,
                 guild_id,
                 genesis_hash: [141; 32],
                 generation: 1,
@@ -4179,6 +4487,7 @@ mod tests {
                     epoch: 1,
                     public_key: writer.verifying_key().to_bytes(),
                 }],
+                revision_tombstones: Vec::new(),
                 revisions: vec![revision],
                 coding_groups: vec![group],
             },
@@ -4329,7 +4638,7 @@ mod tests {
         group.id = group.calculate_id().unwrap();
         let mut checkpoint = QuorumCheckpoint {
             checkpoint: GuildCheckpoint {
-                format_version: 2,
+                format_version: 3,
                 guild_id,
                 genesis_hash: certificate.hash().unwrap(),
                 generation: 1,
@@ -4340,6 +4649,7 @@ mod tests {
                     epoch: revision.value.writer_epoch,
                     public_key: revision.value.writer_public_key,
                 }],
+                revision_tombstones: Vec::new(),
                 revisions: vec![revision.clone()],
                 coding_groups: vec![group],
             },
@@ -4397,6 +4707,140 @@ mod tests {
 
         let mut reopened = Node::open(temp.path(), seed).unwrap();
         assert!(reopened.writer_incarnation(guild_id).unwrap() == writer);
+    }
+
+    #[test]
+    fn retained_prefix_is_collected_only_after_a_later_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([226; 32]);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        let retired = install_public_restore_fixture(&mut node, &seed);
+        node.control
+            .put_record(
+                "user-revision",
+                retired.value.revision_id.as_bytes(),
+                &canonical_bytes(&retired).unwrap(),
+            )
+            .unwrap();
+        let guild_id = retired.value.guild_id;
+        let first = node.current_checkpoint(guild_id).unwrap().unwrap();
+        let mut group = first.checkpoint.coding_groups[0].clone();
+        let target_id = [196; 32];
+        let plaintext = vec![42];
+        let (target, _) = mb_core::encrypted_sector(
+            &node.keys().guild_data_key(&guild_id),
+            target_id,
+            &plaintext,
+        )
+        .unwrap();
+        install_inline_recipe(&mut node.control, guild_id, target.clone(), plaintext).unwrap();
+        for (index, role) in group.roles.iter_mut().enumerate() {
+            match role {
+                ShardRole::Information(information)
+                    if information.owner == node.keys().node_id() =>
+                {
+                    information.sector = target.clone();
+                }
+                ShardRole::Information(information) => {
+                    information.sector.id = [197 + index as u8; 32];
+                    information.sector.root = [207 + index as u8; 32];
+                }
+                ShardRole::Parity(parity) => parity.root = [217 + index as u8; 32],
+            }
+        }
+        group.id = group.calculate_id().unwrap();
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[71; 32]);
+        let mut revision = UserRevision {
+            format_version: 2,
+            guild_id,
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id: Uuid::from_bytes([195; 16]),
+            owner: node.keys().node_id(),
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 2,
+            parent: Some(retired.value.hash().unwrap()),
+            metadata_sectors: vec![target],
+            data_sectors: Vec::new(),
+        };
+        revision.sign_writer(&writer).unwrap();
+        let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, node.keys()).unwrap();
+        let mut second = QuorumCheckpoint {
+            checkpoint: GuildCheckpoint {
+                format_version: 3,
+                guild_id,
+                genesis_hash: first.checkpoint.genesis_hash,
+                generation: 2,
+                parent: Some(first.hash().unwrap()),
+                members: first.checkpoint.members.clone(),
+                writer_fences: first.checkpoint.writer_fences.clone(),
+                revision_tombstones: vec![mb_core::RevisionTombstone {
+                    owner: retired.value.owner,
+                    through_sequence: 1,
+                    last_revision_id: retired.value.revision_id,
+                    last_revision_hash: retired.value.hash().unwrap(),
+                    retired_at_generation: 2,
+                }],
+                revisions: vec![revision],
+                coding_groups: vec![group],
+            },
+            signatures: Vec::new(),
+        };
+        let signing_keys = std::iter::once(seed.clone())
+            .chain((0_u8..4).map(|index| Seed::from_bytes([index + 228; 32])))
+            .map(|seed| KeyMaterial::from_seed(&seed))
+            .collect::<Vec<_>>();
+        for keys in &signing_keys {
+            second.add_signature(keys).unwrap();
+        }
+        second.verify().unwrap();
+        let second_hash = second.hash().unwrap();
+        node.control
+            .commit_checkpoint(
+                &guild_id,
+                2,
+                second.checkpoint.parent.as_ref(),
+                &second_hash,
+                &canonical_bytes(&second.checkpoint).unwrap(),
+                &canonical_bytes(&second).unwrap(),
+                false,
+            )
+            .unwrap();
+        node.reconcile_garbage_collection().unwrap();
+        assert!(node.sector(&retired.value.metadata_sectors[0].id).is_ok());
+
+        let mut third = QuorumCheckpoint {
+            checkpoint: second.checkpoint.clone(),
+            signatures: Vec::new(),
+        };
+        third.checkpoint.generation = 3;
+        third.checkpoint.parent = Some(second.hash().unwrap());
+        for keys in &signing_keys {
+            third.add_signature(keys).unwrap();
+        }
+        third.verify().unwrap();
+        let third_hash = third.hash().unwrap();
+        node.control
+            .commit_checkpoint(
+                &guild_id,
+                3,
+                third.checkpoint.parent.as_ref(),
+                &third_hash,
+                &canonical_bytes(&third.checkpoint).unwrap(),
+                &canonical_bytes(&third).unwrap(),
+                false,
+            )
+            .unwrap();
+        node.reconcile_garbage_collection().unwrap();
+        assert!(node.sector(&retired.value.metadata_sectors[0].id).is_err());
+        assert!(
+            node.control
+                .get_record("user-revision", retired.value.revision_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(node.control.records("gc-sector").unwrap().is_empty());
     }
 
     #[test]

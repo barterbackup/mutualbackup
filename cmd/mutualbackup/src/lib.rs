@@ -22,6 +22,7 @@ const MAX_RECOVERY_FILE_BYTES: usize = 16 * 1024;
 const DEFAULT_PARITY_BUDGET_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_PARITY_HEADROOM_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_MAX_CONNECTIONS: usize = 32;
+const DEFAULT_RETENTION_REVISIONS: u32 = 30;
 
 /// Human-owned daemon options, populated from flags over an optional TOML file.
 #[derive(Clone, Debug, Eq, PartialEq, Conf, Serialize)]
@@ -69,6 +70,10 @@ pub struct DaemonOptions {
     /// Bytes reserved on each parity volume for repair, migration, and GC.
     #[conf(parameter, long)]
     pub parity_headroom_bytes: Option<u64>,
+
+    /// Number of committed snapshots retained per guild member.
+    #[conf(parameter, long, default(DEFAULT_RETENTION_REVISIONS))]
+    pub retention_revisions: u32,
 
     /// Clear parity volumes inherited from the configuration file.
     #[conf(flag, long = "clear-parity-volumes", serde(skip))]
@@ -192,6 +197,9 @@ impl DaemonOptions {
         }
         if self.effective_parity_headroom_bytes() >= self.parity_budget_bytes {
             bail!("parity_headroom_bytes must be smaller than parity_budget_bytes");
+        }
+        if self.retention_revisions == 0 || self.retention_revisions > 1_024 {
+            bail!("retention_revisions must be between 1 and 1024");
         }
         if self.tor_mode == TorMode::DisableTor
             && self.p2p_listen_addresses.is_empty()

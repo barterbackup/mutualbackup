@@ -6417,17 +6417,24 @@ async fn commit_backup_job(
     job: &BackupJob,
 ) -> Result<[u8; 32]> {
     let guild_id = job.descriptor.guild_id;
-    let (certificate, mut peers, local_id, previous) = node_blocking(node.clone(), move |node| {
-        let certificate = node
-            .installed_guild_certificate()?
-            .context("coordinator has no installed guild genesis")?;
-        let summary = node
-            .guild_summary()?
-            .context("coordinator has no guild endpoint roster")?;
-        let previous = node.current_checkpoint(guild_id)?;
-        Ok((certificate, summary.peers, node.keys().node_id(), previous))
-    })
-    .await?;
+    let (certificate, mut peers, local_id, previous, retention_revisions) =
+        node_blocking(node.clone(), move |node| {
+            let certificate = node
+                .installed_guild_certificate()?
+                .context("coordinator has no installed guild genesis")?;
+            let summary = node
+                .guild_summary()?
+                .context("coordinator has no guild endpoint roster")?;
+            let previous = node.current_checkpoint(guild_id)?;
+            Ok((
+                certificate,
+                summary.peers,
+                node.keys().node_id(),
+                previous,
+                node.retention_revisions()?,
+            ))
+        })
+        .await?;
     certificate.verify()?;
     if certificate.genesis.guild_id != guild_id
         || certificate.genesis.coordinator != local_id
@@ -6570,7 +6577,14 @@ async fn commit_backup_job(
         new_groups.push(group);
     }
 
-    let (generation, parent, mut writer_fences, mut revisions, mut coding_groups) = match previous {
+    let (
+        generation,
+        parent,
+        mut writer_fences,
+        mut revision_tombstones,
+        mut revisions,
+        mut coding_groups,
+    ) = match previous {
         Some(previous) => {
             previous.verify()?;
             (
@@ -6581,11 +6595,12 @@ async fn commit_backup_job(
                     .context("checkpoint generation exhausted")?,
                 Some(previous.hash()?),
                 previous.checkpoint.writer_fences,
+                previous.checkpoint.revision_tombstones,
                 previous.checkpoint.revisions,
                 previous.checkpoint.coding_groups,
             )
         }
-        None => (1, None, Vec::new(), Vec::new(), Vec::new()),
+        None => (1, None, Vec::new(), Vec::new(), Vec::new(), Vec::new()),
     };
     include_writer_fence(&mut writer_fences, &revision.value)?;
     revisions.push(revision);
@@ -6598,14 +6613,22 @@ async fn commit_backup_job(
     });
     coding_groups.extend(new_groups);
     coding_groups.sort_by_key(|group| group.id);
+    apply_revision_retention(
+        generation,
+        retention_revisions,
+        &mut revision_tombstones,
+        &mut revisions,
+        &mut coding_groups,
+    )?;
     let checkpoint = GuildCheckpoint {
-        format_version: 2,
+        format_version: 3,
         guild_id,
         genesis_hash: certificate.hash()?,
         generation,
         parent,
         members: certificate.genesis.members.clone(),
         writer_fences,
+        revision_tombstones,
         revisions,
         coding_groups,
     };
@@ -6663,6 +6686,64 @@ async fn commit_backup_job(
     })
     .await?;
     Ok(checkpoint_hash)
+}
+
+fn apply_revision_retention(
+    generation: u64,
+    retain_per_owner: usize,
+    tombstones: &mut Vec<mb_core::RevisionTombstone>,
+    revisions: &mut Vec<SignedRecord<UserRevision>>,
+    coding_groups: &mut Vec<CodingGroup>,
+) -> Result<()> {
+    if retain_per_owner == 0 {
+        bail!("revision retention must keep at least one revision per owner");
+    }
+    let mut retire_through = BTreeMap::<NodeId, u64>::new();
+    let mut per_owner = BTreeMap::<NodeId, Vec<&SignedRecord<UserRevision>>>::new();
+    for revision in revisions.iter() {
+        per_owner
+            .entry(revision.value.owner)
+            .or_default()
+            .push(revision);
+    }
+    for (owner, owned) in per_owner {
+        if owned.len() <= retain_per_owner {
+            continue;
+        }
+        let last_retired = owned[owned.len() - retain_per_owner - 1];
+        retire_through.insert(owner, last_retired.value.sequence);
+        tombstones.retain(|tombstone| tombstone.owner != owner);
+        tombstones.push(mb_core::RevisionTombstone {
+            owner,
+            through_sequence: last_retired.value.sequence,
+            last_revision_id: last_retired.value.revision_id,
+            last_revision_hash: last_retired.value.hash()?,
+            retired_at_generation: generation,
+        });
+    }
+    tombstones.sort_by_key(|tombstone| tombstone.owner);
+    revisions.retain(|revision| {
+        retire_through
+            .get(&revision.value.owner)
+            .is_none_or(|through| revision.value.sequence > *through)
+    });
+    let live_sectors = revisions
+        .iter()
+        .flat_map(|revision| {
+            revision
+                .value
+                .metadata_sectors
+                .iter()
+                .chain(&revision.value.data_sectors)
+        })
+        .map(|reference| reference.id)
+        .collect::<BTreeSet<_>>();
+    coding_groups.retain(|group| {
+        group.roles.iter().any(|role| {
+            matches!(role, ShardRole::Information(information) if live_sectors.contains(&information.sector.id))
+        })
+    });
+    Ok(())
 }
 
 fn include_writer_fence(
@@ -9300,6 +9381,7 @@ mod tests {
                 parent: None,
                 members: Vec::new(),
                 writer_fences: Vec::new(),
+                revision_tombstones: Vec::new(),
                 revisions: Vec::new(),
                 coding_groups: vec![first_group.clone(), second_group.clone()],
             },

@@ -271,6 +271,24 @@ fn reconcile_anchor_retirements(control: &ControlStore) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn retire_revision_anchor(control: &mut ControlStore, revision_id: Uuid) -> Result<()> {
+    let Some(bytes) = control.get_record("anchor-manifest", revision_id.as_bytes())? else {
+        return Ok(());
+    };
+    let manifest: mb_store::StableAnchorManifest = decode_canonical(&bytes)?;
+    control.move_protocol_record(
+        "anchor-manifest",
+        revision_id.as_bytes(),
+        &bytes,
+        ANCHOR_RETIREMENT_KIND,
+        manifest.anchor_id.as_bytes(),
+    )?;
+    if manifest.remove().is_ok() {
+        let _ = control.delete_record(ANCHOR_RETIREMENT_KIND, manifest.anchor_id.as_bytes())?;
+    }
+    Ok(())
+}
+
 pub(crate) fn abandon_recovered_anchor_capture(
     control: &ControlStore,
     guild_id: [u8; 32],

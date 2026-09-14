@@ -65,6 +65,10 @@ an independently wrapped SQLCipher key, a byte budget and repair headroom.
 `storage drain` stops new placement; `storage migrate` copies and verifies each
 object before removing its source. Interrupted writes and moves are reconciled
 from durable control receipts, while an absent disk remains visibly offline.
+`retention_revisions` keeps a signed suffix of each member's history. Retired
+prefixes remain represented by checkpoint tombstones, and local anchors and
+shards are collected only after a later checkpoint confirms they stayed
+unreachable.
 
 The CLI and daemon use a same-user Unix control socket. Pass `--socket` when a
 configuration does not use the default location below `XDG_RUNTIME_DIR`.

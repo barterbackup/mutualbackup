@@ -209,6 +209,31 @@ impl ControlStore {
         Ok(())
     }
 
+    pub fn move_protocol_record(
+        &mut self,
+        source_kind: &str,
+        source_id: &[u8],
+        expected: &[u8],
+        destination_kind: &str,
+        destination_id: &[u8],
+    ) -> Result<(), DatabaseError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+             ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+            params![destination_kind, destination_id, expected],
+        )?;
+        let removed = transaction.execute(
+            "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
+            params![source_kind, source_id, expected],
+        )?;
+        if removed != 1 {
+            return Err(DatabaseError::Conflict);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn reconcile_records(
         &mut self,
         kind: &str,

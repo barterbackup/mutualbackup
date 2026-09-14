@@ -1393,7 +1393,7 @@ pub async fn commit_source_over_network_with_intent(
     checkpoint_members.sort_by_key(|member| member.node_id);
 
     let checkpoint_body = GuildCheckpoint {
-        format_version: 2,
+        format_version: 3,
         guild_id,
         genesis_hash: *blake3::hash(&canonical_bytes(&checkpoint_members)?).as_bytes(),
         generation: 1,
@@ -1404,6 +1404,7 @@ pub async fn commit_source_over_network_with_intent(
             epoch: revision.value.writer_epoch,
             public_key: revision.value.writer_public_key,
         }],
+        revision_tombstones: Vec::new(),
         revisions: vec![revision],
         coding_groups: groups,
     };

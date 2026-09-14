@@ -28,6 +28,10 @@ parity_budget_bytes = 10737418240
 # default is 5% of the budget, capped at 128 MiB.
 # parity_headroom_bytes = 134217728
 
+# Keep this many committed snapshots for each guild member. Retirement is
+# certified in a checkpoint; collection waits for a later checkpoint.
+retention_revisions = 30
+
 # QUIC uses UDP. The external address below makes this example reachable only
 # from this same host; replace it with a genuinely reachable address for peers
 # on other machines.
