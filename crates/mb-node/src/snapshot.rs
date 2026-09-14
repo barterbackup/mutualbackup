@@ -223,6 +223,7 @@ struct CaptureIntent {
     revision_id: Uuid,
     sequence: u64,
     parent: Option<[u8; 32]>,
+    captured_change_sequence: Option<u64>,
     requested_source: PathBuf,
     plan: ReflinkCapturePlan,
 }
@@ -240,7 +241,7 @@ struct RecoveryAnchorIntent {
 pub(crate) fn reconcile_pending_captures(control: &ControlStore) -> Result<()> {
     for (record_id, bytes) in control.records("capture-intent")? {
         let intent: CaptureIntent = decode_canonical(&bytes)?;
-        if intent.format_version != 1 || record_id.as_slice() != intent.revision_id.as_bytes() {
+        if intent.format_version != 2 || record_id.as_slice() != intent.revision_id.as_bytes() {
             bail!("pending source capture is inconsistent");
         }
         // An offline source volume must not prevent unrelated guilds from
@@ -330,6 +331,7 @@ impl Drop for PendingAnchor {
 pub(crate) struct WriterCredentials<'a> {
     pub epoch: u64,
     pub secret: &'a [u8; 32],
+    pub captured_change_sequence: Option<u64>,
 }
 
 pub(crate) fn prepare_revision(
@@ -343,6 +345,7 @@ pub(crate) fn prepare_revision(
 ) -> Result<SignedRecord<UserRevision>> {
     let writer_epoch = writer.epoch;
     let writer_secret = writer.secret;
+    let captured_change_sequence = writer.captured_change_sequence;
     let revision_id = revision_id.unwrap_or_else(Uuid::new_v4);
     if let Some(bytes) = control.get_record("user-revision", revision_id.as_bytes())? {
         let existing: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
@@ -385,7 +388,7 @@ pub(crate) fn prepare_revision(
         match control.get_record("capture-intent", revision_id.as_bytes())? {
             Some(bytes) => {
                 let intent: CaptureIntent = decode_canonical(&bytes)?;
-                if intent.format_version != 1
+                if intent.format_version != 2
                     || intent.guild_id != guild_id
                     || intent.revision_id != revision_id
                     || intent.sequence != sequence
@@ -398,11 +401,12 @@ pub(crate) fn prepare_revision(
             }
             None => {
                 let intent = CaptureIntent {
-                    format_version: 1,
+                    format_version: 2,
                     guild_id,
                     revision_id,
                     sequence,
                     parent,
+                    captured_change_sequence,
                     requested_source: source_root.to_path_buf(),
                     plan: ReflinkAnchor::plan(source_root).context("plan reflink source anchor")?,
                 };
@@ -622,6 +626,13 @@ pub(crate) fn prepare_revision(
                 canonical_bytes(&revision)?,
             ),
         ]);
+        if let Some(captured_change_sequence) = intent.captured_change_sequence {
+            records.push((
+                "revision-root-change".to_owned(),
+                revision_id.as_bytes().to_vec(),
+                canonical_bytes(&captured_change_sequence)?,
+            ));
+        }
         control.finalize_capture_records(revision_id.as_bytes(), &records)?;
         anchor.commit();
         Ok(revision)
@@ -3410,6 +3421,7 @@ mod metadata_compatibility_tests {
             WriterCredentials {
                 epoch: 1,
                 secret: &[17; 32],
+                captured_change_sequence: None,
             },
         );
         assert!(first.is_err());
@@ -3431,6 +3443,7 @@ mod metadata_compatibility_tests {
             WriterCredentials {
                 epoch: 1,
                 secret: &[17; 32],
+                captured_change_sequence: None,
             },
         )
         .unwrap();
@@ -3473,6 +3486,7 @@ mod metadata_compatibility_tests {
             WriterCredentials {
                 epoch: 1,
                 secret: &[18; 32],
+                captured_change_sequence: None,
             },
         )
         .unwrap();
@@ -3586,6 +3600,7 @@ mod metadata_compatibility_tests {
             WriterCredentials {
                 epoch: 1,
                 secret: &[19; 32],
+                captured_change_sequence: None,
             },
         )
         .unwrap();

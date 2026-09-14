@@ -885,7 +885,18 @@ impl Node {
             self.store_automatic_backup_state(&state)?;
             return Ok(AutomaticBackupPoll::Idle);
         }
-        let estimated_bytes = self.protected_root_logical_bytes()?;
+        let estimated_bytes = match self.protected_root_logical_bytes() {
+            Ok(estimated_bytes) => estimated_bytes,
+            Err(error) => {
+                let mut message = format!("automatic full reconciliation failed: {error:#}");
+                message.truncate(512);
+                state.blocked_reason = Some(message);
+                state.retry_at_unix_seconds =
+                    Some(now.saturating_add(policy.minimum_interval_seconds));
+                self.store_automatic_backup_state(&state)?;
+                return Ok(AutomaticBackupPoll::Idle);
+            }
+        };
         if state.window_backup_count >= policy.daily_backup_limit {
             state.blocked_reason = Some("daily automatic-backup count limit reached".into());
             state.retry_at_unix_seconds = Some(
@@ -1605,10 +1616,6 @@ impl Node {
     }
 
     pub fn prepare_protected_backup(&mut self) -> Result<BackupDescriptor> {
-        let captured_change_sequence = self
-            .root_dirty_state()?
-            .map(|state| state.change_sequence)
-            .unwrap_or(0);
         let installed = self
             .installed_guild()?
             .context("this node has no active guild")?;
@@ -1673,20 +1680,6 @@ impl Node {
             sequence,
             Some(*revision_id.as_bytes()),
         )?;
-        if self
-            .control
-            .get_record(
-                "revision-root-change",
-                revision.value.revision_id.as_bytes(),
-            )?
-            .is_none()
-        {
-            self.control.put_record(
-                "revision-root-change",
-                revision.value.revision_id.as_bytes(),
-                &canonical_bytes(&captured_change_sequence)?,
-            )?;
-        }
         let bytes = canonical_bytes(&revision)?;
         let total_pages = bytes.len().div_ceil(V1_CATALOG_PAGE_BYTES);
         if total_pages == 0 || total_pages > V1_MAX_CATALOG_PAGES as usize {
@@ -2069,6 +2062,10 @@ impl Node {
         sequence: u64,
         operation_id: Option<[u8; 16]>,
     ) -> Result<SignedRecord<UserRevision>> {
+        let captured_change_sequence = self
+            .root_dirty_state()?
+            .filter(|state| state.dirty)
+            .map(|state| state.change_sequence);
         let writer = self.writer_incarnation(guild_id)?;
         prepare_revision(
             &mut self.control,
@@ -2080,6 +2077,7 @@ impl Node {
             WriterCredentials {
                 epoch: writer.epoch,
                 secret: &writer.secret_key,
+                captured_change_sequence,
             },
         )
     }
@@ -2116,6 +2114,9 @@ impl Node {
             if is_current || is_pending {
                 return Ok(writer);
             }
+            anyhow::bail!(
+                "local writer incarnation is fenced; recover into fresh state before taking over"
+            );
         }
 
         let epoch = latest
@@ -2841,7 +2842,7 @@ impl Node {
                 .map(|bytes| decode_canonical::<u64>(&bytes))
                 .transpose()?;
             if state.as_ref().is_some_and(|state| {
-                captured_change_sequence.is_some_and(|captured| captured != state.change_sequence)
+                state.dirty && captured_change_sequence != Some(state.change_sequence)
             }) {
                 return Ok(());
             }
@@ -2961,7 +2962,18 @@ impl Node {
         let Some(parent_hash) = current.checkpoint.parent else {
             return Ok(());
         };
-        let previous = self.checkpoint(&parent_hash)?;
+        let Some(previous_bytes) = self.control.get_record("guild-checkpoint", &parent_hash)?
+        else {
+            // Seed recovery installs a certified head without requiring its full
+            // history. Missing history cannot prove anything unreachable, so GC
+            // must wait rather than blocking recovery or later startup.
+            return Ok(());
+        };
+        let previous: QuorumCheckpoint = decode_canonical(&previous_bytes)?;
+        previous.verify()?;
+        if previous.hash()? != parent_hash {
+            anyhow::bail!("checkpoint hash mismatch");
+        }
         for revision in &previous.checkpoint.revisions {
             if live_revisions.contains(&revision.value.revision_id) {
                 continue;
@@ -5388,6 +5400,32 @@ mod tests {
     }
 
     #[test]
+    fn superseded_local_writer_cannot_rotate_itself_back_into_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([225; 32]);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        let guild_id = [233; 32];
+        let stale = node.writer_incarnation(guild_id).unwrap();
+        assert_eq!(stale.epoch, 1);
+
+        let recovered = install_public_restore_fixture(&mut node, &seed);
+        assert_eq!(recovered.value.guild_id, guild_id);
+        let error = match node.writer_incarnation(guild_id) {
+            Err(error) => error,
+            Ok(_) => panic!("superseded writer unexpectedly regained authority"),
+        };
+        assert!(error.to_string().contains("writer incarnation is fenced"));
+        drop(node);
+
+        let mut reopened = Node::open(temp.path(), seed).unwrap();
+        let error = match reopened.writer_incarnation(guild_id) {
+            Err(error) => error,
+            Ok(_) => panic!("superseded writer unexpectedly regained authority after restart"),
+        };
+        assert!(error.to_string().contains("writer incarnation is fenced"));
+    }
+
+    #[test]
     fn automatic_backup_schedule_is_quiet_bounded_and_durable() {
         use std::os::unix::fs::MetadataExt;
 
@@ -5462,6 +5500,145 @@ mod tests {
         let status = reopened.automatic_backup_status().unwrap();
         assert!(status.blocked_reason.unwrap().contains("capacity"));
         assert!(status.retry_at_unix_seconds.is_none());
+    }
+
+    #[test]
+    fn automatic_backup_scan_failure_is_blocked_and_retryable() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("payload"), b"available later").unwrap();
+        let state = temp.path().join("state");
+        let (seed, certificate, peers) = recovery_guild_fixture();
+        let mut node = Node::open(&state, seed).unwrap();
+        node.adopt_recovered_guild(certificate, peers).unwrap();
+        let filesystem = filesystem_identity(&root).unwrap();
+        node.control
+            .put_record(
+                "node-config",
+                b"protected-root",
+                &canonical_bytes(&ProtectedRoot {
+                    format_version: 3,
+                    root_id: Uuid::new_v4(),
+                    path: root.clone(),
+                    filesystem_id: filesystem.stable_id,
+                    root_inode: fs::metadata(&root).unwrap().ino(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        node.configure_automatic_backup(&AutomaticBackupPolicy {
+            enabled: true,
+            quiet_period_seconds: 1,
+            minimum_interval_seconds: 10,
+            full_reconcile_interval_seconds: 60,
+            daily_backup_limit: 10,
+            daily_byte_limit: 1024,
+        })
+        .unwrap();
+        node.mark_root_dirty_at("changed", true, 100).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert!(matches!(
+            node.poll_automatic_backup(101).unwrap(),
+            AutomaticBackupPoll::Idle
+        ));
+        let blocked = node.automatic_backup_state(101).unwrap();
+        assert!(
+            blocked
+                .blocked_reason
+                .as_deref()
+                .unwrap()
+                .contains("full reconciliation failed")
+        );
+        assert_eq!(blocked.retry_at_unix_seconds, Some(111));
+        assert!(node.root_dirty().unwrap());
+
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("payload"), b"available later").unwrap();
+        assert!(matches!(
+            node.poll_automatic_backup(110).unwrap(),
+            AutomaticBackupPoll::Idle
+        ));
+        assert!(matches!(
+            node.poll_automatic_backup(111).unwrap(),
+            AutomaticBackupPoll::Start { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_capture_generation_never_clears_a_dirty_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([224; 32]);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        let revision = install_public_restore_fixture(&mut node, &seed);
+        let guild_id = revision.value.guild_id;
+        node.control
+            .put_record(
+                "user-revision-head",
+                &guild_id,
+                &canonical_bytes(&revision).unwrap(),
+            )
+            .unwrap();
+        node.mark_root_dirty_at("changed after capture", true, 100)
+            .unwrap();
+        let checkpoint = node.current_checkpoint(guild_id).unwrap().unwrap();
+
+        node.clear_root_dirty_if_committed(&checkpoint).unwrap();
+
+        assert!(node.root_dirty().unwrap());
+    }
+
+    #[test]
+    fn garbage_collection_waits_when_recovered_history_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([223; 32]);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        let revision = install_public_restore_fixture(&mut node, &seed);
+        let guild_id = revision.value.guild_id;
+        let first = node.current_checkpoint(guild_id).unwrap().unwrap();
+        let first_hash = first.hash().unwrap();
+        let signing_keys = std::iter::once(seed.clone())
+            .chain((0_u8..4).map(|index| Seed::from_bytes([index + 228; 32])))
+            .map(|seed| KeyMaterial::from_seed(&seed))
+            .collect::<Vec<_>>();
+        let mut second = QuorumCheckpoint {
+            checkpoint: first.checkpoint.clone(),
+            signatures: Vec::new(),
+        };
+        second.checkpoint.generation = 2;
+        second.checkpoint.parent = Some(first_hash);
+        for keys in &signing_keys {
+            second.add_signature(keys).unwrap();
+        }
+        second.verify().unwrap();
+        let second_hash = second.hash().unwrap();
+        node.control
+            .commit_checkpoint(
+                &guild_id,
+                2,
+                Some(&first_hash),
+                &second_hash,
+                &canonical_bytes(&second.checkpoint).unwrap(),
+                &canonical_bytes(&second).unwrap(),
+                false,
+            )
+            .unwrap();
+        assert!(
+            node.control
+                .delete_record("guild-checkpoint", &first_hash)
+                .unwrap()
+        );
+
+        node.reconcile_garbage_collection().unwrap();
+        drop(node);
+        let reopened = Node::open(temp.path(), seed).unwrap();
+        assert_eq!(
+            reopened.current_checkpoint(guild_id).unwrap().unwrap(),
+            second
+        );
     }
 
     #[test]

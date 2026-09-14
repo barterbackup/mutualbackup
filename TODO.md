@@ -7,7 +7,7 @@ The findings below follow source paths and durable-state transitions; no builds,
 tests, or runtime probes were performed for this review. Close these blockers
 and their regression gates before advancing to Milestone 5.
 
-- [ ] **M4-01 / P1 — Allow seed recovery without historical checkpoints.**
+- [x] **M4-01 / P1 — Allow seed recovery without historical checkpoints.**
   Recovery downloads the selected head, but `reconcile_garbage_collection`
   unconditionally loads its parent (`crates/mb-node/src/node.rs:2964`).
   `install_recovered_checkpoint` calls GC after durably installing that head
@@ -17,7 +17,7 @@ and their regression gates before advancing to Milestone 5.
   absent without weakening live-object protection. Verify seed-only recovery
   at generation >= 2, completed restoration, and close/reopen with only the
   selected certified head available locally.
-- [ ] **M4-02 / P1 — Keep a superseded writer fenced.**
+- [x] **M4-02 / P1 — Keep a superseded writer fenced.**
   `writer_incarnation` silently replaces an existing superseded incarnation
   with `latest_epoch + 1` (`crates/mb-node/src/node.rs:2101`), while checkpoint
   reconciliation adopts the recovered head and marks the old machine's root
@@ -27,7 +27,7 @@ and their regression gates before advancing to Milestone 5.
   Cover two independent data directories sharing a seed: after recovery
   establishes the replacement writer, backups and restarts on the old machine
   must remain fenced until an explicit takeover.
-- [ ] **M4-03 / P1 — Keep peer service online when automatic scanning fails.**
+- [x] **M4-03 / P1 — Keep peer service online when automatic scanning fails.**
   `poll_automatic_backup` propagates root enumeration/metadata errors
   (`crates/mb-node/src/node.rs:888`, `node.rs:972`). The automatic worker
   propagates them (`crates/mb-node/src/automation.rs:15`), and the daemon's
@@ -37,7 +37,7 @@ and their regression gates before advancing to Milestone 5.
   service instead of leaving a dirty, blocked root. Persist the reason and
   retry safely. Cover missing/unreadable roots and scan races while checking
   that peer/control service and later automatic reconciliation continue.
-- [ ] **M4-04 / P1 — Persist the captured dirty generation with the revision.**
+- [x] **M4-04 / P1 — Persist the captured dirty generation with the revision.**
   Capture commits the immutable revision and head first
   (`crates/mb-node/src/snapshot.rs:625`); `prepare_protected_backup` records
   `revision-root-change` afterward (`crates/mb-node/src/node.rs:1676`). A crash
