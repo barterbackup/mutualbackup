@@ -48,6 +48,11 @@ const SERVICE_CHANNEL_CAPACITY: usize = 32; // should be plenty
 /// we allow trying a mapping using said protocol.
 const UNAVAILABILITY_TRUST_DURATION: Duration = Duration::from_secs(5);
 
+/// Maximum time to wait for a superseded lease to acknowledge deletion. These
+/// releases run alongside the active mapping lifecycle, but bounding them also
+/// prevents an unresponsive gateway from accumulating cleanup tasks forever.
+const SUPERSEDED_MAPPING_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Output of a port mapping probe.
 #[derive(Debug, Clone, PartialEq, Eq, derive_more::Display)]
 #[display("portmap={{ UPnP: {upnp}, PMP: {nat_pmp}, PCP: {pcp} }}")]
@@ -496,10 +501,16 @@ pub struct Service {
     /// Requests for a probe that arrive while this task is still in progress will receive the same
     /// result.
     probing_task: Option<(AbortOnDropHandle<Probe>, Vec<oneshot::Sender<ProbeResult>>)>,
+    /// Owned cleanup tasks for leases replaced by a distinct successful
+    /// renewal. They remain part of acknowledged deactivation, while running
+    /// independently of the active lease and command loop.
+    superseded_mapping_tasks: tokio::task::JoinSet<Result<(), String>>,
+    /// Deadline applied to each superseded mapping cleanup.
+    superseded_mapping_release_timeout: Duration,
     /// First failure while releasing a lease superseded by a successful
     /// replacement. Preserve it until an acknowledged port change can report
     /// that cleanup was incomplete.
-    mapping_release_error: Option<mapping::Error>,
+    mapping_release_error: Option<String>,
     metrics: Arc<Metrics>,
 }
 
@@ -526,6 +537,8 @@ impl Service {
             full_probe,
             mapping_task: None,
             probing_task: None,
+            superseded_mapping_tasks: tokio::task::JoinSet::new(),
+            superseded_mapping_release_timeout: SUPERSEDED_MAPPING_RELEASE_TIMEOUT,
             mapping_release_error: None,
             metrics,
         };
@@ -552,6 +565,45 @@ impl Service {
         release_mapping_task_result(task.await, &self.metrics).await
     }
 
+    /// Begin releasing a distinct superseded lease without blocking the active
+    /// mapping lifecycle. The task stays owned by the service and has a finite
+    /// deadline so repeated unresponsive gateways cannot grow the set without
+    /// bound.
+    fn release_superseded_mapping(&mut self, mapping: mapping::Mapping) {
+        let deadline = self.superseded_mapping_release_timeout;
+        self.superseded_mapping_tasks.spawn(async move {
+            match tokio::time::timeout(deadline, mapping.release()).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err(format!(
+                    "timed out releasing superseded port mapping after {deadline:?}"
+                )),
+            }
+        });
+    }
+
+    fn on_superseded_mapping_result(
+        &mut self,
+        result: Result<Result<(), String>, tokio::task::JoinError>,
+    ) {
+        let error = match result {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => error,
+            Err(error) => format!("superseded port-mapping cleanup task failed: {error}"),
+        };
+        debug!("failed to release superseded port mapping {error}");
+        self.metrics.mapping_failures.inc();
+        if self.mapping_release_error.is_none() {
+            self.mapping_release_error = Some(error);
+        }
+    }
+
+    async fn settle_superseded_mappings(&mut self) {
+        while let Some(result) = self.superseded_mapping_tasks.join_next().await {
+            self.on_superseded_mapping_result(result);
+        }
+    }
+
     async fn run(mut self) {
         debug!("portmap starting");
         loop {
@@ -574,7 +626,11 @@ impl Service {
                     self.mapping_task = None;
                     // there isn't really a way to react to a join error here. Flatten it to make
                     // it easier to work with
-                    self.on_mapping_result(mapping_result).await;
+                    self.on_mapping_result(mapping_result);
+                }
+                Some(release_result) = self.superseded_mapping_tasks.join_next(), if !self.superseded_mapping_tasks.is_empty() => {
+                    trace!("tick: superseded mapping release ready");
+                    self.on_superseded_mapping_result(release_result);
                 }
                 probe_result = util::MaybeFuture{ inner: self.probing_task.as_mut().map(|(fut, _rec)| fut) } => {
                     trace!("tick: probe ready");
@@ -616,7 +672,7 @@ impl Service {
         }
     }
 
-    async fn on_mapping_result(
+    fn on_mapping_result(
         &mut self,
         result: Result<Result<mapping::Mapping, mapping::Error>, tokio::task::JoinError>,
     ) {
@@ -627,15 +683,8 @@ impl Service {
                     .mapping()
                     .is_some_and(|current| current.same_lease(&mapping));
                 let superseded = self.current_mapping.update(Some(mapping));
-                if !same_lease
-                    && let Some(superseded) = superseded
-                    && let Err(error) = superseded.release().await
-                {
-                    debug!("failed to release superseded port mapping {error}");
-                    self.metrics.mapping_failures.inc();
-                    if self.mapping_release_error.is_none() {
-                        self.mapping_release_error = Some(error);
-                    }
+                if !same_lease && let Some(superseded) = superseded {
+                    self.release_superseded_mapping(superseded);
                 }
             }
             Ok(Err(e)) => {
@@ -662,10 +711,7 @@ impl Service {
                 }
             }
             Message::Deactivate { result_tx } => {
-                let result = self
-                    .update_local_port(None)
-                    .await
-                    .map_err(|error| error.to_string());
+                let result = self.update_local_port(None).await;
                 let _ = result_tx.send(result);
             }
             Message::Probe { result_tx } => self.probe_request(result_tx),
@@ -676,10 +722,7 @@ impl Service {
     ///
     /// If the port changed, any port mapping task is settled and a granted
     /// mapping is released. If the new port is some, this starts a new task.
-    async fn update_local_port(
-        &mut self,
-        local_port: Option<NonZeroU16>,
-    ) -> Result<(), mapping::Error> {
+    async fn update_local_port(&mut self, local_port: Option<NonZeroU16>) -> Result<(), String> {
         // ignore requests to update the local port in a way that does not produce a change
         if local_port != self.local_port {
             self.metrics.local_port_updates.inc();
@@ -689,17 +732,15 @@ impl Service {
 
             // Withdraw and release the known active lease before waiting for a
             // renewal attempt, which may be stalled in a gateway request.
-            let mut release_error = self.mapping_release_error.take();
-            if let Err(error) = self.invalidate_mapping().await
-                && release_error.is_none()
-            {
-                release_error = Some(error);
-            }
-            if let Err(error) = self.settle_mapping_task().await
-                && release_error.is_none()
-            {
-                release_error = Some(error);
-            }
+            let prior_release_error = self.mapping_release_error.take();
+            let active_release_error = self.invalidate_mapping().await.err();
+            let acquisition_release_error = self.settle_mapping_task().await.err();
+            self.settle_superseded_mappings().await;
+            let superseded_release_error = self.mapping_release_error.take();
+            let release_error = prior_release_error
+                .or_else(|| active_release_error.map(|error| error.to_string()))
+                .or_else(|| acquisition_release_error.map(|error| error.to_string()))
+                .or(superseded_release_error);
             debug!(
                 "settled mapping state due to local port update. Old: {:?} New: {:?}",
                 old_port, self.local_port
@@ -981,6 +1022,119 @@ mod lifecycle_tests {
         stream.shutdown().await.unwrap();
     }
 
+    struct StalledUpnpReplacement {
+        first: mapping::Mapping,
+        replacement: mapping::Mapping,
+        first_delete_started: oneshot::Receiver<()>,
+        replacement_deleted: oneshot::Receiver<()>,
+        finish: oneshot::Sender<()>,
+        gateway_task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn stalled_upnp_replacement(
+        local_port: NonZeroU16,
+        first_port: u16,
+        replacement_port: u16,
+        external_ip: Ipv4Addr,
+    ) -> StalledUpnpReplacement {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let gateway = upnp_test_gateway(listener.local_addr().unwrap());
+        let (first_delete_tx, first_delete_started) = oneshot::channel();
+        let (replacement_deleted_tx, replacement_deleted) = oneshot::channel();
+        let (finish, mut finish_rx) = oneshot::channel();
+        let gateway_task = tokio::spawn(async move {
+            let mut grants = 0_u8;
+            let mut first_delete_tx = Some(first_delete_tx);
+            let mut replacement_deleted_tx = Some(replacement_deleted_tx);
+            let mut stalled_first_delete = None;
+            loop {
+                tokio::select! {
+                    _ = &mut finish_rx, if stalled_first_delete.is_some() => break,
+                    request = receive_upnp_request(&listener) => {
+                        let (stream, request) = request;
+                        if request.contains("#GetExternalIPAddress\"") {
+                            respond_upnp(
+                                stream,
+                                "GetExternalIPAddressResponse",
+                                &format!("<NewExternalIPAddress>{external_ip}</NewExternalIPAddress>"),
+                            )
+                            .await;
+                        } else if request.contains("#AddPortMapping\"") {
+                            assert!(request.contains(&format!(
+                                "<NewExternalPort>{first_port}</NewExternalPort>"
+                            )));
+                            // Preserve the first lease while making renewal fall
+                            // back to a distinct port.
+                            drop(stream);
+                        } else if request.contains("#AddAnyPortMapping\"") {
+                            let port = if grants == 0 {
+                                first_port
+                            } else {
+                                replacement_port
+                            };
+                            grants += 1;
+                            respond_upnp(
+                                stream,
+                                "AddAnyPortMappingResponse",
+                                &format!("<NewReservedPort>{port}</NewReservedPort>"),
+                            )
+                            .await;
+                        } else if request.contains("#DeletePortMapping\"")
+                            && request.contains(&format!(
+                                "<NewExternalPort>{first_port}</NewExternalPort>"
+                            ))
+                        {
+                            assert!(stalled_first_delete.is_none());
+                            stalled_first_delete = Some(stream);
+                            let _ = first_delete_tx.take().unwrap().send(());
+                        } else if request.contains("#DeletePortMapping\"")
+                            && request.contains(&format!(
+                                "<NewExternalPort>{replacement_port}</NewExternalPort>"
+                            ))
+                        {
+                            respond_upnp(stream, "DeletePortMappingResponse", "").await;
+                            let _ = replacement_deleted_tx.take().unwrap().send(());
+                        } else {
+                            panic!("unexpected UPnP request: {request}");
+                        }
+                    }
+                }
+            }
+            assert_eq!(grants, 2);
+            drop(stalled_first_delete);
+        });
+
+        let first = mapping::Mapping::new_upnp(
+            Protocol::Udp,
+            Ipv4Addr::LOCALHOST,
+            local_port,
+            Some(gateway.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        let replacement = mapping::Mapping::new_upnp(
+            Protocol::Udp,
+            Ipv4Addr::LOCALHOST,
+            local_port,
+            Some(gateway),
+            Some(first_port.try_into().unwrap()),
+        )
+        .await
+        .unwrap();
+
+        StalledUpnpReplacement {
+            first,
+            replacement,
+            first_delete_started,
+            replacement_deleted,
+            finish,
+            gateway_task,
+        }
+    }
+
     #[tokio::test]
     async fn deactivation_releases_an_active_lease_before_a_stalled_renewal() {
         let gateway = Ipv4Addr::new(127, 0, 0, 3);
@@ -1260,7 +1414,7 @@ mod lifecycle_tests {
         )
         .await
         .unwrap();
-        service.on_mapping_result(Ok(Ok(replacement))).await;
+        service.on_mapping_result(Ok(Ok(replacement)));
         tokio::time::timeout(Duration::from_secs(1), first_deleted_rx)
             .await
             .unwrap()
@@ -1359,7 +1513,7 @@ mod lifecycle_tests {
         )
         .await
         .unwrap();
-        service.on_mapping_result(Ok(Ok(renewed))).await;
+        service.on_mapping_result(Ok(Ok(renewed)));
         assert!(
             tokio::time::timeout(Duration::from_millis(30), &mut deleted_rx)
                 .await
@@ -1461,7 +1615,7 @@ mod lifecycle_tests {
         )
         .await
         .unwrap();
-        service.on_mapping_result(Ok(Ok(replacement))).await;
+        service.on_mapping_result(Ok(Ok(replacement)));
 
         let (result_tx, result_rx) = oneshot::channel();
         service.handle_msg(Message::Deactivate { result_tx }).await;
@@ -1476,6 +1630,138 @@ mod lifecycle_tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_superseded_upnp_release_does_not_delay_active_cleanup() {
+        let local_port = NonZeroU16::new(39_503).unwrap();
+        let first_port = 45_105_u16;
+        let replacement_port = 45_106_u16;
+        let StalledUpnpReplacement {
+            first,
+            replacement,
+            first_delete_started,
+            replacement_deleted,
+            finish,
+            gateway_task,
+        } = stalled_upnp_replacement(
+            local_port,
+            first_port,
+            replacement_port,
+            Ipv4Addr::new(198, 51, 100, 13),
+        )
+        .await;
+
+        let (service_tx, service_rx) = mpsc::channel(SERVICE_CHANNEL_CAPACITY);
+        let (mut service, external) =
+            Service::new(Config::default(), service_rx, Default::default());
+        service.local_port = Some(local_port);
+        service.current_mapping.update(Some(first));
+        service.mapping_task = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+            Ok(replacement)
+        })));
+        let service_task = tokio::spawn(service.run());
+
+        tokio::time::timeout(Duration::from_secs(1), first_delete_started)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(external.borrow().unwrap().port(), replacement_port);
+
+        let (result_tx, mut result_rx) = oneshot::channel();
+        service_tx
+            .send(Message::Deactivate { result_tx })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), replacement_deleted)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(external.borrow().is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut result_rx)
+                .await
+                .is_err(),
+            "deactivation acknowledged while superseded cleanup was unresolved"
+        );
+
+        tokio::time::pause();
+        tokio::time::advance(SUPERSEDED_MAPPING_RELEASE_TIMEOUT).await;
+        let error = result_rx.await.unwrap().unwrap_err();
+        assert!(error.contains("timed out releasing superseded port mapping"));
+
+        finish.send(()).unwrap();
+        gateway_task.await.unwrap();
+        drop(service_tx);
+        service_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_superseded_upnp_release_does_not_stop_mapping_expiry() {
+        let local_port = NonZeroU16::new(39_504).unwrap();
+        let replacement_port = 45_108_u16;
+        let StalledUpnpReplacement {
+            first,
+            replacement,
+            first_delete_started,
+            replacement_deleted: _,
+            finish,
+            gateway_task,
+        } = stalled_upnp_replacement(
+            local_port,
+            45_107,
+            replacement_port,
+            Ipv4Addr::new(198, 51, 100, 14),
+        )
+        .await;
+
+        let config = Config {
+            enable_upnp: false,
+            enable_pcp: false,
+            enable_nat_pmp: false,
+            protocol: Protocol::Udp,
+        };
+        let (service_tx, service_rx) = mpsc::channel(SERVICE_CHANNEL_CAPACITY);
+        let (mut service, mut external) = Service::new(config, service_rx, Default::default());
+        service.local_port = Some(local_port);
+        service.current_mapping.update(Some(first));
+        service.superseded_mapping_release_timeout = Duration::from_secs(3 * 60 * 60);
+        service.mapping_task = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+            Ok(replacement)
+        })));
+        let service_task = tokio::spawn(service.run());
+
+        tokio::time::timeout(Duration::from_secs(1), first_delete_started)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(external.borrow().unwrap().port(), replacement_port);
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60 * 60)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(external.borrow().unwrap().port(), replacement_port);
+        tokio::time::advance(Duration::from_secs(60 * 60)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while external.borrow().is_some() {
+                external.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        finish.send(()).unwrap();
+        gateway_task.await.unwrap();
+        let (result_tx, result_rx) = oneshot::channel();
+        service_tx
+            .send(Message::Deactivate { result_tx })
+            .await
+            .unwrap();
+        assert!(result_rx.await.unwrap().is_err());
+        drop(service_tx);
+        service_task.await.unwrap();
     }
 
     #[test]
