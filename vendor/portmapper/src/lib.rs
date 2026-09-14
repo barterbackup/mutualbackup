@@ -48,11 +48,6 @@ const SERVICE_CHANNEL_CAPACITY: usize = 32; // should be plenty
 /// we allow trying a mapping using said protocol.
 const UNAVAILABILITY_TRUST_DURATION: Duration = Duration::from_secs(5);
 
-/// Maximum time a port change waits for an in-flight acquisition. After this
-/// deadline a cleanup task retains the acquisition and releases any late
-/// successful result without delaying listener shutdown.
-const MAPPING_TASK_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Output of a port mapping probe.
 #[derive(Debug, Clone, PartialEq, Eq, derive_more::Display)]
 #[display("portmap={{ UPnP: {upnp}, PMP: {nat_pmp}, PCP: {pcp} }}")]
@@ -120,9 +115,8 @@ enum Message {
     /// [`Client::watch_external_address`].
     /// A value of `None` will deactivate port mapping.
     UpdateLocalPort { local_port: Option<NonZeroU16> },
-    /// Deactivate port mapping and acknowledge release of the active lease.
-    /// An acquisition that cannot settle promptly retains independent cleanup
-    /// ownership so that any late successful result is also released.
+    /// Deactivate port mapping and acknowledge release of the active lease and
+    /// any lease returned by an in-flight acquisition.
     Deactivate {
         #[debug("_")]
         result_tx: oneshot::Sender<Result<(), String>>,
@@ -276,10 +270,9 @@ impl Client {
         }
     }
 
-    /// Deactivate port mapping and wait for the active mapping to be released.
-    /// An in-flight acquisition is settled for a bounded period; if it remains
-    /// stalled, a background cleanup task retains it and releases any late
-    /// successful result.
+    /// Deactivate port mapping and wait for the active mapping and any in-flight
+    /// acquisition to be settled. Callers that need a bounded shutdown must
+    /// apply their own timeout and treat expiration as incomplete cleanup.
     pub async fn deactivate_and_wait(&self) -> Result<(), DeactivateError> {
         let (result_tx, result_rx) = oneshot::channel();
         self.service_tx
@@ -496,7 +489,7 @@ pub struct Service {
     /// Task attempting to get a port mapping.
     ///
     /// A request to change the local port releases the active mapping, then
-    /// settles this task or transfers it to bounded background cleanup.
+    /// settles this task before acknowledging the change.
     mapping_task: Option<AbortOnDropHandle<Result<mapping::Mapping, mapping::Error>>>,
     /// Task probing the necessary protocols.
     ///
@@ -545,30 +538,13 @@ impl Service {
 
     /// Settle an acquisition after withdrawing the known active lease. A
     /// successful task may already hold a gateway lease even though `run` has
-    /// not selected its completion branch yet, so dropping the handle is not
-    /// sufficient.
+    /// not selected its completion branch yet, so deactivation must retain and
+    /// await the handle before it can acknowledge complete cleanup.
     async fn settle_mapping_task(&mut self) -> Result<(), mapping::Error> {
-        let Some(mut task) = self.mapping_task.take() else {
+        let Some(task) = self.mapping_task.take() else {
             return Ok(());
         };
-        match tokio::time::timeout(MAPPING_TASK_SETTLE_TIMEOUT, &mut task).await {
-            Ok(result) => release_mapping_task_result(result, &self.metrics).await,
-            Err(_) => {
-                debug!(
-                    "mapping acquisition did not settle within {:?}; cleanup will continue in the background",
-                    MAPPING_TASK_SETTLE_TIMEOUT
-                );
-                let metrics = self.metrics.clone();
-                std::mem::drop(tokio::spawn(async move {
-                    if let Err(error) =
-                        release_mapping_task_result(task.detach().await, &metrics).await
-                    {
-                        debug!("failed to release a late port mapping {error}");
-                    }
-                }));
-                Ok(())
-            }
-        }
+        release_mapping_task_result(task.await, &self.metrics).await
     }
 
     async fn run(mut self) {
@@ -987,7 +963,7 @@ mod lifecycle_tests {
         };
         service.mapping_task = Some(AbortOnDropHandle::new(tokio::spawn(renewal)));
 
-        let cleanup_task = tokio::spawn(async move { service.update_local_port(None).await });
+        let mut cleanup_task = tokio::spawn(async move { service.update_local_port(None).await });
         tokio::time::timeout(Duration::from_secs(1), active_deleted_rx)
             .await
             .unwrap()
@@ -995,15 +971,17 @@ mod lifecycle_tests {
         assert!(external.borrow().is_none());
         assert!(!cleanup_task.is_finished());
 
-        tokio::time::timeout(
-            MAPPING_TASK_SETTLE_TIMEOUT + Duration::from_secs(1),
-            cleanup_task,
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut cleanup_task)
+                .await
+                .is_err()
+        );
         resume_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cleanup_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(2), renewed_deleted_rx)
             .await
             .unwrap()
@@ -1088,5 +1066,78 @@ mod lifecycle_tests {
             .unwrap();
         assert!(external.borrow().is_none());
         gateway_task.await.unwrap();
+    }
+
+    #[test]
+    fn runtime_shutdown_cannot_observe_success_while_a_granted_mapping_is_owned() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (cleanup_task, cleanup_timed_out) = runtime.block_on(async {
+            let gateway = Ipv4Addr::new(127, 0, 0, 5);
+            let local_ip = Ipv4Addr::new(127, 0, 0, 6);
+            let local_port = NonZeroU16::new(39_453).unwrap();
+            let external_port = 45_002_u16;
+            let gateway_socket = tokio::net::UdpSocket::bind((gateway, 5351)).await.unwrap();
+            let gateway_task = tokio::spawn(async move {
+                let mut packet = [0_u8; 64];
+                let (read, peer) = gateway_socket.recv_from(&mut packet).await.unwrap();
+                assert_eq!(&packet[..read], &[0, 0]);
+                let mut public_response = vec![0, 128, 0, 0];
+                public_response.extend_from_slice(&0_u32.to_be_bytes());
+                public_response.extend_from_slice(&[198, 51, 100, 9]);
+                gateway_socket
+                    .send_to(&public_response, peer)
+                    .await
+                    .unwrap();
+
+                let (read, peer) = gateway_socket.recv_from(&mut packet).await.unwrap();
+                assert_eq!(read, 12);
+                assert_eq!(&packet[..4], &[0, 1, 0, 0]);
+                assert_eq!(u16::from_be_bytes([packet[4], packet[5]]), local_port.get());
+                assert_ne!(u32::from_be_bytes(packet[8..12].try_into().unwrap()), 0);
+                let mut mapping_response = vec![0, 129, 0, 0];
+                mapping_response.extend_from_slice(&0_u32.to_be_bytes());
+                mapping_response.extend_from_slice(&local_port.get().to_be_bytes());
+                mapping_response.extend_from_slice(&external_port.to_be_bytes());
+                mapping_response.extend_from_slice(&7_200_u32.to_be_bytes());
+                gateway_socket
+                    .send_to(&mapping_response, peer)
+                    .await
+                    .unwrap();
+            });
+            let mapping =
+                mapping::Mapping::new_nat_pmp(Protocol::Udp, local_ip, local_port, gateway, None)
+                    .await
+                    .unwrap();
+            gateway_task.await.unwrap();
+
+            let (_service_tx, service_rx) = mpsc::channel(SERVICE_CHANNEL_CAPACITY);
+            let (mut service, _external) =
+                Service::new(Config::default(), service_rx, Default::default());
+            service.local_port = Some(local_port);
+            service.mapping_task = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+                let _mapping = mapping;
+                std::future::pending::<Result<mapping::Mapping, mapping::Error>>().await
+            })));
+
+            // Model the daemon's bounded outer wait. A grant whose result is
+            // still owned at the deadline must remain incomplete, rather than
+            // being acknowledged and left in a detached task that runtime
+            // teardown immediately cancels.
+            tokio::time::pause();
+            let mut cleanup_task =
+                tokio::spawn(async move { service.update_local_port(None).await });
+            let cleanup_timed_out = tokio::time::timeout(Duration::from_secs(6), &mut cleanup_task)
+                .await
+                .is_err();
+            (cleanup_task, cleanup_timed_out)
+        });
+
+        assert!(cleanup_timed_out, "incomplete cleanup was acknowledged");
+        assert!(!cleanup_task.is_finished());
+        drop(runtime);
+        assert!(cleanup_task.is_finished());
     }
 }
