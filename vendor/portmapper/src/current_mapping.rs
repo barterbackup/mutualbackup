@@ -40,8 +40,9 @@ struct ActiveMapping<M> {
 }
 
 impl<M: Mapping> ActiveMapping<M> {
-    fn new(mapping: M) -> Self {
-        let deadline = Box::pin(time::sleep(mapping.half_lifetime()));
+    fn new(mapping: M, half_lifetime_override: Option<Duration>) -> Self {
+        let half_lifetime = half_lifetime_override.unwrap_or_else(|| mapping.half_lifetime());
+        let deadline = Box::pin(time::sleep(half_lifetime));
         ActiveMapping {
             mapping,
             deadline,
@@ -75,6 +76,8 @@ pub(super) struct CurrentMapping<M = super::mapping::Mapping> {
     /// Waker to ensure this is polled when needed.
     #[debug(skip)]
     waker: Option<std::task::Waker>,
+    /// Optional clock override for deterministic service lifecycle tests.
+    half_lifetime_override: Option<Duration>,
     metrics: Arc<Metrics>,
 }
 
@@ -86,6 +89,7 @@ impl<M: Mapping> CurrentMapping<M> {
             mapping: None,
             address_tx,
             waker: None,
+            half_lifetime_override: None,
             metrics,
         };
         (wrapper, address_rx)
@@ -99,8 +103,12 @@ impl<M: Mapping> CurrentMapping<M> {
             let (ip, port) = mapping.external();
             SocketAddrV4::new(ip, port.into())
         });
-        let old_mapping = std::mem::replace(&mut self.mapping, mapping.map(ActiveMapping::new))
-            .map(|mapping| mapping.mapping);
+        let half_lifetime_override = self.half_lifetime_override;
+        let old_mapping = std::mem::replace(
+            &mut self.mapping,
+            mapping.map(|mapping| ActiveMapping::new(mapping, half_lifetime_override)),
+        )
+        .map(|mapping| mapping.mapping);
         // mapping changed
         // TODO(@divma): maybe only wake if mapping is some
         if let Some(waker) = &self.waker {
@@ -130,6 +138,7 @@ impl<M: Mapping> CurrentMapping<M> {
         }
 
         // poll the mapping deadlines to keep the state up to date
+        let half_lifetime_override = self.half_lifetime_override;
         if let Some(ActiveMapping {
             mapping,
             deadline,
@@ -148,7 +157,9 @@ impl<M: Mapping> CurrentMapping<M> {
                 })
             } else {
                 // mapping is due for renewal
-                *deadline = Box::pin(time::sleep(mapping.half_lifetime()));
+                let half_lifetime =
+                    half_lifetime_override.unwrap_or_else(|| mapping.half_lifetime());
+                *deadline = Box::pin(time::sleep(half_lifetime));
                 *expire_after = true;
                 trace!("due for renewal {mapping:?}");
                 Poll::Ready(Event::Renew {
@@ -168,6 +179,11 @@ impl<M: Mapping> CurrentMapping<M> {
 
     pub(crate) fn mapping(&self) -> Option<&M> {
         self.mapping.as_ref().map(|mapping| &mapping.mapping)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_half_lifetime_for_test(&mut self, half_lifetime: Duration) {
+        self.half_lifetime_override = Some(half_lifetime);
     }
 }
 

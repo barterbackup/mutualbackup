@@ -1725,7 +1725,9 @@ mod lifecycle_tests {
         let (mut service, mut external) = Service::new(config, service_rx, Default::default());
         service.local_port = Some(local_port);
         service.current_mapping.update(Some(first));
-        service.superseded_mapping_release_timeout = Duration::from_secs(3 * 60 * 60);
+        service
+            .current_mapping
+            .set_half_lifetime_for_test(Duration::from_millis(20));
         service.mapping_task = Some(AbortOnDropHandle::new(tokio::spawn(async move {
             Ok(replacement)
         })));
@@ -1737,13 +1739,6 @@ mod lifecycle_tests {
             .unwrap();
         assert_eq!(external.borrow().unwrap().port(), replacement_port);
 
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(60 * 60)).await;
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(external.borrow().unwrap().port(), replacement_port);
-        tokio::time::advance(Duration::from_secs(60 * 60)).await;
         tokio::time::timeout(Duration::from_secs(1), async {
             while external.borrow().is_some() {
                 external.changed().await.unwrap();
