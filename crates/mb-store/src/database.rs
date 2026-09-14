@@ -2421,6 +2421,44 @@ mod tests {
     }
 
     #[test]
+    fn parity_rekey_preserves_a_nonempty_database() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("parity.db");
+        let volume_id = [5; 16];
+        let old_key = [6; 32];
+        let new_key = [7; 32];
+        let bytes = vec![8; V1_SECTOR_SIZE];
+        let object = ParityObject {
+            format_version: 1,
+            guild_id: [9; 32],
+            group_id: [10; 32],
+            shard_index: 3,
+            root: sector_root(&bytes),
+            bytes,
+        };
+        let mut store = ParityStore::open_with_key(&path, &volume_id, &old_key).unwrap();
+        store
+            .stage_and_publish_ack(&object, b"rekeyed-ack", V1_SECTOR_SIZE as u64)
+            .unwrap();
+        store.rekey(&new_key).unwrap();
+
+        let store = ParityStore::open_existing_with_key(&path, &volume_id, &new_key).unwrap();
+        assert_eq!(
+            store
+                .load_ready(&object.group_id, object.shard_index)
+                .unwrap(),
+            object
+        );
+        assert_eq!(
+            store
+                .load_acknowledgement(&object.group_id, object.shard_index)
+                .unwrap(),
+            b"rekeyed-ack"
+        );
+        store.cipher_integrity_check().unwrap();
+    }
+
+    #[test]
     fn database_shell_is_query_only_unless_explicitly_writable() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("control.db");
