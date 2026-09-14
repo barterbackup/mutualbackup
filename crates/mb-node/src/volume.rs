@@ -231,7 +231,7 @@ impl StorageVolumes {
                         }
                     }
                 }
-            } else {
+            } else if record.state != StorageVolumeState::Retired {
                 record.state = StorageVolumeState::Offline;
                 record.last_error = Some("configured volume is absent".to_owned());
             }
@@ -293,6 +293,11 @@ impl StorageVolumes {
                     };
                     volume.record.budget_bytes = budget_bytes;
                     volume.record.headroom_bytes = headroom_bytes;
+                    if volume.record.state == StorageVolumeState::Retired {
+                        volume.record.configured = false;
+                        volume.store = None;
+                        continue;
+                    }
                     volume.record.configured = true;
                     volume.record.state = StorageVolumeState::Offline;
                     volume.record.last_error = Some("configured volume is absent".to_owned());
@@ -1524,6 +1529,64 @@ mod tests {
                 .state,
             StorageVolumeState::Online
         );
+    }
+
+    #[test]
+    fn absent_retired_volume_stays_retired_through_startup_configuration() {
+        let temp = TempDir::new().unwrap();
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([66; 32])));
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys.clone(), &control).unwrap();
+        let configured = vec![first.path().to_path_buf(), second.path().to_path_buf()];
+        volumes
+            .configure(&control, &configured, (V1_SECTOR_SIZE * 2) as u64, 0)
+            .unwrap();
+        let object = parity_object(67, 3);
+        let source = volumes.store(&control, &object, b"ack").unwrap();
+        let source_path = volumes
+            .statuses()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.volume_id == source.volume_id)
+            .unwrap()
+            .path;
+        volumes.mark_draining(&control, source.volume_id).unwrap();
+        assert_eq!(volumes.migrate_draining(&control).unwrap(), 1);
+        drop(volumes);
+        drop(control);
+        fs::remove_dir_all(&source_path).unwrap();
+
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        let status = volumes
+            .statuses()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.volume_id == source.volume_id)
+            .unwrap();
+        assert_eq!(status.state, StorageVolumeState::Retired);
+        assert!(!status.path.exists());
+        volumes
+            .configure(&control, &configured, (V1_SECTOR_SIZE * 2) as u64, 0)
+            .unwrap();
+        let status = volumes
+            .statuses()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.volume_id == source.volume_id)
+            .unwrap();
+        assert_eq!(status.state, StorageVolumeState::Retired);
+        assert!(
+            !volumes
+                .volumes
+                .get(&source.volume_id)
+                .unwrap()
+                .record
+                .configured
+        );
+        assert!(!source_path.exists());
     }
 
     #[test]
