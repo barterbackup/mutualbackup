@@ -1,6 +1,6 @@
 # Product TODO
 
-## Milestone 4 follow-up source review — reopened 2026-09-15
+## Milestone 4 follow-up source review — corrected 2026-09-15
 
 Source review of `e663c49..8411f7d` found the remaining blockers below. The
 2026-09-14 test results remain historical evidence for the cases they exercised;
@@ -129,12 +129,16 @@ advancing to Milestone 5.
   authenticated initialization state distinct from established-data loss. Cover
   interruption before/after schema and registry commits and restart convergence.
 
-- [ ] **Run a new Milestone 4 correction gate after M4-15 through M4-27.**
-  Add the combined failure and upgrade regressions above, then run the required
-  local workspace and disposable-Btrfs/reflink/network gates. Preserve the
-  generation-2 seed-recovery invariant and verify service availability during
-  source/volume failure. Runtime validation belongs to the subsequent correction
-  task; this review is source-only and makes no new test-pass claim.
+- [x] **Run a new Milestone 4 correction gate after M4-15 through M4-27.**
+  Commits `8162ffc`, `99d8ad5`, and `21486e4` close the combined failure and
+  upgrade schedules. On 2026-09-15 the exact corrected tree passed locked
+  workspace tests and warning-free workspace Clippy. A disposable local Btrfs
+  filesystem passed the complete reflink/network gate, including the version-1
+  capture migration, real shared-filesystem headroom boundary, generation-2
+  seed recovery, repeated multi-owner QUIC backup, and five-daemon seed/DHT
+  recovery after source and holder loss. Docker-controller safety and the real
+  NAT-PMP lifecycle gate also passed. All compilation and execution were local;
+  no remote compilation server was used.
 
 ## Milestone 4 initial review findings (prior correction record)
 
