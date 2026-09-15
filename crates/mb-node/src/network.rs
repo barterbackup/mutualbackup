@@ -2562,6 +2562,174 @@ mod tests {
         service.return_reader(reader).unwrap();
     }
 
+    #[test]
+    fn completed_parity_publication_retries_at_the_physical_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let holder_seed = Seed::from_bytes([58; 32]);
+        let coordinator = KeyMaterial::from_seed(&Seed::from_bytes([59; 32]));
+        let local_id = KeyMaterial::from_seed(&holder_seed).node_id();
+        let guild_id = [60; 32];
+        let information = [
+            vec![61; V1_SECTOR_SIZE],
+            vec![62; V1_SECTOR_SIZE],
+            vec![63; V1_SECTOR_SIZE],
+        ];
+        let shards = encode_3_2(information.clone()).unwrap();
+        let information_owners = [
+            KeyMaterial::from_seed(&Seed::from_bytes([64; 32])).node_id(),
+            KeyMaterial::from_seed(&Seed::from_bytes([65; 32])).node_id(),
+            KeyMaterial::from_seed(&Seed::from_bytes([66; 32])).node_id(),
+        ];
+        let mut group = CodingGroup {
+            id: [0; 32],
+            format_version: 1,
+            guild_id,
+            data_shards: V1_RS_DATA_SHARDS,
+            parity_shards: V1_RS_PARITY_SHARDS,
+            shard_size: V1_SECTOR_SIZE as u32,
+            roles: [
+                ShardRole::Information(InformationRole {
+                    owner: information_owners[0],
+                    sector: SectorRef {
+                        id: [67; 32],
+                        root: sector_root(&information[0]),
+                        logical_len: V1_SECTOR_SIZE as u32,
+                    },
+                }),
+                ShardRole::Information(InformationRole {
+                    owner: information_owners[1],
+                    sector: SectorRef {
+                        id: [68; 32],
+                        root: sector_root(&information[1]),
+                        logical_len: V1_SECTOR_SIZE as u32,
+                    },
+                }),
+                ShardRole::Information(InformationRole {
+                    owner: information_owners[2],
+                    sector: SectorRef {
+                        id: [69; 32],
+                        root: sector_root(&information[2]),
+                        logical_len: V1_SECTOR_SIZE as u32,
+                    },
+                }),
+                ShardRole::Parity(ParityRole {
+                    holder: local_id,
+                    row: 0,
+                    root: sector_root(&shards[3]),
+                }),
+                ShardRole::Parity(ParityRole {
+                    holder: KeyMaterial::from_seed(&Seed::from_bytes([70; 32])).node_id(),
+                    row: 1,
+                    root: sector_root(&shards[4]),
+                }),
+            ],
+        };
+        group.id = group.calculate_id().unwrap();
+        let object = ParityObject {
+            format_version: 1,
+            guild_id,
+            group_id: group.id,
+            shard_index: 3,
+            root: sector_root(&shards[3]),
+            bytes: shards[3].clone(),
+        };
+        let request = PeerRequest::PublishParity {
+            operation_id: storage_operation_id(&group.id, object.shard_index),
+            group: Box::new(group),
+            information,
+            object: object.clone(),
+        };
+        let signed = make_peer_request(&coordinator, Some(local_id), request).unwrap();
+        let operation_hash = peer_operation_hash(&signed.value).unwrap();
+        let config = NodeServerConfig {
+            listen: free_address(),
+            public_endpoint: "tcp://127.0.0.1:1".to_owned(),
+            failure_domain: "retry-holder".to_owned(),
+            trusted_coordinator: coordinator.node_id(),
+            max_connections: 2,
+        };
+
+        let node = Arc::new(Mutex::new(
+            Node::open(temp.path(), holder_seed.clone()).unwrap(),
+        ));
+        let service = Arc::new(NodeService {
+            reader_config: node.lock().unwrap().reader_config(),
+            writer: node.clone(),
+            readers: Mutex::new(Vec::new()),
+            max_readers: 2,
+            active_readers: AtomicUsize::new(0),
+        });
+        crate::volume::interrupt_next_volume_transition(
+            crate::volume::VolumeInterruption::ObjectPublished,
+        );
+        let first = process_peer_request(service.clone(), &config, signed.clone()).unwrap();
+        let error = first.value.result.unwrap_err();
+        assert!(error.to_string().contains("injected interruption"));
+        assert_eq!(
+            node.lock()
+                .unwrap()
+                .parity_for_guild(&guild_id, &object.group_id, object.shard_index)
+                .unwrap(),
+            object.bytes
+        );
+        drop(service);
+        drop(node);
+
+        let mut reopened = Node::open(temp.path(), holder_seed.clone()).unwrap();
+        let status = reopened.status().unwrap().storage_volumes.remove(0);
+        assert_eq!(status.object_count, Some(1));
+        let available = status.available_bytes.unwrap();
+        let completion_margin = 128 * 1024_u64;
+        assert!(available > completion_margin);
+        let headroom = available - completion_margin;
+        reopened
+            .configure_storage_volumes(std::slice::from_ref(&status.path), u64::MAX, headroom)
+            .unwrap();
+        let allocated_before_retry = reopened.status().unwrap().storage_volumes[0]
+            .allocated_bytes
+            .unwrap();
+        let node = Arc::new(Mutex::new(reopened));
+        let service = Arc::new(NodeService {
+            reader_config: node.lock().unwrap().reader_config(),
+            writer: node.clone(),
+            readers: Mutex::new(Vec::new()),
+            max_readers: 2,
+            active_readers: AtomicUsize::new(0),
+        });
+        let retried = process_peer_request(service.clone(), &config, signed.clone()).unwrap();
+        expect_storage_ack(retried.value.result.unwrap(), local_id, &object).unwrap();
+        assert_eq!(
+            node.lock().unwrap().status().unwrap().storage_volumes[0].allocated_bytes,
+            Some(allocated_before_retry),
+            "an exact READY retry changed parity allocation"
+        );
+        assert!(
+            node.lock()
+                .unwrap()
+                .cached_operation(
+                    &signed.value.request_id,
+                    "publish-parity",
+                    coordinator.node_id(),
+                    &operation_hash,
+                )
+                .unwrap()
+                .is_some()
+        );
+        drop(service);
+        drop(node);
+
+        let reopened = Arc::new(Mutex::new(Node::open(temp.path(), holder_seed).unwrap()));
+        let service = Arc::new(NodeService {
+            reader_config: reopened.lock().unwrap().reader_config(),
+            writer: reopened.clone(),
+            readers: Mutex::new(Vec::new()),
+            max_readers: 2,
+            active_readers: AtomicUsize::new(0),
+        });
+        let cached = process_peer_request(service, &config, signed).unwrap();
+        expect_storage_ack(cached.value.result.unwrap(), local_id, &object).unwrap();
+    }
+
     #[tokio::test]
     async fn directory_rejects_signed_rollback() {
         let address = free_address();

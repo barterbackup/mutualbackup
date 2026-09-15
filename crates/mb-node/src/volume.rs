@@ -695,6 +695,9 @@ impl StorageVolumes {
         reserve_headroom: bool,
     ) -> Result<VolumeReceipt> {
         if let Some(receipt) = self.receipt(control, &object.group_id, object.shard_index)? {
+            if receipt.guild_id != object.guild_id || receipt.root != object.root {
+                bail!("parity volume receipt conflicts with the requested object");
+            }
             let volume = self
                 .volumes
                 .get_mut(&receipt.volume_id)
@@ -703,6 +706,9 @@ impl StorageVolumes {
                 .store
                 .as_mut()
                 .context("parity receipt volume is offline")?;
+            if store.publication_is_complete(object, acknowledgement)? {
+                return Ok(receipt);
+            }
             let reserved = if reserve_headroom {
                 volume.record.headroom_bytes
             } else {
@@ -1014,6 +1020,10 @@ impl StorageVolumes {
             .map(|bytes| {
                 let receipt: VolumeReceipt = decode_canonical(&bytes)?;
                 validate_receipt(&receipt)?;
+                validate_volume_object_record_id(
+                    &volume_object_id(group_id, shard_index),
+                    &receipt,
+                )?;
                 Ok(receipt)
             })
             .transpose()

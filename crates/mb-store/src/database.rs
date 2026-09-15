@@ -1468,20 +1468,61 @@ impl ParityStore {
         self.stage_and_publish_ack(object, &[], u64::MAX)
     }
 
+    /// Return whether this exact publication is already durable and READY.
+    /// Conflicting rows are rejected before callers make capacity decisions.
+    pub fn publication_is_complete(
+        &self,
+        object: &ParityObject,
+        acknowledgement: &[u8],
+    ) -> Result<bool, DatabaseError> {
+        validate_parity_publication(object, acknowledgement)?;
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT format_version, guild_id, root, byte_length, state, bytes, acknowledgement
+                 FROM parity_objects WHERE group_id = ?1 AND shard_index = ?2",
+                params![object.group_id.as_slice(), object.shard_index],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((format_version, guild_id, root, byte_length, state, bytes, stored_ack)) =
+            existing
+        else {
+            return Ok(false);
+        };
+        if format_version != i64::from(object.format_version)
+            || guild_id.as_slice() != object.guild_id
+            || root.as_slice() != object.root
+            || byte_length != object.bytes.len() as i64
+            || bytes != object.bytes
+            || stored_ack != acknowledgement
+        {
+            return Err(DatabaseError::Conflict);
+        }
+        match state.as_str() {
+            "READY" => Ok(true),
+            "STAGED" => Ok(false),
+            _ => Err(DatabaseError::Integrity),
+        }
+    }
+
     pub fn stage_and_publish_ack(
         &mut self,
         object: &ParityObject,
         acknowledgement: &[u8],
         budget_bytes: u64,
     ) -> Result<(), DatabaseError> {
-        if object.format_version != 1
-            || object.bytes.len() != V1_SECTOR_SIZE
-            || object.shard_index > 4
-            || sector_root(&object.bytes) != object.root
-            || acknowledgement.len() > 4096
-        {
-            return Err(DatabaseError::Integrity);
-        }
+        validate_parity_publication(object, acknowledgement)?;
 
         let transaction = self.connection.transaction()?;
         let existing = transaction
@@ -1657,6 +1698,21 @@ impl ParityStore {
     pub fn cipher_integrity_check(&self) -> Result<(), DatabaseError> {
         cipher_integrity_check(&self.connection)
     }
+}
+
+fn validate_parity_publication(
+    object: &ParityObject,
+    acknowledgement: &[u8],
+) -> Result<(), DatabaseError> {
+    if object.format_version != 1
+        || object.bytes.len() != V1_SECTOR_SIZE
+        || object.shard_index > 4
+        || sector_root(&object.bytes) != object.root
+        || acknowledgement.len() > 4096
+    {
+        return Err(DatabaseError::Integrity);
+    }
+    Ok(())
 }
 
 fn initialize_or_validate_control(connection: &mut Connection) -> Result<(), DatabaseError> {
@@ -3774,12 +3830,21 @@ mod tests {
         store
             .stage_and_publish_ack(&object, b"signed-ack", V1_SECTOR_SIZE as u64)
             .unwrap();
+        assert!(
+            store
+                .publication_is_complete(&object, b"signed-ack")
+                .unwrap()
+        );
         assert_eq!(
             store
                 .load_acknowledgement(&object.group_id, object.shard_index)
                 .unwrap(),
             b"signed-ack"
         );
+        assert!(matches!(
+            store.publication_is_complete(&object, b"other-ack"),
+            Err(DatabaseError::Conflict)
+        ));
         assert!(matches!(
             store.stage_and_publish_ack(&object, b"other-ack", V1_SECTOR_SIZE as u64),
             Err(DatabaseError::Conflict)
