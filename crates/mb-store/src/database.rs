@@ -1317,11 +1317,12 @@ impl ParityStore {
             .connection
             .pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
         if mode == 2 {
-            self.connection
-                .execute_batch("PRAGMA incremental_vacuum;")?;
+            drain_incremental_vacuum(&self.connection)?;
         } else {
             self.connection.execute_batch("VACUUM;")?;
         }
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
     }
 
@@ -1332,8 +1333,9 @@ impl ParityStore {
             .connection
             .pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
         if mode == 2 {
+            drain_incremental_vacuum(&self.connection)?;
             self.connection
-                .execute_batch("PRAGMA incremental_vacuum;")?;
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         }
         Ok(())
     }
@@ -2164,6 +2166,13 @@ fn database_has_tables(connection: &Connection) -> Result<bool, DatabaseError> {
         [],
         |row| row.get(0),
     )?)
+}
+
+fn drain_incremental_vacuum(connection: &Connection) -> Result<(), DatabaseError> {
+    let mut statement = connection.prepare("PRAGMA incremental_vacuum;")?;
+    let mut rows = statement.query([])?;
+    while rows.next()?.is_some() {}
+    Ok(())
 }
 
 fn validate_database_identity(
@@ -3532,6 +3541,7 @@ mod tests {
                 .unwrap(),
             2
         );
+        let allocated_empty = store.allocated_bytes().unwrap();
         let mut objects = Vec::new();
         for index in 0_u8..5 {
             let bytes = vec![14 + index; V1_SECTOR_SIZE];
@@ -3564,7 +3574,16 @@ mod tests {
 
         assert_eq!(store.ready_object_count().unwrap(), 0);
         assert_eq!(store.first_ready_object().unwrap(), None);
-        assert!(store.allocated_bytes().unwrap() < allocated_before);
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "freelist_count", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let allocated_after = store.allocated_bytes().unwrap();
+        assert!(allocated_after < allocated_before);
+        assert!(allocated_after <= allocated_empty + 2 * 4096);
     }
 
     #[test]

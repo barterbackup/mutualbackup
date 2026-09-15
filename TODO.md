@@ -28,7 +28,7 @@ advancing to Milestone 5.
   (`crates/mb-node/src/node.rs:595`). Add an explicit legacy decoder/migration
   that preserves owned capture cleanup and treats the unknown dirty generation
   conservatively. Cover upgrade with an interrupted version-1 capture.
-- [ ] **M4-17 / P1 — Isolate corrupt pending writes during startup.**
+- [x] **M4-17 / P1 — Isolate corrupt pending writes during startup.**
   A publication interrupted after READY commit leaves `volume-write-intent`
   durable (`crates/mb-node/src/volume.rs:671`). If that object's payload is
   corrupt, the database can still open, but `reconcile` propagates its
@@ -37,7 +37,7 @@ advancing to Milestone 5.
   scrub/repair controls become inaccessible. Quarantine/report the failed
   volume while retaining reconciliation evidence. Cover interruption after
   object commit, corruption, healthy replacement, and daemon reopen.
-- [ ] **M4-18 / P1 — Keep corrupt retired shards from blocking GC and startup.**
+- [x] **M4-18 / P1 — Keep corrupt retired shards from blocking GC and startup.**
   `remove_unreachable` verifies payload bytes before deleting a certified
   unreachable object and propagates corruption even on a Failed volume
   (`crates/mb-node/src/volume.rs:537`). Retiring its group and advancing beyond
@@ -46,7 +46,7 @@ advancing to Milestone 5.
   Safely delete or defer the corrupt unreachable object using certified
   identity without making peer/control startup depend on valid obsolete
   payloads. Cover corruption, retirement, grace-period advance, and reopen.
-- [ ] **M4-19 / P1 — Reconcile relocated volumes by durable UUID before initialization.**
+- [x] **M4-19 / P1 — Reconcile relocated volumes by durable UUID before initialization.**
   A newly configured path enters `initialize_volume` before the existing UUID
   is checked (`crates/mb-node/src/volume.rs:339`). Its manifest branch resets
   Online/configured state and creates a missing database (`volume.rs:940`).
@@ -63,7 +63,7 @@ advancing to Milestone 5.
   and terminates the daemon at `cmd/mutualbackup/src/bin/mutualbackupd.rs:151`.
   Apply character-safe bounds to scan and completion errors; test long Unicode
   failure paths with persisted blocked/retry status and continued service.
-- [ ] **M4-21 / P2 — Make emergency-copy classification recoverable after interruption.**
+- [x] **M4-21 / P2 — Make emergency-copy classification recoverable after interruption.**
   `install_repaired_shard` commits the payload and volume receipt before
   separately writing its proof and emergency marker
   (`crates/mb-node/src/node.rs:2445`). A crash before the marker leaves an
@@ -72,7 +72,7 @@ advancing to Milestone 5.
   Volume reconciliation repairs receipts only. Persist/reconcile the repair
   classification across these commits. Cover interruption before proof/marker,
   reopen, restored assignments, retirement, and complete space reclamation.
-- [ ] **M4-22 / P2 — Keep GC work until every migration duplicate is collected.**
+- [x] **M4-22 / P2 — Keep GC work until every migration duplicate is collected.**
   Interruption after migration destination commit leaves both source and
   destination copies (`crates/mb-node/src/volume.rs:810`). GC deletes only
   the receipt-selected destination and returns success (`volume.rs:548`),
@@ -82,7 +82,7 @@ advancing to Milestone 5.
   Collect every duplicate or retain per-volume cleanup obligations, including
   unavailable sources. Cover migration interruption followed by retention/GC,
   reopen, source return, and resumed drain.
-- [ ] **M4-23 / P2 — Reuse repaired destinations when draining a returned volume.**
+- [x] **M4-23 / P2 — Reuse repaired destinations when draining a returned volume.**
   Replacement repair stores the payload with an empty acknowledgement
   (`crates/mb-node/src/volume.rs:598`). If the original volume returns and is
   drained, migration retains the replacement receipt but republishes using the
@@ -91,7 +91,7 @@ advancing to Milestone 5.
   (`crates/mb-store/src/database.rs:1503`). Reuse the verified destination while
   preserving repair/publication acknowledgement semantics. Cover source loss,
   replacement repair, original return, and completed drain at exact capacity.
-- [ ] **M4-24 / P2 — Report failed volumes even when their metadata is unreadable.**
+- [x] **M4-24 / P2 — Report failed volumes even when their metadata is unreadable.**
   Scrub marks a database Failed on a read error but retains its store
   (`crates/mb-node/src/volume.rs:730`). Status still propagates errors from
   `used_bytes`, allocation, free-space, and object-count queries
@@ -99,7 +99,7 @@ advancing to Milestone 5.
   prevents reporting every volume. Return the failed entry with unavailable
   measurements and its error while preserving healthy entries. Cover metadata
   corruption after open, beyond the existing payload-only corruption fixture.
-- [ ] **M4-25 / P2 — Reserve physical database growth rather than payload length alone.**
+- [x] **M4-25 / P2 — Reserve physical database growth rather than payload length alone.**
   Placement compares only `object.bytes.len()` against free space minus
   headroom (`crates/mb-node/src/volume.rs:621`, `volume.rs:637`). A new 64 KiB
   object also requires row metadata, encrypted pages, and WAL space
@@ -109,7 +109,7 @@ advancing to Milestone 5.
   physical database/WAL growth. Cover the actual allocation boundary, including
   shared-filesystem control work, instead of only headroom exceeding all free
   space.
-- [ ] **M4-26 / P2 — Step incremental vacuum to completion before reporting reclaim.**
+- [x] **M4-26 / P2 — Step incremental vacuum to completion before reporting reclaim.**
   Reclaim calls `PRAGMA incremental_vacuum` through `execute_batch`
   (`crates/mb-store/src/database.rs:1321`, `database.rs:1336`). The pinned
   rusqlite 0.37 implementation steps each statement once; bundled SQLCipher
@@ -118,7 +118,7 @@ advancing to Milestone 5.
   Consume the statement to completion and checkpoint afterward. Verify that
   reclaim drains the freelist and returns the expected allocation; the current
   test only checks for any decrease (`database.rs:3567`).
-- [ ] **M4-27 / P2 — Resume fresh-volume initialization after the empty database commit.**
+- [x] **M4-27 / P2 — Resume fresh-volume initialization after the empty database commit.**
   Initialization persists the manifest first
   (`crates/mb-node/src/volume.rs:986`), then commits an empty database via
   `VACUUM` before starting the application-schema transaction

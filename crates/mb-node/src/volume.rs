@@ -18,10 +18,12 @@ const VOLUME_MANIFEST_DOMAIN: &[u8] = b"mutualbackup/local-volume-manifest/v1";
 const VOLUME_MANIFEST_FILE: &str = ".mutualbackup-volume";
 const CONTROL_KEY_FILE: &str = "control.key";
 const MAX_LOCAL_MANIFEST_BYTES: usize = 64 * 1024;
+const DATABASE_PAGE_BYTES: u64 = 4096;
+const PHYSICAL_WRITE_FIXED_RESERVE: u64 = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(not(test), allow(dead_code))]
-enum VolumeInterruption {
+pub(crate) enum VolumeInterruption {
     WriteIntentStored,
     ObjectPublished,
     ReceiptStored,
@@ -55,7 +57,7 @@ fn volume_interruption(point: VolumeInterruption) -> Result<()> {
 }
 
 #[cfg(test)]
-fn interrupt_next_volume_transition(point: VolumeInterruption) {
+pub(crate) fn interrupt_next_volume_transition(point: VolumeInterruption) {
     NEXT_VOLUME_INTERRUPTION.with(|next| next.set(Some(point)));
 }
 
@@ -231,9 +233,14 @@ impl StorageVolumes {
                         }
                     }
                 }
-            } else if record.state != StorageVolumeState::Retired {
+            } else if !matches!(
+                record.state,
+                StorageVolumeState::Retired | StorageVolumeState::Draining
+            ) {
                 record.state = StorageVolumeState::Offline;
                 record.last_error = Some("configured volume is absent".to_owned());
+            } else if record.state == StorageVolumeState::Draining {
+                record.last_error = Some("draining volume is absent".to_owned());
             }
             if volumes
                 .insert(
@@ -299,8 +306,12 @@ impl StorageVolumes {
                         continue;
                     }
                     volume.record.configured = true;
-                    volume.record.state = StorageVolumeState::Offline;
-                    volume.record.last_error = Some("configured volume is absent".to_owned());
+                    if volume.record.state == StorageVolumeState::Draining {
+                        volume.record.last_error = Some("draining volume is absent".to_owned());
+                    } else {
+                        volume.record.state = StorageVolumeState::Offline;
+                        volume.record.last_error = Some("configured volume is absent".to_owned());
+                    }
                     volume.store = None;
                     continue;
                 }
@@ -323,16 +334,61 @@ impl StorageVolumes {
                     continue;
                 }
                 volume.record.configured = true;
+                if matches!(
+                    volume.record.state,
+                    StorageVolumeState::Offline | StorageVolumeState::Draining
+                ) && volume.store.is_none()
+                {
+                    volume.store = Some(open_volume_store(
+                        &volume.record,
+                        &volume.database_key,
+                        &self.keys,
+                    )?);
+                }
                 if volume.record.state == StorageVolumeState::Offline {
-                    if volume.store.is_none() {
-                        volume.store = Some(open_volume_store(
-                            &volume.record,
-                            &volume.database_key,
-                            &self.keys,
-                        )?);
-                    }
                     volume.record.state = StorageVolumeState::Online;
                     volume.record.last_error = None;
+                } else if volume.record.state == StorageVolumeState::Draining {
+                    volume.record.last_error = None;
+                }
+                continue;
+            }
+            if let Some(manifest) = read_volume_manifest(&path, &self.keys)?
+                && let Some(volume) = self.volumes.get_mut(&manifest.volume_id)
+            {
+                if volume.store.is_some() {
+                    bail!(
+                        "parity volume UUID {} is available at more than one configured path",
+                        manifest.volume_id
+                    );
+                }
+                if volume.record.database_file != manifest.database_file
+                    || volume.record.wrapped_database_key != manifest.wrapped_database_key
+                {
+                    bail!("parity volume manifest conflicts with the control registry");
+                }
+                volume.record.path = path;
+                volume.record.budget_bytes = budget_bytes;
+                volume.record.headroom_bytes = headroom_bytes;
+                if volume.record.state == StorageVolumeState::Retired {
+                    volume.record.configured = false;
+                    volume.store = None;
+                    continue;
+                }
+                volume.record.configured = true;
+                match open_volume_store(&volume.record, &volume.database_key, &self.keys) {
+                    Ok(store) => {
+                        if volume.record.state != StorageVolumeState::Draining {
+                            volume.record.state = StorageVolumeState::Online;
+                        }
+                        volume.record.last_error = None;
+                        volume.store = Some(store);
+                    }
+                    Err(error) => {
+                        volume.record.state = StorageVolumeState::Failed;
+                        volume.record.last_error = Some(truncated_error(&error));
+                        volume.store = None;
+                    }
                 }
                 continue;
             }
@@ -393,15 +449,25 @@ impl StorageVolumes {
         self.volumes
             .values()
             .map(|volume| {
+                let mut last_error = volume.record.last_error.clone();
+                let measurements = volume.store.as_ref().map(|store| {
+                    Ok::<_, anyhow::Error>((
+                        store.used_bytes()?,
+                        store.allocated_bytes()?,
+                        fs2::available_space(&volume.record.path)?,
+                        store.ready_object_count()?,
+                    ))
+                });
                 let (used_bytes, allocated_bytes, available_bytes, object_count) =
-                    match &volume.store {
-                        Some(store) => (
-                            Some(store.used_bytes()?),
-                            Some(store.allocated_bytes()?),
-                            Some(fs2::available_space(&volume.record.path)?),
-                            Some(store.ready_object_count()?),
-                        ),
-                        None => (None, None, None, None),
+                    match measurements.transpose() {
+                        Ok(Some((used, allocated, available, count))) => {
+                            (Some(used), Some(allocated), Some(available), Some(count))
+                        }
+                        Ok(None) => (None, None, None, None),
+                        Err(error) => {
+                            last_error.get_or_insert_with(|| truncated_error(&error));
+                            (None, None, None, None)
+                        }
                     };
                 Ok(StorageVolumeStatus {
                     volume_id: volume.record.volume_id,
@@ -413,7 +479,7 @@ impl StorageVolumes {
                     allocated_bytes,
                     available_bytes,
                     object_count,
-                    last_error: volume.record.last_error.clone(),
+                    last_error,
                 })
             })
             .collect()
@@ -527,43 +593,45 @@ impl StorageVolumes {
         root: &[u8; 32],
     ) -> Result<bool> {
         let record_id = volume_object_id(group_id, shard_index);
-        if let Some(receipt) = self.receipt(control, group_id, shard_index)? {
-            let Some(volume) = self.volumes.get_mut(&receipt.volume_id) else {
-                return Ok(false);
-            };
+        let receipt_volume = self
+            .receipt(control, group_id, shard_index)?
+            .map(|receipt| receipt.volume_id);
+        let mut cleanup_volumes = self.cleanup_volumes(control, group_id, shard_index)?;
+        let mut complete =
+            receipt_volume.is_none_or(|volume_id| self.volumes.contains_key(&volume_id));
+        for (volume_id, volume) in &mut self.volumes {
+            let required = receipt_volume == Some(*volume_id)
+                || cleanup_volumes.contains(volume_id)
+                || volume.record.state == StorageVolumeState::Draining;
             let Some(store) = volume.store.as_mut() else {
-                return Ok(false);
-            };
-            match store.load_ready(group_id, shard_index) {
-                Ok(object) => {
-                    if object.root != *root {
-                        bail!("garbage-collection receipt conflicts with parity root");
-                    }
-                    store.remove_ready(group_id, shard_index, root)?;
-                    volume_interruption(VolumeInterruption::GarbageObjectRemoved)?;
+                if required {
+                    complete = false;
                 }
-                Err(DatabaseError::NotReady) => {}
-                Err(error) => return Err(error.into()),
-            }
-            control.delete_record("volume-receipt", &record_id)?;
-            volume_interruption(VolumeInterruption::GarbageReceiptRetired)?;
-            return Ok(true);
-        }
-        for volume in self.volumes.values_mut() {
-            let Some(store) = volume.store.as_mut() else {
                 continue;
             };
-            match store.load_ready(group_id, shard_index) {
-                Ok(object) if object.root == *root => {
-                    store.remove_ready(group_id, shard_index, root)?;
+            match store.remove_ready(group_id, shard_index, root) {
+                Ok(true) => {
                     volume_interruption(VolumeInterruption::GarbageObjectRemoved)?;
+                    cleanup_volumes.remove(volume_id);
                 }
-                Ok(_) => bail!("garbage-collection object has an unexpected parity root"),
-                Err(DatabaseError::NotReady) => {}
-                Err(error) => return Err(error.into()),
+                Ok(false) => {
+                    cleanup_volumes.remove(volume_id);
+                }
+                Err(error) => {
+                    volume.record.state = StorageVolumeState::Failed;
+                    volume.record.last_error = Some(truncated_error(&error));
+                    cleanup_volumes.insert(*volume_id);
+                    complete = false;
+                }
             }
         }
-        Ok(true)
+        self.persist(control)?;
+        self.store_cleanup_volumes(control, &record_id, &cleanup_volumes)?;
+        if complete && cleanup_volumes.is_empty() {
+            control.delete_record("volume-receipt", &record_id)?;
+            volume_interruption(VolumeInterruption::GarbageReceiptRetired)?;
+        }
+        Ok(complete && cleanup_volumes.is_empty())
     }
 
     pub(crate) fn store(
@@ -589,6 +657,12 @@ impl StorageVolumes {
                     )
             });
             if !reusable {
+                self.add_cleanup_volume(
+                    control,
+                    &object.group_id,
+                    object.shard_index,
+                    receipt.volume_id,
+                )?;
                 control.delete_record(
                     "volume-receipt",
                     &volume_object_id(&object.group_id, object.shard_index),
@@ -619,6 +693,8 @@ impl StorageVolumes {
         }
 
         let required = object.bytes.len() as u64;
+        let required_physical =
+            physical_write_reservation(object.bytes.len(), acknowledgement.len());
         let selected = self
             .volumes
             .iter()
@@ -635,7 +711,7 @@ impl StorageVolumes {
                 let writable = volume.record.budget_bytes.saturating_sub(reserved);
                 let available = fs2::available_space(&volume.record.path).ok()?;
                 (used.saturating_add(required) <= writable
-                    && required <= available.saturating_sub(reserved))
+                    && required_physical <= available.saturating_sub(reserved))
                 .then_some((*id, used))
             })
             .min_by_key(|(id, used)| (*used, *id))
@@ -680,7 +756,7 @@ impl StorageVolumes {
         for (record_id, bytes) in control.records("volume-write-intent")? {
             let intent: VolumeWriteIntent = decode_canonical(&bytes)?;
             validate_receipt(&intent.receipt)?;
-            let Some(volume) = self.volumes.get(&intent.receipt.volume_id) else {
+            let Some(volume) = self.volumes.get_mut(&intent.receipt.volume_id) else {
                 continue;
             };
             let Some(store) = &volume.store else {
@@ -690,10 +766,17 @@ impl StorageVolumes {
                 match store.load_ready(&intent.receipt.group_id, intent.receipt.shard_index) {
                     Ok(object) => object,
                     Err(DatabaseError::NotReady) => continue,
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        volume.record.state = StorageVolumeState::Failed;
+                        volume.record.last_error = Some(truncated_error(&error));
+                        continue;
+                    }
                 };
             if object.guild_id != intent.receipt.guild_id || object.root != intent.receipt.root {
-                bail!("completed parity write conflicts with its durable intent");
+                volume.record.state = StorageVolumeState::Failed;
+                volume.record.last_error =
+                    Some("completed parity write conflicts with its durable intent".to_owned());
+                continue;
             }
             control.put_record(
                 "volume-receipt",
@@ -792,6 +875,7 @@ impl StorageVolumes {
                     .expect("source checked above")
                     .load_stored_acknowledgement(&object.group_id, object.shard_index)?;
                 let record_id = volume_object_id(&object.group_id, object.shard_index);
+                self.add_cleanup_volume(control, &object.group_id, object.shard_index, source_id)?;
                 // Remove the source receipt before selecting a destination, while
                 // retaining a write intent that makes an interruption recoverable.
                 let existing_destination = self
@@ -801,12 +885,27 @@ impl StorageVolumes {
                     control.delete_record("volume-receipt", &record_id)?;
                     volume_interruption(VolumeInterruption::MigrationSourceReceiptRetired)?;
                 }
-                let destination =
-                    match self.store_with_headroom(control, &object, &acknowledgement, false) {
-                        Ok(receipt) if receipt.volume_id != source_id => receipt,
-                        Ok(_) => bail!("draining migration selected its source volume"),
-                        Err(error) => return Err(error),
-                    };
+                let destination = match existing_destination {
+                    Some(receipt) => {
+                        let stored = self
+                            .volumes
+                            .get(&receipt.volume_id)
+                            .and_then(|volume| volume.store.as_ref())
+                            .context("migration destination is unavailable")?
+                            .load_ready(&object.group_id, object.shard_index)?;
+                        if stored != object {
+                            bail!("migration destination conflicts with its source object");
+                        }
+                        receipt
+                    }
+                    None => {
+                        match self.store_with_headroom(control, &object, &acknowledgement, false) {
+                            Ok(receipt) if receipt.volume_id != source_id => receipt,
+                            Ok(_) => bail!("draining migration selected its source volume"),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                };
                 volume_interruption(VolumeInterruption::MigrationDestinationStored)?;
                 self.volumes
                     .get_mut(&source_id)
@@ -814,6 +913,7 @@ impl StorageVolumes {
                     .expect("draining source is online")
                     .remove_ready(&object.group_id, object.shard_index, &object.root)?;
                 volume_interruption(VolumeInterruption::MigrationSourceRemoved)?;
+                self.remove_cleanup_volume(control, &record_id, source_id)?;
                 control.put_record(
                     "volume-receipt",
                     &record_id,
@@ -864,6 +964,76 @@ impl StorageVolumes {
                 Ok(receipt)
             })
             .transpose()
+    }
+
+    fn cleanup_volumes(
+        &self,
+        control: &ControlStore,
+        group_id: &[u8; 32],
+        shard_index: u8,
+    ) -> Result<BTreeSet<Uuid>> {
+        let Some(bytes) = control.get_record(
+            "volume-copy-cleanup",
+            &volume_object_id(group_id, shard_index),
+        )?
+        else {
+            return Ok(BTreeSet::new());
+        };
+        let volumes: Vec<Uuid> = decode_canonical(&bytes)?;
+        let set = volumes.into_iter().collect::<BTreeSet<_>>();
+        if set.iter().any(Uuid::is_nil) {
+            bail!("volume cleanup obligation has an invalid UUID");
+        }
+        Ok(set)
+    }
+
+    fn add_cleanup_volume(
+        &self,
+        control: &ControlStore,
+        group_id: &[u8; 32],
+        shard_index: u8,
+        volume_id: Uuid,
+    ) -> Result<()> {
+        let record_id = volume_object_id(group_id, shard_index);
+        let mut volumes = self.cleanup_volumes(control, group_id, shard_index)?;
+        volumes.insert(volume_id);
+        self.store_cleanup_volumes(control, &record_id, &volumes)
+    }
+
+    fn remove_cleanup_volume(
+        &self,
+        control: &ControlStore,
+        record_id: &[u8],
+        volume_id: Uuid,
+    ) -> Result<()> {
+        let group_id: [u8; 32] = record_id
+            .get(..32)
+            .context("volume object key is truncated")?
+            .try_into()?;
+        let shard_index = *record_id
+            .get(32)
+            .context("volume object key is truncated")?;
+        let mut volumes = self.cleanup_volumes(control, &group_id, shard_index)?;
+        volumes.remove(&volume_id);
+        self.store_cleanup_volumes(control, record_id, &volumes)
+    }
+
+    fn store_cleanup_volumes(
+        &self,
+        control: &ControlStore,
+        record_id: &[u8],
+        volumes: &BTreeSet<Uuid>,
+    ) -> Result<()> {
+        if volumes.is_empty() {
+            control.delete_record("volume-copy-cleanup", record_id)?;
+        } else {
+            control.put_record(
+                "volume-copy-cleanup",
+                record_id,
+                &canonical_bytes(&volumes.iter().copied().collect::<Vec<_>>())?,
+            )?;
+        }
+        Ok(())
     }
 
     fn persist(&self, control: &ControlStore) -> Result<()> {
@@ -933,16 +1103,13 @@ fn initialize_volume(
 ) -> Result<VolumeRecord> {
     let root = require_online_directory(root)?;
     let manifest_path = root.join(VOLUME_MANIFEST_FILE);
-    if manifest_path.exists() {
-        let signed: SignedRecord<VolumeManifest> = read_private_record(&manifest_path)?;
-        signed.verify(VOLUME_MANIFEST_DOMAIN)?;
-        validate_manifest(&signed.value, keys.node_id())?;
+    if let Some(manifest) = read_volume_manifest(&root, keys)? {
         let record = VolumeRecord {
             format_version: 1,
-            volume_id: signed.value.volume_id,
+            volume_id: manifest.volume_id,
             path: root,
-            database_file: signed.value.database_file,
-            wrapped_database_key: signed.value.wrapped_database_key,
+            database_file: manifest.database_file,
+            wrapped_database_key: manifest.wrapped_database_key,
             state: StorageVolumeState::Online,
             configured: true,
             budget_bytes,
@@ -950,13 +1117,11 @@ fn initialize_volume(
             last_error: None,
         };
         let database_path = record.path.join(&record.database_file);
-        if !database_path.exists() {
-            let database_key = keys.unwrap_database_key(
-                &volume_database_id(record.volume_id),
-                &record.wrapped_database_key,
-            )?;
-            ParityStore::open_with_key(&database_path, record.volume_id.as_bytes(), &database_key)?;
-        }
+        let database_key = keys.unwrap_database_key(
+            &volume_database_id(record.volume_id),
+            &record.wrapped_database_key,
+        )?;
+        ParityStore::open_with_key(&database_path, record.volume_id.as_bytes(), &database_key)?;
         return Ok(record);
     }
 
@@ -1008,6 +1173,17 @@ fn initialize_volume(
         ParityStore::open_with_key(&database_path, volume_id.as_bytes(), &database_key)?;
     }
     Ok(record)
+}
+
+fn read_volume_manifest(root: &Path, keys: &KeyMaterial) -> Result<Option<VolumeManifest>> {
+    let manifest_path = root.join(VOLUME_MANIFEST_FILE);
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let signed: SignedRecord<VolumeManifest> = read_private_record(&manifest_path)?;
+    signed.verify(VOLUME_MANIFEST_DOMAIN)?;
+    validate_manifest(&signed.value, keys.node_id())?;
+    Ok(Some(signed.value))
 }
 
 fn open_volume_store(
@@ -1120,6 +1296,17 @@ fn volume_object_id(group_id: &[u8; 32], shard_index: u8) -> Vec<u8> {
     id
 }
 
+fn physical_write_reservation(payload_bytes: usize, acknowledgement_bytes: usize) -> u64 {
+    let row_bytes = (payload_bytes as u64)
+        .saturating_add(acknowledgement_bytes as u64)
+        .saturating_add(DATABASE_PAGE_BYTES * 4);
+    let pages = row_bytes.div_ceil(DATABASE_PAGE_BYTES);
+    pages
+        .saturating_mul(DATABASE_PAGE_BYTES)
+        .saturating_mul(3)
+        .saturating_add(PHYSICAL_WRITE_FIXED_RESERVE)
+}
+
 fn volume_database_id(volume_id: Uuid) -> Vec<u8> {
     let mut id = b"parity.db/v2/".to_vec();
     id.extend_from_slice(volume_id.as_bytes());
@@ -1190,7 +1377,13 @@ fn write_new_private_record<T: Serialize>(path: &Path, value: &T) -> Result<()> 
 
 fn truncated_error(error: &impl std::fmt::Display) -> String {
     let mut value = error.to_string();
-    value.truncate(1024);
+    if value.len() > 1024 {
+        let mut boundary = 1024;
+        while !value.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        value.truncate(boundary);
+    }
     value
 }
 
@@ -1313,7 +1506,7 @@ mod tests {
         drop(control);
 
         let (control, _) = open_control_store(temp.path(), &keys).unwrap();
-        let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys.clone(), &control).unwrap();
         volumes
             .configure(
                 &control,
@@ -1590,6 +1783,63 @@ mod tests {
     }
 
     #[test]
+    fn relocated_retired_volume_requires_explicit_reactivation() {
+        let temp = TempDir::new().unwrap();
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([89; 32])));
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys.clone(), &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[first.path().to_path_buf(), second.path().to_path_buf()],
+                (V1_SECTOR_SIZE * 2) as u64,
+                0,
+            )
+            .unwrap();
+        let object = parity_object(90, 3);
+        let source = volumes.store(&control, &object, b"ack").unwrap();
+        let source_path = volumes
+            .volumes
+            .get(&source.volume_id)
+            .unwrap()
+            .record
+            .path
+            .clone();
+        let active_path = volumes
+            .volumes
+            .values()
+            .find(|volume| volume.record.volume_id != source.volume_id && volume.store.is_some())
+            .unwrap()
+            .record
+            .path
+            .clone();
+        volumes.mark_draining(&control, source.volume_id).unwrap();
+        assert_eq!(volumes.migrate_draining(&control).unwrap(), 1);
+        drop(volumes);
+        drop(control);
+        let relocated = temp.path().join("relocated-retired-volume");
+        fs::rename(&source_path, &relocated).unwrap();
+
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[relocated.clone(), active_path],
+                (V1_SECTOR_SIZE * 2) as u64,
+                0,
+            )
+            .unwrap();
+        let retired = volumes.volumes.get(&source.volume_id).unwrap();
+        assert_eq!(retired.record.path, relocated.canonicalize().unwrap());
+        assert_eq!(retired.record.state, StorageVolumeState::Retired);
+        assert!(!retired.record.configured);
+        assert!(retired.store.is_none());
+    }
+
+    #[test]
     fn repair_can_consume_reserved_headroom_while_normal_placement_cannot() {
         let temp = TempDir::new().unwrap();
         let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([64; 32])));
@@ -1697,6 +1947,145 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_pending_write_is_quarantined_during_reconciliation() {
+        let temp = TempDir::new().unwrap();
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([80; 32])));
+        let object = parity_object(81, 3);
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys.clone(), &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[first.path().to_path_buf(), second.path().to_path_buf()],
+                (V1_SECTOR_SIZE * 2) as u64,
+                0,
+            )
+            .unwrap();
+        interrupt_next_volume_transition(VolumeInterruption::ObjectPublished);
+        assert!(volumes.store(&control, &object, b"ack").is_err());
+        let corrupt_volume = *volumes
+            .volumes
+            .iter()
+            .find(|(_, volume)| {
+                volume.store.as_ref().is_some_and(|store| {
+                    store
+                        .load_ready(&object.group_id, object.shard_index)
+                        .is_ok()
+                })
+            })
+            .unwrap()
+            .0;
+        volumes
+            .volumes
+            .get(&corrupt_volume)
+            .unwrap()
+            .store
+            .as_ref()
+            .unwrap()
+            .database_shell_statement("UPDATE parity_objects SET bytes = zeroblob(65536)", false)
+            .unwrap();
+        drop(volumes);
+        drop(control);
+
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        volumes.reconcile(&control).unwrap();
+        assert_eq!(
+            volumes.volumes.get(&corrupt_volume).unwrap().record.state,
+            StorageVolumeState::Failed
+        );
+        assert_eq!(control.records("volume-write-intent").unwrap().len(), 1);
+        let replacement = volumes.store_repair(&control, &object).unwrap();
+        assert_ne!(replacement.volume_id, corrupt_volume);
+        assert_eq!(
+            volumes
+                .load_ready(&object.group_id, object.shard_index)
+                .unwrap(),
+            object
+        );
+    }
+
+    #[test]
+    fn corrupt_unreachable_object_is_removed_without_reading_its_payload() {
+        let temp = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([82; 32])));
+        let object = parity_object(83, 4);
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        let receipt = volumes.store(&control, &object, b"ack").unwrap();
+        volumes
+            .volumes
+            .get(&receipt.volume_id)
+            .unwrap()
+            .store
+            .as_ref()
+            .unwrap()
+            .database_shell_statement("UPDATE parity_objects SET bytes = zeroblob(65536)", false)
+            .unwrap();
+        volumes.scrub(&control).unwrap();
+
+        assert!(
+            volumes
+                .remove_unreachable(&control, &object.group_id, object.shard_index, &object.root,)
+                .unwrap()
+        );
+        assert!(control.records("volume-receipt").unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_metadata_does_not_hide_storage_status() {
+        let temp = TempDir::new().unwrap();
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([84; 32])));
+        let object = parity_object(85, 3);
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[first.path().to_path_buf(), second.path().to_path_buf()],
+                (V1_SECTOR_SIZE * 2) as u64,
+                0,
+            )
+            .unwrap();
+        let receipt = volumes.store(&control, &object, b"ack").unwrap();
+        let failed = volumes.volumes.get(&receipt.volume_id).unwrap();
+        failed
+            .store
+            .as_ref()
+            .unwrap()
+            .database_shell_statement("UPDATE parity_objects SET bytes = zeroblob(65536)", false)
+            .unwrap();
+        volumes.scrub(&control).unwrap();
+        volumes
+            .volumes
+            .get(&receipt.volume_id)
+            .unwrap()
+            .store
+            .as_ref()
+            .unwrap()
+            .database_shell_statement("DROP TABLE parity_objects", false)
+            .unwrap();
+
+        let statuses = volumes.statuses().unwrap();
+        let failed = statuses
+            .iter()
+            .find(|status| status.volume_id == receipt.volume_id)
+            .unwrap();
+        assert_eq!(failed.state, StorageVolumeState::Failed);
+        assert_eq!(failed.used_bytes, None);
+        assert!(failed.last_error.is_some());
+        assert!(statuses.iter().any(|status| {
+            status.volume_id != receipt.volume_id
+                && status.state == StorageVolumeState::Online
+                && status.used_bytes.is_some()
+        }));
+    }
+
+    #[test]
     fn missing_established_database_is_failed_without_recreation() {
         let temp = TempDir::new().unwrap();
         let volume = TempDir::new().unwrap();
@@ -1771,6 +2160,124 @@ mod tests {
     }
 
     #[test]
+    fn relocated_established_volume_does_not_recreate_a_missing_database() {
+        let temp = TempDir::new().unwrap();
+        let original = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([86; 32])));
+        let object = parity_object(87, 4);
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys.clone(), &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[original.path().to_path_buf()],
+                (V1_SECTOR_SIZE * 2) as u64,
+                0,
+            )
+            .unwrap();
+        let receipt = volumes.store(&control, &object, b"ack").unwrap();
+        let database_file = volumes
+            .volumes
+            .get(&receipt.volume_id)
+            .unwrap()
+            .record
+            .database_file
+            .clone();
+        let original_path = original.keep();
+        let relocated = temp.path().join("relocated-volume");
+        drop(volumes);
+        drop(control);
+        fs::rename(&original_path, &relocated).unwrap();
+        let database_path = relocated.join(database_file);
+        fs::remove_file(&database_path).unwrap();
+
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                std::slice::from_ref(&relocated),
+                (V1_SECTOR_SIZE * 2) as u64,
+                0,
+            )
+            .unwrap();
+        let status = volumes
+            .statuses()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.volume_id == receipt.volume_id)
+            .unwrap();
+        assert_eq!(status.path, relocated.canonicalize().unwrap());
+        assert_eq!(status.state, StorageVolumeState::Failed);
+        assert!(!database_path.exists());
+    }
+
+    #[test]
+    fn unknown_manifest_with_an_incomplete_database_resumes_initialization() {
+        let temp = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([88; 32])));
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys.clone(), &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[external.path().to_path_buf()],
+                (V1_SECTOR_SIZE * 2) as u64,
+                0,
+            )
+            .unwrap();
+        let external_id = volumes
+            .statuses()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.path == external.path().canonicalize().unwrap())
+            .unwrap()
+            .volume_id;
+        let external_store = volumes
+            .volumes
+            .get(&external_id)
+            .unwrap()
+            .store
+            .as_ref()
+            .unwrap();
+        external_store
+            .database_shell_statement("DROP TABLE parity_objects", false)
+            .unwrap();
+        external_store
+            .database_shell_statement("DROP TABLE meta", false)
+            .unwrap();
+        let retained = volumes
+            .volumes
+            .values()
+            .filter(|volume| volume.record.volume_id != external_id)
+            .map(|volume| volume.record.clone())
+            .collect::<Vec<_>>();
+        store_volume_records(&control, &retained).unwrap();
+        drop(volumes);
+        drop(control);
+
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[external.path().to_path_buf()],
+                (V1_SECTOR_SIZE * 2) as u64,
+                0,
+            )
+            .unwrap();
+        let status = volumes
+            .statuses()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.volume_id == external_id)
+            .unwrap();
+        assert_eq!(status.state, StorageVolumeState::Online);
+        assert_eq!(status.object_count, Some(0));
+    }
+
+    #[test]
     fn physical_available_space_preserves_repair_headroom() {
         let temp = TempDir::new().unwrap();
         let volume = TempDir::new().unwrap();
@@ -1778,10 +2285,14 @@ mod tests {
         let object = parity_object(79, 4);
         let (control, _) = open_control_store(temp.path(), &keys).unwrap();
         let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        volumes
+            .configure(&control, &[volume.path().to_path_buf()], u64::MAX, 0)
+            .unwrap();
         let available = fs2::available_space(volume.path()).unwrap();
-        assert!(available > V1_SECTOR_SIZE as u64);
-        let headroom = available.saturating_add(1 << 30).min(u64::MAX - 1);
-        assert!(u64::MAX - headroom > V1_SECTOR_SIZE as u64);
+        let required = physical_write_reservation(object.bytes.len(), b"ack".len());
+        assert!(required > V1_SECTOR_SIZE as u64);
+        assert!(available > required);
+        let headroom = available - required / 2;
         volumes
             .configure(&control, &[volume.path().to_path_buf()], u64::MAX, headroom)
             .unwrap();
@@ -1832,6 +2343,161 @@ mod tests {
                 .unwrap(),
             object
         );
+    }
+
+    #[test]
+    fn returned_source_drains_into_an_existing_repaired_copy() {
+        let temp = TempDir::new().unwrap();
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([91; 32])));
+        let object = parity_object(92, 4);
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[first.path().to_path_buf(), second.path().to_path_buf()],
+                V1_SECTOR_SIZE as u64,
+                0,
+            )
+            .unwrap();
+        let source = volumes.store(&control, &object, b"signed-ack").unwrap();
+        let source_volume = volumes.volumes.get_mut(&source.volume_id).unwrap();
+        let source_store = source_volume.store.take().unwrap();
+        source_volume.record.state = StorageVolumeState::Offline;
+        let repaired = volumes.store_repair(&control, &object).unwrap();
+        assert_ne!(repaired.volume_id, source.volume_id);
+
+        let source_volume = volumes.volumes.get_mut(&source.volume_id).unwrap();
+        source_volume.store = Some(source_store);
+        source_volume.record.state = StorageVolumeState::Online;
+        source_volume.record.configured = true;
+        volumes.mark_draining(&control, source.volume_id).unwrap();
+
+        assert_eq!(volumes.migrate_draining(&control).unwrap(), 1);
+        assert_eq!(
+            volumes
+                .load_ready(&object.group_id, object.shard_index)
+                .unwrap(),
+            object
+        );
+        assert_eq!(
+            volumes
+                .receipt(&control, &object.group_id, object.shard_index)
+                .unwrap()
+                .unwrap()
+                .volume_id,
+            repaired.volume_id
+        );
+    }
+
+    #[test]
+    fn garbage_collection_removes_both_sides_of_interrupted_migration() {
+        let temp = TempDir::new().unwrap();
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([93; 32])));
+        let object = parity_object(94, 3);
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys.clone(), &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[first.path().to_path_buf(), second.path().to_path_buf()],
+                (V1_SECTOR_SIZE * 2) as u64,
+                0,
+            )
+            .unwrap();
+        let source = volumes.store(&control, &object, b"ack").unwrap();
+        volumes.mark_draining(&control, source.volume_id).unwrap();
+        interrupt_next_volume_transition(VolumeInterruption::MigrationDestinationStored);
+        assert!(volumes.migrate_draining(&control).is_err());
+        assert_eq!(
+            volumes
+                .volumes
+                .values()
+                .filter(|volume| {
+                    volume.store.as_ref().is_some_and(|store| {
+                        store
+                            .load_ready(&object.group_id, object.shard_index)
+                            .is_ok()
+                    })
+                })
+                .count(),
+            2
+        );
+        let source_path = volumes
+            .volumes
+            .get(&source.volume_id)
+            .unwrap()
+            .record
+            .path
+            .clone();
+        let destination_path = volumes
+            .volumes
+            .values()
+            .find(|volume| volume.record.volume_id != source.volume_id && volume.record.configured)
+            .unwrap()
+            .record
+            .path
+            .clone();
+        drop(volumes);
+        drop(control);
+        let absent_source = temp.path().join("absent-draining-source");
+        fs::rename(&source_path, &absent_source).unwrap();
+
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[source_path.clone(), destination_path.clone()],
+                (V1_SECTOR_SIZE * 2) as u64,
+                0,
+            )
+            .unwrap();
+        let unavailable_source = volumes.volumes.get(&source.volume_id).unwrap();
+        assert_eq!(
+            unavailable_source.record.state,
+            StorageVolumeState::Draining
+        );
+        assert!(unavailable_source.store.is_none());
+        assert!(
+            !volumes
+                .remove_unreachable(&control, &object.group_id, object.shard_index, &object.root,)
+                .unwrap()
+        );
+        assert_eq!(control.records("volume-receipt").unwrap().len(), 1);
+        assert_eq!(control.records("volume-copy-cleanup").unwrap().len(), 1);
+        fs::rename(&absent_source, &source_path).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[source_path, destination_path],
+                (V1_SECTOR_SIZE * 2) as u64,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            volumes.volumes.get(&source.volume_id).unwrap().record.state,
+            StorageVolumeState::Draining
+        );
+        assert!(
+            volumes
+                .remove_unreachable(&control, &object.group_id, object.shard_index, &object.root,)
+                .unwrap()
+        );
+        assert!(control.records("volume-receipt").unwrap().is_empty());
+        assert!(control.records("volume-copy-cleanup").unwrap().is_empty());
+        assert_eq!(volumes.migrate_draining(&control).unwrap(), 0);
+        assert!(matches!(
+            volumes.load_ready(&object.group_id, object.shard_index),
+            Err(error) if matches!(
+                error.downcast_ref::<DatabaseError>(),
+                Some(DatabaseError::NotReady)
+            )
+        ));
     }
 
     #[test]

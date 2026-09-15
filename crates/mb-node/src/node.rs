@@ -2441,25 +2441,29 @@ impl Node {
             root: expected_root,
             bytes: bytes.to_vec(),
         };
-        self.volumes.store_repair(&self.control, &object)?;
-        self.control.put_record(
-            "local-parity-proof",
-            &parity_proof_id(&group_id, shard_index),
-            &canonical_bytes(group)?,
-        )?;
+        let record_id = parity_proof_id(&group_id, shard_index).to_vec();
+        let mut records = vec![(
+            "local-parity-proof".to_owned(),
+            record_id.clone(),
+            canonical_bytes(group)?,
+        )];
         if emergency {
-            self.control.put_record(
-                "emergency-shard",
-                &parity_proof_id(&group_id, shard_index),
-                &canonical_bytes(&EmergencyShardRecord {
+            records.push((
+                "emergency-shard".to_owned(),
+                record_id,
+                canonical_bytes(&EmergencyShardRecord {
                     format_version: 1,
                     checkpoint_hash,
                     group_id,
                     shard_index,
                     root: expected_root,
                 })?,
-            )?;
+            ));
         }
+        // Persist the role classification first. If storage is interrupted, the
+        // marker makes the partial repair discoverable and safe to retry or GC.
+        self.control.put_records(&records)?;
+        self.volumes.store_repair(&self.control, &object)?;
         Ok(())
     }
 
@@ -5811,6 +5815,102 @@ mod tests {
     }
 
     #[test]
+    fn emergency_marker_survives_interruption_before_payload_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([226; 32]);
+        let mut node = Node::open(temp.path(), local_seed.clone()).unwrap();
+        let revision = install_public_restore_fixture(&mut node, &local_seed);
+        let first = node
+            .current_checkpoint(revision.value.guild_id)
+            .unwrap()
+            .unwrap();
+        let first_hash = first.hash().unwrap();
+        let local_id = node.keys().node_id();
+        let bytes = vec![243; mb_core::V1_SECTOR_SIZE];
+        let mut group = first.checkpoint.coding_groups[0].clone();
+        let shard_index = group
+            .roles
+            .iter()
+            .enumerate()
+            .find_map(|(index, role)| match role {
+                ShardRole::Information(information)
+                    if index > 0 && information.owner != local_id =>
+                {
+                    Some(index)
+                }
+                ShardRole::Parity(parity) if parity.holder != local_id => Some(index),
+                _ => None,
+            })
+            .unwrap();
+        match &mut group.roles[shard_index] {
+            ShardRole::Information(information) => information.sector.root = sector_root(&bytes),
+            ShardRole::Parity(parity) => parity.root = sector_root(&bytes),
+        }
+        group.id = group.calculate_id().unwrap();
+        let mut checkpoint = QuorumCheckpoint {
+            checkpoint: first.checkpoint.clone(),
+            signatures: Vec::new(),
+        };
+        checkpoint.checkpoint.generation = 2;
+        checkpoint.checkpoint.parent = Some(first_hash);
+        checkpoint.checkpoint.coding_groups = vec![group.clone()];
+        let signing_seeds = std::iter::once(local_seed.clone())
+            .chain((0_u8..4).map(|index| Seed::from_bytes([index + 228; 32])));
+        for seed in signing_seeds {
+            checkpoint
+                .add_signature(&KeyMaterial::from_seed(&seed))
+                .unwrap();
+        }
+        checkpoint.verify().unwrap();
+        let checkpoint_hash = checkpoint.hash().unwrap();
+        node.control
+            .commit_checkpoint(
+                &checkpoint.checkpoint.guild_id,
+                checkpoint.checkpoint.generation,
+                Some(&first_hash),
+                &checkpoint_hash,
+                &canonical_bytes(&checkpoint.checkpoint).unwrap(),
+                &canonical_bytes(&checkpoint).unwrap(),
+                false,
+            )
+            .unwrap();
+        crate::volume::interrupt_next_volume_transition(
+            crate::volume::VolumeInterruption::WriteIntentStored,
+        );
+
+        let error = node
+            .install_repaired_shard(checkpoint_hash, group.id, shard_index as u8, &bytes, true)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("injected interruption"),
+            "{error:#}"
+        );
+        let record_id = parity_proof_id(&group.id, shard_index as u8);
+        assert!(
+            node.control
+                .get_record("emergency-shard", &record_id)
+                .unwrap()
+                .is_some()
+        );
+        drop(node);
+
+        let mut reopened = Node::open(temp.path(), local_seed).unwrap();
+        assert_eq!(
+            reopened
+                .remove_local_emergency_shards(checkpoint_hash, &group)
+                .unwrap(),
+            1
+        );
+        assert!(
+            reopened
+                .control
+                .get_record("emergency-shard", &record_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn retained_prefix_is_collected_only_after_a_later_checkpoint() {
         let temp = tempfile::tempdir().unwrap();
         let seed = Seed::from_bytes([226; 32]);
@@ -5841,7 +5941,8 @@ mod tests {
             })
             .unwrap();
         let retired_information_bytes = node.sector(&retired_information.sector.id).unwrap();
-        node.volumes
+        let retired_receipt = node
+            .volumes
             .store_repair(
                 &node.control,
                 &ParityObject {
@@ -5863,6 +5964,21 @@ mod tests {
                 &canonical_bytes(&retired_group).unwrap(),
             )
             .unwrap();
+        node.database_shell_statement(
+            Some(retired_receipt.volume_id),
+            "UPDATE parity_objects SET bytes = zeroblob(65536)",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            node.scrub_storage()
+                .unwrap()
+                .into_iter()
+                .find(|report| report.volume_id == retired_receipt.volume_id)
+                .unwrap()
+                .corrupt_objects,
+            vec![(retired_group.id, retired_information_index)]
+        );
         node.control
             .put_record(
                 "emergency-shard",
