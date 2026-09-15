@@ -13,6 +13,12 @@ pub struct MerkleCommitment {
     pub root: [u8; 32],
 }
 
+impl MerkleCommitment {
+    pub fn validate(&self) -> Result<(), MerkleError> {
+        validate_commitment(self)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MerkleRangeProof {
     pub format_version: u16,
@@ -44,6 +50,23 @@ pub fn merkle_commit(bytes: &[u8]) -> Result<MerkleCommitment, MerkleError> {
         leaf_size: MERKLE_LEAF_SIZE as u16,
         byte_len: bytes.len() as u32,
         root: bind_root(bytes.len() as u32, tree_root),
+    })
+}
+
+/// Compute the canonical commitment for an authenticated virtual-zero shard
+/// without allocating the shard itself.
+pub fn merkle_zero_commitment(byte_len: u32) -> Result<MerkleCommitment, MerkleError> {
+    validate_data_len(byte_len as usize)?;
+    let mut tree_root = hash_leaf(&[0; MERKLE_LEAF_SIZE]);
+    let leaf_count = byte_len as usize / MERKLE_LEAF_SIZE;
+    for _ in 0..leaf_count.ilog2() {
+        tree_root = hash_node(&tree_root, &tree_root);
+    }
+    Ok(MerkleCommitment {
+        format_version: MERKLE_SUITE_V1,
+        leaf_size: MERKLE_LEAF_SIZE as u16,
+        byte_len,
+        root: bind_root(byte_len, tree_root),
     })
 }
 
@@ -280,6 +303,16 @@ mod tests {
             challenged_leaf(&challenge, &second).unwrap()
         );
         assert!(challenged_leaf(&challenge, &first).unwrap() < 4096);
+    }
+
+    #[test]
+    fn virtual_zero_commitment_matches_materialized_bytes() {
+        for byte_len in [16_u32, 64, 4096, 64 * 1024] {
+            assert_eq!(
+                merkle_zero_commitment(byte_len).unwrap(),
+                merkle_commit(&vec![0; byte_len as usize]).unwrap()
+            );
+        }
     }
 
     #[test]

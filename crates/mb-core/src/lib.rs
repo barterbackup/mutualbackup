@@ -25,15 +25,16 @@ pub use keys::{
     SeedParseError, WrappedDatabaseKey,
 };
 pub use model::{
-    CodingGroup, CodingGroupId, EndpointRecord, GuildCheckpoint, GuildGenesis, GuildInvite,
-    InformationRole, Member, MemberSignature, ModelError, ParityRole, QuorumCheckpoint,
-    QuorumGuildGenesis, RecoveryBundle, RevisionTombstone, SectorId, SectorRef, ShardRole,
-    SignedRecord, StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision, WriterFence,
-    canonical_bytes, coding_group_id, decode_canonical,
+    CodingGroup, CodingGroupId, CodingGroupV2, EndpointRecord, GuildCheckpoint, GuildGenesis,
+    GuildInvite, InformationRole, InformationRoleV2, Member, MemberSignature, ModelError,
+    ParityRole, ParityRoleV2, QuorumCheckpoint, QuorumGuildGenesis, RangeSectorRef, RecoveryBundle,
+    RevisionTombstone, SectorId, SectorRef, ShardRole, ShardRoleV2, SignedRecord,
+    StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision, WriterFence, canonical_bytes,
+    coding_group_id, coding_group_v2_id, decode_canonical,
 };
 pub use range::{
     MERKLE_LEAF_SIZE, MERKLE_SUITE_V1, MerkleCommitment, MerkleError, MerkleRangeProof,
-    challenged_leaf, merkle_commit, merkle_open_range, merkle_verify_range,
+    challenged_leaf, merkle_commit, merkle_open_range, merkle_verify_range, merkle_zero_commitment,
 };
 pub use recovery::{
     RecoveryCryptoError, RecoveryLocator, SealedRecoveryRecord, open_recovery_record,

@@ -6,8 +6,10 @@ use uuid::Uuid;
 use crate::keys::{KeyMaterial, NodeId, RecoveryPublicKey, signing_payload};
 use crate::recovery::{RecoveryLocator, SealedRecoveryRecord};
 use crate::{
-    V1_CIPHER_PROFILE, V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER,
-    V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, encode_3_2, sector_root,
+    CodingProfile, MerkleCommitment, MerkleRangeProof, V1_CIPHER_PROFILE, V1_MAX_CODING_GROUPS,
+    V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS,
+    V1_SECTOR_SIZE, encode as encode_codeword, encode_3_2, merkle_commit, merkle_verify_range,
+    merkle_zero_commitment, sector_root, verify_sampled_codeword,
 };
 
 pub type SectorId = [u8; 32];
@@ -144,6 +146,199 @@ pub struct CodingGroup {
     pub parity_shards: u16,
     pub shard_size: u32,
     pub roles: [ShardRole; 5],
+}
+
+/// Merkle-committed information reference used by variable coding layouts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RangeSectorRef {
+    pub id: SectorId,
+    pub commitment: MerkleCommitment,
+    pub logical_len: u32,
+    /// Virtual-zero shards have no payload transfer. Their all-zero RS bytes
+    /// remain authenticated by `commitment` and their position by the group ID.
+    pub virtual_zero: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InformationRoleV2 {
+    pub owner: NodeId,
+    /// The certified hard-domain claim at placement time.
+    pub failure_domain: String,
+    pub sector: RangeSectorRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ParityRoleV2 {
+    pub holder: NodeId,
+    /// The certified hard-domain claim at placement time.
+    pub failure_domain: String,
+    pub row: u16,
+    pub commitment: MerkleCommitment,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ShardRoleV2 {
+    Information(InformationRoleV2),
+    Parity(ParityRoleV2),
+}
+
+/// An explicit variable-geometry layout. The descriptor records every coding
+/// parameter and placement-domain claim needed to decode it in the future.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CodingGroupV2 {
+    pub id: CodingGroupId,
+    pub format_version: u16,
+    pub guild_id: [u8; 32],
+    pub profile: CodingProfile,
+    pub roles: Vec<ShardRoleV2>,
+}
+
+impl CodingGroupV2 {
+    pub fn calculate_id(&self) -> Result<CodingGroupId, ModelError> {
+        coding_group_v2_id(
+            self.format_version,
+            self.guild_id,
+            self.profile,
+            &self.roles,
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), ModelError> {
+        self.profile.validate()?;
+        if self.format_version != 2
+            || self.guild_id == [0; 32]
+            || self.roles.len() != self.profile.total_shards()?
+            || self.calculate_id()? != self.id
+        {
+            return Err(ModelError::InvalidCheckpoint);
+        }
+        let mut domains = std::collections::BTreeSet::new();
+        for (index, role) in self.roles.iter().enumerate() {
+            let domain = match role {
+                ShardRoleV2::Information(information)
+                    if index < usize::from(self.profile.data_shards) =>
+                {
+                    information.sector.commitment.validate()?;
+                    if information.sector.id == [0; 32]
+                        || information.sector.commitment.byte_len != self.profile.shard_size
+                        || information.sector.logical_len > self.profile.shard_size
+                        || information.failure_domain.is_empty()
+                        || information.failure_domain.len() > 256
+                    {
+                        return Err(ModelError::InvalidCheckpoint);
+                    }
+                    if information.sector.virtual_zero {
+                        if information.sector.logical_len != self.profile.shard_size
+                            || information.sector.commitment
+                                != merkle_zero_commitment(self.profile.shard_size)?
+                        {
+                            return Err(ModelError::InvalidCheckpoint);
+                        }
+                    } else if information.sector.logical_len == 0 {
+                        return Err(ModelError::InvalidCheckpoint);
+                    }
+                    information.failure_domain.as_str()
+                }
+                ShardRoleV2::Parity(parity)
+                    if index >= usize::from(self.profile.data_shards)
+                        && parity.row == (index - usize::from(self.profile.data_shards)) as u16 =>
+                {
+                    parity.commitment.validate()?;
+                    if parity.commitment.byte_len != self.profile.shard_size
+                        || parity.failure_domain.is_empty()
+                        || parity.failure_domain.len() > 256
+                    {
+                        return Err(ModelError::InvalidCheckpoint);
+                    }
+                    parity.failure_domain.as_str()
+                }
+                _ => return Err(ModelError::InvalidCheckpoint),
+            };
+            if !domains.insert(domain) {
+                return Err(ModelError::ReusedFailureDomain(domain.to_owned()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify a complete parity shard against all committed information bytes.
+    pub fn verify_parity_shard(
+        &self,
+        information: &[Vec<u8>],
+        shard_index: usize,
+        parity: &[u8],
+    ) -> Result<(), ModelError> {
+        self.validate()?;
+        if information.len() != usize::from(self.profile.data_shards) {
+            return Err(ModelError::InvalidCodingRelation);
+        }
+        for (role, bytes) in self.roles[..information.len()].iter().zip(information) {
+            let ShardRoleV2::Information(information_role) = role else {
+                return Err(ModelError::InvalidCodingRelation);
+            };
+            if merkle_commit(bytes)? != information_role.sector.commitment {
+                return Err(ModelError::InvalidCodingRelation);
+            }
+        }
+        let Some(ShardRoleV2::Parity(parity_role)) = self.roles.get(shard_index) else {
+            return Err(ModelError::InvalidCodingRelation);
+        };
+        if merkle_commit(parity)? != parity_role.commitment {
+            return Err(ModelError::InvalidCodingRelation);
+        }
+        let encoded = encode_codeword(self.profile, information.to_vec())?;
+        if encoded[shard_index].as_slice() != parity {
+            return Err(ModelError::InvalidCodingRelation);
+        }
+        Ok(())
+    }
+
+    /// Authenticate the same 16-byte leaf from every shard and verify only
+    /// those symbols against the declared Reed--Solomon equation.
+    pub fn verify_sampled_openings(
+        &self,
+        challenged_leaf: u32,
+        proofs: &[MerkleRangeProof],
+    ) -> Result<(), ModelError> {
+        self.validate()?;
+        if proofs.len() != self.roles.len() {
+            return Err(ModelError::InvalidCodingRelation);
+        }
+        let mut symbols = Vec::with_capacity(proofs.len());
+        for (role, proof) in self.roles.iter().zip(proofs) {
+            if proof.start_leaf != challenged_leaf || proof.leaves.len() != 1 {
+                return Err(ModelError::InvalidCodingRelation);
+            }
+            let commitment = match role {
+                ShardRoleV2::Information(information) => &information.sector.commitment,
+                ShardRoleV2::Parity(parity) => &parity.commitment,
+            };
+            let bytes = merkle_verify_range(commitment, proof)?;
+            symbols.push(
+                bytes
+                    .try_into()
+                    .map_err(|_| ModelError::InvalidCodingRelation)?,
+            );
+        }
+        verify_sampled_codeword(self.profile, &symbols)?;
+        Ok(())
+    }
+}
+
+pub fn coding_group_v2_id(
+    format_version: u16,
+    guild_id: [u8; 32],
+    profile: CodingProfile,
+    roles: &[ShardRoleV2],
+) -> Result<CodingGroupId, ModelError> {
+    let mut hasher = blake3::Hasher::new_derive_key("mutualbackup coding group v2");
+    hasher.update(&canonical_bytes(&(
+        format_version,
+        guild_id,
+        profile,
+        roles,
+    ))?);
+    Ok(*hasher.finalize().as_bytes())
 }
 
 impl CodingGroup {
@@ -787,6 +982,8 @@ pub enum ModelError {
     InvalidCodingRelation,
     #[error("Reed--Solomon validation failed: {0}")]
     Coding(#[from] crate::CodingError),
+    #[error("Merkle range validation failed: {0}")]
+    Merkle(#[from] crate::MerkleError),
 }
 
 fn validate_members(members: &[Member]) -> Result<(), ModelError> {
@@ -1354,6 +1551,136 @@ mod tests {
         assert!(matches!(
             invalid_group.verify_parity_shard(&information, 3, &invalid),
             Err(ModelError::InvalidCodingRelation)
+        ));
+    }
+
+    fn variable_group() -> (CodingGroupV2, Vec<Vec<u8>>) {
+        let keys = (0_u8..6)
+            .map(|value| KeyMaterial::from_seed(&Seed::from_bytes([value + 40; 32])))
+            .collect::<Vec<_>>();
+        let profile = CodingProfile::new(4, 2, 64);
+        let information = (0_u8..4)
+            .map(|value| vec![value.wrapping_mul(37); profile.shard_size as usize])
+            .collect::<Vec<_>>();
+        let encoded = encode_codeword(profile, information).unwrap();
+        let mut roles = encoded[..4]
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                ShardRoleV2::Information(InformationRoleV2 {
+                    owner: keys[index].node_id(),
+                    failure_domain: format!("domain-{index}"),
+                    sector: RangeSectorRef {
+                        id: [index as u8 + 1; 32],
+                        commitment: merkle_commit(bytes).unwrap(),
+                        logical_len: profile.shard_size,
+                        virtual_zero: false,
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        roles.extend(encoded[4..].iter().enumerate().map(|(row, bytes)| {
+            ShardRoleV2::Parity(ParityRoleV2 {
+                holder: keys[row + 4].node_id(),
+                failure_domain: format!("domain-{}", row + 4),
+                row: row as u16,
+                commitment: merkle_commit(bytes).unwrap(),
+            })
+        }));
+        let mut group = CodingGroupV2 {
+            id: [0; 32],
+            format_version: 2,
+            guild_id: [17; 32],
+            profile,
+            roles,
+        };
+        group.id = group.calculate_id().unwrap();
+        (group, encoded)
+    }
+
+    #[test]
+    fn variable_group_binds_geometry_domains_and_complete_parity() {
+        let (group, encoded) = variable_group();
+        group.validate().unwrap();
+        group
+            .verify_parity_shard(&encoded[..4], 4, &encoded[4])
+            .unwrap();
+        group
+            .verify_parity_shard(&encoded[..4], 5, &encoded[5])
+            .unwrap();
+
+        let mut reused_domain = group.clone();
+        let ShardRoleV2::Parity(parity) = &mut reused_domain.roles[5] else {
+            unreachable!();
+        };
+        parity.failure_domain = "domain-0".to_owned();
+        reused_domain.id = reused_domain.calculate_id().unwrap();
+        assert!(matches!(
+            reused_domain.validate(),
+            Err(ModelError::ReusedFailureDomain(domain)) if domain == "domain-0"
+        ));
+
+        let mut changed_profile = group.clone();
+        changed_profile.profile = CodingProfile::new(3, 3, 64);
+        assert_ne!(changed_profile.calculate_id().unwrap(), group.id);
+    }
+
+    #[test]
+    fn variable_group_verifies_authenticated_same_leaf_samples() {
+        let (group, encoded) = variable_group();
+        let proofs = encoded
+            .iter()
+            .map(|bytes| crate::merkle_open_range(bytes, 2, 1).unwrap())
+            .collect::<Vec<_>>();
+        group.verify_sampled_openings(2, &proofs).unwrap();
+
+        let mut different_leaf = proofs.clone();
+        different_leaf[1] = crate::merkle_open_range(&encoded[1], 1, 1).unwrap();
+        assert!(matches!(
+            group.verify_sampled_openings(2, &different_leaf),
+            Err(ModelError::InvalidCodingRelation)
+        ));
+
+        let mut corrupt = encoded.clone();
+        corrupt[5][2 * crate::MERKLE_LEAF_SIZE] ^= 1;
+        let mut invalid_group = group.clone();
+        let ShardRoleV2::Parity(parity) = &mut invalid_group.roles[5] else {
+            unreachable!();
+        };
+        parity.commitment = merkle_commit(&corrupt[5]).unwrap();
+        invalid_group.id = invalid_group.calculate_id().unwrap();
+        invalid_group.validate().unwrap();
+        let corrupt_proofs = corrupt
+            .iter()
+            .map(|bytes| crate::merkle_open_range(bytes, 2, 1).unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            invalid_group.verify_sampled_openings(2, &corrupt_proofs),
+            Err(ModelError::Coding(crate::CodingError::InvalidCodeword))
+        ));
+    }
+
+    #[test]
+    fn variable_group_authenticates_virtual_zero_extents() {
+        let (mut group, _) = variable_group();
+        let ShardRoleV2::Information(information) = &mut group.roles[0] else {
+            unreachable!();
+        };
+        information.sector.commitment = merkle_zero_commitment(group.profile.shard_size).unwrap();
+        information.sector.virtual_zero = true;
+        information.sector.logical_len = group.profile.shard_size;
+        group.id = group.calculate_id().unwrap();
+        group.validate().unwrap();
+
+        let mut forged = group.clone();
+        let ShardRoleV2::Information(information) = &mut forged.roles[0] else {
+            unreachable!();
+        };
+        information.sector.commitment.root[0] ^= 1;
+        forged.id = forged.calculate_id().unwrap();
+        assert!(matches!(
+            forged.validate(),
+            Err(ModelError::InvalidCheckpoint)
         ));
     }
 }
