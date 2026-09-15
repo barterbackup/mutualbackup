@@ -1,14 +1,85 @@
 # Product TODO
 
-## Milestone 4 correction review — closed 2026-09-15
+## Milestone 4 follow-up source review — reopened 2026-09-15
+
+Source review of `668324f..d12f5fb` found three remaining completion blockers
+in the corrections to M4-29, M4-32, and M4-33. Milestone 4 remains open;
+complete these corrections and their gate before advancing to Milestone 5.
+Earlier passing gates cover their exercised cases, but not the schedules
+below. This review ran no builds, tests, or runtime probes.
+
+- [ ] **M4-34 / P2 — Reserve WAL backlog even when automatic checkpointing stalls.**
+  Setting `wal_autocheckpoint = 1` (`crates/mb-store/src/database.rs:2266`)
+  requests a PASSIVE checkpoint; it does not guarantee that backfill completes.
+  The pinned SQLCipher source caps backfill at active readers and its automatic
+  hook ignores checkpoint errors. Peer reads use connections independent of
+  the writer lock (`crates/mb-node/src/network.rs:617`,
+  `crates/mb-node/src/node.rs:505`). A held read snapshot can therefore leave
+  MiBs of new pages in WAL across many writes. After it finishes, the next
+  ordinary write can pass admission with free space equal to headroom plus
+  400 KiB, then checkpoint those MiBs into the main database. Admission still
+  reserves only the current object and fixed overhead
+  (`crates/mb-node/src/volume.rs:710`,
+  `volume.rs:1343`). Reopening a large WAL left by an interrupted previous
+  version also does not flush it merely by changing the threshold. Reserve
+  outstanding main-file growth or coordinate readers and verify checkpoint
+  completion before relying on a bounded reserve. Cover held readers and
+  upgrade with an uncheckpointed WAL at the physical headroom boundary,
+  including control storage on the shared filesystem. The new database test
+  (`database.rs:3516`) uses fresh stores with one connection per database.
+- [ ] **M4-35 / P2 — Settle pending intents and stale receipts before empty drain retirement.**
+  `settle_empty_volume_cleanup` clears only `volume-copy-cleanup`
+  (`crates/mb-node/src/volume.rs:1067`). An emergency repair interrupted at
+  `WriteIntentStored` leaves a durable marker and intent without a payload
+  (`crates/mb-node/src/node.rs:2465`, `volume.rs:764`). Startup preserves the
+  intent when the object is absent (`volume.rs:795`). Draining this empty
+  volume then marks it Retired and closes its store (`volume.rs:952`). Later
+  emergency cleanup/GC requires the intent's volume, cannot access the closed
+  store, and never retires the marker/proof or intent (`volume.rs:616`,
+  `node.rs:2505`). A receipt left by interruption after `GarbageObjectRemoved`
+  has the analogous problem. Reconcile all durable location evidence against
+  the verified-empty source before declaring it removable, preserving valid
+  destination receipts. Also handle cleanup obligations already attached to
+  Retired volumes by the previous implementation. Extend the emergency
+  interruption regression (`node.rs:5818`) through reopen, drain, cleanup,
+  disk removal, and repeated reopen; cover interrupted GC followed by drain
+  and assert that intents, receipts, markers/proofs, cleanup records, and
+  garbage candidates converge.
+- [ ] **M4-36 / P2 — Report protection from all verified emergency-copy locations.**
+  Discovery stops at the first valid alternate for each missing shard
+  (`crates/mb-node/src/network/p2p.rs:6197`), but repair can create another
+  copy even when it already found one (`p2p.rs:6265`). With D/E absent and
+  surviving node IDs A < B < C holding indices 0/1/2, the first repair stores
+  3 on A and 4 on B. The second stores another 3 on C and another 4 on A.
+  The resulting layout survives any further single host loss, yet a later
+  audit with repair disabled finds both emergency indices first on A and
+  ignores their other copies. Its incomplete location sets report that losing
+  A leaves only two indices and persist Emergency instead of Degraded
+  (`p2p.rs:6318`, `p2p.rs:6338`). Collect all verified locations, or an
+  equivalent complete inventory, for placement and durable protection status.
+  Cover repeated repairs followed by read-only audits and reopen, as well as
+  corrected older concentrated layouts. The new outage regression
+  (`p2p.rs:11702`) reconstructs from all copies collected directly from nodes;
+  it does not check that a later audit discovers the same protection.
+
+- [ ] **Run the Milestone 4 correction gate after M4-34 through M4-36.**
+  Add focused regressions for the schedules above, then run formatting,
+  locked all-target workspace tests and warning-free Clippy, Docker-controller
+  safety, and the complete disposable-Btrfs/reflink/network gate locally.
+  Record results against the corrected source tree before closing Milestone 4.
+  Do not use a remote compilation server.
+
+## Milestone 4 correction review — prior correction record
 
 Source review of `8411f7d..2da3e82` found the blockers below in the correction
 and its Milestone 4 integration. M4-29 also checks the existing emergency
 placement against the milestone's outage-layout requirement. Earlier passing
 gates remain historical evidence for their exercised cases; they do not close
 these failure schedules. This review ran no builds, tests, or runtime probes.
-Commits `27cb1b2`, `a265cc1`, and `04875a9` resolve M4-28 through
-M4-33. The local correction gate below passed before Milestone 5.
+Commits `27cb1b2`, `a265cc1`, and `04875a9` were recorded as resolving M4-28
+through M4-33, and the local correction gate below passed. The follow-up above
+supersedes that closure for the remaining M4-29, M4-32, and M4-33 schedules;
+the checked entries below preserve the prior correction record.
 
 - [x] **M4-28 / P1 — Resume legacy parity rekey after manifest publication.**
   The new manifest-present initialization branch opens only with the wrapped
