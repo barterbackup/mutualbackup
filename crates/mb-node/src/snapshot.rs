@@ -229,6 +229,17 @@ struct CaptureIntent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct LegacyCaptureIntentV1 {
+    format_version: u16,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    sequence: u64,
+    parent: Option<[u8; 32]>,
+    requested_source: PathBuf,
+    plan: ReflinkCapturePlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct RecoveryAnchorIntent {
     format_version: u16,
     guild_id: [u8; 32],
@@ -240,9 +251,36 @@ struct RecoveryAnchorIntent {
 
 pub(crate) fn reconcile_pending_captures(control: &ControlStore) -> Result<()> {
     for (record_id, bytes) in control.records("capture-intent")? {
-        let intent: CaptureIntent = decode_canonical(&bytes)?;
+        let (intent, migrated) = match decode_canonical::<CaptureIntent>(&bytes) {
+            Ok(intent) => (intent, false),
+            Err(current_error) => {
+                let legacy: LegacyCaptureIntentV1 =
+                    decode_canonical(&bytes).with_context(|| {
+                        format!("pending source capture is undecodable: {current_error}")
+                    })?;
+                if legacy.format_version != 1 {
+                    bail!("pending source capture has an unsupported version");
+                }
+                (
+                    CaptureIntent {
+                        format_version: 2,
+                        guild_id: legacy.guild_id,
+                        revision_id: legacy.revision_id,
+                        sequence: legacy.sequence,
+                        parent: legacy.parent,
+                        captured_change_sequence: None,
+                        requested_source: legacy.requested_source,
+                        plan: legacy.plan,
+                    },
+                    true,
+                )
+            }
+        };
         if intent.format_version != 2 || record_id.as_slice() != intent.revision_id.as_bytes() {
             bail!("pending source capture is inconsistent");
+        }
+        if migrated {
+            control.put_record("capture-intent", &record_id, &canonical_bytes(&intent)?)?;
         }
         // An offline source volume must not prevent unrelated guilds from
         // starting. The exact plan remains durable for a later explicit retry.
@@ -3456,6 +3494,55 @@ mod metadata_compatibility_tests {
         )
         .unwrap();
         manifest.remove().unwrap();
+        drop(control);
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn version_one_capture_intent_migrates_conservatively() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("capture-intent-v1-{}", Uuid::new_v4()));
+        let source = run_root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("payload"), b"legacy pending capture").unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([51; 32]));
+        let control = ControlStore::open(run_root.join("control.db"), &keys).unwrap();
+        let revision_id = Uuid::from_bytes([52; 16]);
+        let legacy = LegacyCaptureIntentV1 {
+            format_version: 1,
+            guild_id: [53; 32],
+            revision_id,
+            sequence: 1,
+            parent: None,
+            requested_source: source.clone(),
+            plan: ReflinkAnchor::plan(&source).unwrap(),
+        };
+        control
+            .put_record(
+                "capture-intent",
+                revision_id.as_bytes(),
+                &canonical_bytes(&legacy).unwrap(),
+            )
+            .unwrap();
+
+        reconcile_pending_captures(&control).unwrap();
+
+        let migrated: CaptureIntent = decode_canonical(
+            &control
+                .get_record("capture-intent", revision_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(migrated.format_version, 2);
+        assert_eq!(migrated.revision_id, revision_id);
+        assert_eq!(migrated.requested_source, source);
+        assert_eq!(migrated.captured_change_sequence, None);
         drop(control);
         fs::remove_dir_all(run_root).unwrap();
     }

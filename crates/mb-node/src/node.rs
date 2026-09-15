@@ -725,7 +725,7 @@ impl Node {
 
     fn mark_root_dirty_at(&mut self, reason: &str, changed: bool, now: u64) -> Result<()> {
         let mut reason = reason.to_owned();
-        reason.truncate(512);
+        truncate_utf8(&mut reason, 512);
         let previous = self.root_dirty_state()?;
         let change_sequence = previous
             .as_ref()
@@ -905,7 +905,7 @@ impl Node {
             Ok(estimated_bytes) => estimated_bytes,
             Err(error) => {
                 let mut message = format!("automatic full reconciliation failed: {error:#}");
-                message.truncate(512);
+                truncate_utf8(&mut message, 512);
                 state.blocked_reason = Some(message);
                 state.retry_at_unix_seconds =
                     Some(now.saturating_add(policy.minimum_interval_seconds));
@@ -968,7 +968,7 @@ impl Node {
             state.retry_at_unix_seconds = None;
         } else {
             let mut message = error.unwrap_or("automatic backup failed").to_owned();
-            message.truncate(512);
+            truncate_utf8(&mut message, 512);
             let hard = message.contains("budget")
                 || message.contains("capacity")
                 || message.contains("space");
@@ -1830,7 +1830,7 @@ impl Node {
             anyhow::bail!("backup failure conflicts with the durable job");
         }
         let mut error = error.to_owned();
-        error.truncate(4096);
+        truncate_utf8(&mut error, 4096);
         job.state = BackupJobState::Failed;
         job.error = Some(error);
         self.put_backup_job(&job)
@@ -1880,7 +1880,7 @@ impl Node {
             anyhow::bail!("backup retry conflicts with the durable job");
         }
         let mut error = error.to_owned();
-        error.truncate(4096);
+        truncate_utf8(&mut error, 4096);
         job.state = BackupJobState::Pending;
         job.error = Some(error);
         self.put_backup_job(&job)
@@ -2151,10 +2151,9 @@ impl Node {
             let is_current = latest.as_ref().is_some_and(|fence| {
                 fence.epoch == writer.epoch && fence.public_key == writer.public_key
             });
-            let is_pending = writer.base_checkpoint == current_hash
-                && latest.as_ref().map_or(writer.epoch == 1, |fence| {
-                    fence.epoch.checked_add(1) == Some(writer.epoch)
-                });
+            let is_pending = latest.as_ref().map_or(writer.epoch == 1, |fence| {
+                fence.epoch.checked_add(1) == Some(writer.epoch)
+            });
             if is_current || is_pending {
                 return Ok(writer);
             }
@@ -4631,6 +4630,17 @@ impl Node {
     }
 }
 
+fn truncate_utf8(value: &mut String, maximum_bytes: usize) {
+    if value.len() <= maximum_bytes {
+        return;
+    }
+    let mut boundary = maximum_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+}
+
 fn decode_installed_guild(bytes: &[u8]) -> Result<InstalledGuild> {
     let installed: InstalledGuild = decode_canonical(bytes)?;
     if installed.format_version != 2 {
@@ -5457,6 +5467,51 @@ mod tests {
     }
 
     #[test]
+    fn pending_writer_survives_checkpoint_advance_without_a_new_fence() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([226; 32]);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        let prior = install_public_restore_fixture(&mut node, &seed);
+        let guild_id = prior.value.guild_id;
+        let writer = node.writer_incarnation(guild_id).unwrap();
+        assert_eq!(writer.epoch, 2);
+
+        let first = node.current_checkpoint(guild_id).unwrap().unwrap();
+        let first_hash = first.hash().unwrap();
+        let mut second = QuorumCheckpoint {
+            checkpoint: first.checkpoint.clone(),
+            signatures: Vec::new(),
+        };
+        second.checkpoint.generation = 2;
+        second.checkpoint.parent = Some(first_hash);
+        let signing_seeds = std::iter::once(seed.clone())
+            .chain((0_u8..4).map(|index| Seed::from_bytes([index + 228; 32])));
+        for signing_seed in signing_seeds {
+            second
+                .add_signature(&KeyMaterial::from_seed(&signing_seed))
+                .unwrap();
+        }
+        second.verify().unwrap();
+        let second_hash = second.hash().unwrap();
+        node.control
+            .commit_checkpoint(
+                &guild_id,
+                2,
+                Some(&first_hash),
+                &second_hash,
+                &canonical_bytes(&second.checkpoint).unwrap(),
+                &canonical_bytes(&second).unwrap(),
+                false,
+            )
+            .unwrap();
+
+        assert!(node.writer_incarnation(guild_id).unwrap() == writer);
+        drop(node);
+        let mut reopened = Node::open(temp.path(), seed).unwrap();
+        assert!(reopened.writer_incarnation(guild_id).unwrap() == writer);
+    }
+
+    #[test]
     fn superseded_local_writer_cannot_rotate_itself_back_into_authority() {
         let temp = tempfile::tempdir().unwrap();
         let seed = Seed::from_bytes([225; 32]);
@@ -5557,6 +5612,21 @@ mod tests {
         let status = reopened.automatic_backup_status().unwrap();
         assert!(status.blocked_reason.unwrap().contains("capacity"));
         assert!(status.retry_at_unix_seconds.is_none());
+    }
+
+    #[test]
+    fn automatic_backup_errors_are_bounded_at_utf8_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::open(temp.path(), Seed::from_bytes([227; 32])).unwrap();
+        let unicode_error = "é".repeat(300);
+
+        node.automatic_backup_finished(None, false, Some(&unicode_error))
+            .unwrap();
+
+        let state = node.automatic_backup_state(0).unwrap();
+        let message = state.blocked_reason.unwrap();
+        assert!(message.len() <= 512);
+        assert!(message.chars().all(|character| character == 'é'));
     }
 
     #[test]

@@ -8,7 +8,7 @@ they do not cover these combined failure schedules. This review ran no builds,
 tests, or runtime probes. Close these findings and the correction gate before
 advancing to Milestone 5.
 
-- [ ] **M4-15 / P1 — Preserve an uncommitted writer across unrelated checkpoints.**
+- [x] **M4-15 / P1 — Preserve an uncommitted writer across unrelated checkpoints.**
   `writer_incarnation` accepts a pending incarnation only while its original
   `base_checkpoint` equals the current guild head, then permanently fences it
   otherwise (`crates/mb-node/src/node.rs:2154`). That base is never updated.
@@ -19,7 +19,7 @@ advancing to Milestone 5.
   Distinguish unrelated checkpoint progress from actual supersession. Cover
   interrupted first capture and recovery takeover, another owner's commit,
   retry/reopen, and continued rejection of a truly superseded writer.
-- [ ] **M4-16 / P1 — Migrate pending version-1 capture intents.**
+- [x] **M4-16 / P1 — Migrate pending version-1 capture intents.**
   `CaptureIntent` inserts `captured_change_sequence` into its positional
   postcard encoding (`crates/mb-node/src/snapshot.rs:226`), while startup
   decodes only the new shape and requires version 2 (`snapshot.rs:243`). A
@@ -55,7 +55,7 @@ advancing to Milestone 5.
   silently reactivates it. Merge the discovered manifest with durable UUID
   state before any creation or activation. Cover a relocated established
   manifest with lost database and a relocated completed drain.
-- [ ] **M4-20 / P2 — Bound automatic-backup errors on UTF-8 character boundaries.**
+- [x] **M4-20 / P2 — Bound automatic-backup errors on UTF-8 character boundaries.**
   The new scan-error handler calls `message.truncate(512)`
   (`crates/mb-node/src/node.rs:908`). A failing descendant with a long Unicode
   path can place byte 512 inside a character and panic while holding the Node
