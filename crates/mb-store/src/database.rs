@@ -2263,7 +2263,7 @@ fn configure_encrypted(
          PRAGMA secure_delete = ON;
          PRAGMA journal_mode = WAL;
          PRAGMA synchronous = FULL;
-         PRAGMA wal_autocheckpoint = 1000;",
+         PRAGMA wal_autocheckpoint = 1;",
     )?;
     let cipher_version: Option<String> = connection
         .query_row("PRAGMA cipher_version", [], |row| row.get(0))
@@ -3510,6 +3510,50 @@ mod tests {
             store.stage_and_publish(&replacement),
             Err(DatabaseError::Conflict)
         ));
+    }
+
+    #[test]
+    fn encrypted_database_wal_growth_is_bounded_across_checkpoint_thresholds() {
+        let temp = tempdir().unwrap();
+        let parity_path = temp.path().join("parity.db");
+        let control_path = temp.path().join("control.db");
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([39; 32]));
+        let control = ControlStore::open(&control_path, &keys).unwrap();
+        let mut parity = ParityStore::open(&parity_path, &[40; 16], &keys).unwrap();
+
+        for marker in 41_u8..121 {
+            let bytes = vec![marker; V1_SECTOR_SIZE];
+            let object = ParityObject {
+                format_version: 1,
+                guild_id: [122; 32],
+                group_id: [marker; 32],
+                shard_index: marker % 5,
+                root: sector_root(&bytes),
+                bytes,
+            };
+            parity.stage_and_publish(&object).unwrap();
+            control
+                .put_record("wal-boundary", &[marker], &vec![marker; V1_SECTOR_SIZE])
+                .unwrap();
+        }
+
+        for store in [&control.connection, &parity.connection] {
+            let threshold: u32 = store
+                .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(threshold, 1);
+        }
+        for path in [&control_path, &parity_path] {
+            let wal_path = path.with_file_name(format!(
+                "{}-wal",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            assert!(
+                fs::metadata(&wal_path).unwrap().len() < 512 * 1024,
+                "{} accumulated an unexpectedly large WAL",
+                wal_path.display()
+            );
+        }
     }
 
     #[test]

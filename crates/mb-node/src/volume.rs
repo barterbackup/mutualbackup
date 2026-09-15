@@ -2389,7 +2389,7 @@ mod tests {
         let required = physical_write_reservation(object.bytes.len(), b"ack".len());
         assert!(required > V1_SECTOR_SIZE as u64);
         assert!(available > required);
-        let headroom = available - required / 2;
+        let headroom = available.saturating_add(required);
         volumes
             .configure(&control, &[volume.path().to_path_buf()], u64::MAX, headroom)
             .unwrap();
@@ -2416,14 +2416,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
-    fn physical_reservation_preserves_real_shared_filesystem_headroom() {
+    fn physical_reservation_preserves_headroom_after_many_shared_filesystem_writes() {
         let test_root = PathBuf::from(
             std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
                 .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
         );
         let run_root = TempDir::new_in(test_root).unwrap();
         let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([95; 32])));
-        let object = parity_object(96, 4);
         let acknowledgement = b"shared-filesystem-ack";
         let (control, _) = open_control_store(run_root.path(), &keys).unwrap();
         let mut volumes = StorageVolumes::open(run_root.path(), keys, &control).unwrap();
@@ -2434,6 +2433,16 @@ mod tests {
             .find(|status| status.path == run_root.path().canonicalize().unwrap())
             .unwrap()
             .volume_id;
+        for marker in 100_u8..180 {
+            volumes
+                .store(
+                    &control,
+                    &parity_object(marker, marker % 5),
+                    acknowledgement,
+                )
+                .unwrap();
+        }
+        let object = parity_object(180, 4);
         let reservation = physical_write_reservation(object.bytes.len(), acknowledgement.len());
         let available_before = fs2::available_space(run_root.path()).unwrap();
         assert!(available_before > reservation);
