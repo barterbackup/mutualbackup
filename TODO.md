@@ -1,16 +1,17 @@
 # Product TODO
 
-## Milestone 4 follow-up source review — open 2026-09-15
+## Milestone 4 follow-up source review — closed 2026-09-15
 
 Source review of `197c6b0..1b9f99e` found one remaining completion blocker
 in M4-37's capacity correction. Per-holder serialization removes the explicit
 probe burst, but receiving a response does not guarantee that the holder has
 released its request worker. No remaining blocker was identified in M4-38's
-matching READY publication retry correction. Milestone 4 is reopened; the
-earlier passing gates remain evidence for their exercised cases. This review
-ran no builds, tests, or runtime probes.
+matching READY publication retry correction. That review reopened Milestone 4;
+the earlier passing gates remained evidence for their exercised cases. The
+review ran no builds, tests, or runtime probes. Commit `193f67e` resolves
+M4-39, and the local correction gate below passed.
 
-- [ ] **M4-39 / P2 — Release holder capacity before exposing a completed response.**
+- [x] **M4-39 / P2 — Release holder capacity before exposing a completed response.**
   The blocking worker retains its inbound permit while enqueueing
   `InboundResult` (`crates/mb-node/src/network/p2p.rs:4432`, `p2p.rs:4434`).
   The event loop can send that response before the worker resumes and drops
@@ -30,15 +31,21 @@ ran no builds, tests, or runtime probes.
   a deterministic regression that holds the preceding worker after its
   result is queued, then exercises the next sequential probe with one
   available worker and verifies complete discovery and durable Degraded
-  status after a read-only audit and reopen. The current constrained-permit
-  regression (`p2p.rs:11767`) does not force this response/permit handoff.
-- [ ] **Run the Milestone 4 correction gate after M4-39.**
-  Add the deterministic handoff regression, then rerun formatting, locked
-  all-target workspace tests, warning-free locked all-target workspace
-  Clippy, Docker controller safety, and the complete local disposable-Btrfs/
-  reflink/network gate. Build and run everything locally; use no remote
-  compilation server. Record the corrected revision and results before
-  closing Milestone 4 and proceeding to Milestone 5.
+  status after a read-only audit and reopen. The constrained-permit regression
+  at review time (`p2p.rs:11767`) did not force this response/permit handoff.
+- [x] **Run the Milestone 4 correction gate after M4-39.**
+  On 2026-09-15, commit `193f67e` passed formatting, locked all-target
+  workspace tests, warning-free locked all-target workspace Clippy, and Docker
+  controller safety. A freshly provisioned disposable 2 GiB Btrfs filesystem
+  with `user_subvol_rm_allowed` passed the complete
+  `scripts/reflink-acceptance.sh` gate, including capture and recovery
+  reconciliation, shared-filesystem WAL headroom, repeated multi-owner QUIC
+  backup, five-daemon seed/DHT recovery after source and holder loss, and
+  isolated direct/DCUtR/relay paths. The deterministic handoff regression
+  leaves one request permit available on each reachable remote holder, holds
+  the first completed workers after their results are queued, and verifies
+  complete discovery with durable Degraded status through reopen. All
+  compilation and execution were local; no remote compilation server was used.
 
 ## Milestone 4 follow-up correction record — M4-37 and M4-38
 
@@ -46,9 +53,9 @@ Source review of `fb73787..546a1b9` found two completion blockers in the
 latest audit and physical-admission changes. The retired-volume correction
 has no remaining blocker identified in this review. Commits `736bf20` and
 `fea97b1` were recorded as resolving the two findings, and the local correction
-gate below passed. The latest source review above reopens milestone completion
-for the remaining response/permit handoff. The review itself ran no builds,
-tests, or runtime probes.
+gate below passed. The later source review recorded M4-39 for the remaining
+response/permit handoff; commit `193f67e` and the gate above close it. The
+review itself ran no builds, tests, or runtime probes.
 
 - [x] **M4-37 / P2 — Avoid overloading holders during emergency-copy discovery.**
   The new emergency inventory launches four probes per remote holder together

@@ -56,13 +56,12 @@ them as ADRs and test vectors before promising wire compatibility.
   checkpoints. Leave a compatible authorization interface for later quorum
   policies and FROST once membership and recovery policy are stable.
 
-### Implemented baseline — durable operations beta completion reopened
+### Implemented baseline — durable operations beta passed
 
 The first usable architectural prototype and the Milestone 2
 operator-configuration and identity-state slice have passed their review gates.
-The Milestone 3 robust-connectivity beta has passed its closure gate.
-Milestone 4's durable-operations beta is implemented, but its completion is
-reopened by the latest source review. Milestone 4 implements automatic backup,
+The Milestone 3 robust-connectivity beta and Milestone 4 durable-operations beta
+have passed their closure gates. Milestone 4 implements automatic backup,
 writer fencing, retention/GC, independently encrypted volume databases, audits,
 repair, emergency copies, and protection status. Corrections `27cb1b2`,
 `a265cc1`, and `04875a9` passed the recorded local gate on 2026-09-15. Follow-up
@@ -77,8 +76,10 @@ complete local correction gate passed on 2026-09-15. Source review of
 `197c6b0..1b9f99e` found M4-39: a completed response can reach the audit before
 its holder releases the request worker, so even sequential probes can receive
 Busy and persist incorrect protection status. No remaining blocker was found
-in the matching READY retry correction. Close M4-39 and rerun the local
-correction gate before proceeding to Milestone 5.
+in the matching READY retry correction. Commit `193f67e` transfers worker
+capacity with the queued result and releases it before the response becomes
+observable. Its deterministic handoff regression and the complete local
+correction gate passed on 2026-09-15. Milestone 5 is next.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -484,9 +485,8 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 3 have passed; Milestone 4
-completion is reopened for M4-39. Milestone 5 follows its correction and local
-gate. Later wire or durable-state changes
+than a daemon prerequisite. Milestones 0 through 4 have passed; Milestone 5 is
+next. Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
 
@@ -701,8 +701,7 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 3 are passed. Milestone 4 completion
-is reopened for M4-39; Milestone 5 follows correction and the local gate.
+**Current position:** Milestones 0 through 4 are passed. Milestone 5 is next.
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer
 fencing, certified retention/tombstones
@@ -868,6 +867,17 @@ reopen, then rerun the local correction gate before closing Milestone 4.
 No remaining blocker was identified in the READY publication retry correction.
 This review ran no builds, tests, or runtime probes; earlier gate results remain
 historical evidence for their exercised cases.
+
+Commit `193f67e` closes M4-39 by carrying the inbound permit with the bounded
+result queue and dropping it in the event loop before response transmission.
+The deterministic regression holds the completed workers after queueing their
+results while leaving one permit available on each reachable remote holder;
+the read-only audit still discovers the complete layout and persists Degraded
+through reopen. On 2026-09-15, the corrected tree passed formatting, locked
+all-target workspace tests, warning-free locked all-target workspace Clippy,
+Docker controller safety, and the complete local disposable 2 GiB
+Btrfs/reflink/network gate. All compilation and execution were local; no remote
+compilation server was used. Milestone 4 is closed and Milestone 5 is next.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
 
@@ -1074,7 +1084,7 @@ artifact check. The unchanged disposable-Btrfs, isolated-network, private-Tor,
 and Docker gates had passed against its immediate precursor. No remote
 compilation server was used.
 
-### Milestone 4 — durable operations and multi-volume storage beta (completion reopened)
+### Milestone 4 — durable operations and multi-volume storage beta (passed)
 
 Implemented after the Milestone 3 gate. Corrections `d1857b5` through `83ebf83`
 addressed the initial review and passed the recorded local gate on 2026-09-14.
@@ -1100,10 +1110,12 @@ and the complete local correction gate passed on 2026-09-15. Source review of
 `197c6b0..1b9f99e` then reopened completion for M4-39: response delivery can
 precede worker-permit release, causing sequential audit probes to miss valid
 copies under the supported holder capacity limit. The READY publication retry
-correction has no remaining blocker identified in this review. Add a
-deterministic response/permit handoff regression and pass the local correction
-gate before Milestone 5. See `TODO.md` for source locations, failure cases,
-and recorded gate evidence.
+correction had no remaining blocker identified in this review. The correction
+required a deterministic response/permit handoff regression and a new local
+gate. Commit `193f67e` releases capacity before response visibility while
+preserving the bounded result queue. Its regression and the complete local
+correction gate passed on 2026-09-15, closing Milestone 4. See `TODO.md` for
+source locations, failure cases, and recorded gate evidence.
 
 - Add writer-incarnation fencing before supporting concurrent loss/recovery;
   then add retention and tombstones, safe GC, audits/scrubs, repair and emergency
