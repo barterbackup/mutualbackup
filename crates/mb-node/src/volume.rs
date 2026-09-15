@@ -597,10 +597,24 @@ impl StorageVolumes {
             .receipt(control, group_id, shard_index)?
             .map(|receipt| receipt.volume_id);
         let mut cleanup_volumes = self.cleanup_volumes(control, group_id, shard_index)?;
-        let mut complete =
-            receipt_volume.is_none_or(|volume_id| self.volumes.contains_key(&volume_id));
+        let intent_volume = control
+            .get_record("volume-write-intent", &record_id)?
+            .map(|bytes| -> Result<Uuid> {
+                let intent: VolumeWriteIntent = decode_canonical(&bytes)?;
+                validate_receipt(&intent.receipt)?;
+                Ok(intent.receipt.volume_id)
+            })
+            .transpose()?;
+        if let Some(volume_id) = intent_volume {
+            cleanup_volumes.insert(volume_id);
+        }
+        let mut complete = receipt_volume
+            .into_iter()
+            .chain(intent_volume)
+            .all(|volume_id| self.volumes.contains_key(&volume_id));
         for (volume_id, volume) in &mut self.volumes {
             let required = receipt_volume == Some(*volume_id)
+                || intent_volume == Some(*volume_id)
                 || cleanup_volumes.contains(volume_id)
                 || volume.record.state == StorageVolumeState::Draining;
             let Some(store) = volume.store.as_mut() else {
@@ -629,6 +643,7 @@ impl StorageVolumes {
         self.store_cleanup_volumes(control, &record_id, &cleanup_volumes)?;
         if complete && cleanup_volumes.is_empty() {
             control.delete_record("volume-receipt", &record_id)?;
+            control.delete_record("volume-write-intent", &record_id)?;
             volume_interruption(VolumeInterruption::GarbageReceiptRetired)?;
         }
         Ok(complete && cleanup_volumes.is_empty())
@@ -726,6 +741,18 @@ impl StorageVolumes {
             root: object.root,
         };
         let record_id = volume_object_id(&object.group_id, object.shard_index);
+        if let Some(bytes) = control.get_record("volume-write-intent", &record_id)? {
+            let previous: VolumeWriteIntent = decode_canonical(&bytes)?;
+            validate_receipt(&previous.receipt)?;
+            if previous.receipt.volume_id != selected {
+                self.add_cleanup_volume(
+                    control,
+                    &object.group_id,
+                    object.shard_index,
+                    previous.receipt.volume_id,
+                )?;
+            }
+        }
         control.put_record(
             "volume-write-intent",
             &record_id,
@@ -922,6 +949,7 @@ impl StorageVolumes {
                 volume_interruption(VolumeInterruption::MigrationReceiptStored)?;
                 moved += 1;
             }
+            self.settle_empty_volume_cleanup(control, source_id)?;
             let source = self.volumes.get_mut(&source_id).expect("source exists");
             source.record.configured = false;
             source.record.state = StorageVolumeState::Retired;
@@ -1036,6 +1064,20 @@ impl StorageVolumes {
         Ok(())
     }
 
+    fn settle_empty_volume_cleanup(&self, control: &ControlStore, volume_id: Uuid) -> Result<()> {
+        for (record_id, bytes) in control.records("volume-copy-cleanup")? {
+            let volumes: Vec<Uuid> = decode_canonical(&bytes)?;
+            let mut volumes = volumes.into_iter().collect::<BTreeSet<_>>();
+            if volumes.iter().any(Uuid::is_nil) {
+                bail!("volume cleanup obligation has an invalid UUID");
+            }
+            if volumes.remove(&volume_id) {
+                self.store_cleanup_volumes(control, &record_id, &volumes)?;
+            }
+        }
+        Ok(())
+    }
+
     fn persist(&self, control: &ControlStore) -> Result<()> {
         let records = self
             .volumes
@@ -1116,20 +1158,22 @@ fn initialize_volume(
             headroom_bytes,
             last_error: None,
         };
-        let database_path = record.path.join(&record.database_file);
         let database_key = keys.unwrap_database_key(
             &volume_database_id(record.volume_id),
             &record.wrapped_database_key,
         )?;
-        ParityStore::open_with_key(&database_path, record.volume_id.as_bytes(), &database_key)?;
+        if database_file.is_some() && record.volume_id == legacy_default_volume_id(keys) {
+            open_volume_store(&record, &database_key, keys)?;
+        } else {
+            let database_path = record.path.join(&record.database_file);
+            ParityStore::open_with_key(&database_path, record.volume_id.as_bytes(), &database_key)?;
+        }
         return Ok(record);
     }
 
     let legacy_path = database_file.map(|name| root.join(name));
     let volume_id = if legacy_path.as_ref().is_some_and(|path| path.exists()) {
-        let mut bytes = [0_u8; 16];
-        bytes.copy_from_slice(&blake3::hash(&keys.node_id().0).as_bytes()[..16]);
-        Uuid::from_bytes(bytes)
+        legacy_default_volume_id(keys)
     } else {
         Uuid::new_v4()
     };
@@ -1319,6 +1363,12 @@ fn legacy_volume_database_id(volume_id: Uuid) -> Vec<u8> {
     id
 }
 
+fn legacy_default_volume_id(keys: &KeyMaterial) -> Uuid {
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&blake3::hash(&keys.node_id().0).as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
+}
+
 fn require_online_directory(path: &Path) -> Result<PathBuf> {
     let path = path
         .canonicalize()
@@ -1442,6 +1492,53 @@ mod tests {
         let (control, reopened_key) = open_control_store(temp.path(), &keys).unwrap();
         assert_eq!(reopened_key, database_key);
         assert_eq!(control.records("legacy-record").unwrap().len(), 64);
+    }
+
+    #[test]
+    fn manifest_published_before_legacy_volume_rekey_resumes_without_data_loss() {
+        let temp = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([59; 32])));
+        let mut volume_id_bytes = [0_u8; 16];
+        volume_id_bytes.copy_from_slice(&blake3::hash(&keys.node_id().0).as_bytes()[..16]);
+        let volume_id = Uuid::from_bytes(volume_id_bytes);
+        let object = parity_object(58, 3);
+        let database_path = temp.path().join("parity.db");
+        let mut legacy = ParityStore::open(&database_path, volume_id.as_bytes(), &keys).unwrap();
+        legacy.stage_and_publish(&object).unwrap();
+        drop(legacy);
+
+        let database_key = [57; 32];
+        let manifest = VolumeManifest {
+            format_version: 1,
+            owner: keys.node_id(),
+            volume_id,
+            database_file: "parity.db".to_owned(),
+            wrapped_database_key: keys
+                .wrap_database_key(&volume_database_id(volume_id), &database_key)
+                .unwrap(),
+        };
+        let signed = SignedRecord::sign(VOLUME_MANIFEST_DOMAIN, manifest, &keys).unwrap();
+        write_new_private_record(&temp.path().join(VOLUME_MANIFEST_FILE), &signed).unwrap();
+
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let volumes = StorageVolumes::open(temp.path(), keys.clone(), &control).unwrap();
+        assert_eq!(
+            volumes
+                .load_ready(&object.group_id, object.shard_index)
+                .unwrap(),
+            object
+        );
+        drop(volumes);
+        drop(control);
+
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        assert_eq!(
+            volumes
+                .load_ready(&object.group_id, object.shard_index)
+                .unwrap(),
+            object
+        );
     }
 
     #[test]
@@ -2542,6 +2639,141 @@ mod tests {
     }
 
     #[test]
+    fn garbage_collection_waits_for_an_absent_pending_write_destination() {
+        let temp = TempDir::new().unwrap();
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([53; 32])));
+        let object = parity_object(54, 3);
+        let configured = vec![first.path().to_path_buf(), second.path().to_path_buf()];
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys.clone(), &control).unwrap();
+        volumes
+            .configure(&control, &configured, (V1_SECTOR_SIZE * 2) as u64, 0)
+            .unwrap();
+        interrupt_next_volume_transition(VolumeInterruption::ObjectPublished);
+        assert!(volumes.store(&control, &object, b"ack").is_err());
+        let intent_bytes = control
+            .records("volume-write-intent")
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1;
+        let intent: VolumeWriteIntent = decode_canonical(&intent_bytes).unwrap();
+        let destination_path = volumes
+            .volumes
+            .get(&intent.receipt.volume_id)
+            .unwrap()
+            .record
+            .path
+            .clone();
+        drop(volumes);
+        drop(control);
+        let absent_path = temp.path().join("absent-pending-destination");
+        fs::rename(&destination_path, &absent_path).unwrap();
+
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys.clone(), &control).unwrap();
+        volumes.reconcile(&control).unwrap();
+        assert!(
+            !volumes
+                .remove_unreachable(&control, &object.group_id, object.shard_index, &object.root,)
+                .unwrap()
+        );
+        assert_eq!(control.records("volume-write-intent").unwrap().len(), 1);
+        assert_eq!(control.records("volume-copy-cleanup").unwrap().len(), 1);
+        drop(volumes);
+        drop(control);
+
+        fs::rename(&absent_path, &destination_path).unwrap();
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys.clone(), &control).unwrap();
+        volumes.reconcile(&control).unwrap();
+        assert!(
+            volumes
+                .remove_unreachable(&control, &object.group_id, object.shard_index, &object.root,)
+                .unwrap()
+        );
+        assert!(control.records("volume-write-intent").unwrap().is_empty());
+        assert!(control.records("volume-receipt").unwrap().is_empty());
+        assert!(control.records("volume-copy-cleanup").unwrap().is_empty());
+        drop(volumes);
+        drop(control);
+
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        assert!(
+            volumes
+                .remove_unreachable(&control, &object.group_id, object.shard_index, &object.root,)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn retargeted_pending_write_retains_the_first_destination_for_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([55; 32])));
+        let object = parity_object(56, 4);
+        let configured = vec![first.path().to_path_buf(), second.path().to_path_buf()];
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys.clone(), &control).unwrap();
+        volumes
+            .configure(&control, &configured, (V1_SECTOR_SIZE * 2) as u64, 0)
+            .unwrap();
+        interrupt_next_volume_transition(VolumeInterruption::ObjectPublished);
+        assert!(volumes.store(&control, &object, b"ack").is_err());
+        let intent_bytes = control
+            .records("volume-write-intent")
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1;
+        let first_intent: VolumeWriteIntent = decode_canonical(&intent_bytes).unwrap();
+        let first_path = volumes
+            .volumes
+            .get(&first_intent.receipt.volume_id)
+            .unwrap()
+            .record
+            .path
+            .clone();
+        drop(volumes);
+        drop(control);
+        let absent_path = temp.path().join("absent-first-write-destination");
+        fs::rename(&first_path, &absent_path).unwrap();
+
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys.clone(), &control).unwrap();
+        volumes.reconcile(&control).unwrap();
+        let replacement = volumes.store_repair(&control, &object).unwrap();
+        assert_ne!(replacement.volume_id, first_intent.receipt.volume_id);
+        let cleanup = volumes
+            .cleanup_volumes(&control, &object.group_id, object.shard_index)
+            .unwrap();
+        assert!(cleanup.contains(&first_intent.receipt.volume_id));
+        assert!(
+            !volumes
+                .remove_unreachable(&control, &object.group_id, object.shard_index, &object.root,)
+                .unwrap()
+        );
+        assert!(control.records("volume-copy-cleanup").unwrap().len() == 1);
+        drop(volumes);
+        drop(control);
+
+        fs::rename(&absent_path, &first_path).unwrap();
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        assert!(
+            volumes
+                .remove_unreachable(&control, &object.group_id, object.shard_index, &object.root,)
+                .unwrap()
+        );
+        assert!(control.records("volume-copy-cleanup").unwrap().is_empty());
+        assert!(control.records("volume-receipt").unwrap().is_empty());
+    }
+
+    #[test]
     fn migration_reuses_an_exactly_full_committed_destination() {
         let temp = TempDir::new().unwrap();
         let first = TempDir::new().unwrap();
@@ -2691,6 +2923,7 @@ mod tests {
                     .sum::<u64>(),
                 1
             );
+            assert!(control.records("volume-copy-cleanup").unwrap().is_empty());
         }
     }
 
