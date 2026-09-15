@@ -1,10 +1,56 @@
 # Product TODO
 
-## Milestone 4 follow-up source review — closed 2026-09-15
+## Milestone 4 follow-up source review — open 2026-09-15
+
+Source review of `fb73787..546a1b9` found two completion blockers in the
+latest audit and physical-admission changes. The retired-volume correction
+has no remaining blocker identified in this review. Milestone 4 is reopened;
+the earlier passing gates remain evidence for their exercised cases. This
+review ran no builds, tests, or runtime probes.
+
+- [ ] **M4-37 / P2 — Avoid overloading holders during emergency-copy discovery.**
+  The new emergency inventory launches four probes per remote holder together
+  (`crates/mb-node/src/network/p2p.rs:6193`, `p2p.rs:6212`). A supported holder
+  with `max_connections = 1` immediately rejects overlapping requests with
+  retryable `Busy` (`p2p.rs:4394`; existing worker-limit test at `p2p.rs:11013`).
+  Audit treats those responses as missing copies without retrying
+  (`p2p.rs:6214`, `p2p.rs:7415`). With D/E offline, A/B/C holding assigned
+  indices 0/1/2, and emergency indices 3 on B and 4 on C, the actual layout
+  survives another holder loss. If absent-index probes occupy B/C's workers
+  when their emergency-copy probes arrive, the audit discovers only three
+  indices and persists Emergency instead of Degraded (`p2p.rs:6349`,
+  `p2p.rs:6369`). Serialize discovery per holder or handle retryable capacity
+  responses with bounded retries before finalizing inventory. Add a regression
+  with low-capacity holders and overlapping probes, checking complete location
+  discovery and correct durable status after a read-only audit and reopen.
+- [ ] **M4-38 / P2 — Allow matching READY publication retries near capacity.**
+  The receipt branch now requires physical space for another complete sector
+  plus WAL backfill before validating the existing object
+  (`crates/mb-node/src/volume.rs:711`). Matching READY bytes and acknowledgement
+  already complete without a parity write in
+  `crates/mb-store/src/database.rs:1505`. A publish interrupted after durable
+  object/receipt publication but before its peer-operation result commits is
+  reexecuted on retry (`crates/mb-node/src/network.rs:695`, `network.rs:708`).
+  If remaining space above headroom is below the new-sector reservation, the
+  retry now returns CapacityExceeded even though the sector is already stored
+  and enough space remains for its small control completion records. Validate
+  the exact existing payload, metadata, and acknowledgement before treating a
+  retry as requiring growth; retain admission for actual writes and reject
+  conflicting retries. Cover interruption, reopen, and retry at the physical
+  boundary through the peer publication path, including durable completion
+  and unchanged parity allocation. The current boundary regression
+  (`volume.rs:2479`) only exercises admission of a new object.
+- [ ] **Run the Milestone 4 correction gate after M4-37 and M4-38.**
+  Add focused regressions for both schedules, then run the locked workspace
+  checks and complete disposable-Btrfs/reflink/network correction gate on the
+  corrected source tree. Build and run everything locally.
+
+## Milestone 4 follow-up correction record — M4-34 through M4-36
 
 Source review of `668324f..d12f5fb` found three remaining completion blockers
 in the corrections to M4-29, M4-32, and M4-33. Commits `9081266`, `7c58281`,
-and `89c6569` resolve them, and the local correction gate below passed.
+and `89c6569` were recorded as resolving them, and the local correction gate
+below passed. The latest source review above reopens milestone completion.
 Earlier passing gates cover their exercised cases, but not the schedules
 below. This review ran no builds, tests, or runtime probes.
 
