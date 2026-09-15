@@ -6190,35 +6190,45 @@ pub async fn audit_guild(
             }
         }
         if assigned_available.iter().any(|available| !available) {
-            let mut emergency_probes = Vec::with_capacity(group.roles.len() * roster.len());
-            for (index, role) in group.roles.iter().enumerate() {
-                let (assigned_holder, expected_root) = shard_holder_and_root(role);
-                for alternate in roster
-                    .iter()
-                    .map(|peer| peer.member.node_id)
-                    .filter(|alternate| *alternate != assigned_holder)
-                {
-                    let probe_node = node.clone();
-                    emergency_probes.push(async move {
+            // A holder may intentionally expose only one request worker. Keep
+            // discovery concurrent across holders, but serialize each holder's
+            // probes so the audit cannot manufacture Busy responses itself.
+            let mut emergency_probes = Vec::with_capacity(roster.len());
+            for alternate in roster.iter().map(|peer| peer.member.node_id) {
+                let probe_node = node.clone();
+                emergency_probes.push(async move {
+                    let mut results = Vec::with_capacity(group.roles.len());
+                    for (index, role) in group.roles.iter().enumerate() {
+                        let (assigned_holder, expected_root) = shard_holder_and_root(role);
+                        if alternate == assigned_holder {
+                            continue;
+                        }
                         let result = fetch_audit_shard(
-                            probe_node, p2p, local_id, alternate, group, index, true,
+                            probe_node.clone(),
+                            p2p,
+                            local_id,
+                            alternate,
+                            group,
+                            index,
+                            true,
                         )
                         .await;
-                        (index, alternate, expected_root, result)
-                    });
-                }
+                        results.push((index, alternate, expected_root, result));
+                    }
+                    results
+                });
             }
-            for (index, alternate, expected_root, candidate) in
-                futures::future::join_all(emergency_probes).await
-            {
-                if let Ok(bytes) = candidate
-                    && bytes.len() == group.shard_size as usize
-                    && sector_root(&bytes) == expected_root
-                {
-                    shard_locations[index].insert(alternate);
-                    emergency_hosts.insert(alternate);
-                    if shards[index].is_none() {
-                        shards[index] = Some(bytes);
+            for holder_results in futures::future::join_all(emergency_probes).await {
+                for (index, alternate, expected_root, candidate) in holder_results {
+                    if let Ok(bytes) = candidate
+                        && bytes.len() == group.shard_size as usize
+                        && sector_root(&bytes) == expected_root
+                    {
+                        shard_locations[index].insert(alternate);
+                        emergency_hosts.insert(alternate);
+                        if shards[index].is_none() {
+                            shards[index] = Some(bytes);
+                        }
                     }
                 }
             }
@@ -11365,11 +11375,13 @@ mod tests {
         let mut nodes = Vec::new();
         let mut clients = Vec::new();
         let mut tasks = Vec::new();
+        let mut inbound_permits = Vec::new();
         for (index, seed) in seeds.iter().cloned().enumerate() {
             let node = Node::open(temp.path().join(format!("node-{index}")), seed).unwrap();
             let node_id = node.keys().node_id();
             let node = Arc::new(Mutex::new(node));
             let (client, event_loop) = build_p2p(node.clone(), config(node_id)).unwrap();
+            inbound_permits.push(event_loop.inbound_permits.clone());
             nodes.push(node);
             clients.push(client);
             tasks.push(tokio::spawn(event_loop.run()));
@@ -11752,6 +11764,18 @@ mod tests {
                 .install_repaired_shard(audit_checkpoint_hash, group.id, 4, &encoded[4], true)
                 .unwrap();
         }
+        // Leave only one request worker on each reachable remote holder. The
+        // complete-copy audit must respect that capacity while probing several
+        // candidate indices on each holder.
+        let held_inbound_permits = futures::future::join_all(
+            [1_usize, 3]
+                .into_iter()
+                .map(|index| inbound_permits[index].clone().acquire_many_owned(7)),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
         let read_only_after_repeated_repair = audit_guild(nodes[0].clone(), &clients[0], false)
             .await
             .unwrap();
@@ -11768,6 +11792,7 @@ mod tests {
                 .unwrap(),
             read_only_after_repeated_repair
         );
+        drop(held_inbound_permits);
 
         let surviving_holders = [0_usize, 1, 3];
         let mut copies = vec![Vec::<(usize, Vec<u8>)>::new(); group.roles.len()];
