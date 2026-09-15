@@ -325,6 +325,8 @@ pub struct P2pEventLoop {
     inbound_results: mpsc::Receiver<InboundResult>,
     inbound_sender: mpsc::Sender<InboundResult>,
     inbound_permits: Arc<Semaphore>,
+    #[cfg(test)]
+    inbound_worker_pause: Arc<Mutex<Option<InboundWorkerPause>>>,
     pending_requests: HashMap<request_response::OutboundRequestId, PendingRequest>,
     queued_requests: VecDeque<PendingRequest>,
     active_inbound_requests: HashMap<request_response::InboundRequestId, PeerId>,
@@ -533,6 +535,13 @@ struct InboundResult {
     request_id: request_response::InboundRequestId,
     channel: request_response::ResponseChannel<SignedRecord<PeerResponseEnvelope>>,
     response: Result<SignedRecord<PeerResponseEnvelope>>,
+    permit: OwnedSemaphorePermit,
+}
+
+#[cfg(test)]
+struct InboundWorkerPause {
+    reached: oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 struct LearnedAddresses {
@@ -1510,6 +1519,8 @@ pub fn build_p2p_with_tor(
             inbound_results,
             inbound_sender,
             inbound_permits: Arc::new(Semaphore::new(config.max_connections)),
+            #[cfg(test)]
+            inbound_worker_pause: Arc::new(Mutex::new(None)),
             pending_requests: HashMap::new(),
             queued_requests: VecDeque::new(),
             active_inbound_requests: HashMap::new(),
@@ -2842,27 +2853,40 @@ impl P2pEventLoop {
                     self.cancel_request(cancellation_id);
                 }
                 Some(result) = self.inbound_results.recv() => {
-                    match result.response {
+                    let InboundResult {
+                        peer,
+                        path,
+                        request_id,
+                        channel,
+                        response,
+                        permit,
+                    } = result;
+                    // A completed request no longer consumes worker capacity.
+                    // Release it before the response becomes observable so a
+                    // caller's next sequential request cannot be rejected as
+                    // concurrent with work that has already finished.
+                    drop(permit);
+                    match response {
                         Ok(response) => {
                             let response_bytes = cbor_wire_len(&response).ok();
                             if self
                                 .swarm
                                 .behaviour_mut()
                                 .peer
-                                .send_response(result.channel, response)
+                                .send_response(channel, response)
                                 .is_err()
                             {
-                                self.active_inbound_requests.remove(&result.request_id);
+                                self.active_inbound_requests.remove(&request_id);
                                 tracing::warn!("peer disconnected before its response was ready");
                             } else if let Some(response_bytes) = response_bytes {
                                 self.pending_response_bytes.insert(
-                                    result.request_id,
-                                    (result.peer, result.path, response_bytes),
+                                    request_id,
+                                    (peer, path, response_bytes),
                                 );
                             }
                         }
                         Err(error) => {
-                            self.active_inbound_requests.remove(&result.request_id);
+                            self.active_inbound_requests.remove(&request_id);
                             tracing::warn!(%error, "peer request worker failed");
                         }
                     }
@@ -4428,8 +4452,13 @@ impl P2pEventLoop {
                             }
                         };
                         self.active_inbound_requests.insert(request_id, peer);
+                        #[cfg(test)]
+                        let worker_pause = self
+                            .inbound_worker_pause
+                            .lock()
+                            .expect("inbound worker pause lock is poisoned")
+                            .take();
                         tokio::task::spawn_blocking(move || {
-                            let _permit = permit;
                             let response = process_peer_request(service, &config, request);
                             let _ = sender.blocking_send(InboundResult {
                                 peer,
@@ -4437,7 +4466,13 @@ impl P2pEventLoop {
                                 request_id,
                                 channel,
                                 response,
+                                permit,
                             });
+                            #[cfg(test)]
+                            if let Some(worker_pause) = worker_pause {
+                                let _ = worker_pause.reached.send(());
+                                let _ = worker_pause.release.recv();
+                            }
                         });
                     }
                     request_response::Message::Response {
@@ -11376,12 +11411,14 @@ mod tests {
         let mut clients = Vec::new();
         let mut tasks = Vec::new();
         let mut inbound_permits = Vec::new();
+        let mut inbound_worker_pauses = Vec::new();
         for (index, seed) in seeds.iter().cloned().enumerate() {
             let node = Node::open(temp.path().join(format!("node-{index}")), seed).unwrap();
             let node_id = node.keys().node_id();
             let node = Arc::new(Mutex::new(node));
             let (client, event_loop) = build_p2p(node.clone(), config(node_id)).unwrap();
             inbound_permits.push(event_loop.inbound_permits.clone());
+            inbound_worker_pauses.push(event_loop.inbound_worker_pause.clone());
             nodes.push(node);
             clients.push(client);
             tasks.push(tokio::spawn(event_loop.run()));
@@ -11776,9 +11813,30 @@ mod tests {
         .into_iter()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
+        // Keep each remote holder's first completed worker alive after it has
+        // queued its response. Response visibility must release that worker's
+        // final permit before the audit sends its next sequential probe.
+        let mut paused_workers_reached = Vec::new();
+        let mut paused_worker_releases = Vec::new();
+        for index in [1_usize, 3] {
+            let (reached, reached_receiver) = oneshot::channel();
+            let (release, release_receiver) = std::sync::mpsc::channel();
+            *inbound_worker_pauses[index].lock().unwrap() = Some(InboundWorkerPause {
+                reached,
+                release: release_receiver,
+            });
+            paused_workers_reached.push(reached_receiver);
+            paused_worker_releases.push(release);
+        }
         let read_only_after_repeated_repair = audit_guild(nodes[0].clone(), &clients[0], false)
             .await
             .unwrap();
+        for reached in futures::future::join_all(paused_workers_reached).await {
+            reached.expect("remote worker did not pause after queueing its response");
+        }
+        for release in paused_worker_releases {
+            release.send(()).unwrap();
+        }
         assert_eq!(
             read_only_after_repeated_repair.state,
             crate::ProtectionState::Degraded
