@@ -703,6 +703,18 @@ impl StorageVolumes {
                 .store
                 .as_mut()
                 .context("parity receipt volume is offline")?;
+            let reserved = if reserve_headroom {
+                volume.record.headroom_bytes
+            } else {
+                0
+            };
+            let required_physical =
+                physical_write_reservation(object.bytes.len(), acknowledgement.len())
+                    .saturating_add(shared_checkpoint_reservation(control, store)?);
+            let available = fs2::available_space(&volume.record.path)?;
+            if required_physical > available.saturating_sub(reserved) {
+                return Err(DatabaseError::CapacityExceeded.into());
+            }
             store.stage_and_publish_ack(object, acknowledgement, volume.record.budget_bytes)?;
             return Ok(receipt);
         }
@@ -717,7 +729,8 @@ impl StorageVolumes {
                 if volume.record.state != StorageVolumeState::Online {
                     return None;
                 }
-                let used = volume.store.as_ref()?.used_bytes().ok()?;
+                let store = volume.store.as_ref()?;
+                let used = store.used_bytes().ok()?;
                 let reserved = if reserve_headroom {
                     volume.record.headroom_bytes
                 } else {
@@ -725,6 +738,8 @@ impl StorageVolumes {
                 };
                 let writable = volume.record.budget_bytes.saturating_sub(reserved);
                 let available = fs2::available_space(&volume.record.path).ok()?;
+                let required_physical = required_physical
+                    .saturating_add(shared_checkpoint_reservation(control, store).ok()?);
                 (used.saturating_add(required) <= writable
                     && required_physical <= available.saturating_sub(reserved))
                 .then_some((*id, used))
@@ -1386,6 +1401,14 @@ fn physical_write_reservation(payload_bytes: usize, acknowledgement_bytes: usize
         .saturating_mul(DATABASE_PAGE_BYTES)
         .saturating_mul(3)
         .saturating_add(PHYSICAL_WRITE_FIXED_RESERVE)
+}
+
+fn shared_checkpoint_reservation(control: &ControlStore, parity: &ParityStore) -> Result<u64> {
+    let mut reservation = parity.checkpoint_reservation_bytes()?;
+    if fs::metadata(control.path())?.dev() == fs::metadata(parity.path())?.dev() {
+        reservation = reservation.saturating_add(control.checkpoint_reservation_bytes()?);
+    }
+    Ok(reservation)
 }
 
 fn volume_database_id(volume_id: Uuid) -> Vec<u8> {
@@ -2461,7 +2484,7 @@ mod tests {
         let run_root = TempDir::new_in(test_root).unwrap();
         let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([95; 32])));
         let acknowledgement = b"shared-filesystem-ack";
-        let (control, _) = open_control_store(run_root.path(), &keys).unwrap();
+        let (control, control_database_key) = open_control_store(run_root.path(), &keys).unwrap();
         let mut volumes = StorageVolumes::open(run_root.path(), keys, &control).unwrap();
         let volume_id = volumes
             .statuses()
@@ -2470,6 +2493,33 @@ mod tests {
             .find(|status| status.path == run_root.path().canonicalize().unwrap())
             .unwrap()
             .volume_id;
+        let (parity_path, parity_database_key) = {
+            let volume = volumes.volumes.get(&volume_id).unwrap();
+            (
+                volume.store.as_ref().unwrap().path().to_path_buf(),
+                volume.database_key,
+            )
+        };
+        let control_reader =
+            ControlStore::open_with_key(control.path(), &control_database_key).unwrap();
+        let parity_reader = ParityStore::open_existing_with_key(
+            &parity_path,
+            volume_id.as_bytes(),
+            &parity_database_key,
+        )
+        .unwrap();
+        control_reader
+            .database_shell_statement("BEGIN", false)
+            .unwrap();
+        control_reader
+            .database_shell_statement("SELECT count(*) FROM protocol_records", false)
+            .unwrap();
+        parity_reader
+            .database_shell_statement("BEGIN", false)
+            .unwrap();
+        parity_reader
+            .database_shell_statement("SELECT count(*) FROM parity_objects", false)
+            .unwrap();
         for marker in 100_u8..180 {
             volumes
                 .store(
@@ -2481,12 +2531,41 @@ mod tests {
         }
         let object = parity_object(180, 4);
         let reservation = physical_write_reservation(object.bytes.len(), acknowledgement.len());
+        let checkpoint_reservation = shared_checkpoint_reservation(
+            &control,
+            volumes
+                .volumes
+                .get(&volume_id)
+                .unwrap()
+                .store
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(checkpoint_reservation > (V1_SECTOR_SIZE * 40) as u64);
         let available_before = fs2::available_space(run_root.path()).unwrap();
-        assert!(available_before > reservation);
-        let headroom = available_before - reservation;
+        let required = reservation.saturating_add(checkpoint_reservation);
+        assert!(available_before > required);
         let volume = volumes.volumes.get_mut(&volume_id).unwrap();
         volume.record.budget_bytes = u64::MAX;
+        volume.record.headroom_bytes = available_before - reservation;
+        assert!(matches!(
+            volumes.store(&control, &object, acknowledgement),
+            Err(error) if matches!(
+                error.downcast_ref::<DatabaseError>(),
+                Some(DatabaseError::CapacityExceeded)
+            )
+        ));
+
+        let headroom = available_before - required;
+        let volume = volumes.volumes.get_mut(&volume_id).unwrap();
         volume.record.headroom_bytes = headroom;
+        control_reader
+            .database_shell_statement("COMMIT", false)
+            .unwrap();
+        parity_reader
+            .database_shell_statement("COMMIT", false)
+            .unwrap();
 
         let receipt = volumes.store(&control, &object, acknowledgement).unwrap();
 
@@ -2496,7 +2575,7 @@ mod tests {
             available_after >= headroom,
             "physical write consumed {} bytes beyond its {}-byte reservation",
             headroom.saturating_sub(available_after),
-            reservation,
+            required,
         );
     }
 

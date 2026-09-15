@@ -72,6 +72,10 @@ impl ControlStore {
         &self.path
     }
 
+    pub fn checkpoint_reservation_bytes(&self) -> Result<u64, DatabaseError> {
+        wal_checkpoint_reservation_bytes(&self.path)
+    }
+
     pub fn rekey(self, database_key: &[u8; 32]) -> Result<(), DatabaseError> {
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -1239,6 +1243,10 @@ impl ParityStore {
         &self.path
     }
 
+    pub fn checkpoint_reservation_bytes(&self) -> Result<u64, DatabaseError> {
+        wal_checkpoint_reservation_bytes(&self.path)
+    }
+
     pub fn rekey(self, database_key: &[u8; 32]) -> Result<(), DatabaseError> {
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -2293,6 +2301,16 @@ fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
 #[cfg(not(unix))]
 fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
     metadata.len()
+}
+
+fn wal_checkpoint_reservation_bytes(path: &Path) -> Result<u64, DatabaseError> {
+    let mut wal_path = path.as_os_str().to_os_string();
+    wal_path.push("-wal");
+    match fs::metadata(PathBuf::from(wal_path)) {
+        Ok(metadata) => Ok(metadata.len().max(allocated_file_bytes(&metadata))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn database_shell_statement(
@@ -3554,6 +3572,64 @@ mod tests {
                 wal_path.display()
             );
         }
+    }
+
+    #[test]
+    fn checkpoint_reservation_survives_a_reader_stall_and_old_threshold_reopen() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("parity.db");
+        let volume_id = [123; 16];
+        let database_key = [124; 32];
+        let mut writer = ParityStore::open_with_key(&path, &volume_id, &database_key).unwrap();
+        let reader = ParityStore::open_existing_with_key(&path, &volume_id, &database_key).unwrap();
+        reader.connection.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .connection
+            .query_row("SELECT count(*) FROM parity_objects", [], |row| row.get(0))
+            .unwrap();
+        writer
+            .connection
+            .pragma_update(None, "wal_autocheckpoint", 1_000)
+            .unwrap();
+
+        for marker in 125_u8..185 {
+            let bytes = vec![marker; V1_SECTOR_SIZE];
+            writer
+                .stage_and_publish(&ParityObject {
+                    format_version: 1,
+                    guild_id: [186; 32],
+                    group_id: [marker; 32],
+                    shard_index: marker % 5,
+                    root: sector_root(&bytes),
+                    bytes,
+                })
+                .unwrap();
+        }
+        let stalled_reservation = writer.checkpoint_reservation_bytes().unwrap();
+        assert!(stalled_reservation > (V1_SECTOR_SIZE * 40) as u64);
+        drop(writer);
+
+        let mut reopened =
+            ParityStore::open_existing_with_key(&path, &volume_id, &database_key).unwrap();
+        let threshold: u32 = reopened
+            .connection
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(threshold, 1);
+        assert!(reopened.checkpoint_reservation_bytes().unwrap() >= stalled_reservation);
+
+        reader.connection.execute_batch("COMMIT").unwrap();
+        let bytes = vec![187; V1_SECTOR_SIZE];
+        reopened
+            .stage_and_publish(&ParityObject {
+                format_version: 1,
+                guild_id: [186; 32],
+                group_id: [187; 32],
+                shard_index: 2,
+                root: sector_root(&bytes),
+                bytes,
+            })
+            .unwrap();
     }
 
     #[test]
