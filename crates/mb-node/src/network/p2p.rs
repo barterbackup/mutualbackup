@@ -6159,10 +6159,19 @@ pub async fn audit_guild(
         let mut assigned_available = vec![false; group.roles.len()];
         let mut shard_locations = vec![BTreeSet::new(); group.roles.len()];
         let mut emergency_hosts = BTreeSet::new();
+        let mut assigned_probes = Vec::with_capacity(group.roles.len());
         for (index, role) in group.roles.iter().enumerate() {
             let (holder, expected_root) = shard_holder_and_root(role);
-            let assigned =
-                fetch_audit_shard(node.clone(), p2p, local_id, holder, group, index, false).await;
+            let probe_node = node.clone();
+            assigned_probes.push(async move {
+                let result =
+                    fetch_audit_shard(probe_node, p2p, local_id, holder, group, index, false).await;
+                (index, holder, expected_root, result)
+            });
+        }
+        for (index, holder, expected_root, assigned) in
+            futures::future::join_all(assigned_probes).await
+        {
             if let Ok(bytes) = assigned
                 && bytes.len() == group.shard_size as usize
                 && sector_root(&bytes) == expected_root
@@ -6170,31 +6179,47 @@ pub async fn audit_guild(
                 assigned_available[index] = true;
                 shard_locations[index].insert(holder);
                 shards[index] = Some(bytes);
-                continue;
+            } else {
+                report.assigned_shards_unavailable += 1;
+                if report.issues.len() < 256 {
+                    report.issues.push(format!(
+                        "group {} shard {index} unavailable from assigned holder {holder}",
+                        hex::encode(group.id)
+                    ));
+                }
             }
-            report.assigned_shards_unavailable += 1;
-            if report.issues.len() < 256 {
-                report.issues.push(format!(
-                    "group {} shard {index} unavailable from assigned holder {holder}",
-                    hex::encode(group.id)
-                ));
-            }
-            for alternate in roster
-                .iter()
-                .map(|peer| peer.member.node_id)
-                .filter(|alternate| *alternate != holder)
-            {
-                let candidate =
-                    fetch_audit_shard(node.clone(), p2p, local_id, alternate, group, index, true)
+        }
+        if assigned_available.iter().any(|available| !available) {
+            let mut emergency_probes = Vec::with_capacity(group.roles.len() * roster.len());
+            for (index, role) in group.roles.iter().enumerate() {
+                let (assigned_holder, expected_root) = shard_holder_and_root(role);
+                for alternate in roster
+                    .iter()
+                    .map(|peer| peer.member.node_id)
+                    .filter(|alternate| *alternate != assigned_holder)
+                {
+                    let probe_node = node.clone();
+                    emergency_probes.push(async move {
+                        let result = fetch_audit_shard(
+                            probe_node, p2p, local_id, alternate, group, index, true,
+                        )
                         .await;
+                        (index, alternate, expected_root, result)
+                    });
+                }
+            }
+            for (index, alternate, expected_root, candidate) in
+                futures::future::join_all(emergency_probes).await
+            {
                 if let Ok(bytes) = candidate
                     && bytes.len() == group.shard_size as usize
                     && sector_root(&bytes) == expected_root
                 {
                     shard_locations[index].insert(alternate);
                     emergency_hosts.insert(alternate);
-                    shards[index] = Some(bytes);
-                    break;
+                    if shards[index].is_none() {
+                        shards[index] = Some(bytes);
+                    }
                 }
             }
         }
@@ -6260,7 +6285,9 @@ pub async fn audit_guild(
                 let mut alternates = roster
                     .iter()
                     .map(|peer| peer.member.node_id)
-                    .filter(|candidate| *candidate != assigned_holder)
+                    .filter(|candidate| {
+                        *candidate != assigned_holder && !shard_locations[index].contains(candidate)
+                    })
                     .collect::<Vec<_>>();
                 alternates
                     .sort_by_key(|candidate| (emergency_hosts.contains(candidate), *candidate));
@@ -6314,7 +6341,10 @@ pub async fn audit_guild(
             })
             .await?;
         }
-        let available = shards.iter().filter(|shard| shard.is_some()).count();
+        let available = shard_locations
+            .iter()
+            .filter(|locations| !locations.is_empty())
+            .count();
         let available_after_host_loss = minimum_shards_after_single_host_loss(&shard_locations);
         let group_state = if assigned_available.iter().all(|available| *available) {
             crate::ProtectionState::Healthy
@@ -11697,6 +11727,47 @@ mod tests {
             .unwrap();
         assert_eq!(two_holder_outage.state, crate::ProtectionState::Degraded);
         assert!(two_holder_outage.emergency_copies_created >= 1);
+        let repeated_repair = audit_guild(nodes[0].clone(), &clients[0], true)
+            .await
+            .unwrap();
+        assert_eq!(repeated_repair.state, crate::ProtectionState::Degraded);
+        // Make the repeated-repair layout deterministic: the lowest surviving
+        // node has both missing indices, while the other two nodes each have
+        // one of them. Looking only at the first copy reports Emergency even
+        // though the complete layout survives the loss of any survivor.
+        let mut ordered_survivors = [0_usize, 1, 3];
+        ordered_survivors.sort_by_key(|index| nodes[*index].lock().unwrap().keys().node_id());
+        let audit_checkpoint_hash = advanced.hash().unwrap();
+        for holder in [ordered_survivors[0], ordered_survivors[1]] {
+            nodes[holder]
+                .lock()
+                .unwrap()
+                .install_repaired_shard(audit_checkpoint_hash, group.id, 2, &encoded[2], true)
+                .unwrap();
+        }
+        for holder in [ordered_survivors[0], ordered_survivors[2]] {
+            nodes[holder]
+                .lock()
+                .unwrap()
+                .install_repaired_shard(audit_checkpoint_hash, group.id, 4, &encoded[4], true)
+                .unwrap();
+        }
+        let read_only_after_repeated_repair = audit_guild(nodes[0].clone(), &clients[0], false)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_only_after_repeated_repair.state,
+            crate::ProtectionState::Degraded
+        );
+        assert_eq!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .last_guild_audit()
+                .unwrap()
+                .unwrap(),
+            read_only_after_repeated_repair
+        );
 
         let surviving_holders = [0_usize, 1, 3];
         let mut copies = vec![Vec::<(usize, Vec<u8>)>::new(); group.roles.len()];
@@ -11764,6 +11835,14 @@ mod tests {
         for task in tasks {
             task.await.unwrap().unwrap();
         }
+        drop(clients);
+        drop(nodes);
+
+        let reopened = Node::open(temp.path().join("node-0"), seeds[0].clone()).unwrap();
+        assert_eq!(
+            reopened.last_guild_audit().unwrap().unwrap().state,
+            crate::ProtectionState::Degraded
+        );
     }
 
     #[tokio::test]
