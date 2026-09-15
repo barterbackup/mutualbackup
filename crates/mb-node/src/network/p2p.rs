@@ -6157,6 +6157,8 @@ pub async fn audit_guild(
         report.checked_groups += 1;
         let mut shards = vec![None; group.roles.len()];
         let mut assigned_available = vec![false; group.roles.len()];
+        let mut shard_locations = vec![BTreeSet::new(); group.roles.len()];
+        let mut emergency_hosts = BTreeSet::new();
         for (index, role) in group.roles.iter().enumerate() {
             let (holder, expected_root) = shard_holder_and_root(role);
             let assigned =
@@ -6166,6 +6168,7 @@ pub async fn audit_guild(
                 && sector_root(&bytes) == expected_root
             {
                 assigned_available[index] = true;
+                shard_locations[index].insert(holder);
                 shards[index] = Some(bytes);
                 continue;
             }
@@ -6188,6 +6191,8 @@ pub async fn audit_guild(
                     && bytes.len() == group.shard_size as usize
                     && sector_root(&bytes) == expected_root
                 {
+                    shard_locations[index].insert(alternate);
+                    emergency_hosts.insert(alternate);
                     shards[index] = Some(bytes);
                     break;
                 }
@@ -6247,6 +6252,7 @@ pub async fn audit_guild(
                 };
                 if assigned_repair.is_ok() {
                     assigned_available[index] = true;
+                    shard_locations[index].insert(assigned_holder);
                     shards[index] = Some(bytes);
                     report.assigned_shards_repaired += 1;
                     continue;
@@ -6256,7 +6262,8 @@ pub async fn audit_guild(
                     .map(|peer| peer.member.node_id)
                     .filter(|candidate| *candidate != assigned_holder)
                     .collect::<Vec<_>>();
-                alternates.sort();
+                alternates
+                    .sort_by_key(|candidate| (emergency_hosts.contains(candidate), *candidate));
                 let mut stored = false;
                 for alternate in alternates {
                     let result = if alternate == local_id {
@@ -6288,6 +6295,8 @@ pub async fn audit_guild(
                         .await
                     };
                     if result.is_ok() {
+                        shard_locations[index].insert(alternate);
+                        emergency_hosts.insert(alternate);
                         stored = true;
                         break;
                     }
@@ -6306,11 +6315,20 @@ pub async fn audit_guild(
             .await?;
         }
         let available = shards.iter().filter(|shard| shard.is_some()).count();
+        let available_after_host_loss = minimum_shards_after_single_host_loss(&shard_locations);
         let group_state = if assigned_available.iter().all(|available| *available) {
             crate::ProtectionState::Healthy
-        } else if available >= 4 {
+        } else if available >= 4 && available_after_host_loss >= usize::from(V1_RS_DATA_SHARDS) {
             crate::ProtectionState::Degraded
         } else if available == usize::from(V1_RS_DATA_SHARDS) {
+            crate::ProtectionState::Emergency
+        } else if available >= usize::from(V1_RS_DATA_SHARDS) {
+            if report.issues.len() < 256 {
+                report.issues.push(format!(
+                    "group {} has {available} shards but a surviving host loss leaves only {available_after_host_loss}",
+                    hex::encode(group.id)
+                ));
+            }
             crate::ProtectionState::Emergency
         } else {
             crate::ProtectionState::Unrecoverable
@@ -6320,6 +6338,23 @@ pub async fn audit_guild(
     let durable_report = report.clone();
     node_blocking(node, move |node| node.record_guild_audit(&durable_report)).await?;
     Ok(report)
+}
+
+fn minimum_shards_after_single_host_loss(locations: &[BTreeSet<NodeId>]) -> usize {
+    let hosts = locations
+        .iter()
+        .flat_map(|locations| locations.iter().copied())
+        .collect::<BTreeSet<_>>();
+    hosts
+        .iter()
+        .map(|failed| {
+            locations
+                .iter()
+                .filter(|locations| locations.iter().any(|holder| holder != failed))
+                .count()
+        })
+        .min()
+        .unwrap_or(0)
 }
 
 fn shard_holder_and_root(role: &ShardRole) -> (NodeId, [u8; 32]) {
@@ -11541,7 +11576,7 @@ mod tests {
         let after_one_more_loss = audit_guild(nodes[0].clone(), &clients[0], false)
             .await
             .unwrap();
-        assert_eq!(after_one_more_loss.state, crate::ProtectionState::Degraded);
+        assert_eq!(after_one_more_loss.state, crate::ProtectionState::Emergency);
         nodes[2]
             .lock()
             .unwrap()
@@ -11655,8 +11690,74 @@ mod tests {
             1
         );
 
+        let offline_parity_holder = 4;
+        clients[offline_parity_holder].shutdown().await.unwrap();
+        let two_holder_outage = audit_guild(nodes[0].clone(), &clients[0], true)
+            .await
+            .unwrap();
+        assert_eq!(two_holder_outage.state, crate::ProtectionState::Degraded);
+        assert!(two_holder_outage.emergency_copies_created >= 1);
+
+        let surviving_holders = [0_usize, 1, 3];
+        let mut copies = vec![Vec::<(usize, Vec<u8>)>::new(); group.roles.len()];
+        for (shard_index, shard_copies) in copies.iter_mut().enumerate() {
+            let assigned_holder = shard_index;
+            if surviving_holders.contains(&assigned_holder) {
+                let bytes = nodes[assigned_holder]
+                    .lock()
+                    .unwrap()
+                    .local_assigned_shard(&group, shard_index)
+                    .unwrap();
+                shard_copies.push((assigned_holder, bytes));
+            }
+            for holder in surviving_holders {
+                if holder == assigned_holder {
+                    continue;
+                }
+                if let Ok(bytes) = nodes[holder].lock().unwrap().parity_for_guild(
+                    &guild_id,
+                    &group.id,
+                    shard_index as u8,
+                ) {
+                    shard_copies.push((holder, bytes));
+                }
+            }
+        }
+        let emergency_hosts = copies[2]
+            .iter()
+            .chain(&copies[4])
+            .map(|(holder, _)| *holder)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            emergency_hosts.len() >= 2,
+            "both emergency shards were concentrated on one surviving host"
+        );
+        for failed_holder in surviving_holders {
+            let mut remaining = copies
+                .iter()
+                .map(|shard_copies| {
+                    shard_copies
+                        .iter()
+                        .find(|(holder, _)| *holder != failed_holder)
+                        .map(|(_, bytes)| bytes.clone())
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                remaining.iter().filter(|shard| shard.is_some()).count()
+                    >= usize::from(V1_RS_DATA_SHARDS)
+            );
+            mb_core::reconstruct_3_2(&mut remaining).unwrap();
+            assert_eq!(
+                remaining
+                    .into_iter()
+                    .map(Option::unwrap)
+                    .collect::<Vec<_>>(),
+                encoded
+            );
+        }
+
         for (index, client) in clients.iter().enumerate() {
-            if index != offline_information_holder {
+            if index != offline_information_holder && index != offline_parity_holder {
                 client.shutdown().await.unwrap();
             }
         }
