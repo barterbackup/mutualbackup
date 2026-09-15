@@ -56,15 +56,16 @@ them as ADRs and test vectors before promising wire compatibility.
   checkpoints. Leave a compatible authorization interface for later quorum
   policies and FROST once membership and recovery policy are stable.
 
-### Implemented baseline — connectivity and durable operations beta
+### Implemented baseline — connectivity beta; durable operations reopened
 
 The first usable architectural prototype and the Milestone 2
 operator-configuration and identity-state slice have passed their review gates.
-The Milestone 3 robust-connectivity beta and Milestone 4 durable-operations and
-multi-volume-storage beta have passed their closure gates. Milestone 4 provides
-automatic backup, writer fencing, retention/GC, independently encrypted volume
-databases, audits, repair, emergency copies, and protection status. Milestone 5
-is the next development milestone.
+The Milestone 3 robust-connectivity beta passed its closure gate. Milestone 4
+implements automatic backup, writer fencing, retention/GC, independently
+encrypted volume databases, audits, repair, emergency copies, and protection
+status, but source review of `e663c49..8411f7d` on 2026-09-15 reopened its
+completion claim. Resolve M4-15 through M4-27 in `TODO.md` and pass the new
+correction gate before advancing to Milestone 5.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -471,10 +472,10 @@ machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
 than a daemon prerequisite. Milestones 0 through 3 have passed; Milestone 4 is
-reopened for the completion blockers in `TODO.md`. Milestone 5 follows its
-successful correction gate. Later wire or durable-state changes require the
-review and gate of the milestone that owns them. Build and run all subsequent
-validation locally; do not use a remote compilation server.
+reopened for the follow-up blockers M4-15 through M4-27 in `TODO.md`. Milestone 5
+follows its successful correction gate. Later wire or durable-state changes
+require the review and gate of the milestone that owns them. Build and run all
+subsequent validation locally; do not use a remote compilation server.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -687,8 +688,9 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 4 are passed. Milestone 5 is the next
-development milestone. Milestone 4 implements quiet-period
+**Current position:** Milestones 0 through 3 are passed. Milestone 4 is reopened
+after the 2026-09-15 source review; Milestone 5 follows its correction gate.
+Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer
 fencing, certified retention/tombstones
 and delayed GC, independently keyed multi-volume parity storage, drain and
@@ -732,19 +734,38 @@ schedules. Guild geometry and coding-protocol changes remain Milestone 5.
 
 Source review of `7b1114a..b8ffc90` on 2026-09-14 reopened Milestone 4 with the
 M4-01 through M4-14 findings recorded in `TODO.md`. Commits `d1857b5` through
-`83ebf83` close those findings across seed recovery and GC, writer fencing,
-automatic-scan durability, capture generations, emergency-copy use and cleanup,
+`83ebf83` addressed the reviewed paths across seed recovery and GC, writer
+fencing, automatic-scan durability, capture generations, emergency-copy use and cleanup,
 corruption isolation, live volume readers, established-database loss, repair
 migration, exact-capacity resume, durable retirement, bounded metadata access,
 physical headroom/reclaim, and verified SQLCipher rekey.
 
-The exact corrected source tree passed locked workspace tests, warning-free
+The corrected source tree passed locked workspace tests, warning-free
 workspace Clippy, and the complete local disposable-Btrfs/reflink gate on
 2026-09-14. That gate exercised capture interruptions, generation-2 seed
 recovery over QUIC, close/reopen and GC, and real five-daemon seed-and-DHT
-recovery after source loss. Focused tests cover the remaining storage failure
-schedules, and the correction series also passed Docker-controller safety and
-real NAT-PMP lifecycle gates. No remote compilation server was used.
+recovery after source loss. That pass included focused storage failure tests,
+and the correction series also passed Docker-controller safety and real NAT-PMP
+lifecycle gates. No remote compilation server was used.
+
+The follow-up source review of `e663c49..8411f7d` on 2026-09-15 found remaining
+completion blockers. Unrelated checkpoint progress permanently fences pending
+writers, and version-1 capture intents cannot be reopened after the encoding
+change. Corrupt pending writes and corrupt retired shards can prevent startup.
+Discovering a known volume UUID at a new path bypasses established-database
+loss detection and retirement. Long Unicode scan errors can panic the daemon.
+Emergency classification can be lost between commits; GC forgets migration
+duplicates; and a returned original volume cannot drain into its repaired copy
+when acknowledgement forms differ. Failed-volume status still propagates
+metadata errors. Physical admission undercounts database/WAL growth, incremental
+vacuum is not stepped to completion, and fresh initialization cannot resume
+after committing an empty database before its schema.
+
+`TODO.md` records M4-15 through M4-27 with source locations, failure schedules,
+and required regressions. This review performed no builds, tests, or runtime
+probes. The earlier passing gates remain evidence for their exercised cases;
+they do not close the newly identified combinations. Finish these corrections
+and their local gate before marking Milestone 4 passed again.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
 
@@ -951,12 +972,13 @@ artifact check. The unchanged disposable-Btrfs, isolated-network, private-Tor,
 and Docker gates had passed against its immediate precursor. No remote
 compilation server was used.
 
-### Milestone 4 — durable operations and multi-volume storage beta (passed)
+### Milestone 4 — durable operations and multi-volume storage beta (reopened)
 
-Implemented after the Milestone 3 gate. Source review of `7b1114a..b8ffc90`
-reopened the closure claimed in `b8ffc90`; commits `d1857b5` through `83ebf83`
-resolved M4-01 through M4-14, and the local correction gate passed on
-2026-09-14. Milestone 5 now follows this completed gate.
+Implemented after the Milestone 3 gate. Corrections `d1857b5` through `83ebf83`
+addressed the initial review and passed the recorded local gate on 2026-09-14.
+Source review of `e663c49..8411f7d` on 2026-09-15 reopened completion with
+M4-15 through M4-27. Close those findings and run the new local correction gate
+before advancing to Milestone 5.
 
 - Add writer-incarnation fencing before supporting concurrent loss/recovery;
   then add retention and tombstones, safe GC, audits/scrubs, repair and emergency

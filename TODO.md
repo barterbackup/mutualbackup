@@ -1,11 +1,149 @@
 # Product TODO
 
-## Milestone 4 completion blockers (closed)
+## Milestone 4 follow-up source review — reopened 2026-09-15
+
+Source review of `e663c49..8411f7d` found the remaining blockers below. The
+2026-09-14 test results remain historical evidence for the cases they exercised;
+they do not cover these combined failure schedules. This review ran no builds,
+tests, or runtime probes. Close these findings and the correction gate before
+advancing to Milestone 5.
+
+- [ ] **M4-15 / P1 — Preserve an uncommitted writer across unrelated checkpoints.**
+  `writer_incarnation` accepts a pending incarnation only while its original
+  `base_checkpoint` equals the current guild head, then permanently fences it
+  otherwise (`crates/mb-node/src/node.rs:2154`). That base is never updated.
+  If a first capture fails after the writer is persisted, another owner's
+  backup advances the shared checkpoint without changing this owner's fence
+  (`crates/mb-node/src/network/p2p.rs:6960`). Every later local backup fails,
+  including after reopen, although no replacement writer was certified.
+  Distinguish unrelated checkpoint progress from actual supersession. Cover
+  interrupted first capture and recovery takeover, another owner's commit,
+  retry/reopen, and continued rejection of a truly superseded writer.
+- [ ] **M4-16 / P1 — Migrate pending version-1 capture intents.**
+  `CaptureIntent` inserts `captured_change_sequence` into its positional
+  postcard encoding (`crates/mb-node/src/snapshot.rs:226`), while startup
+  decodes only the new shape and requires version 2 (`snapshot.rs:243`). A
+  pending capture written before `d1857b5` cannot be reconciled after upgrade;
+  `Node::open_locked` propagates the error before starting service
+  (`crates/mb-node/src/node.rs:595`). Add an explicit legacy decoder/migration
+  that preserves owned capture cleanup and treats the unknown dirty generation
+  conservatively. Cover upgrade with an interrupted version-1 capture.
+- [ ] **M4-17 / P1 — Isolate corrupt pending writes during startup.**
+  A publication interrupted after READY commit leaves `volume-write-intent`
+  durable (`crates/mb-node/src/volume.rs:671`). If that object's payload is
+  corrupt, the database can still open, but `reconcile` propagates its
+  `load_ready` integrity error (`volume.rs:690`). Startup requires this step
+  to succeed (`crates/mb-node/src/node.rs:597`), so healthy storage and the
+  scrub/repair controls become inaccessible. Quarantine/report the failed
+  volume while retaining reconciliation evidence. Cover interruption after
+  object commit, corruption, healthy replacement, and daemon reopen.
+- [ ] **M4-18 / P1 — Keep corrupt retired shards from blocking GC and startup.**
+  `remove_unreachable` verifies payload bytes before deleting a certified
+  unreachable object and propagates corruption even on a Failed volume
+  (`crates/mb-node/src/volume.rs:537`). Retiring its group and advancing beyond
+  the GC grace period makes checkpoint completion fail at
+  `crates/mb-node/src/node.rs:3179`; every restart repeats GC at `node.rs:609`.
+  Safely delete or defer the corrupt unreachable object using certified
+  identity without making peer/control startup depend on valid obsolete
+  payloads. Cover corruption, retirement, grace-period advance, and reopen.
+- [ ] **M4-19 / P1 — Reconcile relocated volumes by durable UUID before initialization.**
+  A newly configured path enters `initialize_volume` before the existing UUID
+  is checked (`crates/mb-node/src/volume.rs:339`). Its manifest branch resets
+  Online/configured state and creates a missing database (`volume.rs:940`).
+  Moving an absent established volume to a new path therefore bypasses database
+  loss detection while retaining old receipts. Moving a Retired volume also
+  silently reactivates it. Merge the discovered manifest with durable UUID
+  state before any creation or activation. Cover a relocated established
+  manifest with lost database and a relocated completed drain.
+- [ ] **M4-20 / P2 — Bound automatic-backup errors on UTF-8 character boundaries.**
+  The new scan-error handler calls `message.truncate(512)`
+  (`crates/mb-node/src/node.rs:908`). A failing descendant with a long Unicode
+  path can place byte 512 inside a character and panic while holding the Node
+  mutex. The task error propagates through `crates/mb-node/src/automation.rs:127`
+  and terminates the daemon at `cmd/mutualbackup/src/bin/mutualbackupd.rs:151`.
+  Apply character-safe bounds to scan and completion errors; test long Unicode
+  failure paths with persisted blocked/retry status and continued service.
+- [ ] **M4-21 / P2 — Make emergency-copy classification recoverable after interruption.**
+  `install_repaired_shard` commits the payload and volume receipt before
+  separately writing its proof and emergency marker
+  (`crates/mb-node/src/node.rs:2445`). A crash before the marker leaves an
+  emergency information payload that healthy-group cleanup never enumerates
+  (`node.rs:2484`) and retirement never schedules for volume GC (`node.rs:3065`).
+  Volume reconciliation repairs receipts only. Persist/reconcile the repair
+  classification across these commits. Cover interruption before proof/marker,
+  reopen, restored assignments, retirement, and complete space reclamation.
+- [ ] **M4-22 / P2 — Keep GC work until every migration duplicate is collected.**
+  Interruption after migration destination commit leaves both source and
+  destination copies (`crates/mb-node/src/volume.rs:810`). GC deletes only
+  the receipt-selected destination and returns success (`volume.rs:548`),
+  after which its durable candidate is removed
+  (`crates/mb-node/src/node.rs:3199`). The source survives; resuming its drain
+  republishes already-collected data and a receipt with no cleanup candidate.
+  Collect every duplicate or retain per-volume cleanup obligations, including
+  unavailable sources. Cover migration interruption followed by retention/GC,
+  reopen, source return, and resumed drain.
+- [ ] **M4-23 / P2 — Reuse repaired destinations when draining a returned volume.**
+  Replacement repair stores the payload with an empty acknowledgement
+  (`crates/mb-node/src/volume.rs:598`). If the original volume returns and is
+  drained, migration retains the replacement receipt but republishes using the
+  original nonempty acknowledgement (`volume.rs:788`, `volume.rs:805`). The
+  database rejects the valid destination because those bytes differ
+  (`crates/mb-store/src/database.rs:1503`). Reuse the verified destination while
+  preserving repair/publication acknowledgement semantics. Cover source loss,
+  replacement repair, original return, and completed drain at exact capacity.
+- [ ] **M4-24 / P2 — Report failed volumes even when their metadata is unreadable.**
+  Scrub marks a database Failed on a read error but retains its store
+  (`crates/mb-node/src/volume.rs:730`). Status still propagates errors from
+  `used_bytes`, allocation, free-space, and object-count queries
+  (`volume.rs:399`), so an unreadable table page or unavailable filesystem
+  prevents reporting every volume. Return the failed entry with unavailable
+  measurements and its error while preserving healthy entries. Cover metadata
+  corruption after open, beyond the existing payload-only corruption fixture.
+- [ ] **M4-25 / P2 — Reserve physical database growth rather than payload length alone.**
+  Placement compares only `object.bytes.len()` against free space minus
+  headroom (`crates/mb-node/src/volume.rs:621`, `volume.rs:637`). A new 64 KiB
+  object also requires row metadata, encrypted pages, and WAL space
+  (`crates/mb-store/src/database.rs:1740`, `database.rs:2245`). With no reusable
+  pages and free space equal to headroom plus 64 KiB, placement passes but
+  consumes the reserve or fails during publication. Account conservatively for
+  physical database/WAL growth. Cover the actual allocation boundary, including
+  shared-filesystem control work, instead of only headroom exceeding all free
+  space.
+- [ ] **M4-26 / P2 — Step incremental vacuum to completion before reporting reclaim.**
+  Reclaim calls `PRAGMA incremental_vacuum` through `execute_batch`
+  (`crates/mb-store/src/database.rs:1321`, `database.rs:1336`). The pinned
+  rusqlite 0.37 implementation steps each statement once; bundled SQLCipher
+  emits a result row after each vacuumed page. Each call therefore processes
+  at most one page, leaving most of a deleted 64 KiB object's allocation behind.
+  Consume the statement to completion and checkpoint afterward. Verify that
+  reclaim drains the freelist and returns the expected allocation; the current
+  test only checks for any decrease (`database.rs:3567`).
+- [ ] **M4-27 / P2 — Resume fresh-volume initialization after the empty database commit.**
+  Initialization persists the manifest first
+  (`crates/mb-node/src/volume.rs:986`), then commits an empty database via
+  `VACUUM` before starting the application-schema transaction
+  (`crates/mb-store/src/database.rs:1733`). A crash there leaves a manifest and
+  nonempty database without tables. Retry skips creation because the file
+  exists (`volume.rs:952`) and established opening rejects it (`database.rs:1228`),
+  so the configured external volume prevents startup repeatedly. Persist
+  authenticated initialization state distinct from established-data loss. Cover
+  interruption before/after schema and registry commits and restart convergence.
+
+- [ ] **Run a new Milestone 4 correction gate after M4-15 through M4-27.**
+  Add the combined failure and upgrade regressions above, then run the required
+  local workspace and disposable-Btrfs/reflink/network gates. Preserve the
+  generation-2 seed-recovery invariant and verify service availability during
+  source/volume failure. Runtime validation belongs to the subsequent correction
+  task; this review is source-only and makes no new test-pass claim.
+
+## Milestone 4 initial review findings (prior correction record)
 
 Source review of `7b1114a..b8ffc90` on 2026-09-14 reopened Milestone 4.
 The findings below follow source paths and durable-state transitions; no builds,
 tests, or runtime probes were performed for that review. The corrections in
-`d1857b5` through `83ebf83` close every finding and the local correction gate.
+`d1857b5` through `83ebf83` were marked complete and passed the recorded local
+gate. The follow-up findings above identify remaining cases in that corrected
+implementation; Milestone 4 is reopened until they are resolved.
 
 - [x] **M4-01 / P1 — Allow seed recovery without historical checkpoints.**
   Recovery downloads the selected head, but `reconcile_garbage_collection`
