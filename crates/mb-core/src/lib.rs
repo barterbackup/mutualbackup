@@ -4,6 +4,7 @@
 //! database work. The async runtime surrounds these synchronous state and
 //! cryptographic operations.
 
+mod attempt;
 mod coding;
 mod content;
 mod keys;
@@ -11,6 +12,14 @@ mod model;
 mod range;
 mod recovery;
 
+pub use attempt::{
+    CODING_ATTEMPT_PLAN_DOMAIN, CODING_CHALLENGE_COMMITMENT_DOMAIN, CODING_CHALLENGE_REVEAL_DOMAIN,
+    CODING_ROOT_MANIFEST_DOMAIN, CODING_SHARD_OPENING_DOMAIN, CODING_TRANSCRIPT_DOMAIN,
+    CodingAttemptError, CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal,
+    CodingReplayFinding, CodingRootManifest, CodingShardOpening, CodingVerificationTranscript,
+    STAGED_STORAGE_RECEIPT_DOMAIN, StagedStorageReceipt, coding_challenge,
+    coding_challenge_commitment, coding_evidence_hash, replay_coding_transcript,
+};
 pub use coding::{
     CodingError, CodingProfile, MAX_CODING_SHARDS, MAX_PROFILE_SHARD_SIZE, MIN_PROFILE_SHARD_SIZE,
     ReedSolomonConstruction, encode, encode_3_2, reconstruct, reconstruct_3_2, verify_codeword,
