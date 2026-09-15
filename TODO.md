@@ -241,7 +241,7 @@ The findings below follow source paths and durable-state transitions; no builds,
 tests, or runtime probes were performed for that review. The corrections in
 `d1857b5` through `83ebf83` were marked complete and passed the recorded local
 gate. The follow-up findings above identify remaining cases in that corrected
-implementation; Milestone 4 is reopened until they are resolved.
+implementation; Milestone 4 was reopened until they were resolved.
 
 - [x] **M4-01 / P1 — Allow seed recovery without historical checkpoints.**
   Recovery downloads the selected head, but `reconcile_garbage_collection`
