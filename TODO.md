@@ -1,6 +1,94 @@
 # Product TODO
 
-## Milestone 4 follow-up source review — corrected 2026-09-15
+## Milestone 4 correction review — reopened 2026-09-15
+
+Source review of `8411f7d..2da3e82` found the blockers below in the correction
+and its Milestone 4 integration. M4-29 also checks the existing emergency
+placement against the milestone's outage-layout requirement. Earlier passing
+gates remain historical evidence for their exercised cases; they do not close
+these failure schedules. This review ran no builds, tests, or runtime probes.
+Resolve M4-28 through M4-33 and the new correction gate before Milestone 5.
+
+- [ ] **M4-28 / P1 — Resume legacy parity rekey after manifest publication.**
+  The new manifest-present initialization branch opens only with the wrapped
+  random key (`crates/mb-node/src/volume.rs:1124`). Legacy migration publishes
+  that manifest before rekeying the existing database (`volume.rs:1151`,
+  `volume.rs:1171`), and the control registry is saved only after initialization
+  returns (`volume.rs:192`). An interruption between manifest publication and
+  rekey leaves a valid old-key database and no registry. Restart now fails in
+  initialization before reaching the legacy-key fallback at `volume.rs:1211`,
+  preventing node startup (`crates/mb-node/src/node.rs:596`). Preserve recovery
+  through both authenticated key states without recreating lost established
+  databases. Cover a nonempty legacy database, interruption before/after rekey
+  and registry publication, and successful reopen with unchanged objects.
+- [ ] **M4-29 / P1 — Place emergency copies across surviving failure domains.**
+  Each missing shard starts with the same sorted alternate roster and stops
+  at the first successful store (`crates/mb-node/src/network/p2p.rs:6254`,
+  `p2p.rs:6292`). With holders D/E unavailable and A/B/C holding indices 0/1/2,
+  both reconstructed indices 3/4 can land on lowest-ID A. The audit then
+  reports Degraded by counting distinct shard indices (`p2p.rs:6308`), but
+  losing A leaves only indices 1/2. Distributing the two copies across A/B
+  would preserve three after any further single surviving-host loss. Track
+  actual copy locations and failure domains during placement and protection
+  reporting, consistent with the fixed-profile outage requirement. Cover two
+  absent holders, emergency repair, loss of each surviving host in turn, and
+  actual reconstruction; deleting only individual sectors while the emergency
+  holder stays online (`p2p.rs:11536`) does not exercise this case.
+- [ ] **M4-30 / P2 — Include pending write destinations in garbage collection.**
+  `remove_unreachable` checks receipts, copy-cleanup obligations, and Draining
+  state, but ignores `volume-write-intent` (`crates/mb-node/src/volume.rs:595`).
+  Emergency repair can commit its marker and payload, then stop before receipt
+  publication (`volume.rs:747`). If that volume is absent after restart,
+  reconciliation preserves its intent, but healthy-group cleanup reports
+  success and deletes the marker/proof (`crates/mb-node/src/node.rs:2513`).
+  On volume return, reconciliation recreates the receipt (`volume.rs:781`),
+  leaving information-shard bytes without emergency classification or future
+  volume GC. Include pending destinations in cleanup obligations, and retire
+  their intents only when collection converges. Cover payload-before-receipt
+  interruption, absent volume, cleanup, return, and repeated reopen.
+- [ ] **M4-31 / P2 — Preserve the old destination before replacing a write intent.**
+  Publication overwrites the single object-keyed intent without retaining its
+  previous destination (`crates/mb-node/src/volume.rs:729`). `store_repair`
+  records an old cleanup volume only when a receipt exists (`volume.rs:651`).
+  If A commits a payload but loses power before its receipt, retry with A absent
+  can publish on B and replace/delete A's only location evidence. Later GC
+  collects B and forgets A's copy permanently; fixing M4-30 alone cannot recover
+  a discarded UUID. Preserve prior pending destinations before retargeting a
+  repair or migration write. Cover an interrupted destination commit, retry on
+  another volume, GC while the first is absent, and its return.
+- [ ] **M4-32 / P2 — Settle source cleanup obligations before drain retirement.**
+  Migration deletes the source object before clearing its cleanup obligation
+  (`crates/mb-node/src/volume.rs:914`). A crash at `MigrationSourceRemoved`
+  leaves the obligation durable. Resume sees an empty source and retires it
+  without clearing that record (`volume.rs:868`, `volume.rs:925`). Later GC
+  waits permanently for the retired volume, whose store stays closed, even
+  though its empty database is still attached (`volume.rs:603`). Reconcile
+  outstanding obligations against the verified-empty source before declaring
+  it removable. Extend transition coverage through retention/GC and reopen,
+  asserting that receipts, cleanup obligations, and garbage candidates retire;
+  the existing test only checks the retained payload and Retired state.
+- [ ] **M4-33 / P2 — Reserve accumulated WAL checkpoint growth.**
+  `physical_write_reservation` budgets only the current row plus fixed overhead
+  (`crates/mb-node/src/volume.rs:1299`), while SQLCipher checkpoints after
+  1,000 WAL frames (`crates/mb-store/src/database.rs:2266`). Repeated inserts
+  can accumulate several MiB of new pages in WAL before a threshold-crossing
+  commit copies them into the main database. That write can pass admission
+  with free space equal to headroom plus 400 KiB (`volume.rs:713`) and then
+  consume MiBs of the reserve. The pinned SQLCipher source confirms that the
+  automatic checkpoint copies all unbackfilled pages. Account for outstanding
+  main-file growth or bound it with an appropriate checkpoint/reservation
+  policy, including control writes on a shared filesystem. Cover many inserts
+  across checkpoint thresholds at the headroom boundary; the one-object test
+  at `volume.rs:2322` does not reach that boundary.
+
+- [ ] **Run the Milestone 4 correction gate after M4-28 through M4-33.**
+  Add the combined crash, upgrade, outage, and near-full storage regressions
+  above, then run the locked workspace and required disposable-Btrfs/network
+  gates locally. Preserve generation-2 seed recovery and source/volume failure
+  availability. Record runtime evidence in the subsequent correction task;
+  this source-only review makes no new test-pass claim.
+
+## Milestone 4 follow-up source review — prior correction record
 
 Source review of `e663c49..8411f7d` found the remaining blockers below. The
 2026-09-14 test results remain historical evidence for the cases they exercised;
