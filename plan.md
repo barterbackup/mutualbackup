@@ -56,12 +56,13 @@ them as ADRs and test vectors before promising wire compatibility.
   checkpoints. Leave a compatible authorization interface for later quorum
   policies and FROST once membership and recovery policy are stable.
 
-### Implemented baseline — durable operations beta passed
+### Implemented baseline — durable operations beta completion reopened
 
 The first usable architectural prototype and the Milestone 2
 operator-configuration and identity-state slice have passed their review gates.
-The Milestone 3 robust-connectivity beta and Milestone 4 durable-operations beta
-have passed their closure gates. Milestone 4 implements automatic backup,
+The Milestone 3 robust-connectivity beta has passed its closure gate.
+Milestone 4's durable-operations beta is implemented, but its completion is
+reopened by the latest source review. Milestone 4 implements automatic backup,
 writer fencing, retention/GC, independently encrypted volume databases, audits,
 repair, emergency copies, and protection status. Corrections `27cb1b2`,
 `a265cc1`, and `04875a9` passed the recorded local gate on 2026-09-15. Follow-up
@@ -71,8 +72,13 @@ local disposable-Btrfs/reflink/network gate passed on 2026-09-15. Source review
 of `fb73787..546a1b9` then found M4-37 and M4-38: concurrent audit probes can
 overload reachable holders and persist incorrect protection status, and
 physical admission can reject matching READY publication retries. Commits
-`736bf20` and `fea97b1` resolve those findings, and the complete local correction
-gate passed on 2026-09-15. Milestone 5 is next.
+`736bf20` and `fea97b1` were recorded as resolving those findings, and the
+complete local correction gate passed on 2026-09-15. Source review of
+`197c6b0..1b9f99e` found M4-39: a completed response can reach the audit before
+its holder releases the request worker, so even sequential probes can receive
+Busy and persist incorrect protection status. No remaining blocker was found
+in the matching READY retry correction. Close M4-39 and rerun the local
+correction gate before proceeding to Milestone 5.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -478,8 +484,9 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 4 have passed; Milestone 5 is
-next. Later wire or durable-state changes
+than a daemon prerequisite. Milestones 0 through 3 have passed; Milestone 4
+completion is reopened for M4-39. Milestone 5 follows its correction and local
+gate. Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
 
@@ -694,7 +701,8 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 4 are passed. Milestone 5 is next.
+**Current position:** Milestones 0 through 3 are passed. Milestone 4 completion
+is reopened for M4-39; Milestone 5 follows correction and the local gate.
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer
 fencing, certified retention/tombstones
@@ -832,10 +840,10 @@ gate before closing Milestone 4. Earlier gate results remain historical
 evidence for their exercised cases; this review ran no builds, tests, or
 runtime probes.
 
-Commits `736bf20` and `fea97b1` subsequently close M4-37 and M4-38. Emergency
-inventory remains concurrent across holders but serializes probes to each
-holder, so the audit respects a single available request worker while still
-collecting every verified copy. Receipt-backed publication validates an exact
+Commits `736bf20` and `fea97b1` were subsequently recorded as closing M4-37
+and M4-38. Emergency inventory remains concurrent across holders but
+serializes probes to each holder to remove the explicit request burst.
+Receipt-backed publication validates an exact
 READY row before physical admission, while conflicts and writes retain their
 normal validation and capacity checks. The focused regressions exercise the
 low-capacity audit schedule through durable status and reopen, and interrupted
@@ -844,7 +852,22 @@ growth. On 2026-09-15, the corrected tree passed formatting, locked all-target
 workspace tests, warning-free locked all-target workspace Clippy, Docker
 controller safety, and the complete local disposable 2 GiB
 Btrfs/reflink/network gate. All compilation and execution were local; no remote
-compilation server was used. Milestone 4 is closed and Milestone 5 is next.
+compilation server was used. These results preceded the source review below.
+
+Source review of `197c6b0..1b9f99e` on 2026-09-15 reopens Milestone 4 for
+M4-39 in `TODO.md`. The inbound worker enqueues its response while still
+holding its capacity permit. The event loop can transmit that response before
+the worker releases the permit, allowing the next sequential inventory probe
+to receive Busy from a holder with one available worker. Inventory drops that
+error without retry and can persist Emergency for a Degraded layout. The
+constrained-permit regression does not force this handoff schedule. Order
+capacity release before response visibility while retaining bounded handling,
+or handle retryable capacity outcomes with a bounded policy. Cover the
+handoff deterministically through complete discovery, durable status, and
+reopen, then rerun the local correction gate before closing Milestone 4.
+No remaining blocker was identified in the READY publication retry correction.
+This review ran no builds, tests, or runtime probes; earlier gate results remain
+historical evidence for their exercised cases.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
 
@@ -1051,7 +1074,7 @@ artifact check. The unchanged disposable-Btrfs, isolated-network, private-Tor,
 and Docker gates had passed against its immediate precursor. No remote
 compilation server was used.
 
-### Milestone 4 — durable operations and multi-volume storage beta (passed)
+### Milestone 4 — durable operations and multi-volume storage beta (completion reopened)
 
 Implemented after the Milestone 3 gate. Corrections `d1857b5` through `83ebf83`
 addressed the initial review and passed the recorded local gate on 2026-09-14.
@@ -1072,9 +1095,15 @@ the complete local correction gate passed on 2026-09-15.
 The source review of `fb73787..546a1b9` reopened completion for M4-37 and M4-38:
 respect holder capacity during emergency-copy inventory, and allow exact READY
 publication retries without reserving a second payload. Commits `736bf20` and
-`fea97b1` correct both schedules. Their focused regressions and the complete
-local correction gate passed on 2026-09-15, closing Milestone 4. See `TODO.md`
-for source locations, failure cases, and recorded gate evidence.
+`fea97b1` were recorded as correcting both schedules. Their focused regressions
+and the complete local correction gate passed on 2026-09-15. Source review of
+`197c6b0..1b9f99e` then reopened completion for M4-39: response delivery can
+precede worker-permit release, causing sequential audit probes to miss valid
+copies under the supported holder capacity limit. The READY publication retry
+correction has no remaining blocker identified in this review. Add a
+deterministic response/permit handoff regression and pass the local correction
+gate before Milestone 5. See `TODO.md` for source locations, failure cases,
+and recorded gate evidence.
 
 - Add writer-incarnation fencing before supporting concurrent loss/recovery;
   then add retention and tombstones, safe GC, audits/scrubs, repair and emergency

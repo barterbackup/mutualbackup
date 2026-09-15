@@ -1,12 +1,54 @@
 # Product TODO
 
-## Milestone 4 follow-up source review — closed 2026-09-15
+## Milestone 4 follow-up source review — open 2026-09-15
+
+Source review of `197c6b0..1b9f99e` found one remaining completion blocker
+in M4-37's capacity correction. Per-holder serialization removes the explicit
+probe burst, but receiving a response does not guarantee that the holder has
+released its request worker. No remaining blocker was identified in M4-38's
+matching READY publication retry correction. Milestone 4 is reopened; the
+earlier passing gates remain evidence for their exercised cases. This review
+ran no builds, tests, or runtime probes.
+
+- [ ] **M4-39 / P2 — Release holder capacity before exposing a completed response.**
+  The blocking worker retains its inbound permit while enqueueing
+  `InboundResult` (`crates/mb-node/src/network/p2p.rs:4432`, `p2p.rs:4434`).
+  The event loop can send that response before the worker resumes and drops
+  the permit (`p2p.rs:2844`, `p2p.rs:2852`). Consequently, even the new
+  sequential discovery loop (`p2p.rs:6206`) can receive retryable Busy for its
+  next probe when the holder has one available worker (`p2p.rs:4394`). With
+  A/B/C holding assigned indices 0/1/2, D/E offline, and emergency indices 3
+  on B and 4 on C, pause B's worker after enqueueing the absent-index-2
+  response. B's next probe for its existing index 3 is rejected while that
+  worker still owns the permit. Inventory discards the error without retry
+  (`p2p.rs:6223`); even if it discovers C's index 4, the known layout loses
+  indices 2 and 4 together with C and persists Emergency instead of the
+  actual Degraded status (`p2p.rs:6365`, `p2p.rs:6379`). Release or transfer
+  permit ownership so capacity is available before the response becomes
+  observable, preserving bounded response handling, or handle retryable
+  capacity outcomes with a bounded policy before finalizing inventory. Add
+  a deterministic regression that holds the preceding worker after its
+  result is queued, then exercises the next sequential probe with one
+  available worker and verifies complete discovery and durable Degraded
+  status after a read-only audit and reopen. The current constrained-permit
+  regression (`p2p.rs:11767`) does not force this response/permit handoff.
+- [ ] **Run the Milestone 4 correction gate after M4-39.**
+  Add the deterministic handoff regression, then rerun formatting, locked
+  all-target workspace tests, warning-free locked all-target workspace
+  Clippy, Docker controller safety, and the complete local disposable-Btrfs/
+  reflink/network gate. Build and run everything locally; use no remote
+  compilation server. Record the corrected revision and results before
+  closing Milestone 4 and proceeding to Milestone 5.
+
+## Milestone 4 follow-up correction record — M4-37 and M4-38
 
 Source review of `fb73787..546a1b9` found two completion blockers in the
 latest audit and physical-admission changes. The retired-volume correction
 has no remaining blocker identified in this review. Commits `736bf20` and
-`fea97b1` resolve the two findings, and the local correction gate below passed.
-The review itself ran no builds, tests, or runtime probes.
+`fea97b1` were recorded as resolving the two findings, and the local correction
+gate below passed. The latest source review above reopens milestone completion
+for the remaining response/permit handoff. The review itself ran no builds,
+tests, or runtime probes.
 
 - [x] **M4-37 / P2 — Avoid overloading holders during emergency-copy discovery.**
   The new emergency inventory launches four probes per remote holder together
