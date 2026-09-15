@@ -1,14 +1,14 @@
 # Product TODO
 
-## Milestone 4 follow-up source review — open 2026-09-15
+## Milestone 4 follow-up source review — closed 2026-09-15
 
 Source review of `fb73787..546a1b9` found two completion blockers in the
 latest audit and physical-admission changes. The retired-volume correction
-has no remaining blocker identified in this review. Milestone 4 is reopened;
-the earlier passing gates remain evidence for their exercised cases. This
-review ran no builds, tests, or runtime probes.
+has no remaining blocker identified in this review. Commits `736bf20` and
+`fea97b1` resolve the two findings, and the local correction gate below passed.
+The review itself ran no builds, tests, or runtime probes.
 
-- [ ] **M4-37 / P2 — Avoid overloading holders during emergency-copy discovery.**
+- [x] **M4-37 / P2 — Avoid overloading holders during emergency-copy discovery.**
   The new emergency inventory launches four probes per remote holder together
   (`crates/mb-node/src/network/p2p.rs:6193`, `p2p.rs:6212`). A supported holder
   with `max_connections = 1` immediately rejects overlapping requests with
@@ -23,7 +23,7 @@ review ran no builds, tests, or runtime probes.
   responses with bounded retries before finalizing inventory. Add a regression
   with low-capacity holders and overlapping probes, checking complete location
   discovery and correct durable status after a read-only audit and reopen.
-- [ ] **M4-38 / P2 — Allow matching READY publication retries near capacity.**
+- [x] **M4-38 / P2 — Allow matching READY publication retries near capacity.**
   The receipt branch now requires physical space for another complete sector
   plus WAL backfill before validating the existing object
   (`crates/mb-node/src/volume.rs:711`). Matching READY bytes and acknowledgement
@@ -40,10 +40,18 @@ review ran no builds, tests, or runtime probes.
   boundary through the peer publication path, including durable completion
   and unchanged parity allocation. The current boundary regression
   (`volume.rs:2479`) only exercises admission of a new object.
-- [ ] **Run the Milestone 4 correction gate after M4-37 and M4-38.**
-  Add focused regressions for both schedules, then run the locked workspace
-  checks and complete disposable-Btrfs/reflink/network correction gate on the
-  corrected source tree. Build and run everything locally.
+- [x] **Run the Milestone 4 correction gate after M4-37 and M4-38.**
+  On 2026-09-15, the corrected source tree passed formatting, locked all-target
+  workspace tests, warning-free locked all-target workspace Clippy, and Docker
+  controller safety. A locally provisioned disposable 2 GiB Btrfs filesystem
+  passed the complete `scripts/reflink-acceptance.sh` gate, including capture
+  and recovery reconciliation, shared-filesystem WAL headroom, repeated
+  multi-owner QUIC backup, five-daemon seed/DHT recovery after source and
+  holder loss, and isolated direct/DCUtR/relay paths. Focused regressions cover
+  one available request worker per remote audit holder, complete location
+  discovery with durable Degraded status, and interrupted READY publication
+  replay at constrained headroom without parity growth. All compilation and
+  execution were local; no remote compilation server was used.
 
 ## Milestone 4 follow-up correction record — M4-34 through M4-36
 
