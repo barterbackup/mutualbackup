@@ -2316,6 +2316,47 @@ mod tests {
         assert!(status.available_bytes.is_some());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn physical_reservation_preserves_real_shared_filesystem_headroom() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = TempDir::new_in(test_root).unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([95; 32])));
+        let object = parity_object(96, 4);
+        let acknowledgement = b"shared-filesystem-ack";
+        let (control, _) = open_control_store(run_root.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(run_root.path(), keys, &control).unwrap();
+        let volume_id = volumes
+            .statuses()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.path == run_root.path().canonicalize().unwrap())
+            .unwrap()
+            .volume_id;
+        let reservation = physical_write_reservation(object.bytes.len(), acknowledgement.len());
+        let available_before = fs2::available_space(run_root.path()).unwrap();
+        assert!(available_before > reservation);
+        let headroom = available_before - reservation;
+        let volume = volumes.volumes.get_mut(&volume_id).unwrap();
+        volume.record.budget_bytes = u64::MAX;
+        volume.record.headroom_bytes = headroom;
+
+        let receipt = volumes.store(&control, &object, acknowledgement).unwrap();
+
+        assert_eq!(receipt.volume_id, volume_id);
+        let available_after = fs2::available_space(run_root.path()).unwrap();
+        assert!(
+            available_after >= headroom,
+            "physical write consumed {} bytes beyond its {}-byte reservation",
+            headroom.saturating_sub(available_after),
+            reservation,
+        );
+    }
+
     #[test]
     fn repaired_objects_migrate_without_storage_acknowledgements() {
         let temp = TempDir::new().unwrap();

@@ -6101,7 +6101,8 @@ mod tests {
                 false,
             )
             .unwrap();
-        node.reconcile_garbage_collection().unwrap();
+        drop(node);
+        let node = Node::open(temp.path(), seed).unwrap();
         assert!(node.sector(&retired.value.metadata_sectors[0].id).is_err());
         assert!(
             node.control
