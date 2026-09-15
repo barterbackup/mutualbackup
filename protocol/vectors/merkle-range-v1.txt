@@ -1,0 +1,9 @@
+# MutualBackup version-one Merkle range commitment vector.
+# Input is 64 bytes with values 0x00 through 0x3f. The opened range is the
+# third 16-byte leaf. The challenge is 32 bytes of 0x0b.
+input=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f
+root=c8ea461a17b6ea8acc93f88f7456df6642432356862f990bef2a69a9659cd989
+start_leaf=2
+leaf=202122232425262728292a2b2c2d2e2f
+siblings=0c6dc381b1ce0d94a21b3965b19c36273373b95f9784bf1c6618e23077039f73,5eac849815f5f74fe38975e685c671041312c5c38ddbdabe6c7287d271489168
+challenge_leaf=3

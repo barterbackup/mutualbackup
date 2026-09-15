@@ -8,9 +8,14 @@ mod coding;
 mod content;
 mod keys;
 mod model;
+mod range;
 mod recovery;
 
-pub use coding::{CodingError, encode_3_2, reconstruct_3_2};
+pub use coding::{
+    CodingError, CodingProfile, MAX_CODING_SHARDS, MAX_PROFILE_SHARD_SIZE, MIN_PROFILE_SHARD_SIZE,
+    ReedSolomonConstruction, encode, encode_3_2, reconstruct, reconstruct_3_2, verify_codeword,
+    verify_sampled_codeword,
+};
 pub use content::{
     ContentError, SectorPurpose, crypt_sector, encrypted_sector, make_sector_id,
     synthetic_filler_sector,
@@ -25,6 +30,10 @@ pub use model::{
     QuorumGuildGenesis, RecoveryBundle, RevisionTombstone, SectorId, SectorRef, ShardRole,
     SignedRecord, StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision, WriterFence,
     canonical_bytes, coding_group_id, decode_canonical,
+};
+pub use range::{
+    MERKLE_LEAF_SIZE, MERKLE_SUITE_V1, MerkleCommitment, MerkleError, MerkleRangeProof,
+    challenged_leaf, merkle_commit, merkle_open_range, merkle_verify_range,
 };
 pub use recovery::{
     RecoveryCryptoError, RecoveryLocator, SealedRecoveryRecord, open_recovery_record,
