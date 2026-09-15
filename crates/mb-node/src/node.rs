@@ -5817,6 +5817,7 @@ mod tests {
     #[test]
     fn emergency_marker_survives_interruption_before_payload_commit() {
         let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
         let local_seed = Seed::from_bytes([226; 32]);
         let mut node = Node::open(temp.path(), local_seed.clone()).unwrap();
         let revision = install_public_restore_fixture(&mut node, &local_seed);
@@ -5874,6 +5875,12 @@ mod tests {
                 false,
             )
             .unwrap();
+        node.configure_storage_volumes(
+            &[storage.path().to_path_buf()],
+            (mb_core::V1_SECTOR_SIZE * 2) as u64,
+            0,
+        )
+        .unwrap();
         crate::volume::interrupt_next_volume_transition(
             crate::volume::VolumeInterruption::WriteIntentStored,
         );
@@ -5894,7 +5901,18 @@ mod tests {
         );
         drop(node);
 
-        let mut reopened = Node::open(temp.path(), local_seed).unwrap();
+        let mut reopened = Node::open(temp.path(), local_seed.clone()).unwrap();
+        let storage_id = reopened
+            .status()
+            .unwrap()
+            .storage_volumes
+            .into_iter()
+            .find(|status| status.path == storage.path().canonicalize().unwrap())
+            .unwrap()
+            .volume_id;
+        reopened.drain_storage_volume(storage_id).unwrap();
+        assert_eq!(reopened.migrate_draining_volumes().unwrap(), 0);
+        fs::remove_dir_all(storage.path()).unwrap();
         assert_eq!(
             reopened
                 .remove_local_emergency_shards(checkpoint_hash, &group)
@@ -5907,6 +5925,49 @@ mod tests {
                 .get_record("emergency-shard", &record_id)
                 .unwrap()
                 .is_none()
+        );
+        assert!(
+            reopened
+                .control
+                .get_record("local-parity-proof", &record_id)
+                .unwrap()
+                .is_none()
+        );
+        for kind in [
+            "volume-write-intent",
+            "volume-receipt",
+            "volume-copy-cleanup",
+            "gc-parity",
+        ] {
+            assert!(
+                reopened
+                    .control
+                    .get_record(kind, &record_id)
+                    .unwrap()
+                    .is_none(),
+                "{kind}"
+            );
+        }
+        drop(reopened);
+
+        let reopened = Node::open(temp.path(), local_seed).unwrap();
+        assert!(
+            reopened
+                .control
+                .get_record("emergency-shard", &record_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            reopened
+                .status()
+                .unwrap()
+                .storage_volumes
+                .into_iter()
+                .find(|status| status.volume_id == storage_id)
+                .unwrap()
+                .state,
+            crate::StorageVolumeState::Retired
         );
     }
 

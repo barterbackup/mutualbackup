@@ -783,6 +783,7 @@ impl StorageVolumes {
         for (record_id, bytes) in control.records("volume-write-intent")? {
             let intent: VolumeWriteIntent = decode_canonical(&bytes)?;
             validate_receipt(&intent.receipt)?;
+            validate_volume_object_record_id(&record_id, &intent.receipt)?;
             let Some(volume) = self.volumes.get_mut(&intent.receipt.volume_id) else {
                 continue;
             };
@@ -811,6 +812,15 @@ impl StorageVolumes {
                 &canonical_bytes(&intent.receipt)?,
             )?;
             control.delete_record("volume-write-intent", &record_id)?;
+        }
+        let retired = self
+            .volumes
+            .iter()
+            .filter(|(_, volume)| volume.record.state == StorageVolumeState::Retired)
+            .map(|(volume_id, _)| *volume_id)
+            .collect::<Vec<_>>();
+        for volume_id in retired {
+            self.settle_empty_volume_location_evidence(control, volume_id)?;
         }
         self.persist(control)
     }
@@ -949,7 +959,7 @@ impl StorageVolumes {
                 volume_interruption(VolumeInterruption::MigrationReceiptStored)?;
                 moved += 1;
             }
-            self.settle_empty_volume_cleanup(control, source_id)?;
+            self.settle_empty_volume_location_evidence(control, source_id)?;
             let source = self.volumes.get_mut(&source_id).expect("source exists");
             source.record.configured = false;
             source.record.state = StorageVolumeState::Retired;
@@ -1064,7 +1074,27 @@ impl StorageVolumes {
         Ok(())
     }
 
-    fn settle_empty_volume_cleanup(&self, control: &ControlStore, volume_id: Uuid) -> Result<()> {
+    fn settle_empty_volume_location_evidence(
+        &self,
+        control: &ControlStore,
+        volume_id: Uuid,
+    ) -> Result<()> {
+        for (record_id, bytes) in control.records("volume-write-intent")? {
+            let intent: VolumeWriteIntent = decode_canonical(&bytes)?;
+            validate_receipt(&intent.receipt)?;
+            validate_volume_object_record_id(&record_id, &intent.receipt)?;
+            if intent.receipt.volume_id == volume_id {
+                control.delete_record("volume-write-intent", &record_id)?;
+            }
+        }
+        for (record_id, bytes) in control.records("volume-receipt")? {
+            let receipt: VolumeReceipt = decode_canonical(&bytes)?;
+            validate_receipt(&receipt)?;
+            validate_volume_object_record_id(&record_id, &receipt)?;
+            if receipt.volume_id == volume_id {
+                control.delete_record("volume-receipt", &record_id)?;
+            }
+        }
         for (record_id, bytes) in control.records("volume-copy-cleanup")? {
             let volumes: Vec<Uuid> = decode_canonical(&bytes)?;
             let mut volumes = volumes.into_iter().collect::<BTreeSet<_>>();
@@ -1306,6 +1336,13 @@ fn validate_receipt(receipt: &VolumeReceipt) -> Result<()> {
         || receipt.root == [0; 32]
     {
         bail!("invalid parity volume receipt");
+    }
+    Ok(())
+}
+
+fn validate_volume_object_record_id(record_id: &[u8], receipt: &VolumeReceipt) -> Result<()> {
+    if record_id != volume_object_id(&receipt.group_id, receipt.shard_index) {
+        bail!("parity volume receipt conflicts with its record key");
     }
     Ok(())
 }
@@ -2934,6 +2971,97 @@ mod tests {
             );
             assert!(control.records("volume-copy-cleanup").unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn empty_drain_settles_pending_and_preexisting_retired_location_evidence() {
+        let temp = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([116; 32])));
+        let object = parity_object(117, 3);
+        let record_id = volume_object_id(&object.group_id, object.shard_index);
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys.clone(), &control).unwrap();
+        interrupt_next_volume_transition(VolumeInterruption::WriteIntentStored);
+        assert!(volumes.store_repair(&control, &object).is_err());
+        let intent_bytes = control
+            .get_record("volume-write-intent", &record_id)
+            .unwrap()
+            .unwrap();
+        let intent: VolumeWriteIntent = decode_canonical(&intent_bytes).unwrap();
+        let retired_id = intent.receipt.volume_id;
+        drop(volumes);
+        drop(control);
+
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys.clone(), &control).unwrap();
+        volumes.reconcile(&control).unwrap();
+        volumes.mark_draining(&control, retired_id).unwrap();
+        assert_eq!(volumes.migrate_draining(&control).unwrap(), 0);
+        assert!(control.records("volume-write-intent").unwrap().is_empty());
+        assert!(
+            volumes
+                .remove_unreachable(&control, &object.group_id, object.shard_index, &object.root,)
+                .unwrap()
+        );
+
+        // Older versions could already have persisted Retired before clearing
+        // these records. Reconciliation must converge that durable state too.
+        control
+            .put_record("volume-write-intent", &record_id, &intent_bytes)
+            .unwrap();
+        control
+            .put_record(
+                "volume-receipt",
+                &record_id,
+                &canonical_bytes(&intent.receipt).unwrap(),
+            )
+            .unwrap();
+        control
+            .put_record(
+                "volume-copy-cleanup",
+                &record_id,
+                &canonical_bytes(&vec![retired_id]).unwrap(),
+            )
+            .unwrap();
+        drop(volumes);
+        drop(control);
+
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        volumes.reconcile(&control).unwrap();
+        for kind in [
+            "volume-write-intent",
+            "volume-receipt",
+            "volume-copy-cleanup",
+        ] {
+            assert!(control.records(kind).unwrap().is_empty(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn empty_drain_settles_receipt_left_after_garbage_removal() {
+        let temp = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([118; 32])));
+        let object = parity_object(119, 4);
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        let receipt = volumes.store(&control, &object, b"gc-ack").unwrap();
+        interrupt_next_volume_transition(VolumeInterruption::GarbageObjectRemoved);
+        assert!(
+            volumes
+                .remove_unreachable(&control, &object.group_id, object.shard_index, &object.root,)
+                .is_err()
+        );
+        assert_eq!(control.records("volume-receipt").unwrap().len(), 1);
+
+        volumes.mark_draining(&control, receipt.volume_id).unwrap();
+        assert_eq!(volumes.migrate_draining(&control).unwrap(), 0);
+        assert!(control.records("volume-receipt").unwrap().is_empty());
+        assert!(
+            volumes
+                .remove_unreachable(&control, &object.group_id, object.shard_index, &object.root,)
+                .unwrap()
+        );
     }
 
     #[test]
