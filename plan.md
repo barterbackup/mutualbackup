@@ -56,19 +56,19 @@ them as ADRs and test vectors before promising wire compatibility.
   checkpoints. Leave a compatible authorization interface for later quorum
   policies and FROST once membership and recovery policy are stable.
 
-### Implemented baseline — durable operations beta correction review reopened
+### Implemented baseline — durable operations beta passed
 
 The first usable architectural prototype and the Milestone 2
 operator-configuration and identity-state slice have passed their review gates.
-The Milestone 3 robust-connectivity beta has passed its closure gate.
-Milestone 4 implements automatic backup,
+The Milestone 3 robust-connectivity beta and Milestone 4 durable-operations beta
+have passed their closure gates. Milestone 4 implements automatic backup,
 writer fencing, retention/GC, independently encrypted volume databases, audits,
 repair, emergency copies, and protection status. Corrections `27cb1b2`,
-`a265cc1`, and `04875a9` passed the recorded local gate on 2026-09-15, but
-source review of `668324f..d12f5fb` found remaining WAL headroom, empty-drain
-cleanup, and emergency-copy status blockers. Milestone 4 is reopened for
-M4-34 through M4-36 in `TODO.md` and their correction gate. Milestone 5 follows
-that closure.
+`a265cc1`, and `04875a9` passed the recorded local gate on 2026-09-15. The final
+corrections `9081266`, `7c58281`, and `89c6569` close M4-34 through M4-36 from
+the source review of `668324f..d12f5fb`; the locked workspace and complete
+local disposable-Btrfs/reflink/network gate passed on 2026-09-15. Milestone 5
+is next.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -474,9 +474,8 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 3 have passed; Milestone 4
-is reopened for M4-34 through M4-36 and their correction gate before Milestone 5.
-Later wire or durable-state changes
+than a daemon prerequisite. Milestones 0 through 4 have passed; Milestone 5 is
+next. Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
 
@@ -691,8 +690,7 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 3 are passed. Milestone 4 is reopened
-for M4-34 through M4-36 and their correction gate; Milestone 5 follows closure.
+**Current position:** Milestones 0 through 4 are passed. Milestone 5 is next.
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer
 fencing, certified retention/tombstones
@@ -797,16 +795,23 @@ WAL headroom boundary, two-holder emergency placement with reconstruction after
 each remaining-host loss, generation-2 seed recovery, repeated QUIC backup,
 and five-daemon seed/DHT recovery. No remote compilation server was used.
 
-Source review of `668324f..d12f5fb` on 2026-09-15 reopens Milestone 4 with
+Source review of `668324f..d12f5fb` on 2026-09-15 reopened Milestone 4 with
 M4-34 through M4-36 in `TODO.md`. Automatic PASSIVE checkpointing can still
 accumulate unreserved main-file growth behind a reader or retain a WAL from
 the previous version. Empty drain retirement clears copy-cleanup records but
 can leave pending intents or stale receipts requiring a permanently closed
 store. Repeated emergency repairs create valid copies that a later audit's
 first-copy discovery misses, causing a safe layout to be reported as Emergency.
-The earlier gate did not exercise these schedules. Complete the corrections,
-their focused regressions, and the local correction gate before Milestone 5.
-This review ran no builds, tests, or runtime probes.
+The earlier gate did not exercise these schedules. The review itself ran no
+builds, tests, or runtime probes. Commits `9081266`, `7c58281`, and `89c6569`
+subsequently close the three findings with focused regressions. On 2026-09-15,
+the corrected tree passed formatting, locked all-target workspace tests,
+warning-free locked all-target workspace Clippy, Docker-controller safety, and
+the complete local disposable 2 GiB Btrfs/reflink/network gate. The gate covered
+held-reader parity/control WAL headroom, capture and recovery reconciliation,
+repeated multi-owner QUIC backup, five-daemon seed/DHT recovery after source and
+holder loss, and isolated direct/DCUtR/relay paths. No remote compilation server
+was used.
 
 ### Milestone 0 — first usable IP prototype architecture (passed)
 
@@ -1013,7 +1018,7 @@ artifact check. The unchanged disposable-Btrfs, isolated-network, private-Tor,
 and Docker gates had passed against its immediate precursor. No remote
 compilation server was used.
 
-### Milestone 4 — durable operations and multi-volume storage beta (reopened)
+### Milestone 4 — durable operations and multi-volume storage beta (passed)
 
 Implemented after the Milestone 3 gate. Corrections `d1857b5` through `83ebf83`
 addressed the initial review and passed the recorded local gate on 2026-09-14.
@@ -1026,8 +1031,10 @@ key-migration, emergency-placement, cleanup, and physical-reserve schedules. The
 locked workspace and complete local disposable-Btrfs/reflink/network correction
 gate passed on 2026-09-15. Source review of `668324f..d12f5fb` then found the
 remaining WAL headroom, empty-drain cleanup, and protection-reporting schedules
-recorded as M4-34 through M4-36. Completion requires those corrections and
-their local gate; the prior passing results do not close these cases.
+recorded as M4-34 through M4-36. Commits `9081266`, `7c58281`, and `89c6569`
+settle retired-volume location evidence, audit every valid emergency-copy
+location, and reserve stalled or inherited WAL growth. Focused regressions and
+the complete local correction gate passed on 2026-09-15.
 
 - Add writer-incarnation fencing before supporting concurrent loss/recovery;
   then add retention and tombstones, safe GC, audits/scrubs, repair and emergency

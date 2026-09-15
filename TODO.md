@@ -1,14 +1,14 @@
 # Product TODO
 
-## Milestone 4 follow-up source review — reopened 2026-09-15
+## Milestone 4 follow-up source review — closed 2026-09-15
 
 Source review of `668324f..d12f5fb` found three remaining completion blockers
-in the corrections to M4-29, M4-32, and M4-33. Milestone 4 remains open;
-complete these corrections and their gate before advancing to Milestone 5.
+in the corrections to M4-29, M4-32, and M4-33. Commits `9081266`, `7c58281`,
+and `89c6569` resolve them, and the local correction gate below passed.
 Earlier passing gates cover their exercised cases, but not the schedules
 below. This review ran no builds, tests, or runtime probes.
 
-- [ ] **M4-34 / P2 — Reserve WAL backlog even when automatic checkpointing stalls.**
+- [x] **M4-34 / P2 — Reserve WAL backlog even when automatic checkpointing stalls.**
   Setting `wal_autocheckpoint = 1` (`crates/mb-store/src/database.rs:2266`)
   requests a PASSIVE checkpoint; it does not guarantee that backfill completes.
   The pinned SQLCipher source caps backfill at active readers and its automatic
@@ -27,7 +27,7 @@ below. This review ran no builds, tests, or runtime probes.
   upgrade with an uncheckpointed WAL at the physical headroom boundary,
   including control storage on the shared filesystem. The new database test
   (`database.rs:3516`) uses fresh stores with one connection per database.
-- [ ] **M4-35 / P2 — Settle pending intents and stale receipts before empty drain retirement.**
+- [x] **M4-35 / P2 — Settle pending intents and stale receipts before empty drain retirement.**
   `settle_empty_volume_cleanup` clears only `volume-copy-cleanup`
   (`crates/mb-node/src/volume.rs:1067`). An emergency repair interrupted at
   `WriteIntentStored` leaves a durable marker and intent without a payload
@@ -45,7 +45,7 @@ below. This review ran no builds, tests, or runtime probes.
   disk removal, and repeated reopen; cover interrupted GC followed by drain
   and assert that intents, receipts, markers/proofs, cleanup records, and
   garbage candidates converge.
-- [ ] **M4-36 / P2 — Report protection from all verified emergency-copy locations.**
+- [x] **M4-36 / P2 — Report protection from all verified emergency-copy locations.**
   Discovery stops at the first valid alternate for each missing shard
   (`crates/mb-node/src/network/p2p.rs:6197`), but repair can create another
   copy even when it already found one (`p2p.rs:6265`). With D/E absent and
@@ -62,12 +62,19 @@ below. This review ran no builds, tests, or runtime probes.
   (`p2p.rs:11702`) reconstructs from all copies collected directly from nodes;
   it does not check that a later audit discovers the same protection.
 
-- [ ] **Run the Milestone 4 correction gate after M4-34 through M4-36.**
-  Add focused regressions for the schedules above, then run formatting,
-  locked all-target workspace tests and warning-free Clippy, Docker-controller
-  safety, and the complete disposable-Btrfs/reflink/network gate locally.
-  Record results against the corrected source tree before closing Milestone 4.
-  Do not use a remote compilation server.
+- [x] **Run the Milestone 4 correction gate after M4-34 through M4-36.**
+  On 2026-09-15, the exact corrected source tree passed formatting, locked
+  all-target workspace tests, warning-free locked all-target workspace Clippy,
+  and Docker-controller safety. A locally provisioned disposable 2 GiB Btrfs
+  filesystem passed the complete `scripts/reflink-acceptance.sh` gate. That
+  gate included the held-reader parity/control WAL headroom boundary, capture
+  and recovery reconciliation, repeated multi-owner QUIC backup, five-daemon
+  seed/DHT recovery after source and holder loss, and isolated direct/DCUtR/
+  relay network paths. Focused regressions also cover an old-threshold WAL
+  reopen, pending intent and stale receipt retirement, already-Retired cleanup,
+  repeated emergency repairs, complete copy discovery, durable audit status,
+  and reconstruction after every surviving-host loss. All compilation and
+  execution were local; no remote compilation server was used.
 
 ## Milestone 4 correction review — prior correction record
 
