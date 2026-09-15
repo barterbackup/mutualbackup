@@ -2,8 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use mb_core::{
-    KeyMaterial, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_SECTOR_SIZE,
-    sector_root,
+    KeyMaterial, MAX_CODING_SHARDS, MAX_PROFILE_SHARD_SIZE, MERKLE_LEAF_SIZE, MerkleCommitment,
+    MerkleRangeProof, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES,
+    V1_SECTOR_SIZE, merkle_commit, merkle_open_range, sector_root,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -1180,6 +1181,16 @@ pub struct ParityObject {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct VariableParityObject {
+    pub format_version: u16,
+    pub guild_id: [u8; 32],
+    pub group_id: [u8; 32],
+    pub shard_index: u16,
+    pub commitment: MerkleCommitment,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParityScrubReport {
     pub checked_objects: usize,
@@ -1289,7 +1300,8 @@ impl ParityStore {
             .connection
             .query_row(
                 "SELECT group_id, shard_index FROM parity_objects
-                 WHERE state = 'READY' ORDER BY group_id, shard_index LIMIT 1",
+                 WHERE state = 'READY' AND format_version = 1
+                 ORDER BY group_id, shard_index LIMIT 1",
                 [],
                 |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
             )
@@ -1353,6 +1365,7 @@ impl ParityStore {
             "SELECT format_version, guild_id, group_id, shard_index, root,
                     byte_length, bytes
              FROM parity_objects WHERE state = 'READY'
+               AND format_version = 1
              ORDER BY group_id, shard_index",
         )?;
         let rows = statement.query_map([], |row| {
@@ -1394,17 +1407,18 @@ impl ParityStore {
     pub fn scrub(&self) -> Result<ParityScrubReport, DatabaseError> {
         self.cipher_integrity_check()?;
         let mut statement = self.connection.prepare(
-            "SELECT group_id, shard_index, root, byte_length, bytes
+            "SELECT format_version, group_id, shard_index, root, byte_length, bytes
              FROM parity_objects WHERE state = 'READY'
              ORDER BY group_id, shard_index",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
             ))
         })?;
         let mut report = ParityScrubReport {
@@ -1413,7 +1427,7 @@ impl ParityStore {
             corrupt_objects: Vec::new(),
         };
         for row in rows {
-            let (group_id, shard_index, root, byte_length, bytes) = row?;
+            let (format_version, group_id, shard_index, root, byte_length, bytes) = row?;
             let group_id: [u8; 32] = group_id.try_into().map_err(|_| DatabaseError::Integrity)?;
             let shard_index = u8::try_from(shard_index).map_err(|_| DatabaseError::Integrity)?;
             let root: [u8; 32] = root.try_into().map_err(|_| DatabaseError::Integrity)?;
@@ -1422,11 +1436,21 @@ impl ParityStore {
                 .checked_bytes
                 .checked_add(bytes.len() as u64)
                 .ok_or(DatabaseError::Integrity)?;
-            if shard_index > 4
-                || byte_length != bytes.len() as i64
-                || bytes.len() != V1_SECTOR_SIZE
-                || sector_root(&bytes) != root
-            {
+            let valid = match format_version {
+                1 => {
+                    shard_index <= 4
+                        && byte_length == V1_SECTOR_SIZE as i64
+                        && bytes.len() == V1_SECTOR_SIZE
+                        && sector_root(&bytes) == root
+                }
+                2 => {
+                    u16::from(shard_index) < MAX_CODING_SHARDS
+                        && byte_length == bytes.len() as i64
+                        && merkle_commit(&bytes).is_ok_and(|commitment| commitment.root == root)
+                }
+                _ => false,
+            };
+            if !valid {
                 report.corrupt_objects.push((group_id, shard_index));
             }
         }
@@ -1618,6 +1642,286 @@ impl ParityStore {
         Ok(())
     }
 
+    /// Durably store a variable-profile parity shard as STAGED. This operation
+    /// never makes the shard active protection; activation is a separate write
+    /// after the signed sampled-coding transcript has been verified.
+    pub fn stage_attempt(
+        &mut self,
+        attempt_id: &[u8; 16],
+        object: &VariableParityObject,
+        staged_receipt: &[u8],
+        budget_bytes: u64,
+    ) -> Result<(), DatabaseError> {
+        validate_variable_parity_object(object)?;
+        if *attempt_id == [0; 16] || staged_receipt.is_empty() || staged_receipt.len() > 64 * 1024 {
+            return Err(DatabaseError::Integrity);
+        }
+        let transaction = self.connection.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT format_version, guild_id, root, byte_length, state, bytes,
+                        acknowledgement, attempt_id, verification_hash
+                 FROM parity_objects WHERE group_id = ?1 AND shard_index = ?2",
+                params![object.group_id.as_slice(), object.shard_index],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                        row.get::<_, Option<Vec<u8>>>(7)?,
+                        row.get::<_, Option<Vec<u8>>>(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((
+            format_version,
+            guild_id,
+            root,
+            byte_length,
+            state,
+            bytes,
+            receipt,
+            stored_attempt,
+            verification_hash,
+        )) = existing
+        {
+            if format_version != 2
+                || guild_id.as_slice() != object.guild_id
+                || root.as_slice() != object.commitment.root
+                || byte_length != object.bytes.len() as i64
+                || bytes != object.bytes
+                || receipt != staged_receipt
+                || stored_attempt.as_deref() != Some(attempt_id.as_slice())
+                || !matches!(state.as_str(), "STAGED" | "READY")
+                || (state == "STAGED" && verification_hash.is_some())
+                || (state == "READY"
+                    && verification_hash
+                        .as_ref()
+                        .is_none_or(|hash| hash.len() != 32))
+            {
+                return Err(DatabaseError::Conflict);
+            }
+            transaction.commit()?;
+            return Ok(());
+        }
+
+        let used: i64 = transaction.query_row(
+            "SELECT coalesce(sum(byte_length), 0) FROM parity_objects",
+            [],
+            |row| row.get(0),
+        )?;
+        let required = u64::try_from(used)
+            .map_err(|_| DatabaseError::Integrity)?
+            .checked_add(object.bytes.len() as u64)
+            .ok_or(DatabaseError::CapacityExceeded)?;
+        if required > budget_bytes {
+            return Err(DatabaseError::CapacityExceeded);
+        }
+        transaction.execute(
+            "INSERT INTO parity_objects(
+                format_version, guild_id, group_id, shard_index, root,
+                byte_length, state, bytes, acknowledgement, attempt_id, verification_hash
+             ) VALUES (2, ?1, ?2, ?3, ?4, ?5, 'STAGED', ?6, ?7, ?8, NULL)",
+            params![
+                object.guild_id.as_slice(),
+                object.group_id.as_slice(),
+                object.shard_index,
+                object.commitment.root.as_slice(),
+                object.bytes.len() as i64,
+                object.bytes.as_slice(),
+                staged_receipt,
+                attempt_id.as_slice(),
+            ],
+        )?;
+        let stored: (Vec<u8>, i64, Vec<u8>, Vec<u8>) = transaction.query_row(
+            "SELECT root, byte_length, bytes, attempt_id FROM parity_objects
+             WHERE group_id = ?1 AND shard_index = ?2 AND state = 'STAGED'",
+            params![object.group_id.as_slice(), object.shard_index],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        if stored.0.as_slice() != object.commitment.root
+            || stored.1 != object.bytes.len() as i64
+            || merkle_commit(&stored.2).map_err(|_| DatabaseError::Integrity)? != object.commitment
+            || stored.3.as_slice() != attempt_id
+        {
+            return Err(DatabaseError::Integrity);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Activate exactly one staged attempt object after transcript replay.
+    pub fn activate_attempt_object(
+        &mut self,
+        attempt_id: &[u8; 16],
+        group_id: &[u8; 32],
+        shard_index: u16,
+        commitment: &MerkleCommitment,
+        verification_hash: &[u8; 32],
+    ) -> Result<(), DatabaseError> {
+        if *attempt_id == [0; 16] || *verification_hash == [0; 32] {
+            return Err(DatabaseError::Integrity);
+        }
+        let transaction = self.connection.transaction()?;
+        let row = transaction
+            .query_row(
+                "SELECT format_version, root, byte_length, state, attempt_id, verification_hash
+                 FROM parity_objects WHERE group_id = ?1 AND shard_index = ?2",
+                params![group_id.as_slice(), shard_index],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, Option<Vec<u8>>>(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(DatabaseError::NotReady)?;
+        if row.0 != 2
+            || row.1.as_slice() != commitment.root
+            || row.2 != i64::from(commitment.byte_len)
+            || row.4.as_deref() != Some(attempt_id.as_slice())
+        {
+            return Err(DatabaseError::Conflict);
+        }
+        match row.3.as_str() {
+            "STAGED" if row.5.is_none() => {
+                transaction.execute(
+                    "UPDATE parity_objects SET state = 'READY', verification_hash = ?1
+                     WHERE group_id = ?2 AND shard_index = ?3
+                       AND state = 'STAGED' AND attempt_id = ?4",
+                    params![
+                        verification_hash.as_slice(),
+                        group_id.as_slice(),
+                        shard_index,
+                        attempt_id.as_slice()
+                    ],
+                )?;
+            }
+            "READY" if row.5.as_deref() == Some(verification_hash.as_slice()) => {}
+            _ => return Err(DatabaseError::Conflict),
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Remove every uncommitted parity object from one failed attempt.
+    pub fn discard_staged_attempt(&mut self, attempt_id: &[u8; 16]) -> Result<u64, DatabaseError> {
+        if *attempt_id == [0; 16] {
+            return Err(DatabaseError::Integrity);
+        }
+        let removed = self.connection.execute(
+            "DELETE FROM parity_objects WHERE attempt_id = ?1 AND state = 'STAGED'",
+            [attempt_id.as_slice()],
+        )? as u64;
+        if removed != 0 {
+            self.reclaim_deleted_pages()?;
+        }
+        Ok(removed)
+    }
+
+    pub fn load_attempt_receipt(
+        &self,
+        attempt_id: &[u8; 16],
+        group_id: &[u8; 32],
+        shard_index: u16,
+    ) -> Result<Vec<u8>, DatabaseError> {
+        let receipt = self
+            .connection
+            .query_row(
+                "SELECT acknowledgement FROM parity_objects
+                 WHERE attempt_id = ?1 AND group_id = ?2 AND shard_index = ?3
+                   AND format_version = 2 AND state IN ('STAGED', 'READY')",
+                params![attempt_id.as_slice(), group_id.as_slice(), shard_index],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .ok_or(DatabaseError::NotReady)?;
+        if receipt.is_empty() || receipt.len() > 64 * 1024 {
+            return Err(DatabaseError::Integrity);
+        }
+        Ok(receipt)
+    }
+
+    pub fn open_attempt_range(
+        &self,
+        attempt_id: &[u8; 16],
+        group_id: &[u8; 32],
+        shard_index: u16,
+        start_leaf: u32,
+        leaf_count: u32,
+    ) -> Result<MerkleRangeProof, DatabaseError> {
+        let object = self.load_variable_object(
+            "attempt_id = ?1 AND group_id = ?2 AND shard_index = ?3
+             AND format_version = 2 AND state IN ('STAGED', 'READY')",
+            params![attempt_id.as_slice(), group_id.as_slice(), shard_index],
+        )?;
+        merkle_open_range(&object.bytes, start_leaf, leaf_count)
+            .map_err(|_| DatabaseError::Integrity)
+    }
+
+    pub fn load_ready_variable(
+        &self,
+        group_id: &[u8; 32],
+        shard_index: u16,
+    ) -> Result<VariableParityObject, DatabaseError> {
+        self.load_variable_object(
+            "group_id = ?1 AND shard_index = ?2 AND format_version = 2 AND state = 'READY'",
+            params![group_id.as_slice(), shard_index],
+        )
+    }
+
+    fn load_variable_object<P: rusqlite::Params>(
+        &self,
+        predicate: &str,
+        params: P,
+    ) -> Result<VariableParityObject, DatabaseError> {
+        let sql = format!(
+            "SELECT format_version, guild_id, group_id, shard_index, root, byte_length, bytes
+             FROM parity_objects WHERE {predicate}"
+        );
+        let row = self
+            .connection
+            .query_row(&sql, params, |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                ))
+            })
+            .optional()?
+            .ok_or(DatabaseError::NotReady)?;
+        let root: [u8; 32] = row.4.try_into().map_err(|_| DatabaseError::Integrity)?;
+        let object = VariableParityObject {
+            format_version: u16::try_from(row.0).map_err(|_| DatabaseError::Integrity)?,
+            guild_id: row.1.try_into().map_err(|_| DatabaseError::Integrity)?,
+            group_id: row.2.try_into().map_err(|_| DatabaseError::Integrity)?,
+            shard_index: u16::try_from(row.3).map_err(|_| DatabaseError::Integrity)?,
+            commitment: MerkleCommitment {
+                format_version: 1,
+                leaf_size: MERKLE_LEAF_SIZE as u16,
+                byte_len: u32::try_from(row.5).map_err(|_| DatabaseError::Integrity)?,
+                root,
+            },
+            bytes: row.6,
+        };
+        validate_variable_parity_object(&object)?;
+        Ok(object)
+    }
+
     pub fn load_acknowledgement(
         &self,
         group_id: &[u8; 32],
@@ -1715,6 +2019,20 @@ fn validate_parity_publication(
     Ok(())
 }
 
+fn validate_variable_parity_object(object: &VariableParityObject) -> Result<(), DatabaseError> {
+    if object.format_version != 2
+        || object.guild_id == [0; 32]
+        || object.group_id == [0; 32]
+        || object.shard_index >= MAX_CODING_SHARDS
+        || object.bytes.len() < MERKLE_LEAF_SIZE
+        || object.bytes.len() > MAX_PROFILE_SHARD_SIZE as usize
+        || merkle_commit(&object.bytes).map_err(|_| DatabaseError::Integrity)? != object.commitment
+    {
+        return Err(DatabaseError::Integrity);
+    }
+    Ok(())
+}
+
 fn initialize_or_validate_control(connection: &mut Connection) -> Result<(), DatabaseError> {
     if database_has_tables(connection)? {
         migrate_control(connection)?;
@@ -1804,15 +2122,21 @@ fn initialize_or_validate_parity(
             value BLOB NOT NULL
          ) STRICT;
          CREATE TABLE parity_objects (
-            format_version INTEGER NOT NULL CHECK(format_version = 1),
+            format_version INTEGER NOT NULL CHECK(format_version IN (1, 2)),
             guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
             group_id BLOB NOT NULL CHECK(length(group_id) = 32),
-            shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 0 AND 4),
+            shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 0 AND 63),
             root BLOB NOT NULL CHECK(length(root) = 32),
-            byte_length INTEGER NOT NULL CHECK(byte_length = 65536),
+            byte_length INTEGER NOT NULL CHECK(byte_length BETWEEN 16 AND 4194304),
             state TEXT NOT NULL CHECK(state IN ('STAGED', 'READY')),
             bytes BLOB NOT NULL,
             acknowledgement BLOB NOT NULL DEFAULT x'',
+            attempt_id BLOB CHECK(attempt_id IS NULL OR length(attempt_id) = 16),
+            verification_hash BLOB CHECK(
+                verification_hash IS NULL OR length(verification_hash) = 32
+            ),
+            CHECK(length(bytes) = byte_length),
+            CHECK(format_version = 2 OR byte_length = 65536),
             PRIMARY KEY(group_id, shard_index)
          ) STRICT;",
     )?;
@@ -1840,7 +2164,7 @@ fn migrate_control(connection: &mut Connection) -> Result<(), DatabaseError> {
     if version == SCHEMA_VERSION {
         return validate_control_schema(connection, version);
     }
-    if !matches!(version, 1..=3 | 5..=6) {
+    if !matches!(version, 1..=3 | 5..=7) {
         return Err(DatabaseError::IncompatibleSchema);
     }
     if version >= 2 && meta_value(connection, "database_kind")?.as_deref() != Some(b"control") {
@@ -1929,16 +2253,16 @@ fn migrate_parity(connection: &mut Connection, volume_id: &[u8; 16]) -> Result<(
     if version == SCHEMA_VERSION {
         return validate_parity_schema(connection);
     }
-    if !matches!(version, 2..=3 | 5..=6)
+    if !matches!(version, 2..=3 | 5..=7)
         || meta_value(connection, "database_kind")?.as_deref() != Some(b"parity")
         || meta_value(connection, "volume_id")?.as_deref() != Some(volume_id.as_slice())
     {
         return Err(DatabaseError::IncompatibleSchema);
     }
-    let prior_schema = if version == 6 {
-        PARITY_OBJECTS_BEFORE_V7_SCHEMA
-    } else {
-        PARITY_OBJECTS_BEFORE_V6_SCHEMA
+    let prior_schema = match version {
+        7 => PARITY_OBJECTS_BEFORE_V8_SCHEMA,
+        6 => PARITY_OBJECTS_BEFORE_V7_SCHEMA,
+        _ => PARITY_OBJECTS_BEFORE_V6_SCHEMA,
     };
     require_exact_tables(
         connection,
@@ -1952,27 +2276,33 @@ fn migrate_parity(connection: &mut Connection, volume_id: &[u8; 16]) -> Result<(
         )?;
     }
     transaction.execute_batch(
-        "ALTER TABLE parity_objects RENAME TO parity_objects_before_v7;
+        "ALTER TABLE parity_objects RENAME TO parity_objects_before_v8;
          CREATE TABLE parity_objects (
-            format_version INTEGER NOT NULL CHECK(format_version = 1),
+            format_version INTEGER NOT NULL CHECK(format_version IN (1, 2)),
             guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
             group_id BLOB NOT NULL CHECK(length(group_id) = 32),
-            shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 0 AND 4),
+            shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 0 AND 63),
             root BLOB NOT NULL CHECK(length(root) = 32),
-            byte_length INTEGER NOT NULL CHECK(byte_length = 65536),
+            byte_length INTEGER NOT NULL CHECK(byte_length BETWEEN 16 AND 4194304),
             state TEXT NOT NULL CHECK(state IN ('STAGED', 'READY')),
             bytes BLOB NOT NULL,
             acknowledgement BLOB NOT NULL DEFAULT x'',
+            attempt_id BLOB CHECK(attempt_id IS NULL OR length(attempt_id) = 16),
+            verification_hash BLOB CHECK(
+                verification_hash IS NULL OR length(verification_hash) = 32
+            ),
+            CHECK(length(bytes) = byte_length),
+            CHECK(format_version = 2 OR byte_length = 65536),
             PRIMARY KEY(group_id, shard_index)
          ) STRICT;
          INSERT INTO parity_objects(
             format_version, guild_id, group_id, shard_index, root,
-            byte_length, state, bytes, acknowledgement
+            byte_length, state, bytes, acknowledgement, attempt_id, verification_hash
          )
          SELECT format_version, guild_id, group_id, shard_index, root,
-                byte_length, state, bytes, acknowledgement
-         FROM parity_objects_before_v7;
-         DROP TABLE parity_objects_before_v7;",
+                byte_length, state, bytes, acknowledgement, NULL, NULL
+         FROM parity_objects_before_v8;
+         DROP TABLE parity_objects_before_v8;",
     )?;
     transaction.execute(
         "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
@@ -2063,6 +2393,25 @@ const CHECKPOINT_PAGES_SCHEMA: &str = "CREATE TABLE checkpoint_pages (
     PRIMARY KEY(object_kind, object_id, page_index)
 ) STRICT";
 const PARITY_OBJECTS_SCHEMA: &str = "CREATE TABLE parity_objects (
+    format_version INTEGER NOT NULL CHECK(format_version IN (1, 2)),
+    guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
+    group_id BLOB NOT NULL CHECK(length(group_id) = 32),
+    shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 0 AND 63),
+    root BLOB NOT NULL CHECK(length(root) = 32),
+    byte_length INTEGER NOT NULL CHECK(byte_length BETWEEN 16 AND 4194304),
+    state TEXT NOT NULL CHECK(state IN ('STAGED', 'READY')),
+    bytes BLOB NOT NULL,
+    acknowledgement BLOB NOT NULL DEFAULT x'',
+    attempt_id BLOB CHECK(attempt_id IS NULL OR length(attempt_id) = 16),
+    verification_hash BLOB CHECK(
+        verification_hash IS NULL OR length(verification_hash) = 32
+    ),
+    CHECK(length(bytes) = byte_length),
+    CHECK(format_version = 2 OR byte_length = 65536),
+    PRIMARY KEY(group_id, shard_index)
+) STRICT";
+
+const PARITY_OBJECTS_BEFORE_V8_SCHEMA: &str = "CREATE TABLE parity_objects (
     format_version INTEGER NOT NULL CHECK(format_version = 1),
     guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
     group_id BLOB NOT NULL CHECK(length(group_id) = 32),
@@ -2121,7 +2470,7 @@ fn validate_control_schema(connection: &Connection, version: u32) -> Result<(), 
             ("checkpoint_signature_locks", CHECKPOINT_LOCKS_SCHEMA),
             ("checkpoint_heads", CHECKPOINT_HEADS_SCHEMA),
         ],
-        5 | 6 | SCHEMA_VERSION => vec![
+        5 | 6 | 7 | SCHEMA_VERSION => vec![
             ("meta", META_SCHEMA),
             ("protocol_records", PROTOCOL_RECORDS_SCHEMA),
             ("operations", OPERATIONS_SCHEMA),
@@ -3849,5 +4198,102 @@ mod tests {
             store.stage_and_publish_ack(&object, b"other-ack", V1_SECTOR_SIZE as u64),
             Err(DatabaseError::Conflict)
         ));
+    }
+
+    #[test]
+    fn variable_parity_stays_staged_until_separate_activation() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([51; 32]));
+        let mut store = ParityStore::open(temp.path().join("parity.db"), &[52; 16], &keys).unwrap();
+        let bytes = (0_u8..64).collect::<Vec<_>>();
+        let object = VariableParityObject {
+            format_version: 2,
+            guild_id: [53; 32],
+            group_id: [54; 32],
+            shard_index: 11,
+            commitment: merkle_commit(&bytes).unwrap(),
+            bytes,
+        };
+        let attempt_id = [55; 16];
+        store
+            .stage_attempt(&attempt_id, &object, b"signed-staged-receipt", 64)
+            .unwrap();
+        store
+            .stage_attempt(&attempt_id, &object, b"signed-staged-receipt", 64)
+            .unwrap();
+        assert_eq!(store.ready_object_count().unwrap(), 0);
+        assert!(matches!(
+            store.load_ready_variable(&object.group_id, object.shard_index),
+            Err(DatabaseError::NotReady)
+        ));
+        assert_eq!(
+            store
+                .load_attempt_receipt(&attempt_id, &object.group_id, object.shard_index)
+                .unwrap(),
+            b"signed-staged-receipt"
+        );
+        let proof = store
+            .open_attempt_range(&attempt_id, &object.group_id, object.shard_index, 2, 1)
+            .unwrap();
+        assert_eq!(
+            mb_core::merkle_verify_range(&object.commitment, &proof).unwrap(),
+            object.bytes[32..48]
+        );
+
+        let verification_hash = [56; 32];
+        store
+            .activate_attempt_object(
+                &attempt_id,
+                &object.group_id,
+                object.shard_index,
+                &object.commitment,
+                &verification_hash,
+            )
+            .unwrap();
+        store
+            .activate_attempt_object(
+                &attempt_id,
+                &object.group_id,
+                object.shard_index,
+                &object.commitment,
+                &verification_hash,
+            )
+            .unwrap();
+        assert_eq!(store.ready_object_count().unwrap(), 1);
+        assert_eq!(
+            store
+                .load_ready_variable(&object.group_id, object.shard_index)
+                .unwrap(),
+            object
+        );
+        assert_eq!(store.discard_staged_attempt(&attempt_id).unwrap(), 0);
+        assert_eq!(store.ready_object_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn failed_attempt_cleanup_removes_all_and_never_active_parity() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([61; 32]));
+        let mut store = ParityStore::open(temp.path().join("parity.db"), &[62; 16], &keys).unwrap();
+        let attempt_id = [63; 16];
+        for index in 4_u16..7 {
+            let bytes = vec![index as u8; 256];
+            let object = VariableParityObject {
+                format_version: 2,
+                guild_id: [64; 32],
+                group_id: [index as u8; 32],
+                shard_index: index,
+                commitment: merkle_commit(&bytes).unwrap(),
+                bytes,
+            };
+            store
+                .stage_attempt(&attempt_id, &object, b"receipt", 3 * 256)
+                .unwrap();
+        }
+        assert_eq!(store.used_bytes().unwrap(), 3 * 256);
+        assert_eq!(store.ready_object_count().unwrap(), 0);
+        assert_eq!(store.discard_staged_attempt(&attempt_id).unwrap(), 3);
+        assert_eq!(store.used_bytes().unwrap(), 0);
+        assert_eq!(store.discard_staged_attempt(&attempt_id).unwrap(), 0);
     }
 }

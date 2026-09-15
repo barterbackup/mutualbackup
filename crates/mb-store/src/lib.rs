@@ -15,7 +15,7 @@ pub use anchor::{
 };
 pub use database::{
     CheckpointRow, ControlStore, DatabaseError, DatabaseShellResult, ParityObject,
-    ParityScrubReport, ParityStore, ProtocolRecordRow,
+    ParityScrubReport, ParityStore, ProtocolRecordRow, VariableParityObject,
 };
 
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
