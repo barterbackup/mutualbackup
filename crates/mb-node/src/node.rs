@@ -7104,7 +7104,7 @@ impl Node {
     ) -> Result<()> {
         match checkpoint.checkpoint.format_version {
             3 if bundle.format_version == 1 && bundle.key_envelope.is_none() => Ok(()),
-            4 => {
+            4..=7 => {
                 let state = self
                     .dynamic_guild_state()?
                     .context("dynamic recovery requires dynamic guild state")?;
@@ -11865,6 +11865,14 @@ mod tests {
             let locator: SignedRecord<RecoveryLocator> = decode_canonical(&plaintext).unwrap();
             locator.verify(RECOVERY_LOCATOR_DOMAIN).unwrap();
             assert_eq!(locator.value.checkpoint_hash, checkpoint_hash);
+        }
+        for format_version in 4..=7 {
+            let mut compatible = checkpoint.clone();
+            compatible.checkpoint.format_version = format_version;
+            for bundle in &first.recovery {
+                node.validate_recovery_bundle_key(&compatible, &bundle.value)
+                    .unwrap();
+            }
         }
 
         let target = first.recovery[0].value.subject;

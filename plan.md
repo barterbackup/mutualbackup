@@ -762,8 +762,14 @@ and both local restores, but its DHT readiness probe found no publishers. The
 test had cold-started provider announcements only after the long workload and
 allowed about three seconds for convergence. It now runs the daemon's real DHT
 publication/readiness worker on every node throughout the workload and waits
-under a bounded deadline for final-checkpoint readiness. A fresh provisioned
-production gate must still close before Milestone 5 can pass.
+under a bounded deadline for final-checkpoint readiness. That worker completed
+repeated passes across checkpoints 1 and 2 but still retained zero publishers.
+Replaying each exact stored bundle through the production validator found that
+publication correctly emitted format-2 current-epoch bundles for checkpoint 7,
+while validation admitted that format only for checkpoint 4. Dynamic recovery
+key validation now covers every supported dynamic checkpoint format, 4 through
+7, with a focused range regression. A fresh provisioned production gate must
+still close before Milestone 5 can pass.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer
