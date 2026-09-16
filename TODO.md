@@ -647,15 +647,25 @@ node Clippy gate passed locally. No remote compilation server was used.
   proceed, while group retirement waits until the job commits or is deferred.
   The production test now claims each backup job before constructing it, as the
   daemon coordinator does.
-- [ ] **M5-08 / gate — Run the corrected production gate.**
+- [x] **M5-08 / P1 — Exercise the daemon's renewable DHT publication loop.**
+  The next production run completed all four checkpoints, verified the packed
+  catalog and local restores, then found zero recovery-readiness publishers on
+  every node. Each node had built four current bundles, but the test cold-started
+  provider announcements only after the 43-minute workload and allowed roughly
+  three seconds for Kademlia convergence. Run the daemon's real five-second DHT
+  publication/readiness worker on every node throughout the production test,
+  then wait under a 60-second deadline for all subjects to certify three current
+  publishers for the final checkpoint.
+- [ ] **M5-09 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
-  when the full daemon peer-exchange task set first ran beside backup. The
+  when the daemon peer-exchange task first ran beside backup. The next run
+  completed checkpoint 4 and exposed M5-08 at DHT readiness. The
   provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked
   all-target workspace tests, warning-free locked all-target Clippy, and the
-  local reflink/network acceptance gate after M5-01 through M5-07 close.
+  local reflink/network acceptance gate after M5-01 through M5-08 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

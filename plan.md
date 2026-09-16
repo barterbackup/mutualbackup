@@ -757,6 +757,12 @@ coordinator retired groups for a running checkpoint draft because they were not
 yet referenced by the prior current checkpoint. A durable `Running` backup job
 now fences group retirement until checkpoint construction commits or defers,
 while recovery-key and endpoint exchange continue. A fresh provisioned
+production run then completed all four checkpoints, the packed-catalog checks,
+and both local restores, but its DHT readiness probe found no publishers. The
+test had cold-started provider announcements only after the long workload and
+allowed about three seconds for convergence. It now runs the daemon's real DHT
+publication/readiness worker on every node throughout the workload and waits
+under a bounded deadline for final-checkpoint readiness. A fresh provisioned
 production gate must still close before Milestone 5 can pass.
 
 Milestone 4 implements quiet-period

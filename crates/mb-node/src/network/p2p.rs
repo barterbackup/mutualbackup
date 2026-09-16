@@ -17151,6 +17151,12 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        let dht_publication_tasks = nodes
+            .iter()
+            .cloned()
+            .zip(clients.iter().cloned())
+            .map(|(node, client)| tokio::spawn(run_dht_publications(node, client)))
+            .collect::<Vec<_>>();
         let coding_tasks = nodes
             .iter()
             .cloned()
@@ -17466,29 +17472,20 @@ mod tests {
         assert!(nodes[2].lock().unwrap().root_dirty().unwrap());
         watcher_task.take().unwrap().abort();
 
-        for _ in 0..6 {
-            let passes = nodes
-                .iter()
-                .cloned()
-                .zip(clients.iter())
-                .map(|(node, client)| publish_dht_once(node, client));
-            for result in futures::future::join_all(passes).await {
-                result.unwrap();
-            }
+        let recovery_readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
             if nodes
                 .iter()
                 .all(|node| node.lock().unwrap().seed_recovery_ready().unwrap())
             {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(
+                tokio::time::Instant::now() < recovery_readiness_deadline,
+                "all subjects must find current bundles from at least three other publishers"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(
-            nodes
-                .iter()
-                .all(|node| node.lock().unwrap().seed_recovery_ready().unwrap()),
-            "all subjects must find current bundles from at least three other publishers"
-        );
         let final_hash = final_checkpoint.hash().unwrap();
         let expires = unix_seconds() + 300;
         nodes[0]
@@ -17650,6 +17647,9 @@ mod tests {
             task.abort();
         }
         for task in peer_exchange_tasks {
+            task.abort();
+        }
+        for task in dht_publication_tasks {
             task.abort();
         }
         for client in &clients {
