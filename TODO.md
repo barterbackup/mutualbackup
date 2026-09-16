@@ -574,20 +574,40 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (completed)
+## Milestone 5 guild geometry and coding protocol (reopened)
 
-Milestone 5 passed its local source and test gate on 2026-09-16. The production
-backup path now schedules fair cross-user variable coding from the active guild,
-reuses exact committed coverage incrementally, plans bounded roles from live
-per-device capacity, and commits only replay-verified groups. Delegated attempts
-reserve storage before bulk input, use resumable authenticated ranges, separate
-the coding and verification coordinators, retain explicit historical geometry,
-and clean interrupted staged or uncommitted ready objects across membership
-changes. Dynamic membership, quorum, writer/recovery key epochs, recovery,
-audit/repair, and retention use the authenticated event history. The locked
-all-target workspace tests and warning-free Clippy passed locally; tests marked
-as requiring a provisioned Btrfs or private Chutney environment remained
-ignored. No remote compilation server was used.
+The first closure record at `8135e0b` was premature. A follow-up source audit
+found the remaining production gaps below. Commit `eeffd45` makes removal or
+relabel exclude old placement from new coverage, invalidates stale audit state,
+queues replacement coding without duplicating durable retries, and preserves
+old layout readability. Its complete node library suite and warning-free core/
+node Clippy gate passed locally. No remote compilation server was used.
+
+- [ ] **M5-01 / P1 — Protect multiple named roots with independent revision chains.**
+  `Node::add_protected_root` still rejects a second path, status and the watcher
+  expose one root, and `UserRevision`/retention track one sequence per owner.
+  Add durable root IDs to signed revisions and tombstones, keep a head and dirty
+  state per root, schedule every dirty root, and cover independent backup,
+  retention, restart, and restore selection.
+- [ ] **M5-02 / P1 — Integrate stable-slot incremental packing into production.**
+  `mb_core::pack_incremental` and `unpack_object` are exercised only by core
+  tests. The production backup path groups complete 64 KiB owner sectors into
+  coding lanes and never persists or consumes a `PackedCatalog`. Connect the
+  authenticated packing catalog to capture, coding, recovery, and restore, and
+  prove unchanged slots/ranges are reused across updates from different roots
+  and owners.
+- [ ] **M5-03 / P2 — Rank a delegated coder by every bulk lane path.**
+  `coding_candidate_path_rank` observes only the checkpoint coordinator's
+  current path to a candidate. It does not establish the candidate's direct or
+  fallback path to each information source and parity destination. Add bounded,
+  authenticated path observations and rank total input/output cost while still
+  preferring participants and retaining relay/onion availability.
+- [ ] **M5-04 / gate — Run the corrected production gate.**
+  The ignored repeated multi-owner QUIC test had a stale checkpoint-version
+  assertion, now corrected to version 5, but the provisioned Btrfs production
+  path has not been rerun for the reopened work. Run formatting, locked
+  all-target workspace tests, warning-free locked all-target Clippy, and the
+  local reflink/network acceptance gate after M5-01 through M5-03 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
