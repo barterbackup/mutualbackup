@@ -3143,7 +3143,10 @@ impl Node {
                 anyhow::bail!("durable coding launch job is invalid");
             }
             if !job.dispatched {
-                self.validate_coding_attempt_plan(&job.plan)?;
+                // Durable launches must remain claimable after their authority
+                // epoch changes so the worker can fence them instead of
+                // terminating on a permanently stale record.
+                self.validate_coding_attempt_authority(&job.plan)?;
                 return Ok(Some(job));
             }
         }
@@ -9862,6 +9865,7 @@ mod tests {
         );
         node.complete_coding_retry([212; 16]).unwrap();
         assert!(node.claim_coding_retry().unwrap().is_none());
+        node.enqueue_coding_launch(failed.clone()).unwrap();
 
         let state = node.dynamic_guild_state().unwrap().unwrap();
         let relabel = GuildEvent {
@@ -9886,6 +9890,9 @@ mod tests {
         .unwrap();
         assert!(node.validate_coding_attempt_plan(&failed).is_err());
         node.validate_coding_attempt_for_cleanup(&failed).unwrap();
+        assert_eq!(node.claim_coding_launch().unwrap().unwrap().plan, failed);
+        node.complete_coding_launch([212; 16]).unwrap();
+        assert!(node.claim_coding_launch().unwrap().is_none());
     }
 
     #[test]

@@ -5720,6 +5720,29 @@ pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -
         if let Some(job) = node_blocking(node.clone(), |node| node.claim_delegated_coding()).await?
         {
             let attempt_id = job.plan.value.attempt_id;
+            let attempt_membership_epoch = job.plan.value.membership_epoch;
+            let current_membership_epoch = node_blocking(node.clone(), |node| {
+                Ok(node
+                    .dynamic_guild_state()?
+                    .context("delegated coding requires dynamic guild state")?
+                    .membership_epoch)
+            })
+            .await?;
+            if attempt_membership_epoch != current_membership_epoch {
+                match abort_stale_delegated_coding(node.clone(), &p2p, &job).await {
+                    Ok(()) => {
+                        node_blocking(node.clone(), move |node| {
+                            node.complete_delegated_coding(attempt_id)
+                        })
+                        .await?;
+                    }
+                    Err(error) => {
+                        tracing::warn!(?attempt_id, %error, "stale delegated coding cleanup deferred");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+                continue;
+            }
             if job.state == DelegatedCodingJobState::ReportingFailure {
                 let failure = node_blocking(node.clone(), move |node| {
                     node.delegated_coding_failure(attempt_id)
@@ -5811,6 +5834,21 @@ pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -
 
         if let Some(job) = node_blocking(node.clone(), |node| node.claim_coding_retry()).await? {
             let failed_attempt_id = job.failure.value.plan.value.attempt_id;
+            let attempt_membership_epoch = job.failure.value.plan.value.membership_epoch;
+            let current_membership_epoch = node_blocking(node.clone(), |node| {
+                Ok(node
+                    .dynamic_guild_state()?
+                    .context("coding retry requires dynamic guild state")?
+                    .membership_epoch)
+            })
+            .await?;
+            if attempt_membership_epoch != current_membership_epoch {
+                node_blocking(node.clone(), move |node| {
+                    node.complete_coding_retry(failed_attempt_id)
+                })
+                .await?;
+                continue;
+            }
             match execute_coding_retry(node.clone(), &p2p, &job).await {
                 Ok(()) => {
                     node_blocking(node.clone(), move |node| {
@@ -5831,10 +5869,49 @@ pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -
             continue;
         }
 
+        if dispatch_next_coding_launch(node.clone(), &p2p).await? {
+            continue;
+        }
+
         if let Some(job) =
             node_blocking(node.clone(), |node| node.claim_coding_activation()).await?
         {
             let attempt_id = job.transcript.value.plan.value.attempt_id;
+            let attempt_membership_epoch = job.transcript.value.plan.value.membership_epoch;
+            let current_membership_epoch = node_blocking(node.clone(), |node| {
+                Ok(node
+                    .dynamic_guild_state()?
+                    .context("coding activation requires dynamic guild state")?
+                    .membership_epoch)
+            })
+            .await?;
+            if attempt_membership_epoch != current_membership_epoch {
+                let cleanup_job = DelegatedCodingJob {
+                    format_version: 1,
+                    plan: job.transcript.value.plan.clone(),
+                    state: DelegatedCodingJobState::Cleanup,
+                    transcript: None,
+                    error: Some("guild authority changed before coding activation".to_owned()),
+                };
+                match abort_stale_delegated_coding(node.clone(), &p2p, &cleanup_job).await {
+                    Ok(()) => {
+                        node_blocking(node.clone(), move |node| {
+                            node.complete_coding_activation(attempt_id)
+                        })
+                        .await?;
+                    }
+                    Err(error) => {
+                        let message = format!("stale coding cleanup failed: {error:#}");
+                        node_blocking(node.clone(), move |node| {
+                            node.defer_coding_activation(attempt_id, &message)
+                        })
+                        .await?;
+                        tracing::warn!(?attempt_id, %error, "stale coding activation cleanup deferred");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+                continue;
+            }
             match finish_coding_activation(node.clone(), &p2p, &job.transcript).await {
                 Ok(()) => {
                     node_blocking(node.clone(), move |node| {
@@ -5855,42 +5932,55 @@ pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -
             continue;
         }
 
-        if let Some(job) = node_blocking(node.clone(), |node| node.claim_coding_launch()).await? {
-            let attempt_id = job.plan.value.attempt_id;
-            let coordinator = job.plan.value.coding_coordinator;
-            let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
-            let result = if coordinator == local_id {
-                let plan = job.plan.clone();
-                node_blocking(node.clone(), move |node| {
-                    node.enqueue_delegated_coding(local_id, plan)
-                })
-                .await
-            } else {
-                p2p.delegate_coding_attempt(coordinator, job.plan.clone())
-                    .await
-            };
-            match result {
-                Ok(()) => {
-                    node_blocking(node.clone(), move |node| {
-                        node.complete_coding_launch(attempt_id)
-                    })
-                    .await?;
-                }
-                Err(error) => {
-                    let message = format!("{error:#}");
-                    node_blocking(node.clone(), move |node| {
-                        node.defer_coding_launch(attempt_id, &message)
-                    })
-                    .await?;
-                    tracing::warn!(?attempt_id, %error, "coding launch deferred");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            }
-            continue;
-        }
-
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+async fn dispatch_next_coding_launch(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<bool> {
+    let Some(job) = node_blocking(node.clone(), |node| node.claim_coding_launch()).await? else {
+        return Ok(false);
+    };
+    let attempt_id = job.plan.value.attempt_id;
+    let attempt_membership_epoch = job.plan.value.membership_epoch;
+    let current_membership_epoch = node_blocking(node.clone(), |node| {
+        Ok(node
+            .dynamic_guild_state()?
+            .context("coding launch requires dynamic guild state")?
+            .membership_epoch)
+    })
+    .await?;
+    if attempt_membership_epoch != current_membership_epoch {
+        node_blocking(node, move |node| node.complete_coding_launch(attempt_id)).await?;
+        return Ok(true);
+    }
+    let coordinator = job.plan.value.coding_coordinator;
+    let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
+    let result = if coordinator == local_id {
+        let plan = job.plan.clone();
+        node_blocking(node.clone(), move |node| {
+            node.enqueue_delegated_coding(local_id, plan)
+        })
+        .await
+    } else {
+        p2p.delegate_coding_attempt(coordinator, job.plan.clone())
+            .await
+    };
+    let dispatched = result.is_ok();
+    match result {
+        Ok(()) => {
+            node_blocking(node, move |node| node.complete_coding_launch(attempt_id)).await?;
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            node_blocking(node, move |node| {
+                node.defer_coding_launch(attempt_id, &message)
+            })
+            .await?;
+            tracing::warn!(?attempt_id, %error, "coding launch deferred");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+    Ok(dispatched)
 }
 
 async fn submit_delegated_coding_failure(
@@ -6307,7 +6397,37 @@ async fn abort_delegated_coding(
     p2p: &P2pClient,
     job: &DelegatedCodingJob,
 ) -> Result<()> {
+    abort_delegated_coding_with_policy(node, p2p, job, false).await
+}
+
+async fn abort_stale_delegated_coding(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    job: &DelegatedCodingJob,
+) -> Result<()> {
+    abort_delegated_coding_with_policy(node, p2p, job, true).await
+}
+
+async fn abort_delegated_coding_with_policy(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    job: &DelegatedCodingJob,
+    tolerate_inactive_holders: bool,
+) -> Result<()> {
     let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
+    let active_holders = if tolerate_inactive_holders {
+        node_blocking(node.clone(), |node| {
+            Ok(node
+                .dynamic_guild_state()?
+                .context("stale coding cleanup requires dynamic guild state")?
+                .active_members()
+                .map(|member| member.node_id)
+                .collect::<BTreeSet<_>>())
+        })
+        .await?
+    } else {
+        BTreeSet::new()
+    };
     let mut holders = BTreeSet::new();
     for information in &job.plan.value.geometry.information {
         if !information.sector.virtual_zero {
@@ -6317,19 +6437,34 @@ async fn abort_delegated_coding(
     for placement in &job.plan.value.geometry.parity {
         holders.insert(placement.holder);
     }
+    let mut first_error = None;
     for holder in holders {
-        if holder == local_id {
+        let result = if holder == local_id {
             let attempt_id = job.plan.value.attempt_id;
             let complete = node_blocking(node.clone(), move |node| {
                 node.discard_coding_attempt(&attempt_id)
             })
             .await?;
             if !complete {
-                bail!("some local staged coding volumes are offline");
+                Err(anyhow::anyhow!(
+                    "some local staged coding volumes are offline"
+                ))
+            } else {
+                Ok(())
             }
         } else {
-            p2p.abort_coding_attempt(holder, job.plan.clone()).await?;
+            p2p.abort_coding_attempt(holder, job.plan.clone()).await
+        };
+        if let Err(error) = result {
+            if tolerate_inactive_holders && !active_holders.contains(&holder) {
+                tracing::debug!(%holder, %error, "inactive holder did not acknowledge stale coding cleanup");
+            } else {
+                first_error.get_or_insert(error);
+            }
         }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
     Ok(())
 }
@@ -10054,7 +10189,21 @@ async fn wait_for_variable_coding_groups(
     node: Arc<Mutex<Node>>,
     checkpoint: GuildCheckpoint,
 ) -> Result<()> {
+    let expected_membership_epoch = checkpoint
+        .authority
+        .context("variable checkpoint has no dynamic authority")?
+        .membership_epoch;
     loop {
+        let current_membership_epoch = node_blocking(node.clone(), |node| {
+            Ok(node
+                .dynamic_guild_state()?
+                .context("backup coordinator has no dynamic guild state")?
+                .membership_epoch)
+        })
+        .await?;
+        if current_membership_epoch != expected_membership_epoch {
+            bail!("guild authority changed while variable coding was in progress");
+        }
         let pending_checkpoint = checkpoint.clone();
         let coverage = node_blocking(node.clone(), move |node| {
             node.validate_variable_checkpoint_coverage(&pending_checkpoint, false)
