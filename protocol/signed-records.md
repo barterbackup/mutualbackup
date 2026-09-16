@@ -19,8 +19,9 @@ Postcard's variable-length representation. A `SignedRecord<T>` is ordered as
 | `CodingGroup` | `id`, `format_version`, `guild_id`, `data_shards`, `parity_shards`, `shard_size`, five ordered `roles` | ID is BLAKE3 of the same fields except `id` |
 | `InformationRole` | `owner`, `sector` | embedded value |
 | `ParityRole` | `holder`, `row`, `root` | embedded value |
-| `GuildCheckpoint` | `format_version`, `guild_id`, `genesis_hash`, `generation`, `parent`, `members`, `writer_fences`, `revision_tombstones`, `revisions`, `coding_groups` | `mutualbackup/guild-checkpoint/v1`; hash is BLAKE3 of canonical bytes |
-| `QuorumCheckpoint` | `checkpoint`, `signatures` | certificate of checkpoint signatures |
+| `CheckpointAuthority` | `format_version`, `membership_epoch`, `quorum` | embedded version-5 checkpoint authority; the epoch changes with roster, failure-domain, or quorum-policy authorization |
+| `GuildCheckpoint` | versions 3–4: `format_version`, `guild_id`, `genesis_hash`, `generation`, `parent`, `members`, `writer_fences`, `revision_tombstones`, `revisions`, `coding_groups`; version 5 appends `authority` | `mutualbackup/guild-checkpoint/v1`; hash is BLAKE3 of canonical bytes; versions 3–4 retain their byte-exact legacy layout |
+| `QuorumCheckpoint` | `checkpoint`, `signatures` | certificate of checkpoint signatures; versions 3–4 require every listed member, while version 5 requires its epoch-bound guild quorum |
 | `MemberSignature` | `signer`, `signature` | signature domain belongs to containing certificate |
 | `StorageAcknowledgement` | `format_version`, `operation_id`, `guild_id`, `group_id`, `shard_index`, `row`, `root`, `holder` | `mutualbackup/storage-acknowledgement/v1` |
 | `EndpointRecord` | `format_version`, `publisher`, `sequence`, `expires_at_unix_seconds`, `endpoints` | `mutualbackup/endpoint-record/v1` |

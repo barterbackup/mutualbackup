@@ -266,6 +266,7 @@ impl PrototypeGuild {
                 revision_tombstones: Vec::new(),
                 revisions: vec![revision],
                 coding_groups: groups,
+                authority: None,
             },
             signatures: Vec::new(),
         };

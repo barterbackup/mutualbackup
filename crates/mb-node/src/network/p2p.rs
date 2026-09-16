@@ -27,26 +27,27 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use mb_core::{
     CODING_CHALLENGE_COMMITMENT_DOMAIN, CODING_CHALLENGE_REVEAL_DOMAIN,
-    CODING_FAILURE_REPORT_DOMAIN, CODING_SHARD_OPENING_DOMAIN, CodingAttemptPlan,
-    CodingChallengeCommitment, CodingChallengeReveal, CodingFailureReport, CodingGroup,
-    CodingGroupV2, CodingPlanGeometry, CodingProfile, CodingRootManifest, CodingShardOpening,
-    CodingVerificationTranscript, DynamicGuildState, GuildCheckpoint, GuildEvent, GuildEventTail,
-    GuildGenesis, GuildInvite, InformationRoleV2, MAX_GUILD_EVENT_TAIL, MERKLE_LEAF_SIZE, Member,
-    MemberSignature, NodeId, ParityPlacementV2, ParityRoleV2, QuorumCheckpoint, QuorumGuildEvent,
-    QuorumGuildGenesis, QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN, RangeSectorRef,
-    STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole,
-    ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement, UserRevision,
-    V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS,
-    V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_SECTOR_SIZE,
-    canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical, encode,
-    merkle_commit, merkle_zero_commitment, replay_coding_transcript, sector_root,
+    CODING_FAILURE_REPORT_DOMAIN, CODING_SHARD_OPENING_DOMAIN, CheckpointAuthority,
+    CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal, CodingFailureReport,
+    CodingGroup, CodingGroupV2, CodingPlanGeometry, CodingProfile, CodingRootManifest,
+    CodingShardOpening, CodingVerificationTranscript, DynamicGuildState, GuildCheckpoint,
+    GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, InformationRoleV2, MAX_GUILD_EVENT_TAIL,
+    MERKLE_LEAF_SIZE, Member, MemberSignature, NodeId, ParityPlacementV2, ParityRoleV2,
+    QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy, QuorumRule,
+    RECOVERY_LOCATOR_DOMAIN, RangeSectorRef, STAGED_STORAGE_RECEIPT_DOMAIN,
+    STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole, ShardRoleV2, SignedRecord,
+    StagedStorageReceipt, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
+    V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES,
+    V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_SECTOR_SIZE, canonical_bytes,
+    coding_challenge, coding_transfer_estimate, decode_canonical, encode, merkle_commit,
+    merkle_zero_commitment, replay_coding_transcript, sector_root,
 };
 use mb_store::{ParityObject, VariableParityObject};
 use uuid::Uuid;
 
 use crate::node::{
     CheckpointRecoveryObservation, CodingRetryJob, DelegatedCodingJob, DelegatedCodingJobState,
-    DhtRecordObservation, GuildPhase, SnapshotInfo,
+    DhtRecordObservation, GuildPhase, SnapshotInfo, checkpoint_matches_dynamic_authority,
 };
 
 #[cfg(test)]
@@ -7674,7 +7675,7 @@ async fn recover_from_dht_once(
     let recovered_roster = roster.clone();
     let recovery_checkpoint = checkpoint.clone();
     node_blocking(node.clone(), move |node| {
-        if recovery_checkpoint.checkpoint.format_version == 4 {
+        if matches!(recovery_checkpoint.checkpoint.format_version, 4 | 5) {
             node.adopt_recovered_dynamic_guild(
                 recovered_genesis,
                 &recovery_checkpoint,
@@ -7790,14 +7791,12 @@ async fn validate_recovery_head(
                     },
                     genesis.genesis.members.clone(),
                 )?;
-                let mut checkpoint_membership = replay
-                    .active_members()
-                    .eq(checkpoint.checkpoint.members.iter());
+                let mut checkpoint_membership =
+                    checkpoint_matches_dynamic_authority(&checkpoint.checkpoint, &replay);
                 for event in &events {
                     replay.apply_event(event)?;
-                    checkpoint_membership |= replay
-                        .active_members()
-                        .eq(checkpoint.checkpoint.members.iter());
+                    checkpoint_membership |=
+                        checkpoint_matches_dynamic_authority(&checkpoint.checkpoint, &replay);
                 }
                 Ok(genesis.genesis.guild_id == guild_id
                     && genesis.hash()? == checkpoint.checkpoint.genesis_hash
@@ -9004,7 +9003,7 @@ async fn recover_p2p_variable_shards(
     checkpoint: &QuorumCheckpoint,
     roster: &[GuildPeer],
 ) -> Result<()> {
-    if checkpoint.checkpoint.format_version != 4 {
+    if !matches!(checkpoint.checkpoint.format_version, 4 | 5) {
         return Ok(());
     }
     let checkpoint_hash = checkpoint.hash()?;
@@ -10033,7 +10032,7 @@ async fn commit_backup_job(
         local_id,
         previous,
         retention_revisions,
-        membership_epoch,
+        checkpoint_authority,
     ) = node_blocking(node.clone(), move |node| {
         let certificate = node
             .installed_guild_certificate()?
@@ -10053,7 +10052,11 @@ async fn commit_backup_job(
             node.keys().node_id(),
             previous,
             node.retention_revisions()?,
-            state.membership_epoch,
+            CheckpointAuthority {
+                format_version: 1,
+                membership_epoch: state.membership_epoch,
+                quorum: state.quorum,
+            },
         ))
     })
     .await?;
@@ -10168,7 +10171,7 @@ async fn commit_backup_job(
     )?;
     coding_groups.clear();
     let checkpoint = GuildCheckpoint {
-        format_version: 4,
+        format_version: 5,
         guild_id,
         genesis_hash: certificate.hash()?,
         generation,
@@ -10178,6 +10181,7 @@ async fn commit_backup_job(
         revision_tombstones,
         revisions,
         coding_groups,
+        authority: Some(checkpoint_authority),
     };
     checkpoint.validate()?;
     let checkpoint_hash = checkpoint.hash()?;
@@ -10198,35 +10202,64 @@ async fn commit_backup_job(
     let expected_variable_groups = queue_variable_coding_lanes(
         node.clone(),
         checkpoint_hash,
-        membership_epoch,
+        checkpoint_authority.membership_epoch,
         &peers,
         variable_lanes,
     )
     .await?;
     wait_for_variable_coding_groups(node.clone(), expected_variable_groups).await?;
     let body = canonical_bytes(&checkpoint)?;
-    publish_p2p_checkpoint_object(
+    let body_holders = publish_p2p_checkpoint_object(
         node.clone(),
         p2p,
         local_id,
         &peers,
+        None,
         CheckpointObjectKind::Body,
         guild_id,
         checkpoint_hash,
         &body,
     )
     .await?;
+    let required_signers = checkpoint_authority
+        .quorum
+        .required(checkpoint.members.len())?;
     let mut signatures = Vec::with_capacity(peers.len());
-    for peer in &peers {
+    let mut signature_requests = FuturesUnordered::new();
+    for peer in peers
+        .iter()
+        .filter(|peer| body_holders.contains(&peer.member.node_id))
+    {
         let signer = peer.member.node_id;
         let signature = if signer == local_id {
             let checkpoint = checkpoint.clone();
             node_blocking(node.clone(), move |node| node.sign_checkpoint(&checkpoint)).await?
         } else {
-            p2p.sign_checkpoint(signer, guild_id, checkpoint_hash)
-                .await?
+            signature_requests.push(async move {
+                (
+                    signer,
+                    p2p.sign_checkpoint(signer, guild_id, checkpoint_hash).await,
+                )
+            });
+            continue;
         };
         signatures.push(signature);
+    }
+    while let Some((signer, result)) = signature_requests.next().await {
+        match result {
+            Ok(signature)
+                if signature.signer == signer
+                    && checkpoint.verify_member_signature(&signature).is_ok() =>
+            {
+                signatures.push(signature);
+            }
+            Ok(signature) => {
+                tracing::warn!(%signer, returned = %signature.signer, "guild member returned an invalid checkpoint signature");
+            }
+            Err(error) => {
+                tracing::debug!(%signer, %error, "guild member did not sign checkpoint");
+            }
+        }
     }
     signatures.sort_by_key(|signature| signature.signer);
     let quorum = QuorumCheckpoint {
@@ -10235,26 +10268,63 @@ async fn commit_backup_job(
     };
     quorum.verify()?;
     let certificate_bytes = canonical_bytes(&quorum)?;
-    publish_p2p_checkpoint_object(
+    let certificate_signers = quorum
+        .signatures
+        .iter()
+        .map(|signature| signature.signer)
+        .collect::<BTreeSet<_>>();
+    let certificate_holders = publish_p2p_checkpoint_object(
         node.clone(),
         p2p,
         local_id,
         &peers,
+        Some(&certificate_signers),
         CheckpointObjectKind::Certificate,
         guild_id,
         checkpoint_hash,
         &certificate_bytes,
     )
     .await?;
-    for peer in peers.iter().filter(|peer| peer.member.node_id != local_id) {
-        p2p.finalize_checkpoint(peer.member.node_id, guild_id, checkpoint_hash)
-            .await?;
+    let mut finalized = BTreeSet::new();
+    let mut finalization_requests = FuturesUnordered::new();
+    if !certificate_holders.contains(&local_id) {
+        bail!("local checkpoint coordinator did not stage its certificate");
     }
-    node_blocking(node, move |node| {
-        node.finalize_staged_checkpoint(&guild_id, &checkpoint_hash)?;
-        Ok(())
+    for signer in certificate_holders
+        .into_iter()
+        .filter(|signer| *signer != local_id)
+    {
+        finalization_requests.push(async move {
+            (
+                signer,
+                p2p.finalize_checkpoint(signer, guild_id, checkpoint_hash)
+                    .await,
+            )
+        });
+    }
+    while let Some((signer, result)) = finalization_requests.next().await {
+        match result {
+            Ok(()) => {
+                finalized.insert(signer);
+            }
+            Err(error) => {
+                tracing::debug!(%signer, %error, "guild member did not finalize checkpoint");
+            }
+        }
+    }
+    if finalized.len() + 1 < required_signers {
+        bail!(
+            "checkpoint can finalize on only {} guild members but policy requires {required_signers}",
+            finalized.len() + 1
+        );
+    }
+    let finalized_hash = node_blocking(node, move |node| {
+        node.finalize_staged_checkpoint(&guild_id, &checkpoint_hash)
     })
     .await?;
+    if finalized_hash != checkpoint_hash {
+        bail!("local checkpoint finalization returned another checkpoint");
+    }
     Ok(checkpoint_hash)
 }
 
@@ -10470,47 +10540,65 @@ async fn publish_p2p_checkpoint_object(
     p2p: &P2pClient,
     local_id: NodeId,
     peers: &[GuildPeer],
+    selected: Option<&BTreeSet<NodeId>>,
     object_kind: CheckpointObjectKind,
     guild_id: [u8; 32],
     checkpoint_hash: [u8; 32],
     bytes: &[u8],
-) -> Result<()> {
+) -> Result<BTreeSet<NodeId>> {
+    let mut holders = peers
+        .iter()
+        .map(|peer| peer.member.node_id)
+        .filter(|peer| selected.is_none_or(|selected| selected.contains(peer)))
+        .collect::<BTreeSet<_>>();
+    if !holders.contains(&local_id) {
+        bail!("local checkpoint coordinator is absent from publication targets");
+    }
     let total_pages = checked_catalog_page_count(bytes.len())?;
     for (page_index, page) in bytes.chunks(V1_CATALOG_PAGE_BYTES).enumerate() {
         let page = page.to_vec();
         let page_hash = *blake3::hash(&page).as_bytes();
-        for peer in peers {
-            let peer_id = peer.member.node_id;
-            if peer_id == local_id {
-                let page = page.clone();
-                node_blocking(node.clone(), move |node| {
-                    node.stage_checkpoint_page(
-                        object_kind.as_str(),
-                        &guild_id,
-                        &checkpoint_hash,
+        let local_page = page.clone();
+        node_blocking(node.clone(), move |node| {
+            node.stage_checkpoint_page(
+                object_kind.as_str(),
+                &guild_id,
+                &checkpoint_hash,
+                page_index as u32,
+                total_pages,
+                &page_hash,
+                &local_page,
+            )
+        })
+        .await?;
+        let mut page_requests = FuturesUnordered::new();
+        for peer_id in holders.iter().copied().filter(|peer| *peer != local_id) {
+            let page = page.clone();
+            page_requests.push(async move {
+                (
+                    peer_id,
+                    p2p.put_checkpoint_page(
+                        peer_id,
+                        object_kind,
+                        guild_id,
+                        checkpoint_hash,
                         page_index as u32,
                         total_pages,
-                        &page_hash,
-                        &page,
+                        page_hash,
+                        page,
                     )
-                })
-                .await?;
-            } else {
-                p2p.put_checkpoint_page(
-                    peer_id,
-                    object_kind,
-                    guild_id,
-                    checkpoint_hash,
-                    page_index as u32,
-                    total_pages,
-                    page_hash,
-                    page.clone(),
+                    .await,
                 )
-                .await?;
+            });
+        }
+        while let Some((peer, result)) = page_requests.next().await {
+            if let Err(error) = result {
+                holders.remove(&peer);
+                tracing::debug!(%peer, %error, kind = object_kind.as_str(), "guild member did not stage checkpoint page");
             }
         }
     }
-    Ok(())
+    Ok(holders)
 }
 
 async fn node_blocking<T, F>(node: Arc<Mutex<Node>>, operation: F) -> Result<T>
@@ -13250,6 +13338,7 @@ mod tests {
                 revision_tombstones: Vec::new(),
                 revisions: Vec::new(),
                 coding_groups: vec![first_group.clone(), second_group.clone()],
+                authority: None,
             },
             signatures: Vec::new(),
         };
@@ -15080,6 +15169,7 @@ mod tests {
             revision_tombstones: Vec::new(),
             revisions,
             coding_groups: vec![group.clone()],
+            authority: None,
         };
         checkpoint_body.validate().unwrap();
         let mut signatures = Vec::new();

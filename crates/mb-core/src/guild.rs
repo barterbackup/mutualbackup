@@ -413,6 +413,7 @@ impl DynamicGuildState {
             GuildEventKind::SetQuorum { policy } => {
                 policy.required(self.active_members().count())?;
                 self.quorum = *policy;
+                self.membership_epoch += 1;
             }
             GuildEventKind::RotateWriterKey {
                 owner,

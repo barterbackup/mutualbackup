@@ -502,7 +502,14 @@ pub fn coding_group_id(
     .as_bytes())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointAuthority {
+    pub format_version: u16,
+    pub membership_epoch: u64,
+    pub quorum: crate::QuorumPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuildCheckpoint {
     pub format_version: u16,
     pub guild_id: [u8; 32],
@@ -514,6 +521,103 @@ pub struct GuildCheckpoint {
     pub revision_tombstones: Vec<RevisionTombstone>,
     pub revisions: Vec<SignedRecord<UserRevision>>,
     pub coding_groups: Vec<CodingGroup>,
+    pub authority: Option<CheckpointAuthority>,
+}
+
+impl Serialize for GuildCheckpoint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let field_count = match (self.format_version, self.authority) {
+            (version, None) if version != 5 => 10,
+            (5, Some(_)) => 11,
+            _ => {
+                return Err(serde::ser::Error::custom(
+                    "invalid checkpoint authority version",
+                ));
+            }
+        };
+        let mut tuple = serializer.serialize_tuple(field_count)?;
+        tuple.serialize_element(&self.format_version)?;
+        tuple.serialize_element(&self.guild_id)?;
+        tuple.serialize_element(&self.genesis_hash)?;
+        tuple.serialize_element(&self.generation)?;
+        tuple.serialize_element(&self.parent)?;
+        tuple.serialize_element(&self.members)?;
+        tuple.serialize_element(&self.writer_fences)?;
+        tuple.serialize_element(&self.revision_tombstones)?;
+        tuple.serialize_element(&self.revisions)?;
+        tuple.serialize_element(&self.coding_groups)?;
+        if let Some(authority) = self.authority {
+            tuple.serialize_element(&authority)?;
+        }
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for GuildCheckpoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct GuildCheckpointVisitor;
+
+        impl<'de> Visitor<'de> for GuildCheckpointVisitor {
+            type Value = GuildCheckpoint;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a versioned guild checkpoint")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let format_version = next_checkpoint_field(&mut sequence, "format version")?;
+                let guild_id = next_checkpoint_field(&mut sequence, "guild ID")?;
+                let genesis_hash = next_checkpoint_field(&mut sequence, "genesis hash")?;
+                let generation = next_checkpoint_field(&mut sequence, "generation")?;
+                let parent = next_checkpoint_field(&mut sequence, "parent")?;
+                let members = next_checkpoint_field(&mut sequence, "members")?;
+                let writer_fences = next_checkpoint_field(&mut sequence, "writer fences")?;
+                let revision_tombstones =
+                    next_checkpoint_field(&mut sequence, "revision tombstones")?;
+                let revisions = next_checkpoint_field(&mut sequence, "revisions")?;
+                let coding_groups = next_checkpoint_field(&mut sequence, "coding groups")?;
+                let authority = match format_version {
+                    version if version != 5 => None,
+                    5 => Some(next_checkpoint_field(&mut sequence, "authority")?),
+                    _ => return Err(serde::de::Error::custom("invalid checkpoint version")),
+                };
+                Ok(GuildCheckpoint {
+                    format_version,
+                    guild_id,
+                    genesis_hash,
+                    generation,
+                    parent,
+                    members,
+                    writer_fences,
+                    revision_tombstones,
+                    revisions,
+                    coding_groups,
+                    authority,
+                })
+            }
+        }
+
+        deserializer.deserialize_tuple(11, GuildCheckpointVisitor)
+    }
+}
+
+fn next_checkpoint_field<'de, A, T>(sequence: &mut A, name: &'static str) -> Result<T, A::Error>
+where
+    A: SeqAccess<'de>,
+    T: Deserialize<'de>,
+{
+    sequence
+        .next_element()?
+        .ok_or_else(|| serde::de::Error::missing_field(name))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -530,14 +634,14 @@ pub struct QuorumCheckpoint {
 
 impl GuildCheckpoint {
     pub fn validate(&self) -> Result<(), ModelError> {
-        if !matches!(self.format_version, 3 | 4)
+        if !matches!(self.format_version, 3..=5)
             || self.genesis_hash == [0; 32]
             || self.generation == 0
             || self.generation > i64::MAX as u64
             || (self.generation == 1) != self.parent.is_none()
             || match self.format_version {
                 3 => self.members.len() != 5,
-                4 => self.members.is_empty() || self.members.len() > 256,
+                4 | 5 => self.members.is_empty() || self.members.len() > 256,
                 _ => true,
             }
             || self.revisions.is_empty()
@@ -546,6 +650,14 @@ impl GuildCheckpoint {
             || self.coding_groups.len() > V1_MAX_CODING_GROUPS
         {
             return Err(ModelError::InvalidCheckpoint);
+        }
+        match (self.format_version, self.authority) {
+            (3 | 4, None) => {}
+            (5, Some(authority))
+                if authority.format_version == 1
+                    && authority.membership_epoch > 0
+                    && authority.quorum.required(self.members.len()).is_ok() => {}
+            _ => return Err(ModelError::InvalidCheckpoint),
         }
         let mut member_ids = std::collections::BTreeSet::new();
         let mut failure_domains = std::collections::BTreeMap::new();
@@ -732,6 +844,30 @@ impl GuildCheckpoint {
                 .to_vec(),
         })
     }
+
+    pub fn verify_member_signature(
+        &self,
+        member_signature: &MemberSignature,
+    ) -> Result<(), ModelError> {
+        self.validate()?;
+        if !self
+            .members
+            .iter()
+            .any(|member| member.node_id == member_signature.signer)
+        {
+            return Err(ModelError::NonMemberSigner(member_signature.signer));
+        }
+        let key = VerifyingKey::from_bytes(&member_signature.signer.0)?;
+        if key.is_weak() {
+            return Err(ModelError::WeakPublicKey);
+        }
+        let signature = Signature::from_slice(&member_signature.signature)?;
+        key.verify_strict(
+            &signing_payload(b"mutualbackup/guild-checkpoint/v1", &canonical_bytes(self)?),
+            &signature,
+        )?;
+        Ok(())
+    }
 }
 
 impl GuildGenesis {
@@ -875,10 +1011,17 @@ impl QuorumCheckpoint {
             )?;
             previous_signer = Some(member_signature.signer);
         }
-        // The fixed v1 slice relies on each role holder's signature as its
-        // durable-storage and coding-validation attestation. A smaller quorum
-        // could certify a group without either parity holder participating.
-        let quorum = self.checkpoint.members.len();
+        // Legacy certificates used each member signature as both checkpoint
+        // authorization and storage attestation. Version five separates those
+        // facts: replayable coding transcripts contain signed holder receipts,
+        // so the epoch-bound guild policy authorizes the checkpoint itself.
+        let quorum = match self.checkpoint.authority {
+            Some(authority) if self.checkpoint.format_version == 5 => authority
+                .quorum
+                .required(member_ids.len())
+                .map_err(|_| ModelError::InvalidCheckpoint)?,
+            _ => self.checkpoint.members.len(),
+        };
         if valid_signers.len() < quorum {
             return Err(ModelError::InsufficientQuorum {
                 actual: valid_signers.len(),
@@ -932,7 +1075,7 @@ impl QuorumCheckpoint {
                 .members
                 .iter()
                 .any(|member| member.node_id == locator.publisher)
-            || !self.has_signature(subject)
+            || self.checkpoint.format_version < 5 && !self.has_signature(subject)
         {
             return Err(ModelError::InvalidRecoveryAuthority);
         }
@@ -1433,6 +1576,7 @@ mod tests {
                 revision_tombstones: Vec::new(),
                 revisions: vec![revision],
                 coding_groups: vec![group],
+                authority: None,
             },
             signatures: Vec::new(),
         };
@@ -1452,6 +1596,49 @@ mod tests {
         variable_checkpoint.format_version = 4;
         variable_checkpoint.coding_groups.clear();
         variable_checkpoint.validate().unwrap();
+
+        #[derive(Serialize)]
+        struct LegacyGuildCheckpoint {
+            format_version: u16,
+            guild_id: [u8; 32],
+            genesis_hash: [u8; 32],
+            generation: u64,
+            parent: Option<[u8; 32]>,
+            members: Vec<Member>,
+            writer_fences: Vec<WriterFence>,
+            revision_tombstones: Vec<RevisionTombstone>,
+            revisions: Vec<SignedRecord<UserRevision>>,
+            coding_groups: Vec<CodingGroup>,
+        }
+        let legacy_bytes = |body: &GuildCheckpoint| {
+            canonical_bytes(&LegacyGuildCheckpoint {
+                format_version: body.format_version,
+                guild_id: body.guild_id,
+                genesis_hash: body.genesis_hash,
+                generation: body.generation,
+                parent: body.parent,
+                members: body.members.clone(),
+                writer_fences: body.writer_fences.clone(),
+                revision_tombstones: body.revision_tombstones.clone(),
+                revisions: body.revisions.clone(),
+                coding_groups: body.coding_groups.clone(),
+            })
+            .unwrap()
+        };
+        for legacy in [&checkpoint.checkpoint, &variable_checkpoint] {
+            let encoded = canonical_bytes(legacy).unwrap();
+            assert_eq!(encoded, legacy_bytes(legacy));
+            assert_eq!(
+                decode_canonical::<GuildCheckpoint>(&encoded).unwrap(),
+                *legacy
+            );
+        }
+        let legacy_certificate = canonical_bytes(&checkpoint).unwrap();
+        assert_eq!(
+            decode_canonical::<QuorumCheckpoint>(&legacy_certificate).unwrap(),
+            checkpoint
+        );
+
         variable_checkpoint
             .members
             .retain(|member| member.node_id != keys[0].node_id());
@@ -1470,6 +1657,50 @@ mod tests {
             }
         }
         dynamic_quorum.verify().unwrap();
+
+        let mut policy_checkpoint = variable_checkpoint.clone();
+        policy_checkpoint.format_version = 5;
+        policy_checkpoint.authority = Some(CheckpointAuthority {
+            format_version: 1,
+            membership_epoch: 2,
+            quorum: crate::QuorumPolicy {
+                format_version: 1,
+                rule: crate::QuorumRule::Majority,
+            },
+        });
+        let mut policy_quorum = QuorumCheckpoint {
+            checkpoint: policy_checkpoint,
+            signatures: Vec::new(),
+        };
+        for key in keys.iter().filter(|key| {
+            variable_checkpoint
+                .members
+                .iter()
+                .any(|member| member.node_id == key.node_id())
+        }) {
+            if policy_quorum.signatures.len() == 3 {
+                break;
+            }
+            policy_quorum.add_signature(key).unwrap();
+        }
+        policy_quorum.verify().unwrap();
+        let mut invalid_signature = policy_quorum.signatures[0].clone();
+        invalid_signature.signature[0] ^= 1;
+        assert!(
+            policy_quorum
+                .checkpoint
+                .verify_member_signature(&invalid_signature)
+                .is_err()
+        );
+        policy_quorum.signatures.pop();
+        assert!(matches!(
+            policy_quorum.verify(),
+            Err(ModelError::InsufficientQuorum {
+                actual: 2,
+                required: 3
+            })
+        ));
+
         variable_checkpoint.format_version = 3;
         assert!(matches!(
             variable_checkpoint.validate(),

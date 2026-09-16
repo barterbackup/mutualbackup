@@ -1937,7 +1937,7 @@ impl Node {
             certificate,
         };
         let guild_id = installed.certificate.genesis.guild_id;
-        if checkpoint.checkpoint.format_version != 4
+        if !matches!(checkpoint.checkpoint.format_version, 4 | 5)
             || checkpoint.checkpoint.guild_id != guild_id
             || checkpoint.checkpoint.genesis_hash != installed.certificate.hash()?
         {
@@ -1945,9 +1945,8 @@ impl Node {
         }
         let mut state = initial_dynamic_guild_state(&installed)?;
         let mut authority_states = BTreeMap::from([(state.membership_epoch, state.clone())]);
-        let mut checkpoint_membership = state
-            .active_members()
-            .eq(checkpoint.checkpoint.members.iter());
+        let mut checkpoint_membership =
+            checkpoint_matches_dynamic_authority(&checkpoint.checkpoint, &state);
         let mut event_records = Vec::with_capacity(events.len());
         for event in events {
             let record_id = event.event.sequence.to_be_bytes().to_vec();
@@ -1955,9 +1954,8 @@ impl Node {
             authority_states
                 .entry(state.membership_epoch)
                 .or_insert_with(|| state.clone());
-            checkpoint_membership |= state
-                .active_members()
-                .eq(checkpoint.checkpoint.members.iter());
+            checkpoint_membership |=
+                checkpoint_matches_dynamic_authority(&checkpoint.checkpoint, &state);
             event_records.push((
                 "guild-event".to_owned(),
                 record_id,
@@ -1975,7 +1973,7 @@ impl Node {
             .map(|member| member.member.clone())
             .context("recovered dynamic guild does not authorize this seed identity")?;
         if local_member.recovery_public_key != self.keys.recovery_public_key()
-            || !checkpoint.has_signature(local_id)
+            || checkpoint.checkpoint.format_version < 5 && !checkpoint.has_signature(local_id)
             || !checkpoint.checkpoint.members.iter().any(|member| {
                 member.node_id == local_id
                     && member.recovery_public_key == self.keys.recovery_public_key()
@@ -5010,13 +5008,13 @@ impl Node {
         checkpoint: &GuildCheckpoint,
         recovered_head: bool,
     ) -> Result<()> {
-        if checkpoint.format_version != 4 {
+        if !matches!(checkpoint.format_version, 4 | 5) {
             return Ok(());
         }
         let checkpoint_hash = checkpoint.hash()?;
         let state = self
             .dynamic_guild_state()?
-            .context("version-four checkpoint requires dynamic guild state")?;
+            .context("dynamic checkpoint requires dynamic guild state")?;
         if state.guild_id != checkpoint.guild_id {
             anyhow::bail!("checkpoint and dynamic guild state differ");
         }
@@ -5198,25 +5196,26 @@ impl Node {
             } else {
                 let durable = self
                     .dynamic_guild_state()?
-                    .context("version-four checkpoint requires dynamic guild state")?;
+                    .context("dynamic checkpoint requires dynamic guild state")?;
                 let mut replay = initial_dynamic_guild_state(&installed)?;
                 let mut historical_membership =
-                    replay.active_members().eq(checkpoint.members.iter());
+                    checkpoint_matches_dynamic_authority(checkpoint, &replay);
                 for (record_id, bytes) in self.control.records("guild-event")? {
                     let event: QuorumGuildEvent = decode_canonical(&bytes)?;
                     if record_id != event.event.sequence.to_be_bytes() {
                         anyhow::bail!("guild event history has an invalid record ID");
                     }
                     replay.apply_event(&event)?;
-                    historical_membership |= replay.active_members().eq(checkpoint.members.iter());
+                    historical_membership |=
+                        checkpoint_matches_dynamic_authority(checkpoint, &replay);
                 }
                 if replay != durable || !historical_membership {
                     anyhow::bail!("checkpoint membership is absent from guild event history");
                 }
                 if require_current_membership
-                    && !durable.active_members().eq(checkpoint.members.iter())
+                    && !checkpoint_matches_dynamic_authority(checkpoint, &durable)
                 {
-                    anyhow::bail!("checkpoint does not use the current guild membership");
+                    anyhow::bail!("checkpoint does not use the current guild authority");
                 }
                 let historical = durable
                     .members
@@ -6012,29 +6011,29 @@ impl Node {
         checkpoint.verify()?;
         let checkpoint_hash = checkpoint.hash()?;
         let local_id = self.keys.node_id();
-        let (publication_members, recovery_envelopes) = if checkpoint.checkpoint.format_version == 4
-        {
-            let state = self
-                .dynamic_guild_state()?
-                .context("version-four DHT publication requires dynamic guild state")?;
-            let active = state.active_members().cloned().collect::<Vec<_>>();
-            if active != checkpoint.checkpoint.members {
-                return Ok(None);
-            }
-            let mut envelopes = BTreeMap::new();
-            for member in &active {
-                if member.node_id == local_id {
-                    continue;
-                }
-                let Some(epoch) = state.current_recovery_key(member.node_id) else {
+        let (publication_members, recovery_envelopes) =
+            if matches!(checkpoint.checkpoint.format_version, 4 | 5) {
+                let state = self
+                    .dynamic_guild_state()?
+                    .context("dynamic DHT publication requires dynamic guild state")?;
+                let active = state.active_members().cloned().collect::<Vec<_>>();
+                if active != checkpoint.checkpoint.members {
                     return Ok(None);
-                };
-                envelopes.insert(member.node_id, epoch.envelope.clone());
-            }
-            (active, envelopes)
-        } else {
-            (checkpoint.checkpoint.members.clone(), BTreeMap::new())
-        };
+                }
+                let mut envelopes = BTreeMap::new();
+                for member in &active {
+                    if member.node_id == local_id {
+                        continue;
+                    }
+                    let Some(epoch) = state.current_recovery_key(member.node_id) else {
+                        return Ok(None);
+                    };
+                    envelopes.insert(member.node_id, epoch.envelope.clone());
+                }
+                (active, envelopes)
+            } else {
+                (checkpoint.checkpoint.members.clone(), BTreeMap::new())
+            };
         let recovery_epochs = recovery_envelopes
             .iter()
             .map(|(subject, envelope)| (*subject, envelope.epoch))
@@ -6557,7 +6556,7 @@ impl Node {
             4 => {
                 let state = self
                     .dynamic_guild_state()?
-                    .context("version-four recovery requires dynamic guild state")?;
+                    .context("dynamic recovery requires dynamic guild state")?;
                 let current = state
                     .current_recovery_key(bundle.subject)
                     .context("recovery key epoch is unavailable or revoked")?;
@@ -6677,10 +6676,10 @@ impl Node {
         checkpoint: &QuorumCheckpoint,
     ) -> Result<(BTreeSet<NodeId>, usize)> {
         let local_id = self.keys.node_id();
-        let members = if checkpoint.checkpoint.format_version == 4 {
+        let members = if matches!(checkpoint.checkpoint.format_version, 4 | 5) {
             let state = self
                 .dynamic_guild_state()?
-                .context("version-four recovery readiness requires dynamic guild state")?;
+                .context("dynamic recovery readiness requires dynamic guild state")?;
             let active = state.active_members().cloned().collect::<Vec<_>>();
             if active != checkpoint.checkpoint.members {
                 anyhow::bail!("recovery readiness checkpoint has a stale membership roster");
@@ -7797,6 +7796,26 @@ fn initial_dynamic_guild_state(installed: &InstalledGuild) -> Result<DynamicGuil
     )?)
 }
 
+pub(crate) fn checkpoint_matches_dynamic_authority(
+    checkpoint: &GuildCheckpoint,
+    state: &DynamicGuildState,
+) -> bool {
+    if checkpoint.guild_id != state.guild_id
+        || !state.active_members().eq(checkpoint.members.iter())
+    {
+        return false;
+    }
+    match checkpoint.format_version {
+        4 => checkpoint.authority.is_none(),
+        5 => checkpoint.authority.is_some_and(|authority| {
+            authority.format_version == 1
+                && authority.membership_epoch == state.membership_epoch
+                && authority.quorum == state.quorum
+        }),
+        _ => false,
+    }
+}
+
 fn validate_dynamic_state_origin(
     state: &DynamicGuildState,
     initial: &DynamicGuildState,
@@ -8350,6 +8369,7 @@ mod tests {
                 revision_tombstones: Vec::new(),
                 revisions: vec![revision],
                 coding_groups: vec![group],
+                authority: None,
             },
             signatures: Vec::new(),
         };
@@ -8512,6 +8532,7 @@ mod tests {
                 revision_tombstones: Vec::new(),
                 revisions: vec![revision.clone()],
                 coding_groups: vec![group],
+                authority: None,
             },
             signatures: Vec::new(),
         };
@@ -9213,6 +9234,7 @@ mod tests {
                 }],
                 revisions: vec![revision],
                 coding_groups: vec![group],
+                authority: None,
             },
             signatures: Vec::new(),
         };
@@ -9663,6 +9685,7 @@ mod tests {
                 revision_tombstones: Vec::new(),
                 revisions: vec![revision],
                 coding_groups: Vec::new(),
+                authority: None,
             },
             signatures: Vec::new(),
         };
@@ -10400,6 +10423,7 @@ mod tests {
                 revision_tombstones: Vec::new(),
                 revisions: vec![revision],
                 coding_groups: Vec::new(),
+                authority: None,
             },
             signatures: Vec::new(),
         };
@@ -10692,6 +10716,7 @@ mod tests {
                 revision_tombstones: Vec::new(),
                 revisions: vec![revision],
                 coding_groups: Vec::new(),
+                authority: None,
             },
             signatures: Vec::new(),
         };

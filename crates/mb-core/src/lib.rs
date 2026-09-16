@@ -44,12 +44,12 @@ pub use keys::{
     SeedParseError, WrappedDatabaseKey,
 };
 pub use model::{
-    CodingGroup, CodingGroupId, CodingGroupV2, EndpointRecord, GuildCheckpoint, GuildGenesis,
-    GuildInvite, InformationRole, InformationRoleV2, Member, MemberSignature, ModelError,
-    ParityRole, ParityRoleV2, QuorumCheckpoint, QuorumGuildGenesis, RangeSectorRef, RecoveryBundle,
-    RevisionTombstone, SectorId, SectorRef, ShardRole, ShardRoleV2, SignedRecord,
-    StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision, WriterFence, canonical_bytes,
-    coding_group_id, coding_group_v2_id, decode_canonical,
+    CheckpointAuthority, CodingGroup, CodingGroupId, CodingGroupV2, EndpointRecord,
+    GuildCheckpoint, GuildGenesis, GuildInvite, InformationRole, InformationRoleV2, Member,
+    MemberSignature, ModelError, ParityRole, ParityRoleV2, QuorumCheckpoint, QuorumGuildGenesis,
+    RangeSectorRef, RecoveryBundle, RevisionTombstone, SectorId, SectorRef, ShardRole, ShardRoleV2,
+    SignedRecord, StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision, WriterFence,
+    canonical_bytes, coding_group_id, coding_group_v2_id, decode_canonical,
 };
 pub use packing::{
     PackedCatalog, PackedSector, PackedSectorDescriptor, PackedSlot, PackedSourceChunk,
