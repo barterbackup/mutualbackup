@@ -7,6 +7,7 @@
 mod attempt;
 mod coding;
 mod content;
+mod guild;
 mod keys;
 mod model;
 mod range;
@@ -28,6 +29,12 @@ pub use coding::{
 pub use content::{
     ContentError, SectorPurpose, crypt_sector, encrypted_sector, make_sector_id,
     synthetic_filler_sector,
+};
+pub use guild::{
+    DynamicGuildState, DynamicMember, GUILD_EVENT_DOMAIN, GuildEvent, GuildEventKind,
+    GuildEventTail, GuildStateError, QuorumGuildEvent, QuorumPolicy, QuorumRule,
+    RecoveryEpochSecret, RecoveryKeyEnvelope, RecoveryKeyEpoch, RetainedCodingGroup,
+    WriterKeyEpoch, create_recovery_key_envelope, open_recovery_key_envelope, sign_guild_event,
 };
 pub use keys::{
     DatabaseKeyError, KeyIdentityError, KeyMaterial, NodeId, RecoveryPublicKey, Seed,
