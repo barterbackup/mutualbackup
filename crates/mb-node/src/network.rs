@@ -48,7 +48,6 @@ mod p2p;
 mod port_mapping;
 mod tor;
 mod wire;
-pub(crate) use p2p::restore_snapshot_with_p2p;
 pub(crate) use p2p::validate_published_endpoint;
 pub use p2p::{
     DhtRecord, DhtRecoveryResult, P2pActiveSession, P2pClient, P2pConfig, P2pEventLoop, P2pPath,
@@ -59,6 +58,7 @@ pub use p2p::{
     run_peer_exchange, run_relay_membership_sync, validate_bootstrap_addresses,
     validate_local_advertised_endpoints,
 };
+pub(crate) use p2p::{GuildAdministration, commit_guild_administration, restore_snapshot_with_p2p};
 pub use port_mapping::{run_port_mapping, validate_port_mapping_listeners};
 pub use tor::{
     ClaimedTorTransportConfig, ONION_SERVICE_PORT, PreparedTorTransportConfig, TorMode,

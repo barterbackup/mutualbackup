@@ -32,6 +32,11 @@ local-request =
   / "GuildRetry"
   / "GuildCancel"
   / "GuildFinalize"
+  / { "GuildRemoveMember": { node_id: bytes32-array } }
+  / { "GuildRelabelMember": { node_id: bytes32-array, failure_domain: tstr } }
+  / { "GuildSetQuorum": { policy: quorum-policy } }
+  / "GuildRotateRecoveryKey"
+  / { "GuildRevokeRecoveryKey": { subject: bytes32-array, epoch: uint } }
   / { "Backup": { wait: bool } }
   / { "BackupStatus": { revision_id: uuid-text } }
   / { "Recover": { target: tstr } }
@@ -52,6 +57,7 @@ local-response =
   / { "RootAdded": protected-root }
   / { "Guild": null / guild-summary }
   / { "GuildInvite": { token: tstr, expires_at_unix_seconds: uint } }
+  / { "GuildEventCommitted": { sequence: uint, event_hash: bytes32-array } }
   / { "BackupJob": backup-job }
   / { "Recovered": dht-recovery-result }
   / { "Snapshots": [* snapshot-info] }
@@ -202,7 +208,15 @@ guild-summary = {
   guild_id: bytes32-array,
   coordinator: bytes32-array,
   phase: "Draft" / "Joining" / "Active",
-  peers: [* guild-peer]
+  peers: [* guild-peer],
+  membership_epoch: null / uint,
+  event_sequence: null / uint,
+  quorum: null / quorum-policy
+}
+
+quorum-policy = {
+  format_version: 1,
+  rule: "Unanimous" / "Majority" / { "Threshold": uint }
 }
 
 guild-peer = { member: member, endpoints: [* tstr] }

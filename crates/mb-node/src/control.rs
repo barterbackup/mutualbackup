@@ -22,7 +22,8 @@ use zeroize::Zeroizing;
 use crate::{
     AutomaticBackupStatus, BackupJob, BackupJobState, GuildAuditReport, Node, P2pClient, P2pStatus,
     ProtectionState, StorageVolumeStatus, WireError, audit_guild,
-    network::restore_snapshot_with_p2p, recover_from_dht,
+    network::{GuildAdministration, commit_guild_administration, restore_snapshot_with_p2p},
+    recover_from_dht,
 };
 
 mod wire;
@@ -446,6 +447,66 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GuildRemoveMember { node_id } => {
+            commit_guild_administration(node, &p2p, GuildAdministration::RemoveMember(node_id))
+                .await
+                .map(
+                    |(sequence, event_hash)| LocalResponse::GuildEventCommitted {
+                        sequence,
+                        event_hash,
+                    },
+                )
+        }
+        LocalRequest::GuildRelabelMember {
+            node_id,
+            failure_domain,
+        } => commit_guild_administration(
+            node,
+            &p2p,
+            GuildAdministration::RelabelMember {
+                node_id,
+                failure_domain,
+            },
+        )
+        .await
+        .map(
+            |(sequence, event_hash)| LocalResponse::GuildEventCommitted {
+                sequence,
+                event_hash,
+            },
+        ),
+        LocalRequest::GuildSetQuorum { policy } => {
+            commit_guild_administration(node, &p2p, GuildAdministration::SetQuorum(policy))
+                .await
+                .map(
+                    |(sequence, event_hash)| LocalResponse::GuildEventCommitted {
+                        sequence,
+                        event_hash,
+                    },
+                )
+        }
+        LocalRequest::GuildRotateRecoveryKey => {
+            commit_guild_administration(node, &p2p, GuildAdministration::RotateLocalRecoveryKey)
+                .await
+                .map(
+                    |(sequence, event_hash)| LocalResponse::GuildEventCommitted {
+                        sequence,
+                        event_hash,
+                    },
+                )
+        }
+        LocalRequest::GuildRevokeRecoveryKey { subject, epoch } => commit_guild_administration(
+            node,
+            &p2p,
+            GuildAdministration::RevokeRecoveryKey { subject, epoch },
+        )
+        .await
+        .map(
+            |(sequence, event_hash)| LocalResponse::GuildEventCommitted {
+                sequence,
+                event_hash,
+            },
+        ),
         LocalRequest::Backup { wait } => submit_local_backup(node, &p2p, wait)
             .await
             .map(LocalResponse::BackupJob),

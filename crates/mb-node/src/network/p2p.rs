@@ -6675,6 +6675,105 @@ async fn commit_plain_guild_event(
     node_blocking(node, move |node| node.install_guild_event(certified)).await
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum GuildAdministration {
+    RemoveMember(NodeId),
+    RelabelMember {
+        node_id: NodeId,
+        failure_domain: String,
+    },
+    SetQuorum(QuorumPolicy),
+    RotateLocalRecoveryKey,
+    RevokeRecoveryKey {
+        subject: NodeId,
+        epoch: u64,
+    },
+}
+
+pub(crate) async fn commit_guild_administration(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    administration: GuildAdministration,
+) -> Result<(u64, [u8; 32])> {
+    let (state, guild, local_id, event) = node_blocking(node.clone(), move |node| {
+        let state = node
+            .dynamic_guild_state()?
+            .context("guild administration requires dynamic guild state")?;
+        let guild = node
+            .guild_summary()?
+            .context("guild administration requires an installed guild")?;
+        if !matches!(guild.phase, GuildPhase::Active) {
+            bail!("guild administration requires an active guild");
+        }
+        let local_id = node.keys().node_id();
+        let kind = match administration {
+            GuildAdministration::RemoveMember(node_id) => {
+                require_guild_administrator(&guild, local_id)?;
+                mb_core::GuildEventKind::RemoveMember { node_id }
+            }
+            GuildAdministration::RelabelMember {
+                node_id,
+                failure_domain,
+            } => {
+                require_guild_administrator(&guild, local_id)?;
+                mb_core::GuildEventKind::RelabelMember {
+                    node_id,
+                    failure_domain,
+                }
+            }
+            GuildAdministration::SetQuorum(policy) => {
+                require_guild_administrator(&guild, local_id)?;
+                mb_core::GuildEventKind::SetQuorum { policy }
+            }
+            GuildAdministration::RotateLocalRecoveryKey => {
+                let epoch = state
+                    .recovery_keys
+                    .iter()
+                    .filter(|entry| entry.envelope.subject == local_id)
+                    .map(|entry| entry.envelope.epoch)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .context("recovery-key epoch exhausted")?;
+                let (envelope, _) =
+                    mb_core::create_recovery_key_envelope(node.keys(), state.guild_id, epoch)?;
+                mb_core::GuildEventKind::RotateRecoveryKey { envelope }
+            }
+            GuildAdministration::RevokeRecoveryKey { subject, epoch } => {
+                require_guild_administrator(&guild, local_id)?;
+                mb_core::GuildEventKind::RevokeRecoveryKey { subject, epoch }
+            }
+        };
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: state
+                .event_sequence
+                .checked_add(1)
+                .context("guild event sequence exhausted")?,
+            parent: state.event_head,
+            kind,
+        };
+        state.validate_event_proposal(&event)?;
+        Ok((state, guild, local_id, event))
+    })
+    .await?;
+    let sequence = event.sequence;
+    let event_hash = event.hash()?;
+    commit_plain_guild_event(node, p2p, state, guild, local_id, event).await?;
+    Ok((sequence, event_hash))
+}
+
+fn require_guild_administrator(guild: &crate::GuildSummary, local_id: NodeId) -> Result<()> {
+    if guild.coordinator != local_id {
+        bail!(
+            "guild administration must be submitted through coordinator {}",
+            guild.coordinator
+        );
+    }
+    Ok(())
+}
+
 async fn ensure_writer_key_epochs(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
@@ -14240,6 +14339,140 @@ mod tests {
             let reopened = node.installed_guild_certificate().unwrap().unwrap();
             assert_eq!(reopened, certificate);
             reopened.verify().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn active_guild_administration_commits_and_converges_signed_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut nodes = Vec::new();
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for (index, seed) in (121_u8..=125).enumerate() {
+            let node = Node::open(
+                temp.path().join(format!("node-{index}")),
+                Seed::from_bytes([seed; 32]),
+            )
+            .unwrap();
+            let node_id = node.keys().node_id();
+            let node = Arc::new(Mutex::new(node));
+            let (client, event_loop) = build_p2p(node.clone(), config(node_id)).unwrap();
+            nodes.push(node);
+            clients.push(client);
+            tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let addresses = futures::future::join_all(clients.iter().map(listening_address)).await;
+        let endpoints = clients
+            .iter()
+            .zip(addresses.iter().cloned())
+            .map(|(client, address)| peer_endpoint(client, address))
+            .collect::<Vec<_>>();
+        form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+
+        let non_coordinator_error = commit_guild_administration(
+            nodes[1].clone(),
+            &clients[1],
+            GuildAdministration::SetQuorum(QuorumPolicy {
+                format_version: 1,
+                rule: QuorumRule::Majority,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            non_coordinator_error
+                .to_string()
+                .contains("must be submitted through coordinator")
+        );
+
+        assert_eq!(
+            commit_guild_administration(
+                nodes[0].clone(),
+                &clients[0],
+                GuildAdministration::SetQuorum(QuorumPolicy {
+                    format_version: 1,
+                    rule: QuorumRule::Majority,
+                }),
+            )
+            .await
+            .unwrap()
+            .0,
+            1
+        );
+        let relabeled = nodes[4].lock().unwrap().keys().node_id();
+        assert_eq!(
+            commit_guild_administration(
+                nodes[0].clone(),
+                &clients[0],
+                GuildAdministration::RelabelMember {
+                    node_id: relabeled,
+                    failure_domain: "replacement-domain".to_owned(),
+                },
+            )
+            .await
+            .unwrap()
+            .0,
+            2
+        );
+        assert_eq!(
+            commit_guild_administration(
+                nodes[0].clone(),
+                &clients[0],
+                GuildAdministration::RemoveMember(relabeled),
+            )
+            .await
+            .unwrap()
+            .0,
+            3
+        );
+        let rotating_subject = nodes[1].lock().unwrap().keys().node_id();
+        assert_eq!(
+            commit_guild_administration(
+                nodes[1].clone(),
+                &clients[1],
+                GuildAdministration::RotateLocalRecoveryKey,
+            )
+            .await
+            .unwrap()
+            .0,
+            4
+        );
+        assert_eq!(
+            commit_guild_administration(
+                nodes[0].clone(),
+                &clients[0],
+                GuildAdministration::RevokeRecoveryKey {
+                    subject: rotating_subject,
+                    epoch: 1,
+                },
+            )
+            .await
+            .unwrap()
+            .0,
+            5
+        );
+
+        for node in nodes.iter().take(4) {
+            let state = node.lock().unwrap().dynamic_guild_state().unwrap().unwrap();
+            assert_eq!(state.event_sequence, 5);
+            assert_eq!(state.quorum.rule, QuorumRule::Majority);
+            assert_eq!(state.active_members().count(), 4);
+            assert!(state.current_recovery_key(rotating_subject).is_none());
+        }
+        let removed_state = nodes[4]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed_state.event_sequence, 3);
+        assert_eq!(removed_state.active_members().count(), 4);
+
+        for client in &clients {
+            client.shutdown().await.unwrap();
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
         }
     }
 

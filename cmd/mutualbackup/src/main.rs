@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use mb_core::{KeyMaterial, Seed};
+use mb_core::{KeyMaterial, QuorumPolicy, QuorumRule, Seed};
 use mb_node::{LocalRequest, LocalResponse, Node, UnlockSecret, local_control_call};
 use mb_store::{DatabaseShellResult, probe_reflink};
 #[cfg(test)]
@@ -97,7 +97,7 @@ enum Command {
         #[command(subcommand)]
         command: RootCommand,
     },
-    /// Create, join, and inspect the fixed five-member prototype guild.
+    /// Create, join, inspect, and administer a guild.
     Guild {
         #[command(subcommand)]
         command: GuildCommand,
@@ -151,6 +151,32 @@ enum GuildCommand {
     Finalize,
     /// Show local guild membership and onboarding phase.
     Status,
+    /// Remove an active member through a quorum-signed event.
+    Remove { node_id: mb_core::NodeId },
+    /// Change an active member's failure-domain claim for future placement.
+    Relabel {
+        node_id: mb_core::NodeId,
+        failure_domain: String,
+    },
+    /// Change the signature policy for subsequent guild events.
+    SetQuorum {
+        #[command(subcommand)]
+        policy: GuildQuorumCommand,
+    },
+    /// Create and quorum-authorize the next recovery-key epoch for this node.
+    RotateRecoveryKey,
+    /// Revoke a recovery-key epoch through a quorum-signed event.
+    RevokeRecoveryKey {
+        subject: mb_core::NodeId,
+        epoch: u64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GuildQuorumCommand {
+    Unanimous,
+    Majority,
+    Threshold { signatures: u16 },
 }
 
 #[derive(Debug, Subcommand)]
@@ -519,13 +545,46 @@ async fn main() -> Result<()> {
                 GuildCommand::Cancel => LocalRequest::GuildCancel,
                 GuildCommand::Finalize => LocalRequest::GuildFinalize,
                 GuildCommand::Status => LocalRequest::GuildStatus,
+                GuildCommand::Remove { node_id } => LocalRequest::GuildRemoveMember { node_id },
+                GuildCommand::Relabel {
+                    node_id,
+                    failure_domain,
+                } => LocalRequest::GuildRelabelMember {
+                    node_id,
+                    failure_domain,
+                },
+                GuildCommand::SetQuorum { policy } => LocalRequest::GuildSetQuorum {
+                    policy: QuorumPolicy {
+                        format_version: 1,
+                        rule: match policy {
+                            GuildQuorumCommand::Unanimous => QuorumRule::Unanimous,
+                            GuildQuorumCommand::Majority => QuorumRule::Majority,
+                            GuildQuorumCommand::Threshold { signatures } => {
+                                QuorumRule::Threshold(signatures)
+                            }
+                        },
+                    },
+                },
+                GuildCommand::RotateRecoveryKey => LocalRequest::GuildRotateRecoveryKey,
+                GuildCommand::RevokeRecoveryKey { subject, epoch } => {
+                    LocalRequest::GuildRevokeRecoveryKey { subject, epoch }
+                }
             };
             match local_control_call(&control_socket, &request).await? {
                 LocalResponse::Guild(Some(guild)) => {
                     println!("guild id:    {}", hex::encode(guild.guild_id));
                     println!("coordinator: {}", guild.coordinator);
                     println!("phase:       {:?}", guild.phase);
-                    println!("members:     {} of 5", guild.peers.len());
+                    println!("members:     {}", guild.peers.len());
+                    if let Some(membership_epoch) = guild.membership_epoch {
+                        println!("membership epoch: {membership_epoch}");
+                    }
+                    if let Some(event_sequence) = guild.event_sequence {
+                        println!("event sequence:   {event_sequence}");
+                    }
+                    if let Some(quorum) = guild.quorum {
+                        println!("quorum:           {:?}", quorum.rule);
+                    }
                     for peer in guild.peers {
                         println!(
                             "member:      {} [{}]",
@@ -540,6 +599,13 @@ async fn main() -> Result<()> {
                 } => {
                     println!("invitation: {token}");
                     println!("expires unix: {expires_at_unix_seconds}");
+                }
+                LocalResponse::GuildEventCommitted {
+                    sequence,
+                    event_hash,
+                } => {
+                    println!("guild event committed: {sequence}");
+                    println!("event hash: {}", hex::encode(event_hash));
                 }
                 _ => bail!("daemon returned the wrong response to guild request"),
             }
@@ -811,6 +877,34 @@ fn print_backup_job(job: &mb_node::BackupJob) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_dynamic_guild_administration_commands() {
+        let node_id = "0707070707070707070707070707070707070707070707070707070707070707";
+        let parsed =
+            Cli::try_parse_from(["mutualbackup", "guild", "set-quorum", "threshold", "3"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Guild {
+                command: GuildCommand::SetQuorum {
+                    policy: GuildQuorumCommand::Threshold { signatures: 3 }
+                }
+            }
+        ));
+
+        let parsed =
+            Cli::try_parse_from(["mutualbackup", "guild", "relabel", node_id, "new-domain"])
+                .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Guild {
+                command: GuildCommand::Relabel {
+                    failure_domain,
+                    ..
+                }
+            } if failure_domain == "new-domain"
+        ));
+    }
 
     #[test]
     fn seed_install_is_no_replace_and_private() {

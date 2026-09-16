@@ -171,6 +171,9 @@ pub struct GuildSummary {
     pub coordinator: NodeId,
     pub phase: GuildPhase,
     pub peers: Vec<GuildPeer>,
+    pub membership_epoch: Option<u64>,
+    pub event_sequence: Option<u64>,
+    pub quorum: Option<QuorumPolicy>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -2136,22 +2139,31 @@ impl Node {
     pub fn guild_summary(&self) -> Result<Option<GuildSummary>> {
         if let Some(installed) = self.installed_guild()? {
             let dynamic = self.dynamic_guild_state()?;
-            let (coordinator, peers) = match dynamic {
+            let (coordinator, peers, membership_epoch, event_sequence, quorum) = match dynamic {
                 Some(state) => (
                     dynamic_guild_coordinator(&installed, &state)?,
                     self.dynamic_guild_peers(&installed, &state)?,
+                    Some(state.membership_epoch),
+                    Some(state.event_sequence),
+                    Some(state.quorum),
                 ),
                 None => (
                     installed.certificate.genesis.coordinator,
                     self.guild_peers(&installed)?,
+                    None,
+                    None,
+                    None,
                 ),
             };
             return Ok(Some(GuildSummary {
-                format_version: 1,
+                format_version: 2,
                 guild_id: installed.certificate.genesis.guild_id,
                 coordinator,
                 phase: GuildPhase::Active,
                 peers,
+                membership_epoch,
+                event_sequence,
+                quorum,
             }));
         }
         if let Some(draft) = self.guild_draft()? {
@@ -2159,7 +2171,7 @@ impl Node {
         }
         if let Some(pending) = self.pending_guild()? {
             return Ok(Some(GuildSummary {
-                format_version: 1,
+                format_version: 2,
                 guild_id: pending.invite.value.guild_id,
                 coordinator: pending.invite.value.coordinator.node_id,
                 phase: GuildPhase::Joining,
@@ -2170,6 +2182,9 @@ impl Node {
                     },
                     pending.local_peer,
                 ],
+                membership_epoch: None,
+                event_sequence: None,
+                quorum: None,
             }));
         }
         Ok(None)
@@ -7866,11 +7881,14 @@ fn backup_job(control: &ControlStore, guild_id: [u8; 32], revision_id: Uuid) -> 
 
 fn summary_from_draft(draft: &GuildDraft) -> GuildSummary {
     GuildSummary {
-        format_version: 1,
+        format_version: 2,
         guild_id: draft.guild_id,
         coordinator: draft.coordinator,
         phase: GuildPhase::Draft,
         peers: draft.peers.clone(),
+        membership_epoch: None,
+        event_sequence: None,
+        quorum: None,
     }
 }
 

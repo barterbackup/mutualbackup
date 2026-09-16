@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use mb_core::{NodeId, Seed};
+use mb_core::{NodeId, QuorumPolicy, Seed};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -61,6 +61,21 @@ pub enum LocalRequest {
     GuildRetry,
     GuildCancel,
     GuildFinalize,
+    GuildRemoveMember {
+        node_id: NodeId,
+    },
+    GuildRelabelMember {
+        node_id: NodeId,
+        failure_domain: String,
+    },
+    GuildSetQuorum {
+        policy: QuorumPolicy,
+    },
+    GuildRotateRecoveryKey,
+    GuildRevokeRecoveryKey {
+        subject: NodeId,
+        epoch: u64,
+    },
     Backup {
         wait: bool,
     },
@@ -102,6 +117,10 @@ pub enum LocalResponse {
     GuildInvite {
         token: String,
         expires_at_unix_seconds: u64,
+    },
+    GuildEventCommitted {
+        sequence: u64,
+        event_hash: [u8; 32],
     },
     BackupJob(BackupJob),
     Recovered(DhtRecoveryResult),
@@ -199,5 +218,53 @@ mod tests {
         assert!(
             cddl_cat::validate_json_str("local-request-envelope", SCHEMA, INVALID_VERSION).is_err()
         );
+    }
+
+    #[test]
+    fn dynamic_guild_administration_matches_local_schema() {
+        let node_id = NodeId([7; 32]);
+        let requests = [
+            LocalRequest::GuildRemoveMember { node_id },
+            LocalRequest::GuildRelabelMember {
+                node_id,
+                failure_domain: "new-domain".to_owned(),
+            },
+            LocalRequest::GuildSetQuorum {
+                policy: QuorumPolicy {
+                    format_version: 1,
+                    rule: mb_core::QuorumRule::Threshold(3),
+                },
+            },
+            LocalRequest::GuildRotateRecoveryKey,
+            LocalRequest::GuildRevokeRecoveryKey {
+                subject: node_id,
+                epoch: 2,
+            },
+        ];
+        for request in requests {
+            let envelope = LocalRequestEnvelope {
+                format_version: LOCAL_WIRE_FORMAT_VERSION,
+                request_id: [9; 16],
+                request,
+            };
+            let encoded = serde_json::to_string(&envelope).unwrap();
+            cddl_cat::validate_json_str("local-request-envelope", SCHEMA, &encoded).unwrap();
+            let decoded: LocalRequestEnvelope<LocalRequest> =
+                serde_json::from_str(&encoded).unwrap();
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+        }
+
+        let response = LocalResponseEnvelope {
+            format_version: LOCAL_WIRE_FORMAT_VERSION,
+            request_id: [9; 16],
+            result: Ok(LocalResponse::GuildEventCommitted {
+                sequence: 12,
+                event_hash: [8; 32],
+            }),
+        };
+        let encoded = serde_json::to_string(&response).unwrap();
+        cddl_cat::validate_json_str("local-response-envelope", SCHEMA, &encoded).unwrap();
+        let decoded: LocalResponseEnvelope = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
     }
 }
