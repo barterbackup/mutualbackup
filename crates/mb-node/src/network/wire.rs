@@ -57,6 +57,18 @@ pub(super) enum PeerRequest {
     InstallGuildEvent {
         certified: Box<QuorumGuildEvent>,
     },
+    SignCodingGroupEvent {
+        event: Box<GuildEvent>,
+        transcript: Box<SignedRecord<CodingVerificationTranscript>>,
+    },
+    InstallCodingGroupEvent {
+        certified: Box<QuorumGuildEvent>,
+        transcript: Box<SignedRecord<CodingVerificationTranscript>>,
+    },
+    GetCodingTranscript {
+        guild_id: [u8; 32],
+        group_id: [u8; 32],
+    },
     ExchangeEndpoints {
         guild_id: [u8; 32],
     },
@@ -239,6 +251,7 @@ impl PeerRequest {
                 | Self::BackupStatus { .. }
                 | Self::GetGuildGenesis { .. }
                 | Self::GetGuildEventTail { .. }
+                | Self::GetCodingTranscript { .. }
                 | Self::ExchangeEndpoints { .. }
         )
     }
@@ -254,6 +267,7 @@ impl PeerRequest {
             | Self::BackupStatus { .. }
             | Self::GetGuildGenesis { .. }
             | Self::GetGuildEventTail { .. }
+            | Self::GetCodingTranscript { .. }
             | Self::ExchangeEndpoints { .. } => None,
             #[cfg(test)]
             Self::BeginCommit { .. } => Some("begin-commit"),
@@ -262,6 +276,8 @@ impl PeerRequest {
             Self::InstallGuildGenesis { .. } => Some("install-guild-genesis"),
             Self::SignGuildEvent { .. } => Some("sign-guild-event"),
             Self::InstallGuildEvent { .. } => Some("install-guild-event"),
+            Self::SignCodingGroupEvent { .. } => Some("sign-coding-group-event"),
+            Self::InstallCodingGroupEvent { .. } => Some("install-coding-group-event"),
             Self::SubmitBackup { .. } => Some("submit-backup"),
             #[cfg(test)]
             Self::PrepareSource { .. } => Some("prepare-source"),
@@ -324,6 +340,9 @@ impl PeerRequest {
             Self::GetGuildEventTail { guild_id, .. } => Some(*guild_id),
             Self::SignGuildEvent { event } => Some(event.guild_id),
             Self::InstallGuildEvent { certified } => Some(certified.event.guild_id),
+            Self::SignCodingGroupEvent { event, .. } => Some(event.guild_id),
+            Self::InstallCodingGroupEvent { certified, .. } => Some(certified.event.guild_id),
+            Self::GetCodingTranscript { guild_id, .. } => Some(*guild_id),
             Self::PublishParity { object, .. } => Some(object.guild_id),
             Self::StageCodingParity { plan, .. }
             | Self::ReserveCodingParity { plan, .. }

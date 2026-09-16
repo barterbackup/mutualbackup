@@ -1871,6 +1871,76 @@ impl P2pClient {
         Ok(())
     }
 
+    pub async fn sign_coding_group_event(
+        &self,
+        peer: NodeId,
+        event: GuildEvent,
+        transcript: SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<MemberSignature> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::SignCodingGroupEvent {
+                    event: Box::new(event),
+                    transcript: Box::new(transcript),
+                },
+            )
+            .await?;
+        let PeerResponse::GuildEventSignature(signature) = response else {
+            bail!("peer returned the wrong coding-group event signature response");
+        };
+        if signature.signer != peer {
+            bail!("peer returned another member's coding-group event signature");
+        }
+        Ok(signature)
+    }
+
+    pub async fn install_coding_group_event(
+        &self,
+        peer: NodeId,
+        certified: QuorumGuildEvent,
+        transcript: SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<()> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::InstallCodingGroupEvent {
+                    certified: Box::new(certified),
+                    transcript: Box::new(transcript),
+                },
+            )
+            .await?;
+        if !matches!(response, PeerResponse::Ack) {
+            bail!("peer returned the wrong coding-group event installation response");
+        }
+        Ok(())
+    }
+
+    pub async fn coding_transcript(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        group_id: [u8; 32],
+    ) -> Result<SignedRecord<CodingVerificationTranscript>> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::GetCodingTranscript { guild_id, group_id },
+            )
+            .await?;
+        let PeerResponse::CodingVerificationTranscript(transcript) = response else {
+            bail!("peer returned the wrong coding transcript response");
+        };
+        let transcript = *transcript;
+        if transcript.value.manifest.value.group.guild_id != guild_id
+            || transcript.value.manifest.value.group.id != group_id
+            || replay_coding_transcript(&transcript)? != mb_core::CodingReplayFinding::Verified
+        {
+            bail!("peer returned invalid coding-group verifier evidence");
+        }
+        Ok(transcript)
+    }
+
     pub async fn submit_backup(
         &self,
         coordinator: NodeId,
@@ -5938,6 +6008,103 @@ async fn abort_delegated_coding(
     Ok(())
 }
 
+async fn commit_verified_coding_group(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    transcript: &SignedRecord<CodingVerificationTranscript>,
+) -> Result<()> {
+    let group = transcript.value.manifest.value.group.clone();
+    let (state, guild, local_id) = node_blocking(node.clone(), |node| {
+        Ok((
+            node.dynamic_guild_state()?
+                .context("coding activation requires dynamic guild state")?,
+            node.guild_summary()?
+                .context("coding activation requires an installed guild")?,
+            node.keys().node_id(),
+        ))
+    })
+    .await?;
+    if state
+        .coding_groups
+        .iter()
+        .any(|retained| retained.group == group)
+    {
+        return Ok(());
+    }
+    let event = GuildEvent {
+        format_version: 1,
+        guild_id: state.guild_id,
+        sequence: state
+            .event_sequence
+            .checked_add(1)
+            .context("guild event sequence exhausted")?,
+        parent: state.event_head,
+        kind: mb_core::GuildEventKind::AddCodingGroup {
+            group: group.clone(),
+        },
+    };
+    state.validate_event_proposal(&event)?;
+    let mut signatures = Vec::new();
+    let mut requests = FuturesUnordered::new();
+    for peer in &guild.peers {
+        let signer = peer.member.node_id;
+        if signer == local_id {
+            let local_event = event.clone();
+            let local_transcript = transcript.clone();
+            signatures.push(
+                node_blocking(node.clone(), move |node| {
+                    node.sign_coding_group_event_proposal(&local_event, &local_transcript)
+                })
+                .await?,
+            );
+            continue;
+        }
+        for endpoint in &peer.endpoints {
+            if let Ok(address) = endpoint.parse() {
+                let _ = p2p.add_peer_address(signer, address).await;
+            }
+        }
+        let proposed = event.clone();
+        let evidence = transcript.clone();
+        requests.push(async move {
+            (
+                signer,
+                p2p.sign_coding_group_event(signer, proposed, evidence)
+                    .await,
+            )
+        });
+    }
+    while let Some((signer, result)) = requests.next().await {
+        match result {
+            Ok(signature) => signatures.push(signature),
+            Err(error) => {
+                tracing::debug!(%signer, %error, "guild member did not sign coding-group event");
+            }
+        }
+    }
+    signatures.sort_by_key(|signature| signature.signer);
+    let certified = QuorumGuildEvent { event, signatures };
+    state.verify_event(&certified)?;
+    for peer in guild
+        .peers
+        .iter()
+        .filter(|peer| peer.member.node_id != local_id)
+    {
+        if let Err(error) = p2p
+            .install_coding_group_event(peer.member.node_id, certified.clone(), transcript.clone())
+            .await
+        {
+            tracing::debug!(peer = %peer.member.node_id, %error, "coding-group event dissemination deferred to tail sync");
+        }
+    }
+    let local_certified = certified.clone();
+    let local_transcript = transcript.clone();
+    node_blocking(node, move |node| {
+        node.install_coding_group_event(local_certified, local_transcript)
+    })
+    .await
+}
+
 async fn finish_coding_activation(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
@@ -5972,7 +6139,7 @@ async fn finish_coding_activation(
                 .await?;
         }
     }
-    Ok(())
+    commit_verified_coding_group(node, p2p, transcript).await
 }
 
 pub async fn run_coordinator_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {
@@ -6108,8 +6275,41 @@ async fn sync_guild_events_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Resu
             bail!("peers returned conflicting quorum-certified guild event tails");
         }
     }
-    for event in selected.events.clone() {
-        node_blocking(node.clone(), move |node| node.install_guild_event(event)).await?;
+    for (event_index, event) in selected.events.clone().into_iter().enumerate() {
+        if let mb_core::GuildEventKind::AddCodingGroup { group } = &event.event.kind {
+            let mut transcript = None;
+            let mut last_error = None;
+            for (source, tail) in &tails {
+                if tail.events.get(event_index) != Some(&event) {
+                    continue;
+                }
+                match p2p.coding_transcript(*source, guild_id, group.id).await {
+                    Ok(found) => {
+                        transcript = Some(found);
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::debug!(%source, %error, group = %hex::encode(group.id), "coding-group evidence request failed");
+                        last_error = Some(error);
+                    }
+                }
+            }
+            let transcript = transcript.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no peer supplied verifier evidence for coding group {}: {}",
+                    hex::encode(group.id),
+                    last_error
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "no eligible event source".to_owned())
+                )
+            })?;
+            node_blocking(node.clone(), move |node| {
+                node.install_coding_group_event(event, transcript)
+            })
+            .await?;
+        } else {
+            node_blocking(node.clone(), move |node| node.install_guild_event(event)).await?;
+        }
     }
     Ok(())
 }

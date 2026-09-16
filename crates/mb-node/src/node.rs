@@ -533,6 +533,26 @@ impl NodeReader {
         guild_event_tail_from_store(&self.control, base_sequence, base_head)
     }
 
+    pub(crate) fn coding_transcript_for_group(
+        &self,
+        guild_id: [u8; 32],
+        group_id: [u8; 32],
+    ) -> Result<SignedRecord<CodingVerificationTranscript>> {
+        let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(
+            &self
+                .control
+                .get_record("coding-group-transcript", &group_id)?
+                .context("coding-group verifier transcript is unavailable")?,
+        )?;
+        if transcript.value.manifest.value.group.guild_id != guild_id
+            || transcript.value.manifest.value.group.id != group_id
+            || replay_coding_transcript(&transcript)? != CodingReplayFinding::Verified
+        {
+            anyhow::bail!("stored coding-group verifier transcript is invalid");
+        }
+        Ok(transcript)
+    }
+
     pub(crate) fn peer_exchange_endpoints(
         &self,
         guild_id: [u8; 32],
@@ -1774,6 +1794,22 @@ impl Node {
     }
 
     pub fn sign_guild_event_proposal(&self, event: &GuildEvent) -> Result<MemberSignature> {
+        if matches!(event.kind, mb_core::GuildEventKind::AddCodingGroup { .. }) {
+            anyhow::bail!("coding-group events require replayable verifier evidence");
+        }
+        self.sign_guild_event_proposal_inner(event)
+    }
+
+    pub fn sign_coding_group_event_proposal(
+        &self,
+        event: &GuildEvent,
+        transcript: &SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<MemberSignature> {
+        self.validate_coding_group_event_evidence(event, transcript)?;
+        self.sign_guild_event_proposal_inner(event)
+    }
+
+    fn sign_guild_event_proposal_inner(&self, event: &GuildEvent) -> Result<MemberSignature> {
         let event_hash = event.hash()?;
         let record_id = event.sequence.to_be_bytes();
         if let Some(bytes) = self
@@ -1814,6 +1850,29 @@ impl Node {
     }
 
     pub fn install_guild_event(&mut self, certified: QuorumGuildEvent) -> Result<()> {
+        if matches!(
+            certified.event.kind,
+            mb_core::GuildEventKind::AddCodingGroup { .. }
+        ) {
+            anyhow::bail!("coding-group events require replayable verifier evidence");
+        }
+        self.install_guild_event_inner(certified, None)
+    }
+
+    pub fn install_coding_group_event(
+        &mut self,
+        certified: QuorumGuildEvent,
+        transcript: SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<()> {
+        self.validate_coding_group_event_evidence(&certified.event, &transcript)?;
+        self.install_guild_event_inner(certified, Some(transcript))
+    }
+
+    fn install_guild_event_inner(
+        &mut self,
+        certified: QuorumGuildEvent,
+        transcript: Option<SignedRecord<CodingVerificationTranscript>>,
+    ) -> Result<()> {
         let mut state = self
             .dynamic_guild_state()?
             .context("node has no dynamic guild state")?;
@@ -1828,6 +1887,9 @@ impl Node {
             if existing != encoded {
                 anyhow::bail!("guild event conflicts with installed history");
             }
+            if let Some(transcript) = transcript {
+                self.persist_coding_group_transcript(&transcript)?;
+            }
             return Ok(());
         }
         if let Some(existing) = self.control.get_record("guild-event", &record_id)?
@@ -1836,12 +1898,91 @@ impl Node {
             anyhow::bail!("guild event conflicts with durable history");
         }
         state.apply_event(&certified)?;
-        self.control.put_records(&[
+        let mut records = vec![
             ("guild-event".to_owned(), record_id.to_vec(), encoded),
             (
                 "guild-dynamic-state".to_owned(),
                 b"primary".to_vec(),
                 canonical_bytes(&state)?,
+            ),
+        ];
+        if let Some(transcript) = transcript {
+            self.validate_coding_transcript_storage_conflicts(&transcript)?;
+            let bytes = canonical_bytes(&transcript)?;
+            records.push((
+                "coding-transcript".to_owned(),
+                transcript.value.plan.value.attempt_id.to_vec(),
+                bytes.clone(),
+            ));
+            records.push((
+                "coding-group-transcript".to_owned(),
+                transcript.value.manifest.value.group.id.to_vec(),
+                bytes,
+            ));
+        }
+        self.control.put_records(&records)?;
+        Ok(())
+    }
+
+    fn validate_coding_group_event_evidence(
+        &self,
+        event: &GuildEvent,
+        transcript: &SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<()> {
+        let mb_core::GuildEventKind::AddCodingGroup { group } = &event.kind else {
+            anyhow::bail!("coding evidence was supplied for another guild event kind");
+        };
+        self.validate_coding_attempt_authority(&transcript.value.plan)?;
+        if replay_coding_transcript(transcript)? != CodingReplayFinding::Verified
+            || transcript.value.manifest.value.group != *group
+        {
+            anyhow::bail!("guild coding-group event has invalid verifier evidence");
+        }
+        Ok(())
+    }
+
+    fn validate_coding_transcript_storage_conflicts(
+        &self,
+        transcript: &SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<()> {
+        let bytes = canonical_bytes(transcript)?;
+        for (kind, id) in [
+            (
+                "coding-transcript",
+                transcript.value.plan.value.attempt_id.as_slice(),
+            ),
+            (
+                "coding-group-transcript",
+                transcript.value.manifest.value.group.id.as_slice(),
+            ),
+        ] {
+            if self
+                .control
+                .get_record(kind, id)?
+                .is_some_and(|existing| existing != bytes)
+            {
+                anyhow::bail!("coding group already has conflicting verifier evidence");
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_coding_group_transcript(
+        &mut self,
+        transcript: &SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<()> {
+        self.validate_coding_transcript_storage_conflicts(transcript)?;
+        let bytes = canonical_bytes(transcript)?;
+        self.control.put_records(&[
+            (
+                "coding-transcript".to_owned(),
+                transcript.value.plan.value.attempt_id.to_vec(),
+                bytes.clone(),
+            ),
+            (
+                "coding-group-transcript".to_owned(),
+                transcript.value.manifest.value.group.id.to_vec(),
+                bytes,
             ),
         ])?;
         Ok(())
@@ -3401,19 +3542,7 @@ impl Node {
         if !activated {
             anyhow::bail!("coding attempt assigns no parity to the local node");
         }
-        let transcript_bytes = canonical_bytes(transcript)?;
-        if !self.control.put_record_if_absent(
-            "coding-transcript",
-            &plan.attempt_id,
-            &transcript_bytes,
-        )? && self
-            .control
-            .get_record("coding-transcript", &plan.attempt_id)?
-            .as_deref()
-            != Some(transcript_bytes.as_slice())
-        {
-            anyhow::bail!("coding attempt already has a conflicting transcript");
-        }
+        self.persist_coding_group_transcript(transcript)?;
         Ok(())
     }
 
@@ -8318,6 +8447,45 @@ mod tests {
             )
             .unwrap(),
             local_object
+        );
+        assert_eq!(
+            node.reader_config()
+                .open()
+                .unwrap()
+                .coding_transcript_for_group([181; 32], transcript.value.manifest.value.group.id,)
+                .unwrap(),
+            transcript
+        );
+
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::AddCodingGroup {
+                group: transcript.value.manifest.value.group.clone(),
+            },
+        };
+        assert!(node.sign_guild_event_proposal(&event).is_err());
+        assert_eq!(
+            node.sign_coding_group_event_proposal(&event, &transcript)
+                .unwrap()
+                .signer,
+            node.keys().node_id()
+        );
+        let mut signatures = keys
+            .iter()
+            .map(|keys| sign_guild_event(&event, keys).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        let certified = QuorumGuildEvent { event, signatures };
+        assert!(node.install_guild_event(certified.clone()).is_err());
+        node.install_coding_group_event(certified, transcript.clone())
+            .unwrap();
+        assert_eq!(
+            node.dynamic_guild_state().unwrap().unwrap().coding_groups[0].group,
+            transcript.value.manifest.value.group
         );
         assert!(
             node.discard_coding_attempt(&transcript.value.plan.value.attempt_id)

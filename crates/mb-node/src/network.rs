@@ -629,7 +629,11 @@ fn process_peer_request(
                     let guild_id = request
                         .guild_scope()
                         .context("guild-scoped request has no scope")?;
-                    if matches!(&request, PeerRequest::GetGuildEventTail { .. }) {
+                    if matches!(
+                        &request,
+                        PeerRequest::GetGuildEventTail { .. }
+                            | PeerRequest::GetCodingTranscript { .. }
+                    ) {
                         reader.authorize_historical_member(&guild_id, caller)?;
                     } else {
                         reader.authorize_member(&guild_id, caller)?;
@@ -681,7 +685,10 @@ fn process_peer_request(
             .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
         let guild_transition = matches!(
             &request,
-            PeerRequest::SignGuildEvent { .. } | PeerRequest::InstallGuildEvent { .. }
+            PeerRequest::SignGuildEvent { .. }
+                | PeerRequest::InstallGuildEvent { .. }
+                | PeerRequest::SignCodingGroupEvent { .. }
+                | PeerRequest::InstallCodingGroupEvent { .. }
         ) && request
             .guild_scope()
             .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
@@ -929,6 +936,11 @@ fn execute_read_request(
         } => Ok(PeerResponse::GuildEventTail(Box::new(
             node.guild_event_tail(base_sequence, base_head)?,
         ))),
+        PeerRequest::GetCodingTranscript { guild_id, group_id } => {
+            Ok(PeerResponse::CodingVerificationTranscript(Box::new(
+                node.coding_transcript_for_group(guild_id, group_id)?,
+            )))
+        }
         PeerRequest::ExchangeEndpoints { guild_id } => Ok(PeerResponse::EndpointRecords(
             node.peer_exchange_endpoints(guild_id)?,
         )),
@@ -964,6 +976,18 @@ fn execute_peer_request(
         )),
         PeerRequest::InstallGuildEvent { certified } => {
             node.install_guild_event(*certified)?;
+            Ok(PeerResponse::Ack)
+        }
+        PeerRequest::SignCodingGroupEvent { event, transcript } => {
+            Ok(PeerResponse::GuildEventSignature(
+                node.sign_coding_group_event_proposal(&event, &transcript)?,
+            ))
+        }
+        PeerRequest::InstallCodingGroupEvent {
+            certified,
+            transcript,
+        } => {
+            node.install_coding_group_event(*certified, *transcript)?;
             Ok(PeerResponse::Ack)
         }
         PeerRequest::SubmitBackup { descriptor } => Ok(PeerResponse::BackupJob(
@@ -1191,6 +1215,9 @@ fn execute_peer_request(
         }
         PeerRequest::GetGuildEventTail { .. } => {
             bail!("guild event-tail read was sent to a mutation worker")
+        }
+        PeerRequest::GetCodingTranscript { .. } => {
+            bail!("coding transcript read was sent to a mutation worker")
         }
         PeerRequest::ExchangeEndpoints { .. } => {
             bail!("endpoint exchange was sent to a mutation worker")

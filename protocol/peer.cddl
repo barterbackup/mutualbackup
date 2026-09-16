@@ -47,6 +47,15 @@ peer-request =
       } }
   / { "SignGuildEvent": { event: guild-event } }
   / { "InstallGuildEvent": { certified: quorum-guild-event } }
+  / { "SignCodingGroupEvent": {
+        event: guild-event,
+        transcript: signed-coding-transcript
+      } }
+  / { "InstallCodingGroupEvent": {
+        certified: quorum-guild-event,
+        transcript: signed-coding-transcript
+      } }
+  / { "GetCodingTranscript": { guild_id: bytes32-array, group_id: bytes32-array } }
   / { "ExchangeEndpoints": { guild_id: bytes32-array } }
   / { "GetPreparedRevisionPage": { guild_id: bytes32-array, revision_id: uuid-bytes, page_index: uint } }
   / { "EnsureFiller": { guild_id: bytes32-array, revision_id: uuid-bytes, ordinal: uint } }
