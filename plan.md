@@ -747,8 +747,13 @@ alone did not ensure incremental cross-user sectors: an initial owner could
 consume every slot before another owner arrived. Single-owner sectors now keep
 one deterministic vacancy, later owners fill those vacancies first, and mixed
 sectors remain densely packed. This preserves old source positions while making
-incremental cross-user packing attainable. A fresh provisioned production gate
-must still close before Milestone 5 can pass.
+incremental cross-user packing attainable. That corrected catalog and both
+local restores passed on the next gate, which then showed that the test runtime
+had omitted the daemon's peer-exchange worker. Format-7 recovery publication
+requires every active subject's certified recovery-key epoch, so the production
+test now runs peer exchange on all five nodes and waits for those epochs before
+backing up. A fresh provisioned production gate must still close before
+Milestone 5 can pass.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer

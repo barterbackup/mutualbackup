@@ -630,14 +630,22 @@ node Clippy gate passed locally. No remote compilation server was used.
   in a single-owner sector, fills vacancies from other owners before extending
   a same-owner sector, and packs mixed sectors densely. A regression adds a
   later owner without moving any prior source chunk and requires a mixed sector.
-- [ ] **M5-06 / gate — Run the corrected production gate.**
+- [x] **M5-06 / P1 — Exercise recovery-key registration in the production path.**
+  The next gate passed the corrected catalog invariant and both local restores,
+  then found that its manually assembled runtime had started delegated coding
+  but omitted the daemon's peer-exchange worker. Format-7 DHT publication
+  correctly waits for a current recovery-key epoch for every active subject, so
+  all six publication passes returned without publishing. Run the real
+  peer-exchange worker for every test node and wait for the certified recovery
+  epochs before starting production backups.
+- [ ] **M5-07 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
-  assertion, now corrected to version 7. Its first rerun exposed M5-04; its
-  second completed four production checkpoints and exposed M5-05 before the
-  recovery assertions. The provisioned Btrfs production path has therefore not
-  yet passed for the reopened work. Run formatting, locked
+  assertion, now corrected to version 7. Successive reruns exposed M5-04,
+  M5-05, and then M5-06 after the catalog and local restore assertions passed.
+  The provisioned Btrfs production path has therefore not yet passed for the
+  reopened work. Run formatting, locked
   all-target workspace tests, warning-free locked all-target Clippy, and the
-  local reflink/network acceptance gate after M5-01 through M5-05 close.
+  local reflink/network acceptance gate after M5-01 through M5-06 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

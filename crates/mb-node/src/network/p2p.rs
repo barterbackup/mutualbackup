@@ -17122,6 +17122,29 @@ mod tests {
             .map(|(client, address)| peer_endpoint(client, address))
             .collect::<Vec<_>>();
         let genesis = form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+        let peer_exchange_tasks = nodes
+            .iter()
+            .cloned()
+            .zip(clients.iter().cloned())
+            .map(|(node, client)| tokio::spawn(run_peer_exchange(node, client)))
+            .collect::<Vec<_>>();
+        let recovery_key_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let recovery_keys_ready = nodes.iter().all(|node| {
+                let state = node.lock().unwrap().dynamic_guild_state().unwrap().unwrap();
+                state
+                    .active_members()
+                    .all(|member| state.current_recovery_key(member.node_id).is_some())
+            });
+            if recovery_keys_ready {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < recovery_key_deadline,
+                "production peer exchange did not register every recovery-key epoch"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let coding_tasks = nodes
             .iter()
             .cloned()
@@ -17425,7 +17448,9 @@ mod tests {
                 .cloned()
                 .zip(clients.iter())
                 .map(|(node, client)| publish_dht_once(node, client));
-            let _ = futures::future::join_all(passes).await;
+            for result in futures::future::join_all(passes).await {
+                result.unwrap();
+            }
             if nodes
                 .iter()
                 .all(|node| node.lock().unwrap().seed_recovery_ready().unwrap())
@@ -17598,6 +17623,9 @@ mod tests {
         drop(reopened_recovery);
 
         for task in coding_tasks {
+            task.abort();
+        }
+        for task in peer_exchange_tasks {
             task.abort();
         }
         for client in &clients {
