@@ -6480,6 +6480,9 @@ pub async fn run_peer_exchange(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result
         if let Err(error) = sync_guild_events_once(node.clone(), &p2p).await {
             tracing::warn!(%error, "guild event-tail synchronization failed");
         }
+        if let Err(error) = reconcile_recovery_key_epoch_once(node.clone(), &p2p).await {
+            tracing::warn!(%error, "recovery-key epoch reconciliation failed");
+        }
         if let Err(error) = reconcile_variable_group_lifecycle_once(node.clone(), &p2p).await {
             tracing::warn!(%error, "variable coding-group lifecycle reconciliation failed");
         }
@@ -6488,6 +6491,48 @@ pub async fn run_peer_exchange(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result
         }
         tokio::time::sleep(PEER_EXCHANGE_INTERVAL).await;
     }
+}
+
+async fn reconcile_recovery_key_epoch_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
+    let proposal = node_blocking(node.clone(), |node| {
+        let state = node
+            .dynamic_guild_state()?
+            .context("recovery-key registration requires dynamic guild state")?;
+        let local_id = node.keys().node_id();
+        let next_subject = state.active_members().find(|member| {
+            !state
+                .recovery_keys
+                .iter()
+                .any(|entry| entry.envelope.subject == member.node_id)
+        });
+        let Some(subject) = next_subject else {
+            return Ok(None);
+        };
+        if subject.node_id != local_id {
+            return Ok(None);
+        }
+        let (envelope, _) = mb_core::create_recovery_key_envelope(node.keys(), state.guild_id, 1)?;
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: state
+                .event_sequence
+                .checked_add(1)
+                .context("guild event sequence exhausted")?,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RotateRecoveryKey { envelope },
+        };
+        state.validate_event_proposal(&event)?;
+        let guild = node
+            .guild_summary()?
+            .context("recovery-key registration requires an installed guild")?;
+        Ok(Some((state, guild, local_id, event)))
+    })
+    .await?;
+    let Some((state, guild, local_id, event)) = proposal else {
+        return Ok(());
+    };
+    commit_plain_guild_event(node, p2p, state, guild, local_id, event).await
 }
 
 async fn reconcile_variable_group_lifecycle_once(
