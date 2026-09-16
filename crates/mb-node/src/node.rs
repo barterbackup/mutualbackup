@@ -2318,7 +2318,18 @@ impl Node {
         {
             anyhow::bail!("guild event conflicts with durable history");
         }
+        let invalidates_placement_audit = matches!(
+            &certified.event.kind,
+            mb_core::GuildEventKind::RemoveMember { .. }
+                | mb_core::GuildEventKind::RelabelMember { .. }
+        );
         state.apply_event(&certified)?;
+        if invalidates_placement_audit {
+            // Invalidate before committing the valid event so an interruption
+            // cannot leave a pre-change Healthy report attached to the
+            // unchanged checkpoint hash.
+            self.control.delete_record("node-state", b"guild-audit")?;
+        }
         let mut records = vec![
             ("guild-event".to_owned(), record_id.to_vec(), encoded),
             (
@@ -3179,6 +3190,37 @@ impl Node {
             }
         }
         Ok(stale)
+    }
+
+    pub(crate) fn coding_checkpoint_has_pending(&self, checkpoint_hash: [u8; 32]) -> Result<bool> {
+        for (_, bytes) in self.control.records("coding-launch-job")? {
+            let job: CodingLaunchJob = decode_canonical(&bytes)?;
+            if job.format_version != 1 {
+                anyhow::bail!("durable coding launch job is invalid");
+            }
+            if job.plan.value.checkpoint_hash == checkpoint_hash {
+                return Ok(true);
+            }
+        }
+        for (_, bytes) in self.control.records("coding-activation-job")? {
+            let job: CodingActivationJob = decode_canonical(&bytes)?;
+            if job.format_version != 1 {
+                anyhow::bail!("durable coding activation job is invalid");
+            }
+            if !job.complete && job.transcript.value.plan.value.checkpoint_hash == checkpoint_hash {
+                return Ok(true);
+            }
+        }
+        for (_, bytes) in self.control.records("coding-retry-job")? {
+            let job: CodingRetryJob = decode_canonical(&bytes)?;
+            if job.format_version != 1 {
+                anyhow::bail!("durable coding retry job is invalid");
+            }
+            if !job.complete && job.failure.value.plan.value.checkpoint_hash == checkpoint_hash {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn complete_coding_launch(&self, attempt_id: [u8; 16]) -> Result<()> {
@@ -5224,6 +5266,13 @@ impl Node {
             .iter()
             .filter(|retained| retained.retired_at_event.is_none())
         {
+            if !allow_legacy_root
+                && state
+                    .validate_current_group_placement(&retained.group)
+                    .is_err()
+            {
+                continue;
+            }
             let Some(information_index) = retained.group.roles.iter().position(|role| {
                 matches!(role, ShardRoleV2::Information(information)
                     if !information.sector.virtual_zero
@@ -9971,6 +10020,7 @@ mod tests {
             .unwrap();
         node.accept_coding_failure(keys[remote[0]].node_id(), failure)
             .unwrap();
+        assert!(node.coding_checkpoint_has_pending([213; 32]).unwrap());
 
         drop(node);
         let mut node = Node::open(temp.path(), local_seed).unwrap();
@@ -10007,6 +10057,7 @@ mod tests {
         );
         node.complete_coding_retry([212; 16]).unwrap();
         assert!(node.claim_coding_retry().unwrap().is_none());
+        assert!(!node.coding_checkpoint_has_pending([213; 32]).unwrap());
         node.enqueue_coding_launch(failed.clone()).unwrap();
 
         let state = node.dynamic_guild_state().unwrap().unwrap();
@@ -10664,17 +10715,21 @@ mod tests {
             .map(|keys| sign_guild_event(&writer_event, keys).unwrap())
             .collect::<Vec<_>>();
         signatures.sort_by_key(|signature| signature.signer);
-        node.install_guild_event(QuorumGuildEvent {
+        let certified_writer_event = QuorumGuildEvent {
             event: writer_event,
             signatures,
-        })
-        .unwrap();
+        };
+        node.install_guild_event(certified_writer_event.clone())
+            .unwrap();
+        information_node
+            .install_guild_event(certified_writer_event)
+            .unwrap();
         assert!(
             node.uncovered_variable_sectors(members[2].node_id, std::slice::from_ref(&target))
                 .unwrap()
                 .is_empty()
         );
-        let mut changed = target;
+        let mut changed = target.clone();
         changed.root[0] ^= 1;
         assert_eq!(
             node.uncovered_variable_sectors(members[2].node_id, &[changed.clone()])
@@ -10767,6 +10822,62 @@ mod tests {
                 .variable_shard_for_guild(&[181; 32], &transcript.value.manifest.value.group.id, 4,)
                 .unwrap(),
             shards[4]
+        );
+        node.record_guild_audit(&GuildAuditReport {
+            format_version: 1,
+            checkpoint_hash,
+            checkpoint_generation: checkpoint.checkpoint.generation,
+            audited_at_unix_seconds: 1,
+            state: ProtectionState::Healthy,
+            checked_groups: 1,
+            assigned_shards_unavailable: 0,
+            assigned_shards_repaired: 0,
+            emergency_copies_created: 0,
+            emergency_copies_removed: 0,
+            issues: Vec::new(),
+        })
+        .unwrap();
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let relabel = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RelabelMember {
+                node_id: members[2].node_id,
+                failure_domain: "replacement-domain".to_owned(),
+            },
+        };
+        let mut signatures = keys
+            .iter()
+            .map(|keys| sign_guild_event(&relabel, keys).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        let certified_relabel = QuorumGuildEvent {
+            event: relabel,
+            signatures,
+        };
+        node.install_guild_event(certified_relabel.clone()).unwrap();
+        information_node
+            .install_guild_event(certified_relabel)
+            .unwrap();
+        assert!(node.last_guild_audit().unwrap().is_none());
+        assert_eq!(
+            node.uncovered_variable_sectors(members[2].node_id, std::slice::from_ref(&target))
+                .unwrap(),
+            vec![target.clone()]
+        );
+        // A retained checkpoint remains valid while replacement work is
+        // queued; only fresh placement decisions exclude the stale layout.
+        node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, false)
+            .unwrap();
+        node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, true)
+            .unwrap();
+        assert_eq!(
+            information_node
+                .variable_shard_for_guild(&[181; 32], &transcript.value.manifest.value.group.id, 2,)
+                .unwrap(),
+            shards[2]
         );
         assert!(
             node.discard_coding_attempt(&transcript.value.plan.value.attempt_id)

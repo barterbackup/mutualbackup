@@ -6836,6 +6836,93 @@ async fn reconcile_variable_group_lifecycle_once(
         })
         .map(|reference| reference.id)
         .collect::<BTreeSet<_>>();
+    let stale_live_placement = state.coding_groups.iter().any(|retained| {
+        retained.retired_at_event.is_none()
+            && state
+                .validate_current_group_placement(&retained.group)
+                .is_err()
+            && retained.group.roles.iter().any(|role| {
+                matches!(role, ShardRoleV2::Information(information)
+                    if !information.sector.virtual_zero
+                        && live_sectors.contains(&information.sector.id))
+            })
+    });
+    if stale_live_placement {
+        let checkpoint_hash = checkpoint.hash()?;
+        let pending = node_blocking(node.clone(), move |node| {
+            node.coding_checkpoint_has_pending(checkpoint_hash)
+        })
+        .await?;
+        if !pending {
+            let active = state
+                .active_members()
+                .map(|member| member.node_id)
+                .collect::<BTreeSet<_>>();
+            let mut replacement = None;
+            for revision in checkpoint.checkpoint.revisions.iter().rev() {
+                if !active.contains(&revision.value.owner) {
+                    continue;
+                }
+                let sectors = revision
+                    .value
+                    .metadata_sectors
+                    .iter()
+                    .chain(&revision.value.data_sectors)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let owner = revision.value.owner;
+                let uncovered = node_blocking(node.clone(), move |node| {
+                    node.uncovered_variable_sectors(owner, &sectors)
+                })
+                .await?;
+                if !uncovered.is_empty() {
+                    replacement = Some((owner, revision.value.revision_id, uncovered));
+                    break;
+                }
+            }
+            if let Some((owner, revision_id, uncovered)) = replacement {
+                let coding_peers = reachable_coding_peers(p2p, local_id, &guild.peers).await;
+                if !coding_peers.iter().any(|peer| peer.member.node_id == owner) {
+                    bail!("replacement coding owner is unavailable");
+                }
+                let mut parity_capacity = coding_capacity_by_peer(
+                    node.clone(),
+                    p2p,
+                    local_id,
+                    state.guild_id,
+                    &coding_peers,
+                    V1_SECTOR_SIZE as u32,
+                )
+                .await?;
+                let lanes = build_cross_user_coding_lanes(
+                    node.clone(),
+                    uncovered,
+                    CrossUserCodingContext {
+                        p2p,
+                        local_id,
+                        guild_id: state.guild_id,
+                        revision_id,
+                        current_owner: owner,
+                        retained_revisions: &checkpoint.checkpoint.revisions,
+                        peers: &coding_peers,
+                        parity_capacity: &mut parity_capacity,
+                    },
+                )
+                .await?;
+                queue_variable_coding_lanes(
+                    node,
+                    p2p,
+                    local_id,
+                    checkpoint_hash,
+                    state.membership_epoch,
+                    &coding_peers,
+                    lanes,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
     let sequence = state
         .event_sequence
         .checked_add(1)
@@ -16265,7 +16352,7 @@ mod tests {
             .current_checkpoint(genesis.genesis.guild_id)
             .unwrap()
             .unwrap();
-        assert_eq!(final_checkpoint.checkpoint.format_version, 4);
+        assert_eq!(final_checkpoint.checkpoint.format_version, 5);
         assert_eq!(final_checkpoint.checkpoint.revisions.len(), 2);
         assert!(final_checkpoint.checkpoint.coding_groups.is_empty());
         let protected_sector_count = final_checkpoint

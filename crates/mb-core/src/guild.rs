@@ -497,7 +497,7 @@ impl DynamicGuildState {
                 {
                     return Err(GuildStateError::InvalidEvent);
                 }
-                self.validate_new_group_placement(group)?;
+                self.validate_current_group_placement(group)?;
                 let index = self
                     .coding_groups
                     .partition_point(|entry| entry.group.id < group.id);
@@ -658,7 +658,10 @@ impl DynamicGuildState {
             .ok_or(GuildStateError::InactiveMember(node_id))
     }
 
-    fn validate_new_group_placement(&self, group: &CodingGroupV2) -> Result<(), GuildStateError> {
+    pub fn validate_current_group_placement(
+        &self,
+        group: &CodingGroupV2,
+    ) -> Result<(), GuildStateError> {
         for role in &group.roles {
             let (node_id, domain) = match role {
                 ShardRoleV2::Information(information) => {
@@ -1056,6 +1059,10 @@ mod tests {
             &keys[..3],
         );
         state.apply_event(&remove).unwrap();
+        assert!(matches!(
+            state.validate_current_group_placement(&group),
+            Err(GuildStateError::InactiveMember(_))
+        ));
         let relabel = certify(
             &state,
             GuildEventKind::RelabelMember {
@@ -1065,6 +1072,7 @@ mod tests {
             &keys[..3],
         );
         state.apply_event(&relabel).unwrap();
+        assert!(state.validate_current_group_placement(&group).is_err());
         assert_eq!(state.coding_groups[0].group, group);
 
         let retire = certify(
