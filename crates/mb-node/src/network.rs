@@ -700,16 +700,25 @@ fn process_peer_request(
             PeerRequest::FinalizeCodingVerification { transcript } => {
                 caller == transcript.plan.value.coding_coordinator
             }
+            _ => false,
+        } && request
+            .guild_scope()
+            .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
+        let historical_coding = match &request {
             PeerRequest::SubmitCodingTranscript { transcript } => {
                 caller == transcript.value.plan.value.coding_coordinator
+            }
+            PeerRequest::SubmitCodingFailure { failure } => {
+                caller == failure.value.plan.value.coding_coordinator && caller == failure.signer
+            }
+            PeerRequest::ActivateCodingParity { transcript } => {
+                caller == transcript.value.plan.value.delegator
             }
             PeerRequest::AbortCodingAttempt { plan } => {
                 caller == plan.value.coding_coordinator || caller == plan.value.delegator
             }
             _ => false,
-        } && request
-            .guild_scope()
-            .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
+        };
         if mutation_kind.is_some()
             && !trusted_coordinator_admission
             && !certified_coordinator
@@ -718,6 +727,7 @@ fn process_peer_request(
             && !member_submission
             && !guild_transition
             && !delegated_coding
+            && !historical_coding
         {
             bail!("caller is not the configured guild coordinator");
         }
@@ -1081,6 +1091,10 @@ fn execute_peer_request(
         }
         PeerRequest::SubmitCodingTranscript { transcript } => {
             node.accept_coding_transcript(caller, *transcript)?;
+            Ok(PeerResponse::Ack)
+        }
+        PeerRequest::SubmitCodingFailure { failure } => {
+            node.accept_coding_failure(caller, *failure)?;
             Ok(PeerResponse::Ack)
         }
         PeerRequest::ActivateCodingParity { transcript } => {

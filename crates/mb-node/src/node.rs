@@ -7,19 +7,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use mb_core::{
     CODING_ATTEMPT_PLAN_DOMAIN, CODING_CHALLENGE_COMMITMENT_DOMAIN, CODING_CHALLENGE_REVEAL_DOMAIN,
-    CODING_ROOT_MANIFEST_DOMAIN, CODING_SHARD_OPENING_DOMAIN, CODING_TRANSCRIPT_DOMAIN,
-    CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal, CodingReplayFinding,
-    CodingRootManifest, CodingShardOpening, CodingVerificationTranscript, DynamicGuildState,
-    EndpointRecord, GuildCheckpoint, GuildEvent, GuildEventTail, GuildGenesis, GuildInvite,
-    KeyMaterial, MAX_GUILD_EVENT_TAIL, Member, MemberSignature, NodeId, QuorumCheckpoint,
-    QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN,
-    RecoveryBundle, RecoveryLocator, STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN,
-    SectorId, SectorRef, Seed, ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt,
-    StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision, V1_CATALOG_PAGE_BYTES,
-    V1_MAX_CATALOG_PAGES, V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes, challenged_leaf,
-    coding_challenge_commitment, coding_evidence_hash, decode_canonical, encode_coding_attempt,
-    merkle_commit, merkle_open_range, open_recovery_record, replay_coding_transcript,
-    seal_recovery_record, sector_root, sign_guild_event, synthetic_filler_sector,
+    CODING_FAILURE_REPORT_DOMAIN, CODING_ROOT_MANIFEST_DOMAIN, CODING_SHARD_OPENING_DOMAIN,
+    CODING_TRANSCRIPT_DOMAIN, CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal,
+    CodingFailureReport, CodingReplayFinding, CodingRootManifest, CodingShardOpening,
+    CodingVerificationTranscript, DynamicGuildState, EndpointRecord, GuildCheckpoint, GuildEvent,
+    GuildEventTail, GuildGenesis, GuildInvite, KeyMaterial, MAX_GUILD_EVENT_TAIL, Member,
+    MemberSignature, NodeId, QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy,
+    QuorumRule, RECOVERY_LOCATOR_DOMAIN, RecoveryBundle, RecoveryLocator,
+    STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, Seed,
+    ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
+    USER_REVISION_DOMAIN, UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_PAGES,
+    V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes, challenged_leaf, coding_challenge_commitment,
+    coding_evidence_hash, decode_canonical, encode_coding_attempt, merkle_commit,
+    merkle_open_range, open_recovery_record, replay_coding_transcript, seal_recovery_record,
+    sector_root, sign_guild_event, synthetic_filler_sector,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
@@ -104,6 +105,7 @@ pub(crate) enum DelegatedCodingJobState {
     Submitting,
     Complete,
     Failed,
+    ReportingFailure,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -119,6 +121,15 @@ pub(crate) struct DelegatedCodingJob {
 pub(crate) struct CodingActivationJob {
     pub format_version: u16,
     pub transcript: SignedRecord<CodingVerificationTranscript>,
+    pub complete: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CodingRetryJob {
+    pub format_version: u16,
+    pub failure: SignedRecord<CodingFailureReport>,
+    pub retry_plan: Option<SignedRecord<CodingAttemptPlan>>,
     pub complete: bool,
     pub error: Option<String>,
 }
@@ -2548,6 +2559,9 @@ impl Node {
                 }
                 return Ok(Some(job));
             }
+            if job.state == DelegatedCodingJobState::ReportingFailure {
+                return Ok(Some(job));
+            }
             if job.state == DelegatedCodingJobState::Running {
                 self.validate_coding_attempt_authority(&job.plan)?;
                 job.state = DelegatedCodingJobState::Cleanup;
@@ -2556,10 +2570,11 @@ impl Node {
                 return Ok(Some(job));
             }
             if job.state == DelegatedCodingJobState::Pending {
-                self.validate_coding_attempt_authority(&job.plan)?;
-                if job.plan.value.expires_at_unix_seconds < unix_seconds() {
+                if let Err(error) = self.validate_coding_attempt_plan(&job.plan) {
                     job.state = DelegatedCodingJobState::Cleanup;
-                    job.error = Some("coding attempt expired before verification".to_owned());
+                    job.error = Some(format!(
+                        "coding attempt became ineligible before verification: {error:#}"
+                    ));
                     self.put_delegated_coding_job(&job)?;
                     return Ok(Some(job));
                 }
@@ -2609,10 +2624,77 @@ impl Node {
         self.put_delegated_coding_job(&job)
     }
 
-    pub(crate) fn fail_delegated_coding(&self, attempt_id: [u8; 16], error: &str) -> Result<()> {
-        let mut error = error.to_owned();
-        truncate_utf8(&mut error, 4096);
-        self.update_delegated_coding_job(attempt_id, DelegatedCodingJobState::Failed, Some(error))
+    pub(crate) fn record_delegated_coding_failure(
+        &mut self,
+        attempt_id: [u8; 16],
+        error: &str,
+    ) -> Result<SignedRecord<CodingFailureReport>> {
+        let bytes = self
+            .control
+            .get_record("delegated-coding-job", &attempt_id)?
+            .context("delegated coding job is unavailable")?;
+        let mut job: DelegatedCodingJob = decode_canonical(&bytes)?;
+        if job.format_version != 1
+            || job.plan.value.attempt_id != attempt_id
+            || job.plan.value.coding_coordinator != self.keys.node_id()
+        {
+            anyhow::bail!("delegated coding job cannot report this failure");
+        }
+        self.validate_coding_attempt_authority(&job.plan)?;
+        let mut error_hash = *blake3::hash(error.as_bytes()).as_bytes();
+        if error_hash == [0; 32] {
+            error_hash[0] = 1;
+        }
+        let report = SignedRecord::sign(
+            CODING_FAILURE_REPORT_DOMAIN,
+            CodingFailureReport {
+                format_version: 1,
+                failed_at_unix_seconds: unix_seconds(),
+                plan: job.plan.clone(),
+                error_hash,
+            },
+            &self.keys,
+        )?;
+        report.value.validate()?;
+        job.state = DelegatedCodingJobState::ReportingFailure;
+        job.error = Some({
+            let mut error = error.to_owned();
+            truncate_utf8(&mut error, 4096);
+            error
+        });
+        self.control.put_records(&[
+            (
+                "delegated-coding-failure".to_owned(),
+                attempt_id.to_vec(),
+                canonical_bytes(&report)?,
+            ),
+            (
+                "delegated-coding-job".to_owned(),
+                attempt_id.to_vec(),
+                canonical_bytes(&job)?,
+            ),
+        ])?;
+        Ok(report)
+    }
+
+    pub(crate) fn delegated_coding_failure(
+        &self,
+        attempt_id: [u8; 16],
+    ) -> Result<SignedRecord<CodingFailureReport>> {
+        let report: SignedRecord<CodingFailureReport> = decode_canonical(
+            &self
+                .control
+                .get_record("delegated-coding-failure", &attempt_id)?
+                .context("delegated coding failure report is unavailable")?,
+        )?;
+        report.verify(CODING_FAILURE_REPORT_DOMAIN)?;
+        report.value.validate()?;
+        if report.value.plan.value.attempt_id != attempt_id
+            || report.signer != report.value.plan.value.coding_coordinator
+        {
+            anyhow::bail!("delegated coding failure report conflicts with its attempt");
+        }
+        Ok(report)
     }
 
     pub(crate) fn cleanup_delegated_coding(&self, attempt_id: [u8; 16], error: &str) -> Result<()> {
@@ -3061,7 +3143,7 @@ impl Node {
         transcript: SignedRecord<CodingVerificationTranscript>,
     ) -> Result<()> {
         let plan = &transcript.value.plan.value;
-        self.validate_coding_attempt_plan(&transcript.value.plan)?;
+        self.validate_coding_attempt_authority(&transcript.value.plan)?;
         if plan.delegator != self.keys.node_id() || caller != plan.coding_coordinator {
             anyhow::bail!("coding result was not submitted to its delegator by its coordinator");
         }
@@ -3080,6 +3162,150 @@ impl Node {
             complete: false,
             error: None,
         })
+    }
+
+    pub fn accept_coding_failure(
+        &self,
+        caller: NodeId,
+        failure: SignedRecord<CodingFailureReport>,
+    ) -> Result<()> {
+        failure.verify(CODING_FAILURE_REPORT_DOMAIN)?;
+        failure.value.validate()?;
+        let plan = &failure.value.plan;
+        self.validate_coding_attempt_authority(plan)?;
+        if failure.signer != plan.value.coding_coordinator
+            || caller != failure.signer
+            || plan.value.delegator != self.keys.node_id()
+        {
+            anyhow::bail!("coding failure was not submitted by its assigned coordinator");
+        }
+        let attempt_id = plan.value.attempt_id;
+        if self
+            .control
+            .get_record("coding-activation-job", &attempt_id)?
+            .is_some()
+        {
+            anyhow::bail!("verified coding evidence already exists for this attempt");
+        }
+        if let Some(bytes) = self.control.get_record("coding-retry-job", &attempt_id)? {
+            let existing: CodingRetryJob = decode_canonical(&bytes)?;
+            if existing.format_version != 1 || existing.failure != failure {
+                anyhow::bail!("coding attempt already has a different failure report");
+            }
+            return Ok(());
+        }
+        self.put_coding_retry_job(&CodingRetryJob {
+            format_version: 1,
+            failure,
+            retry_plan: None,
+            complete: false,
+            error: None,
+        })
+    }
+
+    pub(crate) fn claim_coding_retry(&self) -> Result<Option<CodingRetryJob>> {
+        for (_, bytes) in self.control.records("coding-retry-job")? {
+            let job: CodingRetryJob = decode_canonical(&bytes)?;
+            if job.format_version != 1 {
+                anyhow::bail!("durable coding retry job is invalid");
+            }
+            job.failure.verify(CODING_FAILURE_REPORT_DOMAIN)?;
+            job.failure.value.validate()?;
+            if job.failure.value.plan.value.delegator != self.keys.node_id()
+                || job.failure.signer != job.failure.value.plan.value.coding_coordinator
+            {
+                anyhow::bail!("durable coding retry job belongs to another delegator");
+            }
+            if !job.complete {
+                return Ok(Some(job));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn prepare_coding_retry(
+        &self,
+        failed_attempt_id: [u8; 16],
+        coding_coordinator: NodeId,
+        verification_coordinator: NodeId,
+        expires_at_unix_seconds: u64,
+    ) -> Result<SignedRecord<CodingAttemptPlan>> {
+        let bytes = self
+            .control
+            .get_record("coding-retry-job", &failed_attempt_id)?
+            .context("coding retry job is unavailable")?;
+        let mut job: CodingRetryJob = decode_canonical(&bytes)?;
+        if let Some(plan) = &job.retry_plan {
+            return Ok(plan.clone());
+        }
+        let prior = &job.failure.value.plan.value;
+        let state = self
+            .dynamic_guild_state()?
+            .context("node has no dynamic guild state")?;
+        let mut attempt_id = [0_u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut attempt_id);
+        if attempt_id == [0; 16] || attempt_id == prior.attempt_id {
+            attempt_id[0] ^= 1;
+        }
+        let plan = SignedRecord::sign(
+            CODING_ATTEMPT_PLAN_DOMAIN,
+            CodingAttemptPlan {
+                format_version: 1,
+                attempt_id,
+                checkpoint_hash: prior.checkpoint_hash,
+                membership_epoch: state.membership_epoch,
+                geometry: prior.geometry.clone(),
+                delegator: self.keys.node_id(),
+                coding_coordinator,
+                verification_coordinator,
+                expires_at_unix_seconds,
+            },
+            &self.keys,
+        )?;
+        self.validate_coding_attempt_plan(&plan)?;
+        job.retry_plan = Some(plan.clone());
+        job.error = None;
+        self.put_coding_retry_job(&job)?;
+        Ok(plan)
+    }
+
+    pub(crate) fn complete_coding_retry(&self, failed_attempt_id: [u8; 16]) -> Result<()> {
+        self.update_coding_retry_job(failed_attempt_id, true, None)
+    }
+
+    pub(crate) fn defer_coding_retry(
+        &self,
+        failed_attempt_id: [u8; 16],
+        error: &str,
+    ) -> Result<()> {
+        let mut error = error.to_owned();
+        truncate_utf8(&mut error, 4096);
+        self.update_coding_retry_job(failed_attempt_id, false, Some(error))
+    }
+
+    fn update_coding_retry_job(
+        &self,
+        failed_attempt_id: [u8; 16],
+        complete: bool,
+        error: Option<String>,
+    ) -> Result<()> {
+        let bytes = self
+            .control
+            .get_record("coding-retry-job", &failed_attempt_id)?
+            .context("coding retry job is unavailable")?;
+        let mut job: CodingRetryJob = decode_canonical(&bytes)?;
+        job.complete = complete;
+        job.error = error;
+        self.put_coding_retry_job(&job)
+    }
+
+    fn put_coding_retry_job(&self, job: &CodingRetryJob) -> Result<()> {
+        self.control.put_record(
+            "coding-retry-job",
+            &job.failure.value.plan.value.attempt_id,
+            &canonical_bytes(job)?,
+        )?;
+        Ok(())
     }
 
     pub(crate) fn claim_coding_activation(&self) -> Result<Option<CodingActivationJob>> {
@@ -3223,11 +3449,37 @@ impl Node {
         plan: &SignedRecord<CodingAttemptPlan>,
     ) -> Result<()> {
         self.validate_signed_coding_attempt(plan)?;
-        let state = self
-            .dynamic_guild_state()?
-            .context("node has no dynamic guild state")?;
+        let state = self.dynamic_guild_state_for_membership_epoch(plan.value.membership_epoch)?;
         state.validate_attempt_authority(&plan.value)?;
         Ok(())
+    }
+
+    fn dynamic_guild_state_for_membership_epoch(
+        &self,
+        membership_epoch: u64,
+    ) -> Result<DynamicGuildState> {
+        let installed = self
+            .installed_guild()?
+            .context("node has no installed guild")?;
+        let durable = self
+            .dynamic_guild_state()?
+            .context("node has no dynamic guild state")?;
+        let mut replay = initial_dynamic_guild_state(&installed)?;
+        let mut selected = (replay.membership_epoch == membership_epoch).then(|| replay.clone());
+        for (record_id, bytes) in self.control.records("guild-event")? {
+            let event: QuorumGuildEvent = decode_canonical(&bytes)?;
+            if record_id != event.event.sequence.to_be_bytes() {
+                anyhow::bail!("guild event history has an invalid record ID");
+            }
+            replay.apply_event(&event)?;
+            if selected.is_none() && replay.membership_epoch == membership_epoch {
+                selected = Some(replay.clone());
+            }
+        }
+        if replay != durable {
+            anyhow::bail!("dynamic guild state conflicts with its event history");
+        }
+        selected.context("coding attempt membership epoch is absent from guild history")
     }
 
     fn validate_signed_coding_attempt(&self, plan: &SignedRecord<CodingAttemptPlan>) -> Result<()> {
@@ -7510,6 +7762,139 @@ mod tests {
         }));
         assert!(node.authorize_member(&guild_id, removed).is_err());
         assert_eq!(node.guild_event_tail(0, genesis_hash).unwrap(), tail);
+    }
+
+    #[test]
+    fn coding_failure_creates_one_durable_fresh_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let (local_seed, certificate, peers) = recovery_guild_fixture();
+        let mut keys = (0_u8..5)
+            .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([index + 120; 32])))
+            .collect::<Vec<_>>();
+        keys.sort_by_key(KeyMaterial::node_id);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let local_index = keys
+            .iter()
+            .position(|keys| keys.node_id() == local_id)
+            .unwrap();
+        let remote = (0..keys.len())
+            .filter(|index| *index != local_index)
+            .collect::<Vec<_>>();
+        let mut node = Node::open(temp.path(), local_seed.clone()).unwrap();
+        node.adopt_recovered_guild(certificate.clone(), peers)
+            .unwrap();
+        let profile = mb_core::CodingProfile::new(1, 1, 16);
+        let geometry = mb_core::CodingPlanGeometry {
+            format_version: 1,
+            guild_id: certificate.genesis.guild_id,
+            profile,
+            information: vec![mb_core::InformationRoleV2 {
+                owner: certificate.genesis.members[remote[0]].node_id,
+                failure_domain: certificate.genesis.members[remote[0]]
+                    .failure_domain
+                    .clone(),
+                sector: mb_core::RangeSectorRef {
+                    id: [211; 32],
+                    commitment: merkle_commit(&[7; 16]).unwrap(),
+                    logical_len: 16,
+                    virtual_zero: false,
+                },
+            }],
+            parity: vec![mb_core::ParityPlacementV2 {
+                holder: certificate.genesis.members[remote[1]].node_id,
+                failure_domain: certificate.genesis.members[remote[1]]
+                    .failure_domain
+                    .clone(),
+                row: 0,
+            }],
+        };
+        let failed = node
+            .sign_coding_attempt_plan(CodingAttemptPlan {
+                format_version: 1,
+                attempt_id: [212; 16],
+                checkpoint_hash: [213; 32],
+                membership_epoch: 1,
+                geometry,
+                delegator: local_id,
+                coding_coordinator: keys[remote[0]].node_id(),
+                verification_coordinator: keys[remote[1]].node_id(),
+                expires_at_unix_seconds: unix_seconds() + 600,
+            })
+            .unwrap();
+        let failure = SignedRecord::sign(
+            CODING_FAILURE_REPORT_DOMAIN,
+            CodingFailureReport {
+                format_version: 1,
+                failed_at_unix_seconds: unix_seconds(),
+                plan: failed.clone(),
+                error_hash: [214; 32],
+            },
+            &keys[remote[0]],
+        )
+        .unwrap();
+        node.accept_coding_failure(keys[remote[0]].node_id(), failure.clone())
+            .unwrap();
+        node.accept_coding_failure(keys[remote[0]].node_id(), failure)
+            .unwrap();
+
+        drop(node);
+        let mut node = Node::open(temp.path(), local_seed).unwrap();
+        let retry = node.claim_coding_retry().unwrap().unwrap();
+        assert!(retry.retry_plan.is_none());
+        let fresh = node
+            .prepare_coding_retry(
+                [212; 16],
+                keys[remote[2]].node_id(),
+                keys[remote[3]].node_id(),
+                unix_seconds() + 600,
+            )
+            .unwrap();
+        assert_ne!(fresh.value.attempt_id, failed.value.attempt_id);
+        assert_ne!(
+            fresh.value.coding_coordinator,
+            failed.value.coding_coordinator
+        );
+        assert_ne!(
+            fresh.value.verification_coordinator,
+            failed.value.verification_coordinator
+        );
+        assert_eq!(fresh.value.geometry, failed.value.geometry);
+        assert_eq!(
+            node.prepare_coding_retry(
+                [212; 16],
+                keys[remote[3]].node_id(),
+                keys[remote[2]].node_id(),
+                unix_seconds() + 900,
+            )
+            .unwrap(),
+            fresh
+        );
+        node.complete_coding_retry([212; 16]).unwrap();
+        assert!(node.claim_coding_retry().unwrap().is_none());
+
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let relabel = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RelabelMember {
+                node_id: certificate.genesis.members[remote[0]].node_id,
+                failure_domain: "changed-after-attempt".to_owned(),
+            },
+        };
+        let mut signatures = keys
+            .iter()
+            .map(|keys| sign_guild_event(&relabel, keys).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        node.install_guild_event(QuorumGuildEvent {
+            event: relabel,
+            signatures,
+        })
+        .unwrap();
+        assert!(node.validate_coding_attempt_plan(&failed).is_err());
+        node.validate_coding_attempt_for_cleanup(&failed).unwrap();
     }
 
     #[test]

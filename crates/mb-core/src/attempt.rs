@@ -16,6 +16,7 @@ pub const CODING_CHALLENGE_COMMITMENT_DOMAIN: &[u8] =
 pub const CODING_CHALLENGE_REVEAL_DOMAIN: &[u8] = b"mutualbackup/coding-challenge-reveal/v1";
 pub const CODING_SHARD_OPENING_DOMAIN: &[u8] = b"mutualbackup/coding-shard-opening/v1";
 pub const CODING_TRANSCRIPT_DOMAIN: &[u8] = b"mutualbackup/coding-transcript/v1";
+pub const CODING_FAILURE_REPORT_DOMAIN: &[u8] = b"mutualbackup/coding-failure-report/v1";
 
 /// The immutable, narrow delegation for one complete coding attempt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -226,6 +227,34 @@ pub struct CodingVerificationTranscript {
     pub staged_receipts: Vec<SignedRecord<StagedStorageReceipt>>,
     pub challenge_reveal: SignedRecord<CodingChallengeReveal>,
     pub openings: Vec<SignedRecord<CodingShardOpening>>,
+}
+
+/// A coding coordinator's durable notice that an attempt failed before a
+/// verifier accepted it. The detailed local error stays out of the protocol;
+/// its hash binds diagnostics without making them authorization input.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CodingFailureReport {
+    pub format_version: u16,
+    pub failed_at_unix_seconds: u64,
+    pub plan: SignedRecord<CodingAttemptPlan>,
+    pub error_hash: [u8; 32],
+}
+
+impl CodingFailureReport {
+    pub fn validate(&self) -> Result<(), CodingAttemptError> {
+        self.plan
+            .verify(CODING_ATTEMPT_PLAN_DOMAIN)
+            .map_err(|_| CodingAttemptError::InvalidPlan)?;
+        self.plan.value.validate()?;
+        if self.format_version != 1
+            || self.failed_at_unix_seconds == 0
+            || self.plan.signer != self.plan.value.delegator
+            || self.error_hash == [0; 32]
+        {
+            return Err(CodingAttemptError::InvalidPlan);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

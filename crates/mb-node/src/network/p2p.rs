@@ -27,23 +27,24 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use mb_core::{
     CODING_CHALLENGE_COMMITMENT_DOMAIN, CODING_CHALLENGE_REVEAL_DOMAIN,
-    CODING_SHARD_OPENING_DOMAIN, CodingAttemptPlan, CodingChallengeCommitment,
-    CodingChallengeReveal, CodingGroup, CodingRootManifest, CodingShardOpening,
-    CodingVerificationTranscript, GuildCheckpoint, GuildEvent, GuildEventTail, GuildGenesis,
-    GuildInvite, InformationRole, MERKLE_LEAF_SIZE, Member, MemberSignature, NodeId, ParityRole,
-    QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN,
-    STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole,
-    ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement, UserRevision,
-    V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS,
-    V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS,
-    V1_SECTOR_SIZE, canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical,
-    encode_3_2, merkle_commit, open_recovery_record, replay_coding_transcript, sector_root,
+    CODING_FAILURE_REPORT_DOMAIN, CODING_SHARD_OPENING_DOMAIN, CodingAttemptPlan,
+    CodingChallengeCommitment, CodingChallengeReveal, CodingFailureReport, CodingGroup,
+    CodingRootManifest, CodingShardOpening, CodingVerificationTranscript, GuildCheckpoint,
+    GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, InformationRole, MERKLE_LEAF_SIZE,
+    Member, MemberSignature, NodeId, ParityRole, QuorumCheckpoint, QuorumGuildEvent,
+    QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN, STAGED_STORAGE_RECEIPT_DOMAIN,
+    STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole, ShardRoleV2, SignedRecord,
+    StagedStorageReceipt, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
+    V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES,
+    V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE,
+    canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical, encode_3_2,
+    merkle_commit, open_recovery_record, replay_coding_transcript, sector_root,
 };
 use mb_store::{ParityObject, VariableParityObject};
 use uuid::Uuid;
 
 use crate::node::{
-    CheckpointRecoveryObservation, DelegatedCodingJob, DelegatedCodingJobState,
+    CheckpointRecoveryObservation, CodingRetryJob, DelegatedCodingJob, DelegatedCodingJobState,
     DhtRecordObservation, GuildPhase, SnapshotInfo,
 };
 
@@ -2424,6 +2425,30 @@ impl P2pClient {
             .await?;
         if !matches!(response, PeerResponse::Ack) {
             bail!("peer returned the wrong coding-result response");
+        }
+        Ok(())
+    }
+
+    pub async fn submit_coding_failure(
+        &self,
+        delegator: NodeId,
+        failure: SignedRecord<CodingFailureReport>,
+    ) -> Result<()> {
+        if failure.value.plan.value.delegator != delegator {
+            bail!("coding failure names a different delegator");
+        }
+        failure.verify(CODING_FAILURE_REPORT_DOMAIN)?;
+        failure.value.validate()?;
+        let response = self
+            .call(
+                delegator,
+                PeerRequest::SubmitCodingFailure {
+                    failure: Box::new(failure),
+                },
+            )
+            .await?;
+        if !matches!(response, PeerResponse::Ack) {
+            bail!("peer returned the wrong coding-failure response");
         }
         Ok(())
     }
@@ -5373,6 +5398,25 @@ pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -
         if let Some(job) = node_blocking(node.clone(), |node| node.claim_delegated_coding()).await?
         {
             let attempt_id = job.plan.value.attempt_id;
+            if job.state == DelegatedCodingJobState::ReportingFailure {
+                let failure = node_blocking(node.clone(), move |node| {
+                    node.delegated_coding_failure(attempt_id)
+                })
+                .await?;
+                match submit_delegated_coding_failure(node.clone(), &p2p, failure).await {
+                    Ok(()) => {
+                        node_blocking(node.clone(), move |node| {
+                            node.complete_delegated_coding(attempt_id)
+                        })
+                        .await?;
+                    }
+                    Err(error) => {
+                        tracing::warn!(?attempt_id, %error, "coding failure submission deferred");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+                continue;
+            }
             if job.state == DelegatedCodingJobState::Cleanup {
                 match abort_delegated_coding(node.clone(), &p2p, &job).await {
                     Ok(()) => {
@@ -5382,7 +5426,8 @@ pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -
                             .unwrap_or("coding attempt failed and was cleaned up")
                             .to_owned();
                         node_blocking(node.clone(), move |node| {
-                            node.fail_delegated_coding(attempt_id, &error)
+                            node.record_delegated_coding_failure(attempt_id, &error)
+                                .map(|_| ())
                         })
                         .await?;
                     }
@@ -5431,11 +5476,34 @@ pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -
                         .is_ok()
                     {
                         node_blocking(node.clone(), move |node| {
-                            node.fail_delegated_coding(attempt_id, &message)
+                            node.record_delegated_coding_failure(attempt_id, &message)
+                                .map(|_| ())
                         })
                         .await?;
                     }
                     tracing::warn!(?attempt_id, %error, "delegated coding attempt failed");
+                }
+            }
+            continue;
+        }
+
+        if let Some(job) = node_blocking(node.clone(), |node| node.claim_coding_retry()).await? {
+            let failed_attempt_id = job.failure.value.plan.value.attempt_id;
+            match execute_coding_retry(node.clone(), &p2p, &job).await {
+                Ok(()) => {
+                    node_blocking(node.clone(), move |node| {
+                        node.complete_coding_retry(failed_attempt_id)
+                    })
+                    .await?;
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    node_blocking(node.clone(), move |node| {
+                        node.defer_coding_retry(failed_attempt_id, &message)
+                    })
+                    .await?;
+                    tracing::warn!(?failed_attempt_id, %error, "fresh coding retry deferred");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             }
             continue;
@@ -5467,6 +5535,149 @@ pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -
 
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+async fn submit_delegated_coding_failure(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    failure: SignedRecord<CodingFailureReport>,
+) -> Result<()> {
+    let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
+    let delegator = failure.value.plan.value.delegator;
+    if delegator == local_id {
+        node_blocking(node, move |node| {
+            node.accept_coding_failure(local_id, failure)
+        })
+        .await
+    } else {
+        p2p.submit_coding_failure(delegator, failure).await
+    }
+}
+
+async fn execute_coding_retry(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    job: &CodingRetryJob,
+) -> Result<()> {
+    let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
+    let plan = match &job.retry_plan {
+        Some(plan) => plan.clone(),
+        None => {
+            let prior = job.failure.value.plan.value.clone();
+            let (guild, old_coder, old_verifier, participants) =
+                node_blocking(node.clone(), move |node| {
+                    let guild = node
+                        .guild_summary()?
+                        .context("coding retry requires an installed guild")?;
+                    let participants = prior
+                        .geometry
+                        .information
+                        .iter()
+                        .map(|role| role.owner)
+                        .chain(prior.geometry.parity.iter().map(|role| role.holder))
+                        .collect::<BTreeSet<_>>();
+                    Ok((
+                        guild,
+                        prior.coding_coordinator,
+                        prior.verification_coordinator,
+                        participants,
+                    ))
+                })
+                .await?;
+            let mut reachable = Vec::new();
+            for peer in guild.peers {
+                let candidate = peer.member.node_id;
+                if candidate == old_coder || candidate == old_verifier {
+                    continue;
+                }
+                for endpoint in peer.endpoints {
+                    if let Ok(address) = endpoint.parse() {
+                        let _ = p2p.add_peer_address(candidate, address).await;
+                    }
+                }
+                if candidate == local_id
+                    || p2p
+                        .profile(candidate)
+                        .await
+                        .is_ok_and(|profile| profile.member.node_id == candidate)
+                {
+                    reachable.push(candidate);
+                }
+            }
+            if reachable.len() < 2 {
+                bail!("coding retry has fewer than two fresh reachable coordinators");
+            }
+            let status = p2p.status().await?;
+            reachable.sort_by_key(|candidate| {
+                let participant_rank = !participants.contains(candidate);
+                let path_rank = coding_candidate_path_rank(*candidate, local_id, &status);
+                (participant_rank, path_rank, *candidate)
+            });
+            let coding_coordinator = reachable[0];
+            let verification_coordinator = reachable
+                .iter()
+                .copied()
+                .filter(|candidate| *candidate != coding_coordinator)
+                .min_by_key(|candidate| {
+                    (
+                        coding_candidate_path_rank(*candidate, local_id, &status),
+                        *candidate,
+                    )
+                })
+                .context("coding retry has no separate fresh verifier")?;
+            let expires_at = unix_seconds()
+                .checked_add(10 * 60)
+                .context("coding retry expiry overflow")?;
+            let failed_attempt_id = job.failure.value.plan.value.attempt_id;
+            node_blocking(node.clone(), move |node| {
+                node.prepare_coding_retry(
+                    failed_attempt_id,
+                    coding_coordinator,
+                    verification_coordinator,
+                    expires_at,
+                )
+            })
+            .await?
+        }
+    };
+    let coordinator = plan.value.coding_coordinator;
+    if coordinator == local_id {
+        let local_plan = plan.clone();
+        node_blocking(node, move |node| {
+            node.enqueue_delegated_coding(local_id, local_plan)
+        })
+        .await
+    } else {
+        p2p.delegate_coding_attempt(coordinator, plan).await
+    }
+}
+
+fn coding_path_rank(path: P2pPath) -> usize {
+    match path {
+        P2pPath::Direct | P2pPath::HolePunched => 0,
+        P2pPath::Relayed | P2pPath::RelayFallback => 1,
+        P2pPath::Tor => 2,
+    }
+}
+
+fn coding_candidate_path_rank(candidate: NodeId, local_id: NodeId, status: &P2pStatus) -> usize {
+    if candidate == local_id {
+        return 0;
+    }
+    let Ok(peer_id) = candidate.libp2p_peer_id() else {
+        return usize::MAX;
+    };
+    status
+        .peers
+        .iter()
+        .find(|peer| peer.peer_id == peer_id.to_string())
+        .and_then(|peer| {
+            peer.active_paths
+                .iter()
+                .map(|path| coding_path_rank(*path))
+                .min()
+        })
+        .unwrap_or(usize::MAX)
 }
 
 async fn execute_delegated_coding(

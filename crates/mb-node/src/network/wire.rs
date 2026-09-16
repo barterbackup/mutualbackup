@@ -1,7 +1,7 @@
 use mb_core::{
-    CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal, CodingGroup,
-    CodingRootManifest, CodingShardOpening, CodingVerificationTranscript, EndpointRecord,
-    GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, Member, MemberSignature,
+    CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal, CodingFailureReport,
+    CodingGroup, CodingRootManifest, CodingShardOpening, CodingVerificationTranscript,
+    EndpointRecord, GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, Member, MemberSignature,
     MerkleRangeProof, NodeId, QuorumGuildEvent, QuorumGuildGenesis, SectorId, SectorRef,
     SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
 };
@@ -141,6 +141,9 @@ pub(super) enum PeerRequest {
     SubmitCodingTranscript {
         transcript: Box<SignedRecord<CodingVerificationTranscript>>,
     },
+    SubmitCodingFailure {
+        failure: Box<SignedRecord<CodingFailureReport>>,
+    },
     ActivateCodingParity {
         transcript: Box<SignedRecord<CodingVerificationTranscript>>,
     },
@@ -274,6 +277,7 @@ impl PeerRequest {
             Self::GetCodingOpening { .. } => Some("get-coding-opening"),
             Self::FinalizeCodingVerification { .. } => Some("finalize-coding-verification"),
             Self::SubmitCodingTranscript { .. } => Some("submit-coding-transcript"),
+            Self::SubmitCodingFailure { .. } => Some("submit-coding-failure"),
             Self::ActivateCodingParity { .. } => Some("activate-coding-parity"),
             Self::AbortCodingAttempt { .. } => Some("abort-coding-attempt"),
             Self::StoreRepairShard { .. } => Some("store-repair-shard"),
@@ -337,6 +341,9 @@ impl PeerRequest {
             }
             Self::SubmitCodingTranscript { transcript } => {
                 Some(transcript.value.plan.value.geometry.guild_id)
+            }
+            Self::SubmitCodingFailure { failure } => {
+                Some(failure.value.plan.value.geometry.guild_id)
             }
         }
     }

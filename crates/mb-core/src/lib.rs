@@ -16,11 +16,11 @@ mod recovery;
 
 pub use attempt::{
     CODING_ATTEMPT_PLAN_DOMAIN, CODING_CHALLENGE_COMMITMENT_DOMAIN, CODING_CHALLENGE_REVEAL_DOMAIN,
-    CODING_ROOT_MANIFEST_DOMAIN, CODING_SHARD_OPENING_DOMAIN, CODING_TRANSCRIPT_DOMAIN,
-    CodingAttemptError, CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal,
-    CodingPlanGeometry, CodingReplayFinding, CodingRootManifest, CodingShardOpening,
-    CodingTransferEstimate, CodingVerificationTranscript, ParityPlacementV2,
-    STAGED_STORAGE_RECEIPT_DOMAIN, StagedStorageReceipt, coding_challenge,
+    CODING_FAILURE_REPORT_DOMAIN, CODING_ROOT_MANIFEST_DOMAIN, CODING_SHARD_OPENING_DOMAIN,
+    CODING_TRANSCRIPT_DOMAIN, CodingAttemptError, CodingAttemptPlan, CodingChallengeCommitment,
+    CodingChallengeReveal, CodingFailureReport, CodingPlanGeometry, CodingReplayFinding,
+    CodingRootManifest, CodingShardOpening, CodingTransferEstimate, CodingVerificationTranscript,
+    ParityPlacementV2, STAGED_STORAGE_RECEIPT_DOMAIN, StagedStorageReceipt, coding_challenge,
     coding_challenge_commitment, coding_evidence_hash, coding_transfer_estimate,
     encode_coding_attempt, replay_coding_transcript,
 };

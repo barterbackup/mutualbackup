@@ -99,6 +99,7 @@ peer-request =
       } }
   / { "FinalizeCodingVerification": { transcript: coding-transcript } }
   / { "SubmitCodingTranscript": { transcript: signed-coding-transcript } }
+  / { "SubmitCodingFailure": { failure: signed-coding-failure-report } }
   / { "ActivateCodingParity": { transcript: signed-coding-transcript } }
   / { "AbortCodingAttempt": { plan: signed-coding-attempt-plan } }
   / { "GetParity": { guild_id: bytes32-array, group_id: bytes32-array, shard_index: uint8 } }
@@ -254,6 +255,7 @@ signed-storage-ack = {
 signed-coding-attempt-plan = any
 variable-parity-object = any
 signed-coding-transcript = any
+signed-coding-failure-report = any
 coding-transcript = any
 signed-coding-root-manifest = any
 signed-staged-storage-receipt = any
