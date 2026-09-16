@@ -670,7 +670,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   formats 4 through 7, but recovery-head certification independently admitted
   current-epoch bundles only for format 4. Apply the same dynamic checkpoint
   range during certification and regress every supported version.
-- [ ] **M5-11 / gate — Run the corrected production gate.**
+- [x] **M5-11 / P1 — Establish watcher coverage before backup capture.**
+  The next production run again completed all coding transcripts, then found
+  node 2 dirty before the deliberate post-restore source edit. Its durable
+  record showed that capture saved dirty generation 1 while the asynchronously
+  started watcher later wrote generation 2 for startup reconciliation. Install
+  every filesystem watch before advancing that generation, expose a readiness
+  signal, and require the production path to observe it before capture.
+- [ ] **M5-12 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -679,10 +686,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   publication loop throughout the next gate exposed M5-09 in bundle validation.
   The following run passed final-checkpoint readiness but exposed M5-10 when
   cold recovery applied an older, narrower copy of the same validation rule.
+  The next run exposed M5-11 when its fixed watcher-startup sleep lost a race
+  with capture after the full coding workload completed.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-10 close.
+  acceptance gate after M5-01 through M5-11 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

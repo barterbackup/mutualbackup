@@ -774,8 +774,14 @@ large recovery with three live holders timed out. Cold-recovery head
 certification had a separate copy of the recovery-key rule that still admitted
 format-2 current-epoch bundles only for checkpoint format 4. Certification now
 uses the same supported dynamic range, 4 through 7, with a focused regression.
-A fresh provisioned production gate must still close before Milestone 5 can
-pass.
+The following production run completed all coding transcripts, then found the
+watched node dirty before the deliberate post-restore edit. Its durable record
+showed capture had saved dirty generation 1 before the asynchronously started
+watcher wrote generation 2 for startup reconciliation. The watcher now installs
+all filesystem watches before advancing the reconciliation generation and
+offers an explicit readiness signal; the production path waits for that signal
+instead of a fixed delay. A fresh provisioned production gate must still close
+before Milestone 5 can pass.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer

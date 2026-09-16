@@ -22,6 +22,21 @@ struct WatchedRootIdentity {
 }
 
 pub async fn run_root_watcher(node: Arc<Mutex<Node>>) -> Result<()> {
+    run_root_watcher_inner(node, None).await
+}
+
+#[cfg(test)]
+pub(crate) async fn run_root_watcher_ready(
+    node: Arc<Mutex<Node>>,
+    ready: tokio::sync::oneshot::Sender<()>,
+) -> Result<()> {
+    run_root_watcher_inner(node, Some(ready)).await
+}
+
+async fn run_root_watcher_inner(
+    node: Arc<Mutex<Node>>,
+    mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
     let mut retry_delay = WATCH_RETRY_MIN;
     loop {
         let roots = match node_blocking(node.clone(), |node| node.protected_roots()).await {
@@ -38,17 +53,7 @@ pub async fn run_root_watcher(node: Arc<Mutex<Node>>) -> Result<()> {
             tokio::time::sleep(WATCH_RETRY_MIN).await;
             continue;
         }
-        for root in &roots {
-            mark_dirty(
-                node.clone(),
-                root.root_id,
-                "startup or watcher restart reconciliation required",
-                false,
-            )
-            .await;
-        }
-
-        match watch_once(node.clone(), &roots).await {
+        match watch_once(node.clone(), &roots, &mut ready).await {
             Ok(()) => tracing::warn!("filesystem watcher stopped; restarting"),
             Err(error) => tracing::warn!(
                 %error,
@@ -69,7 +74,11 @@ pub async fn run_root_watcher(node: Arc<Mutex<Node>>) -> Result<()> {
     }
 }
 
-async fn watch_once(node: Arc<Mutex<Node>>, roots: &[ProtectedRoot]) -> Result<()> {
+async fn watch_once(
+    node: Arc<Mutex<Node>>,
+    roots: &[ProtectedRoot],
+    ready: &mut Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
     let opened = roots
         .iter()
         .map(|root| {
@@ -113,6 +122,21 @@ async fn watch_once(node: Arc<Mutex<Node>>, roots: &[ProtectedRoot]) -> Result<(
         watcher
             .watch(&root.path, RecursiveMode::Recursive)
             .with_context(|| format!("cannot watch protected root {}", root.path.display()))?;
+    }
+    // Attach every watch before advancing the dirty generation. Events which
+    // arrive during reconciliation remain queued, so a capture started after
+    // readiness cannot miss a change between the full scan and watcher setup.
+    for root in roots {
+        persist_dirty(
+            node.clone(),
+            root.root_id,
+            "startup or watcher restart reconciliation required",
+            false,
+        )
+        .await?;
+    }
+    if let Some(ready) = ready.take() {
+        let _ = ready.send(());
     }
     let mut health = tokio::time::interval(WATCH_ROOT_HEALTH_INTERVAL);
     health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -200,7 +224,18 @@ async fn mark_dirty(
     reason: &'static str,
     changed: bool,
 ) {
-    if let Err(error) = node_blocking(node, move |node| {
+    if let Err(error) = persist_dirty(node, root_id, reason, changed).await {
+        tracing::error!(%error, "cannot persist protected-root dirty state");
+    }
+}
+
+async fn persist_dirty(
+    node: Arc<Mutex<Node>>,
+    root_id: uuid::Uuid,
+    reason: &'static str,
+    changed: bool,
+) -> Result<()> {
+    node_blocking(node, move |node| {
         if changed {
             node.mark_root_changed(root_id, reason)
         } else {
@@ -208,9 +243,6 @@ async fn mark_dirty(
         }
     })
     .await
-    {
-        tracing::error!(%error, "cannot persist protected-root dirty state");
-    }
 }
 
 fn next_retry_delay(current: Duration) -> Duration {

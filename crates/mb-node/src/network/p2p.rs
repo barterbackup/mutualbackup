@@ -17255,10 +17255,15 @@ mod tests {
                 owner_one_primary = Some(root);
             }
             if owner_index == 2 {
-                watcher_task = Some(tokio::spawn(crate::run_root_watcher(
+                let (ready, attached) = tokio::sync::oneshot::channel();
+                watcher_task = Some(tokio::spawn(crate::watcher::run_root_watcher_ready(
                     nodes[owner_index].clone(),
+                    ready,
                 )));
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::timeout(Duration::from_secs(5), attached)
+                    .await
+                    .expect("production watcher did not attach")
+                    .expect("production watcher stopped before attaching");
             }
             let descriptor = nodes[owner_index]
                 .lock()
