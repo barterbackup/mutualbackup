@@ -449,7 +449,11 @@ impl GuildCheckpoint {
             || self.generation == 0
             || self.generation > i64::MAX as u64
             || (self.generation == 1) != self.parent.is_none()
-            || self.members.len() != 5
+            || match self.format_version {
+                3 => self.members.len() != 5,
+                4 => self.members.is_empty() || self.members.len() > 256,
+                _ => true,
+            }
             || self.revisions.is_empty()
             || self.revisions.len() > 4096
             || (self.format_version == 3 && self.coding_groups.is_empty())
@@ -488,7 +492,7 @@ impl GuildCheckpoint {
             let order = (fence.owner, fence.epoch);
             let key = VerifyingKey::from_bytes(&fence.public_key)?;
             if previous_fence.is_some_and(|previous| previous >= order)
-                || !member_ids.contains(&fence.owner)
+                || self.format_version == 3 && !member_ids.contains(&fence.owner)
                 || fence.epoch == 0
                 || key.is_weak()
                 || fences.insert(order, fence.public_key).is_some()
@@ -506,7 +510,7 @@ impl GuildCheckpoint {
         let mut previous_tombstone = None;
         for tombstone in &self.revision_tombstones {
             if previous_tombstone.is_some_and(|previous| previous >= tombstone.owner)
-                || !member_ids.contains(&tombstone.owner)
+                || self.format_version == 3 && !member_ids.contains(&tombstone.owner)
                 || tombstone.through_sequence == 0
                 || tombstone.last_revision_id.is_nil()
                 || tombstone.last_revision_hash == [0; 32]
@@ -528,7 +532,7 @@ impl GuildCheckpoint {
             );
             if revision_order.is_some_and(|previous| previous >= order)
                 || revision.signer != revision.value.owner
-                || !member_ids.contains(&revision.signer)
+                || self.format_version == 3 && !member_ids.contains(&revision.signer)
                 || revision.value.format_version != 2
                 || revision.value.guild_id != self.guild_id
                 || revision.value.cipher_profile != V1_CIPHER_PROFILE
@@ -1290,6 +1294,24 @@ mod tests {
         variable_checkpoint.format_version = 4;
         variable_checkpoint.coding_groups.clear();
         variable_checkpoint.validate().unwrap();
+        variable_checkpoint
+            .members
+            .retain(|member| member.node_id != keys[0].node_id());
+        variable_checkpoint.validate().unwrap();
+        let mut dynamic_quorum = QuorumCheckpoint {
+            checkpoint: variable_checkpoint.clone(),
+            signatures: Vec::new(),
+        };
+        for key in &keys {
+            if variable_checkpoint
+                .members
+                .iter()
+                .any(|member| member.node_id == key.node_id())
+            {
+                dynamic_quorum.add_signature(key).unwrap();
+            }
+        }
+        dynamic_quorum.verify().unwrap();
         variable_checkpoint.format_version = 3;
         assert!(matches!(
             variable_checkpoint.validate(),

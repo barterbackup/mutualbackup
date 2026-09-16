@@ -9334,10 +9334,19 @@ fn variable_coding_lane(
     source_bytes: &[u8],
     peers: &[crate::GuildPeer],
 ) -> Result<VariableCodingLane> {
-    if peers.len() != 5 || source_bytes.len() != V1_SECTOR_SIZE {
-        bail!("variable coding lane requires five placements and one complete source sector");
+    let participant_count = peers.len().min(mb_core::MAX_CODING_SHARDS as usize);
+    if participant_count < 3 || source_bytes.len() != V1_SECTOR_SIZE {
+        bail!(
+            "variable coding lane requires at least three placements and one complete source sector"
+        );
     }
-    let profile = CodingProfile::new(3, 2, V1_SECTOR_SIZE as u32);
+    let parity_shards = if participant_count == 3 { 1 } else { 2 };
+    let data_shards = participant_count - parity_shards;
+    let profile = CodingProfile::new(
+        u16::try_from(data_shards)?,
+        u16::try_from(parity_shards)?,
+        V1_SECTOR_SIZE as u32,
+    );
     profile.validate()?;
     let zero_commitment = merkle_zero_commitment(profile.shard_size)?;
     let source_commitment = merkle_commit(source_bytes)?;
@@ -9353,50 +9362,35 @@ fn variable_coding_lane(
         }
         id
     };
-    let information = vec![
-        InformationRoleV2 {
-            owner: peers[0].member.node_id,
-            failure_domain: peers[0].member.failure_domain.clone(),
-            sector: RangeSectorRef {
-                id: source.id,
-                commitment: source_commitment,
-                logical_len: source.logical_len,
-                virtual_zero: false,
-            },
+    let mut information = vec![InformationRoleV2 {
+        owner: peers[0].member.node_id,
+        failure_domain: peers[0].member.failure_domain.clone(),
+        sector: RangeSectorRef {
+            id: source.id,
+            commitment: source_commitment,
+            logical_len: source.logical_len,
+            virtual_zero: false,
         },
-        InformationRoleV2 {
-            owner: peers[1].member.node_id,
-            failure_domain: peers[1].member.failure_domain.clone(),
-            sector: RangeSectorRef {
-                id: virtual_sector(0),
-                commitment: zero_commitment.clone(),
-                logical_len: profile.shard_size,
-                virtual_zero: true,
-            },
+    }];
+    information.extend((1..data_shards).map(|index| InformationRoleV2 {
+        owner: peers[index].member.node_id,
+        failure_domain: peers[index].member.failure_domain.clone(),
+        sector: RangeSectorRef {
+            id: virtual_sector((index - 1) as u8),
+            commitment: zero_commitment.clone(),
+            logical_len: profile.shard_size,
+            virtual_zero: true,
         },
-        InformationRoleV2 {
-            owner: peers[2].member.node_id,
-            failure_domain: peers[2].member.failure_domain.clone(),
-            sector: RangeSectorRef {
-                id: virtual_sector(1),
-                commitment: zero_commitment,
-                logical_len: profile.shard_size,
-                virtual_zero: true,
-            },
-        },
-    ];
-    let parity = vec![
-        ParityPlacementV2 {
-            holder: peers[3].member.node_id,
-            failure_domain: peers[3].member.failure_domain.clone(),
-            row: 0,
-        },
-        ParityPlacementV2 {
-            holder: peers[4].member.node_id,
-            failure_domain: peers[4].member.failure_domain.clone(),
-            row: 1,
-        },
-    ];
+    }));
+    let parity = peers[data_shards..participant_count]
+        .iter()
+        .enumerate()
+        .map(|(row, peer)| ParityPlacementV2 {
+            holder: peer.member.node_id,
+            failure_domain: peer.member.failure_domain.clone(),
+            row: row as u16,
+        })
+        .collect::<Vec<_>>();
     let geometry = CodingPlanGeometry {
         format_version: 1,
         guild_id,
@@ -9405,14 +9399,9 @@ fn variable_coding_lane(
         parity,
     };
     geometry.validate()?;
-    let encoded = encode(
-        profile,
-        vec![
-            source_bytes.to_vec(),
-            vec![0; V1_SECTOR_SIZE],
-            vec![0; V1_SECTOR_SIZE],
-        ],
-    )?;
+    let mut information_bytes = vec![source_bytes.to_vec()];
+    information_bytes.resize(data_shards, vec![0; V1_SECTOR_SIZE]);
+    let encoded = encode(profile, information_bytes)?;
     let mut roles = geometry
         .information
         .iter()
@@ -9424,7 +9413,7 @@ fn variable_coding_lane(
             holder: placement.holder,
             failure_domain: placement.failure_domain.clone(),
             row: placement.row,
-            commitment: merkle_commit(&encoded[3 + offset])?,
+            commitment: merkle_commit(&encoded[data_shards + offset])?,
         }));
     }
     let mut expected_group = CodingGroupV2 {
@@ -9545,30 +9534,41 @@ async fn commit_backup_job(
     job: &BackupJob,
 ) -> Result<[u8; 32]> {
     let guild_id = job.descriptor.guild_id;
-    let (certificate, mut peers, local_id, previous, retention_revisions, membership_epoch) =
-        node_blocking(node.clone(), move |node| {
-            let certificate = node
-                .installed_guild_certificate()?
-                .context("coordinator has no installed guild genesis")?;
-            let summary = node
-                .guild_summary()?
-                .context("coordinator has no guild endpoint roster")?;
-            let previous = node.current_checkpoint(guild_id)?;
-            Ok((
-                certificate,
-                summary.peers,
-                node.keys().node_id(),
-                previous,
-                node.retention_revisions()?,
-                node.dynamic_guild_state()?
-                    .context("coordinator has no dynamic guild state")?
-                    .membership_epoch,
-            ))
-        })
-        .await?;
+    let (
+        certificate,
+        coordinator,
+        mut peers,
+        checkpoint_members,
+        local_id,
+        previous,
+        retention_revisions,
+        membership_epoch,
+    ) = node_blocking(node.clone(), move |node| {
+        let certificate = node
+            .installed_guild_certificate()?
+            .context("coordinator has no installed guild genesis")?;
+        let summary = node
+            .guild_summary()?
+            .context("coordinator has no guild endpoint roster")?;
+        let previous = node.current_checkpoint(guild_id)?;
+        let state = node
+            .dynamic_guild_state()?
+            .context("coordinator has no dynamic guild state")?;
+        Ok((
+            certificate,
+            summary.coordinator,
+            summary.peers,
+            state.active_members().cloned().collect::<Vec<_>>(),
+            node.keys().node_id(),
+            previous,
+            node.retention_revisions()?,
+            state.membership_epoch,
+        ))
+    })
+    .await?;
     certificate.verify()?;
     if certificate.genesis.guild_id != guild_id
-        || certificate.genesis.coordinator != local_id
+        || coordinator != local_id
         || job.descriptor.owner == local_id
             && !peers.iter().any(|peer| peer.member.node_id == local_id)
     {
@@ -9589,8 +9589,8 @@ async fn commit_backup_job(
     let owner = peers.remove(owner_position);
     peers.sort_by_key(|peer| peer.member.node_id);
     peers.insert(0, owner);
-    if peers.len() != 5 {
-        bail!("prototype backup requires exactly five guild peers");
+    if peers.len() < 3 {
+        bail!("variable backup requires at least three active guild peers");
     }
     for peer in peers.iter().filter(|peer| peer.member.node_id != local_id) {
         for endpoint in &peer.endpoints {
@@ -9682,13 +9682,14 @@ async fn commit_backup_job(
         &mut revisions,
         &mut coding_groups,
     )?;
+    coding_groups.clear();
     let checkpoint = GuildCheckpoint {
         format_version: 4,
         guild_id,
         genesis_hash: certificate.hash()?,
         generation,
         parent,
-        members: certificate.genesis.members.clone(),
+        members: checkpoint_members,
         writer_fences,
         revision_tombstones,
         revisions,
@@ -9717,7 +9718,7 @@ async fn commit_backup_job(
         &body,
     )
     .await?;
-    let mut signatures = Vec::with_capacity(5);
+    let mut signatures = Vec::with_capacity(peers.len());
     for peer in &peers {
         let signer = peer.member.node_id;
         let signature = if signer == local_id {
@@ -10177,6 +10178,44 @@ mod tests {
             estimate.bulk_bytes,
             2 * u64::try_from(V1_SECTOR_SIZE).unwrap()
         );
+    }
+
+    #[test]
+    fn production_variable_lane_tracks_dynamic_roster_geometry() {
+        let peers = (0_u8..6)
+            .map(|index| {
+                let keys = KeyMaterial::from_seed(&Seed::from_bytes([index + 40; 32]));
+                crate::GuildPeer {
+                    member: Member {
+                        node_id: keys.node_id(),
+                        recovery_public_key: keys.recovery_public_key(),
+                        failure_domain: format!("dynamic-lane-domain-{index}"),
+                    },
+                    endpoints: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let bytes = vec![88; V1_SECTOR_SIZE];
+        let source = SectorRef {
+            id: [41; 32],
+            root: sector_root(&bytes),
+            logical_len: 321,
+        };
+        for (members, expected_data, expected_parity) in [(3, 2, 1), (5, 3, 2), (6, 4, 2)] {
+            let lane = variable_coding_lane(
+                [42; 32],
+                Uuid::from_bytes([43; 16]),
+                members as u64,
+                &source,
+                &bytes,
+                &peers[..members],
+            )
+            .unwrap();
+            assert_eq!(lane.geometry.profile.data_shards, expected_data);
+            assert_eq!(lane.geometry.profile.parity_shards, expected_parity);
+            assert_eq!(lane.expected_group.roles.len(), members);
+            lane.expected_group.validate().unwrap();
+        }
     }
 
     fn register_request_connection(

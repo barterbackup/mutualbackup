@@ -1920,14 +1920,21 @@ impl Node {
 
     pub fn guild_summary(&self) -> Result<Option<GuildSummary>> {
         if let Some(installed) = self.installed_guild()? {
-            let peers = match self.dynamic_guild_state()? {
-                Some(state) => self.dynamic_guild_peers(&installed, &state)?,
-                None => self.guild_peers(&installed)?,
+            let dynamic = self.dynamic_guild_state()?;
+            let (coordinator, peers) = match dynamic {
+                Some(state) => (
+                    dynamic_guild_coordinator(&installed, &state)?,
+                    self.dynamic_guild_peers(&installed, &state)?,
+                ),
+                None => (
+                    installed.certificate.genesis.coordinator,
+                    self.guild_peers(&installed)?,
+                ),
             };
             return Ok(Some(GuildSummary {
                 format_version: 1,
                 guild_id: installed.certificate.genesis.guild_id,
-                coordinator: installed.certificate.genesis.coordinator,
+                coordinator,
                 phase: GuildPhase::Active,
                 peers,
             }));
@@ -2298,14 +2305,14 @@ impl Node {
         let installed = self
             .installed_guild()?
             .context("this node has no active guild")?;
-        if installed.certificate.genesis.coordinator != self.keys.node_id()
+        let state = self
+            .dynamic_guild_state()?
+            .context("this node has no dynamic guild state")?;
+        if dynamic_guild_coordinator(&installed, &state)? != self.keys.node_id()
             || installed.certificate.genesis.guild_id != descriptor.guild_id
             || descriptor.owner != caller
-            || !installed
-                .certificate
-                .genesis
-                .members
-                .iter()
+            || !state
+                .active_members()
                 .any(|member| member.node_id == caller)
         {
             anyhow::bail!("backup submission is not authorized for this coordinator");
@@ -2344,7 +2351,10 @@ impl Node {
         let Some(installed) = self.installed_guild()? else {
             return Ok(None);
         };
-        if installed.certificate.genesis.coordinator != self.keys.node_id() {
+        let state = self
+            .dynamic_guild_state()?
+            .context("this node has no dynamic guild state")?;
+        if dynamic_guild_coordinator(&installed, &state)? != self.keys.node_id() {
             return Ok(None);
         }
         for (_, bytes) in self.control.records("backup-job")? {
@@ -4708,7 +4718,7 @@ impl Node {
 
     pub fn store_checkpoint(&mut self, checkpoint: &QuorumCheckpoint) -> Result<[u8; 32]> {
         checkpoint.verify()?;
-        self.validate_local_member(&checkpoint.checkpoint)?;
+        self.validate_local_member(&checkpoint.checkpoint, true)?;
         self.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, false)?;
         if !checkpoint.has_signature(self.keys.node_id()) {
             anyhow::bail!("local node did not authorize this checkpoint");
@@ -4735,7 +4745,7 @@ impl Node {
 
     pub fn sign_checkpoint(&mut self, checkpoint: &GuildCheckpoint) -> Result<MemberSignature> {
         checkpoint.validate()?;
-        self.validate_local_member(checkpoint)?;
+        self.validate_local_member(checkpoint, true)?;
         self.validate_variable_checkpoint_coverage(checkpoint, false)?;
         let configured: Member = decode_canonical(
             &self
@@ -4940,13 +4950,70 @@ impl Node {
         checkpoint_page(&self.control, guild_id, checkpoint_hash, page_index)
     }
 
-    fn validate_local_member(&self, checkpoint: &GuildCheckpoint) -> Result<()> {
-        if let Some(installed) = self.installed_guild()?
-            && (checkpoint.guild_id != installed.certificate.genesis.guild_id
+    fn validate_local_member(
+        &self,
+        checkpoint: &GuildCheckpoint,
+        require_current_membership: bool,
+    ) -> Result<()> {
+        if let Some(installed) = self.installed_guild()? {
+            if checkpoint.guild_id != installed.certificate.genesis.guild_id
                 || checkpoint.genesis_hash != installed.certificate.hash()?
-                || checkpoint.members != installed.certificate.genesis.members)
-        {
-            anyhow::bail!("checkpoint is not bound to the installed guild genesis");
+            {
+                anyhow::bail!("checkpoint is not bound to the installed guild genesis");
+            }
+            if checkpoint.format_version == 3 {
+                if checkpoint.members != installed.certificate.genesis.members {
+                    anyhow::bail!("legacy checkpoint changes its genesis membership");
+                }
+            } else {
+                let durable = self
+                    .dynamic_guild_state()?
+                    .context("version-four checkpoint requires dynamic guild state")?;
+                let mut replay = initial_dynamic_guild_state(&installed)?;
+                let mut historical_membership =
+                    replay.active_members().eq(checkpoint.members.iter());
+                for (record_id, bytes) in self.control.records("guild-event")? {
+                    let event: QuorumGuildEvent = decode_canonical(&bytes)?;
+                    if record_id != event.event.sequence.to_be_bytes() {
+                        anyhow::bail!("guild event history has an invalid record ID");
+                    }
+                    replay.apply_event(&event)?;
+                    historical_membership |= replay.active_members().eq(checkpoint.members.iter());
+                }
+                if replay != durable || !historical_membership {
+                    anyhow::bail!("checkpoint membership is absent from guild event history");
+                }
+                if require_current_membership
+                    && !durable.active_members().eq(checkpoint.members.iter())
+                {
+                    anyhow::bail!("checkpoint does not use the current guild membership");
+                }
+                let historical = durable
+                    .members
+                    .iter()
+                    .map(|member| member.member.node_id)
+                    .collect::<BTreeSet<_>>();
+                if checkpoint
+                    .writer_fences
+                    .iter()
+                    .map(|fence| fence.owner)
+                    .chain(
+                        checkpoint
+                            .revision_tombstones
+                            .iter()
+                            .map(|tombstone| tombstone.owner),
+                    )
+                    .chain(
+                        checkpoint
+                            .revisions
+                            .iter()
+                            .map(|revision| revision.value.owner),
+                    )
+                    .any(|owner| !historical.contains(&owner))
+                {
+                    anyhow::bail!("checkpoint refers to a node outside guild history");
+                }
+            }
         }
         let member = checkpoint
             .members
@@ -5078,7 +5145,7 @@ impl Node {
             })
             .map(|reference| reference.id)
             .collect::<BTreeSet<_>>();
-        if !previous.members.iter().all(|item| {
+        if checkpoint.format_version == 3 && !previous.members.iter().all(|item| {
             checkpoint
                 .members
                 .binary_search_by_key(&item.node_id, |entry| entry.node_id)
@@ -5089,7 +5156,7 @@ impl Node {
                     tombstone.owner == item.value.owner
                         && tombstone.through_sequence >= item.value.sequence
                 })
-        }) || !previous.coding_groups.iter().all(|item| {
+        }) || checkpoint.format_version == 3 && !previous.coding_groups.iter().all(|item| {
             checkpoint
                 .coding_groups
                 .binary_search_by_key(&item.id, |entry| entry.id)
@@ -6496,7 +6563,7 @@ impl Node {
         checkpoint: &QuorumCheckpoint,
     ) -> Result<[u8; 32]> {
         checkpoint.verify()?;
-        self.validate_local_member(&checkpoint.checkpoint)?;
+        self.validate_local_member(&checkpoint.checkpoint, false)?;
         self.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, true)?;
         if !checkpoint.has_signature(self.keys.node_id()) {
             anyhow::bail!("checkpoint is not authorized by the recovering seed");
@@ -6582,7 +6649,7 @@ impl Node {
             return Ok(None);
         };
         checkpoint.verify()?;
-        self.validate_local_member(&checkpoint.checkpoint)?;
+        self.validate_local_member(&checkpoint.checkpoint, false)?;
         let checkpoint_hash = checkpoint.hash()?;
         let revision = checkpoint
             .checkpoint
@@ -6609,7 +6676,7 @@ impl Node {
         observations: Vec<CheckpointRecoveryObservation>,
     ) -> Result<()> {
         checkpoint.verify()?;
-        self.validate_local_member(&checkpoint.checkpoint)?;
+        self.validate_local_member(&checkpoint.checkpoint, false)?;
         let checkpoint_hash = checkpoint.hash()?;
         if let Some(active) = self.active_recovery_attempt()?
             && (active.guild_id != checkpoint.checkpoint.guild_id
@@ -7318,21 +7385,31 @@ fn guild_coordinator(control: &ControlStore, guild_id: &[u8; 32]) -> Result<Opti
     if installed.certificate.genesis.guild_id != *guild_id {
         anyhow::bail!("requested guild differs from installed guild");
     }
-    let coordinator = installed.certificate.genesis.coordinator;
     if let Some(bytes) = control.get_record("guild-dynamic-state", b"primary")? {
         let state: DynamicGuildState = decode_canonical(&bytes)?;
         state.validate()?;
         if state.guild_id != *guild_id {
             anyhow::bail!("dynamic membership belongs to another guild");
         }
-        if !state
-            .active_members()
-            .any(|member| member.node_id == coordinator)
-        {
-            return Ok(None);
-        }
+        return dynamic_guild_coordinator(&installed, &state).map(Some);
     }
-    Ok(Some(coordinator))
+    Ok(Some(installed.certificate.genesis.coordinator))
+}
+
+fn dynamic_guild_coordinator(
+    installed: &InstalledGuild,
+    state: &DynamicGuildState,
+) -> Result<NodeId> {
+    if state.guild_id != installed.certificate.genesis.guild_id {
+        anyhow::bail!("dynamic membership belongs to another guild");
+    }
+    let genesis_coordinator = installed.certificate.genesis.coordinator;
+    state
+        .active_members()
+        .map(|member| member.node_id)
+        .find(|node_id| *node_id == genesis_coordinator)
+        .or_else(|| state.active_members().next().map(|member| member.node_id))
+        .context("dynamic guild has no active coordinator")
 }
 
 fn initial_dynamic_guild_state(installed: &InstalledGuild) -> Result<DynamicGuildState> {
@@ -9055,13 +9132,49 @@ mod tests {
                 .failure_domain,
             "relabeled-domain"
         );
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let remove_coordinator = GuildEvent {
+            format_version: 1,
+            guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RemoveMember {
+                node_id: certificate.genesis.coordinator,
+            },
+        };
+        let active = state
+            .active_members()
+            .map(|member| member.node_id)
+            .collect::<BTreeSet<_>>();
+        let mut coordinator_signatures = signer_keys
+            .iter()
+            .filter(|keys| active.contains(&keys.node_id()))
+            .map(|keys| sign_guild_event(&remove_coordinator, keys).unwrap())
+            .collect::<Vec<_>>();
+        coordinator_signatures.sort_by_key(|signature| signature.signer);
+        node.install_guild_event(QuorumGuildEvent {
+            event: remove_coordinator,
+            signatures: coordinator_signatures,
+        })
+        .unwrap();
+        let summary = node.guild_summary().unwrap().unwrap();
+        assert_ne!(summary.coordinator, certificate.genesis.coordinator);
+        assert_eq!(
+            summary.coordinator,
+            summary
+                .peers
+                .iter()
+                .map(|peer| peer.member.node_id)
+                .min()
+                .unwrap()
+        );
         let tail = node.guild_event_tail(0, genesis_hash).unwrap();
-        assert_eq!(tail.events.len(), 3);
+        assert_eq!(tail.events.len(), 4);
 
         drop(node);
         let node = Node::open(temp.path(), local_seed).unwrap();
         let reopened = node.dynamic_guild_state().unwrap().unwrap();
-        assert_eq!(reopened.event_sequence, 3);
+        assert_eq!(reopened.event_sequence, 4);
         assert!(reopened.active_members().any(|member| {
             member.node_id == added_keys.node_id() && member.failure_domain == "relabeled-domain"
         }));
