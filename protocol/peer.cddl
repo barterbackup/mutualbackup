@@ -1,4 +1,4 @@
-; MutualBackup /mutualbackup/peer/1 CBOR data model.
+; MutualBackup /mutualbackup/peer/2 CBOR data model.
 ; libp2p request-response supplies stream framing. Both roots are signed records.
 
 signed-peer-request = {
@@ -14,7 +14,7 @@ signed-peer-response = {
 }
 
 peer-request-envelope = {
-  format_version: 1,
+  format_version: 2,
   request_id: bytes16-array,
   caller: bytes32-array,
   recipient: null / bytes32-array,
@@ -25,7 +25,7 @@ peer-request-envelope = {
 }
 
 peer-response-envelope = {
-  format_version: 1,
+  format_version: 2,
   request_id: bytes16-array,
   recipient: bytes32-array,
   request_hash: bytes32-array,
@@ -176,6 +176,10 @@ peer-request =
   / { "SignCheckpoint": { guild_id: bytes32-array, checkpoint_hash: bytes32-array } }
   / { "FinalizeCheckpoint": { guild_id: bytes32-array, checkpoint_hash: bytes32-array } }
   / { "GetCheckpointPage": { guild_id: bytes32-array, checkpoint_hash: bytes32-array, page_index: uint } }
+  / { "CodingPathObservation": {
+        guild_id: bytes32-array,
+        targets: [1*256 bytes32-array]
+      } }
   / { "CodingCapacity": { guild_id: bytes32-array, shard_size: uint } }
 
 peer-response =
@@ -200,11 +204,22 @@ peer-response =
   / { "GuildEventTail": guild-event-tail }
   / { "EndpointRecords": [* signed-endpoint-record] }
   / { "CheckpointPage": { total_pages: uint, page_hash: bytes32-array, bytes: byte-vector } }
+  / { "CodingPathObservation": coding-path-observation }
   / { "CodingCapacity": { available_shards: uint } }
   / "Ack"
 
 peer-profile = { member: member, endpoint: tstr }
 guild-peer = { member: member, endpoints: [* tstr] }
+
+coding-path-observation = {
+  observed_at_unix_seconds: uint,
+  paths: [1*256 coding-path-entry]
+}
+
+coding-path-entry = {
+  target: bytes32-array,
+  path: "Direct" / "Relay" / "Tor" / null
+}
 
 member = {
   node_id: bytes32-array,

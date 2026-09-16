@@ -604,12 +604,16 @@ node Clippy gate passed locally. No remote compilation server was used.
   an original owner is offline. Core partial-unpack and layout regressions plus
   node persistence/reopen coverage pass; the production Btrfs/QUIC gate checks
   stable slot positions across updates from two owners and two roots.
-- [ ] **M5-03 / P2 — Rank a delegated coder by every bulk lane path.**
-  `coding_candidate_path_rank` observes only the checkpoint coordinator's
-  current path to a candidate. It does not establish the candidate's direct or
-  fallback path to each information source and parity destination. Add bounded,
-  authenticated path observations and rank total input/output cost while still
-  preferring participants and retaining relay/onion availability.
+- [x] **M5-03 / P2 — Rank a delegated coder by every bulk lane path.**
+  Peer protocol 2 adds fresh, signed, request-bound path observations over a
+  canonical list of at most 256 active guild members. Each candidate reports
+  its live or selected direct, relay, or Tor path to every real information
+  source and parity destination. Initial attempts and retries rank the sum of
+  those bulk edges, omit the candidate's own transfer when it participates,
+  prefer a participant when totals tie, and retain relay/Tor as higher-cost
+  available paths. The separate verifier still uses ordinary reachability and
+  does not need a complete bulk-path report. Schema, snapshot, ranking, node
+  library, and warning-free all-target node Clippy checks pass locally.
 - [ ] **M5-04 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7, but the provisioned Btrfs production

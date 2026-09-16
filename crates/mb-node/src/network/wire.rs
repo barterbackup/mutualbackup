@@ -14,7 +14,8 @@ use super::{BackupDescriptor, BackupJob, GuildPeer};
 use super::{PublishedRecoveryRecord, RecoveryPublisherAdmission};
 use crate::WireError;
 
-pub(super) const PEER_WIRE_FORMAT_VERSION: u16 = 1;
+pub(super) const PEER_WIRE_FORMAT_VERSION: u16 = 2;
+pub(super) const MAX_CODING_PATH_TARGETS: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(super) struct PeerProfile {
@@ -22,9 +23,32 @@ pub(super) struct PeerProfile {
     pub(super) endpoint: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub(super) enum CodingPathClass {
+    Direct,
+    Relay,
+    Tor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct CodingPathEntry {
+    pub(super) target: NodeId,
+    pub(super) path: Option<CodingPathClass>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct CodingPathObservation {
+    pub(super) observed_at_unix_seconds: u64,
+    pub(super) paths: Vec<CodingPathEntry>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) enum PeerRequest {
     Profile,
+    CodingPathObservation {
+        guild_id: [u8; 32],
+        targets: Vec<NodeId>,
+    },
     JoinGuild {
         invite: Box<SignedRecord<GuildInvite>>,
         peer: GuildPeer,
@@ -290,6 +314,7 @@ impl PeerRequest {
         matches!(
             self,
             Self::Profile
+                | Self::CodingPathObservation { .. }
                 | Self::GetSector { .. }
                 | Self::GetSectorRange { .. }
                 | Self::GetSectorCommitment { .. }
@@ -310,6 +335,7 @@ impl PeerRequest {
     pub(super) fn mutation_kind(&self) -> Option<&'static str> {
         match self {
             Self::Profile
+            | Self::CodingPathObservation { .. }
             | Self::GetSector { .. }
             | Self::GetSectorRange { .. }
             | Self::GetSectorCommitment { .. }
@@ -372,6 +398,7 @@ impl PeerRequest {
     pub(super) fn guild_scope(&self) -> Option<[u8; 32]> {
         match self {
             Self::Profile => None,
+            Self::CodingPathObservation { guild_id, .. } => Some(*guild_id),
             #[cfg(test)]
             Self::BeginCommit { .. } => None,
             Self::JoinGuild { invite, .. } => Some(invite.value.guild_id),
@@ -453,6 +480,7 @@ pub(super) struct PeerRequestEnvelope {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) enum PeerResponse {
     Profile(PeerProfile),
+    CodingPathObservation(CodingPathObservation),
     #[cfg(test)]
     CommitStarted {
         guild_id: [u8; 32],
@@ -529,7 +557,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::network::PEER_REQUEST_DOMAIN;
+    use crate::network::{PEER_REQUEST_DOMAIN, PEER_RESPONSE_DOMAIN};
 
     const SCHEMA: &str = include_str!("../../../../protocol/peer.cddl");
     const PROFILE_REQUEST: &str =
@@ -569,7 +597,8 @@ mod tests {
     #[test]
     fn peer_cbor_vectors_match_cddl_and_round_trip() {
         let expected = decode_hex_fixture(PROFILE_REQUEST);
-        let actual = cbor4ii::serde::to_vec(Vec::new(), &profile_request(1)).unwrap();
+        let actual =
+            cbor4ii::serde::to_vec(Vec::new(), &profile_request(PEER_WIRE_FORMAT_VERSION)).unwrap();
         assert_eq!(actual, expected);
         cddl_cat::validate_cbor_bytes("signed-peer-request", SCHEMA, &actual).unwrap();
         let decoded: SignedRecord<PeerRequestEnvelope> =
@@ -581,10 +610,63 @@ mod tests {
 
         let invalid = decode_hex_fixture(INVALID_VERSION);
         assert_eq!(
-            cbor4ii::serde::to_vec(Vec::new(), &profile_request(2)).unwrap(),
+            cbor4ii::serde::to_vec(Vec::new(), &profile_request(1)).unwrap(),
             invalid
         );
         assert!(cddl_cat::validate_cbor_bytes("signed-peer-request", SCHEMA, &invalid).is_err());
+    }
+
+    #[test]
+    fn coding_path_observation_matches_cddl() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([7; 32]));
+        let recipient = KeyMaterial::from_seed(&Seed::from_bytes([8; 32])).node_id();
+        let request = SignedRecord::sign(
+            PEER_REQUEST_DOMAIN,
+            PeerRequestEnvelope {
+                format_version: PEER_WIRE_FORMAT_VERSION,
+                request_id: [9; 16],
+                caller: keys.node_id(),
+                recipient: Some(recipient),
+                guild_scope: Some([3; 32]),
+                issued_at_unix_seconds: 1_700_000_000,
+                expires_at_unix_seconds: 1_700_000_060,
+                request: PeerRequest::CodingPathObservation {
+                    guild_id: [3; 32],
+                    targets: vec![keys.node_id(), recipient],
+                },
+            },
+            &keys,
+        )
+        .unwrap();
+        let request_bytes = cbor4ii::serde::to_vec(Vec::new(), &request).unwrap();
+        cddl_cat::validate_cbor_bytes("signed-peer-request", SCHEMA, &request_bytes).unwrap();
+
+        let response = SignedRecord::sign(
+            PEER_RESPONSE_DOMAIN,
+            PeerResponseEnvelope {
+                format_version: PEER_WIRE_FORMAT_VERSION,
+                request_id: [9; 16],
+                recipient: keys.node_id(),
+                request_hash: [4; 32],
+                result: Ok(PeerResponse::CodingPathObservation(CodingPathObservation {
+                    observed_at_unix_seconds: 1_700_000_001,
+                    paths: vec![
+                        CodingPathEntry {
+                            target: keys.node_id(),
+                            path: Some(CodingPathClass::Direct),
+                        },
+                        CodingPathEntry {
+                            target: recipient,
+                            path: None,
+                        },
+                    ],
+                })),
+            },
+            &keys,
+        )
+        .unwrap();
+        let response_bytes = cbor4ii::serde::to_vec(Vec::new(), &response).unwrap();
+        cddl_cat::validate_cbor_bytes("signed-peer-response", SCHEMA, &response_bytes).unwrap();
     }
 
     #[test]

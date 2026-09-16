@@ -80,10 +80,10 @@ in the matching READY retry correction. Commit `193f67e` transfers worker
 capacity with the queued result and releases it before the response becomes
 observable. Its deterministic handoff regression and the complete local
 correction gate passed on 2026-09-15. Milestone 5's first closure record was
-reopened by follow-up source review. Root-scoped signed revision chains and
-checkpoint-authenticated production stable-slot packing are now implemented;
-delegated-coder path ranking does not yet cover every source and destination.
-Milestone 5 remains current.
+reopened by follow-up source review. Root-scoped signed revision chains,
+checkpoint-authenticated production stable-slot packing, and authenticated
+candidate-to-lane path ranking are now implemented. The fresh provisioned
+production gate remains, so Milestone 5 is still current.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -732,7 +732,11 @@ selection. Root-scoped signed chains, scheduling, retention, restore selection,
 and recovered-chain continuation now close the protected-root gap. Checkpoint
 format 7 now binds the production packed catalog to variable coding, lifecycle,
 recovery, restore, and delayed collection, while preserving stable source slots
-across owner/root updates. Candidate-to-lane path selection and a fresh
+across owner/root updates. Peer protocol 2 obtains fresh signed observations
+from each candidate for every real information and parity participant; coding
+selection minimizes the complete bulk-lane path cost, saves a transfer for a
+participating candidate, and keeps relay and Tor fallbacks eligible. The full
+node suite and warning-free all-target node Clippy pass for this change. A fresh
 provisioned production gate must still close before Milestone 5 can pass.
 
 Milestone 4 implements quiet-period
@@ -1170,9 +1174,10 @@ source locations, failure cases, and recorded gate evidence.
   scheduling. Add incremental updates, hierarchical Merkle range proofs and
   range resume, authenticated virtual-zero extents, multiple protected roots,
   and measured sparse/large-tree efficiency.
-- Delegate each deterministic geometry lane to a directly reachable coding
-  coordinator, preferably one of its participants, so every information range
-  is uploaded once and only parity rows travel onward: `k+m` bulk shard
+- Delegate each deterministic geometry lane to a reachable coding coordinator
+  selected from fresh signed observations of every source and destination path,
+  preferring one of its participants when total path cost ties, so every
+  information range is uploaded once and only parity rows travel onward: `k+m` bulk shard
   transfers, or `k+m-1` for a participating coordinator, instead of `k*m`
   holder-side input transfers. Use a separate reachable verifier that is never
   that attempt's coding coordinator. It precommits a

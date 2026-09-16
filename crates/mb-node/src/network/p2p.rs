@@ -58,16 +58,17 @@ use crate::node::{
 use super::onion_listener_address;
 use super::tor::is_canonical_onion_address;
 use super::{
-    BackupDescriptor, BackupJob, CheckpointObjectKind, DhtSequenceFloors, GuildPeer,
-    MAX_PEER_FRAME_BYTES, Node, NodeServerConfig, NodeService, PEER_RESPONSE_DOMAIN, PeerRequest,
-    PeerRequestEnvelope, PeerResponse, PeerResponseEnvelope, checked_catalog_page_count,
-    make_peer_request, peer_error_response, process_peer_request, storage_operation_id,
+    BackupDescriptor, BackupJob, CheckpointObjectKind, CodingPathClass, CodingPathObservation,
+    DhtSequenceFloors, GuildPeer, MAX_PEER_FRAME_BYTES, Node, NodeServerConfig, NodeService,
+    PEER_RESPONSE_DOMAIN, PeerRequest, PeerRequestEnvelope, PeerResponse, PeerResponseEnvelope,
+    checked_catalog_page_count, make_peer_request, peer_error_response, process_peer_request,
+    storage_operation_id, validate_coding_path_targets,
 };
 use super::{
     TorMode, TorTransport, is_onion_address, onion_address_matches_node, onion_address_matches_peer,
 };
 
-const P2P_PROTOCOL: StreamProtocol = StreamProtocol::new("/mutualbackup/peer/1");
+const P2P_PROTOCOL: StreamProtocol = StreamProtocol::new("/mutualbackup/peer/2");
 const IDENTIFY_PROTOCOL: &str = "/mutualbackup/identify/1";
 const KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/mutualbackup/kad/1");
 const COMMAND_CAPACITY: usize = 128;
@@ -476,6 +477,10 @@ enum Command {
     },
     Status {
         response: oneshot::Sender<P2pStatus>,
+    },
+    CodingPathObservation {
+        targets: Vec<NodeId>,
+        response: oneshot::Sender<Result<CodingPathObservation>>,
     },
     PutRecord {
         key: Vec<u8>,
@@ -1512,6 +1517,7 @@ pub fn build_p2p_with_tor(
         readers: Mutex::new(Vec::new()),
         max_readers: config.max_connections,
         active_readers: std::sync::atomic::AtomicUsize::new(0),
+        coding_paths: RwLock::new(BTreeMap::new()),
     });
     let server_config = NodeServerConfig {
         #[cfg(test)]
@@ -1740,6 +1746,39 @@ impl P2pClient {
             member: profile.member,
             endpoint: profile.endpoint,
         })
+    }
+
+    async fn coding_path_observation(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        targets: Vec<NodeId>,
+    ) -> Result<CodingPathObservation> {
+        validate_coding_path_targets(&targets)?;
+        let expected_targets = targets.clone();
+        let observation = if peer.libp2p_peer_id()? == self.local_peer_id {
+            let (response, receiver) = oneshot::channel();
+            self.commands
+                .send(Command::CodingPathObservation { targets, response })
+                .await
+                .context("libp2p event loop stopped")?;
+            receiver
+                .await
+                .context("libp2p path-observation command was lost")??
+        } else {
+            let response = self
+                .call(
+                    peer,
+                    PeerRequest::CodingPathObservation { guild_id, targets },
+                )
+                .await?;
+            let PeerResponse::CodingPathObservation(observation) = response else {
+                bail!("peer returned the wrong coding-path observation response");
+            };
+            observation
+        };
+        validate_coding_path_observation(&expected_targets, &observation)?;
+        Ok(observation)
     }
 
     pub async fn coding_capacity(
@@ -4007,6 +4046,53 @@ impl P2pEventLoop {
         Some(address_path(address))
     }
 
+    fn coding_path_class(&self, peer: PeerId) -> Option<CodingPathClass> {
+        let selected_tier = self.selected_transport_tier(peer);
+        let path = self
+            .connection_paths
+            .iter()
+            .filter_map(|(connection, (candidate, path))| {
+                (*candidate == peer
+                    && transport_path_allowed(self.tor_mode, *path)
+                    && path_preference_rank(self.tor_mode, *path) == selected_tier
+                    && !self.connection_is_retiring_or_unhealthy(*connection))
+                .then_some(*path)
+            })
+            .min_by_key(|path| coding_path_rank(*path))
+            .or_else(|| self.selected_path_hint(peer))?;
+        Some(match path {
+            P2pPath::Direct | P2pPath::HolePunched => CodingPathClass::Direct,
+            P2pPath::Relayed | P2pPath::RelayFallback => CodingPathClass::Relay,
+            P2pPath::Tor => CodingPathClass::Tor,
+        })
+    }
+
+    fn refresh_coding_path_observations(&self) -> Result<()> {
+        let mut peers = self
+            .relay_members
+            .read()
+            .map_err(|_| anyhow::anyhow!("relay membership lock is poisoned"))?
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        peers.extend(self.installed_policy_addresses.keys().copied());
+        peers.extend(self.connection_paths.values().map(|(peer, _path)| *peer));
+        let observations = peers
+            .into_iter()
+            .filter_map(|peer| {
+                self.coding_path_class(peer)
+                    .map(|path| (peer.to_string(), path))
+            })
+            .collect();
+        *self
+            .service
+            .coding_paths
+            .write()
+            .map_err(|_| anyhow::anyhow!("coding path observation lock is poisoned"))? =
+            observations;
+        Ok(())
+    }
+
     fn record_dial_failure(&mut self, peer: PeerId) {
         if let Some(path) = self.selected_path_hint(peer) {
             self.record_dial_failure_path(path);
@@ -4644,6 +4730,12 @@ impl P2pEventLoop {
                     }
                 }
             }
+            Command::CodingPathObservation { targets, response } => {
+                let result = self
+                    .refresh_coding_path_observations()
+                    .and_then(|()| self.service.coding_path_observation(&targets));
+                let _ = response.send(result);
+            }
             Command::Status { response } => {
                 let mut listen_addresses = self
                     .swarm
@@ -5214,6 +5306,13 @@ impl P2pEventLoop {
                         channel,
                         request_id,
                     } => {
+                        if matches!(
+                            &request.value.request,
+                            PeerRequest::CodingPathObservation { .. }
+                        ) && let Err(error) = self.refresh_coding_path_observations()
+                        {
+                            tracing::warn!(%error, "could not refresh coding path observations");
+                        }
                         if let Ok(bytes) = cbor_wire_len(&request) {
                             self.record_transfer(peer, path, 0, bytes);
                         }
@@ -6089,6 +6188,7 @@ async fn execute_coding_retry(
                         .geometry
                         .information
                         .iter()
+                        .filter(|role| !role.sector.virtual_zero)
                         .map(|role| role.owner)
                         .chain(prior.geometry.parity.iter().map(|role| role.holder))
                         .collect::<BTreeSet<_>>();
@@ -6100,6 +6200,7 @@ async fn execute_coding_retry(
                     ))
                 })
                 .await?;
+            let guild_id = guild.guild_id;
             let mut reachable = Vec::new();
             for peer in guild.peers {
                 let candidate = peer.member.node_id;
@@ -6123,24 +6224,32 @@ async fn execute_coding_retry(
             if reachable.len() < 2 {
                 bail!("coding retry has fewer than two fresh reachable coordinators");
             }
+            let targets = participants.iter().copied().collect::<Vec<_>>();
+            let observations =
+                collect_coding_path_observations(p2p, guild_id, &reachable, &targets).await;
             let status = p2p.status().await?;
-            reachable.sort_by_key(|candidate| {
-                let participant_rank = !participants.contains(candidate);
-                let path_rank = coding_candidate_path_rank(*candidate, local_id, &status);
-                (participant_rank, path_rank, *candidate)
-            });
-            let coding_coordinator = reachable[0];
-            let verification_coordinator = reachable
+            let verifier_path_ranks = reachable
                 .iter()
-                .copied()
-                .filter(|candidate| *candidate != coding_coordinator)
-                .min_by_key(|candidate| {
+                .map(|candidate| {
                     (
-                        coding_candidate_path_rank(*candidate, local_id, &status),
                         *candidate,
+                        coding_candidate_path_rank(*candidate, local_id, &status),
                     )
                 })
-                .context("coding retry has no separate fresh verifier")?;
+                .collect::<BTreeMap<_, _>>();
+            let lane_scores = reachable
+                .iter()
+                .filter_map(|candidate| {
+                    coding_candidate_lane_score(*candidate, &participants, &observations)
+                        .map(|score| (*candidate, score))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let (coding_coordinator, verification_coordinator) = choose_coding_coordinators(
+                &reachable,
+                &participants,
+                &lane_scores,
+                &verifier_path_ranks,
+            )?;
             let expires_at = unix_seconds()
                 .checked_add(10 * 60)
                 .context("coding retry expiry overflow")?;
@@ -6176,6 +6285,27 @@ fn coding_path_rank(path: P2pPath) -> usize {
     }
 }
 
+fn validate_coding_path_observation(
+    expected_targets: &[NodeId],
+    observation: &CodingPathObservation,
+) -> Result<()> {
+    validate_coding_path_targets(expected_targets)?;
+    let observed_targets = observation
+        .paths
+        .iter()
+        .map(|entry| entry.target)
+        .collect::<Vec<_>>();
+    let now = unix_seconds();
+    if observed_targets != expected_targets
+        || observation.observed_at_unix_seconds == 0
+        || observation.observed_at_unix_seconds > now.saturating_add(30)
+        || observation.observed_at_unix_seconds.saturating_add(120) < now
+    {
+        bail!("coding path observation has invalid targets or freshness");
+    }
+    Ok(())
+}
+
 fn coding_candidate_path_rank(candidate: NodeId, local_id: NodeId, status: &P2pStatus) -> usize {
     if candidate == local_id {
         return 0;
@@ -6188,38 +6318,119 @@ fn coding_candidate_path_rank(candidate: NodeId, local_id: NodeId, status: &P2pS
         .iter()
         .find(|peer| peer.peer_id == peer_id.to_string())
         .and_then(|peer| {
-            peer.active_paths
-                .iter()
-                .map(|path| coding_path_rank(*path))
-                .min()
+            peer.last_application_path
+                .map(coding_path_rank)
+                .or_else(|| {
+                    peer.active_paths
+                        .iter()
+                        .map(|path| coding_path_rank(*path))
+                        .min()
+                })
         })
         .unwrap_or(usize::MAX)
+}
+
+type CodingPathMatrix = BTreeMap<NodeId, BTreeMap<NodeId, Option<CodingPathClass>>>;
+
+async fn collect_coding_path_observations(
+    p2p: &P2pClient,
+    guild_id: [u8; 32],
+    candidates: &[NodeId],
+    targets: &[NodeId],
+) -> CodingPathMatrix {
+    let mut requests = FuturesUnordered::new();
+    for candidate in candidates.iter().copied() {
+        let targets = targets.to_vec();
+        requests.push(async move {
+            (
+                candidate,
+                p2p.coding_path_observation(candidate, guild_id, targets)
+                    .await,
+            )
+        });
+    }
+    let mut observations = BTreeMap::new();
+    while let Some((candidate, result)) = requests.next().await {
+        match result {
+            Ok(observation) => {
+                observations.insert(
+                    candidate,
+                    observation
+                        .paths
+                        .into_iter()
+                        .map(|entry| (entry.target, entry.path))
+                        .collect(),
+                );
+            }
+            Err(error) => tracing::debug!(
+                %candidate,
+                %error,
+                "coding candidate did not return a valid path observation"
+            ),
+        }
+    }
+    observations
+}
+
+fn coding_path_class_cost(path: CodingPathClass) -> u64 {
+    match path {
+        CodingPathClass::Direct => 1,
+        CodingPathClass::Relay => 2,
+        CodingPathClass::Tor => 3,
+    }
+}
+
+fn coding_candidate_lane_score(
+    candidate: NodeId,
+    bulk_participants: &BTreeSet<NodeId>,
+    observations: &CodingPathMatrix,
+) -> Option<(u64, u64)> {
+    let paths = observations.get(&candidate)?;
+    let mut total = 0_u64;
+    let mut worst = 0_u64;
+    for participant in bulk_participants {
+        if *participant == candidate {
+            continue;
+        }
+        let cost = coding_path_class_cost(paths.get(participant).copied().flatten()?);
+        total = total.checked_add(cost)?;
+        worst = worst.max(cost);
+    }
+    Some((total, worst))
 }
 
 fn choose_coding_coordinators(
     reachable: &[NodeId],
     participants: &BTreeSet<NodeId>,
-    path_ranks: &BTreeMap<NodeId, usize>,
+    lane_scores: &BTreeMap<NodeId, (u64, u64)>,
+    verifier_path_ranks: &BTreeMap<NodeId, usize>,
 ) -> Result<(NodeId, NodeId)> {
     if reachable.len() < 2 {
         bail!("coding attempt has fewer than two reachable coordinators");
     }
-    let mut ranked = reachable.to_vec();
+    let mut ranked = reachable
+        .iter()
+        .copied()
+        .filter(|candidate| lane_scores.contains_key(candidate))
+        .collect::<Vec<_>>();
+    if ranked.is_empty() {
+        bail!("coding attempt has no coordinator with every bulk path available");
+    }
     ranked.sort_by_key(|candidate| {
-        (
-            !participants.contains(candidate),
-            path_ranks.get(candidate).copied().unwrap_or(usize::MAX),
-            *candidate,
-        )
+        let (total, worst) = lane_scores[candidate];
+        (total, !participants.contains(candidate), worst, *candidate)
     });
     let coding_coordinator = ranked[0];
-    let verification_coordinator = ranked
+    let verification_coordinator = reachable
         .iter()
         .copied()
         .filter(|candidate| *candidate != coding_coordinator)
         .min_by_key(|candidate| {
             (
-                path_ranks.get(candidate).copied().unwrap_or(usize::MAX),
+                verifier_path_ranks
+                    .get(candidate)
+                    .copied()
+                    .unwrap_or(usize::MAX),
                 *candidate,
             )
         })
@@ -10649,6 +10860,24 @@ async fn queue_variable_coding_lanes(
     peers: &[crate::GuildPeer],
     lanes: Vec<VariableCodingLane>,
 ) -> Result<()> {
+    let Some(first_lane) = lanes.first() else {
+        return Ok(());
+    };
+    let guild_id = first_lane.geometry.guild_id;
+    let observation_targets = lanes
+        .iter()
+        .flat_map(|lane| {
+            lane.geometry
+                .information
+                .iter()
+                .filter(|role| !role.sector.virtual_zero)
+                .map(|role| role.owner)
+                .chain(lane.geometry.parity.iter().map(|role| role.holder))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    validate_coding_path_targets(&observation_targets)?;
     let mut reachable = Vec::new();
     let mut reachability_requests = FuturesUnordered::new();
     for peer in peers {
@@ -10674,8 +10903,10 @@ async fn queue_variable_coding_lanes(
     if reachable.len() < 2 {
         bail!("variable coding has fewer than two reachable coordinators");
     }
+    let observations =
+        collect_coding_path_observations(p2p, guild_id, &reachable, &observation_targets).await;
     let status = p2p.status().await?;
-    let path_ranks = reachable
+    let verifier_path_ranks = reachable
         .iter()
         .map(|candidate| {
             (
@@ -10692,11 +10923,23 @@ async fn queue_variable_coding_lanes(
             .geometry
             .information
             .iter()
+            .filter(|role| !role.sector.virtual_zero)
             .map(|role| role.owner)
             .chain(lane.geometry.parity.iter().map(|role| role.holder))
             .collect::<BTreeSet<_>>();
-        let (coding_coordinator, verification_coordinator) =
-            choose_coding_coordinators(&reachable, &participants, &path_ranks)?;
+        let lane_scores = reachable
+            .iter()
+            .filter_map(|candidate| {
+                coding_candidate_lane_score(*candidate, &participants, &observations)
+                    .map(|score| (*candidate, score))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let (coding_coordinator, verification_coordinator) = choose_coding_coordinators(
+            &reachable,
+            &participants,
+            &lane_scores,
+            &verifier_path_ranks,
+        )?;
         let mut hasher = blake3::Hasher::new_derive_key("mutualbackup initial coding attempt v1");
         hasher.update(&checkpoint_hash);
         hasher.update(&canonical_bytes(&(
@@ -11690,19 +11933,81 @@ mod tests {
     }
 
     #[test]
-    fn coding_coordinator_prefers_a_participant_and_keeps_a_separate_best_verifier() {
+    fn coding_coordinator_ranks_all_bulk_paths_then_prefers_a_participant() {
         let candidates = (0_u8..3)
             .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([index + 20; 32])).node_id())
             .collect::<Vec<_>>();
         let participants = BTreeSet::from([candidates[2]]);
-        let path_ranks =
+        let verifier_ranks =
             BTreeMap::from([(candidates[0], 0), (candidates[1], 1), (candidates[2], 2)]);
+        let lane_scores = BTreeMap::from([
+            (candidates[0], (2, 1)),
+            (candidates[1], (3, 1)),
+            (candidates[2], (4, 3)),
+        ]);
         let (coder, verifier) =
-            choose_coding_coordinators(&candidates, &participants, &path_ranks).unwrap();
-        assert_eq!(coder, candidates[2]);
-        assert_eq!(verifier, candidates[0]);
+            choose_coding_coordinators(&candidates, &participants, &lane_scores, &verifier_ranks)
+                .unwrap();
+        assert_eq!(coder, candidates[0]);
+        assert_eq!(verifier, candidates[1]);
         assert_ne!(coder, verifier);
-        assert!(choose_coding_coordinators(&candidates[..1], &participants, &path_ranks).is_err());
+        let tied_scores = BTreeMap::from([
+            (candidates[0], (2, 1)),
+            (candidates[1], (2, 1)),
+            (candidates[2], (2, 3)),
+        ]);
+        let (coder, _) =
+            choose_coding_coordinators(&candidates, &participants, &tied_scores, &verifier_ranks)
+                .unwrap();
+        assert_eq!(coder, candidates[2]);
+        let only_coder_score = BTreeMap::from([(candidates[0], (2, 1))]);
+        let (coder, verifier) = choose_coding_coordinators(
+            &candidates,
+            &participants,
+            &only_coder_score,
+            &verifier_ranks,
+        )
+        .unwrap();
+        assert_eq!(coder, candidates[0]);
+        assert_eq!(verifier, candidates[1]);
+        assert!(
+            choose_coding_coordinators(
+                &candidates[..1],
+                &participants,
+                &lane_scores,
+                &verifier_ranks,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn coding_lane_score_keeps_relay_and_tor_paths_available() {
+        let nodes = (0_u8..3)
+            .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([index + 23; 32])).node_id())
+            .collect::<Vec<_>>();
+        let participants = nodes.iter().copied().collect();
+        let mut paths = BTreeMap::from([
+            (nodes[0], Some(CodingPathClass::Direct)),
+            (nodes[1], Some(CodingPathClass::Relay)),
+            (nodes[2], Some(CodingPathClass::Tor)),
+        ]);
+        let observations = BTreeMap::from([(nodes[0], paths.clone())]);
+        assert_eq!(
+            coding_candidate_lane_score(nodes[0], &participants, &observations),
+            Some((5, 3))
+        );
+        paths.insert(nodes[2], None);
+        let observations = BTreeMap::from([(nodes[0], paths)]);
+        assert_eq!(
+            coding_candidate_lane_score(nodes[0], &participants, &observations),
+            None
+        );
+        assert!(validate_coding_path_targets(&[]).is_err());
+        assert!(validate_coding_path_targets(&[nodes[0], nodes[0]]).is_err());
+        let mut canonical = nodes.clone();
+        canonical.sort();
+        assert!(validate_coding_path_targets(&canonical).is_ok());
     }
 
     #[test]
@@ -14661,6 +14966,59 @@ mod tests {
             merge_established_path(Some(P2pPath::Relayed), P2pPath::Direct),
             P2pPath::Direct,
         );
+    }
+
+    #[tokio::test]
+    async fn coding_path_snapshot_includes_policy_fallbacks_and_live_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::open(temp.path(), Seed::from_bytes([66; 32])).unwrap();
+        let local_id = node.keys().node_id();
+        let (_client, mut event_loop) =
+            build_p2p(Arc::new(Mutex::new(node)), config(local_id)).unwrap();
+        event_loop.tor_mode = TorMode::Auto;
+        let peers = (67_u8..=69)
+            .map(|seed| KeyMaterial::from_seed(&Seed::from_bytes([seed; 32])).node_id())
+            .collect::<Vec<_>>();
+        event_loop.installed_policy_addresses.insert(
+            peers[0].libp2p_peer_id().unwrap(),
+            BTreeSet::from(["/ip4/127.0.0.1/udp/4400/quic-v1".parse().unwrap()]),
+        );
+        event_loop.connection_paths.insert(
+            ConnectionId::new_unchecked(701),
+            (peers[1].libp2p_peer_id().unwrap(), P2pPath::Relayed),
+        );
+        event_loop
+            .fallback_tiers
+            .insert(peers[1].libp2p_peer_id().unwrap(), 1);
+        event_loop.connection_paths.insert(
+            ConnectionId::new_unchecked(702),
+            (peers[2].libp2p_peer_id().unwrap(), P2pPath::Direct),
+        );
+        event_loop.connection_paths.insert(
+            ConnectionId::new_unchecked(703),
+            (peers[2].libp2p_peer_id().unwrap(), P2pPath::Tor),
+        );
+        event_loop
+            .fallback_tiers
+            .insert(peers[2].libp2p_peer_id().unwrap(), 2);
+        event_loop.refresh_coding_path_observations().unwrap();
+
+        let mut targets = vec![local_id];
+        targets.extend(&peers);
+        targets.sort();
+        let observation = event_loop
+            .service
+            .coding_path_observation(&targets)
+            .unwrap();
+        let paths = observation
+            .paths
+            .into_iter()
+            .map(|entry| (entry.target, entry.path))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(paths[&local_id], Some(CodingPathClass::Direct));
+        assert_eq!(paths[&peers[0]], Some(CodingPathClass::Direct));
+        assert_eq!(paths[&peers[1]], Some(CodingPathClass::Relay));
+        assert_eq!(paths[&peers[2]], Some(CodingPathClass::Tor));
     }
 
     #[tokio::test]

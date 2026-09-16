@@ -7,7 +7,7 @@ they are not a compatibility promise before the release-candidate milestone.
   message is prefixed by a 32-bit big-endian byte length and is limited to 1 MiB.
   Clients choose a nonzero 16-byte request ID; responses echo it.
 - `peer.cddl` is the CBOR data model carried by libp2p request-response protocol
-  `/mutualbackup/peer/1`. Requests and responses are Ed25519 `SignedRecord`s,
+  `/mutualbackup/peer/2`. Requests and responses are Ed25519 `SignedRecord`s,
   correlate request ID plus request hash, and use the signing domains listed in
   `signed-records.md`. The application frame limit is 600 KiB.
 - `signed-records.md` fixes the ordered Postcard fields used for hashes and

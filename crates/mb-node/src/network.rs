@@ -1,11 +1,12 @@
+use std::collections::BTreeMap;
 #[cfg(test)]
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 #[cfg(test)]
 use std::net::SocketAddr;
 #[cfg(test)]
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 #[cfg(test)]
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -185,9 +186,47 @@ struct NodeService {
     readers: Mutex<Vec<NodeReader>>,
     max_readers: usize,
     active_readers: AtomicUsize,
+    coding_paths: RwLock<BTreeMap<String, CodingPathClass>>,
+}
+
+fn validate_coding_path_targets(targets: &[NodeId]) -> Result<()> {
+    if targets.is_empty()
+        || targets.len() > MAX_CODING_PATH_TARGETS
+        || targets.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        bail!("coding path observation targets are not canonical and bounded");
+    }
+    Ok(())
 }
 
 impl NodeService {
+    fn coding_path_observation(&self, targets: &[NodeId]) -> Result<CodingPathObservation> {
+        validate_coding_path_targets(targets)?;
+        let local_id = self.reader_config.keys().node_id();
+        let paths = self.coding_paths.read().map_err(lock_error)?;
+        let entries = targets
+            .iter()
+            .map(|target| {
+                let path = if *target == local_id {
+                    Some(CodingPathClass::Direct)
+                } else {
+                    target
+                        .libp2p_peer_id()
+                        .ok()
+                        .and_then(|peer| paths.get(&peer.to_string()).copied())
+                };
+                CodingPathEntry {
+                    target: *target,
+                    path,
+                }
+            })
+            .collect();
+        Ok(CodingPathObservation {
+            observed_at_unix_seconds: unix_seconds(),
+            paths: entries,
+        })
+    }
+
     fn checkout_reader(&self) -> Result<NodeReader> {
         self.active_readers
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
@@ -485,6 +524,7 @@ pub async fn serve_node(node: Arc<Mutex<Node>>, config: NodeServerConfig) -> Res
         readers: Mutex::new(Vec::new()),
         max_readers: config.max_connections,
         active_readers: AtomicUsize::new(0),
+        coding_paths: RwLock::new(BTreeMap::new()),
     });
     let listener = TcpListener::bind(config.listen).await?;
     let permits = Arc::new(Semaphore::new(config.max_connections));
@@ -641,7 +681,7 @@ fn process_peer_request(
                         reader.authorize_member(&guild_id, caller)?;
                     }
                 }
-                execute_read_request(&reader, config, request)
+                execute_read_request(&reader, config, &service, request)
             })();
             service.return_reader(reader)?;
             return result;
@@ -865,6 +905,7 @@ fn peer_operation_hash(envelope: &PeerRequestEnvelope) -> Result<[u8; 32]> {
 fn execute_read_request(
     node: &NodeReader,
     config: &NodeServerConfig,
+    service: &NodeService,
     request: PeerRequest,
 ) -> Result<PeerResponse> {
     match request {
@@ -872,6 +913,15 @@ fn execute_read_request(
             member: node.advertised_member(&config.failure_domain)?,
             endpoint: config.public_endpoint.clone(),
         })),
+        PeerRequest::CodingPathObservation { guild_id, targets } => {
+            validate_coding_path_targets(&targets)?;
+            for target in &targets {
+                node.authorize_member(&guild_id, *target)?;
+            }
+            Ok(PeerResponse::CodingPathObservation(
+                service.coding_path_observation(&targets)?,
+            ))
+        }
         PeerRequest::CodingCapacity {
             guild_id: _,
             shard_size,
@@ -995,6 +1045,9 @@ fn execute_peer_request(
             member: node.advertised_member(&config.failure_domain)?,
             endpoint: config.public_endpoint.clone(),
         })),
+        PeerRequest::CodingPathObservation { .. } => {
+            bail!("coding path observation was sent to a mutation worker")
+        }
         PeerRequest::CodingCapacity {
             guild_id: _,
             shard_size,
@@ -2546,7 +2599,13 @@ fn make_peer_request(
     let issued_at_unix_seconds = unix_seconds();
     let guild_scope = request.guild_scope();
     let request_id = if request.mutation_kind().is_some() {
-        let bytes = canonical_bytes(&(1_u16, keys.node_id(), recipient, guild_scope, &request))?;
+        let bytes = canonical_bytes(&(
+            PEER_WIRE_FORMAT_VERSION,
+            keys.node_id(),
+            recipient,
+            guild_scope,
+            &request,
+        ))?;
         let mut id = [0_u8; 16];
         id.copy_from_slice(&blake3::hash(&bytes).as_bytes()[..16]);
         id
@@ -2847,6 +2906,7 @@ mod tests {
             readers: Mutex::new(Vec::new()),
             max_readers: 2,
             active_readers: AtomicUsize::new(0),
+            coding_paths: RwLock::new(BTreeMap::new()),
         });
         let config = NodeServerConfig {
             listen: free_address(),
@@ -2888,6 +2948,7 @@ mod tests {
             readers: Mutex::new(Vec::new()),
             max_readers: 1,
             active_readers: AtomicUsize::new(0),
+            coding_paths: RwLock::new(BTreeMap::new()),
         };
         let reader = service.checkout_reader().unwrap();
         assert!(service.checkout_reader().is_err());
@@ -2992,6 +3053,7 @@ mod tests {
             readers: Mutex::new(Vec::new()),
             max_readers: 2,
             active_readers: AtomicUsize::new(0),
+            coding_paths: RwLock::new(BTreeMap::new()),
         });
         crate::volume::interrupt_next_volume_transition(
             crate::volume::VolumeInterruption::ObjectPublished,
@@ -3029,6 +3091,7 @@ mod tests {
             readers: Mutex::new(Vec::new()),
             max_readers: 2,
             active_readers: AtomicUsize::new(0),
+            coding_paths: RwLock::new(BTreeMap::new()),
         });
         let retried = process_peer_request(service.clone(), &config, signed.clone()).unwrap();
         expect_storage_ack(retried.value.result.unwrap(), local_id, &object).unwrap();
@@ -3059,6 +3122,7 @@ mod tests {
             readers: Mutex::new(Vec::new()),
             max_readers: 2,
             active_readers: AtomicUsize::new(0),
+            coding_paths: RwLock::new(BTreeMap::new()),
         });
         let cached = process_peer_request(service, &config, signed).unwrap();
         expect_storage_ack(cached.value.result.unwrap(), local_id, &object).unwrap();
