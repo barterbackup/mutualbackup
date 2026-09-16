@@ -5971,8 +5971,24 @@ async fn dispatch_next_coding_launch(node: Arc<Mutex<Node>>, p2p: &P2pClient) ->
     })
     .await?;
     if attempt_membership_epoch != current_membership_epoch {
-        node_blocking(node, move |node| node.complete_coding_launch(attempt_id)).await?;
-        return Ok(true);
+        let cleanup_job = DelegatedCodingJob {
+            format_version: 1,
+            plan: job.plan,
+            state: DelegatedCodingJobState::Cleanup,
+            transcript: None,
+            error: Some("guild authority changed after coding dispatch".to_owned()),
+        };
+        return match abort_stale_delegated_coding(node.clone(), p2p, &cleanup_job).await {
+            Ok(()) => {
+                node_blocking(node, move |node| node.abandon_coding_launch(attempt_id)).await?;
+                Ok(true)
+            }
+            Err(error) => {
+                tracing::warn!(?attempt_id, %error, "stale coding launch cleanup deferred");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Ok(false)
+            }
+        };
     }
     let coordinator = job.plan.value.coding_coordinator;
     let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;

@@ -3146,6 +3146,11 @@ impl Node {
     }
 
     pub(crate) fn claim_coding_launch(&self) -> Result<Option<CodingLaunchJob>> {
+        let current_membership_epoch = self
+            .dynamic_guild_state()?
+            .context("coding launch requires dynamic guild state")?
+            .membership_epoch;
+        let mut stale = None;
         for (_, bytes) in self.control.records("coding-launch-job")? {
             let job: CodingLaunchJob = decode_canonical(&bytes)?;
             if job.format_version != 1
@@ -3154,19 +3159,24 @@ impl Node {
             {
                 anyhow::bail!("durable coding launch job is invalid");
             }
-            if !job.dispatched {
-                // Durable launches must remain claimable after their authority
-                // epoch changes so the worker can fence them instead of
-                // terminating on a permanently stale record.
-                self.validate_coding_attempt_authority(&job.plan)?;
+            self.validate_coding_attempt_authority(&job.plan)?;
+            if job.plan.value.membership_epoch != current_membership_epoch {
+                stale.get_or_insert(job);
+            } else if !job.dispatched {
                 return Ok(Some(job));
             }
         }
-        Ok(None)
+        Ok(stale)
     }
 
     pub(crate) fn complete_coding_launch(&self, attempt_id: [u8; 16]) -> Result<()> {
         self.update_coding_launch(attempt_id, true, None)
+    }
+
+    pub(crate) fn abandon_coding_launch(&self, attempt_id: [u8; 16]) -> Result<()> {
+        self.control
+            .delete_record("coding-launch-job", &attempt_id)?;
+        Ok(())
     }
 
     pub(crate) fn defer_coding_launch(&self, attempt_id: [u8; 16], error: &str) -> Result<()> {
@@ -3230,10 +3240,20 @@ impl Node {
     }
 
     pub(crate) fn claim_delegated_coding(&self) -> Result<Option<DelegatedCodingJob>> {
+        let current_membership_epoch = self
+            .dynamic_guild_state()?
+            .context("delegated coding requires dynamic guild state")?
+            .membership_epoch;
+        let mut stale = None;
         for (_, bytes) in self.control.records("delegated-coding-job")? {
             let mut job: DelegatedCodingJob = decode_canonical(&bytes)?;
             if job.format_version != 1 || job.plan.value.coding_coordinator != self.keys.node_id() {
                 anyhow::bail!("durable delegated coding job is invalid");
+            }
+            if job.plan.value.membership_epoch != current_membership_epoch {
+                self.validate_coding_attempt_authority(&job.plan)?;
+                stale.get_or_insert(job);
+                continue;
             }
             if job.state == DelegatedCodingJobState::Cleanup {
                 return Ok(Some(job));
@@ -3269,7 +3289,7 @@ impl Node {
                 return Ok(Some(job));
             }
         }
-        Ok(None)
+        Ok(stale)
     }
 
     pub(crate) fn encode_delegated_coding(
@@ -4130,6 +4150,11 @@ impl Node {
     }
 
     pub(crate) fn claim_coding_activation(&self) -> Result<Option<CodingActivationJob>> {
+        let current_membership_epoch = self
+            .dynamic_guild_state()?
+            .context("coding activation requires dynamic guild state")?
+            .membership_epoch;
+        let mut stale = None;
         for (_, bytes) in self.control.records("coding-activation-job")? {
             let mut job: CodingActivationJob = decode_canonical(&bytes)?;
             if job.format_version != 1
@@ -4139,12 +4164,16 @@ impl Node {
             }
             if !job.complete {
                 self.validate_coding_attempt_authority(&job.transcript.value.plan)?;
+                if job.transcript.value.plan.value.membership_epoch != current_membership_epoch {
+                    stale.get_or_insert(job);
+                    continue;
+                }
                 job.error = None;
                 self.put_coding_activation_job(&job)?;
                 return Ok(Some(job));
             }
         }
-        Ok(None)
+        Ok(stale)
     }
 
     pub(crate) fn complete_coding_activation(&self, attempt_id: [u8; 16]) -> Result<()> {
@@ -9928,8 +9957,16 @@ mod tests {
         .unwrap();
         assert!(node.validate_coding_attempt_plan(&failed).is_err());
         node.validate_coding_attempt_for_cleanup(&failed).unwrap();
+        let mut current = failed.value.clone();
+        current.attempt_id = [215; 16];
+        current.membership_epoch = 2;
+        current.geometry.information[0].failure_domain = "changed-after-attempt".to_owned();
+        let current = node.sign_coding_attempt_plan(current).unwrap();
+        node.enqueue_coding_launch(current.clone()).unwrap();
+        assert_eq!(node.claim_coding_launch().unwrap().unwrap().plan, current);
+        node.complete_coding_launch([215; 16]).unwrap();
         assert_eq!(node.claim_coding_launch().unwrap().unwrap().plan, failed);
-        node.complete_coding_launch([212; 16]).unwrap();
+        node.abandon_coding_launch([212; 16]).unwrap();
         assert!(node.claim_coding_launch().unwrap().is_none());
     }
 
