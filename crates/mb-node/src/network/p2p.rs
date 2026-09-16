@@ -1883,6 +1883,36 @@ impl P2pClient {
         Ok(bytes)
     }
 
+    pub async fn sector_range(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        sector_id: SectorId,
+        commitment: &mb_core::MerkleCommitment,
+        start_leaf: u32,
+        leaf_count: u32,
+    ) -> Result<Vec<u8>> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::GetSectorRange {
+                    guild_id,
+                    sector_id,
+                    start_leaf,
+                    leaf_count,
+                },
+            )
+            .await?;
+        let PeerResponse::MerkleRange(proof) = response else {
+            bail!("peer returned the wrong sector-range response");
+        };
+        if proof.start_leaf != start_leaf || proof.leaves.len() != leaf_count as usize {
+            bail!("peer returned a different sector range than requested");
+        }
+        mb_core::merkle_verify_range(commitment, &proof)
+            .context("peer sector range failed Merkle verification")
+    }
+
     pub(crate) async fn parity(
         &self,
         peer: NodeId,

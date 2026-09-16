@@ -44,6 +44,12 @@ peer-request =
   / { "GetPreparedRevisionPage": { guild_id: bytes32-array, revision_id: uuid-bytes, page_index: uint } }
   / { "EnsureFiller": { guild_id: bytes32-array, revision_id: uuid-bytes, ordinal: uint } }
   / { "GetSector": { guild_id: bytes32-array, sector_id: bytes32-array } }
+  / { "GetSectorRange": {
+        guild_id: bytes32-array,
+        sector_id: bytes32-array,
+        start_leaf: uint,
+        leaf_count: uint
+      } }
   / { "PublishParity": {
         operation_id: bytes16-array,
         group: coding-group,
@@ -97,6 +103,7 @@ peer-response =
   / { "PreparedRevisionPage": { total_pages: uint, page_hash: bytes32-array, bytes: byte-vector } }
   / { "Filler": { reference: sector-ref, bytes: byte-vector } }
   / { "Bytes": byte-vector }
+  / { "MerkleRange": merkle-range-proof }
   / { "CheckpointSignature": member-signature }
   / { "GuildGenesisSignature": member-signature }
   / { "BackupJob": backup-job }
@@ -216,6 +223,12 @@ signed-staged-storage-receipt = any
 signed-coding-challenge-commitment = any
 signed-coding-challenge-reveal = any
 signed-coding-shard-opening = any
+merkle-range-proof = {
+  format_version: uint,
+  start_leaf: uint,
+  leaves: [* bytes16-array],
+  siblings: [* bytes32-array]
+}
 
 endpoint-record = {
   format_version: 1,

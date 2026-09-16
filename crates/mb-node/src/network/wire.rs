@@ -1,8 +1,9 @@
 use mb_core::{
     CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal, CodingGroup,
     CodingRootManifest, CodingShardOpening, CodingVerificationTranscript, EndpointRecord,
-    GuildGenesis, GuildInvite, Member, MemberSignature, NodeId, QuorumGuildGenesis, SectorId,
-    SectorRef, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
+    GuildGenesis, GuildInvite, Member, MemberSignature, MerkleRangeProof, NodeId,
+    QuorumGuildGenesis, SectorId, SectorRef, SignedRecord, StagedStorageReceipt,
+    StorageAcknowledgement,
 };
 use mb_store::{ParityObject, VariableParityObject};
 use serde::{Deserialize, Serialize};
@@ -72,6 +73,12 @@ pub(super) enum PeerRequest {
     GetSector {
         guild_id: [u8; 32],
         sector_id: SectorId,
+    },
+    GetSectorRange {
+        guild_id: [u8; 32],
+        sector_id: SectorId,
+        start_leaf: u32,
+        leaf_count: u32,
     },
     PublishParity {
         operation_id: [u8; 16],
@@ -187,6 +194,7 @@ impl PeerRequest {
             self,
             Self::Profile
                 | Self::GetSector { .. }
+                | Self::GetSectorRange { .. }
                 | Self::GetParity { .. }
                 | Self::GetPreparedRevisionPage { .. }
                 | Self::GetCheckpointPage { .. }
@@ -200,6 +208,7 @@ impl PeerRequest {
         match self {
             Self::Profile
             | Self::GetSector { .. }
+            | Self::GetSectorRange { .. }
             | Self::GetParity { .. }
             | Self::GetPreparedRevisionPage { .. }
             | Self::GetCheckpointPage { .. }
@@ -247,6 +256,7 @@ impl PeerRequest {
             Self::GetPreparedRevisionPage { guild_id, .. }
             | Self::EnsureFiller { guild_id, .. }
             | Self::GetSector { guild_id, .. }
+            | Self::GetSectorRange { guild_id, .. }
             | Self::GetParity { guild_id, .. }
             | Self::StoreRepairShard { guild_id, .. }
             | Self::PutCheckpointPage { guild_id, .. }
@@ -309,6 +319,7 @@ pub(super) enum PeerResponse {
         bytes: Vec<u8>,
     },
     Bytes(Vec<u8>),
+    MerkleRange(MerkleRangeProof),
     CheckpointSignature(MemberSignature),
     GuildGenesisSignature(MemberSignature),
     BackupJob(BackupJob),

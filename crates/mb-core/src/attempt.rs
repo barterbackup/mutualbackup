@@ -2,9 +2,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    CodingGroupV2, CodingProfile, InformationRoleV2, MerkleCommitment, MerkleRangeProof,
-    ModelError, NodeId, ShardRoleV2, SignedRecord, canonical_bytes, challenged_leaf,
-    merkle_verify_range, merkle_zero_commitment, verify_sampled_codeword,
+    CodingError, CodingGroupV2, CodingProfile, InformationRoleV2, KeyMaterial, MerkleCommitment,
+    MerkleRangeProof, ModelError, NodeId, ParityRoleV2, ShardRoleV2, SignedRecord, canonical_bytes,
+    challenged_leaf, encode, merkle_commit, merkle_verify_range, merkle_zero_commitment,
+    verify_sampled_codeword,
 };
 
 pub const CODING_ATTEMPT_PLAN_DOMAIN: &[u8] = b"mutualbackup/coding-attempt-plan/v1";
@@ -248,8 +249,85 @@ pub enum CodingAttemptError {
     InvalidTranscript,
     #[error("the coding transcript is incomplete; this proves only unavailability")]
     Incomplete,
+    #[error("coding input does not match the immutable attempt plan")]
+    InvalidInformation,
+    #[error("Reed-Solomon coding failed: {0}")]
+    Coding(#[from] CodingError),
     #[error("canonical coding evidence encoding failed: {0}")]
     Model(#[from] ModelError),
+}
+
+/// Verify the delegated information and produce the coordinator-signed output
+/// manifest. A `None` input is accepted only for an authenticated virtual-zero
+/// extent, so callers can preserve the no-transfer invariant for sparse data.
+pub fn encode_coding_attempt(
+    signed_plan: &SignedRecord<CodingAttemptPlan>,
+    information: Vec<Option<Vec<u8>>>,
+    coordinator_keys: &KeyMaterial,
+) -> Result<(SignedRecord<CodingRootManifest>, Vec<Vec<u8>>), CodingAttemptError> {
+    signed_plan.verify(CODING_ATTEMPT_PLAN_DOMAIN)?;
+    let plan = &signed_plan.value;
+    plan.validate()?;
+    if signed_plan.signer != plan.delegator
+        || coordinator_keys.node_id() != plan.coding_coordinator
+        || information.len() != plan.geometry.information.len()
+    {
+        return Err(CodingAttemptError::InvalidPlan);
+    }
+
+    let mut input_bytes = Vec::with_capacity(information.len());
+    for (role, bytes) in plan.geometry.information.iter().zip(information) {
+        let bytes = match (role.sector.virtual_zero, bytes) {
+            (true, None) => vec![0_u8; plan.geometry.profile.shard_size as usize],
+            (false, Some(bytes)) => bytes,
+            _ => return Err(CodingAttemptError::InvalidInformation),
+        };
+        if merkle_commit(&bytes).map_err(|_| CodingAttemptError::InvalidInformation)?
+            != role.sector.commitment
+        {
+            return Err(CodingAttemptError::InvalidInformation);
+        }
+        input_bytes.push(bytes);
+    }
+
+    let encoded = encode(plan.geometry.profile, input_bytes)?;
+    let parity_start = usize::from(plan.geometry.profile.data_shards);
+    let parity = encoded[parity_start..].to_vec();
+    let mut roles = plan
+        .geometry
+        .information
+        .iter()
+        .cloned()
+        .map(ShardRoleV2::Information)
+        .collect::<Vec<_>>();
+    for (placement, bytes) in plan.geometry.parity.iter().zip(&parity) {
+        roles.push(ShardRoleV2::Parity(ParityRoleV2 {
+            holder: placement.holder,
+            failure_domain: placement.failure_domain.clone(),
+            row: placement.row,
+            commitment: merkle_commit(bytes).map_err(|_| CodingAttemptError::InvalidInformation)?,
+        }));
+    }
+    let mut group = CodingGroupV2 {
+        id: [0; 32],
+        format_version: 2,
+        guild_id: plan.geometry.guild_id,
+        profile: plan.geometry.profile,
+        roles,
+    };
+    group.id = group.calculate_id()?;
+    group.validate()?;
+    let manifest = SignedRecord::sign(
+        CODING_ROOT_MANIFEST_DOMAIN,
+        CodingRootManifest {
+            format_version: 1,
+            attempt_id: plan.attempt_id,
+            plan_hash: plan.hash()?,
+            group,
+        },
+        coordinator_keys,
+    )?;
+    Ok((manifest, parity))
 }
 
 pub fn coding_challenge_commitment(plan_hash: [u8; 32], nonce: [u8; 32]) -> [u8; 32] {
@@ -440,7 +518,7 @@ mod tests {
         let information = (0_u8..4)
             .map(|value| vec![value.wrapping_mul(29); 64])
             .collect::<Vec<_>>();
-        let shards = encode(profile, information).unwrap();
+        let shards = encode(profile, information.clone()).unwrap();
         let mut roles = shards[..4]
             .iter()
             .enumerate()
@@ -508,17 +586,11 @@ mod tests {
         };
         let plan_hash = plan.hash().unwrap();
         let plan = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, &keys[6]).unwrap();
-        let manifest = SignedRecord::sign(
-            CODING_ROOT_MANIFEST_DOMAIN,
-            CodingRootManifest {
-                format_version: 1,
-                attempt_id: [4; 16],
-                plan_hash,
-                group,
-            },
-            &keys[7],
-        )
-        .unwrap();
+        let (manifest, parity) =
+            encode_coding_attempt(&plan, information.into_iter().map(Some).collect(), &keys[7])
+                .unwrap();
+        assert_eq!(manifest.value.group, group);
+        assert_eq!(parity, shards[4..]);
         let staged_receipts = (4_usize..6)
             .map(|index| {
                 let ShardRoleV2::Parity(parity) = &manifest.value.group.roles[index] else {

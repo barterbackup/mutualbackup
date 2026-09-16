@@ -21,7 +21,7 @@ pub use attempt::{
     CodingPlanGeometry, CodingReplayFinding, CodingRootManifest, CodingShardOpening,
     CodingVerificationTranscript, ParityPlacementV2, STAGED_STORAGE_RECEIPT_DOMAIN,
     StagedStorageReceipt, coding_challenge, coding_challenge_commitment, coding_evidence_hash,
-    replay_coding_transcript,
+    encode_coding_attempt, replay_coding_transcript,
 };
 pub use coding::{
     CodingError, CodingProfile, MAX_CODING_SHARDS, MAX_PROFILE_SHARD_SIZE, MIN_PROFILE_SHARD_SIZE,
