@@ -685,7 +685,15 @@ node Clippy gate passed locally. No remote compilation server was used.
   recovery-observation reconciliation while retaining local-state validation
   for ordinary readiness, and regress pinning on a fresh node with no installed
   dynamic state.
-- [ ] **M5-13 / gate — Run the corrected production gate.**
+- [x] **M5-13 / P1 — Fetch cold-recovery coding evidence concurrently.**
+  The corrected run passed M5-12, installed the recovered dynamic guild and all
+  51 coding transcripts, then exhausted the 60-second recovery bound before
+  staging its first assigned shard. Recovery-head validation fetched every
+  transcript serially from each candidate, consuming the window before shard
+  reconstruction began. Fetch transcript evidence with bounded concurrency,
+  leaving the existing outbound semaphore as the global network limit, and
+  regress that the collector is concurrent without exceeding its bound.
+- [ ] **M5-14 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -698,11 +706,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   with capture after the full coding workload completed. The following run
   completed all 51 transcripts and exposed M5-12 when cold-recovery pinning
   consulted local dynamic state before the certified downloaded state had been
-  adopted.
+  adopted. The next run passed that transition and installed all recovered guild
+  history and transcripts, then exposed M5-13 because serial transcript fetches
+  consumed the recovery deadline before any shard was staged.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-12 close.
+  acceptance gate after M5-01 through M5-13 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

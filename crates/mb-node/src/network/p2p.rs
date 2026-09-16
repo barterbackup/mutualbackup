@@ -100,6 +100,7 @@ const MAX_RELAY_CIRCUITS: usize = 8;
 const MAX_RELAY_CIRCUIT_BYTES: u64 = 8 * 1024 * 1024;
 const DHT_RECOVERY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DHT_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+const RECOVERY_TRANSCRIPT_FETCH_CONCURRENCY: usize = 8;
 const SHARD_FETCH_ATTEMPTS: usize = 3;
 const PEER_EXCHANGE_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_EXCHANGED_ENDPOINT_RECORDS: usize = 64;
@@ -8409,13 +8410,8 @@ async fn validate_recovery_head(
                     fetch_p2p_checkpoint(p2p, publisher, guild_id, checkpoint_hash).await?;
                 let (state, events) =
                     fetch_recovery_guild_history(p2p, publisher, &genesis).await?;
-                let mut transcripts = Vec::with_capacity(state.coding_groups.len());
-                for retained in &state.coding_groups {
-                    transcripts.push(
-                        p2p.coding_transcript(publisher, guild_id, retained.group.id)
-                            .await?,
-                    );
-                }
+                let transcripts =
+                    fetch_recovery_transcripts(p2p, publisher, guild_id, &state).await?;
                 Ok::<_, anyhow::Error>((genesis, checkpoint, state, events, transcripts))
             });
         }
@@ -8509,6 +8505,44 @@ async fn validate_recovery_head(
         tracing::warn!(%error, "could not clear attempt-scoped recovery endpoints");
     }
     result
+}
+
+async fn fetch_recovery_transcripts(
+    p2p: &P2pClient,
+    publisher: NodeId,
+    guild_id: [u8; 32],
+    state: &DynamicGuildState,
+) -> Result<Vec<SignedRecord<CodingVerificationTranscript>>> {
+    let group_ids = state
+        .coding_groups
+        .iter()
+        .map(|retained| retained.group.id)
+        .collect::<Vec<_>>();
+    let requests = group_ids
+        .into_iter()
+        .map(|group_id| async move { p2p.coding_transcript(publisher, guild_id, group_id).await });
+    let mut transcripts =
+        collect_bounded_recovery_requests(requests, RECOVERY_TRANSCRIPT_FETCH_CONCURRENCY).await?;
+    transcripts.sort_by_key(|transcript| transcript.value.manifest.value.group.id);
+    Ok(transcripts)
+}
+
+async fn collect_bounded_recovery_requests<I, Fut, T>(
+    requests: I,
+    concurrency: usize,
+) -> Result<Vec<T>>
+where
+    I: IntoIterator<Item = Fut>,
+    I::IntoIter: Send,
+    Fut: std::future::Future<Output = Result<T>> + Send,
+    T: Send,
+{
+    let mut pending = futures::stream::iter(requests).buffer_unordered(concurrency);
+    let mut collected = Vec::new();
+    while let Some(result) = pending.next().await {
+        collected.push(result?);
+    }
+    Ok(collected)
 }
 
 fn required_recovery_publishers(active_members: usize) -> Result<usize> {
@@ -11941,6 +11975,33 @@ mod tests {
         assert_eq!(required_recovery_publishers(4).unwrap(), 3);
         assert_eq!(required_recovery_publishers(5).unwrap(), 3);
         assert_eq!(required_recovery_publishers(256).unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn recovery_request_collection_is_bounded_and_concurrent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let requests = (0_usize..12).map(|value| {
+            let active = active.clone();
+            let maximum = maximum.clone();
+            async move {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(current, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(value)
+            }
+        });
+
+        let mut collected = collect_bounded_recovery_requests(requests, 4)
+            .await
+            .unwrap();
+        collected.sort_unstable();
+        assert_eq!(collected, (0_usize..12).collect::<Vec<_>>());
+        assert_eq!(maximum.load(Ordering::SeqCst), 4);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
     #[test]

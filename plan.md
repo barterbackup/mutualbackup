@@ -786,8 +786,13 @@ attempt because that pre-adoption step tried to load dynamic guild state from
 the fresh node. Recovery pinning now validates observed bundles against the
 already certified downloaded state, while ordinary readiness continues to use
 installed local state; a focused regression covers a fresh node with no dynamic
-state. A fresh provisioned production gate must still close before Milestone 5
-can pass.
+state. The next production run passed that transition, installed the recovered
+dynamic guild and all 51 coding transcripts, then exhausted its recovery bound
+before staging the first assigned shard. Recovery-head validation had fetched
+all transcript evidence serially from every candidate. Those requests now run
+with bounded concurrency under the existing global outbound semaphore, and a
+focused regression proves both concurrency and its cap. A fresh provisioned
+production gate must still close before Milestone 5 can pass.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer
