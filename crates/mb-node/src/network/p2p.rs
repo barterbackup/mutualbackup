@@ -31,16 +31,15 @@ use mb_core::{
     CodingChallengeCommitment, CodingChallengeReveal, CodingFailureReport, CodingGroup,
     CodingGroupV2, CodingPlanGeometry, CodingProfile, CodingRootManifest, CodingShardOpening,
     CodingVerificationTranscript, GuildCheckpoint, GuildEvent, GuildEventTail, GuildGenesis,
-    GuildInvite, InformationRole, InformationRoleV2, MERKLE_LEAF_SIZE, Member, MemberSignature,
-    NodeId, ParityPlacementV2, ParityRole, ParityRoleV2, QuorumCheckpoint, QuorumGuildEvent,
+    GuildInvite, InformationRoleV2, MAX_GUILD_EVENT_TAIL, MERKLE_LEAF_SIZE, Member,
+    MemberSignature, NodeId, ParityPlacementV2, ParityRoleV2, QuorumCheckpoint, QuorumGuildEvent,
     QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN, RangeSectorRef, STAGED_STORAGE_RECEIPT_DOMAIN,
     STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole, ShardRoleV2, SignedRecord,
     StagedStorageReceipt, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
     V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES,
-    V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE,
-    canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical, encode,
-    encode_3_2, merkle_commit, merkle_zero_commitment, open_recovery_record,
-    replay_coding_transcript, sector_root,
+    V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_SECTOR_SIZE, canonical_bytes,
+    coding_challenge, coding_transfer_estimate, decode_canonical, encode, merkle_commit,
+    merkle_zero_commitment, open_recovery_record, replay_coding_transcript, sector_root,
 };
 use mb_store::{ParityObject, VariableParityObject};
 use uuid::Uuid;
@@ -2186,6 +2185,7 @@ impl P2pClient {
         Ok((total_pages, page_hash, bytes))
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn ensure_filler(
         &self,
         peer: NodeId,
@@ -2209,6 +2209,7 @@ impl P2pClient {
         Ok((reference, bytes))
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn publish_parity(
         &self,
         peer: NodeId,
@@ -6409,7 +6410,15 @@ pub async fn run_peer_exchange(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result
     }
 }
 
-async fn sync_guild_events_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
+async fn sync_guild_events_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<usize> {
+    sync_guild_event_page(node, p2p, None).await
+}
+
+async fn sync_guild_event_page(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    recovery_peers: Option<Vec<GuildPeer>>,
+) -> Result<usize> {
     let (guild, state, local_id) = node_blocking(node.clone(), |node| {
         Ok((
             node.guild_summary()?,
@@ -6419,17 +6428,17 @@ async fn sync_guild_events_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Resu
     })
     .await?;
     let (Some(guild), Some(state)) = (guild, state) else {
-        return Ok(());
+        return Ok(0);
     };
     if !matches!(guild.phase, GuildPhase::Active) {
-        return Ok(());
+        return Ok(0);
     }
     let guild_id = guild.guild_id;
     let base_sequence = state.event_sequence;
     let base_head = state.event_head;
     let mut requests = FuturesUnordered::new();
-    for peer in guild
-        .peers
+    for peer in recovery_peers
+        .unwrap_or(guild.peers)
         .into_iter()
         .filter(|peer| peer.member.node_id != local_id)
     {
@@ -6465,7 +6474,7 @@ async fn sync_guild_events_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Resu
     }
     tails.sort_by_key(|(source, tail)| (std::cmp::Reverse(tail.events.len()), *source));
     let Some((_, selected)) = tails.first() else {
-        return Ok(());
+        return Ok(0);
     };
     for (_, tail) in tails.iter().skip(1) {
         let shared = selected.events.len().min(tail.events.len());
@@ -6473,6 +6482,7 @@ async fn sync_guild_events_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Resu
             bail!("peers returned conflicting quorum-certified guild event tails");
         }
     }
+    let installed = selected.events.len();
     for (event_index, event) in selected.events.clone().into_iter().enumerate() {
         if let mb_core::GuildEventKind::AddCodingGroup { group } = &event.event.kind {
             let mut transcript = None;
@@ -6509,7 +6519,7 @@ async fn sync_guild_events_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Resu
             node_blocking(node.clone(), move |node| node.install_guild_event(event)).await?;
         }
     }
-    Ok(())
+    Ok(installed)
 }
 
 pub async fn run_relay_membership_sync(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {
@@ -7206,7 +7216,14 @@ async fn recover_from_dht_once(
         node.adopt_recovered_guild(recovered_genesis, recovered_roster)
     })
     .await?;
+    loop {
+        let installed = sync_guild_event_page(node.clone(), p2p, Some(roster.clone())).await?;
+        if installed < MAX_GUILD_EVENT_TAIL {
+            break;
+        }
+    }
     recover_p2p_local_shards(node.clone(), p2p, &checkpoint, &roster).await?;
+    recover_p2p_variable_shards(node.clone(), p2p, &checkpoint, &roster).await?;
     let recovered_checkpoint = checkpoint.clone();
     node_blocking(node.clone(), move |node| {
         node.install_recovered_checkpoint(&recovered_checkpoint)?;
@@ -8030,6 +8047,118 @@ async fn recover_p2p_local_shards(
         }
     })
     .await
+}
+
+async fn recover_p2p_variable_shards(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    checkpoint: &QuorumCheckpoint,
+    roster: &[GuildPeer],
+) -> Result<()> {
+    if checkpoint.checkpoint.format_version != 4 {
+        return Ok(());
+    }
+    let checkpoint_hash = checkpoint.hash()?;
+    let checkpoint_for_plan = checkpoint.clone();
+    let plans = node_blocking(node.clone(), move |node| {
+        let local_id = node.keys().node_id();
+        let state = node
+            .dynamic_guild_state()?
+            .context("variable recovery requires dynamic guild state")?;
+        let sectors = checkpoint_for_plan
+            .checkpoint
+            .revisions
+            .iter()
+            .flat_map(|revision| {
+                revision
+                    .value
+                    .metadata_sectors
+                    .iter()
+                    .chain(&revision.value.data_sectors)
+                    .map(move |reference| {
+                        (reference.id, (revision.value.owner, reference.logical_len))
+                    })
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut plans = Vec::new();
+        for retained in state.coding_groups {
+            if !retained.group.roles.iter().any(|role| {
+                matches!(role, ShardRoleV2::Information(information)
+                    if !information.sector.virtual_zero
+                        && sectors.get(&information.sector.id)
+                            == Some(&(information.owner, information.sector.logical_len)))
+            }) {
+                continue;
+            }
+            let targets = retained
+                .group
+                .roles
+                .iter()
+                .enumerate()
+                .filter_map(|(index, role)| match role {
+                    ShardRoleV2::Information(information)
+                        if information.owner == local_id && !information.sector.virtual_zero =>
+                    {
+                        Some(index)
+                    }
+                    ShardRoleV2::Parity(parity) if parity.holder == local_id => Some(index),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if !targets.is_empty() {
+                plans.push((
+                    node.coding_transcript_for_group(retained.group.guild_id, retained.group.id)?,
+                    targets,
+                ));
+            }
+        }
+        Ok(plans)
+    })
+    .await?;
+    let deferred_holders = Mutex::new(BTreeSet::new());
+    for (transcript, targets) in plans {
+        let group = &transcript.value.manifest.value.group;
+        for target_index in targets {
+            let group_for_check = group.clone();
+            let already_ready = node_blocking(node.clone(), move |node| {
+                Ok(node
+                    .variable_shard_for_guild(
+                        &group_for_check.guild_id,
+                        &group_for_check.id,
+                        target_index as u16,
+                    )
+                    .is_ok())
+            })
+            .await?;
+            if already_ready {
+                continue;
+            }
+            let bytes = reconstruct_variable_shard_from_peers(
+                node.clone(),
+                p2p,
+                group,
+                target_index,
+                roster,
+                &deferred_holders,
+            )
+            .await?;
+            let transcript_for_stage = transcript.clone();
+            node_blocking(node.clone(), move |node| {
+                node.stage_recovered_variable_shard(
+                    &checkpoint_hash,
+                    &transcript_for_stage,
+                    target_index as u16,
+                    &bytes,
+                )
+            })
+            .await?;
+        }
+        node_blocking(node.clone(), move |node| {
+            node.activate_coding_attempt(&transcript)
+        })
+        .await?;
+    }
+    Ok(())
 }
 
 async fn recover_local_shards_with<F, Fut>(
@@ -8864,7 +8993,6 @@ async fn commit_backup_job(
         bail!("prepared revision exceeds the bounded coding catalog");
     }
 
-    let mut new_groups = Vec::with_capacity(target_sectors.len());
     let mut variable_lanes = Vec::with_capacity(target_sectors.len());
     for (ordinal, target) in target_sectors.iter().enumerate() {
         let owner_bytes = load_p2p_sector(
@@ -8887,83 +9015,6 @@ async fn commit_backup_job(
             &owner_bytes,
             &peers,
         )?);
-        let helper_a = ensure_p2p_filler(
-            node.clone(),
-            p2p,
-            local_id,
-            peers[1].member.node_id,
-            guild_id,
-            revision.value.revision_id,
-            ordinal as u64 * 2,
-        )
-        .await?;
-        let helper_b = ensure_p2p_filler(
-            node.clone(),
-            p2p,
-            local_id,
-            peers[2].member.node_id,
-            guild_id,
-            revision.value.revision_id,
-            ordinal as u64 * 2 + 1,
-        )
-        .await?;
-        let shards = encode_3_2([owner_bytes, helper_a.1, helper_b.1])?;
-        let roles = [
-            ShardRole::Information(InformationRole {
-                owner: peers[0].member.node_id,
-                sector: target.clone(),
-            }),
-            ShardRole::Information(InformationRole {
-                owner: peers[1].member.node_id,
-                sector: helper_a.0,
-            }),
-            ShardRole::Information(InformationRole {
-                owner: peers[2].member.node_id,
-                sector: helper_b.0,
-            }),
-            ShardRole::Parity(ParityRole {
-                holder: peers[3].member.node_id,
-                row: 0,
-                root: sector_root(&shards[3]),
-            }),
-            ShardRole::Parity(ParityRole {
-                holder: peers[4].member.node_id,
-                row: 1,
-                root: sector_root(&shards[4]),
-            }),
-        ];
-        let mut group = CodingGroup {
-            id: [0; 32],
-            format_version: 1,
-            guild_id,
-            data_shards: V1_RS_DATA_SHARDS,
-            parity_shards: V1_RS_PARITY_SHARDS,
-            shard_size: V1_SECTOR_SIZE as u32,
-            roles,
-        };
-        group.id = group.calculate_id()?;
-        let information = [shards[0].clone(), shards[1].clone(), shards[2].clone()];
-        for (position, shard_index) in [(3_usize, 3_u8), (4, 4)] {
-            let object = ParityObject {
-                format_version: 1,
-                guild_id,
-                group_id: group.id,
-                shard_index,
-                root: sector_root(&shards[position]),
-                bytes: shards[position].clone(),
-            };
-            publish_p2p_parity(
-                node.clone(),
-                p2p,
-                local_id,
-                peers[position].member.node_id,
-                group.clone(),
-                information.clone(),
-                object,
-            )
-            .await?;
-        }
-        new_groups.push(group);
     }
 
     let (
@@ -9000,7 +9051,6 @@ async fn commit_backup_job(
             revision.value.revision_id,
         )
     });
-    coding_groups.extend(new_groups);
     coding_groups.sort_by_key(|group| group.id);
     apply_revision_retention(
         generation,
@@ -9010,7 +9060,7 @@ async fn commit_backup_job(
         &mut coding_groups,
     )?;
     let checkpoint = GuildCheckpoint {
-        format_version: 3,
+        format_version: 4,
         guild_id,
         genesis_hash: certificate.hash()?,
         generation,
@@ -9234,6 +9284,7 @@ async fn load_p2p_sector(
     }
 }
 
+#[allow(dead_code)]
 async fn ensure_p2p_filler(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
@@ -9255,6 +9306,7 @@ async fn ensure_p2p_filler(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 async fn publish_p2p_parity(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
@@ -9423,7 +9475,9 @@ mod tests {
     use super::*;
     use futures::future::{Pending, Ready, ready};
     use libp2p::core::{Endpoint, transport::PortUse};
-    use mb_core::{KeyMaterial, Seed};
+    use mb_core::{
+        InformationRole, KeyMaterial, ParityRole, Seed, V1_RS_PARITY_SHARDS, encode_3_2,
+    };
     use request_response::Codec as _;
     use std::io;
 
@@ -14013,8 +14067,28 @@ mod tests {
             .current_checkpoint(genesis.genesis.guild_id)
             .unwrap()
             .unwrap();
+        assert_eq!(final_checkpoint.checkpoint.format_version, 4);
         assert_eq!(final_checkpoint.checkpoint.revisions.len(), 2);
-        assert!(final_checkpoint.checkpoint.coding_groups.len() >= 4);
+        assert!(final_checkpoint.checkpoint.coding_groups.is_empty());
+        let protected_sector_count = final_checkpoint
+            .checkpoint
+            .revisions
+            .iter()
+            .map(|revision| {
+                revision.value.metadata_sectors.len() + revision.value.data_sectors.len()
+            })
+            .sum::<usize>();
+        assert!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .dynamic_guild_state()
+                .unwrap()
+                .unwrap()
+                .coding_groups
+                .len()
+                >= protected_sector_count
+        );
         let forgotten_sector = final_checkpoint
             .checkpoint
             .revisions

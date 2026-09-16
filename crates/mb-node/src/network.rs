@@ -362,6 +362,7 @@ fn recovery_slot(subject: NodeId, publisher: NodeId, guild_id: [u8; 32]) -> [u8;
     *hasher.finalize().as_bytes()
 }
 
+#[allow(dead_code)]
 pub(super) fn storage_operation_id(group_id: &[u8; 32], shard_index: u8) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new_derive_key("mutualbackup parity operation v1");
     hasher.update(group_id);

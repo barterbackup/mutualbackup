@@ -2004,6 +2004,26 @@ impl Node {
         guild_event_tail_from_store(&self.control, base_sequence, base_head)
     }
 
+    pub(crate) fn coding_transcript_for_group(
+        &self,
+        guild_id: [u8; 32],
+        group_id: [u8; 32],
+    ) -> Result<SignedRecord<CodingVerificationTranscript>> {
+        let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(
+            &self
+                .control
+                .get_record("coding-group-transcript", &group_id)?
+                .context("coding-group verifier transcript is unavailable")?,
+        )?;
+        if transcript.value.manifest.value.group.guild_id != guild_id
+            || transcript.value.manifest.value.group.id != group_id
+            || replay_coding_transcript(&transcript)? != CodingReplayFinding::Verified
+        {
+            anyhow::bail!("stored coding-group verifier transcript is invalid");
+        }
+        Ok(transcript)
+    }
+
     pub fn pending_guild_join(&self) -> Result<Option<(SignedRecord<GuildInvite>, GuildPeer)>> {
         Ok(self
             .pending_guild()?
@@ -4235,6 +4255,7 @@ impl Node {
     pub fn store_checkpoint(&mut self, checkpoint: &QuorumCheckpoint) -> Result<[u8; 32]> {
         checkpoint.verify()?;
         self.validate_local_member(&checkpoint.checkpoint)?;
+        self.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, false)?;
         if !checkpoint.has_signature(self.keys.node_id()) {
             anyhow::bail!("local node did not authorize this checkpoint");
         }
@@ -4261,6 +4282,7 @@ impl Node {
     pub fn sign_checkpoint(&mut self, checkpoint: &GuildCheckpoint) -> Result<MemberSignature> {
         checkpoint.validate()?;
         self.validate_local_member(checkpoint)?;
+        self.validate_variable_checkpoint_coverage(checkpoint, false)?;
         let configured: Member = decode_canonical(
             &self
                 .control
@@ -4287,6 +4309,96 @@ impl Node {
             &body,
         )?;
         Ok(checkpoint.member_signature(&self.keys)?)
+    }
+
+    fn validate_variable_checkpoint_coverage(
+        &self,
+        checkpoint: &GuildCheckpoint,
+        recovered_head: bool,
+    ) -> Result<()> {
+        if checkpoint.format_version != 4 {
+            return Ok(());
+        }
+        let checkpoint_hash = checkpoint.hash()?;
+        let state = self
+            .dynamic_guild_state()?
+            .context("version-four checkpoint requires dynamic guild state")?;
+        if state.guild_id != checkpoint.guild_id {
+            anyhow::bail!("checkpoint and dynamic guild state differ");
+        }
+        let previous_revisions = if recovered_head {
+            None
+        } else {
+            self.control
+                .checkpoint_head(&checkpoint.guild_id)?
+                .filter(|(generation, hash, _)| {
+                    (*generation == checkpoint.generation && *hash == checkpoint_hash)
+                        || (generation.checked_add(1) == Some(checkpoint.generation)
+                            && checkpoint.parent == Some(*hash))
+                })
+                .map(|(_, _, bytes)| decode_canonical::<QuorumCheckpoint>(&bytes))
+                .transpose()?
+                .map(|previous| previous.checkpoint.revisions)
+        };
+        let legacy_coverage = checkpoint
+            .coding_groups
+            .iter()
+            .flat_map(|group| &group.roles)
+            .filter_map(|role| match role {
+                ShardRole::Information(information) => Some(information.sector.id),
+                ShardRole::Parity(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for revision in &checkpoint.revisions {
+            let retained_revision = previous_revisions
+                .as_ref()
+                .is_some_and(|previous| previous.contains(revision));
+            for reference in revision
+                .value
+                .metadata_sectors
+                .iter()
+                .chain(&revision.value.data_sectors)
+            {
+                if legacy_coverage.contains(&reference.id) {
+                    continue;
+                }
+                let retained = state.coding_groups.iter().filter(|retained| {
+                    retained.group.roles.iter().any(|role| {
+                        matches!(role, ShardRoleV2::Information(information)
+                                if !information.sector.virtual_zero
+                                    && information.owner == revision.value.owner
+                                    && information.sector.id == reference.id
+                                    && information.sector.logical_len == reference.logical_len)
+                    })
+                });
+                let mut covered = false;
+                for retained in retained {
+                    let Some(bytes) = self
+                        .control
+                        .get_record("coding-group-transcript", &retained.group.id)?
+                    else {
+                        continue;
+                    };
+                    let transcript: SignedRecord<CodingVerificationTranscript> =
+                        decode_canonical(&bytes)?;
+                    if transcript.value.manifest.value.group == retained.group
+                        && replay_coding_transcript(&transcript)? == CodingReplayFinding::Verified
+                        && (recovered_head
+                            || retained_revision
+                            || transcript.value.plan.value.checkpoint_hash == checkpoint_hash)
+                    {
+                        covered = true;
+                        break;
+                    }
+                }
+                if !covered {
+                    anyhow::bail!(
+                        "checkpoint sector has no verified variable coding group bound to its revision"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5770,6 +5882,7 @@ impl Node {
     ) -> Result<[u8; 32]> {
         checkpoint.verify()?;
         self.validate_local_member(&checkpoint.checkpoint)?;
+        self.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, true)?;
         if !checkpoint.has_signature(self.keys.node_id()) {
             anyhow::bail!("checkpoint is not authorized by the recovering seed");
         }
@@ -6024,6 +6137,79 @@ impl Node {
             shard_index,
             &root,
             bytes,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn stage_recovered_variable_shard(
+        &mut self,
+        checkpoint_hash: &[u8; 32],
+        transcript: &SignedRecord<CodingVerificationTranscript>,
+        shard_index: u16,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let plan = &transcript.value.plan;
+        let group = &transcript.value.manifest.value.group;
+        self.require_active_recovery_attempt(group.guild_id, *checkpoint_hash)?;
+        self.validate_coding_attempt_authority(plan)?;
+        if replay_coding_transcript(transcript)? != CodingReplayFinding::Verified
+            || !self
+                .dynamic_guild_state()?
+                .context("node has no dynamic guild state")?
+                .coding_groups
+                .iter()
+                .any(|retained| retained.group == *group)
+        {
+            anyhow::bail!("recovered variable shard has no certified coding group");
+        }
+        let (storage_group, commitment) = match group.roles.get(usize::from(shard_index)) {
+            Some(ShardRoleV2::Information(information))
+                if information.owner == self.keys.node_id() && !information.sector.virtual_zero =>
+            {
+                (information.sector.id, &information.sector.commitment)
+            }
+            Some(ShardRoleV2::Parity(parity)) if parity.holder == self.keys.node_id() => {
+                (group.id, &parity.commitment)
+            }
+            _ => anyhow::bail!("recovered variable shard is not assigned to the local node"),
+        };
+        if bytes.len() != commitment.byte_len as usize || merkle_commit(bytes)? != *commitment {
+            anyhow::bail!("recovered variable shard conflicts with its commitment");
+        }
+        self.volumes.reserve_attempt(
+            &self.control,
+            &plan.value.attempt_id,
+            group.guild_id,
+            shard_index,
+            commitment.byte_len,
+        )?;
+        let mut offset = 0_u32;
+        for chunk in bytes.chunks(1024 * 1024) {
+            offset = self.volumes.write_attempt_range(
+                &self.control,
+                &plan.value.attempt_id,
+                shard_index,
+                offset,
+                chunk,
+            )?;
+        }
+        if offset != commitment.byte_len {
+            anyhow::bail!("recovered variable shard upload is incomplete");
+        }
+        self.volumes.finish_attempt_upload(
+            &self.control,
+            &plan.value.attempt_id,
+            storage_group,
+            shard_index,
+            commitment,
+        )?;
+        let transcript_hash = blake3::hash(&canonical_bytes(transcript)?);
+        self.volumes.attach_attempt_receipt(
+            &self.control,
+            &plan.value.attempt_id,
+            &storage_group,
+            shard_index,
+            transcript_hash.as_bytes(),
         )?;
         Ok(())
     }

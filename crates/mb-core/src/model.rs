@@ -444,7 +444,7 @@ pub struct QuorumCheckpoint {
 
 impl GuildCheckpoint {
     pub fn validate(&self) -> Result<(), ModelError> {
-        if self.format_version != 3
+        if !matches!(self.format_version, 3 | 4)
             || self.genesis_hash == [0; 32]
             || self.generation == 0
             || self.generation > i64::MAX as u64
@@ -452,7 +452,7 @@ impl GuildCheckpoint {
             || self.members.len() != 5
             || self.revisions.is_empty()
             || self.revisions.len() > 4096
-            || self.coding_groups.is_empty()
+            || (self.format_version == 3 && self.coding_groups.is_empty())
             || self.coding_groups.len() > V1_MAX_CODING_GROUPS
         {
             return Err(ModelError::InvalidCheckpoint);
@@ -618,10 +618,11 @@ impl GuildCheckpoint {
             )?;
             previous_group = Some(group.id);
         }
-        if covered_revision_sectors.len() != revision_sectors.len()
-            || !revision_sectors
-                .keys()
-                .all(|id| covered_revision_sectors.contains(id))
+        if self.format_version == 3
+            && (covered_revision_sectors.len() != revision_sectors.len()
+                || !revision_sectors
+                    .keys()
+                    .all(|id| covered_revision_sectors.contains(id)))
         {
             return Err(ModelError::InvalidCheckpoint);
         }
@@ -1284,6 +1285,16 @@ mod tests {
             checkpoint.add_signature(key).unwrap();
         }
         checkpoint.verify().unwrap();
+
+        let mut variable_checkpoint = checkpoint.checkpoint.clone();
+        variable_checkpoint.format_version = 4;
+        variable_checkpoint.coding_groups.clear();
+        variable_checkpoint.validate().unwrap();
+        variable_checkpoint.format_version = 3;
+        assert!(matches!(
+            variable_checkpoint.validate(),
+            Err(ModelError::InvalidCheckpoint)
+        ));
 
         let mut tampered_writer = checkpoint.checkpoint.clone();
         tampered_writer.revisions[0].value.writer_signature[0] ^= 1;
