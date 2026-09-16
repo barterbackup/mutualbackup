@@ -1739,6 +1739,27 @@ impl P2pClient {
         })
     }
 
+    pub async fn coding_capacity(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        shard_size: u32,
+    ) -> Result<u64> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::CodingCapacity {
+                    guild_id,
+                    shard_size,
+                },
+            )
+            .await?;
+        let PeerResponse::CodingCapacity { available_shards } = response else {
+            bail!("peer returned the wrong coding-capacity response");
+        };
+        Ok(available_shards)
+    }
+
     pub async fn exchange_endpoints(
         &self,
         peer: NodeId,
@@ -9869,12 +9890,24 @@ fn variable_coding_profile(peers: &[crate::GuildPeer]) -> Result<CodingProfile> 
     Ok(profile)
 }
 
+#[cfg(test)]
 fn variable_coding_lane(
     guild_id: [u8; 32],
     revision_id: Uuid,
     ordinal: u64,
     sources: &[VariableInformationInput<'_>],
     peers: &[crate::GuildPeer],
+) -> Result<VariableCodingLane> {
+    variable_coding_lane_with_capacity(guild_id, revision_id, ordinal, sources, peers, None)
+}
+
+fn variable_coding_lane_with_capacity(
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    ordinal: u64,
+    sources: &[VariableInformationInput<'_>],
+    peers: &[crate::GuildPeer],
+    parity_capacity: Option<&BTreeMap<NodeId, u64>>,
 ) -> Result<VariableCodingLane> {
     let profile = variable_coding_profile(peers)?;
     let data_shards = usize::from(profile.data_shards);
@@ -9924,7 +9957,7 @@ fn variable_coding_lane(
         information_roots.push(source.sector.root);
     }
     let virtual_count = data_shards - information.len();
-    let remaining_count = virtual_count + usize::from(profile.parity_shards);
+    let parity_count = usize::from(profile.parity_shards);
     let mut candidates = peers
         .iter()
         .filter(|peer| !used_nodes.contains(&peer.member.node_id))
@@ -9938,19 +9971,41 @@ fn variable_coding_lane(
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|(score, node_id, _)| (*score, *node_id));
-    let mut remaining = Vec::with_capacity(remaining_count);
-    for (_, _, peer) in candidates {
-        if used_domains.insert(peer.member.failure_domain.clone()) {
-            remaining.push(peer);
-            if remaining.len() == remaining_count {
+    let mut placement_domains = used_domains;
+    let mut parity_peers = Vec::with_capacity(parity_count);
+    for (_, _, peer) in &candidates {
+        if parity_capacity
+            .is_none_or(|capacity| capacity.get(&peer.member.node_id).copied().unwrap_or(0) > 0)
+            && placement_domains.insert(peer.member.failure_domain.clone())
+        {
+            parity_peers.push(*peer);
+            if parity_peers.len() == parity_count {
                 break;
             }
         }
     }
-    if remaining.len() < remaining_count {
+    if parity_peers.len() < parity_count {
+        bail!("variable coding roster has too few parity domains with available capacity");
+    }
+    let parity_nodes = parity_peers
+        .iter()
+        .map(|peer| peer.member.node_id)
+        .collect::<BTreeSet<_>>();
+    let mut virtual_peers = Vec::with_capacity(virtual_count);
+    for (_, _, peer) in candidates {
+        if !parity_nodes.contains(&peer.member.node_id)
+            && placement_domains.insert(peer.member.failure_domain.clone())
+        {
+            virtual_peers.push(peer);
+            if virtual_peers.len() == virtual_count {
+                break;
+            }
+        }
+    }
+    if virtual_peers.len() < virtual_count {
         bail!("variable coding roster has too few distinct placement domains");
     }
-    for (lane, peer) in remaining.iter().take(virtual_count).enumerate() {
+    for (lane, peer) in virtual_peers.iter().enumerate() {
         information.push(InformationRoleV2 {
             owner: peer.member.node_id,
             failure_domain: peer.member.failure_domain.clone(),
@@ -9963,10 +10018,8 @@ fn variable_coding_lane(
         });
         information_roots.push([0; 32]);
     }
-    let parity = remaining
+    let parity = parity_peers
         .iter()
-        .skip(virtual_count)
-        .take(usize::from(profile.parity_shards))
         .enumerate()
         .map(|(row, peer)| ParityPlacementV2 {
             holder: peer.member.node_id,
@@ -9996,6 +10049,7 @@ struct CrossUserCodingContext<'a> {
     current_owner: NodeId,
     retained_revisions: &'a [SignedRecord<UserRevision>],
     peers: &'a [crate::GuildPeer],
+    parity_capacity: &'a mut BTreeMap<NodeId, u64>,
 }
 
 async fn reachable_coding_peers(
@@ -10036,6 +10090,47 @@ async fn reachable_coding_peers(
     }
     reachable.sort_by_key(|peer| peer.member.node_id);
     reachable
+}
+
+async fn coding_capacity_by_peer(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    local_id: NodeId,
+    guild_id: [u8; 32],
+    peers: &[crate::GuildPeer],
+    shard_size: u32,
+) -> Result<BTreeMap<NodeId, u64>> {
+    let mut capacity = BTreeMap::new();
+    let mut requests = FuturesUnordered::new();
+    for peer in peers {
+        let candidate = peer.member.node_id;
+        if candidate == local_id {
+            capacity.insert(
+                candidate,
+                node_blocking(node.clone(), move |node| node.coding_capacity(shard_size)).await?,
+            );
+        } else {
+            requests.push(async move {
+                (
+                    candidate,
+                    p2p.coding_capacity(candidate, guild_id, shard_size).await,
+                )
+            });
+        }
+    }
+    while let Some((candidate, result)) = requests.next().await {
+        match result {
+            Ok(available_shards) => {
+                capacity.insert(candidate, available_shards);
+            }
+            Err(error) => tracing::debug!(
+                peer = %candidate,
+                %error,
+                "guild member capacity is unavailable for new coding placement"
+            ),
+        }
+    }
+    Ok(capacity)
 }
 
 async fn build_cross_user_coding_lanes(
@@ -10139,13 +10234,24 @@ async fn build_cross_user_coding_lanes(
                 commitment,
             })
             .collect::<Vec<_>>();
-        lanes.push(variable_coding_lane(
+        let lane = variable_coding_lane_with_capacity(
             context.guild_id,
             context.revision_id,
             ordinal as u64,
             &sources,
             context.peers,
-        )?);
+            Some(&*context.parity_capacity),
+        )?;
+        for parity in &lane.geometry.parity {
+            let available = context
+                .parity_capacity
+                .get_mut(&parity.holder)
+                .context("selected parity holder has no capacity record")?;
+            *available = available
+                .checked_sub(1)
+                .context("selected parity holder capacity was exhausted")?;
+        }
+        lanes.push(lane);
     }
     Ok(lanes)
 }
@@ -10434,6 +10540,15 @@ async fn commit_backup_job(
     {
         bail!("backup owner is unavailable for new coding placement");
     }
+    let mut parity_capacity = coding_capacity_by_peer(
+        node.clone(),
+        p2p,
+        local_id,
+        guild_id,
+        &coding_peers,
+        V1_SECTOR_SIZE as u32,
+    )
+    .await?;
     let variable_lanes = build_cross_user_coding_lanes(
         node.clone(),
         current_sectors,
@@ -10445,6 +10560,7 @@ async fn commit_backup_job(
             current_owner: job.descriptor.owner,
             retained_revisions: &checkpoint.revisions,
             peers: &coding_peers,
+            parity_capacity: &mut parity_capacity,
         },
     )
     .await?;
@@ -11380,6 +11496,69 @@ mod tests {
         assert_eq!(
             assigned,
             peers.iter().map(|peer| peer.member.node_id).collect()
+        );
+    }
+
+    #[test]
+    fn production_variable_lane_uses_only_hosts_with_advertised_capacity() {
+        let peers = (0_u8..6)
+            .map(|index| {
+                let keys = KeyMaterial::from_seed(&Seed::from_bytes([index + 105; 32]));
+                crate::GuildPeer {
+                    member: Member {
+                        node_id: keys.node_id(),
+                        recovery_public_key: keys.recovery_public_key(),
+                        failure_domain: format!("capacity-lane-domain-{index}"),
+                    },
+                    endpoints: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let bytes = vec![106; V1_SECTOR_SIZE];
+        let source = SectorRef {
+            id: [107; 32],
+            root: sector_root(&bytes),
+            logical_len: 321,
+        };
+        let commitment = merkle_commit(&bytes).unwrap();
+        let capacity = BTreeMap::from([(peers[4].member.node_id, 1), (peers[5].member.node_id, 1)]);
+        let lane = variable_coding_lane_with_capacity(
+            [108; 32],
+            Uuid::from_bytes([109; 16]),
+            0,
+            &[VariableInformationInput {
+                owner: peers[0].member.node_id,
+                sector: &source,
+                commitment: &commitment,
+            }],
+            &peers,
+            Some(&capacity),
+        )
+        .unwrap();
+        assert_eq!(
+            lane.geometry
+                .parity
+                .iter()
+                .map(|role| role.holder)
+                .collect::<BTreeSet<_>>(),
+            capacity.keys().copied().collect()
+        );
+
+        let insufficient = BTreeMap::from([(peers[4].member.node_id, 1)]);
+        assert!(
+            variable_coding_lane_with_capacity(
+                [108; 32],
+                Uuid::from_bytes([109; 16]),
+                0,
+                &[VariableInformationInput {
+                    owner: peers[0].member.node_id,
+                    sector: &source,
+                    commitment: &commitment,
+                }],
+                &peers,
+                Some(&insufficient),
+            )
+            .is_err()
         );
     }
 

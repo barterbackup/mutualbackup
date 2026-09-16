@@ -506,6 +506,24 @@ impl StorageVolumes {
             .collect()
     }
 
+    pub(crate) fn coding_capacity(&self, control: &ControlStore, shard_size: u32) -> Result<u64> {
+        validate_coding_shard_size(shard_size)?;
+        self.volumes.values().try_fold(0_u64, |capacity, volume| {
+            if volume.record.state != StorageVolumeState::Online {
+                return Ok(capacity);
+            }
+            let Some(store) = volume.store.as_ref() else {
+                return Ok(capacity);
+            };
+            Ok(capacity.saturating_add(volume_coding_capacity(
+                control,
+                &volume.record,
+                store,
+                shard_size,
+            )?))
+        })
+    }
+
     pub(crate) fn reclaim(&mut self, volume_id: Option<Uuid>) -> Result<u64> {
         if let Some(volume_id) = volume_id
             && !self.volumes.contains_key(&volume_id)
@@ -1659,6 +1677,38 @@ impl StorageVolumes {
     }
 }
 
+pub(crate) fn reader_coding_capacity(
+    control: &ControlStore,
+    readers: &[VolumeReaderConfig],
+    shard_size: u32,
+) -> Result<u64> {
+    validate_coding_shard_size(shard_size)?;
+    let records = load_volume_records(control)?
+        .into_iter()
+        .map(|record| (record.volume_id, record))
+        .collect::<BTreeMap<_, _>>();
+    let mut capacity = 0_u64;
+    for reader in readers {
+        let Some(record) = records.get(&reader.volume_id) else {
+            continue;
+        };
+        if record.state != StorageVolumeState::Online {
+            continue;
+        }
+        let store = match ParityStore::open_existing_with_key(
+            &reader.path,
+            reader.volume_id.as_bytes(),
+            &reader.database_key,
+        ) {
+            Ok(store) => store,
+            Err(_) => continue,
+        };
+        capacity =
+            capacity.saturating_add(volume_coding_capacity(control, record, &store, shard_size)?);
+    }
+    Ok(capacity)
+}
+
 pub(crate) fn open_control_store(
     data_dir: &Path,
     keys: &KeyMaterial,
@@ -1967,6 +2017,34 @@ fn attempt_reservation_id(attempt_id: &[u8; 16], shard_index: u8) -> Vec<u8> {
     id
 }
 
+fn validate_coding_shard_size(shard_size: u32) -> Result<()> {
+    if !(mb_core::MIN_PROFILE_SHARD_SIZE..=mb_core::MAX_PROFILE_SHARD_SIZE).contains(&shard_size)
+        || !shard_size.is_power_of_two()
+    {
+        bail!("coding capacity shard size is invalid");
+    }
+    Ok(())
+}
+
+fn volume_coding_capacity(
+    control: &ControlStore,
+    record: &VolumeRecord,
+    store: &ParityStore,
+    shard_size: u32,
+) -> Result<u64> {
+    let logical = record
+        .budget_bytes
+        .saturating_sub(record.headroom_bytes)
+        .saturating_sub(store.used_bytes()?)
+        / u64::from(shard_size);
+    let required_physical = physical_write_reservation(shard_size as usize, 0);
+    let physical = fs2::available_space(&record.path)?
+        .saturating_sub(record.headroom_bytes)
+        .saturating_sub(shared_checkpoint_reservation(control, store)?)
+        / required_physical;
+    Ok(logical.min(physical))
+}
+
 fn physical_write_reservation(payload_bytes: usize, acknowledgement_bytes: usize) -> u64 {
     let row_bytes = (payload_bytes as u64)
         .saturating_add(acknowledgement_bytes as u64)
@@ -2078,6 +2156,41 @@ mod tests {
     use mb_core::{Seed, V1_SECTOR_SIZE, sector_root};
     use tempfile::TempDir;
 
+    #[test]
+    fn coding_capacity_accounts_for_durable_reservations() {
+        let temp = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([201; 32])));
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(temp.path(), keys, &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[temp.path().to_path_buf()],
+                3 * V1_SECTOR_SIZE as u64,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            volumes
+                .coding_capacity(&control, V1_SECTOR_SIZE as u32)
+                .unwrap(),
+            3
+        );
+        volumes
+            .reserve_attempt(&control, &[202; 16], [203; 32], 3, V1_SECTOR_SIZE as u32)
+            .unwrap();
+        assert_eq!(
+            volumes
+                .coding_capacity(&control, V1_SECTOR_SIZE as u32)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            reader_coding_capacity(&control, &volumes.reader_configs(), V1_SECTOR_SIZE as u32,)
+                .unwrap(),
+            2
+        );
+    }
     fn parity_object(marker: u8, shard_index: u8) -> ParityObject {
         let bytes = vec![marker; V1_SECTOR_SIZE];
         ParityObject {

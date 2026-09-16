@@ -176,6 +176,7 @@ peer-request =
   / { "SignCheckpoint": { guild_id: bytes32-array, checkpoint_hash: bytes32-array } }
   / { "FinalizeCheckpoint": { guild_id: bytes32-array, checkpoint_hash: bytes32-array } }
   / { "GetCheckpointPage": { guild_id: bytes32-array, checkpoint_hash: bytes32-array, page_index: uint } }
+  / { "CodingCapacity": { guild_id: bytes32-array, shard_size: uint } }
 
 peer-response =
     { "Profile": peer-profile }
@@ -199,6 +200,7 @@ peer-response =
   / { "GuildEventTail": guild-event-tail }
   / { "EndpointRecords": [* signed-endpoint-record] }
   / { "CheckpointPage": { total_pages: uint, page_hash: bytes32-array, bytes: byte-vector } }
+  / { "CodingCapacity": { available_shards: uint } }
   / "Ack"
 
 peer-profile = { member: member, endpoint: tstr }

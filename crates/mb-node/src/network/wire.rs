@@ -264,6 +264,10 @@ pub(super) enum PeerRequest {
         guild_id: [u8; 32],
         sector_id: SectorId,
     },
+    CodingCapacity {
+        guild_id: [u8; 32],
+        shard_size: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -299,6 +303,7 @@ impl PeerRequest {
                 | Self::GetGuildEventTail { .. }
                 | Self::GetCodingTranscript { .. }
                 | Self::ExchangeEndpoints { .. }
+                | Self::CodingCapacity { .. }
         )
     }
 
@@ -317,7 +322,8 @@ impl PeerRequest {
             | Self::GetGuildGenesis { .. }
             | Self::GetGuildEventTail { .. }
             | Self::GetCodingTranscript { .. }
-            | Self::ExchangeEndpoints { .. } => None,
+            | Self::ExchangeEndpoints { .. }
+            | Self::CodingCapacity { .. } => None,
             #[cfg(test)]
             Self::BeginCommit { .. } => Some("begin-commit"),
             Self::JoinGuild { .. } => Some("join-guild"),
@@ -388,7 +394,9 @@ impl PeerRequest {
             | Self::GetCheckpointPage { guild_id, .. }
             | Self::BackupStatus { guild_id, .. } => Some(*guild_id),
             Self::AbortCodingAttempt { plan } => Some(plan.value.geometry.guild_id),
-            Self::ExchangeEndpoints { guild_id } => Some(*guild_id),
+            Self::ExchangeEndpoints { guild_id } | Self::CodingCapacity { guild_id, .. } => {
+                Some(*guild_id)
+            }
             #[cfg(test)]
             Self::PrepareSource { guild_id, .. }
             | Self::CompleteCommit { guild_id, .. }
@@ -493,6 +501,9 @@ pub(super) enum PeerResponse {
     RecoveryAdmission(SignedRecord<RecoveryPublisherAdmission>),
     Ack,
     MerkleCommitment(MerkleCommitment),
+    CodingCapacity {
+        available_shards: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

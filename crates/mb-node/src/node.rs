@@ -537,6 +537,14 @@ impl NodeReader {
         authorize_historical_member(&self.control, guild_id, caller)
     }
 
+    pub(crate) fn coding_capacity(&self, shard_size: u32) -> Result<u64> {
+        let readers = self
+            .volume_readers
+            .read()
+            .map_err(|_| anyhow::anyhow!("volume reader configuration lock was poisoned"))?;
+        crate::volume::reader_coding_capacity(&self.control, &readers, shard_size)
+    }
+
     pub(crate) fn backup_job(&self, guild_id: [u8; 32], revision_id: Uuid) -> Result<BackupJob> {
         backup_job(&self.control, guild_id, revision_id)
     }
@@ -1405,6 +1413,10 @@ impl Node {
 
     pub fn storage_status(&self) -> Result<Vec<crate::StorageVolumeStatus>> {
         self.volumes.statuses()
+    }
+
+    pub(crate) fn coding_capacity(&self, shard_size: u32) -> Result<u64> {
+        self.volumes.coding_capacity(&self.control, shard_size)
     }
 
     pub fn database_shell_statement(

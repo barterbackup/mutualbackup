@@ -872,6 +872,12 @@ fn execute_read_request(
             member: node.advertised_member(&config.failure_domain)?,
             endpoint: config.public_endpoint.clone(),
         })),
+        PeerRequest::CodingCapacity {
+            guild_id: _,
+            shard_size,
+        } => Ok(PeerResponse::CodingCapacity {
+            available_shards: node.coding_capacity(shard_size)?,
+        }),
         PeerRequest::GetSector {
             guild_id,
             sector_id,
@@ -989,6 +995,12 @@ fn execute_peer_request(
             member: node.advertised_member(&config.failure_domain)?,
             endpoint: config.public_endpoint.clone(),
         })),
+        PeerRequest::CodingCapacity {
+            guild_id: _,
+            shard_size,
+        } => Ok(PeerResponse::CodingCapacity {
+            available_shards: node.coding_capacity(shard_size)?,
+        }),
         PeerRequest::JoinGuild { invite, peer } => {
             node.accept_guild_join(caller, &invite, peer)?;
             Ok(PeerResponse::Ack)
