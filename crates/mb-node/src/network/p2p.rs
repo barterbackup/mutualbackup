@@ -8410,13 +8410,11 @@ async fn validate_recovery_head(
                     fetch_p2p_checkpoint(p2p, publisher, guild_id, checkpoint_hash).await?;
                 let (state, events) =
                     fetch_recovery_guild_history(p2p, publisher, &genesis).await?;
-                let transcripts =
-                    fetch_recovery_transcripts(p2p, publisher, guild_id, &state).await?;
-                Ok::<_, anyhow::Error>((genesis, checkpoint, state, events, transcripts))
+                Ok::<_, anyhow::Error>((publisher, genesis, checkpoint, state, events))
             });
         }
         while let Some(attempt) = state_attempts.next().await {
-            let Ok((genesis, checkpoint, state, events, transcripts)) = attempt else {
+            let Ok((publisher, genesis, checkpoint, state, events)) = attempt else {
                 continue;
             };
             let state_matches = (|| -> Result<bool> {
@@ -8485,6 +8483,24 @@ async fn validate_recovery_head(
             })
             .await?;
             if valid_candidates.len() >= required_confirmations {
+                let transcripts = match fetch_recovery_transcripts(
+                    p2p,
+                    publisher,
+                    guild_id,
+                    &state,
+                )
+                .await
+                {
+                    Ok(transcripts) => transcripts,
+                    Err(error) => {
+                        tracing::warn!(
+                            %publisher,
+                            %error,
+                            "certified recovery publisher failed to serve coding evidence"
+                        );
+                        continue;
+                    }
+                };
                 return Ok(ValidatedRecoveryHead {
                     guild_id,
                     checkpoint_hash,

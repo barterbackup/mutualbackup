@@ -791,7 +791,14 @@ dynamic guild and all 51 coding transcripts, then exhausted its recovery bound
 before staging the first assigned shard. Recovery-head validation had fetched
 all transcript evidence serially from every candidate. Those requests now run
 with bounded concurrency under the existing global outbound semaphore, and a
-focused regression proves both concurrency and its cap. A fresh provisioned
+focused regression proves both concurrency and its cap. The following run
+completed all four checkpoints and 51 transcripts but timed out before the
+fresh node adopted guild state: every candidate had started its own eight-way
+transcript fetch, so redundant work and stopped publishers could consume the
+complete global eight-request budget. Candidate genesis, checkpoint, and event
+history are now certified before transcript retrieval; only a publisher whose
+state has enough independent current locators fetches the evidence, with a
+later certified publisher used if that fetch fails. A fresh provisioned
 production gate must still close before Milestone 5 can pass.
 
 Milestone 4 implements quiet-period

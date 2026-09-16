@@ -693,7 +693,18 @@ node Clippy gate passed locally. No remote compilation server was used.
   reconstruction began. Fetch transcript evidence with bounded concurrency,
   leaving the existing outbound semaphore as the global network limit, and
   regress that the collector is concurrent without exceeding its bound.
-- [ ] **M5-14 / gate — Run the corrected production gate.**
+- [x] **M5-14 / P1 — Fetch coding evidence from one certified publisher at a time.**
+  The next run again completed all four checkpoints and 51 transcripts, but the
+  fresh node timed out before adopting guild state. Recovery-head validation
+  started an eight-request transcript fetch for every candidate concurrently,
+  exactly filling the test's global eight-request limit. Requests to the two
+  stopped publishers could therefore hold every permit for a full protocol
+  timeout while live publishers redundantly fetched the same 51 transcripts.
+  Validate candidate genesis, checkpoint, and event history first, then fetch
+  transcript evidence only from a publisher whose state has enough independent
+  current locators. If that publisher cannot serve the evidence, continue with
+  another certified candidate rather than starting duplicate bulk fetches.
+- [ ] **M5-15 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -708,11 +719,15 @@ node Clippy gate passed locally. No remote compilation server was used.
   consulted local dynamic state before the certified downloaded state had been
   adopted. The next run passed that transition and installed all recovered guild
   history and transcripts, then exposed M5-13 because serial transcript fetches
-  consumed the recovery deadline before any shard was staged.
+  consumed the recovery deadline before any shard was staged. The following run
+  completed the same production workload but exposed M5-14: parallelizing each
+  candidate's transcript list allowed redundant and offline candidate fetches
+  to consume the complete global outbound budget before any certified state was
+  adopted.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-13 close.
+  acceptance gate after M5-01 through M5-14 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
