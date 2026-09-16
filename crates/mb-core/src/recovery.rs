@@ -6,7 +6,7 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
-use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
+use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
 
 use crate::{KeyMaterial, NodeId, RecoveryPublicKey};
 
@@ -82,12 +82,19 @@ pub fn open_recovery_record(
     keys: &KeyMaterial,
     record: &SealedRecoveryRecord,
 ) -> Result<Vec<u8>, RecoveryCryptoError> {
+    open_recovery_record_with_secret(keys.recovery_secret(), keys.recovery_public_key(), record)
+}
+
+pub(crate) fn open_recovery_record_with_secret(
+    secret: &StaticSecret,
+    recipient_public: RecoveryPublicKey,
+    record: &SealedRecoveryRecord,
+) -> Result<Vec<u8>, RecoveryCryptoError> {
     if record.format_version != 1 {
         return Err(RecoveryCryptoError::Version);
     }
     let ephemeral_public = X25519PublicKey::from(record.ephemeral_public_key);
-    let recipient_public = keys.recovery_public_key();
-    let shared_secret = keys.recovery_secret().diffie_hellman(&ephemeral_public);
+    let shared_secret = secret.diffie_hellman(&ephemeral_public);
     if !shared_secret.was_contributory() {
         return Err(RecoveryCryptoError::Authentication);
     }

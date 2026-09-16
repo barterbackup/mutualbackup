@@ -2219,6 +2219,7 @@ impl DhtNoise {
                             publisher,
                             sequence: u64::MAX,
                             expires_at_unix_seconds: unix_seconds().saturating_sub(1),
+                            key_envelope: None,
                             sealed: SealedRecoveryRecord {
                                 format_version: 1,
                                 ephemeral_public_key: [1; 32],

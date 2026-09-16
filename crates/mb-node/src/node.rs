@@ -19,9 +19,9 @@ use mb_core::{
     StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision, V1_CATALOG_PAGE_BYTES,
     V1_MAX_CATALOG_PAGES, V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes, challenged_leaf,
     coding_challenge_commitment, coding_evidence_hash, decode_canonical, encode_coding_attempt,
-    merkle_commit, merkle_open_range, merkle_open_zero_range, open_recovery_record,
-    replay_coding_transcript, seal_recovery_record, sector_root, sign_guild_event,
-    synthetic_filler_sector,
+    merkle_commit, merkle_open_range, merkle_open_zero_range, open_recovery_key_envelope,
+    open_recovery_record, replay_coding_transcript, seal_recovery_record, sector_root,
+    sign_guild_event, synthetic_filler_sector,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
@@ -219,6 +219,7 @@ struct DhtPublicationState {
     checkpoint_hash: [u8; 32],
     endpoints: Vec<String>,
     expires_at_unix_seconds: u64,
+    recovery_epochs: Vec<(NodeId, u64)>,
 }
 
 const MAX_DHT_OBSERVED_SEQUENCES: usize = 64;
@@ -5938,6 +5939,29 @@ impl Node {
         endpoints: Vec<String>,
         expires_at_unix_seconds: u64,
     ) -> Result<mb_core::SealedRecoveryRecord> {
+        let signed = self.recovery_locator_for_endpoints(
+            subject,
+            guild_id,
+            checkpoint_hash,
+            checkpoint_generation,
+            endpoints,
+            expires_at_unix_seconds,
+        )?;
+        Ok(seal_recovery_record(
+            subject.recovery_public_key,
+            &canonical_bytes(&signed)?,
+        )?)
+    }
+
+    fn recovery_locator_for_endpoints(
+        &self,
+        subject: &Member,
+        guild_id: [u8; 32],
+        checkpoint_hash: [u8; 32],
+        checkpoint_generation: u64,
+        endpoints: Vec<String>,
+        expires_at_unix_seconds: u64,
+    ) -> Result<SignedRecord<RecoveryLocator>> {
         let locator = RecoveryLocator {
             format_version: 1,
             subject: subject.node_id,
@@ -5950,10 +5974,10 @@ impl Node {
             endpoints,
             expires_at_unix_seconds,
         };
-        let signed = SignedRecord::sign(RECOVERY_LOCATOR_DOMAIN, locator, &self.keys)?;
-        Ok(seal_recovery_record(
-            subject.recovery_public_key,
-            &canonical_bytes(&signed)?,
+        Ok(SignedRecord::sign(
+            RECOVERY_LOCATOR_DOMAIN,
+            locator,
+            &self.keys,
         )?)
     }
 
@@ -5973,7 +5997,8 @@ impl Node {
         checkpoint.verify()?;
         let checkpoint_hash = checkpoint.hash()?;
         let local_id = self.keys.node_id();
-        let publication_members = if checkpoint.checkpoint.format_version == 4 {
+        let (publication_members, recovery_envelopes) = if checkpoint.checkpoint.format_version == 4
+        {
             let state = self
                 .dynamic_guild_state()?
                 .context("version-four DHT publication requires dynamic guild state")?;
@@ -5981,10 +6006,24 @@ impl Node {
             if active != checkpoint.checkpoint.members {
                 return Ok(None);
             }
-            active
+            let mut envelopes = BTreeMap::new();
+            for member in &active {
+                if member.node_id == local_id {
+                    continue;
+                }
+                let Some(epoch) = state.current_recovery_key(member.node_id) else {
+                    return Ok(None);
+                };
+                envelopes.insert(member.node_id, epoch.envelope.clone());
+            }
+            (active, envelopes)
         } else {
-            checkpoint.checkpoint.members.clone()
+            (checkpoint.checkpoint.members.clone(), BTreeMap::new())
         };
+        let recovery_epochs = recovery_envelopes
+            .iter()
+            .map(|(subject, envelope)| (*subject, envelope.epoch))
+            .collect::<Vec<_>>();
         if !checkpoint.has_signature(local_id)
             || !publication_members
                 .iter()
@@ -5997,12 +6036,15 @@ impl Node {
             anyhow::bail!("DHT publication expiry must be in the future");
         }
         if let Some(bytes) = self.control.get_record("dht-publication", b"primary")? {
-            let state: DhtPublicationState = decode_canonical(&bytes)?;
-            if state.format_version == 1
-                && state.checkpoint_hash == checkpoint_hash
-                && state.endpoints == endpoints
-                && state.expires_at_unix_seconds.saturating_add(5 * 60) >= expires_at_unix_seconds
-            {
+            let state = decode_canonical::<DhtPublicationState>(&bytes);
+            if state.as_ref().is_ok_and(|state| {
+                state.format_version == 2
+                    && state.checkpoint_hash == checkpoint_hash
+                    && state.endpoints == endpoints
+                    && state.recovery_epochs == recovery_epochs
+                    && state.expires_at_unix_seconds.saturating_add(5 * 60)
+                        >= expires_at_unix_seconds
+            }) {
                 let endpoint = self
                     .control
                     .get_record("dht-endpoint", b"primary")?
@@ -6047,7 +6089,11 @@ impl Node {
                     .unwrap_or(1)
                     .max(1),
             )?;
-            let sealed = self.recovery_record_for_endpoints(
+            let key_envelope = recovery_envelopes.get(&subject.node_id).cloned();
+            let recipient = key_envelope
+                .as_ref()
+                .map_or(subject.recovery_public_key, |envelope| envelope.public_key);
+            let locator = self.recovery_locator_for_endpoints(
                 subject,
                 guild_id,
                 checkpoint_hash,
@@ -6055,14 +6101,16 @@ impl Node {
                 endpoints.clone(),
                 expires_at_unix_seconds,
             )?;
+            let sealed = seal_recovery_record(recipient, &canonical_bytes(&locator)?)?;
             let bundle = SignedRecord::sign(
                 b"mutualbackup/recovery-bundle/v1",
                 RecoveryBundle {
-                    format_version: 1,
+                    format_version: if key_envelope.is_some() { 2 } else { 1 },
                     subject: subject.node_id,
                     publisher: local_id,
                     sequence,
                     expires_at_unix_seconds,
+                    key_envelope,
                     sealed,
                 },
                 &self.keys,
@@ -6078,10 +6126,11 @@ impl Node {
             "dht-publication",
             b"primary",
             &canonical_bytes(&DhtPublicationState {
-                format_version: 1,
+                format_version: 2,
                 checkpoint_hash,
                 endpoints,
                 expires_at_unix_seconds,
+                recovery_epochs,
             })?,
         )?;
         self.control.put_record(
@@ -6423,7 +6472,7 @@ impl Node {
     ) -> Result<NodeId> {
         let bundle = &observation.selected;
         bundle.verify(b"mutualbackup/recovery-bundle/v1")?;
-        if bundle.value.format_version != 1
+        if bundle.value.format_version != 1 && bundle.value.format_version != 2
             || bundle.value.subject != self.keys.node_id()
             || bundle.value.publisher != bundle.signer
             || bundle.value.sequence == 0
@@ -6432,7 +6481,8 @@ impl Node {
         {
             anyhow::bail!("invalid certified recovery bundle");
         }
-        let plaintext = open_recovery_record(self.keys(), &bundle.value.sealed)?;
+        self.validate_recovery_bundle_key(checkpoint, &bundle.value)?;
+        let plaintext = self.open_recovery_bundle_record(&bundle.value)?;
         let locator: SignedRecord<RecoveryLocator> = decode_canonical(&plaintext)?;
         locator.verify(RECOVERY_LOCATOR_DOMAIN)?;
         if locator.signer != bundle.value.publisher
@@ -6455,7 +6505,10 @@ impl Node {
             observed.verify(b"mutualbackup/recovery-bundle/v1")?;
             if record.sequence != observed.value.sequence
                 || record.expires_at_unix_seconds != observed.value.expires_at_unix_seconds
-                || observed.value.format_version != 1
+                || !matches!(
+                    (&observed.value.format_version, &observed.value.key_envelope),
+                    (1, None) | (2, Some(_))
+                )
                 || observed.value.subject != bundle.value.subject
                 || observed.value.publisher != bundle.value.publisher
                 || observed.value.publisher != observed.signer
@@ -6466,6 +6519,42 @@ impl Node {
             }
         }
         Ok(bundle.value.publisher)
+    }
+
+    pub(crate) fn open_recovery_bundle_record(&self, bundle: &RecoveryBundle) -> Result<Vec<u8>> {
+        match (bundle.format_version, &bundle.key_envelope) {
+            (1, None) => Ok(open_recovery_record(self.keys(), &bundle.sealed)?),
+            (2, Some(envelope)) if envelope.subject == bundle.subject => {
+                let secret = open_recovery_key_envelope(self.keys(), envelope)?;
+                Ok(secret.open_record(&bundle.sealed)?)
+            }
+            _ => anyhow::bail!("recovery bundle has an invalid key envelope"),
+        }
+    }
+
+    pub(crate) fn validate_recovery_bundle_key(
+        &self,
+        checkpoint: &QuorumCheckpoint,
+        bundle: &RecoveryBundle,
+    ) -> Result<()> {
+        match checkpoint.checkpoint.format_version {
+            3 if bundle.format_version == 1 && bundle.key_envelope.is_none() => Ok(()),
+            4 => {
+                let state = self
+                    .dynamic_guild_state()?
+                    .context("version-four recovery requires dynamic guild state")?;
+                let current = state
+                    .current_recovery_key(bundle.subject)
+                    .context("recovery key epoch is unavailable or revoked")?;
+                if bundle.format_version != 2
+                    || bundle.key_envelope.as_ref() != Some(&current.envelope)
+                {
+                    anyhow::bail!("recovery bundle does not use the current key epoch");
+                }
+                Ok(())
+            }
+            _ => anyhow::bail!("recovery bundle format does not match its checkpoint"),
+        }
     }
 
     pub(crate) fn observed_recovery_records(
@@ -6511,10 +6600,12 @@ impl Node {
         {
             anyhow::bail!("recovery readiness checkpoint belongs to another guild");
         }
+        let (allowed_publishers, required_publishers) =
+            self.recovery_readiness_publishers(&checkpoint)?;
         let now = unix_seconds();
         let mut by_publisher = BTreeMap::new();
         for (publisher, expires_at) in confirmations {
-            if expires_at > now {
+            if expires_at > now && allowed_publishers.contains(&publisher) {
                 by_publisher
                     .entry(publisher)
                     .and_modify(|current: &mut u64| *current = (*current).max(expires_at))
@@ -6523,7 +6614,8 @@ impl Node {
         }
         let mut expiries = by_publisher.values().copied().collect::<Vec<_>>();
         expiries.sort_unstable_by(|left, right| right.cmp(left));
-        let confirmed_until_unix_seconds = expiries.get(2).copied().unwrap_or(0);
+        let confirmed_until_unix_seconds =
+            expiries.get(required_publishers - 1).copied().unwrap_or(0);
         self.control.put_record(
             "seed-recovery-ready",
             b"primary",
@@ -6542,18 +6634,56 @@ impl Node {
             return Ok(false);
         };
         let ready: SeedRecoveryReadiness = decode_canonical(&bytes)?;
-        if ready.format_version != 1
-            || ready.publishers.len() < 3
-            || ready.confirmed_until_unix_seconds <= unix_seconds()
-        {
+        if ready.format_version != 1 || ready.confirmed_until_unix_seconds <= unix_seconds() {
             return Ok(false);
         }
         let Some(installed) = self.installed_guild()? else {
             return Ok(false);
         };
-        Ok(self
-            .current_checkpoint(installed.certificate.genesis.guild_id)?
-            .is_some_and(|checkpoint| checkpoint.hash().ok() == Some(ready.checkpoint_hash)))
+        let Some(checkpoint) = self.current_checkpoint(installed.certificate.genesis.guild_id)?
+        else {
+            return Ok(false);
+        };
+        if checkpoint.hash()? != ready.checkpoint_hash {
+            return Ok(false);
+        }
+        let (allowed_publishers, required_publishers) =
+            self.recovery_readiness_publishers(&checkpoint)?;
+        Ok(ready
+            .publishers
+            .iter()
+            .filter(|publisher| allowed_publishers.contains(publisher))
+            .count()
+            >= required_publishers)
+    }
+
+    fn recovery_readiness_publishers(
+        &self,
+        checkpoint: &QuorumCheckpoint,
+    ) -> Result<(BTreeSet<NodeId>, usize)> {
+        let local_id = self.keys.node_id();
+        let members = if checkpoint.checkpoint.format_version == 4 {
+            let state = self
+                .dynamic_guild_state()?
+                .context("version-four recovery readiness requires dynamic guild state")?;
+            let active = state.active_members().cloned().collect::<Vec<_>>();
+            if active != checkpoint.checkpoint.members {
+                anyhow::bail!("recovery readiness checkpoint has a stale membership roster");
+            }
+            active
+        } else {
+            checkpoint.checkpoint.members.clone()
+        };
+        let publishers = members
+            .iter()
+            .map(|member| member.node_id)
+            .filter(|member| *member != local_id)
+            .collect::<BTreeSet<_>>();
+        if publishers.is_empty() {
+            anyhow::bail!("seed recovery requires another active guild member");
+        }
+        let required = publishers.len().min(3);
+        Ok((publishers, required))
     }
 
     pub fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>> {
@@ -10495,6 +10625,205 @@ mod tests {
     }
 
     #[test]
+    fn dht_recovery_publication_tracks_rotated_and_revoked_key_epochs() {
+        let temp = tempfile::tempdir().unwrap();
+        let (local_seed, certificate, peers) = recovery_guild_fixture();
+        let mut signer_keys = (0_u8..5)
+            .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([index + 120; 32])))
+            .collect::<Vec<_>>();
+        signer_keys.sort_by_key(KeyMaterial::node_id);
+        let mut node = Node::open(temp.path(), local_seed).unwrap();
+        node.adopt_recovered_guild(certificate.clone(), peers)
+            .unwrap();
+        let guild_id = certificate.genesis.guild_id;
+        let local_id = node.keys().node_id();
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[194; 32]);
+        let mut revision = UserRevision {
+            format_version: 2,
+            guild_id,
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id: Uuid::from_bytes([193; 16]),
+            owner: local_id,
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![SectorRef {
+                id: [192; 32],
+                root: [191; 32],
+                logical_len: 1,
+            }],
+            data_sectors: Vec::new(),
+        };
+        revision.sign_writer(&writer).unwrap();
+        let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, node.keys()).unwrap();
+        let mut checkpoint = QuorumCheckpoint {
+            checkpoint: GuildCheckpoint {
+                format_version: 4,
+                guild_id,
+                genesis_hash: certificate.hash().unwrap(),
+                generation: 1,
+                parent: None,
+                members: certificate.genesis.members.clone(),
+                writer_fences: vec![mb_core::WriterFence {
+                    owner: local_id,
+                    epoch: 1,
+                    public_key: writer.verifying_key().to_bytes(),
+                }],
+                revision_tombstones: Vec::new(),
+                revisions: vec![revision],
+                coding_groups: Vec::new(),
+            },
+            signatures: Vec::new(),
+        };
+        for keys in &signer_keys {
+            checkpoint.add_signature(keys).unwrap();
+        }
+        let checkpoint_hash = checkpoint.hash().unwrap();
+        node.control
+            .commit_checkpoint(
+                &guild_id,
+                1,
+                None,
+                &checkpoint_hash,
+                &canonical_bytes(&checkpoint.checkpoint).unwrap(),
+                &canonical_bytes(&checkpoint).unwrap(),
+                false,
+            )
+            .unwrap();
+
+        let mut current_envelopes = BTreeMap::new();
+        for keys in &signer_keys {
+            let state = node.dynamic_guild_state().unwrap().unwrap();
+            let (envelope, _) = mb_core::create_recovery_key_envelope(keys, guild_id, 1).unwrap();
+            let event = GuildEvent {
+                format_version: 1,
+                guild_id,
+                sequence: state.event_sequence + 1,
+                parent: state.event_head,
+                kind: mb_core::GuildEventKind::RotateRecoveryKey {
+                    envelope: envelope.clone(),
+                },
+            };
+            let mut signatures = signer_keys
+                .iter()
+                .map(|signer| sign_guild_event(&event, signer).unwrap())
+                .collect::<Vec<_>>();
+            signatures.sort_by_key(|signature| signature.signer);
+            node.install_guild_event(QuorumGuildEvent { event, signatures })
+                .unwrap();
+            current_envelopes.insert(keys.node_id(), envelope);
+        }
+        let endpoint = format!(
+            "/ip4/127.0.0.1/udp/44000/quic-v1/p2p/{}",
+            local_id.libp2p_peer_id().unwrap()
+        );
+        let expires = unix_seconds() + 15 * 60;
+        let first = node
+            .build_dht_publications(
+                vec![endpoint.clone()],
+                expires,
+                DhtSequenceFloors::default(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.recovery.len(), 4);
+        for bundle in &first.recovery {
+            assert_eq!(bundle.value.format_version, 2);
+            let envelope = bundle.value.key_envelope.as_ref().unwrap();
+            assert_eq!(Some(envelope), current_envelopes.get(&bundle.value.subject));
+            let subject_keys = signer_keys
+                .iter()
+                .find(|keys| keys.node_id() == bundle.value.subject)
+                .unwrap();
+            let secret = open_recovery_key_envelope(subject_keys, envelope).unwrap();
+            let plaintext = secret.open_record(&bundle.value.sealed).unwrap();
+            let locator: SignedRecord<RecoveryLocator> = decode_canonical(&plaintext).unwrap();
+            locator.verify(RECOVERY_LOCATOR_DOMAIN).unwrap();
+            assert_eq!(locator.value.checkpoint_hash, checkpoint_hash);
+        }
+
+        let target = first.recovery[0].value.subject;
+        let target_keys = signer_keys
+            .iter()
+            .find(|keys| keys.node_id() == target)
+            .unwrap();
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let (rotated, _) = mb_core::create_recovery_key_envelope(target_keys, guild_id, 2).unwrap();
+        let rotate = GuildEvent {
+            format_version: 1,
+            guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RotateRecoveryKey {
+                envelope: rotated.clone(),
+            },
+        };
+        let mut signatures = signer_keys
+            .iter()
+            .map(|keys| sign_guild_event(&rotate, keys).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        node.install_guild_event(QuorumGuildEvent {
+            event: rotate,
+            signatures,
+        })
+        .unwrap();
+        let rotated_publications = node
+            .build_dht_publications(
+                vec![endpoint.clone()],
+                expires,
+                DhtSequenceFloors::default(),
+            )
+            .unwrap()
+            .unwrap();
+        let rotated_bundle = rotated_publications
+            .recovery
+            .iter()
+            .find(|bundle| bundle.value.subject == target)
+            .unwrap();
+        assert_eq!(rotated_bundle.value.key_envelope.as_ref(), Some(&rotated));
+        assert!(
+            rotated_bundle.value.sequence
+                > first
+                    .recovery
+                    .iter()
+                    .find(|bundle| bundle.value.subject == target)
+                    .unwrap()
+                    .value
+                    .sequence
+        );
+
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let revoke = GuildEvent {
+            format_version: 1,
+            guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RevokeRecoveryKey {
+                subject: target,
+                epoch: 2,
+            },
+        };
+        let mut signatures = signer_keys
+            .iter()
+            .map(|keys| sign_guild_event(&revoke, keys).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        node.install_guild_event(QuorumGuildEvent {
+            event: revoke,
+            signatures,
+        })
+        .unwrap();
+        assert!(
+            node.build_dht_publications(vec![endpoint], expires, DhtSequenceFloors::default(),)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn recovered_parity_respects_the_configured_budget() {
         let temp = tempfile::tempdir().unwrap();
         let mut node = Node::open(temp.path(), Seed::from_bytes([83; 32])).unwrap();
@@ -11329,6 +11658,7 @@ mod tests {
                 publisher,
                 sequence,
                 expires_at_unix_seconds,
+                key_envelope: None,
                 sealed: mb_core::SealedRecoveryRecord {
                     format_version: 1,
                     ephemeral_public_key: [0; 32],

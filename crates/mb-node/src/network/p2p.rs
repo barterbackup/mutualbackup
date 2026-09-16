@@ -39,8 +39,7 @@ use mb_core::{
     V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS,
     V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_SECTOR_SIZE,
     canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical, encode,
-    merkle_commit, merkle_zero_commitment, open_recovery_record, replay_coding_transcript,
-    sector_root,
+    merkle_commit, merkle_zero_commitment, replay_coding_transcript, sector_root,
 };
 use mb_store::{ParityObject, VariableParityObject};
 use uuid::Uuid;
@@ -6500,19 +6499,26 @@ async fn reconcile_recovery_key_epoch_once(node: Arc<Mutex<Node>>, p2p: &P2pClie
             .dynamic_guild_state()?
             .context("recovery-key registration requires dynamic guild state")?;
         let local_id = node.keys().node_id();
-        let next_subject = state.active_members().find(|member| {
-            !state
-                .recovery_keys
-                .iter()
-                .any(|entry| entry.envelope.subject == member.node_id)
-        });
+        let next_subject = state
+            .active_members()
+            .find(|member| state.current_recovery_key(member.node_id).is_none());
         let Some(subject) = next_subject else {
             return Ok(None);
         };
         if subject.node_id != local_id {
             return Ok(None);
         }
-        let (envelope, _) = mb_core::create_recovery_key_envelope(node.keys(), state.guild_id, 1)?;
+        let epoch = state
+            .recovery_keys
+            .iter()
+            .filter(|entry| entry.envelope.subject == local_id)
+            .map(|entry| entry.envelope.epoch)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("recovery-key epoch exhausted")?;
+        let (envelope, _) =
+            mb_core::create_recovery_key_envelope(node.keys(), state.guild_id, epoch)?;
         let event = GuildEvent {
             format_version: 1,
             guild_id: state.guild_id,
@@ -7124,7 +7130,7 @@ async fn validate_ready_bundle(
     let provider_peer_id = provider_peer_id.to_owned();
     node_blocking(node, move |node| {
         bundle.verify(b"mutualbackup/recovery-bundle/v1")?;
-        if bundle.value.format_version != 1
+        if !recovery_bundle_shape_is_valid(&bundle.value)
             || bundle.value.subject != node.keys().node_id()
             || bundle.value.publisher != bundle.signer
             || bundle.value.sequence == 0
@@ -7133,7 +7139,9 @@ async fn validate_ready_bundle(
         {
             bail!("invalid DHT recovery bundle");
         }
-        let plaintext = open_recovery_record(node.keys(), &bundle.value.sealed)?;
+        let checkpoint = node.checkpoint(&checkpoint_hash)?;
+        node.validate_recovery_bundle_key(&checkpoint, &bundle.value)?;
+        let plaintext = node.open_recovery_bundle_record(&bundle.value)?;
         let locator: SignedRecord<mb_core::RecoveryLocator> = decode_canonical(&plaintext)?;
         locator.verify(RECOVERY_LOCATOR_DOMAIN)?;
         if locator.signer != bundle.value.publisher
@@ -7145,7 +7153,6 @@ async fn validate_ready_bundle(
         {
             bail!("sealed recovery locator differs from its DHT bundle");
         }
-        let checkpoint = node.checkpoint(&checkpoint_hash)?;
         checkpoint.validate_recovery_authority(
             node.keys(),
             &locator.value,
@@ -7662,6 +7669,7 @@ async fn validate_recovery_head(
             }
             let checkpoint_for_validation = checkpoint.clone();
             let candidates_for_validation = candidates.clone();
+            let state_for_validation = state.clone();
             let active_publishers = state
                 .active_members()
                 .map(|member| member.node_id)
@@ -7672,6 +7680,11 @@ async fn validate_recovery_head(
                     .iter()
                     .filter(|candidate| {
                         active_publishers.contains(&candidate.publisher)
+                            && recovery_bundle_key_matches_state(
+                                checkpoint_for_validation.checkpoint.format_version,
+                                &state_for_validation,
+                                &candidate.observation.selected.value,
+                            )
                             && checkpoint_for_validation
                             .validate_recovery_authority(
                                 node.keys(),
@@ -7712,6 +7725,30 @@ fn required_recovery_publishers(active_members: usize) -> Result<usize> {
         bail!("cold recovery requires another active guild member");
     }
     Ok((active_members - 1).min(3))
+}
+
+fn recovery_bundle_shape_is_valid(bundle: &mb_core::RecoveryBundle) -> bool {
+    matches!(
+        (bundle.format_version, &bundle.key_envelope),
+        (1, None) | (2, Some(_))
+    )
+}
+
+fn recovery_bundle_key_matches_state(
+    checkpoint_format: u16,
+    state: &DynamicGuildState,
+    bundle: &mb_core::RecoveryBundle,
+) -> bool {
+    match checkpoint_format {
+        3 => bundle.format_version == 1 && bundle.key_envelope.is_none(),
+        4 => state
+            .current_recovery_key(bundle.subject)
+            .is_some_and(|current| {
+                bundle.format_version == 2
+                    && bundle.key_envelope.as_ref() == Some(&current.envelope)
+            }),
+        _ => false,
+    }
 }
 
 async fn fetch_recovery_guild_history(
@@ -7755,7 +7792,7 @@ fn decode_recovery_candidate(
 ) -> Result<RecoveryCandidate> {
     let bundle = &observation.selected;
     bundle.verify(b"mutualbackup/recovery-bundle/v1")?;
-    if bundle.value.format_version != 1
+    if !recovery_bundle_shape_is_valid(&bundle.value)
         || bundle.value.subject != node.keys().node_id()
         || bundle.value.publisher != bundle.signer
         || bundle.value.sequence == 0
@@ -7764,7 +7801,7 @@ fn decode_recovery_candidate(
     {
         bail!("invalid recovery bundle context");
     }
-    let plaintext = open_recovery_record(node.keys(), &bundle.value.sealed)?;
+    let plaintext = node.open_recovery_bundle_record(&bundle.value)?;
     let locator: SignedRecord<mb_core::RecoveryLocator> = decode_canonical(&plaintext)?;
     locator.verify(RECOVERY_LOCATOR_DOMAIN)?;
     if locator.signer != bundle.value.publisher
@@ -7808,7 +7845,7 @@ fn recovery_bundle_observations(
             continue;
         };
         if bundle.verify(b"mutualbackup/recovery-bundle/v1").is_err()
-            || bundle.value.format_version != 1
+            || !recovery_bundle_shape_is_valid(&bundle.value)
             || bundle.value.subject != subject
             || bundle.value.publisher != bundle.signer
             || bundle.value.sequence == 0
@@ -8009,7 +8046,7 @@ fn highest_recovery_sequence(
             continue;
         };
         if bundle.verify(b"mutualbackup/recovery-bundle/v1").is_ok()
-            && bundle.value.format_version == 1
+            && recovery_bundle_shape_is_valid(&bundle.value)
             && bundle.value.subject == subject
             && bundle.value.publisher == bundle.signer
             && bundle.value.sequence > 0
@@ -11139,6 +11176,7 @@ mod tests {
                     publisher,
                     sequence: 1,
                     expires_at_unix_seconds,
+                    key_envelope: None,
                     sealed: mb_core::SealedRecoveryRecord {
                         format_version: 1,
                         ephemeral_public_key: [index.wrapping_add(1); 32],
@@ -11185,6 +11223,7 @@ mod tests {
                 publisher,
                 sequence: LEGACY_MEMBER_POISON_SEQUENCE,
                 expires_at_unix_seconds,
+                key_envelope: None,
                 sealed: mb_core::SealedRecoveryRecord {
                     format_version: 1,
                     ephemeral_public_key: [0; 32],
@@ -13372,6 +13411,7 @@ mod tests {
                 publisher,
                 sequence,
                 expires_at_unix_seconds: expires,
+                key_envelope: None,
                 sealed: mb_core::SealedRecoveryRecord {
                     format_version: 1,
                     ephemeral_public_key: [marker; 32],

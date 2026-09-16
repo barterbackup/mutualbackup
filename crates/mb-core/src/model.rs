@@ -1,8 +1,11 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::de::{DeserializeOwned, SeqAccess, Visitor};
+use serde::ser::SerializeTuple;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::guild::RecoveryKeyEnvelope;
 use crate::keys::{KeyMaterial, NodeId, RecoveryPublicKey, signing_payload};
 use crate::recovery::{RecoveryLocator, SealedRecoveryRecord};
 use crate::{
@@ -85,14 +88,97 @@ pub struct EndpointRecord {
     pub endpoints: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryBundle {
     pub format_version: u16,
     pub subject: NodeId,
     pub publisher: NodeId,
     pub sequence: u64,
     pub expires_at_unix_seconds: u64,
+    pub key_envelope: Option<RecoveryKeyEnvelope>,
     pub sealed: SealedRecoveryRecord,
+}
+
+impl Serialize for RecoveryBundle {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let field_count = match (self.format_version, &self.key_envelope) {
+            (1, None) => 6,
+            (2, Some(_)) => 7,
+            _ => return Err(serde::ser::Error::custom("invalid recovery bundle version")),
+        };
+        let mut tuple = serializer.serialize_tuple(field_count)?;
+        tuple.serialize_element(&self.format_version)?;
+        tuple.serialize_element(&self.subject)?;
+        tuple.serialize_element(&self.publisher)?;
+        tuple.serialize_element(&self.sequence)?;
+        tuple.serialize_element(&self.expires_at_unix_seconds)?;
+        if let Some(envelope) = &self.key_envelope {
+            tuple.serialize_element(envelope)?;
+        }
+        tuple.serialize_element(&self.sealed)?;
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for RecoveryBundle {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RecoveryBundleVisitor;
+
+        impl<'de> Visitor<'de> for RecoveryBundleVisitor {
+            type Value = RecoveryBundle;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a versioned recovery bundle")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let format_version = next_recovery_bundle_field(&mut sequence, "format version")?;
+                let subject = next_recovery_bundle_field(&mut sequence, "subject")?;
+                let publisher = next_recovery_bundle_field(&mut sequence, "publisher")?;
+                let bundle_sequence = next_recovery_bundle_field(&mut sequence, "sequence")?;
+                let expires_at_unix_seconds = next_recovery_bundle_field(&mut sequence, "expiry")?;
+                let key_envelope = match format_version {
+                    1 => None,
+                    2 => Some(next_recovery_bundle_field(&mut sequence, "key envelope")?),
+                    _ => return Err(serde::de::Error::custom("invalid recovery bundle version")),
+                };
+                let sealed = next_recovery_bundle_field(&mut sequence, "sealed record")?;
+                Ok(RecoveryBundle {
+                    format_version,
+                    subject,
+                    publisher,
+                    sequence: bundle_sequence,
+                    expires_at_unix_seconds,
+                    key_envelope,
+                    sealed,
+                })
+            }
+        }
+
+        deserializer.deserialize_tuple(7, RecoveryBundleVisitor)
+    }
+}
+
+fn next_recovery_bundle_field<'de, A, T>(
+    sequence: &mut A,
+    name: &'static str,
+) -> Result<T, A::Error>
+where
+    A: SeqAccess<'de>,
+    T: Deserialize<'de>,
+{
+    sequence
+        .next_element()?
+        .ok_or_else(|| serde::de::Error::missing_field(name))
 }
 
 impl StorageAcknowledgement {
@@ -1111,6 +1197,78 @@ mod tests {
             signature: vec![0; 64],
         };
         assert!(weak.verify(b"test/member/v1").is_err());
+    }
+
+    #[test]
+    fn recovery_bundle_v1_keeps_its_legacy_canonical_layout() {
+        #[derive(Serialize)]
+        struct LegacyRecoveryBundle {
+            format_version: u16,
+            subject: NodeId,
+            publisher: NodeId,
+            sequence: u64,
+            expires_at_unix_seconds: u64,
+            sealed: SealedRecoveryRecord,
+        }
+
+        let legacy = LegacyRecoveryBundle {
+            format_version: 1,
+            subject: NodeId([12; 32]),
+            publisher: NodeId([13; 32]),
+            sequence: 14,
+            expires_at_unix_seconds: 15,
+            sealed: SealedRecoveryRecord {
+                format_version: 1,
+                ephemeral_public_key: [16; 32],
+                nonce: [17; 24],
+                ciphertext: vec![18; 32],
+            },
+        };
+        let legacy_bytes = canonical_bytes(&legacy).unwrap();
+        let decoded: RecoveryBundle = decode_canonical(&legacy_bytes).unwrap();
+        assert_eq!(decoded.format_version, 1);
+        assert!(decoded.key_envelope.is_none());
+        assert_eq!(canonical_bytes(&decoded).unwrap(), legacy_bytes);
+
+        let version_two = RecoveryBundle {
+            format_version: 2,
+            subject: NodeId([21; 32]),
+            publisher: NodeId([22; 32]),
+            sequence: 23,
+            expires_at_unix_seconds: 24,
+            key_envelope: Some(RecoveryKeyEnvelope {
+                format_version: 1,
+                guild_id: [25; 32],
+                subject: NodeId([21; 32]),
+                epoch: 2,
+                public_key: RecoveryPublicKey([26; 32]),
+                sealed_private_key: SealedRecoveryRecord {
+                    format_version: 1,
+                    ephemeral_public_key: [27; 32],
+                    nonce: [28; 24],
+                    ciphertext: vec![29; 48],
+                },
+            }),
+            sealed: SealedRecoveryRecord {
+                format_version: 1,
+                ephemeral_public_key: [30; 32],
+                nonce: [31; 24],
+                ciphertext: vec![32; 64],
+            },
+        };
+        assert_eq!(
+            decode_canonical::<RecoveryBundle>(&canonical_bytes(&version_two).unwrap()).unwrap(),
+            version_two
+        );
+        let signer = KeyMaterial::from_seed(&Seed::from_bytes([33; 32]));
+        for bundle in [decoded, version_two] {
+            let signed =
+                SignedRecord::sign(b"mutualbackup/recovery-bundle/v1", bundle, &signer).unwrap();
+            let reopened: SignedRecord<RecoveryBundle> =
+                decode_canonical(&canonical_bytes(&signed).unwrap()).unwrap();
+            reopened.verify(b"mutualbackup/recovery-bundle/v1").unwrap();
+            assert_eq!(reopened, signed);
+        }
     }
 
     #[test]

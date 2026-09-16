@@ -7,6 +7,7 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::keys::signing_payload;
+use crate::recovery::open_recovery_record_with_secret;
 use crate::{
     CodingAttemptPlan, CodingGroupV2, KeyMaterial, Member, MemberSignature, ModelError, NodeId,
     RecoveryCryptoError, RecoveryPublicKey, SealedRecoveryRecord, ShardRoleV2, canonical_bytes,
@@ -623,6 +624,14 @@ impl DynamicGuildState {
             .map(|entry| entry.public_key)
     }
 
+    pub fn current_recovery_key(&self, subject: NodeId) -> Option<&RecoveryKeyEpoch> {
+        self.recovery_keys
+            .iter()
+            .filter(|entry| entry.envelope.subject == subject)
+            .max_by_key(|entry| entry.envelope.epoch)
+            .filter(|entry| entry.revoked_at_event.is_none())
+    }
+
     pub fn writer_epoch_is_current(&self, owner: NodeId, epoch: u64) -> bool {
         self.writer_keys
             .iter()
@@ -684,6 +693,14 @@ impl RecoveryEpochSecret {
     pub fn public_key(&self) -> RecoveryPublicKey {
         let secret = StaticSecret::from(self.0);
         RecoveryPublicKey(X25519PublicKey::from(&secret).to_bytes())
+    }
+
+    pub fn open_record(
+        &self,
+        record: &SealedRecoveryRecord,
+    ) -> Result<Vec<u8>, RecoveryCryptoError> {
+        let secret = StaticSecret::from(self.0);
+        open_recovery_record_with_secret(&secret, self.public_key(), record)
     }
 }
 
@@ -1102,6 +1119,18 @@ mod tests {
             &keys[..3],
         );
         state.apply_event(&rotate_one).unwrap();
+        assert_eq!(
+            state
+                .current_recovery_key(keys[0].node_id())
+                .unwrap()
+                .envelope,
+            envelope_one
+        );
+        let epoch_record = seal_recovery_record(envelope_one.public_key, b"epoch locator").unwrap();
+        assert_eq!(
+            secret_one.open_record(&epoch_record).unwrap(),
+            b"epoch locator"
+        );
         let revoke = certify(
             &state,
             GuildEventKind::RevokeRecoveryKey {
@@ -1111,6 +1140,23 @@ mod tests {
             &keys[..3],
         );
         state.apply_event(&revoke).unwrap();
+        assert!(state.current_recovery_key(keys[0].node_id()).is_none());
+        let (envelope_two, _) = create_recovery_key_envelope(&keys[0], state.guild_id, 2).unwrap();
+        let rotate_two = certify(
+            &state,
+            GuildEventKind::RotateRecoveryKey {
+                envelope: envelope_two.clone(),
+            },
+            &keys[..3],
+        );
+        state.apply_event(&rotate_two).unwrap();
+        assert_eq!(
+            state
+                .current_recovery_key(keys[0].node_id())
+                .unwrap()
+                .envelope,
+            envelope_two
+        );
         assert_eq!(
             open_recovery_key_envelope(&keys[0], &envelope_one)
                 .unwrap()
