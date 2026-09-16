@@ -2121,6 +2121,32 @@ impl ParityStore {
         Ok(removed)
     }
 
+    /// Remove every object and reservation owned by an attempt that never
+    /// committed its coding group. Callers must first prove that the group is
+    /// absent from retained guild history; READY objects are otherwise active
+    /// protection and must survive ordinary failed-attempt cleanup.
+    pub fn discard_uncommitted_attempt(
+        &mut self,
+        attempt_id: &[u8; 16],
+    ) -> Result<u64, DatabaseError> {
+        if *attempt_id == [0; 16] {
+            return Err(DatabaseError::Integrity);
+        }
+        let objects = self.connection.execute(
+            "DELETE FROM parity_objects WHERE attempt_id = ?1",
+            [attempt_id.as_slice()],
+        )? as u64;
+        let reservations = self.connection.execute(
+            "DELETE FROM coding_reservations WHERE attempt_id = ?1",
+            [attempt_id.as_slice()],
+        )? as u64;
+        let removed = objects.saturating_add(reservations);
+        if removed != 0 {
+            self.reclaim_deleted_pages()?;
+        }
+        Ok(removed)
+    }
+
     pub fn load_attempt_receipt(
         &self,
         attempt_id: &[u8; 16],
@@ -4600,6 +4626,8 @@ mod tests {
         );
         assert_eq!(store.discard_staged_attempt(&attempt_id).unwrap(), 0);
         assert_eq!(store.ready_object_count().unwrap(), 1);
+        assert_eq!(store.discard_uncommitted_attempt(&attempt_id).unwrap(), 1);
+        assert_eq!(store.ready_object_count().unwrap(), 0);
     }
 
     #[test]

@@ -5907,6 +5907,36 @@ pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -
             })
             .await?;
             if attempt_membership_epoch != current_membership_epoch {
+                let group_id = job.transcript.value.manifest.value.group.id;
+                let group_committed = node_blocking(node.clone(), move |node| {
+                    Ok(node
+                        .dynamic_guild_state()?
+                        .context("coding activation requires dynamic guild state")?
+                        .coding_groups
+                        .iter()
+                        .any(|retained| retained.group.id == group_id))
+                })
+                .await?;
+                if group_committed {
+                    match finish_coding_activation(node.clone(), &p2p, &job.transcript).await {
+                        Ok(()) => {
+                            node_blocking(node.clone(), move |node| {
+                                node.complete_coding_activation(attempt_id)
+                            })
+                            .await?;
+                        }
+                        Err(error) => {
+                            let message = format!("{error:#}");
+                            node_blocking(node.clone(), move |node| {
+                                node.defer_coding_activation(attempt_id, &message)
+                            })
+                            .await?;
+                            tracing::warn!(?attempt_id, %error, "committed coding activation deferred");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                    }
+                    continue;
+                }
                 let cleanup_job = DelegatedCodingJob {
                     format_version: 1,
                     plan: job.transcript.value.plan.clone(),

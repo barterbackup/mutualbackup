@@ -2307,7 +2307,9 @@ impl Node {
                 anyhow::bail!("guild event conflicts with installed history");
             }
             if let Some(transcript) = transcript {
+                let attempt_id = transcript.value.plan.value.attempt_id;
                 self.persist_coding_group_transcript(&transcript)?;
+                self.volumes.finalize_attempt(&self.control, &attempt_id)?;
             }
             return Ok(());
         }
@@ -2325,6 +2327,9 @@ impl Node {
                 canonical_bytes(&state)?,
             ),
         ];
+        let attempt_id = transcript
+            .as_ref()
+            .map(|transcript| transcript.value.plan.value.attempt_id);
         if let Some(transcript) = transcript {
             self.validate_coding_transcript_storage_conflicts(&transcript)?;
             let bytes = canonical_bytes(&transcript)?;
@@ -2340,6 +2345,9 @@ impl Node {
             ));
         }
         self.control.put_records(&records)?;
+        if let Some(attempt_id) = attempt_id {
+            self.volumes.finalize_attempt(&self.control, &attempt_id)?;
+        }
         Ok(())
     }
 
@@ -4224,6 +4232,12 @@ impl Node {
         let plan = &transcript.value.plan.value;
         let group = &transcript.value.manifest.value.group;
         self.validate_coding_attempt_authority(&transcript.value.plan)?;
+        let group_committed = self.dynamic_guild_state()?.is_some_and(|state| {
+            state
+                .coding_groups
+                .iter()
+                .any(|retained| retained.group == *group)
+        });
         let transcript_hash = *blake3::hash(&canonical_bytes(transcript)?).as_bytes();
         let mut activated = false;
         for (index, role) in group.roles.iter().enumerate() {
@@ -4233,6 +4247,21 @@ impl Node {
                 {
                     activated = true;
                     if information.sector.virtual_zero {
+                        continue;
+                    }
+                    if group_committed
+                        && self
+                            .volumes
+                            .load_ready_variable(
+                                &self.control,
+                                &information.sector.id,
+                                index as u16,
+                            )
+                            .is_ok_and(|object| {
+                                object.guild_id == group.guild_id
+                                    && object.commitment == information.sector.commitment
+                            })
+                    {
                         continue;
                     }
                     if self
@@ -4254,6 +4283,18 @@ impl Node {
                     )?;
                 }
                 ShardRoleV2::Parity(parity) if parity.holder == self.keys.node_id() => {
+                    if group_committed
+                        && self
+                            .volumes
+                            .load_ready_variable(&self.control, &group.id, index as u16)
+                            .is_ok_and(|object| {
+                                object.guild_id == group.guild_id
+                                    && object.commitment == parity.commitment
+                            })
+                    {
+                        activated = true;
+                        continue;
+                    }
                     self.volumes.activate_attempt_object(
                         &self.control,
                         &plan.attempt_id,
@@ -4275,6 +4316,19 @@ impl Node {
     }
 
     pub fn discard_coding_attempt(&mut self, attempt_id: &[u8; 16]) -> Result<bool> {
+        if let Some(bytes) = self.control.get_record("coding-transcript", attempt_id)? {
+            let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(&bytes)?;
+            let group_id = transcript.value.manifest.value.group.id;
+            if self.dynamic_guild_state()?.is_some_and(|state| {
+                state
+                    .coding_groups
+                    .iter()
+                    .any(|retained| retained.group.id == group_id)
+            }) {
+                self.volumes.finalize_attempt(&self.control, attempt_id)?;
+                return Ok(true);
+            }
+        }
         self.volumes.discard_attempt(&self.control, attempt_id)
     }
 
@@ -10429,6 +10483,44 @@ mod tests {
                 .unwrap(),
             transcript
         );
+        assert!(
+            node.discard_coding_attempt(&transcript.value.plan.value.attempt_id)
+                .unwrap()
+        );
+        assert!(
+            node.variable_parity_for_guild(
+                &[181; 32],
+                &transcript.value.manifest.value.group.id,
+                4,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            node.reserve_coding_parity(&transcript.value.plan, 4)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            node.write_coding_parity_range(
+                &transcript.value.plan,
+                &transcript.value.manifest,
+                4,
+                0,
+                &local_object.bytes,
+            )
+            .unwrap(),
+            64
+        );
+        assert_eq!(
+            node.finish_coding_parity_upload(
+                &transcript.value.plan,
+                &transcript.value.manifest,
+                4,
+            )
+            .unwrap(),
+            transcript.value.staged_receipts[1]
+        );
+        node.activate_coding_attempt(&transcript).unwrap();
 
         let state = node.dynamic_guild_state().unwrap().unwrap();
         let event = GuildEvent {
@@ -10458,6 +10550,10 @@ mod tests {
             .unwrap();
         information_node
             .install_coding_group_event(certified, transcript.clone())
+            .unwrap();
+        node.activate_coding_attempt(&transcript).unwrap();
+        information_node
+            .activate_coding_attempt(&transcript)
             .unwrap();
         assert_eq!(
             node.dynamic_guild_state().unwrap().unwrap().coding_groups[0].group,

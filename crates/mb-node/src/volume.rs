@@ -1065,9 +1065,27 @@ impl StorageVolumes {
                 &canonical_bytes(&record.receipt)?,
             )?;
         }
-        control.delete_record("volume-attempt-receipt", &record_id)?;
-        control.delete_record("volume-attempt-intent", &record_id)?;
+        // Keep the attempt receipt until the coding-group event is durable.
+        // It is the rollback handle if authority changes after this object
+        // becomes READY but before the group enters retained guild history.
         Ok(record.receipt)
+    }
+
+    pub(crate) fn finalize_attempt(
+        &mut self,
+        control: &ControlStore,
+        attempt_id: &[u8; 16],
+    ) -> Result<()> {
+        for kind in ["volume-attempt-intent", "volume-attempt-receipt"] {
+            for (record_id, bytes) in control.records(kind)? {
+                let record: AttemptVolumeRecord = decode_canonical(&bytes)?;
+                validate_attempt_volume_record(&record)?;
+                if record.attempt_id == *attempt_id {
+                    control.delete_record(kind, &record_id)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn discard_attempt(
@@ -1076,36 +1094,24 @@ impl StorageVolumes {
         attempt_id: &[u8; 16],
     ) -> Result<bool> {
         let mut required_volumes = BTreeSet::new();
+        let mut attempt_records = Vec::new();
         for kind in ["volume-attempt-intent", "volume-attempt-receipt"] {
             for (record_id, bytes) in control.records(kind)? {
                 let record: AttemptVolumeRecord = decode_canonical(&bytes)?;
                 validate_attempt_volume_record(&record)?;
                 if record.attempt_id == *attempt_id {
                     required_volumes.insert(record.receipt.volume_id);
-                    if self
-                        .volumes
-                        .get(&record.receipt.volume_id)
-                        .and_then(|volume| volume.store.as_ref())
-                        .is_some()
-                    {
-                        control.delete_record(kind, &record_id)?;
-                    }
+                    attempt_records.push((kind, record_id, record));
                 }
             }
         }
+        let mut reservations = Vec::new();
         for (record_id, bytes) in control.records("volume-attempt-reservation")? {
             let record: AttemptReservationRecord = decode_canonical(&bytes)?;
             validate_attempt_reservation_record(&record)?;
             if record.attempt_id == *attempt_id {
                 required_volumes.insert(record.volume_id);
-                if self
-                    .volumes
-                    .get(&record.volume_id)
-                    .and_then(|volume| volume.store.as_ref())
-                    .is_some()
-                {
-                    control.delete_record("volume-attempt-reservation", &record_id)?;
-                }
+                reservations.push((record_id, record));
             }
         }
         let mut complete = true;
@@ -1116,7 +1122,37 @@ impl StorageVolumes {
                 }
                 continue;
             };
-            store.discard_staged_attempt(attempt_id)?;
+            store.discard_uncommitted_attempt(attempt_id)?;
+        }
+        for (kind, record_id, record) in attempt_records {
+            if self
+                .volumes
+                .get(&record.receipt.volume_id)
+                .and_then(|volume| volume.store.as_ref())
+                .is_none()
+            {
+                continue;
+            }
+            let receipt = record.receipt;
+            let active_id = volume_object_id(&receipt.group_id, receipt.shard_index);
+            if let Some(bytes) = control.get_record("volume-receipt", &active_id)? {
+                let active: VolumeReceipt = decode_canonical(&bytes)?;
+                if active != receipt {
+                    bail!("active volume receipt conflicts with aborted coding attempt");
+                }
+                control.delete_record("volume-receipt", &active_id)?;
+            }
+            control.delete_record(kind, &record_id)?;
+        }
+        for (record_id, record) in reservations {
+            if self
+                .volumes
+                .get(&record.volume_id)
+                .and_then(|volume| volume.store.as_ref())
+                .is_some()
+            {
+                control.delete_record("volume-attempt-reservation", &record_id)?;
+            }
         }
         Ok(complete)
     }
