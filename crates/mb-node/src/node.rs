@@ -3154,12 +3154,16 @@ impl Node {
     }
 
     pub(crate) fn claim_coding_launch(&self) -> Result<Option<CodingLaunchJob>> {
+        let records = self.control.records("coding-launch-job")?;
+        if records.is_empty() {
+            return Ok(None);
+        }
         let current_membership_epoch = self
             .dynamic_guild_state()?
             .context("coding launch requires dynamic guild state")?
             .membership_epoch;
         let mut stale = None;
-        for (_, bytes) in self.control.records("coding-launch-job")? {
+        for (_, bytes) in records {
             let job: CodingLaunchJob = decode_canonical(&bytes)?;
             if job.format_version != 1
                 || job.plan.value.delegator != self.keys.node_id()
@@ -3248,12 +3252,16 @@ impl Node {
     }
 
     pub(crate) fn claim_delegated_coding(&self) -> Result<Option<DelegatedCodingJob>> {
+        let records = self.control.records("delegated-coding-job")?;
+        if records.is_empty() {
+            return Ok(None);
+        }
         let current_membership_epoch = self
             .dynamic_guild_state()?
             .context("delegated coding requires dynamic guild state")?
             .membership_epoch;
         let mut stale = None;
-        for (_, bytes) in self.control.records("delegated-coding-job")? {
+        for (_, bytes) in records {
             let mut job: DelegatedCodingJob = decode_canonical(&bytes)?;
             if job.format_version != 1 || job.plan.value.coding_coordinator != self.keys.node_id() {
                 anyhow::bail!("durable delegated coding job is invalid");
@@ -4158,12 +4166,16 @@ impl Node {
     }
 
     pub(crate) fn claim_coding_activation(&self) -> Result<Option<CodingActivationJob>> {
+        let records = self.control.records("coding-activation-job")?;
+        if records.is_empty() {
+            return Ok(None);
+        }
         let current_membership_epoch = self
             .dynamic_guild_state()?
             .context("coding activation requires dynamic guild state")?
             .membership_epoch;
         let mut stale = None;
-        for (_, bytes) in self.control.records("coding-activation-job")? {
+        for (_, bytes) in records {
             let mut job: CodingActivationJob = decode_canonical(&bytes)?;
             if job.format_version != 1
                 || job.transcript.value.plan.value.delegator != self.keys.node_id()
@@ -9869,6 +9881,15 @@ mod tests {
                 .events,
             vec![add, rotate_writer]
         );
+    }
+
+    #[test]
+    fn empty_coding_queues_do_not_require_a_guild() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::open(temp.path(), Seed::from_bytes([210; 32])).unwrap();
+        assert!(node.claim_coding_launch().unwrap().is_none());
+        assert!(node.claim_delegated_coding().unwrap().is_none());
+        assert!(node.claim_coding_activation().unwrap().is_none());
     }
 
     #[test]
