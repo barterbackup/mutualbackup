@@ -6579,33 +6579,11 @@ async fn reconcile_variable_group_lifecycle_once(
         })
         .map(|reference| reference.id)
         .collect::<BTreeSet<_>>();
-    let candidate = state.coding_groups.iter().find(|retained| {
-        !retained.group.roles.iter().any(|role| {
-            matches!(role, ShardRoleV2::Information(information)
-                if !information.sector.virtual_zero
-                    && live_sectors.contains(&information.sector.id))
-        })
-    });
-    let Some(candidate) = candidate else {
-        return Ok(());
-    };
     let sequence = state
         .event_sequence
         .checked_add(1)
         .context("guild event sequence exhausted")?;
-    let kind = if candidate.retired_at_event.is_none() {
-        mb_core::GuildEventKind::RetireCodingGroup {
-            group_id: candidate.group.id,
-            retain_through_event: sequence,
-        }
-    } else if candidate
-        .retain_through_event
-        .is_some_and(|retain_through| sequence > retain_through)
-    {
-        mb_core::GuildEventKind::ForgetCodingGroup {
-            group_id: candidate.group.id,
-        }
-    } else {
+    let Some(kind) = variable_group_lifecycle_kind(&state, &live_sectors, sequence) else {
         return Ok(());
     };
     let event = GuildEvent {
@@ -6617,6 +6595,76 @@ async fn reconcile_variable_group_lifecycle_once(
     };
     state.validate_event_proposal(&event)?;
     commit_plain_guild_event(node, p2p, state, guild, local_id, event).await
+}
+
+fn variable_group_lifecycle_kind(
+    state: &DynamicGuildState,
+    live_sectors: &BTreeSet<[u8; 32]>,
+    sequence: u64,
+) -> Option<mb_core::GuildEventKind> {
+    let forget = state
+        .coding_groups
+        .iter()
+        .filter(|retained| {
+            retained
+                .retain_through_event
+                .is_some_and(|retain_through| sequence > retain_through)
+        })
+        .min_by_key(|retained| (retained.added_at_event, retained.group.id));
+    let mut live_by_group = BTreeMap::<[u8; 32], BTreeSet<[u8; 32]>>::new();
+    let mut coverage = BTreeMap::<[u8; 32], usize>::new();
+    for retained in state
+        .coding_groups
+        .iter()
+        .filter(|retained| retained.retired_at_event.is_none())
+    {
+        let covered = retained
+            .group
+            .roles
+            .iter()
+            .filter_map(|role| match role {
+                ShardRoleV2::Information(information)
+                    if !information.sector.virtual_zero
+                        && live_sectors.contains(&information.sector.id) =>
+                {
+                    Some(information.sector.id)
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for sector in &covered {
+            *coverage.entry(*sector).or_default() += 1;
+        }
+        live_by_group.insert(retained.group.id, covered);
+    }
+    let redundant = state
+        .coding_groups
+        .iter()
+        .filter(|retained| retained.retired_at_event.is_none())
+        .filter(|retained| {
+            let covered = &live_by_group[&retained.group.id];
+            covered.is_empty()
+                || covered
+                    .iter()
+                    .all(|sector| coverage.get(sector).copied().unwrap_or(0) > 1)
+        })
+        .min_by_key(|retained| {
+            (
+                live_by_group[&retained.group.id].len(),
+                retained.added_at_event,
+                retained.group.id,
+            )
+        });
+    if let Some(candidate) = forget {
+        Some(mb_core::GuildEventKind::ForgetCodingGroup {
+            group_id: candidate.group.id,
+        })
+    } else {
+        redundant.map(|candidate| mb_core::GuildEventKind::RetireCodingGroup {
+            group_id: candidate.group.id,
+            retain_through_event: sequence,
+        })
+    }
 }
 
 async fn commit_plain_guild_event(
@@ -9605,30 +9653,45 @@ struct VariableCodingLane {
     expected_group: CodingGroupV2,
 }
 
-fn variable_coding_lane(
-    guild_id: [u8; 32],
-    revision_id: Uuid,
-    ordinal: u64,
-    source: &SectorRef,
-    source_bytes: &[u8],
-    peers: &[crate::GuildPeer],
-) -> Result<VariableCodingLane> {
-    let participant_count = peers.len().min(mb_core::MAX_CODING_SHARDS as usize);
-    if participant_count < 3 || source_bytes.len() != V1_SECTOR_SIZE {
-        bail!(
-            "variable coding lane requires at least three placements and one complete source sector"
-        );
+struct VariableInformationInput<'a> {
+    owner: NodeId,
+    sector: &'a SectorRef,
+    bytes: &'a [u8],
+}
+
+fn variable_coding_profile(peers: &[crate::GuildPeer]) -> Result<CodingProfile> {
+    let participant_count = peers
+        .iter()
+        .map(|peer| peer.member.failure_domain.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+        .min(mb_core::MAX_CODING_SHARDS as usize);
+    if participant_count < 3 {
+        bail!("variable coding requires at least three distinct failure domains");
     }
     let parity_shards = if participant_count == 3 { 1 } else { 2 };
-    let data_shards = participant_count - parity_shards;
     let profile = CodingProfile::new(
-        u16::try_from(data_shards)?,
+        u16::try_from(participant_count - parity_shards)?,
         u16::try_from(parity_shards)?,
         V1_SECTOR_SIZE as u32,
     );
     profile.validate()?;
+    Ok(profile)
+}
+
+fn variable_coding_lane(
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    ordinal: u64,
+    sources: &[VariableInformationInput<'_>],
+    peers: &[crate::GuildPeer],
+) -> Result<VariableCodingLane> {
+    let profile = variable_coding_profile(peers)?;
+    let data_shards = usize::from(profile.data_shards);
+    if sources.is_empty() || sources.len() > data_shards {
+        bail!("variable coding lane has an invalid number of information sources");
+    }
     let zero_commitment = merkle_zero_commitment(profile.shard_size)?;
-    let source_commitment = merkle_commit(source_bytes)?;
     let virtual_sector = |lane: u8| {
         let mut hasher = blake3::Hasher::new_derive_key("mutualbackup virtual zero information v1");
         hasher.update(&guild_id);
@@ -9641,28 +9704,65 @@ fn variable_coding_lane(
         }
         id
     };
-    let mut information = vec![InformationRoleV2 {
-        owner: peers[0].member.node_id,
-        failure_domain: peers[0].member.failure_domain.clone(),
-        sector: RangeSectorRef {
-            id: source.id,
-            commitment: source_commitment,
-            logical_len: source.logical_len,
-            virtual_zero: false,
-        },
-    }];
-    information.extend((1..data_shards).map(|index| InformationRoleV2 {
-        owner: peers[index].member.node_id,
-        failure_domain: peers[index].member.failure_domain.clone(),
-        sector: RangeSectorRef {
-            id: virtual_sector((index - 1) as u8),
-            commitment: zero_commitment.clone(),
-            logical_len: profile.shard_size,
-            virtual_zero: true,
-        },
-    }));
-    let parity = peers[data_shards..participant_count]
+    let mut used_domains = BTreeSet::new();
+    let mut used_nodes = BTreeSet::new();
+    let mut information = Vec::with_capacity(data_shards);
+    let mut information_bytes = Vec::with_capacity(data_shards);
+    for source in sources {
+        let peer = peers
+            .iter()
+            .find(|peer| peer.member.node_id == source.owner)
+            .context("variable coding source owner is not an active member")?;
+        if source.bytes.len() != V1_SECTOR_SIZE
+            || sector_root(source.bytes) != source.sector.root
+            || !used_nodes.insert(source.owner)
+            || !used_domains.insert(peer.member.failure_domain.clone())
+        {
+            bail!("variable coding source is invalid or reuses a failure domain");
+        }
+        information.push(InformationRoleV2 {
+            owner: source.owner,
+            failure_domain: peer.member.failure_domain.clone(),
+            sector: RangeSectorRef {
+                id: source.sector.id,
+                commitment: merkle_commit(source.bytes)?,
+                logical_len: source.sector.logical_len,
+                virtual_zero: false,
+            },
+        });
+        information_bytes.push(source.bytes.to_vec());
+    }
+    let mut remaining = Vec::new();
+    for peer in peers {
+        if used_nodes.contains(&peer.member.node_id)
+            || !used_domains.insert(peer.member.failure_domain.clone())
+        {
+            continue;
+        }
+        used_nodes.insert(peer.member.node_id);
+        remaining.push(peer);
+    }
+    let virtual_count = data_shards - information.len();
+    if remaining.len() < virtual_count + usize::from(profile.parity_shards) {
+        bail!("variable coding roster has too few distinct placement domains");
+    }
+    for (lane, peer) in remaining.iter().take(virtual_count).enumerate() {
+        information.push(InformationRoleV2 {
+            owner: peer.member.node_id,
+            failure_domain: peer.member.failure_domain.clone(),
+            sector: RangeSectorRef {
+                id: virtual_sector(lane as u8),
+                commitment: zero_commitment.clone(),
+                logical_len: profile.shard_size,
+                virtual_zero: true,
+            },
+        });
+        information_bytes.push(vec![0; V1_SECTOR_SIZE]);
+    }
+    let parity = remaining
         .iter()
+        .skip(virtual_count)
+        .take(usize::from(profile.parity_shards))
         .enumerate()
         .map(|(row, peer)| ParityPlacementV2 {
             holder: peer.member.node_id,
@@ -9678,8 +9778,6 @@ fn variable_coding_lane(
         parity,
     };
     geometry.validate()?;
-    let mut information_bytes = vec![source_bytes.to_vec()];
-    information_bytes.resize(data_shards, vec![0; V1_SECTOR_SIZE]);
     let encoded = encode(profile, information_bytes)?;
     let mut roles = geometry
         .information
@@ -9708,6 +9806,120 @@ fn variable_coding_lane(
         geometry,
         expected_group,
     })
+}
+
+struct CrossUserCodingContext<'a> {
+    p2p: &'a P2pClient,
+    local_id: NodeId,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    current_owner: NodeId,
+    retained_revisions: &'a [SignedRecord<UserRevision>],
+    peers: &'a [crate::GuildPeer],
+}
+
+async fn build_cross_user_coding_lanes(
+    node: Arc<Mutex<Node>>,
+    current_sectors: Vec<(SectorRef, Vec<u8>)>,
+    context: CrossUserCodingContext<'_>,
+) -> Result<Vec<VariableCodingLane>> {
+    let data_shards = usize::from(variable_coding_profile(context.peers)?.data_shards);
+    let mut candidates = BTreeMap::<NodeId, Vec<SectorRef>>::new();
+    for revision in context.retained_revisions {
+        if revision.value.owner == context.current_owner
+            || !context
+                .peers
+                .iter()
+                .any(|peer| peer.member.node_id == revision.value.owner)
+        {
+            continue;
+        }
+        candidates.entry(revision.value.owner).or_default().extend(
+            revision
+                .value
+                .metadata_sectors
+                .iter()
+                .chain(&revision.value.data_sectors)
+                .cloned(),
+        );
+    }
+    for sectors in candidates.values_mut() {
+        sectors.sort_by_key(|sector| sector.id);
+        sectors.dedup_by_key(|sector| sector.id);
+    }
+    let candidates = candidates.into_iter().collect::<Vec<_>>();
+    let mut lanes = Vec::with_capacity(current_sectors.len());
+    for (ordinal, (current_sector, current_bytes)) in current_sectors.into_iter().enumerate() {
+        let mut source_data = vec![(context.current_owner, current_sector, current_bytes)];
+        let mut used_domains = context
+            .peers
+            .iter()
+            .find(|peer| peer.member.node_id == context.current_owner)
+            .map(|peer| BTreeSet::from([peer.member.failure_domain.clone()]))
+            .context("backup owner is absent from the active coding roster")?;
+        if !candidates.is_empty() {
+            let start = ordinal % candidates.len();
+            for offset in 0..candidates.len() {
+                if source_data.len() == data_shards {
+                    break;
+                }
+                let (owner, sectors) = &candidates[(start + offset) % candidates.len()];
+                let Some(peer) = context
+                    .peers
+                    .iter()
+                    .find(|peer| peer.member.node_id == *owner)
+                else {
+                    continue;
+                };
+                if used_domains.contains(&peer.member.failure_domain) || sectors.is_empty() {
+                    continue;
+                }
+                let sector = sectors[ordinal % sectors.len()].clone();
+                let bytes = match load_p2p_sector(
+                    node.clone(),
+                    context.p2p,
+                    context.local_id,
+                    *owner,
+                    context.guild_id,
+                    sector.id,
+                )
+                .await
+                {
+                    Ok(bytes)
+                        if bytes.len() == V1_SECTOR_SIZE && sector_root(&bytes) == sector.root =>
+                    {
+                        bytes
+                    }
+                    Ok(_) => {
+                        tracing::debug!(%owner, sector = %hex::encode(sector.id), "retained cross-user sector failed its signed root");
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::debug!(%owner, sector = %hex::encode(sector.id), %error, "retained cross-user sector is temporarily unavailable");
+                        continue;
+                    }
+                };
+                used_domains.insert(peer.member.failure_domain.clone());
+                source_data.push((*owner, sector, bytes));
+            }
+        }
+        let sources = source_data
+            .iter()
+            .map(|(owner, sector, bytes)| VariableInformationInput {
+                owner: *owner,
+                sector,
+                bytes,
+            })
+            .collect::<Vec<_>>();
+        lanes.push(variable_coding_lane(
+            context.guild_id,
+            context.revision_id,
+            ordinal as u64,
+            &sources,
+            context.peers,
+        )?);
+    }
+    Ok(lanes)
 }
 
 async fn queue_variable_coding_lanes(
@@ -9894,8 +10106,8 @@ async fn commit_backup_job(
         bail!("prepared revision exceeds the bounded coding catalog");
     }
 
-    let mut variable_lanes = Vec::with_capacity(target_sectors.len());
-    for (ordinal, target) in target_sectors.iter().enumerate() {
+    let mut current_sectors = Vec::with_capacity(target_sectors.len());
+    for target in &target_sectors {
         let owner_bytes = load_p2p_sector(
             node.clone(),
             p2p,
@@ -9908,14 +10120,7 @@ async fn commit_backup_job(
         if owner_bytes.len() != V1_SECTOR_SIZE || sector_root(&owner_bytes) != target.root {
             bail!("owner sector failed its committed root or fixed size");
         }
-        variable_lanes.push(variable_coding_lane(
-            guild_id,
-            revision.value.revision_id,
-            ordinal as u64,
-            target,
-            &owner_bytes,
-            &peers,
-        )?);
+        current_sectors.push((target.clone(), owner_bytes));
     }
 
     let (
@@ -9976,6 +10181,20 @@ async fn commit_backup_job(
     };
     checkpoint.validate()?;
     let checkpoint_hash = checkpoint.hash()?;
+    let variable_lanes = build_cross_user_coding_lanes(
+        node.clone(),
+        current_sectors,
+        CrossUserCodingContext {
+            p2p,
+            local_id,
+            guild_id,
+            revision_id: job.descriptor.revision_id,
+            current_owner: job.descriptor.owner,
+            retained_revisions: &checkpoint.revisions,
+            peers: &peers,
+        },
+    )
+    .await?;
     let expected_variable_groups = queue_variable_coding_lanes(
         node.clone(),
         checkpoint_hash,
@@ -10413,7 +10632,7 @@ mod tests {
     }
 
     #[test]
-    fn production_variable_lane_eliminates_filler_transfers() {
+    fn production_variable_lane_synthesizes_unused_information_shards() {
         let peers = (0_u8..5)
             .map(|index| {
                 let keys = KeyMaterial::from_seed(&Seed::from_bytes([index + 30; 32]));
@@ -10437,8 +10656,11 @@ mod tests {
             [32; 32],
             Uuid::from_bytes([33; 16]),
             7,
-            &source,
-            &bytes,
+            &[VariableInformationInput {
+                owner: peers[0].member.node_id,
+                sector: &source,
+                bytes: &bytes,
+            }],
             &peers,
         )
         .unwrap();
@@ -10470,6 +10692,185 @@ mod tests {
     }
 
     #[test]
+    fn production_variable_lane_packs_cross_user_information_once() {
+        let peers = (0_u8..5)
+            .map(|index| {
+                let keys = KeyMaterial::from_seed(&Seed::from_bytes([index + 35; 32]));
+                crate::GuildPeer {
+                    member: Member {
+                        node_id: keys.node_id(),
+                        recovery_public_key: keys.recovery_public_key(),
+                        failure_domain: format!("cross-user-domain-{index}"),
+                    },
+                    endpoints: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let bytes = [
+            vec![61; V1_SECTOR_SIZE],
+            vec![62; V1_SECTOR_SIZE],
+            vec![63; V1_SECTOR_SIZE],
+        ];
+        let sectors = bytes
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| SectorRef {
+                id: [index as u8 + 60; 32],
+                root: sector_root(bytes),
+                logical_len: (index + 1) as u32,
+            })
+            .collect::<Vec<_>>();
+        let sources = (0..3)
+            .map(|index| VariableInformationInput {
+                owner: peers[index].member.node_id,
+                sector: &sectors[index],
+                bytes: &bytes[index],
+            })
+            .collect::<Vec<_>>();
+        let lane = variable_coding_lane([64; 32], Uuid::from_bytes([65; 16]), 0, &sources, &peers)
+            .unwrap();
+        assert!(
+            lane.geometry
+                .information
+                .iter()
+                .all(|role| !role.sector.virtual_zero)
+        );
+        let plan = CodingAttemptPlan {
+            format_version: 1,
+            attempt_id: [66; 16],
+            checkpoint_hash: [67; 32],
+            membership_epoch: 1,
+            geometry: lane.geometry,
+            delegator: peers[4].member.node_id,
+            coding_coordinator: peers[0].member.node_id,
+            verification_coordinator: peers[1].member.node_id,
+            expires_at_unix_seconds: 1,
+        };
+        let estimate = coding_transfer_estimate(&plan).unwrap();
+        assert_eq!(estimate.information_shard_transfers, 2);
+        assert_eq!(estimate.parity_shard_transfers, 2);
+        assert_eq!(
+            estimate.bulk_bytes,
+            4 * u64::try_from(V1_SECTOR_SIZE).unwrap()
+        );
+    }
+
+    #[test]
+    fn redundant_variable_groups_retire_only_after_replacement_coverage() {
+        let peers = (0_u8..5)
+            .map(|index| {
+                let keys = KeyMaterial::from_seed(&Seed::from_bytes([index + 70; 32]));
+                crate::GuildPeer {
+                    member: Member {
+                        node_id: keys.node_id(),
+                        recovery_public_key: keys.recovery_public_key(),
+                        failure_domain: format!("lifecycle-domain-{index}"),
+                    },
+                    endpoints: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let first_bytes = vec![71; V1_SECTOR_SIZE];
+        let second_bytes = vec![72; V1_SECTOR_SIZE];
+        let first = SectorRef {
+            id: [73; 32],
+            root: sector_root(&first_bytes),
+            logical_len: 11,
+        };
+        let second = SectorRef {
+            id: [74; 32],
+            root: sector_root(&second_bytes),
+            logical_len: 12,
+        };
+        let old = variable_coding_lane(
+            [75; 32],
+            Uuid::from_bytes([76; 16]),
+            0,
+            &[VariableInformationInput {
+                owner: peers[0].member.node_id,
+                sector: &first,
+                bytes: &first_bytes,
+            }],
+            &peers,
+        )
+        .unwrap()
+        .expected_group;
+        let replacement = variable_coding_lane(
+            [75; 32],
+            Uuid::from_bytes([77; 16]),
+            0,
+            &[
+                VariableInformationInput {
+                    owner: peers[0].member.node_id,
+                    sector: &first,
+                    bytes: &first_bytes,
+                },
+                VariableInformationInput {
+                    owner: peers[1].member.node_id,
+                    sector: &second,
+                    bytes: &second_bytes,
+                },
+            ],
+            &peers,
+        )
+        .unwrap()
+        .expected_group;
+        let old_id = old.id;
+        let replacement_id = replacement.id;
+        let mut state = DynamicGuildState::new(
+            [75; 32],
+            [78; 32],
+            QuorumPolicy {
+                format_version: 1,
+                rule: QuorumRule::Majority,
+            },
+            peers.iter().map(|peer| peer.member.clone()).collect(),
+        )
+        .unwrap();
+        state.event_sequence = 2;
+        state.coding_groups = vec![
+            mb_core::RetainedCodingGroup {
+                group: old,
+                added_at_event: 1,
+                retired_at_event: None,
+                retain_through_event: None,
+            },
+            mb_core::RetainedCodingGroup {
+                group: replacement,
+                added_at_event: 2,
+                retired_at_event: None,
+                retain_through_event: None,
+            },
+        ];
+        state
+            .coding_groups
+            .sort_by_key(|retained| retained.group.id);
+        let live = BTreeSet::from([first.id, second.id]);
+        assert!(matches!(
+            variable_group_lifecycle_kind(&state, &live, 3),
+            Some(mb_core::GuildEventKind::RetireCodingGroup { group_id, .. })
+                if group_id == old_id
+        ));
+        assert!(!matches!(
+            variable_group_lifecycle_kind(&state, &BTreeSet::from([second.id]), 3),
+            Some(mb_core::GuildEventKind::RetireCodingGroup { group_id, .. })
+                if group_id == replacement_id
+        ));
+        let old = state
+            .coding_groups
+            .iter_mut()
+            .find(|retained| retained.group.id == old_id)
+            .unwrap();
+        old.retired_at_event = Some(3);
+        old.retain_through_event = Some(3);
+        assert!(matches!(
+            variable_group_lifecycle_kind(&state, &live, 4),
+            Some(mb_core::GuildEventKind::ForgetCodingGroup { group_id })
+                if group_id == old_id
+        ));
+    }
+
+    #[test]
     fn production_variable_lane_tracks_dynamic_roster_geometry() {
         let peers = (0_u8..6)
             .map(|index| {
@@ -10495,8 +10896,11 @@ mod tests {
                 [42; 32],
                 Uuid::from_bytes([43; 16]),
                 members as u64,
-                &source,
-                &bytes,
+                &[VariableInformationInput {
+                    owner: peers[0].member.node_id,
+                    sector: &source,
+                    bytes: &bytes,
+                }],
                 &peers[..members],
             )
             .unwrap();
@@ -15166,17 +15570,28 @@ mod tests {
                 revision.value.metadata_sectors.len() + revision.value.data_sectors.len()
             })
             .sum::<usize>();
-        assert!(
-            nodes[0]
-                .lock()
-                .unwrap()
-                .dynamic_guild_state()
-                .unwrap()
-                .unwrap()
-                .coding_groups
+        let dynamic = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap();
+        assert!(dynamic.coding_groups.len() >= protected_sector_count);
+        assert!(dynamic.coding_groups.iter().any(|retained| {
+            retained
+                .group
+                .roles
+                .iter()
+                .filter_map(|role| match role {
+                    ShardRoleV2::Information(information) if !information.sector.virtual_zero => {
+                        Some(information.owner)
+                    }
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>()
                 .len()
-                >= protected_sector_count
-        );
+                > 1
+        }));
         let forgotten_sector = final_checkpoint
             .checkpoint
             .revisions
