@@ -768,8 +768,14 @@ Replaying each exact stored bundle through the production validator found that
 publication correctly emitted format-2 current-epoch bundles for checkpoint 7,
 while validation admitted that format only for checkpoint 4. Dynamic recovery
 key validation now covers every supported dynamic checkpoint format, 4 through
-7, with a focused range regression. A fresh provisioned production gate must
-still close before Milestone 5 can pass.
+7, with a focused range regression. The next production run completed all four
+checkpoints, final DHT readiness, packed-catalog checks, and local restores, but
+large recovery with three live holders timed out. Cold-recovery head
+certification had a separate copy of the recovery-key rule that still admitted
+format-2 current-epoch bundles only for checkpoint format 4. Certification now
+uses the same supported dynamic range, 4 through 7, with a focused regression.
+A fresh provisioned production gate must still close before Milestone 5 can
+pass.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer

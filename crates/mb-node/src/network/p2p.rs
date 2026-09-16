@@ -8527,7 +8527,7 @@ fn recovery_bundle_key_matches_state(
 ) -> bool {
     match checkpoint_format {
         3 => bundle.format_version == 1 && bundle.key_envelope.is_none(),
-        4 => state
+        4..=7 => state
             .current_recovery_key(bundle.subject)
             .is_some_and(|current| {
                 bundle.format_version == 2
@@ -11936,6 +11936,66 @@ mod tests {
         assert_eq!(required_recovery_publishers(4).unwrap(), 3);
         assert_eq!(required_recovery_publishers(5).unwrap(), 3);
         assert_eq!(required_recovery_publishers(256).unwrap(), 3);
+    }
+
+    #[test]
+    fn cold_recovery_accepts_current_key_epochs_for_every_dynamic_checkpoint() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([19; 32]));
+        let guild_id = [20; 32];
+        let (envelope, _) = mb_core::create_recovery_key_envelope(&keys, guild_id, 1).unwrap();
+        let mut state = DynamicGuildState::new(
+            guild_id,
+            [21; 32],
+            QuorumPolicy {
+                format_version: 1,
+                rule: QuorumRule::Unanimous,
+            },
+            vec![Member {
+                node_id: keys.node_id(),
+                recovery_public_key: keys.recovery_public_key(),
+                failure_domain: "cold-recovery-domain".to_owned(),
+            }],
+        )
+        .unwrap();
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id,
+            sequence: 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RotateRecoveryKey {
+                envelope: envelope.clone(),
+            },
+        };
+        state
+            .apply_event(&QuorumGuildEvent {
+                signatures: vec![mb_core::sign_guild_event(&event, &keys).unwrap()],
+                event,
+            })
+            .unwrap();
+        let bundle = mb_core::RecoveryBundle {
+            format_version: 2,
+            subject: keys.node_id(),
+            publisher: keys.node_id(),
+            sequence: 1,
+            expires_at_unix_seconds: unix_seconds() + 300,
+            key_envelope: Some(envelope),
+            sealed: mb_core::SealedRecoveryRecord {
+                format_version: 1,
+                ephemeral_public_key: [22; 32],
+                nonce: [23; 24],
+                ciphertext: vec![24],
+            },
+        };
+
+        for checkpoint_format in 4..=7 {
+            assert!(recovery_bundle_key_matches_state(
+                checkpoint_format,
+                &state,
+                &bundle
+            ));
+        }
+        assert!(!recovery_bundle_key_matches_state(3, &state, &bundle));
+        assert!(!recovery_bundle_key_matches_state(8, &state, &bundle));
     }
 
     #[test]
