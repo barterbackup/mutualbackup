@@ -8697,7 +8697,7 @@ async fn queue_variable_coding_lanes(
     membership_epoch: u64,
     peers: &[crate::GuildPeer],
     lanes: Vec<VariableCodingLane>,
-) -> Result<()> {
+) -> Result<Vec<[u8; 32]>> {
     let coding_coordinator = peers
         .first()
         .context("variable coding lane has no participant coordinator")?
@@ -8711,8 +8711,10 @@ async fn queue_variable_coding_lanes(
     let expires_at_unix_seconds = unix_seconds()
         .checked_add(24 * 60 * 60)
         .context("coding launch expiry overflow")?;
+    let mut expected_groups = Vec::with_capacity(lanes.len());
     for lane in lanes {
         let expected_group_id = lane.expected_group.id;
+        expected_groups.push(expected_group_id);
         let already_committed = node_blocking(node.clone(), move |node| {
             Ok(node.dynamic_guild_state()?.is_some_and(|state| {
                 state
@@ -8751,7 +8753,39 @@ async fn queue_variable_coding_lanes(
         })
         .await?;
     }
-    Ok(())
+    Ok(expected_groups)
+}
+
+async fn wait_for_variable_coding_groups(
+    node: Arc<Mutex<Node>>,
+    expected_groups: Vec<[u8; 32]>,
+) -> Result<()> {
+    let expected = expected_groups.into_iter().collect::<BTreeSet<_>>();
+    loop {
+        let missing = node_blocking(node.clone(), {
+            let expected = expected.clone();
+            move |node| {
+                let state = node
+                    .dynamic_guild_state()?
+                    .context("backup coordinator has no dynamic guild state")?;
+                let committed = state
+                    .coding_groups
+                    .iter()
+                    .map(|retained| retained.group.id)
+                    .collect::<BTreeSet<_>>();
+                Ok(expected.difference(&committed).copied().collect::<Vec<_>>())
+            }
+        })
+        .await?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+        tracing::debug!(
+            missing_groups = missing.len(),
+            "backup is waiting for verified variable coding groups"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 async fn commit_backup_job(
@@ -8989,7 +9023,7 @@ async fn commit_backup_job(
     };
     checkpoint.validate()?;
     let checkpoint_hash = checkpoint.hash()?;
-    queue_variable_coding_lanes(
+    let expected_variable_groups = queue_variable_coding_lanes(
         node.clone(),
         checkpoint_hash,
         membership_epoch,
@@ -8997,6 +9031,7 @@ async fn commit_backup_job(
         variable_lanes,
     )
     .await?;
+    wait_for_variable_coding_groups(node.clone(), expected_variable_groups).await?;
     let body = canonical_bytes(&checkpoint)?;
     publish_p2p_checkpoint_object(
         node.clone(),
@@ -13905,6 +13940,12 @@ mod tests {
             .map(|(client, address)| peer_endpoint(client, address))
             .collect::<Vec<_>>();
         let genesis = form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+        let coding_tasks = nodes
+            .iter()
+            .cloned()
+            .zip(clients.iter().cloned())
+            .map(|(node, client)| tokio::spawn(run_delegated_coding_jobs(node, client)))
+            .collect::<Vec<_>>();
         let owner_content = |owner_index: usize| {
             let len = if owner_index == 1 {
                 V1_SECTOR_SIZE * 10 + 123
@@ -14171,6 +14212,9 @@ mod tests {
         );
         drop(reopened_recovery);
 
+        for task in coding_tasks {
+            task.abort();
+        }
         for client in &clients {
             let _ = client.shutdown().await;
         }
