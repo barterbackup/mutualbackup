@@ -5085,47 +5085,12 @@ impl Node {
                 if legacy_coverage.contains(&reference.id) {
                     continue;
                 }
-                let retained = state.coding_groups.iter().filter_map(|retained| {
-                    retained
-                        .group
-                        .roles
-                        .iter()
-                        .position(|role| {
-                            matches!(role, ShardRoleV2::Information(information)
-                                    if !information.sector.virtual_zero
-                                        && information.owner == revision.value.owner
-                                        && information.sector.id == reference.id
-                                        && information.sector.logical_len == reference.logical_len)
-                        })
-                        .map(|index| (retained, index))
-                });
-                let mut covered = false;
-                for (retained, information_index) in retained {
-                    let Some(bytes) = self
-                        .control
-                        .get_record("coding-group-transcript", &retained.group.id)?
-                    else {
-                        continue;
-                    };
-                    let transcript: SignedRecord<CodingVerificationTranscript> =
-                        decode_canonical(&bytes)?;
-                    if transcript.value.manifest.value.group == retained.group
-                        && replay_coding_transcript(&transcript)? == CodingReplayFinding::Verified
-                        && (recovered_head
-                            || retained_revision
-                            || transcript.value.plan.value.checkpoint_hash == checkpoint_hash
-                                && transcript
-                                    .value
-                                    .plan
-                                    .value
-                                    .information_root(information_index)
-                                    == Some(reference.root))
-                    {
-                        covered = true;
-                        break;
-                    }
-                }
-                if !covered {
+                if !self.verified_variable_sector_coverage(
+                    &state,
+                    revision.value.owner,
+                    reference,
+                    recovered_head || retained_revision,
+                )? {
                     anyhow::bail!(
                         "checkpoint sector has no verified variable coding group bound to its revision"
                     );
@@ -5133,6 +5098,67 @@ impl Node {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn uncovered_variable_sectors(
+        &self,
+        owner: NodeId,
+        sectors: &[SectorRef],
+    ) -> Result<Vec<SectorRef>> {
+        let state = self
+            .dynamic_guild_state()?
+            .context("variable coverage requires dynamic guild state")?;
+        let mut uncovered = Vec::new();
+        for sector in sectors {
+            if !self.verified_variable_sector_coverage(&state, owner, sector, false)? {
+                uncovered.push(sector.clone());
+            }
+        }
+        Ok(uncovered)
+    }
+
+    fn verified_variable_sector_coverage(
+        &self,
+        state: &DynamicGuildState,
+        owner: NodeId,
+        reference: &SectorRef,
+        allow_legacy_root: bool,
+    ) -> Result<bool> {
+        for retained in state
+            .coding_groups
+            .iter()
+            .filter(|retained| retained.retired_at_event.is_none())
+        {
+            let Some(information_index) = retained.group.roles.iter().position(|role| {
+                matches!(role, ShardRoleV2::Information(information)
+                    if !information.sector.virtual_zero
+                        && information.owner == owner
+                        && information.sector.id == reference.id
+                        && information.sector.logical_len == reference.logical_len)
+            }) else {
+                continue;
+            };
+            let Some(bytes) = self
+                .control
+                .get_record("coding-group-transcript", &retained.group.id)?
+            else {
+                continue;
+            };
+            let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(&bytes)?;
+            if transcript.value.manifest.value.group == retained.group
+                && replay_coding_transcript(&transcript)? == CodingReplayFinding::Verified
+                && (transcript
+                    .value
+                    .plan
+                    .value
+                    .information_root(information_index)
+                    == Some(reference.root)
+                    || allow_legacy_root && transcript.value.plan.value.format_version == 1)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10150,7 +10176,7 @@ mod tests {
         };
         group.id = group.calculate_id().unwrap();
         let plan = CodingAttemptPlan {
-            format_version: 1,
+            format_version: 2,
             attempt_id: [182; 16],
             checkpoint_hash: [183; 32],
             membership_epoch: 1,
@@ -10181,7 +10207,7 @@ mod tests {
             coding_coordinator: members[1].node_id,
             verification_coordinator: members[4].node_id,
             expires_at_unix_seconds: unix_seconds() + 600,
-            information_roots: None,
+            information_roots: Some(shards[..3].iter().map(|bytes| sector_root(bytes)).collect()),
         };
         let plan_hash = plan.hash().unwrap();
         let plan = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, &keys[0]).unwrap();
@@ -10435,7 +10461,7 @@ mod tests {
             writer_signature: Vec::new(),
             sequence: 1,
             parent: None,
-            metadata_sectors: vec![target],
+            metadata_sectors: vec![target.clone()],
             data_sectors: Vec::new(),
         };
         revision.sign_writer(&writer).unwrap();
@@ -10489,6 +10515,20 @@ mod tests {
             signatures,
         })
         .unwrap();
+        assert!(
+            node.uncovered_variable_sectors(members[2].node_id, std::slice::from_ref(&target))
+                .unwrap()
+                .is_empty()
+        );
+        let mut changed = target;
+        changed.root[0] ^= 1;
+        assert_eq!(
+            node.uncovered_variable_sectors(members[2].node_id, &[changed.clone()])
+                .unwrap(),
+            vec![changed]
+        );
+        node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, false)
+            .unwrap();
         node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, true)
             .unwrap();
         let checkpoint_hash = checkpoint.hash().unwrap();

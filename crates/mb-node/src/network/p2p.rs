@@ -10533,47 +10533,54 @@ async fn commit_backup_job(
     };
     checkpoint.validate()?;
     let checkpoint_hash = checkpoint.hash()?;
-    let coding_peers = reachable_coding_peers(p2p, local_id, &peers).await;
-    if !coding_peers
-        .iter()
-        .any(|peer| peer.member.node_id == job.descriptor.owner)
-    {
-        bail!("backup owner is unavailable for new coding placement");
-    }
-    let mut parity_capacity = coding_capacity_by_peer(
-        node.clone(),
-        p2p,
-        local_id,
-        guild_id,
-        &coding_peers,
-        V1_SECTOR_SIZE as u32,
-    )
+    let current_owner = job.descriptor.owner;
+    let current_sectors = node_blocking(node.clone(), move |node| {
+        node.uncovered_variable_sectors(current_owner, &current_sectors)
+    })
     .await?;
-    let variable_lanes = build_cross_user_coding_lanes(
-        node.clone(),
-        current_sectors,
-        CrossUserCodingContext {
+    if !current_sectors.is_empty() {
+        let coding_peers = reachable_coding_peers(p2p, local_id, &peers).await;
+        if !coding_peers
+            .iter()
+            .any(|peer| peer.member.node_id == current_owner)
+        {
+            bail!("backup owner is unavailable for new coding placement");
+        }
+        let mut parity_capacity = coding_capacity_by_peer(
+            node.clone(),
             p2p,
             local_id,
             guild_id,
-            revision_id: job.descriptor.revision_id,
-            current_owner: job.descriptor.owner,
-            retained_revisions: &checkpoint.revisions,
-            peers: &coding_peers,
-            parity_capacity: &mut parity_capacity,
-        },
-    )
-    .await?;
-    queue_variable_coding_lanes(
-        node.clone(),
-        p2p,
-        local_id,
-        checkpoint_hash,
-        checkpoint_authority.membership_epoch,
-        &coding_peers,
-        variable_lanes,
-    )
-    .await?;
+            &coding_peers,
+            V1_SECTOR_SIZE as u32,
+        )
+        .await?;
+        let variable_lanes = build_cross_user_coding_lanes(
+            node.clone(),
+            current_sectors,
+            CrossUserCodingContext {
+                p2p,
+                local_id,
+                guild_id,
+                revision_id: job.descriptor.revision_id,
+                current_owner,
+                retained_revisions: &checkpoint.revisions,
+                peers: &coding_peers,
+                parity_capacity: &mut parity_capacity,
+            },
+        )
+        .await?;
+        queue_variable_coding_lanes(
+            node.clone(),
+            p2p,
+            local_id,
+            checkpoint_hash,
+            checkpoint_authority.membership_epoch,
+            &coding_peers,
+            variable_lanes,
+        )
+        .await?;
+    }
     wait_for_variable_coding_groups(node.clone(), checkpoint.clone()).await?;
     let body = canonical_bytes(&checkpoint)?;
     let body_holders = publish_p2p_checkpoint_object(
