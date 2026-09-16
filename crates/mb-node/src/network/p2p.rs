@@ -6623,6 +6623,50 @@ async fn commit_plain_guild_event(
     node_blocking(node, move |node| node.install_guild_event(certified)).await
 }
 
+async fn ensure_writer_key_epochs(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    mut fences: Vec<mb_core::WriterFence>,
+) -> Result<()> {
+    fences.sort_by_key(|fence| (fence.owner, fence.epoch));
+    fences.dedup();
+    for fence in fences {
+        let (state, guild, local_id) = node_blocking(node.clone(), |node| {
+            Ok((
+                node.dynamic_guild_state()?
+                    .context("writer-key registration requires dynamic guild state")?,
+                node.guild_summary()?
+                    .context("writer-key registration requires an installed guild")?,
+                node.keys().node_id(),
+            ))
+        })
+        .await?;
+        if let Some(public_key) = state.writer_key_for_retained_revision(fence.owner, fence.epoch) {
+            if public_key != fence.public_key {
+                bail!("writer epoch conflicts with the authenticated guild event history");
+            }
+            continue;
+        }
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: state
+                .event_sequence
+                .checked_add(1)
+                .context("guild event sequence exhausted")?,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RotateWriterKey {
+                owner: fence.owner,
+                epoch: fence.epoch,
+                public_key: fence.public_key,
+            },
+        };
+        state.validate_event_proposal(&event)?;
+        commit_plain_guild_event(node.clone(), p2p, state, guild, local_id, event).await?;
+    }
+    Ok(())
+}
+
 async fn sync_guild_events_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<usize> {
     sync_guild_event_page(node, p2p, None).await
 }
@@ -9621,6 +9665,7 @@ async fn commit_backup_job(
         None => (1, None, Vec::new(), Vec::new(), Vec::new(), Vec::new()),
     };
     include_writer_fence(&mut writer_fences, &revision.value)?;
+    ensure_writer_key_epochs(node.clone(), p2p, writer_fences.clone()).await?;
     revisions.push(revision);
     revisions.sort_by_key(|revision| {
         (

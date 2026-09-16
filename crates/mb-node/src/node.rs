@@ -4807,6 +4807,21 @@ impl Node {
             let retained_revision = previous_revisions
                 .as_ref()
                 .is_some_and(|previous| previous.contains(revision));
+            let authenticated_writer_key = state.writer_key_for_retained_revision(
+                revision.value.owner,
+                revision.value.writer_epoch,
+            );
+            if authenticated_writer_key != Some(revision.value.writer_public_key) {
+                anyhow::bail!(
+                    "checkpoint revision writer is absent from the authenticated guild history"
+                );
+            }
+            if !recovered_head
+                && !retained_revision
+                && !state.writer_epoch_is_current(revision.value.owner, revision.value.writer_epoch)
+            {
+                anyhow::bail!("checkpoint revision was signed by a superseded writer epoch");
+            }
             for reference in revision
                 .value
                 .metadata_sectors
@@ -9748,6 +9763,34 @@ mod tests {
         for key in &keys {
             checkpoint.add_signature(key).unwrap();
         }
+        assert!(
+            node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, true)
+                .is_err()
+        );
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let writer_event = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RotateWriterKey {
+                owner: members[2].node_id,
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            },
+        };
+        let mut signatures = keys
+            .iter()
+            .map(|keys| sign_guild_event(&writer_event, keys).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        node.install_guild_event(QuorumGuildEvent {
+            event: writer_event,
+            signatures,
+        })
+        .unwrap();
+        node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, true)
+            .unwrap();
         let checkpoint_hash = checkpoint.hash().unwrap();
         node.pin_recovery_attempt(&checkpoint, Vec::new()).unwrap();
         node.install_recovered_checkpoint(&checkpoint).unwrap();
