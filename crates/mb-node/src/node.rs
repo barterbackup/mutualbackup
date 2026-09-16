@@ -38,7 +38,7 @@ use crate::snapshot::{
     prepare_revision, publish_owned_restore, reanchor_recovered_revision,
     reconcile_pending_captures, recovered_recipe_is_stable, render_sector,
     restore_revision_from_source, restore_signed_root_metadata_at, resume_restore_publication,
-    retire_revision_anchor,
+    retire_revision_anchor, revision_head_id,
 };
 use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open_control_store};
 
@@ -181,6 +181,7 @@ pub struct BackupDescriptor {
     pub format_version: u16,
     pub guild_id: [u8; 32],
     pub owner: NodeId,
+    pub protected_root_id: Uuid,
     pub revision_id: Uuid,
     pub total_pages: u32,
     pub object_hash: [u8; 32],
@@ -275,6 +276,7 @@ struct DhtObservedRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotInfo {
+    pub protected_root_id: Uuid,
     pub revision_id: Uuid,
     pub sequence: u64,
     pub checkpoint_generation: u64,
@@ -330,6 +332,7 @@ struct GuildEndpointCache {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct RootDirtyState {
     format_version: u16,
+    protected_root_id: Uuid,
     dirty: bool,
     reason: String,
     change_sequence: u64,
@@ -338,7 +341,7 @@ struct RootDirtyState {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct RetentionPolicy {
     format_version: u16,
-    revisions_per_owner: u32,
+    revisions_per_root: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -930,10 +933,10 @@ impl Node {
             _ => ProtectionState::Unknown,
         };
         Ok(NodeStatus {
-            format_version: 1,
+            format_version: 2,
             node_id: self.keys.node_id(),
             data_dir: self.data_dir.clone(),
-            protected_root: self.protected_root()?,
+            protected_roots: self.protected_roots()?,
             checkpoint_count: self.control.checkpoint_head_certificates()?.len() as u64,
             seed_recovery_ready: self.seed_recovery_ready()?,
             root_dirty: self.root_dirty()?,
@@ -945,23 +948,55 @@ impl Node {
         })
     }
 
-    pub fn protected_root(&self) -> Result<Option<ProtectedRoot>> {
-        let root: Option<ProtectedRoot> = self
-            .control
-            .get_record("node-config", b"protected-root")?
-            .map(|bytes| decode_canonical::<ProtectedRoot>(&bytes).map_err(anyhow::Error::from))
-            .transpose()?;
-        if let Some(root) = &root
-            && (!matches!(root.format_version, 2 | 3)
+    pub fn protected_roots(&self) -> Result<Vec<ProtectedRoot>> {
+        let mut roots = Vec::new();
+        for (record_id, bytes) in self.control.records("protected-root")? {
+            let root: ProtectedRoot = decode_canonical(&bytes)?;
+            if root.format_version != 3
+                || root.root_id.is_nil()
+                || record_id != root.root_id.as_bytes()
                 || root.filesystem_id == 0
-                || root.root_inode == 0)
-        {
-            anyhow::bail!("invalid protected-root record");
+                || root.root_inode == 0
+            {
+                anyhow::bail!("invalid protected-root record");
+            }
+            roots.push(root);
         }
-        Ok(root)
+        roots.sort_by_key(|root| root.root_id);
+        if roots.len() > 256 {
+            anyhow::bail!("too many protected roots");
+        }
+        for (index, root) in roots.iter().enumerate() {
+            if roots[..index].iter().any(|configured| {
+                configured.path.starts_with(&root.path) || root.path.starts_with(&configured.path)
+            }) {
+                anyhow::bail!("protected roots must not overlap");
+            }
+        }
+        Ok(roots)
+    }
+
+    fn protected_root_by_id(&self, root_id: Uuid) -> Result<ProtectedRoot> {
+        self.protected_roots()?
+            .into_iter()
+            .find(|root| root.root_id == root_id)
+            .context("protected root is not registered")
     }
 
     pub fn add_protected_root(&mut self, source_root: &Path) -> Result<ProtectedRoot> {
+        self.register_protected_root(source_root, None, true, true)
+    }
+
+    fn register_protected_root(
+        &mut self,
+        source_root: &Path,
+        requested_root_id: Option<Uuid>,
+        initially_dirty: bool,
+        probe_source: bool,
+    ) -> Result<ProtectedRoot> {
+        if requested_root_id.is_some_and(|root_id| root_id.is_nil()) {
+            anyhow::bail!("protected root ID must not be nil");
+        }
         let source_root = source_root
             .canonicalize()
             .with_context(|| format!("cannot resolve protected root {}", source_root.display()))?;
@@ -981,47 +1016,83 @@ impl Node {
         #[cfg(not(unix))]
         let root_inode = 0;
 
-        let configured = self.protected_root()?;
-        if let Some(configured) = &configured {
-            if configured.path != source_root {
-                anyhow::bail!("the prototype supports exactly one protected root");
-            }
+        let configured = self.protected_roots()?;
+        if let Some(configured) = configured.iter().find(|root| root.path == source_root) {
             if configured.format_version == 3
+                && requested_root_id.is_none_or(|root_id| configured.root_id == root_id)
                 && configured.filesystem_id == filesystem.stable_id
                 && configured.root_inode == root_inode
             {
                 return Ok(configured.clone());
             }
+            anyhow::bail!("protected root identity conflicts with an existing root");
+        }
+        let root_id = requested_root_id.unwrap_or_else(Uuid::new_v4);
+        if configured.iter().any(|root| root.root_id == root_id) {
+            anyhow::bail!("protected root identity conflicts with an existing root");
         }
 
-        probe_reflink(&source_root).context("protected root failed the reflink COW probe")?;
+        if probe_source {
+            probe_reflink(&source_root).context("protected root failed the reflink COW probe")?;
+        }
+        if configured
+            .iter()
+            .any(|root| root.path.starts_with(&source_root) || source_root.starts_with(&root.path))
+        {
+            anyhow::bail!("protected roots must not overlap");
+        }
+        if configured.len() == 256 {
+            anyhow::bail!("at most 256 protected roots may be registered");
+        }
         let root = ProtectedRoot {
             format_version: 3,
-            root_id: configured
-                .map(|configured| configured.root_id)
-                .unwrap_or_else(Uuid::new_v4),
+            root_id,
             path: source_root,
             filesystem_id: filesystem.stable_id,
             root_inode,
         };
-        self.control
-            .put_record("node-config", b"protected-root", &canonical_bytes(&root)?)?;
-        self.mark_root_dirty("protected root has not been backed up")?;
+        self.control.put_record(
+            "protected-root",
+            root.root_id.as_bytes(),
+            &canonical_bytes(&root)?,
+        )?;
+        if initially_dirty {
+            self.mark_root_dirty(root.root_id, "protected root has not been backed up")?;
+        } else {
+            self.control.put_record(
+                "root-dirty",
+                root.root_id.as_bytes(),
+                &canonical_bytes(&RootDirtyState {
+                    format_version: 3,
+                    protected_root_id: root.root_id,
+                    dirty: false,
+                    reason: "protected root was restored from its committed revision".to_owned(),
+                    change_sequence: 0,
+                })?,
+            )?;
+        }
         Ok(root)
     }
 
-    pub fn mark_root_dirty(&mut self, reason: &str) -> Result<()> {
-        self.mark_root_dirty_at(reason, false, unix_seconds())
+    pub fn mark_root_dirty(&mut self, root_id: Uuid, reason: &str) -> Result<()> {
+        self.mark_root_dirty_at(root_id, reason, false, unix_seconds())
     }
 
-    pub fn mark_root_changed(&mut self, reason: &str) -> Result<()> {
-        self.mark_root_dirty_at(reason, true, unix_seconds())
+    pub fn mark_root_changed(&mut self, root_id: Uuid, reason: &str) -> Result<()> {
+        self.mark_root_dirty_at(root_id, reason, true, unix_seconds())
     }
 
-    fn mark_root_dirty_at(&mut self, reason: &str, changed: bool, now: u64) -> Result<()> {
+    fn mark_root_dirty_at(
+        &mut self,
+        root_id: Uuid,
+        reason: &str,
+        changed: bool,
+        now: u64,
+    ) -> Result<()> {
+        self.protected_root_by_id(root_id)?;
         let mut reason = reason.to_owned();
         truncate_utf8(&mut reason, 512);
-        let previous = self.root_dirty_state()?;
+        let previous = self.root_dirty_state(root_id)?;
         let change_sequence = previous
             .as_ref()
             .map(|state| state.change_sequence)
@@ -1029,10 +1100,11 @@ impl Node {
             .checked_add(1)
             .context("protected-root change sequence exhausted")?;
         self.control.put_record(
-            "node-state",
-            b"root-dirty",
+            "root-dirty",
+            root_id.as_bytes(),
             &canonical_bytes(&RootDirtyState {
-                format_version: 2,
+                format_version: 3,
+                protected_root_id: root_id,
                 dirty: true,
                 reason,
                 change_sequence,
@@ -1047,21 +1119,26 @@ impl Node {
     }
 
     pub fn root_dirty(&self) -> Result<bool> {
-        Ok(self
-            .root_dirty_state()?
-            .map(|state| state.dirty)
-            .unwrap_or(self.protected_root()?.is_some()))
+        for root in self.protected_roots()? {
+            if self
+                .root_dirty_state(root.root_id)?
+                .is_none_or(|state| state.dirty)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
-    fn root_dirty_state(&self) -> Result<Option<RootDirtyState>> {
+    fn root_dirty_state(&self, root_id: Uuid) -> Result<Option<RootDirtyState>> {
         let state = self
             .control
-            .get_record("node-state", b"root-dirty")?
+            .get_record("root-dirty", root_id.as_bytes())?
             .map(|bytes| decode_canonical::<RootDirtyState>(&bytes))
             .transpose()?;
         if state
             .as_ref()
-            .is_some_and(|state| state.format_version != 2)
+            .is_some_and(|state| state.format_version != 3 || state.protected_root_id != root_id)
         {
             anyhow::bail!("unsupported root dirty-state version");
         }
@@ -1162,7 +1239,9 @@ impl Node {
         if reconciliation_due {
             state.last_full_reconcile_unix_seconds = Some(now);
             self.store_automatic_backup_state(&state)?;
-            self.mark_root_dirty_at("scheduled full reconciliation", false, now)?;
+            for root in self.protected_roots()? {
+                self.mark_root_dirty_at(root.root_id, "scheduled full reconciliation", false, now)?;
+            }
             state = self.automatic_backup_state(now)?;
         }
         if let Some(revision_id) = state.in_flight_revision {
@@ -1190,13 +1269,16 @@ impl Node {
             self.store_automatic_backup_state(&state)?;
             return Ok(AutomaticBackupPoll::Idle);
         }
-        if self.protected_root()?.is_none() || self.installed_guild()?.is_none() {
+        if self.protected_roots()?.is_empty() || self.installed_guild()?.is_none() {
             state.blocked_reason = Some("automatic backup needs a protected root and guild".into());
             state.retry_at_unix_seconds = None;
             self.store_automatic_backup_state(&state)?;
             return Ok(AutomaticBackupPoll::Idle);
         }
-        let estimated_bytes = match self.protected_root_logical_bytes() {
+        let root = self
+            .next_dirty_root()?
+            .context("automatic backup has no dirty protected root")?;
+        let estimated_bytes = match self.protected_root_logical_bytes(&root) {
             Ok(estimated_bytes) => estimated_bytes,
             Err(error) => {
                 let mut message = format!("automatic full reconciliation failed: {error:#}");
@@ -1286,10 +1368,19 @@ impl Node {
         self.store_automatic_backup_state(&state)
     }
 
-    fn protected_root_logical_bytes(&self) -> Result<u64> {
-        let root = self
-            .protected_root()?
-            .context("automatic backup has no protected root")?;
+    fn next_dirty_root(&self) -> Result<Option<ProtectedRoot>> {
+        for root in self.protected_roots()? {
+            if self
+                .root_dirty_state(root.root_id)?
+                .is_none_or(|state| state.dirty)
+            {
+                return Ok(Some(root));
+            }
+        }
+        Ok(None)
+    }
+
+    fn protected_root_logical_bytes(&self, root: &ProtectedRoot) -> Result<u64> {
         let mut total = 0_u64;
         for entry in walkdir::WalkDir::new(&root.path).follow_links(false) {
             let entry = entry.context("automatic full reconciliation could not enumerate root")?;
@@ -1382,16 +1473,16 @@ impl Node {
         self.refresh_volume_readers()
     }
 
-    pub fn configure_retention(&self, revisions_per_owner: u32) -> Result<()> {
-        if revisions_per_owner == 0 || revisions_per_owner > 1_024 {
-            anyhow::bail!("retention must keep between 1 and 1024 revisions per owner");
+    pub fn configure_retention(&self, revisions_per_root: u32) -> Result<()> {
+        if revisions_per_root == 0 || revisions_per_root > 1_024 {
+            anyhow::bail!("retention must keep between 1 and 1024 revisions per root");
         }
         self.control.put_record(
             "node-config",
             b"retention",
             &canonical_bytes(&RetentionPolicy {
-                format_version: 1,
-                revisions_per_owner,
+                format_version: 2,
+                revisions_per_root,
             })?,
         )?;
         Ok(())
@@ -1402,13 +1493,13 @@ impl Node {
             return Ok(30);
         };
         let policy: RetentionPolicy = decode_canonical(&bytes)?;
-        if policy.format_version != 1
-            || policy.revisions_per_owner == 0
-            || policy.revisions_per_owner > 1_024
+        if policy.format_version != 2
+            || policy.revisions_per_root == 0
+            || policy.revisions_per_root > 1_024
         {
             anyhow::bail!("durable retention policy is invalid");
         }
-        Ok(policy.revisions_per_owner as usize)
+        Ok(policy.revisions_per_root as usize)
     }
 
     pub fn storage_status(&self) -> Result<Vec<crate::StorageVolumeStatus>> {
@@ -1949,7 +2040,7 @@ impl Node {
             certificate,
         };
         let guild_id = installed.certificate.genesis.guild_id;
-        if !matches!(checkpoint.checkpoint.format_version, 4 | 5)
+        if !matches!(checkpoint.checkpoint.format_version, 4..=6)
             || checkpoint.checkpoint.guild_id != guild_id
             || checkpoint.checkpoint.genesis_hash != installed.certificate.hash()?
         {
@@ -2475,14 +2566,25 @@ impl Node {
         guild_coordinator(&self.control, guild_id)
     }
 
-    pub fn prepare_protected_backup(&mut self) -> Result<BackupDescriptor> {
+    pub fn prepare_protected_backup(
+        &mut self,
+        requested_root_id: Option<Uuid>,
+    ) -> Result<BackupDescriptor> {
         let installed = self
             .installed_guild()?
             .context("this node has no active guild")?;
         let guild_id = installed.certificate.genesis.guild_id;
-        let root = self
-            .protected_root()?
-            .context("this node has no protected root")?;
+        let root = match requested_root_id {
+            Some(root_id) => self.protected_root_by_id(root_id)?,
+            None => match self.next_dirty_root()? {
+                Some(root) => root,
+                None => self
+                    .protected_roots()?
+                    .into_iter()
+                    .next()
+                    .context("this node has no protected root")?,
+            },
+        };
         let current_filesystem = filesystem_identity(&root.path)?;
         let root_metadata = fs::symlink_metadata(&root.path)?;
         #[cfg(unix)]
@@ -2500,7 +2602,10 @@ impl Node {
         }
         let local_head = self
             .control
-            .get_record("user-revision-head", &guild_id)?
+            .get_record(
+                "user-revision-head",
+                &revision_head_id(guild_id, root.root_id),
+            )?
             .map(|bytes| decode_canonical::<SignedRecord<UserRevision>>(&bytes))
             .transpose()?;
         let committed_sequence = self
@@ -2513,7 +2618,10 @@ impl Node {
                     .checkpoint
                     .revisions
                     .into_iter()
-                    .filter(|revision| revision.value.owner == self.keys.node_id())
+                    .filter(|revision| {
+                        revision.value.owner == self.keys.node_id()
+                            && revision.value.protected_root_id == root.root_id
+                    })
                     .map(|revision| revision.value.sequence)
                     .max()
             })
@@ -2533,9 +2641,12 @@ impl Node {
         let revision_id = local_head
             .filter(|revision| revision.value.sequence == sequence)
             .map(|revision| revision.value.revision_id)
-            .unwrap_or_else(|| deterministic_revision_id(guild_id, self.keys.node_id(), sequence));
+            .unwrap_or_else(|| {
+                deterministic_revision_id(guild_id, self.keys.node_id(), root.root_id, sequence)
+            });
         let revision = self.prepare_revision(
             guild_id,
+            root.root_id,
             &root.path,
             sequence,
             Some(*revision_id.as_bytes()),
@@ -2546,9 +2657,10 @@ impl Node {
             anyhow::bail!("prepared revision exceeds the catalog paging limit");
         }
         Ok(BackupDescriptor {
-            format_version: 1,
+            format_version: 2,
             guild_id,
             owner: self.keys.node_id(),
+            protected_root_id: root.root_id,
             revision_id,
             total_pages: total_pages as u32,
             object_hash: *blake3::hash(&bytes).as_bytes(),
@@ -2951,12 +3063,13 @@ impl Node {
     pub fn prepare_revision(
         &mut self,
         guild_id: [u8; 32],
+        protected_root_id: Uuid,
         source_root: &Path,
         sequence: u64,
         operation_id: Option<[u8; 16]>,
     ) -> Result<SignedRecord<UserRevision>> {
         let captured_change_sequence = self
-            .root_dirty_state()?
+            .root_dirty_state(protected_root_id)?
             .filter(|state| state.dirty)
             .map(|state| state.change_sequence);
         let writer = self.writer_incarnation(guild_id)?;
@@ -2964,6 +3077,7 @@ impl Node {
             &mut self.control,
             &self.keys,
             guild_id,
+            protected_root_id,
             source_root,
             sequence,
             operation_id.map(Uuid::from_bytes),
@@ -5117,8 +5231,11 @@ impl Node {
             true,
         )?;
         self.clear_root_dirty_if_committed(checkpoint)?;
-        if self.reconcile_local_revision_head(checkpoint)? {
-            self.mark_root_dirty("a recovered writer incarnation replaced a local draft")?;
+        for root_id in self.reconcile_local_revision_head(checkpoint)? {
+            self.mark_root_dirty(
+                root_id,
+                "a recovered writer incarnation replaced a local draft",
+            )?;
         }
         self.reconcile_garbage_collection()?;
         Ok(hash)
@@ -5161,7 +5278,7 @@ impl Node {
         checkpoint: &GuildCheckpoint,
         recovered_head: bool,
     ) -> Result<()> {
-        if !matches!(checkpoint.format_version, 4 | 5) {
+        if !matches!(checkpoint.format_version, 4..=6) {
             return Ok(());
         }
         let checkpoint_hash = checkpoint.hash()?;
@@ -5524,11 +5641,9 @@ impl Node {
             }
         }
         for old in &previous.revision_tombstones {
-            let Some(current) = checkpoint
-                .revision_tombstones
-                .iter()
-                .find(|current| current.owner == old.owner)
-            else {
+            let Some(current) = checkpoint.revision_tombstones.iter().find(|current| {
+                (current.owner, current.protected_root_id) == (old.owner, old.protected_root_id)
+            }) else {
                 anyhow::bail!("checkpoint transition drops a revision tombstone");
             };
             if current.through_sequence < old.through_sequence
@@ -5541,12 +5656,15 @@ impl Node {
             let previous_floor = previous
                 .revision_tombstones
                 .iter()
-                .find(|old| old.owner == current.owner)
+                .find(|old| {
+                    (old.owner, old.protected_root_id) == (current.owner, current.protected_root_id)
+                })
                 .map(|old| old.through_sequence)
                 .unwrap_or(0);
             if current.through_sequence > previous_floor {
                 let retired = previous.revisions.iter().find(|revision| {
                     revision.value.owner == current.owner
+                        && revision.value.protected_root_id == current.protected_root_id
                         && revision.value.sequence == current.through_sequence
                 });
                 if current.retired_at_generation != checkpoint.generation
@@ -5580,6 +5698,7 @@ impl Node {
             checkpoint.revisions.contains(item)
                 || checkpoint.revision_tombstones.iter().any(|tombstone| {
                     tombstone.owner == item.value.owner
+                        && tombstone.protected_root_id == item.value.protected_root_id
                         && tombstone.through_sequence >= item.value.sequence
                 })
         }) || checkpoint.format_version == 3 && !previous.coding_groups.iter().all(|item| {
@@ -5637,15 +5756,19 @@ impl Node {
     }
 
     fn clear_root_dirty_if_committed(&mut self, checkpoint: &QuorumCheckpoint) -> Result<()> {
-        let Some(bytes) = self
-            .control
-            .get_record("user-revision-head", &checkpoint.checkpoint.guild_id)?
-        else {
-            return Ok(());
-        };
-        let local_head: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
-        if checkpoint.checkpoint.revisions.contains(&local_head) {
-            let state = self.root_dirty_state()?;
+        for root in self.protected_roots()? {
+            let Some(bytes) = self.control.get_record(
+                "user-revision-head",
+                &revision_head_id(checkpoint.checkpoint.guild_id, root.root_id),
+            )?
+            else {
+                continue;
+            };
+            let local_head: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
+            if !checkpoint.checkpoint.revisions.contains(&local_head) {
+                continue;
+            }
+            let state = self.root_dirty_state(root.root_id)?;
             let captured_change_sequence = self
                 .control
                 .get_record(
@@ -5657,19 +5780,22 @@ impl Node {
             if state.as_ref().is_some_and(|state| {
                 state.dirty && captured_change_sequence != Some(state.change_sequence)
             }) {
-                return Ok(());
+                continue;
             }
             let change_sequence = state.map(|state| state.change_sequence).unwrap_or(0);
             self.control.put_record(
-                "node-state",
-                b"root-dirty",
+                "root-dirty",
+                root.root_id.as_bytes(),
                 &canonical_bytes(&RootDirtyState {
-                    format_version: 2,
+                    format_version: 3,
+                    protected_root_id: root.root_id,
                     dirty: false,
                     reason: "latest local revision is committed".to_owned(),
                     change_sequence,
                 })?,
             )?;
+        }
+        if !self.root_dirty()? {
             let mut automation = self.automatic_backup_state(unix_seconds())?;
             automation.dirty_since_unix_seconds = None;
             self.store_automatic_backup_state(&automation)?;
@@ -5686,13 +5812,19 @@ impl Node {
             return Ok(());
         };
         checkpoint.verify()?;
-        if self.reconcile_local_revision_head(&checkpoint)? {
-            self.mark_root_dirty("a recovered writer incarnation replaced a local draft")?;
+        for root_id in self.reconcile_local_revision_head(&checkpoint)? {
+            self.mark_root_dirty(
+                root_id,
+                "a recovered writer incarnation replaced a local draft",
+            )?;
         }
         Ok(())
     }
 
-    fn reconcile_local_revision_head(&mut self, checkpoint: &QuorumCheckpoint) -> Result<bool> {
+    fn reconcile_local_revision_head(
+        &mut self,
+        checkpoint: &QuorumCheckpoint,
+    ) -> Result<Vec<Uuid>> {
         let local_id = self.keys.node_id();
         let Some(fence) = checkpoint
             .checkpoint
@@ -5701,40 +5833,49 @@ impl Node {
             .filter(|fence| fence.owner == local_id)
             .max_by_key(|fence| fence.epoch)
         else {
-            return Ok(false);
+            return Ok(Vec::new());
         };
-        let local_head = self
-            .control
-            .get_record("user-revision-head", &checkpoint.checkpoint.guild_id)?
-            .map(|bytes| decode_canonical::<SignedRecord<UserRevision>>(&bytes))
-            .transpose()?;
-        if local_head.as_ref().is_some_and(|revision| {
-            revision.value.writer_epoch == fence.epoch
-                && revision.value.writer_public_key == fence.public_key
-        }) {
-            return Ok(false);
+        let mut replaced = Vec::new();
+        for root in self.protected_roots()? {
+            let head_id = revision_head_id(checkpoint.checkpoint.guild_id, root.root_id);
+            let local_head = self
+                .control
+                .get_record("user-revision-head", &head_id)?
+                .map(|bytes| decode_canonical::<SignedRecord<UserRevision>>(&bytes))
+                .transpose()?;
+            if local_head.as_ref().is_some_and(|revision| {
+                checkpoint.checkpoint.revisions.contains(revision)
+                    || revision.value.writer_epoch == fence.epoch
+                        && revision.value.writer_public_key == fence.public_key
+            }) {
+                continue;
+            }
+            let Some(certified) = checkpoint
+                .checkpoint
+                .revisions
+                .iter()
+                .filter(|revision| {
+                    revision.value.owner == local_id
+                        && revision.value.protected_root_id == root.root_id
+                })
+                .max_by_key(|revision| revision.value.sequence)
+            else {
+                continue;
+            };
+            let bytes = canonical_bytes(certified)?;
+            self.control.put_records(&[
+                (
+                    "user-revision".to_owned(),
+                    certified.value.revision_id.as_bytes().to_vec(),
+                    bytes.clone(),
+                ),
+                ("user-revision-head".to_owned(), head_id, bytes),
+            ])?;
+            if local_head.as_ref() != Some(certified) {
+                replaced.push(root.root_id);
+            }
         }
-        let certified = checkpoint
-            .checkpoint
-            .revisions
-            .iter()
-            .filter(|revision| revision.value.owner == local_id)
-            .max_by_key(|revision| revision.value.sequence)
-            .context("writer fence has no certified local revision")?;
-        let bytes = canonical_bytes(certified)?;
-        self.control.put_records(&[
-            (
-                "user-revision".to_owned(),
-                certified.value.revision_id.as_bytes().to_vec(),
-                bytes.clone(),
-            ),
-            (
-                "user-revision-head".to_owned(),
-                checkpoint.checkpoint.guild_id.to_vec(),
-                bytes,
-            ),
-        ])?;
-        Ok(local_head.as_ref() != Some(certified))
+        Ok(replaced)
     }
 
     fn reconcile_garbage_collection(&mut self) -> Result<()> {
@@ -6209,7 +6350,7 @@ impl Node {
         let checkpoint_hash = checkpoint.hash()?;
         let local_id = self.keys.node_id();
         let (publication_members, recovery_envelopes) =
-            if matches!(checkpoint.checkpoint.format_version, 4 | 5) {
+            if matches!(checkpoint.checkpoint.format_version, 4..=6) {
                 let state = self
                     .dynamic_guild_state()?
                     .context("dynamic DHT publication requires dynamic guild state")?;
@@ -6873,7 +7014,7 @@ impl Node {
         checkpoint: &QuorumCheckpoint,
     ) -> Result<(BTreeSet<NodeId>, usize)> {
         let local_id = self.keys.node_id();
-        let members = if matches!(checkpoint.checkpoint.format_version, 4 | 5) {
+        let members = if matches!(checkpoint.checkpoint.format_version, 4..=6) {
             let state = self
                 .dynamic_guild_state()?
                 .context("dynamic recovery readiness requires dynamic guild state")?;
@@ -6912,6 +7053,7 @@ impl Node {
             .iter()
             .filter(|revision| revision.value.owner == self.keys.node_id())
             .map(|revision| SnapshotInfo {
+                protected_root_id: revision.value.protected_root_id,
                 revision_id: revision.value.revision_id,
                 sequence: revision.value.sequence,
                 checkpoint_generation: checkpoint.checkpoint.generation,
@@ -6943,7 +7085,13 @@ impl Node {
                 .revisions
                 .iter()
                 .filter(|revision| revision.value.owner == self.keys.node_id())
-                .max_by_key(|revision| revision.value.sequence),
+                .max_by_key(|revision| {
+                    (
+                        revision.value.sequence,
+                        revision.value.protected_root_id,
+                        revision.value.revision_id,
+                    )
+                }),
         }
         .context("requested snapshot is unavailable for this node")?;
         restore_revision_from_source(
@@ -6955,6 +7103,7 @@ impl Node {
             |sector_id| self.sector_for_guild(&guild_id, sector_id),
         )?;
         Ok(SnapshotInfo {
+            protected_root_id: revision.value.protected_root_id,
             revision_id: revision.value.revision_id,
             sequence: revision.value.sequence,
             checkpoint_generation: checkpoint.checkpoint.generation,
@@ -6985,13 +7134,20 @@ impl Node {
                 .revisions
                 .iter()
                 .filter(|revision| revision.value.owner == self.keys.node_id())
-                .max_by_key(|revision| revision.value.sequence),
+                .max_by_key(|revision| {
+                    (
+                        revision.value.sequence,
+                        revision.value.protected_root_id,
+                        revision.value.revision_id,
+                    )
+                }),
         }
         .context("requested snapshot is unavailable for this node")?;
         if !resume_restore_publication(&self.control, &self.keys, guild_id, revision, target)? {
             return Ok(None);
         }
         Ok(Some(SnapshotInfo {
+            protected_root_id: revision.value.protected_root_id,
             revision_id: revision.value.revision_id,
             sequence: revision.value.sequence,
             checkpoint_generation: checkpoint.checkpoint.generation,
@@ -7020,7 +7176,13 @@ impl Node {
                 .revisions
                 .iter()
                 .filter(|revision| revision.value.owner == self.keys.node_id())
-                .max_by_key(|revision| revision.value.sequence),
+                .max_by_key(|revision| {
+                    (
+                        revision.value.sequence,
+                        revision.value.protected_root_id,
+                        revision.value.revision_id,
+                    )
+                }),
         }
         .cloned()
         .context("requested snapshot is unavailable for this node")?;
@@ -7183,14 +7345,29 @@ impl Node {
             }
         }
         self.validate_local_roles(&checkpoint.checkpoint)?;
-        let local_revision = checkpoint
+        let mut local_heads = BTreeMap::<Uuid, &SignedRecord<UserRevision>>::new();
+        for revision in checkpoint
             .checkpoint
             .revisions
             .iter()
             .filter(|revision| revision.value.owner == self.keys.node_id())
-            .max_by_key(|revision| revision.value.sequence)
-            .map(canonical_bytes)
-            .transpose()?;
+        {
+            let head = local_heads
+                .entry(revision.value.protected_root_id)
+                .or_insert(revision);
+            if revision.value.sequence > head.value.sequence {
+                *head = revision;
+            }
+        }
+        let local_heads = local_heads
+            .into_iter()
+            .map(|(root_id, revision)| {
+                Ok((
+                    revision_head_id(checkpoint.checkpoint.guild_id, root_id),
+                    canonical_bytes(revision)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
         self.control.commit_recovered_checkpoint(
             &checkpoint.checkpoint.guild_id,
             checkpoint.checkpoint.generation,
@@ -7198,8 +7375,8 @@ impl Node {
             &checkpoint_hash,
             &canonical_bytes(&checkpoint.checkpoint)?,
             &canonical_bytes(checkpoint)?,
-            local_revision.as_deref(),
-            local_revision.is_none(),
+            &local_heads,
+            local_heads.is_empty(),
         )?;
         self.reconcile_garbage_collection()?;
         Ok(checkpoint_hash)
@@ -7224,7 +7401,13 @@ impl Node {
             .revisions
             .iter()
             .filter(|revision| revision.value.owner == self.keys.node_id())
-            .max_by_key(|revision| revision.value.sequence)
+            .max_by_key(|revision| {
+                (
+                    revision.value.sequence,
+                    revision.value.protected_root_id,
+                    revision.value.revision_id,
+                )
+            })
             .cloned();
         let revision_id = revision.as_ref().map(|revision| revision.value.revision_id);
         if let Some(revision) = revision {
@@ -7747,6 +7930,12 @@ impl Node {
             )?;
         }
         verify_pinned_parent_path(parent, containing_directory(&job.target))?;
+        self.register_protected_root(
+            &job.target,
+            Some(revision.value.protected_root_id),
+            false,
+            false,
+        )?;
         job.state = RecoveryJobState::Complete;
         self.control
             .complete_recovery_attempt(checkpoint_hash, &canonical_bytes(job)?)?;
@@ -8004,7 +8193,7 @@ pub(crate) fn checkpoint_matches_dynamic_authority(
     }
     match checkpoint.format_version {
         4 => checkpoint.authority.is_none(),
-        5 => checkpoint.authority.is_some_and(|authority| {
+        5 | 6 => checkpoint.authority.is_some_and(|authority| {
             authority.format_version == 1
                 && authority.membership_epoch == state.membership_epoch
                 && authority.quorum == state.quorum
@@ -8316,10 +8505,16 @@ fn validate_dht_observation_state(state: &DhtObservationState) -> Result<()> {
     Ok(())
 }
 
-fn deterministic_revision_id(guild_id: [u8; 32], owner: NodeId, sequence: u64) -> Uuid {
-    let mut hasher = blake3::Hasher::new_derive_key("mutualbackup revision operation v1");
+fn deterministic_revision_id(
+    guild_id: [u8; 32],
+    owner: NodeId,
+    protected_root_id: Uuid,
+    sequence: u64,
+) -> Uuid {
+    let mut hasher = blake3::Hasher::new_derive_key("mutualbackup revision operation v2");
     hasher.update(&guild_id);
     hasher.update(&owner.0);
+    hasher.update(protected_root_id.as_bytes());
     hasher.update(&sequence.to_le_bytes());
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
@@ -8327,8 +8522,9 @@ fn deterministic_revision_id(guild_id: [u8; 32], owner: NodeId, sequence: u64) -
 }
 
 fn validate_backup_descriptor(descriptor: &BackupDescriptor) -> Result<()> {
-    if descriptor.format_version != 1
+    if descriptor.format_version != 2
         || descriptor.guild_id == [0; 32]
+        || descriptor.protected_root_id.is_nil()
         || descriptor.total_pages == 0
         || descriptor.total_pages > V1_MAX_CATALOG_PAGES
         || descriptor.object_hash == [0; 32]
@@ -8453,8 +8649,9 @@ mod tests {
         install_inline_recipe(&mut node.control, guild_id, reference.clone(), plaintext).unwrap();
         let writer = ed25519_dalek::SigningKey::from_bytes(&[71; 32]);
         let mut revision = UserRevision {
-            format_version: 2,
+            format_version: 3,
             guild_id,
+            protected_root_id: Uuid::from_bytes([1; 16]),
             cipher_profile: mb_core::V1_CIPHER_PROFILE,
             revision_id,
             owner: node.keys().node_id(),
@@ -8534,8 +8731,9 @@ mod tests {
         group.id = group.calculate_id().unwrap();
         let writer = ed25519_dalek::SigningKey::from_bytes(&[72; 32]);
         let mut revision_body = UserRevision {
-            format_version: 2,
+            format_version: 3,
             guild_id,
+            protected_root_id: Uuid::from_bytes([1; 16]),
             cipher_profile: mb_core::V1_CIPHER_PROFILE,
             revision_id: Uuid::from_bytes([140; 16]),
             owner: keys[0].node_id(),
@@ -8871,18 +9069,19 @@ mod tests {
         let mut node = Node::open(&state, seed.clone()).unwrap();
         node.adopt_recovered_guild(certificate, peers).unwrap();
         let filesystem = filesystem_identity(&root).unwrap();
+        let root_id = Uuid::new_v4();
+        let protected_root = ProtectedRoot {
+            format_version: 3,
+            root_id,
+            path: root,
+            filesystem_id: filesystem.stable_id,
+            root_inode: fs::metadata(temp.path().join("root")).unwrap().ino(),
+        };
         node.control
             .put_record(
-                "node-config",
-                b"protected-root",
-                &canonical_bytes(&ProtectedRoot {
-                    format_version: 3,
-                    root_id: Uuid::new_v4(),
-                    path: root,
-                    filesystem_id: filesystem.stable_id,
-                    root_inode: fs::metadata(temp.path().join("root")).unwrap().ino(),
-                })
-                .unwrap(),
+                "protected-root",
+                root_id.as_bytes(),
+                &canonical_bytes(&protected_root).unwrap(),
             )
             .unwrap();
         let mut policy = AutomaticBackupPolicy {
@@ -8894,7 +9093,8 @@ mod tests {
             daily_byte_limit: 3,
         };
         node.configure_automatic_backup(&policy).unwrap();
-        node.mark_root_dirty_at("changed", true, 100).unwrap();
+        node.mark_root_dirty_at(root_id, "changed", true, 100)
+            .unwrap();
         assert!(matches!(
             node.poll_automatic_backup(109).unwrap(),
             AutomaticBackupPoll::Idle
@@ -8936,6 +9136,86 @@ mod tests {
     }
 
     #[test]
+    fn protected_root_configuration_and_dirty_state_are_independent() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([219; 32]);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        let first_id = Uuid::from_bytes([1; 16]);
+        let second_id = Uuid::from_bytes([2; 16]);
+        for (root_id, path, identity) in [
+            (first_id, "/root-one", 1_u64),
+            (second_id, "/root-two", 2_u64),
+        ] {
+            let root = ProtectedRoot {
+                format_version: 3,
+                root_id,
+                path: PathBuf::from(path),
+                filesystem_id: identity,
+                root_inode: identity,
+            };
+            node.control
+                .put_record(
+                    "protected-root",
+                    root_id.as_bytes(),
+                    &canonical_bytes(&root).unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            node.protected_roots()
+                .unwrap()
+                .into_iter()
+                .map(|root| root.root_id)
+                .collect::<Vec<_>>(),
+            vec![first_id, second_id]
+        );
+        node.mark_root_dirty_at(first_id, "first changed", true, 100)
+            .unwrap();
+        node.mark_root_dirty_at(second_id, "second changed", true, 101)
+            .unwrap();
+        let first_state = node.root_dirty_state(first_id).unwrap().unwrap();
+        node.control
+            .put_record(
+                "root-dirty",
+                first_id.as_bytes(),
+                &canonical_bytes(&RootDirtyState {
+                    format_version: 3,
+                    protected_root_id: first_id,
+                    dirty: false,
+                    reason: "first committed".to_owned(),
+                    change_sequence: first_state.change_sequence,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(!node.root_dirty_state(first_id).unwrap().unwrap().dirty);
+        assert!(node.root_dirty_state(second_id).unwrap().unwrap().dirty);
+        assert!(node.root_dirty().unwrap());
+        drop(node);
+
+        let reopened = Node::open(temp.path(), seed).unwrap();
+        assert_eq!(reopened.protected_roots().unwrap().len(), 2);
+        assert!(reopened.root_dirty_state(second_id).unwrap().unwrap().dirty);
+        let nested_id = Uuid::from_bytes([3; 16]);
+        reopened
+            .control
+            .put_record(
+                "protected-root",
+                nested_id.as_bytes(),
+                &canonical_bytes(&ProtectedRoot {
+                    format_version: 3,
+                    root_id: nested_id,
+                    path: PathBuf::from("/root-one/nested"),
+                    filesystem_id: 3,
+                    root_inode: 3,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(reopened.protected_roots().is_err());
+    }
+
+    #[test]
     fn automatic_backup_errors_are_bounded_at_utf8_boundaries() {
         let temp = tempfile::tempdir().unwrap();
         let node = Node::open(temp.path(), Seed::from_bytes([227; 32])).unwrap();
@@ -8963,18 +9243,19 @@ mod tests {
         let mut node = Node::open(&state, seed).unwrap();
         node.adopt_recovered_guild(certificate, peers).unwrap();
         let filesystem = filesystem_identity(&root).unwrap();
+        let root_id = Uuid::new_v4();
+        let protected_root = ProtectedRoot {
+            format_version: 3,
+            root_id,
+            path: root.clone(),
+            filesystem_id: filesystem.stable_id,
+            root_inode: fs::metadata(&root).unwrap().ino(),
+        };
         node.control
             .put_record(
-                "node-config",
-                b"protected-root",
-                &canonical_bytes(&ProtectedRoot {
-                    format_version: 3,
-                    root_id: Uuid::new_v4(),
-                    path: root.clone(),
-                    filesystem_id: filesystem.stable_id,
-                    root_inode: fs::metadata(&root).unwrap().ino(),
-                })
-                .unwrap(),
+                "protected-root",
+                root_id.as_bytes(),
+                &canonical_bytes(&protected_root).unwrap(),
             )
             .unwrap();
         node.configure_automatic_backup(&AutomaticBackupPolicy {
@@ -8986,7 +9267,8 @@ mod tests {
             daily_byte_limit: 1024,
         })
         .unwrap();
-        node.mark_root_dirty_at("changed", true, 100).unwrap();
+        node.mark_root_dirty_at(root_id, "changed", true, 100)
+            .unwrap();
         fs::remove_dir_all(&root).unwrap();
 
         assert!(matches!(
@@ -9023,15 +9305,34 @@ mod tests {
         let mut node = Node::open(temp.path(), seed.clone()).unwrap();
         let revision = install_public_restore_fixture(&mut node, &seed);
         let guild_id = revision.value.guild_id;
+        let protected_root = ProtectedRoot {
+            format_version: 3,
+            root_id: revision.value.protected_root_id,
+            path: PathBuf::from("/missing-test-root"),
+            filesystem_id: 1,
+            root_inode: 1,
+        };
+        node.control
+            .put_record(
+                "protected-root",
+                protected_root.root_id.as_bytes(),
+                &canonical_bytes(&protected_root).unwrap(),
+            )
+            .unwrap();
         node.control
             .put_record(
                 "user-revision-head",
-                &guild_id,
+                &revision_head_id(guild_id, revision.value.protected_root_id),
                 &canonical_bytes(&revision).unwrap(),
             )
             .unwrap();
-        node.mark_root_dirty_at("changed after capture", true, 100)
-            .unwrap();
+        node.mark_root_dirty_at(
+            revision.value.protected_root_id,
+            "changed after capture",
+            true,
+            100,
+        )
+        .unwrap();
         let checkpoint = node.current_checkpoint(guild_id).unwrap().unwrap();
 
         node.clear_root_dirty_if_committed(&checkpoint).unwrap();
@@ -9398,8 +9699,9 @@ mod tests {
         group.id = group.calculate_id().unwrap();
         let writer = ed25519_dalek::SigningKey::from_bytes(&[71; 32]);
         let mut revision = UserRevision {
-            format_version: 2,
+            format_version: 3,
             guild_id,
+            protected_root_id: Uuid::from_bytes([1; 16]),
             cipher_profile: mb_core::V1_CIPHER_PROFILE,
             revision_id: Uuid::from_bytes([195; 16]),
             owner: node.keys().node_id(),
@@ -9424,6 +9726,7 @@ mod tests {
                 writer_fences: first.checkpoint.writer_fences.clone(),
                 revision_tombstones: vec![mb_core::RevisionTombstone {
                     owner: retired.value.owner,
+                    protected_root_id: retired.value.protected_root_id,
                     through_sequence: 1,
                     last_revision_id: retired.value.revision_id,
                     last_revision_hash: retired.value.hash().unwrap(),
@@ -9847,8 +10150,9 @@ mod tests {
         state.apply_event(&rotate_writer).unwrap();
 
         let mut revision = UserRevision {
-            format_version: 2,
+            format_version: 3,
             guild_id: state.guild_id,
+            protected_root_id: Uuid::from_bytes([1; 16]),
             cipher_profile: mb_core::V1_CIPHER_PROFILE,
             revision_id: Uuid::from_bytes([197; 16]),
             owner: added_member.node_id,
@@ -10144,8 +10448,9 @@ mod tests {
         let revision_id = Uuid::from_bytes([86; 16]);
         let writer = ed25519_dalek::SigningKey::from_bytes(&[73; 32]);
         let mut revision_body = UserRevision {
-            format_version: 2,
+            format_version: 3,
             guild_id,
+            protected_root_id: Uuid::from_bytes([1; 16]),
             cipher_profile: mb_core::V1_CIPHER_PROFILE,
             revision_id,
             owner: node.keys().node_id(),
@@ -10656,8 +10961,9 @@ mod tests {
             logical_len: 64,
         };
         let mut revision = UserRevision {
-            format_version: 2,
+            format_version: 3,
             guild_id: [181; 32],
+            protected_root_id: Uuid::from_bytes([1; 16]),
             cipher_profile: mb_core::V1_CIPHER_PROFILE,
             revision_id: Uuid::from_bytes([185; 16]),
             owner: members[2].node_id,
@@ -11019,8 +11325,9 @@ mod tests {
         let local_id = node.keys().node_id();
         let writer = ed25519_dalek::SigningKey::from_bytes(&[194; 32]);
         let mut revision = UserRevision {
-            format_version: 2,
+            format_version: 3,
             guild_id,
+            protected_root_id: Uuid::from_bytes([1; 16]),
             cipher_profile: mb_core::V1_CIPHER_PROFILE,
             revision_id: Uuid::from_bytes([193; 16]),
             owner: local_id,
@@ -11691,8 +11998,9 @@ mod tests {
             .unwrap();
         let writer = ed25519_dalek::SigningKey::from_bytes(&[74; 32]);
         let mut revision_body = UserRevision {
-            format_version: 2,
+            format_version: 3,
             guild_id,
+            protected_root_id: Uuid::from_bytes([1; 16]),
             cipher_profile: mb_core::V1_CIPHER_PROFILE,
             revision_id,
             owner: node.keys().node_id(),
@@ -11763,7 +12071,9 @@ mod tests {
         let mut node = Node::open(run_root.join("node"), Seed::from_bytes([220; 32])).unwrap();
         let guild_id = [221; 32];
         let checkpoint_hash = [222; 32];
-        let revision = node.prepare_revision(guild_id, &source, 1, None).unwrap();
+        let revision = node
+            .prepare_revision(guild_id, Uuid::from_bytes([1; 16]), &source, 1, None)
+            .unwrap();
         assert!(!revision.value.data_sectors.is_empty());
         let manifest: mb_store::StableAnchorManifest = decode_canonical(
             &node

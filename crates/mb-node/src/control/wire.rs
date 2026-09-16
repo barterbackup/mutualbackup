@@ -11,7 +11,7 @@ use crate::{
     StorageVolumeStatus, WireError,
 };
 
-pub(super) const LOCAL_WIRE_FORMAT_VERSION: u16 = 1;
+pub(super) const LOCAL_WIRE_FORMAT_VERSION: u16 = 2;
 
 #[derive(Serialize, Deserialize)]
 pub struct LocalRequestEnvelope<T> {
@@ -78,6 +78,7 @@ pub enum LocalRequest {
     },
     Backup {
         wait: bool,
+        root_id: Option<Uuid>,
     },
     BackupStatus {
         revision_id: Uuid,
@@ -194,7 +195,7 @@ mod tests {
         assert!(matches!(
             &response.result,
             Ok(LocalResponse::Status(status))
-                if status.protected_root.as_ref().is_some_and(|root|
+                if status.protected_roots.first().is_some_and(|root|
                     root.filesystem_id == 41 && root.root_inode == 43)
         ));
         assert_eq!(

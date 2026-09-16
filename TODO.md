@@ -583,12 +583,16 @@ queues replacement coding without duplicating durable retries, and preserves
 old layout readability. Its complete node library suite and warning-free core/
 node Clippy gate passed locally. No remote compilation server was used.
 
-- [ ] **M5-01 / P1 — Protect multiple named roots with independent revision chains.**
-  `Node::add_protected_root` still rejects a second path, status and the watcher
-  expose one root, and `UserRevision`/retention track one sequence per owner.
-  Add durable root IDs to signed revisions and tombstones, keep a head and dirty
-  state per root, schedule every dirty root, and cover independent backup,
-  retention, restart, and restore selection.
+- [x] **M5-01 / P1 — Protect multiple named roots with independent revision chains.**
+  Signed revision format 3 and checkpoint format 6 bind every revision and
+  retention tombstone to a protected-root UUID. The node keeps durable heads,
+  dirty state, watcher signals, automatic scheduling, status, explicit backup
+  selection, snapshot selection, and retention per root. Recovery atomically
+  installs all certified root heads, registers the restored root under its
+  signed ID, and continues that chain after restart. Focused model, retention,
+  recovery-store, local-control, and restart regressions pass; the ignored
+  provisioned Btrfs/QUIC gate now covers two roots for one owner and exact-root
+  restore.
 - [ ] **M5-02 / P1 — Integrate stable-slot incremental packing into production.**
   `mb_core::pack_incremental` and `unpack_object` are exercised only by core
   tests. The production backup path groups complete 64 KiB owner sectors into
@@ -604,7 +608,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   preferring participants and retaining relay/onion availability.
 - [ ] **M5-04 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
-  assertion, now corrected to version 5, but the provisioned Btrfs production
+  assertion, now corrected to version 6, but the provisioned Btrfs production
   path has not been rerun for the reopened work. Run formatting, locked
   all-target workspace tests, warning-free locked all-target Clippy, and the
   local reflink/network acceptance gate after M5-01 through M5-03 close.

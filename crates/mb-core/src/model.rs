@@ -17,7 +17,7 @@ use crate::{
 
 pub type SectorId = [u8; 32];
 pub type CodingGroupId = [u8; 32];
-pub const USER_REVISION_DOMAIN: &[u8] = b"mutualbackup/user-revision/v2";
+pub const USER_REVISION_DOMAIN: &[u8] = b"mutualbackup/user-revision/v3";
 const WRITER_REVISION_DOMAIN: &[u8] = b"mutualbackup/writer-revision/v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -73,6 +73,7 @@ pub struct WriterFence {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RevisionTombstone {
     pub owner: NodeId,
+    pub protected_root_id: Uuid,
     pub through_sequence: u64,
     pub last_revision_id: Uuid,
     pub last_revision_hash: [u8; 32],
@@ -530,8 +531,8 @@ impl Serialize for GuildCheckpoint {
         S: Serializer,
     {
         let field_count = match (self.format_version, self.authority) {
-            (version, None) if version != 5 => 10,
-            (5, Some(_)) => 11,
+            (3 | 4, None) => 10,
+            (5 | 6, Some(_)) => 11,
             _ => {
                 return Err(serde::ser::Error::custom(
                     "invalid checkpoint authority version",
@@ -586,8 +587,8 @@ impl<'de> Deserialize<'de> for GuildCheckpoint {
                 let revisions = next_checkpoint_field(&mut sequence, "revisions")?;
                 let coding_groups = next_checkpoint_field(&mut sequence, "coding groups")?;
                 let authority = match format_version {
-                    version if version != 5 => None,
-                    5 => Some(next_checkpoint_field(&mut sequence, "authority")?),
+                    3 | 4 => None,
+                    5 | 6 => Some(next_checkpoint_field(&mut sequence, "authority")?),
                     _ => return Err(serde::de::Error::custom("invalid checkpoint version")),
                 };
                 Ok(GuildCheckpoint {
@@ -634,14 +635,14 @@ pub struct QuorumCheckpoint {
 
 impl GuildCheckpoint {
     pub fn validate(&self) -> Result<(), ModelError> {
-        if !matches!(self.format_version, 3..=5)
+        if !matches!(self.format_version, 3..=6)
             || self.genesis_hash == [0; 32]
             || self.generation == 0
             || self.generation > i64::MAX as u64
             || (self.generation == 1) != self.parent.is_none()
             || match self.format_version {
                 3 => self.members.len() != 5,
-                4 | 5 => self.members.is_empty() || self.members.len() > 256,
+                4..=6 => self.members.is_empty() || self.members.len() > 256,
                 _ => true,
             }
             || self.revisions.is_empty()
@@ -653,7 +654,7 @@ impl GuildCheckpoint {
         }
         match (self.format_version, self.authority) {
             (3 | 4, None) => {}
-            (5, Some(authority))
+            (5 | 6, Some(authority))
                 if authority.format_version == 1
                     && authority.membership_epoch > 0
                     && authority.quorum.required(self.members.len()).is_ok() => {}
@@ -682,7 +683,8 @@ impl GuildCheckpoint {
         let mut revision_ids = std::collections::BTreeSet::new();
         let mut revision_order = None;
         let mut revision_sectors = std::collections::BTreeMap::new();
-        let mut revision_heads = std::collections::BTreeMap::<NodeId, (u64, [u8; 32], u64)>::new();
+        let mut revision_heads =
+            std::collections::BTreeMap::<(NodeId, Uuid), (u64, [u8; 32], u64)>::new();
         let mut fences = std::collections::BTreeMap::<(NodeId, u64), [u8; 32]>::new();
         let mut latest_fences = std::collections::BTreeMap::<NodeId, u64>::new();
         let mut previous_fence = None;
@@ -704,35 +706,40 @@ impl GuildCheckpoint {
             }
             previous_fence = Some(order);
         }
-        let mut tombstones = std::collections::BTreeMap::<NodeId, &RevisionTombstone>::new();
+        let mut tombstones =
+            std::collections::BTreeMap::<(NodeId, Uuid), &RevisionTombstone>::new();
         let mut previous_tombstone = None;
         for tombstone in &self.revision_tombstones {
-            if previous_tombstone.is_some_and(|previous| previous >= tombstone.owner)
+            let order = (tombstone.owner, tombstone.protected_root_id);
+            if previous_tombstone.is_some_and(|previous| previous >= order)
                 || self.format_version == 3 && !member_ids.contains(&tombstone.owner)
+                || tombstone.protected_root_id.is_nil()
                 || tombstone.through_sequence == 0
                 || tombstone.last_revision_id.is_nil()
                 || tombstone.last_revision_hash == [0; 32]
                 || tombstone.retired_at_generation < 2
                 || tombstone.retired_at_generation > self.generation
-                || tombstones.insert(tombstone.owner, tombstone).is_some()
+                || tombstones.insert(order, tombstone).is_some()
             {
                 return Err(ModelError::InvalidCheckpoint);
             }
-            previous_tombstone = Some(tombstone.owner);
+            previous_tombstone = Some(order);
         }
         for revision in &self.revisions {
             revision.verify(USER_REVISION_DOMAIN)?;
             revision.value.verify_writer()?;
             let order = (
                 revision.value.owner,
+                revision.value.protected_root_id,
                 revision.value.sequence,
                 revision.value.revision_id,
             );
             if revision_order.is_some_and(|previous| previous >= order)
                 || revision.signer != revision.value.owner
                 || self.format_version == 3 && !member_ids.contains(&revision.signer)
-                || revision.value.format_version != 2
+                || revision.value.format_version != 3
                 || revision.value.guild_id != self.guild_id
+                || revision.value.protected_root_id.is_nil()
                 || revision.value.cipher_profile != V1_CIPHER_PROFILE
                 || revision.value.sequence == 0
                 || revision.value.metadata_sectors.is_empty()
@@ -745,12 +752,13 @@ impl GuildCheckpoint {
             {
                 return Err(ModelError::InvalidCheckpoint);
             }
-            match revision_heads.get(&revision.value.owner) {
+            let chain = (revision.value.owner, revision.value.protected_root_id);
+            match revision_heads.get(&chain) {
                 Some((previous_sequence, previous_hash, previous_writer_epoch))
                     if previous_sequence.checked_add(1) == Some(revision.value.sequence)
                         && revision.value.parent == Some(*previous_hash)
                         && revision.value.writer_epoch >= *previous_writer_epoch => {}
-                None => match tombstones.get(&revision.value.owner) {
+                None => match tombstones.get(&chain) {
                     Some(tombstone)
                         if tombstone.through_sequence.checked_add(1)
                             == Some(revision.value.sequence)
@@ -776,7 +784,7 @@ impl GuildCheckpoint {
                 }
             }
             revision_heads.insert(
-                revision.value.owner,
+                chain,
                 (
                     revision.value.sequence,
                     revision.value.hash()?,
@@ -785,17 +793,19 @@ impl GuildCheckpoint {
             );
             revision_order = Some(order);
         }
-        for (owner, (_, _, head_writer_epoch)) in &revision_heads {
-            let Some(latest) = latest_fences.get(owner) else {
-                return Err(ModelError::InvalidCheckpoint);
-            };
-            if head_writer_epoch != latest {
+        for (owner, latest_epoch) in &latest_fences {
+            if !revision_heads
+                .iter()
+                .any(|((head_owner, _), (_, _, epoch))| {
+                    head_owner == owner && epoch == latest_epoch
+                })
+            {
                 return Err(ModelError::InvalidCheckpoint);
             }
         }
         if !tombstones
             .keys()
-            .all(|owner| revision_heads.contains_key(owner))
+            .all(|chain| revision_heads.contains_key(chain))
         {
             return Err(ModelError::InvalidCheckpoint);
         }
@@ -1093,6 +1103,7 @@ impl GuildCheckpoint {
 pub struct UserRevision {
     pub format_version: u16,
     pub guild_id: [u8; 32],
+    pub protected_root_id: Uuid,
     pub cipher_profile: u16,
     pub revision_id: Uuid,
     pub owner: NodeId,
@@ -1139,7 +1150,7 @@ impl UserRevision {
 
     /// Stable identity used by the next revision's `parent` field.
     pub fn hash(&self) -> Result<[u8; 32], ModelError> {
-        let mut hasher = blake3::Hasher::new_derive_key("mutualbackup user revision body v2");
+        let mut hasher = blake3::Hasher::new_derive_key("mutualbackup user revision body v3");
         hasher.update(&canonical_bytes(self)?);
         Ok(*hasher.finalize().as_bytes())
     }
@@ -1544,8 +1555,9 @@ mod tests {
         group.id = group.calculate_id().unwrap();
         let writer = SigningKey::from_bytes(&[77; 32]);
         let mut revision_body = UserRevision {
-            format_version: 2,
+            format_version: 3,
             guild_id,
+            protected_root_id: Uuid::from_u128(99),
             cipher_profile: V1_CIPHER_PROFILE,
             revision_id: Uuid::from_u128(1),
             owner: keys[0].node_id(),
@@ -1596,6 +1608,29 @@ mod tests {
         variable_checkpoint.format_version = 4;
         variable_checkpoint.coding_groups.clear();
         variable_checkpoint.validate().unwrap();
+
+        let mut second_root = variable_checkpoint.revisions[0].value.clone();
+        second_root.protected_root_id = Uuid::from_u128(100);
+        second_root.revision_id = Uuid::from_u128(2);
+        second_root.metadata_sectors[0].id = [21; 32];
+        second_root.metadata_sectors[0].root = [22; 32];
+        second_root.writer_signature.clear();
+        second_root.sign_writer(&writer).unwrap();
+        variable_checkpoint
+            .revisions
+            .push(SignedRecord::sign(USER_REVISION_DOMAIN, second_root, &keys[0]).unwrap());
+        variable_checkpoint.revisions.sort_by_key(|revision| {
+            (
+                revision.value.owner,
+                revision.value.protected_root_id,
+                revision.value.sequence,
+                revision.value.revision_id,
+            )
+        });
+        variable_checkpoint.validate().unwrap();
+        let mut changed_root = variable_checkpoint.revisions[0].clone();
+        changed_root.value.protected_root_id = Uuid::from_u128(101);
+        assert!(changed_root.verify(USER_REVISION_DOMAIN).is_err());
 
         #[derive(Serialize)]
         struct LegacyGuildCheckpoint {
@@ -1684,6 +1719,14 @@ mod tests {
             policy_quorum.add_signature(key).unwrap();
         }
         policy_quorum.verify().unwrap();
+        let mut root_scoped_checkpoint = policy_quorum.checkpoint.clone();
+        root_scoped_checkpoint.format_version = 6;
+        root_scoped_checkpoint.validate().unwrap();
+        let root_scoped_bytes = canonical_bytes(&root_scoped_checkpoint).unwrap();
+        assert_eq!(
+            decode_canonical::<GuildCheckpoint>(&root_scoped_bytes).unwrap(),
+            root_scoped_checkpoint
+        );
         let mut invalid_signature = policy_quorum.signatures[0].clone();
         invalid_signature.signature[0] ^= 1;
         assert!(
@@ -1747,8 +1790,9 @@ mod tests {
             logical_len: 1,
         };
         let mut next_revision = UserRevision {
-            format_version: 2,
+            format_version: 3,
             guild_id,
+            protected_root_id: Uuid::from_u128(99),
             cipher_profile: V1_CIPHER_PROFILE,
             revision_id: Uuid::from_u128(2),
             owner: keys[0].node_id(),
@@ -1796,6 +1840,7 @@ mod tests {
         let retired = retained.revisions.remove(0);
         retained.revision_tombstones.push(RevisionTombstone {
             owner: retired.value.owner,
+            protected_root_id: retired.value.protected_root_id,
             through_sequence: retired.value.sequence,
             last_revision_id: retired.value.revision_id,
             last_revision_hash: retired.value.hash().unwrap(),

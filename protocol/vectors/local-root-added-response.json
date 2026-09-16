@@ -1,1 +1,1 @@
-{"format_version":1,"request_id":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16],"result":{"Ok":{"RootAdded":{"format_version":3,"root_id":"00112233-4455-6677-8899-aabbccddeeff","path":"/srv/source","filesystem_id":41,"root_inode":43}}}}
+{"format_version":2,"request_id":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16],"result":{"Ok":{"RootAdded":{"format_version":3,"root_id":"00112233-4455-6677-8899-aabbccddeeff","path":"/srv/source","filesystem_id":41,"root_inode":43}}}}

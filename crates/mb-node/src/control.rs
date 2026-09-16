@@ -58,7 +58,7 @@ pub struct NodeStatus {
     pub format_version: u16,
     pub node_id: NodeId,
     pub data_dir: PathBuf,
-    pub protected_root: Option<ProtectedRoot>,
+    pub protected_roots: Vec<ProtectedRoot>,
     pub checkpoint_count: u64,
     pub seed_recovery_ready: bool,
     pub root_dirty: bool,
@@ -507,7 +507,7 @@ async fn handle_request(
                 event_hash,
             },
         ),
-        LocalRequest::Backup { wait } => submit_local_backup(node, &p2p, wait)
+        LocalRequest::Backup { wait, root_id } => submit_local_backup(node, &p2p, wait, root_id)
             .await
             .map(LocalResponse::BackupJob),
         LocalRequest::BackupStatus { revision_id } => {
@@ -561,9 +561,10 @@ pub(crate) async fn submit_local_backup(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
     wait: bool,
+    root_id: Option<Uuid>,
 ) -> Result<BackupJob> {
-    let (descriptor, guild, local_id) = blocking_node(node.clone(), |node| {
-        let descriptor = node.prepare_protected_backup()?;
+    let (descriptor, guild, local_id) = blocking_node(node.clone(), move |node| {
+        let descriptor = node.prepare_protected_backup(root_id)?;
         let guild = node
             .guild_summary()?
             .context("this node has no active guild")?;

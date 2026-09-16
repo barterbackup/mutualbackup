@@ -150,11 +150,13 @@ impl PrototypeGuild {
     pub fn commit_source(&mut self, owner_index: usize, source: &Path) -> Result<QuorumCheckpoint> {
         let role_indices = role_indices(owner_index, self.nodes.len())?;
         let owner = self.live_node(role_indices[0])?;
-        let revision =
-            owner
-                .lock()
-                .map_err(lock_error)?
-                .prepare_revision(self.guild_id, source, 1, None)?;
+        let revision = owner.lock().map_err(lock_error)?.prepare_revision(
+            self.guild_id,
+            uuid::Uuid::from_bytes([1; 16]),
+            source,
+            1,
+            None,
+        )?;
         let mut target_sectors = revision.value.metadata_sectors.clone();
         target_sectors.extend(revision.value.data_sectors.clone());
         let mut groups = Vec::with_capacity(target_sectors.len());
@@ -339,7 +341,13 @@ impl PrototypeGuild {
             .revisions
             .iter()
             .filter(|revision| revision.value.owner == recovered.keys().node_id())
-            .max_by_key(|revision| revision.value.sequence);
+            .max_by_key(|revision| {
+                (
+                    revision.value.sequence,
+                    revision.value.protected_root_id,
+                    revision.value.revision_id,
+                )
+            });
         if let Some(revision) = revision {
             recovered.restore_recovered_revision(
                 &checkpoint_hash,

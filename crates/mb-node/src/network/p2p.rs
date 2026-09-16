@@ -8018,7 +8018,7 @@ async fn recover_from_dht_once(
     let recovered_roster = roster.clone();
     let recovery_checkpoint = checkpoint.clone();
     node_blocking(node.clone(), move |node| {
-        if matches!(recovery_checkpoint.checkpoint.format_version, 4 | 5) {
+        if matches!(recovery_checkpoint.checkpoint.format_version, 4..=6) {
             node.adopt_recovered_dynamic_guild(
                 recovered_genesis,
                 &recovery_checkpoint,
@@ -8050,7 +8050,13 @@ async fn recover_from_dht_once(
         .revisions
         .iter()
         .filter(|revision| revision.value.owner == subject)
-        .max_by_key(|revision| revision.value.sequence)
+        .max_by_key(|revision| {
+            (
+                revision.value.sequence,
+                revision.value.protected_root_id,
+                revision.value.revision_id,
+            )
+        })
         .cloned();
     let revision_id = revision.as_ref().map(|revision| revision.value.revision_id);
     if let Some(revision) = revision {
@@ -9346,7 +9352,7 @@ async fn recover_p2p_variable_shards(
     checkpoint: &QuorumCheckpoint,
     roster: &[GuildPeer],
 ) -> Result<()> {
-    if !matches!(checkpoint.checkpoint.format_version, 4 | 5) {
+    if !matches!(checkpoint.checkpoint.format_version, 4..=6) {
         return Ok(());
     }
     let checkpoint_hash = checkpoint.hash()?;
@@ -10595,6 +10601,7 @@ async fn commit_backup_job(
     if revision.signer != job.descriptor.owner
         || revision.value.owner != job.descriptor.owner
         || revision.value.guild_id != guild_id
+        || revision.value.protected_root_id != job.descriptor.protected_root_id
         || revision.value.revision_id != job.descriptor.revision_id
     {
         bail!("prepared revision does not match its backup submission");
@@ -10638,6 +10645,7 @@ async fn commit_backup_job(
     revisions.sort_by_key(|revision| {
         (
             revision.value.owner,
+            revision.value.protected_root_id,
             revision.value.sequence,
             revision.value.revision_id,
         )
@@ -10652,7 +10660,7 @@ async fn commit_backup_job(
     )?;
     coding_groups.clear();
     let checkpoint = GuildCheckpoint {
-        format_version: 5,
+        format_version: 6,
         guild_id,
         genesis_hash: certificate.hash()?,
         generation,
@@ -10845,33 +10853,36 @@ fn apply_revision_retention(
     if retain_per_owner == 0 {
         bail!("revision retention must keep at least one revision per owner");
     }
-    let mut retire_through = BTreeMap::<NodeId, u64>::new();
-    let mut per_owner = BTreeMap::<NodeId, Vec<&SignedRecord<UserRevision>>>::new();
+    let mut retire_through = BTreeMap::<(NodeId, Uuid), u64>::new();
+    let mut per_root = BTreeMap::<(NodeId, Uuid), Vec<&SignedRecord<UserRevision>>>::new();
     for revision in revisions.iter() {
-        per_owner
-            .entry(revision.value.owner)
+        per_root
+            .entry((revision.value.owner, revision.value.protected_root_id))
             .or_default()
             .push(revision);
     }
-    for (owner, owned) in per_owner {
+    for ((owner, protected_root_id), owned) in per_root {
         if owned.len() <= retain_per_owner {
             continue;
         }
         let last_retired = owned[owned.len() - retain_per_owner - 1];
-        retire_through.insert(owner, last_retired.value.sequence);
-        tombstones.retain(|tombstone| tombstone.owner != owner);
+        retire_through.insert((owner, protected_root_id), last_retired.value.sequence);
+        tombstones.retain(|tombstone| {
+            (tombstone.owner, tombstone.protected_root_id) != (owner, protected_root_id)
+        });
         tombstones.push(mb_core::RevisionTombstone {
             owner,
+            protected_root_id,
             through_sequence: last_retired.value.sequence,
             last_revision_id: last_retired.value.revision_id,
             last_revision_hash: last_retired.value.hash()?,
             retired_at_generation: generation,
         });
     }
-    tombstones.sort_by_key(|tombstone| tombstone.owner);
+    tombstones.sort_by_key(|tombstone| (tombstone.owner, tombstone.protected_root_id));
     revisions.retain(|revision| {
         retire_through
-            .get(&revision.value.owner)
+            .get(&(revision.value.owner, revision.value.protected_root_id))
             .is_none_or(|through| revision.value.sequence > *through)
     });
     let live_sectors = revisions
@@ -11738,8 +11749,9 @@ mod tests {
     fn writer_fence_rejects_a_superseded_incarnation() {
         fn revision(owner: NodeId, epoch: u64, writer: &ed25519_dalek::SigningKey) -> UserRevision {
             let mut revision = UserRevision {
-                format_version: 2,
+                format_version: 3,
                 guild_id: [201; 32],
+                protected_root_id: Uuid::from_bytes([1; 16]),
                 cipher_profile: mb_core::V1_CIPHER_PROFILE,
                 revision_id: Uuid::new_v4(),
                 owner,
@@ -11763,6 +11775,71 @@ mod tests {
         include_writer_fence(&mut fences, &revision(owner, 2, &recovered)).unwrap();
         let error = include_writer_fence(&mut fences, &revision(owner, 1, &first)).unwrap_err();
         assert!(error.to_string().contains("stale"));
+    }
+
+    #[test]
+    fn revision_retention_is_independent_per_protected_root() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([220; 32]));
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[221; 32]);
+        let mut revisions = Vec::new();
+        for root_byte in [1_u8, 2] {
+            let root_id = Uuid::from_bytes([root_byte; 16]);
+            let mut parent = None;
+            for sequence in 1_u64..=2 {
+                let mut revision = UserRevision {
+                    format_version: 3,
+                    guild_id: [222; 32],
+                    protected_root_id: root_id,
+                    cipher_profile: mb_core::V1_CIPHER_PROFILE,
+                    revision_id: Uuid::from_u128(u128::from(root_byte) * 10 + u128::from(sequence)),
+                    owner: keys.node_id(),
+                    writer_epoch: 1,
+                    writer_public_key: writer.verifying_key().to_bytes(),
+                    writer_signature: Vec::new(),
+                    sequence,
+                    parent,
+                    metadata_sectors: vec![SectorRef {
+                        id: [root_byte * 10 + sequence as u8; 32],
+                        root: [root_byte * 10 + sequence as u8 + 1; 32],
+                        logical_len: 1,
+                    }],
+                    data_sectors: Vec::new(),
+                };
+                revision.sign_writer(&writer).unwrap();
+                parent = Some(revision.hash().unwrap());
+                revisions.push(
+                    SignedRecord::sign(mb_core::USER_REVISION_DOMAIN, revision, &keys).unwrap(),
+                );
+            }
+        }
+        revisions.sort_by_key(|revision| {
+            (
+                revision.value.owner,
+                revision.value.protected_root_id,
+                revision.value.sequence,
+                revision.value.revision_id,
+            )
+        });
+        let mut tombstones = Vec::new();
+        let mut coding_groups = Vec::new();
+
+        apply_revision_retention(2, 1, &mut tombstones, &mut revisions, &mut coding_groups)
+            .unwrap();
+
+        assert_eq!(revisions.len(), 2);
+        assert!(
+            revisions
+                .iter()
+                .all(|revision| revision.value.sequence == 2)
+        );
+        assert_eq!(tombstones.len(), 2);
+        assert_eq!(
+            tombstones
+                .iter()
+                .map(|tombstone| tombstone.protected_root_id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16])])
+        );
     }
 
     #[test]
@@ -14031,7 +14108,7 @@ mod tests {
         let (second_group, second_bytes) = group_for(guild_id, local_id, other_ids, 47);
         let checkpoint = QuorumCheckpoint {
             checkpoint: GuildCheckpoint {
-                format_version: 1,
+                format_version: 3,
                 guild_id,
                 genesis_hash: [126; 32],
                 generation: 1,
@@ -15775,8 +15852,9 @@ mod tests {
                 .unwrap();
             let writer = ed25519_dalek::SigningKey::from_bytes(&[230 + index as u8; 32]);
             let mut revision = UserRevision {
-                format_version: 2,
+                format_version: 3,
                 guild_id,
+                protected_root_id: Uuid::from_bytes([1; 16]),
                 cipher_profile: mb_core::V1_CIPHER_PROFILE,
                 revision_id,
                 owner: node.keys().node_id(),
@@ -15803,6 +15881,7 @@ mod tests {
         revisions.sort_by_key(|revision| {
             (
                 revision.value.owner,
+                revision.value.protected_root_id,
                 revision.value.sequence,
                 revision.value.revision_id,
             )
@@ -16297,6 +16376,7 @@ mod tests {
         };
 
         let mut watcher_task = None;
+        let mut owner_one_primary = None;
         for (owner_index, expected_generation) in [(1_usize, 1_u64), (2, 2)] {
             let source = run_root.join(format!("source-{owner_index}"));
             std::fs::create_dir_all(source.join("documents")).unwrap();
@@ -16306,11 +16386,14 @@ mod tests {
             )
             .unwrap();
             let owner_id = nodes[owner_index].lock().unwrap().keys().node_id();
-            nodes[owner_index]
+            let root = nodes[owner_index]
                 .lock()
                 .unwrap()
                 .add_protected_root(&source)
                 .unwrap();
+            if owner_index == 1 {
+                owner_one_primary = Some(root);
+            }
             if owner_index == 2 {
                 watcher_task = Some(tokio::spawn(crate::run_root_watcher(
                     nodes[owner_index].clone(),
@@ -16320,7 +16403,7 @@ mod tests {
             let descriptor = nodes[owner_index]
                 .lock()
                 .unwrap()
-                .prepare_protected_backup()
+                .prepare_protected_backup(None)
                 .unwrap();
             let queued = nodes[0]
                 .lock()
@@ -16346,15 +16429,95 @@ mod tests {
                 assert_eq!(checkpoint.checkpoint.genesis_hash, genesis.hash().unwrap());
             }
         }
+        let owner_one_primary = owner_one_primary.unwrap();
+        let secondary_source = run_root.join("source-1-secondary");
+        std::fs::create_dir_all(secondary_source.join("documents")).unwrap();
+        let secondary_content = b"independent secondary protected root".repeat(4096);
+        std::fs::write(
+            secondary_source.join("documents/content.bin"),
+            &secondary_content,
+        )
+        .unwrap();
+        let secondary_root = nodes[1]
+            .lock()
+            .unwrap()
+            .add_protected_root(&secondary_source)
+            .unwrap();
+        let owner_one_id = nodes[1].lock().unwrap().keys().node_id();
+        let secondary_descriptor = nodes[1]
+            .lock()
+            .unwrap()
+            .prepare_protected_backup(Some(secondary_root.root_id))
+            .unwrap();
+        let queued = nodes[0]
+            .lock()
+            .unwrap()
+            .enqueue_backup(owner_one_id, secondary_descriptor.clone())
+            .unwrap();
+        let checkpoint_hash = commit_backup_job(nodes[0].clone(), &clients[0], &queued)
+            .await
+            .unwrap();
+        nodes[0]
+            .lock()
+            .unwrap()
+            .complete_backup_job(&secondary_descriptor, checkpoint_hash)
+            .unwrap();
+
+        let mut primary_updated_content = owner_content(1);
+        primary_updated_content.extend_from_slice(b"primary root second revision");
+        std::fs::write(
+            run_root.join("source-1/documents/content.bin"),
+            &primary_updated_content,
+        )
+        .unwrap();
+        nodes[1]
+            .lock()
+            .unwrap()
+            .mark_root_changed(owner_one_primary.root_id, "production test update")
+            .unwrap();
+        let primary_update = nodes[1]
+            .lock()
+            .unwrap()
+            .prepare_protected_backup(Some(owner_one_primary.root_id))
+            .unwrap();
+        let queued = nodes[0]
+            .lock()
+            .unwrap()
+            .enqueue_backup(owner_one_id, primary_update.clone())
+            .unwrap();
+        let checkpoint_hash = commit_backup_job(nodes[0].clone(), &clients[0], &queued)
+            .await
+            .unwrap();
+        nodes[0]
+            .lock()
+            .unwrap()
+            .complete_backup_job(&primary_update, checkpoint_hash)
+            .unwrap();
+
         let final_checkpoint = nodes[0]
             .lock()
             .unwrap()
             .current_checkpoint(genesis.genesis.guild_id)
             .unwrap()
             .unwrap();
-        assert_eq!(final_checkpoint.checkpoint.format_version, 5);
-        assert_eq!(final_checkpoint.checkpoint.revisions.len(), 2);
+        assert_eq!(final_checkpoint.checkpoint.format_version, 6);
+        assert_eq!(final_checkpoint.checkpoint.generation, 4);
+        assert_eq!(final_checkpoint.checkpoint.revisions.len(), 4);
         assert!(final_checkpoint.checkpoint.coding_groups.is_empty());
+        let root_sequences = |root_id| {
+            final_checkpoint
+                .checkpoint
+                .revisions
+                .iter()
+                .filter(|revision| {
+                    revision.value.owner == owner_one_id
+                        && revision.value.protected_root_id == root_id
+                })
+                .map(|revision| revision.value.sequence)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(root_sequences(owner_one_primary.root_id), vec![1, 2]);
+        assert_eq!(root_sequences(secondary_root.root_id), vec![1]);
         let protected_sector_count = final_checkpoint
             .checkpoint
             .revisions
@@ -16385,6 +16548,19 @@ mod tests {
                 .len()
                 > 1
         }));
+        let secondary_restore = run_root.join("secondary-restore-node-1");
+        restore_snapshot_with_p2p(
+            nodes[1].clone(),
+            &clients[1],
+            Some(secondary_descriptor.revision_id),
+            &secondary_restore,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(secondary_restore.join("documents/content.bin")).unwrap(),
+            secondary_content
+        );
         let forgotten_sector = final_checkpoint
             .checkpoint
             .revisions
@@ -16501,10 +16677,10 @@ mod tests {
         .await
         .expect("large recovery with three live holders must not wait for abandoned requests")
         .unwrap();
-        assert_eq!(recovered.generation, 2);
+        assert_eq!(recovered.generation, 4);
         assert_eq!(
             std::fs::read(restored.join("documents/content.bin")).unwrap(),
-            owner_content(1)
+            primary_updated_content
         );
         publish_dht_once(recovered_node.clone(), &recovery_client)
             .await
@@ -16554,6 +16730,24 @@ mod tests {
         recovery_task.await.unwrap().unwrap();
         drop(recovered_node);
         let mut reopened_recovery = Node::open(&recovered_state, seeds[1].clone()).unwrap();
+        let recovered_roots = reopened_recovery.protected_roots().unwrap();
+        assert_eq!(recovered_roots.len(), 1);
+        assert_eq!(recovered_roots[0].root_id, owner_one_primary.root_id);
+        assert_eq!(recovered_roots[0].path, restored.canonicalize().unwrap());
+        let continued = reopened_recovery
+            .prepare_protected_backup(Some(owner_one_primary.root_id))
+            .unwrap();
+        let continued_revision: SignedRecord<UserRevision> = decode_canonical(
+            &reopened_recovery
+                .prepared_revision_bytes(continued.guild_id, continued.revision_id)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            continued_revision.value.protected_root_id,
+            owner_one_primary.root_id
+        );
+        assert_eq!(continued_revision.value.sequence, 3);
         let retained = reopened_recovery
             .observed_recovery_records(recovered_id)
             .unwrap();

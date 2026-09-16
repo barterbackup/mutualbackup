@@ -2,13 +2,13 @@
 ; Frames are a 4-byte big-endian length followed by UTF-8 JSON.
 
 local-request-envelope = {
-  format_version: 1,
+  format_version: 2,
   request_id: bytes16-array,
   request: local-request
 }
 
 local-response-envelope = {
-  format_version: 1,
+  format_version: 2,
   request_id: bytes16-array,
   result: { "Ok": local-response } / { "Err": wire-error }
 }
@@ -37,7 +37,7 @@ local-request =
   / { "GuildSetQuorum": { policy: quorum-policy } }
   / "GuildRotateRecoveryKey"
   / { "GuildRevokeRecoveryKey": { subject: bytes32-array, epoch: uint } }
-  / { "Backup": { wait: bool } }
+  / { "Backup": { wait: bool, root_id: null / uuid-text } }
   / { "BackupStatus": { revision_id: uuid-text } }
   / { "Recover": { target: tstr } }
   / "SnapshotList"
@@ -81,7 +81,7 @@ node-status = {
   format_version: uint,
   node_id: bytes32-array,
   data_dir: tstr,
-  protected_root: null / protected-root,
+  protected_roots: [* protected-root],
   checkpoint_count: uint,
   seed_recovery_ready: bool,
   root_dirty: bool,
@@ -230,6 +230,7 @@ backup-descriptor = {
   format_version: uint,
   guild_id: bytes32-array,
   owner: bytes32-array,
+  protected_root_id: uuid-text,
   revision_id: uuid-text,
   total_pages: uint,
   object_hash: bytes32-array
@@ -251,6 +252,7 @@ dht-recovery-result = {
 }
 
 snapshot-info = {
+  protected_root_id: uuid-text,
   revision_id: uuid-text,
   sequence: uint,
   checkpoint_generation: uint,

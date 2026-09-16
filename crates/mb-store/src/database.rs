@@ -1037,7 +1037,7 @@ impl ControlStore {
         checkpoint_hash: &[u8; 32],
         checkpoint_body_bytes: &[u8],
         checkpoint_certificate_bytes: &[u8],
-        local_revision_head: Option<&[u8]>,
+        local_revision_heads: &[(Vec<u8>, Vec<u8>)],
         complete_recovery_attempt: bool,
     ) -> Result<(), DatabaseError> {
         let generation_i64 = i64::try_from(generation).map_err(|_| DatabaseError::Integrity)?;
@@ -1083,22 +1083,22 @@ impl ControlStore {
             checkpoint_hash,
             checkpoint_body_bytes,
         )?;
-        match local_revision_head {
-            Some(revision) => {
-                transaction.execute(
-                    "INSERT INTO protocol_records(kind, record_id, bytes)
-                     VALUES ('user-revision-head', ?1, ?2)
-                     ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
-                    params![guild_id.as_slice(), revision],
-                )?;
+        transaction.execute(
+            "DELETE FROM protocol_records
+             WHERE kind = 'user-revision-head'
+               AND (record_id = ?1 OR (length(record_id) = 48 AND substr(record_id, 1, 32) = ?1))",
+            [guild_id.as_slice()],
+        )?;
+        for (record_id, revision) in local_revision_heads {
+            if record_id.len() != 48 || &record_id[..32] != guild_id {
+                return Err(DatabaseError::Integrity);
             }
-            None => {
-                transaction.execute(
-                    "DELETE FROM protocol_records
-                     WHERE kind = 'user-revision-head' AND record_id = ?1",
-                    [guild_id.as_slice()],
-                )?;
-            }
+            transaction.execute(
+                "INSERT INTO protocol_records(kind, record_id, bytes)
+                 VALUES ('user-revision-head', ?1, ?2)
+                 ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+                params![record_id, revision],
+            )?;
         }
         transaction.execute(
             "DELETE FROM recovery_shards WHERE checkpoint_hash = ?1",
@@ -3692,6 +3692,14 @@ mod tests {
         let guild_id = [62; 32];
         let checkpoint_hash = [63; 32];
         let group_id = [64; 32];
+        let mut first_head_id = guild_id.to_vec();
+        first_head_id.extend_from_slice(&[1; 16]);
+        let mut second_head_id = guild_id.to_vec();
+        second_head_id.extend_from_slice(&[2; 16]);
+        let local_heads = vec![
+            (first_head_id.clone(), b"first-local-revision".to_vec()),
+            (second_head_id.clone(), b"second-local-revision".to_vec()),
+        ];
         let shard = vec![65; V1_SECTOR_SIZE];
         let shard_root = sector_root(&shard);
         store
@@ -3728,7 +3736,7 @@ mod tests {
                     &checkpoint_hash,
                     b"checkpoint-body",
                     b"checkpoint-certificate",
-                    Some(b"local-revision"),
+                    &local_heads,
                     false,
                 )
                 .is_err()
@@ -3763,7 +3771,7 @@ mod tests {
                 &checkpoint_hash,
                 b"checkpoint-body",
                 b"checkpoint-certificate",
-                Some(b"local-revision"),
+                &local_heads,
                 false,
             )
             .unwrap();
@@ -3772,8 +3780,16 @@ mod tests {
             Some((1, checkpoint_hash, b"checkpoint-certificate".to_vec()))
         );
         assert_eq!(
-            store.get_record("user-revision-head", &guild_id).unwrap(),
-            Some(b"local-revision".to_vec())
+            store
+                .get_record("user-revision-head", &first_head_id)
+                .unwrap(),
+            Some(b"first-local-revision".to_vec())
+        );
+        assert_eq!(
+            store
+                .get_record("user-revision-head", &second_head_id)
+                .unwrap(),
+            Some(b"second-local-revision".to_vec())
         );
         assert!(matches!(
             store.recovery_shard(&checkpoint_hash, &guild_id, &group_id, 0, &shard_root),
@@ -3807,7 +3823,7 @@ mod tests {
                 &checkpoint_hash,
                 b"checkpoint-body",
                 b"checkpoint-certificate",
-                None,
+                &[],
                 true,
             )
             .unwrap();

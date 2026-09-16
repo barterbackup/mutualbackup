@@ -1047,8 +1047,13 @@ fn execute_peer_request(
             source,
             sequence,
         } => {
-            let revision =
-                node.prepare_revision(guild_id, Path::new(&source), sequence, Some(_request_id))?;
+            let revision = node.prepare_revision(
+                guild_id,
+                Uuid::from_bytes([1; 16]),
+                Path::new(&source),
+                sequence,
+                Some(_request_id),
+            )?;
             let bytes = canonical_bytes(&revision)?;
             let total_pages = checked_catalog_page_count(bytes.len())?;
             Ok(PeerResponse::PreparedRevision {
@@ -1929,7 +1934,13 @@ async fn recover_selected_guild_over_network(
                 .revisions
                 .iter()
                 .filter(|revision| revision.value.owner == local_node_id)
-                .max_by_key(|revision| revision.value.sequence)
+                .max_by_key(|revision| {
+                    (
+                        revision.value.sequence,
+                        revision.value.protected_root_id,
+                        revision.value.revision_id,
+                    )
+                })
                 .cloned()?;
             Some((checkpoint, revision))
         })

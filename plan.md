@@ -80,9 +80,10 @@ in the matching READY retry correction. Commit `193f67e` transfers worker
 capacity with the queued result and releases it before the response becomes
 observable. Its deterministic handoff regression and the complete local
 correction gate passed on 2026-09-15. Milestone 5's first closure record was
-reopened by follow-up source review: multiple protected-root chains and
-production stable-slot packing remain absent, and delegated-coder path ranking
-does not yet cover every source and destination. Milestone 5 remains current.
+reopened by follow-up source review. Root-scoped signed revision chains are now
+implemented; production stable-slot packing remains absent, and delegated-coder
+path ranking does not yet cover every source and destination. Milestone 5
+remains current.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -322,10 +323,11 @@ Later partial-range transfer must supply proofs to that same authority.
   cursors are local catalog state, never portable signed recovery fields.
   Symlink restore and broader portable attributes come later and require an
   explicit policy that prevents path escape.
-- **Prototype UserRevision:** guild, owner, monotonic revision, optional parent,
-  explicit metadata/data `SectorRef` lists, suite versions, and owner signature.
-  It represents the member's single protected root; multiple named/root-ID
-  revision chains come later.
+- **UserRevision:** guild, owner, protected-root ID, root-scoped monotonic
+  revision, optional parent in that root's chain, explicit metadata/data
+  `SectorRef` lists, suite versions, and owner signature. Milestone 5 keeps
+  independent heads, retention tombstones, dirty state, and restore selection
+  for each named root.
 - **CodingGroup:** stable ID, shard size, versioned RS construction and row IDs,
   `k/m`, canonical ordered roles, sector roots, nodes, and failure domains.
 - **Prototype GuildGenesis:** guild ID, exactly five Node IDs/recovery keys and
@@ -726,8 +728,10 @@ explicitly require a provisioned Btrfs filesystem or private Chutney network
 remained ignored; no remote compilation server was used. Follow-up review found
 that this evidence did not exercise a production caller for the stable-slot
 packer, distinct protected-root revision chains, or candidate-to-lane path
-selection. Those gaps and a fresh provisioned production gate must close before
-Milestone 5 can pass.
+selection. Root-scoped signed chains, scheduling, retention, restore selection,
+and recovered-chain continuation now close the protected-root gap. Production
+packing, candidate-to-lane path selection, and a fresh provisioned production
+gate must still close before Milestone 5 can pass.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer

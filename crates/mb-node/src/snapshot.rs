@@ -372,10 +372,19 @@ pub(crate) struct WriterCredentials<'a> {
     pub captured_change_sequence: Option<u64>,
 }
 
+pub(crate) fn revision_head_id(guild_id: [u8; 32], protected_root_id: Uuid) -> Vec<u8> {
+    let mut id = Vec::with_capacity(48);
+    id.extend_from_slice(&guild_id);
+    id.extend_from_slice(protected_root_id.as_bytes());
+    id
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_revision(
     control: &mut ControlStore,
     keys: &KeyMaterial,
     guild_id: [u8; 32],
+    protected_root_id: Uuid,
     source_root: &Path,
     sequence: u64,
     revision_id: Option<Uuid>,
@@ -392,6 +401,7 @@ pub(crate) fn prepare_revision(
         if existing.value.revision_id != revision_id
             || existing.value.owner != keys.node_id()
             || existing.value.guild_id != guild_id
+            || existing.value.protected_root_id != protected_root_id
             || existing.value.sequence != sequence
             || existing.value.writer_epoch != writer_epoch
             || existing.value.writer_public_key
@@ -403,7 +413,8 @@ pub(crate) fn prepare_revision(
         }
         return Ok(existing);
     }
-    let parent = match control.get_record("user-revision-head", &guild_id)? {
+    let head_id = revision_head_id(guild_id, protected_root_id);
+    let parent = match control.get_record("user-revision-head", &head_id)? {
         Some(bytes) => {
             let previous: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
             previous.verify(USER_REVISION_DOMAIN)?;
@@ -411,7 +422,8 @@ pub(crate) fn prepare_revision(
             if previous.signer != keys.node_id()
                 || previous.value.owner != keys.node_id()
                 || previous.value.guild_id != guild_id
-                || previous.value.format_version != 2
+                || previous.value.protected_root_id != protected_root_id
+                || previous.value.format_version != 3
                 || previous.value.cipher_profile != V1_CIPHER_PROFILE
                 || previous.value.sequence.checked_add(1) != Some(sequence)
             {
@@ -623,8 +635,9 @@ pub(crate) fn prepare_revision(
 
         let writer = SigningKey::from_bytes(writer_secret);
         let mut revision = UserRevision {
-            format_version: 2,
+            format_version: 3,
             guild_id,
+            protected_root_id,
             cipher_profile: V1_CIPHER_PROFILE,
             revision_id,
             owner: keys.node_id(),
@@ -660,7 +673,7 @@ pub(crate) fn prepare_revision(
             ),
             (
                 "user-revision-head".to_owned(),
-                guild_id.to_vec(),
+                head_id,
                 canonical_bytes(&revision)?,
             ),
         ]);
@@ -1834,7 +1847,7 @@ fn validate_restore_revision(
     if revision.signer != keys.node_id()
         || revision.value.owner != keys.node_id()
         || revision.value.guild_id != guild_id
-        || revision.value.format_version != 2
+        || revision.value.format_version != 3
         || revision.value.cipher_profile != V1_CIPHER_PROFILE
     {
         bail!("revision does not belong to the recovering seed and guild");
@@ -2075,7 +2088,7 @@ where
     if revision.signer != keys.node_id()
         || revision.value.owner != keys.node_id()
         || revision.value.guild_id != guild_id
-        || revision.value.format_version != 2
+        || revision.value.format_version != 3
         || revision.value.cipher_profile != V1_CIPHER_PROFILE
     {
         bail!("revision does not belong to the recovering seed and guild");
@@ -2685,8 +2698,9 @@ mod metadata_compatibility_tests {
         }
         let writer = SigningKey::from_bytes(&[75; 32]);
         let mut revision_body = UserRevision {
-            format_version: 2,
+            format_version: 3,
             guild_id,
+            protected_root_id: Uuid::from_bytes([1; 16]),
             cipher_profile: V1_CIPHER_PROFILE,
             revision_id,
             owner: keys.node_id(),
@@ -3453,6 +3467,7 @@ mod metadata_compatibility_tests {
             &mut control,
             &keys,
             guild_id,
+            Uuid::from_bytes([1; 16]),
             &source,
             1,
             Some(revision_id),
@@ -3475,6 +3490,7 @@ mod metadata_compatibility_tests {
             &mut control,
             &keys,
             guild_id,
+            Uuid::from_bytes([1; 16]),
             &source,
             1,
             Some(revision_id),
@@ -3567,6 +3583,7 @@ mod metadata_compatibility_tests {
             &mut control,
             &keys,
             guild_id,
+            Uuid::from_bytes([1; 16]),
             &source,
             1,
             None,
@@ -3681,6 +3698,7 @@ mod metadata_compatibility_tests {
             &mut control,
             &keys,
             guild_id,
+            Uuid::from_bytes([1; 16]),
             &source,
             1,
             None,

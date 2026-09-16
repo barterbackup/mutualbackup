@@ -39,7 +39,7 @@ pub async fn run_automatic_backups(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Re
                 }
             }
             AutomaticBackupPoll::Start { estimated_bytes } => {
-                match submit_local_backup(node.clone(), &p2p, false).await {
+                match submit_local_backup(node.clone(), &p2p, false, None).await {
                     Ok(job) => {
                         let revision_id = job.descriptor.revision_id;
                         node_blocking(node.clone(), move |node| {

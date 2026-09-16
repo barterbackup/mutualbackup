@@ -92,7 +92,7 @@ enum Command {
         #[arg(long, conflicts_with = "seed_file")]
         seed_stdin: bool,
     },
-    /// Manage the single protected root in the prototype.
+    /// Manage protected roots.
     Root {
         #[command(subcommand)]
         command: RootCommand,
@@ -107,6 +107,9 @@ enum Command {
         /// Wait until the checkpoint is committed.
         #[arg(long)]
         wait: bool,
+        /// Back up this root ID; defaults to the next dirty root.
+        #[arg(long)]
+        root_id: Option<Uuid>,
     },
     /// Inspect a durable backup job by revision ID.
     BackupStatus { revision_id: Uuid },
@@ -351,9 +354,12 @@ async fn main() -> Result<()> {
             for volume in status.storage_volumes {
                 print_storage_volume(&volume);
             }
-            match status.protected_root {
-                Some(root) => println!("protected root: {}", root.path.display()),
-                None => println!("protected root: (not configured)"),
+            if status.protected_roots.is_empty() {
+                println!("protected roots: (not configured)");
+            } else {
+                for root in status.protected_roots {
+                    println!("protected root {}: {}", root.root_id, root.path.display());
+                }
             }
             if let Some(network) = status.network {
                 println!("libp2p peer id: {}", network.peer_id);
@@ -610,9 +616,10 @@ async fn main() -> Result<()> {
                 _ => bail!("daemon returned the wrong response to guild request"),
             }
         }
-        Command::Backup { wait } => {
+        Command::Backup { wait, root_id } => {
             let response =
-                local_control_call(&control_socket, &LocalRequest::Backup { wait }).await?;
+                local_control_call(&control_socket, &LocalRequest::Backup { wait, root_id })
+                    .await?;
             let LocalResponse::BackupJob(job) = response else {
                 bail!("daemon returned the wrong response to backup request");
             };
@@ -673,8 +680,11 @@ async fn main() -> Result<()> {
                 };
                 for snapshot in snapshots {
                     println!(
-                        "{} sequence={} checkpoint-generation={}",
-                        snapshot.revision_id, snapshot.sequence, snapshot.checkpoint_generation
+                        "{} root={} sequence={} checkpoint-generation={}",
+                        snapshot.revision_id,
+                        snapshot.protected_root_id,
+                        snapshot.sequence,
+                        snapshot.checkpoint_generation
                     );
                 }
             }
@@ -864,6 +874,7 @@ async fn derive_seed(recovery: &Zeroizing<String>) -> Result<Seed> {
 }
 
 fn print_backup_job(job: &mb_node::BackupJob) {
+    println!("root:       {}", job.descriptor.protected_root_id);
     println!("revision:   {}", job.descriptor.revision_id);
     println!("state:      {:?}", job.state);
     if let Some(hash) = job.checkpoint_hash {
