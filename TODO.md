@@ -677,7 +677,15 @@ node Clippy gate passed locally. No remote compilation server was used.
   started watcher later wrote generation 2 for startup reconciliation. Install
   every filesystem watch before advancing that generation, expose a readiness
   signal, and require the production path to observe it before capture.
-- [ ] **M5-12 / gate — Run the corrected production gate.**
+- [x] **M5-12 / P1 — Pin cold recovery against its certified dynamic state.**
+  The next production run completed all 51 coding transcripts and entered cold
+  recovery, then rejected a current-epoch recovery bundle because recovery
+  attempt pinning ran before dynamic guild adoption and re-read the necessarily
+  absent local dynamic state. Pass the already certified downloaded state into
+  recovery-observation reconciliation while retaining local-state validation
+  for ordinary readiness, and regress pinning on a fresh node with no installed
+  dynamic state.
+- [ ] **M5-13 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -687,11 +695,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   The following run passed final-checkpoint readiness but exposed M5-10 when
   cold recovery applied an older, narrower copy of the same validation rule.
   The next run exposed M5-11 when its fixed watcher-startup sleep lost a race
-  with capture after the full coding workload completed.
+  with capture after the full coding workload completed. The following run
+  completed all 51 transcripts and exposed M5-12 when cold-recovery pinning
+  consulted local dynamic state before the certified downloaded state had been
+  adopted.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-11 close.
+  acceptance gate after M5-01 through M5-12 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

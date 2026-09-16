@@ -8201,8 +8201,13 @@ async fn recover_from_dht_once(
         .map(|candidate| candidate.observation.clone())
         .collect();
     let checkpoint_for_attempt = checkpoint.clone();
+    let state_for_attempt = state.clone();
     node_blocking(node.clone(), move |node| {
-        node.pin_recovery_attempt(&checkpoint_for_attempt, recovery_observations)?;
+        node.pin_recovery_attempt(
+            &checkpoint_for_attempt,
+            recovery_observations,
+            Some(&state_for_attempt),
+        )?;
         node.recover_endpoint_publication_sequence_floor(
             guild_id,
             recovered_endpoint_sequence_floor,

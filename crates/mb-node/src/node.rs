@@ -6911,7 +6911,7 @@ impl Node {
         observations: Vec<CheckpointRecoveryObservation>,
     ) -> Result<()> {
         let reconciliation =
-            self.checkpoint_recovery_record_reconciliation(checkpoint, observations)?;
+            self.checkpoint_recovery_record_reconciliation(checkpoint, observations, None)?;
         self.control.reconcile_records(
             "dht-observed-recovery",
             &reconciliation.delete_record_ids,
@@ -6924,6 +6924,7 @@ impl Node {
         &self,
         checkpoint: &QuorumCheckpoint,
         observations: Vec<CheckpointRecoveryObservation>,
+        recovered_dynamic_state: Option<&DynamicGuildState>,
     ) -> Result<DhtRecordReconciliation> {
         checkpoint.verify()?;
         let subject = self.keys.node_id();
@@ -6980,7 +6981,12 @@ impl Node {
                 || candidate.selected.value.expires_at_unix_seconds
                     != state.current.expires_at_unix_seconds
                 || self
-                    .validate_checkpoint_recovery_observation(checkpoint, &candidate, now)
+                    .validate_checkpoint_recovery_observation(
+                        checkpoint,
+                        &candidate,
+                        now,
+                        recovered_dynamic_state,
+                    )
                     .is_err()
             {
                 delete_record_ids.push(record_id);
@@ -6999,8 +7005,12 @@ impl Node {
 
         let mut seen_publishers = BTreeMap::new();
         for observation in observations {
-            let publisher =
-                self.validate_checkpoint_recovery_observation(checkpoint, &observation, now)?;
+            let publisher = self.validate_checkpoint_recovery_observation(
+                checkpoint,
+                &observation,
+                now,
+                recovered_dynamic_state,
+            )?;
             if seen_publishers.insert(publisher, ()).is_some() {
                 anyhow::bail!("duplicate certified recovery publisher");
             }
@@ -7034,6 +7044,7 @@ impl Node {
         checkpoint: &QuorumCheckpoint,
         observation: &CheckpointRecoveryObservation,
         now: u64,
+        recovered_dynamic_state: Option<&DynamicGuildState>,
     ) -> Result<NodeId> {
         let bundle = &observation.selected;
         bundle.verify(b"mutualbackup/recovery-bundle/v1")?;
@@ -7046,7 +7057,11 @@ impl Node {
         {
             anyhow::bail!("invalid certified recovery bundle");
         }
-        self.validate_recovery_bundle_key(checkpoint, &bundle.value)?;
+        self.validate_recovery_bundle_key_with_state(
+            checkpoint,
+            &bundle.value,
+            recovered_dynamic_state,
+        )?;
         let plaintext = self.open_recovery_bundle_record(&bundle.value)?;
         let locator: SignedRecord<RecoveryLocator> = decode_canonical(&plaintext)?;
         locator.verify(RECOVERY_LOCATOR_DOMAIN)?;
@@ -7102,12 +7117,30 @@ impl Node {
         checkpoint: &QuorumCheckpoint,
         bundle: &RecoveryBundle,
     ) -> Result<()> {
+        self.validate_recovery_bundle_key_with_state(checkpoint, bundle, None)
+    }
+
+    fn validate_recovery_bundle_key_with_state(
+        &self,
+        checkpoint: &QuorumCheckpoint,
+        bundle: &RecoveryBundle,
+        recovered_dynamic_state: Option<&DynamicGuildState>,
+    ) -> Result<()> {
         match checkpoint.checkpoint.format_version {
             3 if bundle.format_version == 1 && bundle.key_envelope.is_none() => Ok(()),
             4..=7 => {
-                let state = self
-                    .dynamic_guild_state()?
+                let local_dynamic_state = if recovered_dynamic_state.is_none() {
+                    self.dynamic_guild_state()?
+                } else {
+                    None
+                };
+                let state = recovered_dynamic_state
+                    .or(local_dynamic_state.as_ref())
                     .context("dynamic recovery requires dynamic guild state")?;
+                state.validate()?;
+                if state.guild_id != checkpoint.checkpoint.guild_id {
+                    anyhow::bail!("dynamic recovery state belongs to another guild");
+                }
                 let current = state
                     .current_recovery_key(bundle.subject)
                     .context("recovery key epoch is unavailable or revoked")?;
@@ -7638,6 +7671,7 @@ impl Node {
         &mut self,
         checkpoint: &QuorumCheckpoint,
         observations: Vec<CheckpointRecoveryObservation>,
+        recovered_dynamic_state: Option<&DynamicGuildState>,
     ) -> Result<()> {
         checkpoint.verify()?;
         self.validate_local_member(&checkpoint.checkpoint, false)?;
@@ -7649,8 +7683,11 @@ impl Node {
         {
             anyhow::bail!("recovery attempt would roll back or fork durable recovery state");
         }
-        let reconciliation =
-            self.checkpoint_recovery_record_reconciliation(checkpoint, observations)?;
+        let reconciliation = self.checkpoint_recovery_record_reconciliation(
+            checkpoint,
+            observations,
+            recovered_dynamic_state,
+        )?;
         for (record_id, bytes) in self.control.records("recovery-job")? {
             if record_id.as_slice() == checkpoint_hash {
                 continue;
@@ -11481,7 +11518,8 @@ mod tests {
         node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, true)
             .unwrap();
         let checkpoint_hash = checkpoint.hash().unwrap();
-        node.pin_recovery_attempt(&checkpoint, Vec::new()).unwrap();
+        node.pin_recovery_attempt(&checkpoint, Vec::new(), None)
+            .unwrap();
         node.install_recovered_checkpoint(&checkpoint).unwrap();
         let parity_root = match &transcript.value.manifest.value.group.roles[4] {
             ShardRoleV2::Parity(parity) => parity.commitment.root,
@@ -12837,11 +12875,117 @@ mod tests {
     }
 
     #[test]
+    fn cold_recovery_pins_observations_against_the_certified_dynamic_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let (seeds, mut checkpoint) = signed_recovery_checkpoint_fixture();
+        let keys = seeds.iter().map(KeyMaterial::from_seed).collect::<Vec<_>>();
+        checkpoint.checkpoint.format_version = 4;
+        checkpoint.signatures.clear();
+        for signer in &keys {
+            checkpoint.add_signature(signer).unwrap();
+        }
+        checkpoint.verify().unwrap();
+
+        let mut recovered_state = DynamicGuildState::new(
+            checkpoint.checkpoint.guild_id,
+            checkpoint.checkpoint.genesis_hash,
+            QuorumPolicy {
+                format_version: 1,
+                rule: QuorumRule::Unanimous,
+            },
+            checkpoint.checkpoint.members.clone(),
+        )
+        .unwrap();
+        let subject_keys = &keys[0];
+        let publisher_keys = &keys[1];
+        let (envelope, _) =
+            mb_core::create_recovery_key_envelope(subject_keys, checkpoint.checkpoint.guild_id, 1)
+                .unwrap();
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: checkpoint.checkpoint.guild_id,
+            sequence: 1,
+            parent: recovered_state.event_head,
+            kind: mb_core::GuildEventKind::RotateRecoveryKey {
+                envelope: envelope.clone(),
+            },
+        };
+        let mut signatures = keys
+            .iter()
+            .map(|signer| sign_guild_event(&event, signer).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        recovered_state
+            .apply_event(&QuorumGuildEvent { event, signatures })
+            .unwrap();
+
+        let mut node = Node::open(temp.path(), seeds[0].clone()).unwrap();
+        assert!(node.dynamic_guild_state().unwrap().is_none());
+        let publisher = publisher_keys.node_id();
+        let provider_peer_id = publisher.libp2p_peer_id().unwrap().to_string();
+        let endpoint = format!("/ip4/127.0.0.1/udp/44000/quic-v1/p2p/{provider_peer_id}");
+        let expires_at_unix_seconds = unix_seconds() + 300;
+        let locator = SignedRecord::sign(
+            RECOVERY_LOCATOR_DOMAIN,
+            RecoveryLocator {
+                format_version: 1,
+                subject: subject_keys.node_id(),
+                publisher,
+                guild_id: checkpoint.checkpoint.guild_id,
+                checkpoint_hash: checkpoint.hash().unwrap(),
+                checkpoint_generation: checkpoint.checkpoint.generation,
+                subject_endpoint_sequence_floor: 0,
+                endpoints: vec![endpoint],
+                expires_at_unix_seconds,
+            },
+            publisher_keys,
+        )
+        .unwrap();
+        let bundle = SignedRecord::sign(
+            b"mutualbackup/recovery-bundle/v1",
+            RecoveryBundle {
+                format_version: 2,
+                subject: subject_keys.node_id(),
+                publisher,
+                sequence: 1,
+                expires_at_unix_seconds,
+                key_envelope: Some(envelope),
+                sealed: seal_recovery_record(
+                    recovered_state
+                        .current_recovery_key(subject_keys.node_id())
+                        .unwrap()
+                        .envelope
+                        .public_key,
+                    &canonical_bytes(&locator).unwrap(),
+                )
+                .unwrap(),
+            },
+            publisher_keys,
+        )
+        .unwrap();
+        let observation = CheckpointRecoveryObservation {
+            provider_peer_id: provider_peer_id.clone(),
+            selected: bundle,
+            observations: Vec::new(),
+        };
+
+        assert!(
+            node.pin_recovery_attempt(&checkpoint, vec![observation.clone()], None)
+                .is_err()
+        );
+        node.pin_recovery_attempt(&checkpoint, vec![observation], Some(&recovered_state))
+            .unwrap();
+        assert!(node.active_recovery_attempt().unwrap().is_some());
+        assert!(node.dynamic_guild_state().unwrap().is_none());
+    }
+
+    #[test]
     fn pinned_recovery_attempt_rejects_a_higher_signed_fork() {
         let temp = tempfile::tempdir().unwrap();
         let (seeds, checkpoint) = signed_recovery_checkpoint_fixture();
         let mut node = Node::open(temp.path(), seeds[0].clone()).unwrap();
-        node.pin_recovery_attempt(&checkpoint, Vec::new()).unwrap();
+        node.pin_recovery_attempt(&checkpoint, Vec::new(), None)
+            .unwrap();
 
         let mut fork = checkpoint.checkpoint.clone();
         fork.generation = checkpoint.checkpoint.generation + 1;
@@ -12854,7 +12998,7 @@ mod tests {
             fork.add_signature(&KeyMaterial::from_seed(seed)).unwrap();
         }
         fork.verify().unwrap();
-        assert!(node.pin_recovery_attempt(&fork, Vec::new()).is_err());
+        assert!(node.pin_recovery_attempt(&fork, Vec::new(), None).is_err());
         assert_eq!(
             node.active_recovery_attempt().unwrap(),
             Some(RecoveryAttempt {
@@ -12890,7 +13034,10 @@ mod tests {
             .put_record("dht-observed-recovery", &stale_record_id, &stale_record)
             .unwrap();
 
-        assert!(node.pin_recovery_attempt(&checkpoint, Vec::new()).is_err());
+        assert!(
+            node.pin_recovery_attempt(&checkpoint, Vec::new(), None)
+                .is_err()
+        );
 
         assert_eq!(
             node.control

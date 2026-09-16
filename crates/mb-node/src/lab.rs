@@ -315,7 +315,7 @@ impl PrototypeGuild {
     ) -> Result<SharedNode> {
         let mut recovered = Node::open(data_dir, seed)?;
         let checkpoint = recover_checkpoint(recovered.keys(), &self.directory, &self.network)?;
-        recovered.pin_recovery_attempt(&checkpoint, Vec::new())?;
+        recovered.pin_recovery_attempt(&checkpoint, Vec::new(), None)?;
         let recovered_shards =
             recover_local_shards(recovered.keys().node_id(), &checkpoint, &self.network)?;
         let checkpoint_hash = checkpoint.hash()?;

@@ -780,8 +780,14 @@ showed capture had saved dirty generation 1 before the asynchronously started
 watcher wrote generation 2 for startup reconciliation. The watcher now installs
 all filesystem watches before advancing the reconciliation generation and
 offers an explicit readiness signal; the production path waits for that signal
-instead of a fixed delay. A fresh provisioned production gate must still close
-before Milestone 5 can pass.
+instead of a fixed delay. The next production run completed all 51 coding
+transcripts and reached cold recovery, then failed while pinning the recovery
+attempt because that pre-adoption step tried to load dynamic guild state from
+the fresh node. Recovery pinning now validates observed bundles against the
+already certified downloaded state, while ordinary readiness continues to use
+installed local state; a focused regression covers a fresh node with no dynamic
+state. A fresh provisioned production gate must still close before Milestone 5
+can pass.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer
