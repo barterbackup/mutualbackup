@@ -30,16 +30,17 @@ use mb_core::{
     CODING_FAILURE_REPORT_DOMAIN, CODING_SHARD_OPENING_DOMAIN, CodingAttemptPlan,
     CodingChallengeCommitment, CodingChallengeReveal, CodingFailureReport, CodingGroup,
     CodingGroupV2, CodingPlanGeometry, CodingProfile, CodingRootManifest, CodingShardOpening,
-    CodingVerificationTranscript, GuildCheckpoint, GuildEvent, GuildEventTail, GuildGenesis,
-    GuildInvite, InformationRoleV2, MAX_GUILD_EVENT_TAIL, MERKLE_LEAF_SIZE, Member,
+    CodingVerificationTranscript, DynamicGuildState, GuildCheckpoint, GuildEvent, GuildEventTail,
+    GuildGenesis, GuildInvite, InformationRoleV2, MAX_GUILD_EVENT_TAIL, MERKLE_LEAF_SIZE, Member,
     MemberSignature, NodeId, ParityPlacementV2, ParityRoleV2, QuorumCheckpoint, QuorumGuildEvent,
-    QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN, RangeSectorRef, STAGED_STORAGE_RECEIPT_DOMAIN,
-    STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole, ShardRoleV2, SignedRecord,
-    StagedStorageReceipt, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
-    V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES,
-    V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_SECTOR_SIZE, canonical_bytes,
-    coding_challenge, coding_transfer_estimate, decode_canonical, encode, merkle_commit,
-    merkle_zero_commitment, open_recovery_record, replay_coding_transcript, sector_root,
+    QuorumGuildGenesis, QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN, RangeSectorRef,
+    STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole,
+    ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement, UserRevision,
+    V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS,
+    V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_SECTOR_SIZE,
+    canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical, encode,
+    merkle_commit, merkle_zero_commitment, open_recovery_record, replay_coding_transcript,
+    sector_root,
 };
 use mb_store::{ParityObject, VariableParityObject};
 use uuid::Uuid;
@@ -7196,6 +7197,9 @@ struct ValidatedRecoveryHead {
     genesis: QuorumGuildGenesis,
     checkpoint: QuorumCheckpoint,
     candidates: Vec<RecoveryCandidate>,
+    state: DynamicGuildState,
+    events: Vec<QuorumGuildEvent>,
+    transcripts: Vec<SignedRecord<CodingVerificationTranscript>>,
 }
 
 pub async fn recover_from_dht(
@@ -7342,16 +7346,15 @@ async fn recover_from_dht_once(
     );
     let mut generations = candidates_by_head
         .iter()
-        .filter(|(_, candidates)| candidates.len() >= 3)
+        .filter(|(_, candidates)| !candidates.is_empty())
         .map(|((generation, _, _), _)| *generation)
         .collect::<Vec<_>>();
     generations.sort_unstable_by(|left, right| right.cmp(left));
     generations.dedup();
     if generations.is_empty() {
-        return Err(RecoveryDiscoveryPending(
-            "Kademlia returned no recovery head confirmed by three publishers",
-        )
-        .into());
+        return Err(
+            RecoveryDiscoveryPending("Kademlia returned no recovery head candidate").into(),
+        );
     }
 
     let mut selected = None;
@@ -7393,6 +7396,9 @@ async fn recover_from_dht_once(
         genesis,
         checkpoint,
         candidates,
+        state,
+        events,
+        transcripts,
     } = selected.ok_or(RecoveryDiscoveryPending(
         "no advertised recovery head could be certified",
     ))?;
@@ -7420,13 +7426,11 @@ async fn recover_from_dht_once(
     // roster permits an empty local endpoint set until the onion service (or
     // another ingress path) is advertised again.
     let local_endpoints = available_p2p_endpoints(p2p).await?;
-    let mut roster = genesis
-        .genesis
+    let mut roster = state
         .members
         .iter()
-        .cloned()
         .map(|member| GuildPeer {
-            member,
+            member: member.member.clone(),
             endpoints: Vec::new(),
         })
         .collect::<Vec<_>>();
@@ -7514,8 +7518,19 @@ async fn recover_from_dht_once(
     }
     let recovered_genesis = genesis.clone();
     let recovered_roster = roster.clone();
+    let recovery_checkpoint = checkpoint.clone();
     node_blocking(node.clone(), move |node| {
-        node.adopt_recovered_guild(recovered_genesis, recovered_roster)
+        if recovery_checkpoint.checkpoint.format_version == 4 {
+            node.adopt_recovered_dynamic_guild(
+                recovered_genesis,
+                &recovery_checkpoint,
+                events,
+                recovered_roster,
+                transcripts,
+            )
+        } else {
+            node.adopt_recovered_guild(recovered_genesis, recovered_roster)
+        }
     })
     .await?;
     loop {
@@ -7564,6 +7579,7 @@ async fn validate_recovery_head(
     candidates: Vec<RecoveryCandidate>,
 ) -> Result<ValidatedRecoveryHead> {
     let scope = Uuid::new_v4();
+    let subject = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
     let result = async {
         for candidate in &candidates {
             let addresses = candidate
@@ -7591,22 +7607,54 @@ async fn validate_recovery_head(
                 let genesis = p2p.guild_genesis(publisher, guild_id).await?;
                 let checkpoint =
                     fetch_p2p_checkpoint(p2p, publisher, guild_id, checkpoint_hash).await?;
-                Ok::<_, anyhow::Error>((genesis, checkpoint))
+                let (state, events) =
+                    fetch_recovery_guild_history(p2p, publisher, &genesis).await?;
+                let mut transcripts = Vec::with_capacity(state.coding_groups.len());
+                for retained in &state.coding_groups {
+                    transcripts.push(
+                        p2p.coding_transcript(publisher, guild_id, retained.group.id)
+                            .await?,
+                    );
+                }
+                Ok::<_, anyhow::Error>((genesis, checkpoint, state, events, transcripts))
             });
         }
         while let Some(attempt) = state_attempts.next().await {
-            let Ok((genesis, checkpoint)) = attempt else {
+            let Ok((genesis, checkpoint, state, events, transcripts)) = attempt else {
                 continue;
             };
             let state_matches = (|| -> Result<bool> {
                 genesis.verify()?;
                 checkpoint.verify()?;
+                state.validate()?;
+                let mut replay = DynamicGuildState::new(
+                    guild_id,
+                    genesis.hash()?,
+                    QuorumPolicy {
+                        format_version: 1,
+                        rule: QuorumRule::Unanimous,
+                    },
+                    genesis.genesis.members.clone(),
+                )?;
+                let mut checkpoint_membership = replay
+                    .active_members()
+                    .eq(checkpoint.checkpoint.members.iter());
+                for event in &events {
+                    replay.apply_event(event)?;
+                    checkpoint_membership |= replay
+                        .active_members()
+                        .eq(checkpoint.checkpoint.members.iter());
+                }
                 Ok(genesis.genesis.guild_id == guild_id
                     && genesis.hash()? == checkpoint.checkpoint.genesis_hash
                     && checkpoint.checkpoint.guild_id == guild_id
                     && checkpoint.checkpoint.generation == generation
                     && checkpoint.hash()? == checkpoint_hash
-                    && checkpoint.checkpoint.members == genesis.genesis.members)
+                    && replay == state
+                    && checkpoint_membership
+                    && state
+                        .active_members()
+                        .any(|member| member.node_id == subject))
             })()
             .unwrap_or(false);
             if !state_matches {
@@ -7614,11 +7662,17 @@ async fn validate_recovery_head(
             }
             let checkpoint_for_validation = checkpoint.clone();
             let candidates_for_validation = candidates.clone();
+            let active_publishers = state
+                .active_members()
+                .map(|member| member.node_id)
+                .collect::<BTreeSet<_>>();
+            let required_confirmations = required_recovery_publishers(active_publishers.len())?;
             let valid_candidates = node_blocking(node.clone(), move |node| {
                 Ok(candidates_for_validation
                     .iter()
                     .filter(|candidate| {
-                        checkpoint_for_validation
+                        active_publishers.contains(&candidate.publisher)
+                            && checkpoint_for_validation
                             .validate_recovery_authority(
                                 node.keys(),
                                 &candidate.locator,
@@ -7630,7 +7684,7 @@ async fn validate_recovery_head(
                     .collect::<Vec<_>>())
             })
             .await?;
-            if valid_candidates.len() >= 3 {
+            if valid_candidates.len() >= required_confirmations {
                 return Ok(ValidatedRecoveryHead {
                     guild_id,
                     checkpoint_hash,
@@ -7638,16 +7692,60 @@ async fn validate_recovery_head(
                     genesis,
                     checkpoint,
                     candidates: valid_candidates,
+                    state,
+                    events,
+                    transcripts,
                 });
             }
         }
-        bail!("no publisher served a certified state authorizing three recovery locators")
+        bail!("no publisher served a certified state with enough recovery locators")
     }
     .await;
     if let Err(error) = p2p.clear_recovery_addresses(scope).await {
         tracing::warn!(%error, "could not clear attempt-scoped recovery endpoints");
     }
     result
+}
+
+fn required_recovery_publishers(active_members: usize) -> Result<usize> {
+    if active_members < 2 {
+        bail!("cold recovery requires another active guild member");
+    }
+    Ok((active_members - 1).min(3))
+}
+
+async fn fetch_recovery_guild_history(
+    p2p: &P2pClient,
+    publisher: NodeId,
+    genesis: &QuorumGuildGenesis,
+) -> Result<(DynamicGuildState, Vec<QuorumGuildEvent>)> {
+    genesis.verify()?;
+    let guild_id = genesis.genesis.guild_id;
+    let mut state = DynamicGuildState::new(
+        guild_id,
+        genesis.hash()?,
+        QuorumPolicy {
+            format_version: 1,
+            rule: QuorumRule::Unanimous,
+        },
+        genesis.genesis.members.clone(),
+    )?;
+    let mut events = Vec::new();
+    loop {
+        let tail = p2p
+            .guild_event_tail(publisher, guild_id, state.event_sequence, state.event_head)
+            .await?;
+        let count = tail.events.len();
+        state.apply_tail(&tail)?;
+        events.extend(tail.events);
+        if events.len() > 1_000_000 {
+            bail!("guild event history exceeds the recovery bound");
+        }
+        if count < MAX_GUILD_EVENT_TAIL {
+            break;
+        }
+    }
+    Ok((state, events))
 }
 
 fn decode_recovery_candidate(
@@ -10166,6 +10264,16 @@ mod tests {
             max_connections: 8,
             tor_mode: TorMode::DisableTor,
         }
+    }
+
+    #[test]
+    fn dynamic_recovery_confirmation_count_preserves_the_three_publisher_rule() {
+        assert!(required_recovery_publishers(1).is_err());
+        assert_eq!(required_recovery_publishers(2).unwrap(), 1);
+        assert_eq!(required_recovery_publishers(3).unwrap(), 2);
+        assert_eq!(required_recovery_publishers(4).unwrap(), 3);
+        assert_eq!(required_recovery_publishers(5).unwrap(), 3);
+        assert_eq!(required_recovery_publishers(256).unwrap(), 3);
     }
 
     #[test]

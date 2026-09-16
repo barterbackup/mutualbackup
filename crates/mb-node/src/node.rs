@@ -1918,6 +1918,220 @@ impl Node {
         Ok(())
     }
 
+    pub fn adopt_recovered_dynamic_guild(
+        &mut self,
+        certificate: QuorumGuildGenesis,
+        checkpoint: &QuorumCheckpoint,
+        events: Vec<QuorumGuildEvent>,
+        mut peers: Vec<GuildPeer>,
+        transcripts: Vec<SignedRecord<CodingVerificationTranscript>>,
+    ) -> Result<()> {
+        certificate.verify()?;
+        checkpoint.verify()?;
+        let installed = InstalledGuild {
+            format_version: 2,
+            certificate,
+        };
+        let guild_id = installed.certificate.genesis.guild_id;
+        if checkpoint.checkpoint.format_version != 4
+            || checkpoint.checkpoint.guild_id != guild_id
+            || checkpoint.checkpoint.genesis_hash != installed.certificate.hash()?
+        {
+            anyhow::bail!("dynamic recovery checkpoint is not bound to its guild genesis");
+        }
+        let mut state = initial_dynamic_guild_state(&installed)?;
+        let mut authority_states = BTreeMap::from([(state.membership_epoch, state.clone())]);
+        let mut checkpoint_membership = state
+            .active_members()
+            .eq(checkpoint.checkpoint.members.iter());
+        let mut event_records = Vec::with_capacity(events.len());
+        for event in events {
+            let record_id = event.event.sequence.to_be_bytes().to_vec();
+            state.apply_event(&event)?;
+            authority_states
+                .entry(state.membership_epoch)
+                .or_insert_with(|| state.clone());
+            checkpoint_membership |= state
+                .active_members()
+                .eq(checkpoint.checkpoint.members.iter());
+            event_records.push((
+                "guild-event".to_owned(),
+                record_id,
+                canonical_bytes(&event)?,
+            ));
+        }
+        if !checkpoint_membership {
+            anyhow::bail!("dynamic recovery checkpoint membership is absent from event history");
+        }
+        let local_id = self.keys.node_id();
+        let local_member = state
+            .members
+            .iter()
+            .find(|member| member.member.node_id == local_id && member.is_active())
+            .map(|member| member.member.clone())
+            .context("recovered dynamic guild does not authorize this seed identity")?;
+        if local_member.recovery_public_key != self.keys.recovery_public_key()
+            || !checkpoint.has_signature(local_id)
+            || !checkpoint.checkpoint.members.iter().any(|member| {
+                member.node_id == local_id
+                    && member.recovery_public_key == self.keys.recovery_public_key()
+            })
+        {
+            anyhow::bail!("dynamic recovery authority does not match this seed");
+        }
+        peers.sort_by_key(|peer| peer.member.node_id);
+        if peers
+            .iter()
+            .map(|peer| &peer.member)
+            .ne(state.members.iter().map(|member| &member.member))
+        {
+            anyhow::bail!("recovered endpoint roster does not match dynamic membership");
+        }
+        for peer in &peers {
+            if !peer.endpoints.is_empty() {
+                validate_endpoint_set(peer.member.node_id, &peer.endpoints)?;
+            }
+        }
+        let transcript_by_group = transcripts
+            .into_iter()
+            .map(|transcript| (transcript.value.manifest.value.group.id, transcript))
+            .collect::<BTreeMap<_, _>>();
+        if transcript_by_group.len() != state.coding_groups.len() {
+            anyhow::bail!("dynamic recovery has incomplete or extra coding evidence");
+        }
+        let mut transcript_records = Vec::with_capacity(transcript_by_group.len() * 2);
+        for retained in &state.coding_groups {
+            let transcript = transcript_by_group
+                .get(&retained.group.id)
+                .context("dynamic recovery coding transcript is unavailable")?;
+            let authority = authority_states
+                .get(&transcript.value.plan.value.membership_epoch)
+                .context("coding transcript membership epoch is absent from event history")?;
+            authority.validate_attempt_authority(&transcript.value.plan.value)?;
+            if transcript.value.manifest.value.group != retained.group
+                || replay_coding_transcript(transcript)? != CodingReplayFinding::Verified
+            {
+                anyhow::bail!("dynamic recovery coding transcript is invalid");
+            }
+            let bytes = canonical_bytes(transcript)?;
+            transcript_records.push((
+                "coding-transcript".to_owned(),
+                transcript.value.plan.value.attempt_id.to_vec(),
+                bytes.clone(),
+            ));
+            transcript_records.push((
+                "coding-group-transcript".to_owned(),
+                retained.group.id.to_vec(),
+                bytes,
+            ));
+        }
+        if let Some(existing) = self.installed_guild()?
+            && existing != installed
+        {
+            anyhow::bail!("this node already has different guild state");
+        }
+        if let Some(existing) = self.dynamic_guild_state()?
+            && existing != state
+        {
+            anyhow::bail!("this node already has a different dynamic guild history");
+        }
+        if let Some(bytes) = self.control.get_record("node-config", b"member")? {
+            let configured: Member = decode_canonical(&bytes)?;
+            if configured != local_member {
+                anyhow::bail!("configured member conflicts with recovered dynamic membership");
+            }
+        }
+        for (kind, record_id, bytes) in event_records.iter().chain(&transcript_records) {
+            if self
+                .control
+                .get_record(kind, record_id)?
+                .is_some_and(|existing| existing.as_slice() != bytes.as_slice())
+            {
+                anyhow::bail!("dynamic recovery conflicts with durable guild history");
+            }
+        }
+        let mut endpoint_map = match self.guild_endpoint_cache()? {
+            Some(cache) => {
+                if cache.format_version != 1 || cache.guild_id != guild_id {
+                    anyhow::bail!("cached guild endpoints belong to different guild state");
+                }
+                cache.endpoints.into_iter().collect::<BTreeMap<_, _>>()
+            }
+            None => BTreeMap::new(),
+        };
+        for peer in peers {
+            if !peer.endpoints.is_empty() {
+                endpoint_map.insert(peer.member.node_id, peer.endpoints);
+            } else {
+                endpoint_map.entry(peer.member.node_id).or_default();
+            }
+        }
+        let endpoint_cache = GuildEndpointCache {
+            format_version: 1,
+            guild_id,
+            endpoints: state
+                .members
+                .iter()
+                .map(|member| {
+                    (
+                        member.member.node_id,
+                        endpoint_map
+                            .remove(&member.member.node_id)
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect(),
+        };
+        let mut records = vec![
+            (
+                "node-config".to_owned(),
+                b"member".to_vec(),
+                canonical_bytes(&local_member)?,
+            ),
+            (
+                "guild-installed".to_owned(),
+                b"primary".to_vec(),
+                canonical_bytes(&installed)?,
+            ),
+            (
+                "guild-endpoints".to_owned(),
+                b"primary".to_vec(),
+                canonical_bytes(&endpoint_cache)?,
+            ),
+            (
+                "guild-dynamic-state".to_owned(),
+                b"primary".to_vec(),
+                canonical_bytes(&state)?,
+            ),
+            (
+                "dht-recovery-sequence-probe".to_owned(),
+                b"primary".to_vec(),
+                canonical_bytes(&true)?,
+            ),
+        ];
+        if let Some(signature) = installed
+            .certificate
+            .signatures
+            .iter()
+            .find(|signature| signature.signer == local_id)
+        {
+            records.push((
+                "guild-genesis-signature-lock".to_owned(),
+                b"primary".to_vec(),
+                canonical_bytes(&GenesisSignatureLock {
+                    format_version: 1,
+                    genesis_hash: installed.certificate.hash()?,
+                    genesis: installed.certificate.genesis.clone(),
+                    signature: signature.clone(),
+                })?,
+            ));
+        }
+        records.extend(event_records);
+        records.extend(transcript_records);
+        self.control.put_records(&records)?;
+        Ok(())
+    }
+
     pub fn guild_summary(&self) -> Result<Option<GuildSummary>> {
         if let Some(installed) = self.installed_guild()? {
             let dynamic = self.dynamic_guild_state()?;
@@ -5759,6 +5973,25 @@ impl Node {
         checkpoint.verify()?;
         let checkpoint_hash = checkpoint.hash()?;
         let local_id = self.keys.node_id();
+        let publication_members = if checkpoint.checkpoint.format_version == 4 {
+            let state = self
+                .dynamic_guild_state()?
+                .context("version-four DHT publication requires dynamic guild state")?;
+            let active = state.active_members().cloned().collect::<Vec<_>>();
+            if active != checkpoint.checkpoint.members {
+                return Ok(None);
+            }
+            active
+        } else {
+            checkpoint.checkpoint.members.clone()
+        };
+        if !checkpoint.has_signature(local_id)
+            || !publication_members
+                .iter()
+                .any(|member| member.node_id == local_id)
+        {
+            return Ok(None);
+        }
         validate_endpoint_set(local_id, &endpoints)?;
         if expires_at_unix_seconds <= unix_seconds() {
             anyhow::bail!("DHT publication expiry must be in the future");
@@ -5776,10 +6009,7 @@ impl Node {
                     .context("DHT publication state has no endpoint record")?;
                 let endpoint: SignedRecord<EndpointRecord> = decode_canonical(&endpoint)?;
                 let mut recovery = Vec::new();
-                for subject in installed
-                    .certificate
-                    .genesis
-                    .members
+                for subject in publication_members
                     .iter()
                     .filter(|member| member.node_id != local_id)
                 {
@@ -5803,10 +6033,7 @@ impl Node {
             sequence_floors.endpoint,
         )?;
         let mut recovery = Vec::new();
-        for subject in installed
-            .certificate
-            .genesis
-            .members
+        for subject in publication_members
             .iter()
             .filter(|member| member.node_id != local_id)
         {
@@ -9180,6 +9407,161 @@ mod tests {
         }));
         assert!(node.authorize_member(&guild_id, removed).is_err());
         assert_eq!(node.guild_event_tail(0, genesis_hash).unwrap(), tail);
+    }
+
+    #[test]
+    fn added_member_can_adopt_a_recovered_dynamic_guild() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, certificate, mut peers) = recovery_guild_fixture();
+        let mut signer_keys = (0_u8..5)
+            .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([index + 120; 32])))
+            .collect::<Vec<_>>();
+        signer_keys.sort_by_key(KeyMaterial::node_id);
+        let added_seed = Seed::from_bytes([199; 32]);
+        let added_keys = KeyMaterial::from_seed(&added_seed);
+        let added_member = Member {
+            node_id: added_keys.node_id(),
+            recovery_public_key: added_keys.recovery_public_key(),
+            failure_domain: "recovered-added-domain".to_owned(),
+        };
+        let mut state = DynamicGuildState::new(
+            certificate.genesis.guild_id,
+            certificate.hash().unwrap(),
+            QuorumPolicy {
+                format_version: 1,
+                rule: QuorumRule::Unanimous,
+            },
+            certificate.genesis.members.clone(),
+        )
+        .unwrap();
+        let add = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::AddMember {
+                member: added_member.clone(),
+            },
+        };
+        let mut add_signatures = signer_keys
+            .iter()
+            .map(|keys| sign_guild_event(&add, keys).unwrap())
+            .collect::<Vec<_>>();
+        add_signatures.sort_by_key(|signature| signature.signer);
+        let add = QuorumGuildEvent {
+            event: add,
+            signatures: add_signatures,
+        };
+        state.apply_event(&add).unwrap();
+
+        signer_keys.push(KeyMaterial::from_seed(&added_seed));
+        signer_keys.sort_by_key(KeyMaterial::node_id);
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[198; 32]);
+        let rotate_writer = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: 2,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RotateWriterKey {
+                owner: added_member.node_id,
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            },
+        };
+        let mut writer_signatures = signer_keys
+            .iter()
+            .map(|keys| sign_guild_event(&rotate_writer, keys).unwrap())
+            .collect::<Vec<_>>();
+        writer_signatures.sort_by_key(|signature| signature.signer);
+        let rotate_writer = QuorumGuildEvent {
+            event: rotate_writer,
+            signatures: writer_signatures,
+        };
+        state.apply_event(&rotate_writer).unwrap();
+
+        let mut revision = UserRevision {
+            format_version: 2,
+            guild_id: state.guild_id,
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id: Uuid::from_bytes([197; 16]),
+            owner: added_member.node_id,
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![SectorRef {
+                id: [196; 32],
+                root: [195; 32],
+                logical_len: 1,
+            }],
+            data_sectors: Vec::new(),
+        };
+        revision.sign_writer(&writer).unwrap();
+        let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, &added_keys).unwrap();
+        let mut checkpoint = QuorumCheckpoint {
+            checkpoint: GuildCheckpoint {
+                format_version: 4,
+                guild_id: state.guild_id,
+                genesis_hash: certificate.hash().unwrap(),
+                generation: 1,
+                parent: None,
+                members: state.active_members().cloned().collect(),
+                writer_fences: vec![mb_core::WriterFence {
+                    owner: added_member.node_id,
+                    epoch: 1,
+                    public_key: writer.verifying_key().to_bytes(),
+                }],
+                revision_tombstones: Vec::new(),
+                revisions: vec![revision],
+                coding_groups: Vec::new(),
+            },
+            signatures: Vec::new(),
+        };
+        for keys in &signer_keys {
+            checkpoint.add_signature(keys).unwrap();
+        }
+        checkpoint.verify().unwrap();
+        peers.push(GuildPeer {
+            member: added_member.clone(),
+            endpoints: Vec::new(),
+        });
+
+        let mut node = Node::open(temp.path(), added_seed.clone()).unwrap();
+        node.adopt_recovered_dynamic_guild(
+            certificate.clone(),
+            &checkpoint,
+            vec![add.clone(), rotate_writer.clone()],
+            peers,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(node.dynamic_guild_state().unwrap().unwrap(), state);
+        assert!(
+            node.control
+                .get_record("guild-genesis-signature-lock", b"primary")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            node.guild_summary()
+                .unwrap()
+                .unwrap()
+                .peers
+                .iter()
+                .any(|peer| peer.member == added_member)
+        );
+        drop(node);
+
+        let reopened = Node::open(temp.path(), added_seed).unwrap();
+        assert_eq!(reopened.dynamic_guild_state().unwrap().unwrap(), state);
+        assert_eq!(
+            reopened
+                .guild_event_tail(0, certificate.hash().unwrap())
+                .unwrap()
+                .events,
+            vec![add, rotate_writer]
+        );
     }
 
     #[test]

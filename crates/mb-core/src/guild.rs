@@ -38,7 +38,13 @@ impl QuorumPolicy {
         let required = match self.rule {
             QuorumRule::Unanimous => active_members,
             QuorumRule::Majority => active_members / 2 + 1,
-            QuorumRule::Threshold(value) => usize::from(value),
+            QuorumRule::Threshold(value) => {
+                let threshold = usize::from(value);
+                if threshold <= active_members / 2 {
+                    return Err(GuildStateError::InvalidState);
+                }
+                threshold
+            }
         };
         if required == 0 || required > active_members {
             return Err(GuildStateError::InvalidState);
@@ -1112,5 +1118,26 @@ mod tests {
             secret_one.public_key()
         );
         assert!(open_recovery_key_envelope(&keys[1], &envelope_one).is_err());
+    }
+
+    #[test]
+    fn configurable_thresholds_preserve_quorum_intersection() {
+        assert_eq!(
+            QuorumPolicy {
+                format_version: 1,
+                rule: QuorumRule::Threshold(3),
+            }
+            .required(5)
+            .unwrap(),
+            3
+        );
+        assert!(
+            QuorumPolicy {
+                format_version: 1,
+                rule: QuorumRule::Threshold(2),
+            }
+            .required(5)
+            .is_err()
+        );
     }
 }
