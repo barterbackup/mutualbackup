@@ -1,0 +1,749 @@
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::{
+    MAX_PROFILE_SHARD_SIZE, MERKLE_LEAF_SIZE, MerkleCommitment, NodeId, canonical_bytes,
+    merkle_commit,
+};
+
+const MAX_PACKED_CHUNKS: usize = 1_000_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackingProfile {
+    pub format_version: u16,
+    pub sector_size: u32,
+    pub slot_size: u32,
+}
+
+impl PackingProfile {
+    pub fn validate(self) -> Result<(), PackingError> {
+        if self.format_version != 1
+            || self.sector_size < MERKLE_LEAF_SIZE as u32
+            || self.sector_size > MAX_PROFILE_SHARD_SIZE
+            || !self.sector_size.is_power_of_two()
+            || self.slot_size < MERKLE_LEAF_SIZE as u32
+            || self.slot_size > self.sector_size
+            || !self.slot_size.is_power_of_two()
+            || !self.sector_size.is_multiple_of(self.slot_size)
+        {
+            return Err(PackingError::InvalidProfile);
+        }
+        Ok(())
+    }
+
+    pub fn slots_per_sector(self) -> Result<u32, PackingError> {
+        self.validate()?;
+        Ok(self.sector_size / self.slot_size)
+    }
+}
+
+/// One independently versioned object inside one named protected root. Bytes
+/// are already owner-encrypted before cross-user packing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackingInput {
+    pub owner: NodeId,
+    pub protected_root: [u8; 32],
+    pub object_id: [u8; 32],
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct SourceChunkId {
+    pub owner: NodeId,
+    pub protected_root: [u8; 32],
+    pub object_id: [u8; 32],
+    pub chunk_index: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackedSourceChunk {
+    pub id: SourceChunkId,
+    pub source_offset: u64,
+    pub logical_len: u32,
+    pub content_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PackedSlot {
+    Data(PackedSourceChunk),
+    /// A zero chunk may retain a logical source mapping, while an empty slot
+    /// has no source. Neither requires source payload transfer.
+    VirtualZero {
+        source: Option<PackedSourceChunk>,
+    },
+}
+
+impl PackedSlot {
+    fn source(&self) -> Option<&PackedSourceChunk> {
+        match self {
+            Self::Data(source)
+            | Self::VirtualZero {
+                source: Some(source),
+            } => Some(source),
+            Self::VirtualZero { source: None } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackedSectorDescriptor {
+    pub id: [u8; 32],
+    pub sector_index: u32,
+    pub commitment: MerkleCommitment,
+    pub slots: Vec<PackedSlot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackedCatalog {
+    pub id: [u8; 32],
+    pub format_version: u16,
+    pub revision: u64,
+    pub parent: Option<[u8; 32]>,
+    pub profile: PackingProfile,
+    pub sectors: Vec<PackedSectorDescriptor>,
+}
+
+impl PackedCatalog {
+    pub fn calculate_id(&self) -> Result<[u8; 32], PackingError> {
+        catalog_id(
+            self.format_version,
+            self.revision,
+            self.parent,
+            self.profile,
+            &self.sectors,
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), PackingError> {
+        self.profile.validate()?;
+        if self.format_version != 1
+            || self.revision == 0
+            || (self.revision == 1) != self.parent.is_none()
+            || self.calculate_id()? != self.id
+        {
+            return Err(PackingError::InvalidCatalog);
+        }
+        let expected_slots = self.profile.slots_per_sector()? as usize;
+        let mut source_ids = std::collections::BTreeSet::new();
+        let mut object_chunks =
+            std::collections::BTreeMap::<(NodeId, [u8; 32], [u8; 32]), Vec<u32>>::new();
+        for (sector_index, sector) in self.sectors.iter().enumerate() {
+            if sector.sector_index != sector_index as u32
+                || sector.slots.len() != expected_slots
+                || sector.commitment.byte_len != self.profile.sector_size
+                || sector.calculate_id(self.profile)? != sector.id
+            {
+                return Err(PackingError::InvalidCatalog);
+            }
+            for slot in &sector.slots {
+                let Some(source) = slot.source() else {
+                    continue;
+                };
+                if source.id.owner == NodeId([0; 32])
+                    || source.id.protected_root == [0; 32]
+                    || source.id.object_id == [0; 32]
+                    || source.logical_len == 0
+                    || source.logical_len > self.profile.slot_size
+                    || source.source_offset
+                        != u64::from(source.id.chunk_index) * u64::from(self.profile.slot_size)
+                    || !source_ids.insert(source.id)
+                {
+                    return Err(PackingError::InvalidCatalog);
+                }
+                object_chunks
+                    .entry((
+                        source.id.owner,
+                        source.id.protected_root,
+                        source.id.object_id,
+                    ))
+                    .or_default()
+                    .push(source.id.chunk_index);
+            }
+        }
+        if self
+            .sectors
+            .last()
+            .is_some_and(|sector| sector.slots.iter().all(|slot| slot.source().is_none()))
+        {
+            return Err(PackingError::InvalidCatalog);
+        }
+        for chunks in object_chunks.values_mut() {
+            chunks.sort_unstable();
+            if chunks
+                .iter()
+                .enumerate()
+                .any(|(index, chunk)| *chunk != index as u32)
+            {
+                return Err(PackingError::InvalidCatalog);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PackedSectorDescriptor {
+    pub fn calculate_id(&self, profile: PackingProfile) -> Result<[u8; 32], PackingError> {
+        let mut hasher = blake3::Hasher::new_derive_key("mutualbackup packed sector v1");
+        hasher.update(&canonical_bytes(&(
+            profile,
+            self.sector_index,
+            &self.commitment,
+            &self.slots,
+        ))?);
+        Ok(*hasher.finalize().as_bytes())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackedSector {
+    pub descriptor: PackedSectorDescriptor,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PackingMetrics {
+    pub logical_bytes: u64,
+    pub source_upload_bytes: u64,
+    pub packed_sector_bytes: u64,
+    pub virtual_zero_bytes: u64,
+    pub reused_slots: u64,
+    pub changed_sectors: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackingResult {
+    pub catalog: PackedCatalog,
+    pub sectors: Vec<PackedSector>,
+    pub metrics: PackingMetrics,
+}
+
+impl PackingResult {
+    pub fn validate(&self) -> Result<(), PackingError> {
+        self.catalog.validate()?;
+        if self.sectors.len() != self.catalog.sectors.len() {
+            return Err(PackingError::InvalidCatalog);
+        }
+        for (packed, descriptor) in self.sectors.iter().zip(&self.catalog.sectors) {
+            if &packed.descriptor != descriptor
+                || packed.bytes.len() != self.catalog.profile.sector_size as usize
+                || merkle_commit(&packed.bytes).map_err(|_| PackingError::InvalidCatalog)?
+                    != descriptor.commitment
+            {
+                return Err(PackingError::InvalidCatalog);
+            }
+            let slot_size = self.catalog.profile.slot_size as usize;
+            for (index, slot) in descriptor.slots.iter().enumerate() {
+                let bytes = &packed.bytes[index * slot_size..(index + 1) * slot_size];
+                match slot {
+                    PackedSlot::Data(source) => {
+                        if bytes[source.logical_len as usize..]
+                            .iter()
+                            .any(|byte| *byte != 0)
+                            || *blake3::hash(&bytes[..source.logical_len as usize]).as_bytes()
+                                != source.content_hash
+                        {
+                            return Err(PackingError::InvalidCatalog);
+                        }
+                    }
+                    PackedSlot::VirtualZero { source } => {
+                        if bytes.iter().any(|byte| *byte != 0) {
+                            return Err(PackingError::InvalidCatalog);
+                        }
+                        if source.as_ref().is_some_and(|source| {
+                            *blake3::hash(&bytes[..source.logical_len as usize]).as_bytes()
+                                != source.content_hash
+                        }) {
+                            return Err(PackingError::InvalidCatalog);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Build a stable-slot catalog. Existing source chunk identities keep their
+/// slot across content updates; removed chunks become authenticated zero slots;
+/// new chunks enter free slots through a deterministic per-owner round robin.
+pub fn pack_incremental(
+    profile: PackingProfile,
+    previous: Option<&PackedCatalog>,
+    inputs: Vec<PackingInput>,
+) -> Result<PackingResult, PackingError> {
+    profile.validate()?;
+    if let Some(previous) = previous {
+        previous.validate()?;
+        if previous.profile != profile {
+            return Err(PackingError::ProfileChanged);
+        }
+    }
+    let chunks = input_chunks(profile, inputs)?;
+    let desired = chunks
+        .iter()
+        .map(|chunk| (chunk.source.id, chunk))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let slots_per_sector = profile.slots_per_sector()? as usize;
+    let previous_slot_count = previous
+        .map(|catalog| catalog.sectors.len() * slots_per_sector)
+        .unwrap_or(0);
+    let mut assignments = vec![None::<SourceChunkId>; previous_slot_count];
+    let mut assigned = std::collections::BTreeSet::new();
+    let mut reused_slots = 0_u64;
+    if let Some(previous) = previous {
+        for (flat_index, slot) in previous
+            .sectors
+            .iter()
+            .flat_map(|sector| &sector.slots)
+            .enumerate()
+        {
+            if let Some(source) = slot.source()
+                && desired.contains_key(&source.id)
+            {
+                assignments[flat_index] = Some(source.id);
+                assigned.insert(source.id);
+                reused_slots += 1;
+            }
+        }
+    }
+
+    let mut pending_by_owner = std::collections::BTreeMap::<NodeId, Vec<SourceChunkId>>::new();
+    for id in desired.keys().filter(|id| !assigned.contains(id)) {
+        pending_by_owner.entry(id.owner).or_default().push(*id);
+    }
+    for pending in pending_by_owner.values_mut() {
+        pending.sort();
+        pending.reverse();
+    }
+    let mut free = assignments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, assigned)| assigned.is_none().then_some(index))
+        .collect::<std::collections::VecDeque<_>>();
+    loop {
+        let mut progress = false;
+        let owners = pending_by_owner.keys().copied().collect::<Vec<_>>();
+        for owner in owners {
+            let Some(id) = pending_by_owner.get_mut(&owner).and_then(Vec::pop) else {
+                continue;
+            };
+            let index = free.pop_front().unwrap_or_else(|| {
+                assignments.push(None);
+                assignments.len() - 1
+            });
+            assignments[index] = Some(id);
+            progress = true;
+        }
+        if !progress {
+            break;
+        }
+    }
+    while assignments.last().is_some_and(Option::is_none) {
+        assignments.pop();
+    }
+    if assignments.len() > MAX_PACKED_CHUNKS {
+        return Err(PackingError::TooManyChunks);
+    }
+    let sector_count = assignments.len().div_ceil(slots_per_sector);
+    assignments.resize(sector_count * slots_per_sector, None);
+
+    let mut sectors = Vec::with_capacity(sector_count);
+    let mut logical_bytes = 0_u64;
+    let mut source_upload_bytes = 0_u64;
+    let mut virtual_zero_bytes = 0_u64;
+    for sector_index in 0..sector_count {
+        let mut bytes = vec![0_u8; profile.sector_size as usize];
+        let mut slots = Vec::with_capacity(slots_per_sector);
+        for slot_index in 0..slots_per_sector {
+            let flat_index = sector_index * slots_per_sector + slot_index;
+            let Some(id) = assignments[flat_index] else {
+                virtual_zero_bytes += u64::from(profile.slot_size);
+                slots.push(PackedSlot::VirtualZero { source: None });
+                continue;
+            };
+            let chunk = desired[&id];
+            logical_bytes += u64::from(chunk.source.logical_len);
+            let slot_start = slot_index * profile.slot_size as usize;
+            if chunk.virtual_zero {
+                virtual_zero_bytes += u64::from(profile.slot_size);
+                slots.push(PackedSlot::VirtualZero {
+                    source: Some(chunk.source.clone()),
+                });
+            } else {
+                let end = slot_start + chunk.bytes.len();
+                bytes[slot_start..end].copy_from_slice(&chunk.bytes);
+                source_upload_bytes += chunk.bytes.len() as u64;
+                virtual_zero_bytes += u64::from(profile.slot_size - chunk.source.logical_len);
+                slots.push(PackedSlot::Data(chunk.source.clone()));
+            }
+        }
+        let commitment = merkle_commit(&bytes).map_err(|_| PackingError::InvalidCatalog)?;
+        let mut descriptor = PackedSectorDescriptor {
+            id: [0; 32],
+            sector_index: sector_index as u32,
+            commitment,
+            slots,
+        };
+        descriptor.id = descriptor.calculate_id(profile)?;
+        sectors.push(PackedSector { descriptor, bytes });
+    }
+    let descriptors = sectors
+        .iter()
+        .map(|sector| sector.descriptor.clone())
+        .collect::<Vec<_>>();
+    let revision = previous.map_or(1, |catalog| catalog.revision + 1);
+    let parent = previous.map(|catalog| catalog.id);
+    let mut catalog = PackedCatalog {
+        id: [0; 32],
+        format_version: 1,
+        revision,
+        parent,
+        profile,
+        sectors: descriptors,
+    };
+    catalog.id = catalog.calculate_id()?;
+    let changed_sectors = sectors
+        .iter()
+        .filter(|sector| {
+            previous
+                .and_then(|catalog| catalog.sectors.get(sector.descriptor.sector_index as usize))
+                .is_none_or(|old| old.commitment != sector.descriptor.commitment)
+        })
+        .count() as u64
+        + previous
+            .map(|catalog| catalog.sectors.len().saturating_sub(sectors.len()) as u64)
+            .unwrap_or(0);
+    let result = PackingResult {
+        metrics: PackingMetrics {
+            logical_bytes,
+            source_upload_bytes,
+            packed_sector_bytes: sector_count as u64 * u64::from(profile.sector_size),
+            virtual_zero_bytes,
+            reused_slots,
+            changed_sectors,
+        },
+        catalog,
+        sectors,
+    };
+    result.validate()?;
+    Ok(result)
+}
+
+/// Recover one logical protected-root object from authenticated packed sector
+/// bytes. Virtual-zero source chunks are synthesized without stored payload.
+pub fn unpack_object(
+    packed: &PackingResult,
+    owner: NodeId,
+    protected_root: [u8; 32],
+    object_id: [u8; 32],
+) -> Result<Vec<u8>, PackingError> {
+    packed.validate()?;
+    let mut chunks = Vec::<(u32, Vec<u8>)>::new();
+    let slot_size = packed.catalog.profile.slot_size as usize;
+    for sector in &packed.sectors {
+        for (slot_index, slot) in sector.descriptor.slots.iter().enumerate() {
+            let Some(source) = slot.source() else {
+                continue;
+            };
+            if (
+                source.id.owner,
+                source.id.protected_root,
+                source.id.object_id,
+            ) != (owner, protected_root, object_id)
+            {
+                continue;
+            }
+            let bytes = match slot {
+                PackedSlot::Data(_) => {
+                    let start = slot_index * slot_size;
+                    sector.bytes[start..start + source.logical_len as usize].to_vec()
+                }
+                PackedSlot::VirtualZero { .. } => vec![0; source.logical_len as usize],
+            };
+            chunks.push((source.id.chunk_index, bytes));
+        }
+    }
+    if chunks.is_empty() {
+        return Err(PackingError::MissingObject);
+    }
+    chunks.sort_by_key(|(index, _)| *index);
+    if chunks
+        .iter()
+        .enumerate()
+        .any(|(index, (chunk, _))| *chunk != index as u32)
+    {
+        return Err(PackingError::InvalidCatalog);
+    }
+    Ok(chunks.into_iter().flat_map(|(_, bytes)| bytes).collect())
+}
+
+#[derive(Debug)]
+struct InputChunk {
+    source: PackedSourceChunk,
+    bytes: Vec<u8>,
+    virtual_zero: bool,
+}
+
+fn input_chunks(
+    profile: PackingProfile,
+    inputs: Vec<PackingInput>,
+) -> Result<Vec<InputChunk>, PackingError> {
+    let mut seen_objects = std::collections::BTreeSet::new();
+    let mut chunks = Vec::new();
+    for input in inputs {
+        let object = (input.owner, input.protected_root, input.object_id);
+        if input.owner == NodeId([0; 32])
+            || input.protected_root == [0; 32]
+            || input.object_id == [0; 32]
+            || input.bytes.is_empty()
+            || !seen_objects.insert(object)
+        {
+            return Err(PackingError::InvalidInput);
+        }
+        for (index, bytes) in input.bytes.chunks(profile.slot_size as usize).enumerate() {
+            if chunks.len() == MAX_PACKED_CHUNKS {
+                return Err(PackingError::TooManyChunks);
+            }
+            let chunk_index = u32::try_from(index).map_err(|_| PackingError::TooManyChunks)?;
+            chunks.push(InputChunk {
+                source: PackedSourceChunk {
+                    id: SourceChunkId {
+                        owner: input.owner,
+                        protected_root: input.protected_root,
+                        object_id: input.object_id,
+                        chunk_index,
+                    },
+                    source_offset: u64::from(chunk_index) * u64::from(profile.slot_size),
+                    logical_len: bytes.len() as u32,
+                    content_hash: *blake3::hash(bytes).as_bytes(),
+                },
+                bytes: bytes.to_vec(),
+                virtual_zero: bytes.iter().all(|byte| *byte == 0),
+            });
+        }
+    }
+    chunks.sort_by_key(|chunk| chunk.source.id);
+    Ok(chunks)
+}
+
+fn catalog_id(
+    format_version: u16,
+    revision: u64,
+    parent: Option<[u8; 32]>,
+    profile: PackingProfile,
+    sectors: &[PackedSectorDescriptor],
+) -> Result<[u8; 32], PackingError> {
+    let mut hasher = blake3::Hasher::new_derive_key("mutualbackup packed catalog v1");
+    hasher.update(&canonical_bytes(&(
+        format_version,
+        revision,
+        parent,
+        profile,
+        sectors,
+    ))?);
+    Ok(*hasher.finalize().as_bytes())
+}
+
+#[derive(Debug, Error)]
+pub enum PackingError {
+    #[error("packing profile is invalid")]
+    InvalidProfile,
+    #[error("packing input is empty, duplicated, or has an invalid identity")]
+    InvalidInput,
+    #[error("packed catalog is invalid")]
+    InvalidCatalog,
+    #[error("an incremental update cannot change its packing profile")]
+    ProfileChanged,
+    #[error("the packing operation exceeds its chunk bound")]
+    TooManyChunks,
+    #[error("the requested packed object is absent")]
+    MissingObject,
+    #[error("protocol model failure: {0}")]
+    Model(#[from] crate::ModelError),
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{KeyMaterial, Seed, merkle_open_range, merkle_verify_range};
+
+    use super::*;
+
+    fn owners(count: u8) -> Vec<NodeId> {
+        (0..count)
+            .map(|value| KeyMaterial::from_seed(&Seed::from_bytes([value + 150; 32])).node_id())
+            .collect()
+    }
+
+    fn input(owner: NodeId, protected_root: u8, object_id: u8, bytes: Vec<u8>) -> PackingInput {
+        PackingInput {
+            owner,
+            protected_root: [protected_root; 32],
+            object_id: [object_id; 32],
+            bytes,
+        }
+    }
+
+    fn profile() -> PackingProfile {
+        PackingProfile {
+            format_version: 1,
+            sector_size: 64,
+            slot_size: 16,
+        }
+    }
+
+    #[test]
+    fn new_slots_are_fair_and_cross_user_and_cover_multiple_roots() {
+        let owners = owners(3);
+        let packed = pack_incremental(
+            profile(),
+            None,
+            vec![
+                input(owners[0], 1, 10, vec![1; 40]),
+                input(owners[0], 2, 11, vec![2; 20]),
+                input(owners[1], 3, 12, vec![3; 35]),
+                input(owners[2], 4, 13, vec![4; 33]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            unpack_object(&packed, owners[0], [1; 32], [10; 32]).unwrap(),
+            vec![1; 40]
+        );
+        assert_eq!(
+            unpack_object(&packed, owners[1], [3; 32], [12; 32]).unwrap(),
+            vec![3; 35]
+        );
+        let scheduled = packed
+            .catalog
+            .sectors
+            .iter()
+            .flat_map(|sector| &sector.slots)
+            .filter_map(PackedSlot::source)
+            .map(|source| source.id.owner)
+            .collect::<Vec<_>>();
+        let mut expected_owners = owners.clone();
+        expected_owners.sort();
+        assert_eq!(scheduled[..3], expected_owners[..]);
+        assert!(
+            packed.catalog.sectors[0]
+                .slots
+                .iter()
+                .filter_map(PackedSlot::source)
+                .map(|source| source.id.owner)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                > 1
+        );
+        assert_eq!(
+            packed
+                .catalog
+                .sectors
+                .iter()
+                .flat_map(|sector| &sector.slots)
+                .filter_map(PackedSlot::source)
+                .filter(|source| source.id.owner == owners[0])
+                .map(|source| source.id.protected_root)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn incremental_changes_keep_slots_and_touch_only_affected_sectors() {
+        let owners = owners(2);
+        let first_inputs = vec![
+            input(owners[0], 1, 10, vec![1; 48]),
+            input(owners[1], 2, 20, vec![2; 48]),
+        ];
+        let first = pack_incremental(profile(), None, first_inputs).unwrap();
+        let mut changed = vec![1; 48];
+        changed[17] = 9;
+        let second = pack_incremental(
+            profile(),
+            Some(&first.catalog),
+            vec![
+                input(owners[0], 1, 10, changed),
+                input(owners[1], 2, 20, vec![2; 48]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(second.metrics.reused_slots, 6);
+        assert_eq!(second.metrics.changed_sectors, 1);
+        let first_locations = source_locations(&first.catalog);
+        assert_eq!(source_locations(&second.catalog), first_locations);
+    }
+
+    #[test]
+    fn removed_and_sparse_chunks_become_authenticated_virtual_zero() {
+        let owners = owners(2);
+        let first = pack_incremental(
+            profile(),
+            None,
+            vec![
+                input(owners[0], 1, 10, vec![8; 48]),
+                input(owners[1], 2, 20, vec![0; 32]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(first.metrics.source_upload_bytes, 48);
+        assert!(first.catalog.sectors.iter().any(|sector| {
+            sector
+                .slots
+                .iter()
+                .any(|slot| matches!(slot, PackedSlot::VirtualZero { source: Some(_) }))
+        }));
+        assert_eq!(
+            unpack_object(&first, owners[1], [2; 32], [20; 32]).unwrap(),
+            vec![0; 32]
+        );
+
+        let second = pack_incremental(
+            profile(),
+            Some(&first.catalog),
+            vec![input(owners[1], 2, 20, vec![0; 32])],
+        )
+        .unwrap();
+        assert!(second.catalog.sectors.iter().any(|sector| {
+            sector
+                .slots
+                .iter()
+                .any(|slot| matches!(slot, PackedSlot::VirtualZero { source: None }))
+        }));
+        for sector in &second.sectors {
+            let proof = merkle_open_range(&sector.bytes, 1, 1).unwrap();
+            merkle_verify_range(&sector.descriptor.commitment, &proof).unwrap();
+        }
+    }
+
+    #[test]
+    fn sparse_large_sector_metrics_pin_transfer_and_proof_efficiency() {
+        let owners = owners(1);
+        let profile = PackingProfile {
+            format_version: 1,
+            sector_size: 64 * 1024,
+            slot_size: 4096,
+        };
+        let packed =
+            pack_incremental(profile, None, vec![input(owners[0], 9, 10, vec![7])]).unwrap();
+        assert_eq!(packed.metrics.logical_bytes, 1);
+        assert_eq!(packed.metrics.source_upload_bytes, 1);
+        assert_eq!(packed.metrics.packed_sector_bytes, 64 * 1024);
+        assert_eq!(packed.metrics.virtual_zero_bytes, 64 * 1024 - 1);
+        let proof = merkle_open_range(&packed.sectors[0].bytes, 0, 1).unwrap();
+        assert_eq!(proof.leaves.len() * MERKLE_LEAF_SIZE, 16);
+        assert_eq!(proof.siblings.len(), 12);
+    }
+
+    fn source_locations(
+        catalog: &PackedCatalog,
+    ) -> std::collections::BTreeMap<SourceChunkId, usize> {
+        catalog
+            .sectors
+            .iter()
+            .flat_map(|sector| &sector.slots)
+            .enumerate()
+            .filter_map(|(index, slot)| slot.source().map(|source| (source.id, index)))
+            .collect()
+    }
+}

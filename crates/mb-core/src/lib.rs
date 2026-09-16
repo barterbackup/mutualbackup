@@ -10,6 +10,7 @@ mod content;
 mod guild;
 mod keys;
 mod model;
+mod packing;
 mod range;
 mod recovery;
 
@@ -47,6 +48,11 @@ pub use model::{
     RevisionTombstone, SectorId, SectorRef, ShardRole, ShardRoleV2, SignedRecord,
     StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision, WriterFence, canonical_bytes,
     coding_group_id, coding_group_v2_id, decode_canonical,
+};
+pub use packing::{
+    PackedCatalog, PackedSector, PackedSectorDescriptor, PackedSlot, PackedSourceChunk,
+    PackingError, PackingInput, PackingMetrics, PackingProfile, PackingResult, SourceChunkId,
+    pack_incremental, unpack_object,
 };
 pub use range::{
     MERKLE_LEAF_SIZE, MERKLE_SUITE_V1, MerkleCommitment, MerkleError, MerkleRangeProof,
