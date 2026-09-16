@@ -6480,11 +6480,147 @@ pub async fn run_peer_exchange(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result
         if let Err(error) = sync_guild_events_once(node.clone(), &p2p).await {
             tracing::warn!(%error, "guild event-tail synchronization failed");
         }
+        if let Err(error) = reconcile_variable_group_lifecycle_once(node.clone(), &p2p).await {
+            tracing::warn!(%error, "variable coding-group lifecycle reconciliation failed");
+        }
         if let Err(error) = exchange_guild_endpoints_once(node.clone(), &p2p).await {
             tracing::warn!(%error, "guild peer endpoint exchange failed");
         }
         tokio::time::sleep(PEER_EXCHANGE_INTERVAL).await;
     }
+}
+
+async fn reconcile_variable_group_lifecycle_once(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+) -> Result<()> {
+    let (state, guild, checkpoint, local_id) = node_blocking(node.clone(), |node| {
+        let guild = node
+            .guild_summary()?
+            .context("coding-group lifecycle requires an installed guild")?;
+        let checkpoint = node.current_checkpoint(guild.guild_id)?;
+        Ok((
+            node.dynamic_guild_state()?
+                .context("coding-group lifecycle requires dynamic guild state")?,
+            guild,
+            checkpoint,
+            node.keys().node_id(),
+        ))
+    })
+    .await?;
+    if guild.coordinator != local_id || !matches!(guild.phase, GuildPhase::Active) {
+        return Ok(());
+    }
+    let Some(checkpoint) = checkpoint else {
+        return Ok(());
+    };
+    let live_sectors = checkpoint
+        .checkpoint
+        .revisions
+        .iter()
+        .flat_map(|revision| {
+            revision
+                .value
+                .metadata_sectors
+                .iter()
+                .chain(&revision.value.data_sectors)
+        })
+        .map(|reference| reference.id)
+        .collect::<BTreeSet<_>>();
+    let candidate = state.coding_groups.iter().find(|retained| {
+        !retained.group.roles.iter().any(|role| {
+            matches!(role, ShardRoleV2::Information(information)
+                if !information.sector.virtual_zero
+                    && live_sectors.contains(&information.sector.id))
+        })
+    });
+    let Some(candidate) = candidate else {
+        return Ok(());
+    };
+    let sequence = state
+        .event_sequence
+        .checked_add(1)
+        .context("guild event sequence exhausted")?;
+    let kind = if candidate.retired_at_event.is_none() {
+        mb_core::GuildEventKind::RetireCodingGroup {
+            group_id: candidate.group.id,
+            retain_through_event: sequence,
+        }
+    } else if candidate
+        .retain_through_event
+        .is_some_and(|retain_through| sequence > retain_through)
+    {
+        mb_core::GuildEventKind::ForgetCodingGroup {
+            group_id: candidate.group.id,
+        }
+    } else {
+        return Ok(());
+    };
+    let event = GuildEvent {
+        format_version: 1,
+        guild_id: state.guild_id,
+        sequence,
+        parent: state.event_head,
+        kind,
+    };
+    state.validate_event_proposal(&event)?;
+    commit_plain_guild_event(node, p2p, state, guild, local_id, event).await
+}
+
+async fn commit_plain_guild_event(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    state: mb_core::DynamicGuildState,
+    guild: crate::GuildSummary,
+    local_id: NodeId,
+    event: GuildEvent,
+) -> Result<()> {
+    let mut signatures = Vec::new();
+    let mut requests = FuturesUnordered::new();
+    for peer in &guild.peers {
+        let signer = peer.member.node_id;
+        if signer == local_id {
+            let event = event.clone();
+            signatures.push(
+                node_blocking(node.clone(), move |node| {
+                    node.sign_guild_event_proposal(&event)
+                })
+                .await?,
+            );
+            continue;
+        }
+        for endpoint in &peer.endpoints {
+            if let Ok(address) = endpoint.parse() {
+                let _ = p2p.add_peer_address(signer, address).await;
+            }
+        }
+        let proposal = event.clone();
+        requests.push(async move { (signer, p2p.sign_guild_event(signer, proposal).await) });
+    }
+    while let Some((signer, result)) = requests.next().await {
+        match result {
+            Ok(signature) => signatures.push(signature),
+            Err(error) => {
+                tracing::debug!(%signer, %error, "guild member did not sign lifecycle event");
+            }
+        }
+    }
+    signatures.sort_by_key(|signature| signature.signer);
+    let certified = QuorumGuildEvent { event, signatures };
+    state.verify_event(&certified)?;
+    for peer in guild
+        .peers
+        .iter()
+        .filter(|peer| peer.member.node_id != local_id)
+    {
+        if let Err(error) = p2p
+            .install_guild_event(peer.member.node_id, certified.clone())
+            .await
+        {
+            tracing::debug!(peer = %peer.member.node_id, %error, "guild lifecycle event dissemination deferred to tail sync");
+        }
+    }
+    node_blocking(node, move |node| node.install_guild_event(certified)).await
 }
 
 async fn sync_guild_events_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<usize> {
