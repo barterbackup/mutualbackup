@@ -508,20 +508,17 @@ impl StorageVolumes {
 
     pub(crate) fn coding_capacity(&self, control: &ControlStore, shard_size: u32) -> Result<u64> {
         validate_coding_shard_size(shard_size)?;
-        self.volumes.values().try_fold(0_u64, |capacity, volume| {
+        let mut devices = BTreeMap::new();
+        for volume in self.volumes.values() {
             if volume.record.state != StorageVolumeState::Online {
-                return Ok(capacity);
+                continue;
             }
             let Some(store) = volume.store.as_ref() else {
-                return Ok(capacity);
+                continue;
             };
-            Ok(capacity.saturating_add(volume_coding_capacity(
-                control,
-                &volume.record,
-                store,
-                shard_size,
-            )?))
-        })
+            add_volume_coding_capacity(&mut devices, &volume.record, store, shard_size)?;
+        }
+        device_coding_capacity(control, &devices, shard_size)
     }
 
     pub(crate) fn reclaim(&mut self, volume_id: Option<Uuid>) -> Result<u64> {
@@ -1723,7 +1720,7 @@ pub(crate) fn reader_coding_capacity(
         .into_iter()
         .map(|record| (record.volume_id, record))
         .collect::<BTreeMap<_, _>>();
-    let mut capacity = 0_u64;
+    let mut devices = BTreeMap::new();
     for reader in readers {
         let Some(record) = records.get(&reader.volume_id) else {
             continue;
@@ -1739,10 +1736,9 @@ pub(crate) fn reader_coding_capacity(
             Ok(store) => store,
             Err(_) => continue,
         };
-        capacity =
-            capacity.saturating_add(volume_coding_capacity(control, record, &store, shard_size)?);
+        add_volume_coding_capacity(&mut devices, record, &store, shard_size)?;
     }
-    Ok(capacity)
+    device_coding_capacity(control, &devices, shard_size)
 }
 
 pub(crate) fn open_control_store(
@@ -2062,23 +2058,65 @@ fn validate_coding_shard_size(shard_size: u32) -> Result<()> {
     Ok(())
 }
 
-fn volume_coding_capacity(
-    control: &ControlStore,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DeviceCodingCapacity {
+    logical_shards: u64,
+    available_bytes: Option<u64>,
+    reserved_bytes: u64,
+}
+
+fn add_volume_coding_capacity(
+    devices: &mut BTreeMap<u64, DeviceCodingCapacity>,
     record: &VolumeRecord,
     store: &ParityStore,
     shard_size: u32,
-) -> Result<u64> {
+) -> Result<()> {
     let logical = record
         .budget_bytes
         .saturating_sub(record.headroom_bytes)
         .saturating_sub(store.used_bytes()?)
         / u64::from(shard_size);
+    let device = fs::metadata(&record.path)?.dev();
+    let available = fs2::available_space(&record.path)?;
+    let entry = devices.entry(device).or_default();
+    entry.logical_shards = entry.logical_shards.saturating_add(logical);
+    entry.available_bytes = Some(
+        entry
+            .available_bytes
+            .map_or(available, |prior| prior.min(available)),
+    );
+    entry.reserved_bytes = entry
+        .reserved_bytes
+        .saturating_add(record.headroom_bytes)
+        .saturating_add(store.checkpoint_reservation_bytes()?);
+    Ok(())
+}
+
+fn device_coding_capacity(
+    control: &ControlStore,
+    devices: &BTreeMap<u64, DeviceCodingCapacity>,
+    shard_size: u32,
+) -> Result<u64> {
+    let control_device = fs::metadata(control.path())?.dev();
+    let control_checkpoint = control.checkpoint_reservation_bytes()?;
     let required_physical = physical_write_reservation(shard_size as usize, 0);
-    let physical = fs2::available_space(&record.path)?
-        .saturating_sub(record.headroom_bytes)
-        .saturating_sub(shared_checkpoint_reservation(control, store)?)
-        / required_physical;
-    Ok(logical.min(physical))
+    Ok(devices
+        .iter()
+        .map(|(device, capacity)| {
+            let control_reserve = if *device == control_device {
+                control_checkpoint
+            } else {
+                0
+            };
+            let reserved = capacity.reserved_bytes.saturating_add(control_reserve);
+            let physical = capacity
+                .available_bytes
+                .unwrap_or(0)
+                .saturating_sub(reserved)
+                / required_physical;
+            capacity.logical_shards.min(physical)
+        })
+        .fold(0_u64, u64::saturating_add))
 }
 
 fn physical_write_reservation(payload_bytes: usize, acknowledgement_bytes: usize) -> u64 {
@@ -2227,6 +2265,29 @@ mod tests {
             2
         );
     }
+
+    #[test]
+    fn coding_capacity_counts_shared_filesystem_space_once() {
+        let temp = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([204; 32])));
+        let (control, _) = open_control_store(temp.path(), &keys).unwrap();
+        let device = fs::metadata(control.path()).unwrap().dev();
+        let checkpoint = control.checkpoint_reservation_bytes().unwrap();
+        let per_shard = physical_write_reservation(V1_SECTOR_SIZE, 0);
+        let devices = BTreeMap::from([(
+            device,
+            DeviceCodingCapacity {
+                logical_shards: 8,
+                available_bytes: Some(checkpoint + 8192 + per_shard * 2 + per_shard / 2),
+                reserved_bytes: 8192,
+            },
+        )]);
+        assert_eq!(
+            device_coding_capacity(&control, &devices, V1_SECTOR_SIZE as u32).unwrap(),
+            2
+        );
+    }
+
     fn parity_object(marker: u8, shard_index: u8) -> ParityObject {
         let bytes = vec![marker; V1_SECTOR_SIZE];
         ParityObject {
