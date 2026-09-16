@@ -2080,6 +2080,39 @@ impl P2pClient {
         Ok(bytes)
     }
 
+    async fn variable_shard(
+        &self,
+        peer: NodeId,
+        group: &CodingGroupV2,
+        shard_index: u16,
+    ) -> Result<Vec<u8>> {
+        let role = group
+            .roles
+            .get(usize::from(shard_index))
+            .context("variable shard index is outside its group")?;
+        let commitment = match role {
+            ShardRoleV2::Information(information) => &information.sector.commitment,
+            ShardRoleV2::Parity(parity) => &parity.commitment,
+        };
+        let response = self
+            .call(
+                peer,
+                PeerRequest::GetVariableShard {
+                    guild_id: group.guild_id,
+                    group_id: group.id,
+                    shard_index,
+                },
+            )
+            .await?;
+        let PeerResponse::Bytes(bytes) = response else {
+            bail!("peer returned the wrong variable shard response");
+        };
+        if merkle_commit(&bytes)? != *commitment {
+            bail!("peer returned a variable shard with the wrong commitment");
+        }
+        Ok(bytes)
+    }
+
     async fn store_repair_shard(&self, peer: NodeId, repair: ShardRepair) -> Result<()> {
         let ShardRepair {
             repair_id,
@@ -8237,6 +8270,140 @@ async fn reconstruct_shard_from_peers(
         .context("target shard was not reconstructed")
 }
 
+async fn reconstruct_variable_shard_from_peers(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    group: &CodingGroupV2,
+    target_index: usize,
+    roster: &[GuildPeer],
+    deferred_holders: &Mutex<BTreeSet<NodeId>>,
+) -> Result<Vec<u8>> {
+    group.validate()?;
+    if target_index >= group.roles.len() {
+        bail!("target shard index is outside its variable coding group");
+    }
+    let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
+    for peer in roster {
+        for endpoint in &peer.endpoints {
+            if let Ok(address) = endpoint.parse::<Multiaddr>() {
+                let _ = p2p.add_peer_address(peer.member.node_id, address).await;
+            }
+        }
+    }
+    let mut shards = group
+        .roles
+        .iter()
+        .map(|role| match role {
+            ShardRoleV2::Information(information) if information.sector.virtual_zero => {
+                Some(vec![0; group.profile.shard_size as usize])
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for attempt in 0..SHARD_FETCH_ATTEMPTS {
+        let deferred = deferred_holders
+            .lock()
+            .map_err(|_| anyhow::anyhow!("shard holder health lock is poisoned"))?
+            .clone();
+        let mut candidates = std::iter::once(target_index)
+            .chain((0..group.roles.len()).filter(|index| *index != target_index))
+            .filter_map(|index| {
+                if shards[index].is_some() {
+                    return None;
+                }
+                let holder = match &group.roles[index] {
+                    ShardRoleV2::Information(information) => information.owner,
+                    ShardRoleV2::Parity(parity) => parity.holder,
+                };
+                roster
+                    .iter()
+                    .any(|peer| peer.member.node_id == holder)
+                    .then_some((index, holder))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(_, holder)| deferred.contains(holder));
+        let needed =
+            usize::from(group.profile.data_shards).saturating_sub(shards.iter().flatten().count());
+        let mut requests = FuturesUnordered::new();
+        let mut issued = Vec::new();
+        for (index, holder) in candidates.into_iter().take(needed.saturating_add(1)) {
+            issued.push((index, holder));
+            let client = p2p.clone();
+            let node = node.clone();
+            let group = group.clone();
+            requests.push(async move {
+                let result = if holder == local_id {
+                    let guild_id = group.guild_id;
+                    let group_id = group.id;
+                    node_blocking(node, move |node| {
+                        node.variable_shard_for_guild(&guild_id, &group_id, index as u16)
+                    })
+                    .await
+                } else {
+                    client.variable_shard(holder, &group, index as u16).await
+                };
+                (index, holder, result)
+            });
+        }
+        while let Some((index, holder, result)) = requests.next().await {
+            match result {
+                Ok(bytes) => shards[index] = Some(bytes),
+                Err(error) => tracing::warn!(
+                    group = %hex::encode(group.id),
+                    shard_index = index,
+                    %holder,
+                    %error,
+                    "could not fetch a variable recovery shard"
+                ),
+            }
+            if shards.iter().flatten().count() >= usize::from(group.profile.data_shards) {
+                break;
+            }
+        }
+        {
+            let mut deferred = deferred_holders
+                .lock()
+                .map_err(|_| anyhow::anyhow!("shard holder health lock is poisoned"))?;
+            for (index, holder) in issued {
+                if shards[index].is_some() {
+                    deferred.remove(&holder);
+                } else {
+                    deferred.insert(holder);
+                }
+            }
+        }
+        if shards.iter().flatten().count() >= usize::from(group.profile.data_shards) {
+            break;
+        }
+        if attempt + 1 < SHARD_FETCH_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    if shards.iter().flatten().count() < usize::from(group.profile.data_shards) {
+        bail!(
+            "variable coding group {} has fewer than {} reachable valid shards after {} attempts",
+            hex::encode(group.id),
+            group.profile.data_shards,
+            SHARD_FETCH_ATTEMPTS
+        );
+    }
+    if let Some(bytes) = shards[target_index].take() {
+        return Ok(bytes);
+    }
+    mb_core::reconstruct(group.profile, &mut shards)?;
+    let bytes = shards[target_index]
+        .take()
+        .context("target variable shard was not reconstructed")?;
+    let commitment = match &group.roles[target_index] {
+        ShardRoleV2::Information(information) => &information.sector.commitment,
+        ShardRoleV2::Parity(parity) => &parity.commitment,
+    };
+    if merkle_commit(&bytes)? != *commitment {
+        bail!("reconstructed variable shard has the wrong Merkle commitment");
+    }
+    Ok(bytes)
+}
+
 pub(crate) async fn restore_snapshot_with_p2p(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
@@ -8251,10 +8418,16 @@ pub(crate) async fn restore_snapshot_with_p2p(
     {
         return Ok(restored);
     }
-    let (checkpoint, revision, roster) = node_blocking(node.clone(), move |node| {
-        node.snapshot_repair_plan(revision_id)
-    })
-    .await?;
+    let (checkpoint, revision, roster, variable_groups) =
+        node_blocking(node.clone(), move |node| {
+            let (checkpoint, revision, roster) = node.snapshot_repair_plan(revision_id)?;
+            let groups = node
+                .dynamic_guild_state()?
+                .context("snapshot recovery requires dynamic guild state")?
+                .coding_groups;
+            Ok((checkpoint, revision, roster, groups))
+        })
+        .await?;
     let guild_id = checkpoint.checkpoint.guild_id;
     let references = revision
         .value
@@ -8278,30 +8451,58 @@ pub(crate) async fn restore_snapshot_with_p2p(
         if local_is_valid {
             continue;
         }
-        let (group, target_index) = checkpoint
-            .checkpoint
-            .coding_groups
-            .iter()
-            .find_map(|group| {
-                group
-                    .roles
-                    .iter()
-                    .enumerate()
-                    .find(|(_, role)| {
-                        matches!(role, ShardRole::Information(information) if information.sector == reference)
-                    })
-                    .map(|(index, _)| (group, index))
-            })
-            .context("snapshot sector is not present in the certified coding catalog")?;
-        let bytes = reconstruct_shard_from_peers(
-            node.clone(),
-            p2p,
-            group,
-            target_index,
-            &roster,
-            &deferred_holders,
-        )
-        .await?;
+        let variable = variable_groups.iter().find_map(|retained| {
+            retained
+                .group
+                .roles
+                .iter()
+                .enumerate()
+                .find(|(_, role)| {
+                    matches!(role, ShardRoleV2::Information(information)
+                        if !information.sector.virtual_zero
+                            && information.sector.id == reference.id)
+                })
+                .map(|(index, _)| (&retained.group, index))
+        });
+        let bytes = if let Some((group, target_index)) = variable {
+            reconstruct_variable_shard_from_peers(
+                node.clone(),
+                p2p,
+                group,
+                target_index,
+                &roster,
+                &deferred_holders,
+            )
+            .await?
+        } else {
+            let (group, target_index) = checkpoint
+                .checkpoint
+                .coding_groups
+                .iter()
+                .find_map(|group| {
+                    group
+                        .roles
+                        .iter()
+                        .enumerate()
+                        .find(|(_, role)| {
+                            matches!(role, ShardRole::Information(information) if information.sector == reference)
+                        })
+                        .map(|(index, _)| (group, index))
+                })
+                .context("snapshot sector is not present in a certified coding catalog")?;
+            reconstruct_shard_from_peers(
+                node.clone(),
+                p2p,
+                group,
+                target_index,
+                &roster,
+                &deferred_holders,
+            )
+            .await?
+        };
+        if bytes.len() != V1_SECTOR_SIZE || sector_root(&bytes) != expected_root {
+            bail!("reconstructed snapshot sector conflicts with its signed revision");
+        }
         let reference_for_install = reference.clone();
         node_blocking(node.clone(), move |node| {
             node.install_repaired_information_sector(guild_id, reference_for_install, &bytes)

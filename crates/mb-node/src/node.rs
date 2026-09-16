@@ -3848,6 +3848,64 @@ impl Node {
         Ok(object)
     }
 
+    pub fn variable_shard_for_guild(
+        &self,
+        guild_id: &[u8; 32],
+        group_id: &[u8; 32],
+        shard_index: u16,
+    ) -> Result<Vec<u8>> {
+        let state = self
+            .dynamic_guild_state()?
+            .context("node has no dynamic guild state")?;
+        if state.guild_id != *guild_id {
+            anyhow::bail!("variable coding group belongs to another guild");
+        }
+        let retained = state
+            .coding_groups
+            .iter()
+            .find(|retained| retained.group.id == *group_id)
+            .context("variable coding group is unavailable")?;
+        let role = retained
+            .group
+            .roles
+            .get(usize::from(shard_index))
+            .context("variable shard index is outside its group")?;
+        let (holder, commitment, storage_group) = match role {
+            ShardRoleV2::Information(information) => {
+                if information.sector.virtual_zero {
+                    return Ok(vec![0; retained.group.profile.shard_size as usize]);
+                }
+                (
+                    information.owner,
+                    &information.sector.commitment,
+                    information.sector.id,
+                )
+            }
+            ShardRoleV2::Parity(parity) => (parity.holder, &parity.commitment, retained.group.id),
+        };
+        if holder != self.keys.node_id() {
+            anyhow::bail!("variable shard is assigned to another holder");
+        }
+        let bytes = if let ShardRoleV2::Information(information) = role {
+            match self.sector_for_guild(guild_id, &information.sector.id) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    self.volumes
+                        .load_ready_variable(&self.control, &storage_group, shard_index)?
+                        .bytes
+                }
+            }
+        } else {
+            self.volumes
+                .load_ready_variable(&self.control, &storage_group, shard_index)?
+                .bytes
+        };
+        if merkle_commit(&bytes)? != *commitment {
+            anyhow::bail!("variable shard conflicts with its committed Merkle root");
+        }
+        Ok(bytes)
+    }
+
     fn validate_coding_attempt_plan(&self, plan: &SignedRecord<CodingAttemptPlan>) -> Result<()> {
         self.validate_signed_coding_attempt(plan)?;
         let state = self
@@ -8826,11 +8884,29 @@ mod tests {
         signatures.sort_by_key(|signature| signature.signer);
         let certified = QuorumGuildEvent { event, signatures };
         assert!(node.install_guild_event(certified.clone()).is_err());
-        node.install_coding_group_event(certified, transcript.clone())
+        node.install_coding_group_event(certified.clone(), transcript.clone())
+            .unwrap();
+        information_node
+            .install_coding_group_event(certified, transcript.clone())
             .unwrap();
         assert_eq!(
             node.dynamic_guild_state().unwrap().unwrap().coding_groups[0].group,
             transcript.value.manifest.value.group
+        );
+        assert_eq!(
+            information_node
+                .variable_shard_for_guild(&[181; 32], &transcript.value.manifest.value.group.id, 2,)
+                .unwrap(),
+            shards[2]
+        );
+        assert_eq!(
+            node.variable_shard_for_guild(
+                &[181; 32],
+                &transcript.value.manifest.value.group.id,
+                4,
+            )
+            .unwrap(),
+            shards[4]
         );
         assert!(
             node.discard_coding_attempt(&transcript.value.plan.value.attempt_id)

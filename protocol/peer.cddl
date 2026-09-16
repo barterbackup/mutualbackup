@@ -132,6 +132,11 @@ peer-request =
   / { "ActivateCodingParity": { transcript: signed-coding-transcript } }
   / { "AbortCodingAttempt": { plan: signed-coding-attempt-plan } }
   / { "GetParity": { guild_id: bytes32-array, group_id: bytes32-array, shard_index: uint8 } }
+  / { "GetVariableShard": {
+        guild_id: bytes32-array,
+        group_id: bytes32-array,
+        shard_index: uint
+      } }
   / { "StoreRepairShard": {
         repair_id: bytes16-array,
         guild_id: bytes32-array,

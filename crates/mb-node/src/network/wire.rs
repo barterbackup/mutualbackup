@@ -187,6 +187,11 @@ pub(super) enum PeerRequest {
         group_id: [u8; 32],
         shard_index: u8,
     },
+    GetVariableShard {
+        guild_id: [u8; 32],
+        group_id: [u8; 32],
+        shard_index: u16,
+    },
     StoreRepairShard {
         repair_id: [u8; 16],
         guild_id: [u8; 32],
@@ -320,6 +325,7 @@ impl PeerRequest {
             Self::SubmitCodingFailure { .. } => Some("submit-coding-failure"),
             Self::ActivateCodingParity { .. } => Some("activate-coding-parity"),
             Self::AbortCodingAttempt { .. } => Some("abort-coding-attempt"),
+            Self::GetVariableShard { .. } => Some("get-variable-shard"),
             Self::StoreRepairShard { .. } => Some("store-repair-shard"),
             Self::PutCheckpointPage { .. } => Some("put-checkpoint-page"),
             Self::SignCheckpoint { .. } => Some("sign-checkpoint"),
@@ -347,6 +353,7 @@ impl PeerRequest {
             | Self::GetSector { guild_id, .. }
             | Self::GetSectorRange { guild_id, .. }
             | Self::GetParity { guild_id, .. }
+            | Self::GetVariableShard { guild_id, .. }
             | Self::StoreRepairShard { guild_id, .. }
             | Self::PutCheckpointPage { guild_id, .. }
             | Self::SignCheckpoint { guild_id, .. }

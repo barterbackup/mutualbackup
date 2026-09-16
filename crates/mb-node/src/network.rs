@@ -907,6 +907,9 @@ fn execute_read_request(
             &group_id,
             shard_index,
         )?)),
+        PeerRequest::GetVariableShard { .. } => {
+            bail!("variable shard read was sent to a read-only worker")
+        }
         PeerRequest::GetCheckpointPage {
             guild_id,
             checkpoint_hash,
@@ -1187,6 +1190,15 @@ fn execute_peer_request(
             group_id,
             shard_index,
         } => Ok(PeerResponse::Bytes(node.parity_for_guild(
+            &guild_id,
+            &group_id,
+            shard_index,
+        )?)),
+        PeerRequest::GetVariableShard {
+            guild_id,
+            group_id,
+            shard_index,
+        } => Ok(PeerResponse::Bytes(node.variable_shard_for_guild(
             &guild_id,
             &group_id,
             shard_index,
