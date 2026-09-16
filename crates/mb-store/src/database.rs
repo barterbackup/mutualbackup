@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use mb_core::{
@@ -7,7 +8,7 @@ use mb_core::{
     V1_SECTOR_SIZE, merkle_commit, merkle_open_range, sector_root,
 };
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, params};
 use thiserror::Error;
 
 use crate::SCHEMA_VERSION;
@@ -1278,12 +1279,298 @@ impl ParityStore {
 
     pub fn used_bytes(&self) -> Result<u64, DatabaseError> {
         let used: i64 = self.connection.query_row(
-            "SELECT coalesce(sum(byte_length), 0) FROM parity_objects
-             WHERE state IN ('STAGED', 'READY')",
+            "SELECT
+                (SELECT coalesce(sum(byte_length), 0) FROM parity_objects
+                 WHERE state IN ('STAGED', 'READY'))
+                +
+                (SELECT coalesce(sum(byte_length), 0) FROM coding_reservations)",
             [],
             |row| row.get(0),
         )?;
         u64::try_from(used).map_err(|_| DatabaseError::Integrity)
+    }
+
+    /// Reserve durable space for one delegated parity row before any coding
+    /// input is transferred. Repeating the exact reservation is idempotent.
+    pub fn reserve_coding_attempt(
+        &mut self,
+        attempt_id: &[u8; 16],
+        guild_id: &[u8; 32],
+        shard_index: u16,
+        byte_length: u32,
+        budget_bytes: u64,
+    ) -> Result<u32, DatabaseError> {
+        if *attempt_id == [0; 16]
+            || *guild_id == [0; 32]
+            || usize::from(shard_index) >= usize::from(MAX_CODING_SHARDS)
+            || byte_length < MERKLE_LEAF_SIZE as u32
+            || byte_length > MAX_PROFILE_SHARD_SIZE
+            || !byte_length.is_power_of_two()
+        {
+            return Err(DatabaseError::Integrity);
+        }
+        let transaction = self.connection.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT guild_id, byte_length, written_until FROM coding_reservations
+                 WHERE attempt_id = ?1 AND shard_index = ?2",
+                params![attempt_id.as_slice(), shard_index],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((stored_guild, stored_length, written_until)) = existing {
+            if stored_guild.as_slice() != guild_id || stored_length != i64::from(byte_length) {
+                return Err(DatabaseError::Conflict);
+            }
+            transaction.commit()?;
+            return u32::try_from(written_until).map_err(|_| DatabaseError::Integrity);
+        }
+        let used: i64 = transaction.query_row(
+            "SELECT
+                (SELECT coalesce(sum(byte_length), 0) FROM parity_objects)
+                +
+                (SELECT coalesce(sum(byte_length), 0) FROM coding_reservations)",
+            [],
+            |row| row.get(0),
+        )?;
+        let required = u64::try_from(used)
+            .map_err(|_| DatabaseError::Integrity)?
+            .checked_add(u64::from(byte_length))
+            .ok_or(DatabaseError::CapacityExceeded)?;
+        if required > budget_bytes {
+            return Err(DatabaseError::CapacityExceeded);
+        }
+        transaction.execute(
+            "INSERT INTO coding_reservations(
+                attempt_id, guild_id, shard_index, byte_length, written_until, bytes
+             ) VALUES (?1, ?2, ?3, ?4, 0, zeroblob(?4))",
+            params![
+                attempt_id.as_slice(),
+                guild_id.as_slice(),
+                shard_index,
+                byte_length
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(0)
+    }
+
+    /// Append one bounded range to a reserved parity row. Exact replay of the
+    /// latest committed range is accepted, while gaps and divergent bytes are
+    /// rejected.
+    pub fn write_coding_attempt_range(
+        &mut self,
+        attempt_id: &[u8; 16],
+        shard_index: u16,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<u32, DatabaseError> {
+        if bytes.is_empty()
+            || bytes.len() > 512 * 1024
+            || !offset.is_multiple_of(MERKLE_LEAF_SIZE as u32)
+            || !bytes.len().is_multiple_of(MERKLE_LEAF_SIZE)
+        {
+            return Err(DatabaseError::Integrity);
+        }
+        let row = self
+            .connection
+            .query_row(
+                "SELECT rowid, byte_length, written_until FROM coding_reservations
+                 WHERE attempt_id = ?1 AND shard_index = ?2",
+                params![attempt_id.as_slice(), shard_index],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(DatabaseError::NotReady)?;
+        let end = u64::from(offset)
+            .checked_add(bytes.len() as u64)
+            .ok_or(DatabaseError::Integrity)?;
+        if end > u64::try_from(row.1).map_err(|_| DatabaseError::Integrity)? {
+            return Err(DatabaseError::Integrity);
+        }
+        let written = u32::try_from(row.2).map_err(|_| DatabaseError::Integrity)?;
+        let mut blob =
+            self.connection
+                .blob_open(MAIN_DB, "coding_reservations", "bytes", row.0, false)?;
+        if offset < written {
+            if end > u64::from(written) {
+                return Err(DatabaseError::Conflict);
+            }
+            let mut stored = vec![0_u8; bytes.len()];
+            blob.seek(SeekFrom::Start(u64::from(offset)))?;
+            blob.read_exact(&mut stored)?;
+            if stored != bytes {
+                return Err(DatabaseError::Conflict);
+            }
+            return Ok(written);
+        }
+        if offset != written {
+            return Err(DatabaseError::Conflict);
+        }
+        blob.seek(SeekFrom::Start(u64::from(offset)))?;
+        blob.write_all(bytes)?;
+        drop(blob);
+        let next = u32::try_from(end).map_err(|_| DatabaseError::Integrity)?;
+        self.connection.execute(
+            "UPDATE coding_reservations SET written_until = ?1
+             WHERE attempt_id = ?2 AND shard_index = ?3 AND written_until = ?4",
+            params![next, attempt_id.as_slice(), shard_index, written],
+        )?;
+        Ok(next)
+    }
+
+    /// Convert a completely uploaded reservation into a root-bound STAGED
+    /// object. The holder attaches its signed receipt in a second small write;
+    /// a crash between the two is safely resumable.
+    pub fn finish_coding_attempt_upload(
+        &mut self,
+        attempt_id: &[u8; 16],
+        group_id: &[u8; 32],
+        shard_index: u16,
+        commitment: &MerkleCommitment,
+    ) -> Result<(), DatabaseError> {
+        commitment
+            .validate()
+            .map_err(|_| DatabaseError::Integrity)?;
+        if *attempt_id == [0; 16]
+            || *group_id == [0; 32]
+            || commitment.byte_len > MAX_PROFILE_SHARD_SIZE
+        {
+            return Err(DatabaseError::Integrity);
+        }
+        let transaction = self.connection.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT format_version, root, byte_length, state, attempt_id, bytes
+                 FROM parity_objects WHERE group_id = ?1 AND shard_index = ?2",
+                params![group_id.as_slice(), shard_index],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing.0 != 2
+                || existing.1.as_slice() != commitment.root
+                || existing.2 != i64::from(commitment.byte_len)
+                || !matches!(existing.3.as_str(), "STAGED" | "READY")
+                || existing.4.as_deref() != Some(attempt_id.as_slice())
+                || merkle_commit(&existing.5).map_err(|_| DatabaseError::Integrity)? != *commitment
+            {
+                return Err(DatabaseError::Conflict);
+            }
+            transaction.execute(
+                "DELETE FROM coding_reservations
+                 WHERE attempt_id = ?1 AND shard_index = ?2",
+                params![attempt_id.as_slice(), shard_index],
+            )?;
+            transaction.commit()?;
+            return Ok(());
+        }
+        let reservation = transaction
+            .query_row(
+                "SELECT guild_id, byte_length, written_until, bytes
+                 FROM coding_reservations
+                 WHERE attempt_id = ?1 AND shard_index = ?2",
+                params![attempt_id.as_slice(), shard_index],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(DatabaseError::NotReady)?;
+        if reservation.1 != i64::from(commitment.byte_len)
+            || reservation.2 != reservation.1
+            || merkle_commit(&reservation.3).map_err(|_| DatabaseError::Integrity)? != *commitment
+        {
+            return Err(DatabaseError::Integrity);
+        }
+        transaction.execute(
+            "INSERT INTO parity_objects(
+                format_version, guild_id, group_id, shard_index, root,
+                byte_length, state, bytes, acknowledgement, attempt_id, verification_hash
+             ) VALUES (2, ?1, ?2, ?3, ?4, ?5, 'STAGED', ?6, x'', ?7, NULL)",
+            params![
+                reservation.0,
+                group_id.as_slice(),
+                shard_index,
+                commitment.root.as_slice(),
+                commitment.byte_len,
+                reservation.3,
+                attempt_id.as_slice(),
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM coding_reservations
+             WHERE attempt_id = ?1 AND shard_index = ?2",
+            params![attempt_id.as_slice(), shard_index],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn attach_coding_attempt_receipt(
+        &mut self,
+        attempt_id: &[u8; 16],
+        group_id: &[u8; 32],
+        shard_index: u16,
+        receipt: &[u8],
+    ) -> Result<(), DatabaseError> {
+        if receipt.is_empty() || receipt.len() > 64 * 1024 {
+            return Err(DatabaseError::Integrity);
+        }
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT acknowledgement FROM parity_objects
+                 WHERE attempt_id = ?1 AND group_id = ?2 AND shard_index = ?3
+                   AND format_version = 2 AND state IN ('STAGED', 'READY')",
+                params![attempt_id.as_slice(), group_id.as_slice(), shard_index],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .ok_or(DatabaseError::NotReady)?;
+        if !existing.is_empty() && existing != receipt {
+            return Err(DatabaseError::Conflict);
+        }
+        if existing.is_empty() {
+            self.connection.execute(
+                "UPDATE parity_objects SET acknowledgement = ?1
+                 WHERE attempt_id = ?2 AND group_id = ?3 AND shard_index = ?4
+                   AND acknowledgement = x''",
+                params![
+                    receipt,
+                    attempt_id.as_slice(),
+                    group_id.as_slice(),
+                    shard_index
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn ready_object_count(&self) -> Result<u64, DatabaseError> {
@@ -1819,10 +2106,15 @@ impl ParityStore {
         if *attempt_id == [0; 16] {
             return Err(DatabaseError::Integrity);
         }
-        let removed = self.connection.execute(
+        let staged = self.connection.execute(
             "DELETE FROM parity_objects WHERE attempt_id = ?1 AND state = 'STAGED'",
             [attempt_id.as_slice()],
         )? as u64;
+        let reservations = self.connection.execute(
+            "DELETE FROM coding_reservations WHERE attempt_id = ?1",
+            [attempt_id.as_slice()],
+        )? as u64;
+        let removed = staged.saturating_add(reservations);
         if removed != 0 {
             self.reclaim_deleted_pages()?;
         }
@@ -2138,6 +2430,17 @@ fn initialize_or_validate_parity(
             CHECK(length(bytes) = byte_length),
             CHECK(format_version = 2 OR byte_length = 65536),
             PRIMARY KEY(group_id, shard_index)
+         ) STRICT;
+         CREATE TABLE coding_reservations (
+            attempt_id BLOB NOT NULL CHECK(length(attempt_id) = 16),
+            guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
+            shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 0 AND 63),
+            byte_length INTEGER NOT NULL CHECK(byte_length BETWEEN 16 AND 4194304),
+            written_until INTEGER NOT NULL CHECK(
+                written_until BETWEEN 0 AND byte_length
+            ),
+            bytes BLOB NOT NULL CHECK(length(bytes) = byte_length),
+            PRIMARY KEY(attempt_id, shard_index)
          ) STRICT;",
     )?;
     transaction.execute(
@@ -2164,7 +2467,7 @@ fn migrate_control(connection: &mut Connection) -> Result<(), DatabaseError> {
     if version == SCHEMA_VERSION {
         return validate_control_schema(connection, version);
     }
-    if !matches!(version, 1..=3 | 5..=7) {
+    if !matches!(version, 1..=3 | 5..=8) {
         return Err(DatabaseError::IncompatibleSchema);
     }
     if version >= 2 && meta_value(connection, "database_kind")?.as_deref() != Some(b"control") {
@@ -2253,13 +2556,14 @@ fn migrate_parity(connection: &mut Connection, volume_id: &[u8; 16]) -> Result<(
     if version == SCHEMA_VERSION {
         return validate_parity_schema(connection);
     }
-    if !matches!(version, 2..=3 | 5..=7)
+    if !matches!(version, 2..=3 | 5..=8)
         || meta_value(connection, "database_kind")?.as_deref() != Some(b"parity")
         || meta_value(connection, "volume_id")?.as_deref() != Some(volume_id.as_slice())
     {
         return Err(DatabaseError::IncompatibleSchema);
     }
     let prior_schema = match version {
+        8 => PARITY_OBJECTS_SCHEMA,
         7 => PARITY_OBJECTS_BEFORE_V8_SCHEMA,
         6 => PARITY_OBJECTS_BEFORE_V7_SCHEMA,
         _ => PARITY_OBJECTS_BEFORE_V6_SCHEMA,
@@ -2275,8 +2579,9 @@ fn migrate_parity(connection: &mut Connection, volume_id: &[u8; 16]) -> Result<(
              ADD COLUMN acknowledgement BLOB NOT NULL DEFAULT x'';",
         )?;
     }
-    transaction.execute_batch(
-        "ALTER TABLE parity_objects RENAME TO parity_objects_before_v8;
+    if version < 8 {
+        transaction.execute_batch(
+            "ALTER TABLE parity_objects RENAME TO parity_objects_before_v8;
          CREATE TABLE parity_objects (
             format_version INTEGER NOT NULL CHECK(format_version IN (1, 2)),
             guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
@@ -2303,6 +2608,20 @@ fn migrate_parity(connection: &mut Connection, volume_id: &[u8; 16]) -> Result<(
                 byte_length, state, bytes, acknowledgement, NULL, NULL
          FROM parity_objects_before_v8;
          DROP TABLE parity_objects_before_v8;",
+        )?;
+    }
+    transaction.execute_batch(
+        "CREATE TABLE coding_reservations (
+            attempt_id BLOB NOT NULL CHECK(length(attempt_id) = 16),
+            guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
+            shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 0 AND 63),
+            byte_length INTEGER NOT NULL CHECK(byte_length BETWEEN 16 AND 4194304),
+            written_until INTEGER NOT NULL CHECK(
+                written_until BETWEEN 0 AND byte_length
+            ),
+            bytes BLOB NOT NULL CHECK(length(bytes) = byte_length),
+            PRIMARY KEY(attempt_id, shard_index)
+         ) STRICT;",
     )?;
     transaction.execute(
         "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
@@ -2411,6 +2730,18 @@ const PARITY_OBJECTS_SCHEMA: &str = "CREATE TABLE parity_objects (
     PRIMARY KEY(group_id, shard_index)
 ) STRICT";
 
+const CODING_RESERVATIONS_SCHEMA: &str = "CREATE TABLE coding_reservations (
+    attempt_id BLOB NOT NULL CHECK(length(attempt_id) = 16),
+    guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
+    shard_index INTEGER NOT NULL CHECK(shard_index BETWEEN 0 AND 63),
+    byte_length INTEGER NOT NULL CHECK(byte_length BETWEEN 16 AND 4194304),
+    written_until INTEGER NOT NULL CHECK(
+        written_until BETWEEN 0 AND byte_length
+    ),
+    bytes BLOB NOT NULL CHECK(length(bytes) = byte_length),
+    PRIMARY KEY(attempt_id, shard_index)
+) STRICT";
+
 const PARITY_OBJECTS_BEFORE_V8_SCHEMA: &str = "CREATE TABLE parity_objects (
     format_version INTEGER NOT NULL CHECK(format_version = 1),
     guild_id BLOB NOT NULL CHECK(length(guild_id) = 32),
@@ -2470,7 +2801,7 @@ fn validate_control_schema(connection: &Connection, version: u32) -> Result<(), 
             ("checkpoint_signature_locks", CHECKPOINT_LOCKS_SCHEMA),
             ("checkpoint_heads", CHECKPOINT_HEADS_SCHEMA),
         ],
-        5 | 6 | 7 | SCHEMA_VERSION => vec![
+        5 | 6 | 7 | 8 | SCHEMA_VERSION => vec![
             ("meta", META_SCHEMA),
             ("protocol_records", PROTOCOL_RECORDS_SCHEMA),
             ("operations", OPERATIONS_SCHEMA),
@@ -2490,6 +2821,7 @@ fn validate_parity_schema(connection: &Connection) -> Result<(), DatabaseError> 
         &[
             ("meta", META_SCHEMA),
             ("parity_objects", PARITY_OBJECTS_SCHEMA),
+            ("coding_reservations", CODING_RESERVATIONS_SCHEMA),
         ],
     )
 }
@@ -4268,6 +4600,79 @@ mod tests {
         );
         assert_eq!(store.discard_staged_attempt(&attempt_id).unwrap(), 0);
         assert_eq!(store.ready_object_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn coding_upload_reserves_capacity_and_resumes_by_authenticated_range() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("parity.db");
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([57; 32]));
+        let volume_id = [58; 16];
+        let attempt_id = [59; 16];
+        let guild_id = [60; 32];
+        let group_id = [61; 32];
+        let bytes = (0_u8..64).collect::<Vec<_>>();
+        let commitment = merkle_commit(&bytes).unwrap();
+        let mut store = ParityStore::open(&path, &volume_id, &keys).unwrap();
+
+        assert_eq!(
+            store
+                .reserve_coding_attempt(&attempt_id, &guild_id, 5, 64, 64)
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.used_bytes().unwrap(), 64);
+        assert!(matches!(
+            store.write_coding_attempt_range(&attempt_id, 5, 32, &bytes[32..]),
+            Err(DatabaseError::Conflict)
+        ));
+        assert_eq!(
+            store
+                .write_coding_attempt_range(&attempt_id, 5, 0, &bytes[..32])
+                .unwrap(),
+            32
+        );
+        drop(store);
+
+        let mut store = ParityStore::open(&path, &volume_id, &keys).unwrap();
+        assert_eq!(
+            store
+                .reserve_coding_attempt(&attempt_id, &guild_id, 5, 64, 64)
+                .unwrap(),
+            32
+        );
+        assert_eq!(
+            store
+                .write_coding_attempt_range(&attempt_id, 5, 0, &bytes[..32])
+                .unwrap(),
+            32
+        );
+        assert_eq!(
+            store
+                .write_coding_attempt_range(&attempt_id, 5, 32, &bytes[32..])
+                .unwrap(),
+            64
+        );
+        store
+            .finish_coding_attempt_upload(&attempt_id, &group_id, 5, &commitment)
+            .unwrap();
+        store
+            .attach_coding_attempt_receipt(&attempt_id, &group_id, 5, b"signed-receipt")
+            .unwrap();
+        assert_eq!(store.used_bytes().unwrap(), 64);
+        assert_eq!(
+            store
+                .load_attempt_receipt(&attempt_id, &group_id, 5)
+                .unwrap(),
+            b"signed-receipt"
+        );
+        assert_eq!(
+            store
+                .open_attempt_range(&attempt_id, &group_id, 5, 2, 1)
+                .unwrap()
+                .leaves[0],
+            bytes[32..48]
+        );
     }
 
     #[test]

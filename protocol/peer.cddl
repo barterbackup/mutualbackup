@@ -61,6 +61,23 @@ peer-request =
         manifest: signed-coding-root-manifest,
         object: variable-parity-object
       } }
+  / { "ReserveCodingParity": {
+        plan: signed-coding-attempt-plan,
+        shard_index: uint
+      } }
+  / { "UploadCodingParityRange": {
+        plan: signed-coding-attempt-plan,
+        manifest: signed-coding-root-manifest,
+        shard_index: uint,
+        offset: uint,
+        bytes: byte-vector
+      } }
+  / { "FinalizeCodingParity": {
+        plan: signed-coding-attempt-plan,
+        manifest: signed-coding-root-manifest,
+        shard_index: uint
+      } }
+  / { "DelegateCodingAttempt": { plan: signed-coding-attempt-plan } }
   / { "CommitCodingChallenge": { plan: signed-coding-attempt-plan } }
   / { "RevealCodingChallenge": {
         plan: signed-coding-attempt-plan,
@@ -73,8 +90,10 @@ peer-request =
         challenge: bytes32-array,
         shard_index: uint
       } }
+  / { "FinalizeCodingVerification": { transcript: coding-transcript } }
+  / { "SubmitCodingTranscript": { transcript: signed-coding-transcript } }
   / { "ActivateCodingParity": { transcript: signed-coding-transcript } }
-  / { "AbortCodingAttempt": { guild_id: bytes32-array, attempt_id: bytes16-array } }
+  / { "AbortCodingAttempt": { plan: signed-coding-attempt-plan } }
   / { "GetParity": { guild_id: bytes32-array, group_id: bytes32-array, shard_index: uint8 } }
   / { "StoreRepairShard": {
         repair_id: bytes16-array,
@@ -109,9 +128,11 @@ peer-response =
   / { "BackupJob": backup-job }
   / { "StorageAcknowledgement": signed-storage-ack }
   / { "StagedStorageReceipt": signed-staged-storage-receipt }
+  / { "CodingRangeProgress": { written_until: uint } }
   / { "CodingChallengeCommitment": signed-coding-challenge-commitment }
   / { "CodingChallengeReveal": signed-coding-challenge-reveal }
   / { "CodingShardOpening": signed-coding-shard-opening }
+  / { "CodingVerificationTranscript": signed-coding-transcript }
   / { "GuildGenesis": quorum-guild-genesis }
   / { "EndpointRecords": [* signed-endpoint-record] }
   / { "CheckpointPage": { total_pages: uint, page_hash: bytes32-array, bytes: byte-vector } }
@@ -218,6 +239,7 @@ signed-storage-ack = {
 signed-coding-attempt-plan = any
 variable-parity-object = any
 signed-coding-transcript = any
+coding-transcript = any
 signed-coding-root-manifest = any
 signed-staged-storage-receipt = any
 signed-coding-challenge-commitment = any

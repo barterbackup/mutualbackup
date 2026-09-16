@@ -55,8 +55,9 @@ pub use p2p::{
     P2pPathMetrics, P2pPathTransfer, P2pPeerProfile, P2pPeerStatus, P2pSessionDirection,
     P2pSessionHistory, P2pSessionOutcome, P2pStartup, P2pStartupReceiver, P2pStatus, audit_guild,
     build_p2p, build_p2p_with_tor, endpoint_record_key, recover_from_dht, recovery_bundle_key,
-    recovery_mailbox_key, run_coordinator_jobs, run_dht_publications, run_peer_exchange,
-    run_relay_membership_sync, validate_bootstrap_addresses, validate_local_advertised_endpoints,
+    recovery_mailbox_key, run_coordinator_jobs, run_delegated_coding_jobs, run_dht_publications,
+    run_peer_exchange, run_relay_membership_sync, validate_bootstrap_addresses,
+    validate_local_advertised_endpoints,
 };
 pub use port_mapping::{run_port_mapping, validate_port_mapping_listeners};
 pub use tor::{
@@ -670,13 +671,27 @@ fn process_peer_request(
             .guild_scope()
             .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
         let delegated_coding = match &request {
-            PeerRequest::StageCodingParity { plan, .. } => caller == plan.value.coding_coordinator,
-            PeerRequest::GetCodingOpening { plan, .. } => {
-                caller == plan.value.verification_coordinator
+            PeerRequest::StageCodingParity { plan, .. }
+            | PeerRequest::ReserveCodingParity { plan, .. }
+            | PeerRequest::UploadCodingParityRange { plan, .. }
+            | PeerRequest::FinalizeCodingParity { plan, .. } => {
+                caller == plan.value.coding_coordinator
             }
+            PeerRequest::DelegateCodingAttempt { plan } => caller == plan.value.delegator,
             PeerRequest::CommitCodingChallenge { plan }
-            | PeerRequest::RevealCodingChallenge { plan, .. } => {
-                caller == plan.value.verification_coordinator
+            | PeerRequest::RevealCodingChallenge { plan, .. }
+            | PeerRequest::GetCodingOpening { plan, .. } => {
+                caller == plan.value.coding_coordinator
+                    || caller == plan.value.verification_coordinator
+            }
+            PeerRequest::FinalizeCodingVerification { transcript } => {
+                caller == transcript.plan.value.coding_coordinator
+            }
+            PeerRequest::SubmitCodingTranscript { transcript } => {
+                caller == transcript.value.plan.value.coding_coordinator
+            }
+            PeerRequest::AbortCodingAttempt { plan } => {
+                caller == plan.value.coding_coordinator || caller == plan.value.delegator
             }
             _ => false,
         } && request
@@ -982,6 +997,37 @@ fn execute_peer_request(
         } => Ok(PeerResponse::StagedStorageReceipt(
             node.stage_coding_parity(&plan, &manifest, &object)?,
         )),
+        PeerRequest::ReserveCodingParity { plan, shard_index } => {
+            Ok(PeerResponse::CodingRangeProgress {
+                written_until: node.reserve_coding_parity(&plan, shard_index)?,
+            })
+        }
+        PeerRequest::UploadCodingParityRange {
+            plan,
+            manifest,
+            shard_index,
+            offset,
+            bytes,
+        } => Ok(PeerResponse::CodingRangeProgress {
+            written_until: node.write_coding_parity_range(
+                &plan,
+                &manifest,
+                shard_index,
+                offset,
+                &bytes,
+            )?,
+        }),
+        PeerRequest::FinalizeCodingParity {
+            plan,
+            manifest,
+            shard_index,
+        } => Ok(PeerResponse::StagedStorageReceipt(
+            node.finish_coding_parity_upload(&plan, &manifest, shard_index)?,
+        )),
+        PeerRequest::DelegateCodingAttempt { plan } => {
+            node.enqueue_delegated_coding(caller, *plan)?;
+            Ok(PeerResponse::Ack)
+        }
         PeerRequest::CommitCodingChallenge { plan } => Ok(PeerResponse::CodingChallengeCommitment(
             node.commit_coding_challenge(&plan)?,
         )),
@@ -1000,15 +1046,22 @@ fn execute_peer_request(
         } => Ok(PeerResponse::CodingShardOpening(
             node.coding_shard_opening(&plan, &manifest, challenge, shard_index)?,
         )),
+        PeerRequest::FinalizeCodingVerification { transcript } => {
+            Ok(PeerResponse::CodingVerificationTranscript(Box::new(
+                node.sign_coding_transcript(*transcript)?,
+            )))
+        }
+        PeerRequest::SubmitCodingTranscript { transcript } => {
+            node.accept_coding_transcript(caller, *transcript)?;
+            Ok(PeerResponse::Ack)
+        }
         PeerRequest::ActivateCodingParity { transcript } => {
             node.activate_coding_attempt(&transcript)?;
             Ok(PeerResponse::Ack)
         }
-        PeerRequest::AbortCodingAttempt {
-            guild_id: _,
-            attempt_id,
-        } => {
-            if !node.discard_coding_attempt(&attempt_id)? {
+        PeerRequest::AbortCodingAttempt { plan } => {
+            node.validate_coding_attempt_for_cleanup(&plan)?;
+            if !node.discard_coding_attempt(&plan.value.attempt_id)? {
                 anyhow::bail!("some staged attempt volumes are offline");
             }
             Ok(PeerResponse::Ack)

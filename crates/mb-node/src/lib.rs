@@ -26,9 +26,10 @@ pub use network::{
     TorTransport, TorTransportConfig, audit_guild, build_p2p, build_p2p_with_tor,
     endpoint_record_key, is_onion_address, onion_address_matches_node, onion_address_matches_peer,
     onion_listener_address, recover_from_dht, recovery_bundle_key, recovery_mailbox_key,
-    run_coordinator_jobs, run_dht_publications, run_peer_exchange, run_port_mapping,
-    run_relay_membership_sync, validate_bootstrap_addresses, validate_local_advertised_endpoints,
-    validate_port_mapping_listeners, wait_for_onion_service_shutdown,
+    run_coordinator_jobs, run_delegated_coding_jobs, run_dht_publications, run_peer_exchange,
+    run_port_mapping, run_relay_membership_sync, validate_bootstrap_addresses,
+    validate_local_advertised_endpoints, validate_port_mapping_listeners,
+    wait_for_onion_service_shutdown,
 };
 pub use node::{
     AutomaticBackupPolicy, AutomaticBackupStatus, BackupDescriptor, BackupJob, BackupJobState,

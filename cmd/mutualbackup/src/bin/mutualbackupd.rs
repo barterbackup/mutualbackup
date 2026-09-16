@@ -9,10 +9,10 @@ use mb_node::{
     AutomaticBackupPolicy, ClaimedTorTransportConfig, LocalControlListener, LocalRequest,
     LocalResponse, LockedDataDir, Node, P2pConfig, P2pStartup, TorShutdownHandle, TorTransport,
     TorTransportConfig, UnlockSecret, WireError, bind_local_control, build_p2p_with_tor,
-    onion_listener_address, run_automatic_backups, run_coordinator_jobs, run_dht_publications,
-    run_peer_exchange, run_periodic_audits, run_port_mapping, run_relay_membership_sync,
-    run_root_watcher, serve_local_control_on, validate_bootstrap_addresses,
-    wait_for_onion_service_shutdown,
+    onion_listener_address, run_automatic_backups, run_coordinator_jobs, run_delegated_coding_jobs,
+    run_dht_publications, run_peer_exchange, run_periodic_audits, run_port_mapping,
+    run_relay_membership_sync, run_root_watcher, serve_local_control_on,
+    validate_bootstrap_addresses, wait_for_onion_service_shutdown,
 };
 use mutualbackup::{
     DaemonOptions, DaemonOptionsError, IdentityManifest, InitializationIntent, read_daemon_options,
@@ -140,6 +140,7 @@ async fn main() -> Result<()> {
     let mut result = tokio::select! {
         result = serve_local_control_on(node.clone(), p2p_client.clone(), listener) => result,
         result = run_coordinator_jobs(node.clone(), p2p_client.clone()) => result,
+        result = run_delegated_coding_jobs(node.clone(), p2p_client.clone()) => result,
         result = run_dht_publications(node.clone(), p2p_client.clone()), if config.enable_dht_maintenance => result,
         result = run_peer_exchange(node.clone(), p2p_client.clone()) => result,
         result = await_optional_task(&mut port_mapping_task) => {

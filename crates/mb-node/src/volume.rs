@@ -173,6 +173,16 @@ struct AttemptVolumeRecord {
     receipt: VolumeReceipt,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct AttemptReservationRecord {
+    format_version: u16,
+    attempt_id: [u8; 16],
+    volume_id: Uuid,
+    guild_id: [u8; 32],
+    shard_index: u8,
+    byte_length: u32,
+}
+
 #[derive(Clone)]
 pub(crate) struct VolumeReaderConfig {
     pub volume_id: Uuid,
@@ -770,6 +780,197 @@ impl StorageVolumes {
         Ok(receipt)
     }
 
+    pub(crate) fn reserve_attempt(
+        &mut self,
+        control: &ControlStore,
+        attempt_id: &[u8; 16],
+        guild_id: [u8; 32],
+        shard_index: u16,
+        byte_length: u32,
+    ) -> Result<u32> {
+        let shard = u8::try_from(shard_index)
+            .context("variable parity shard index exceeds the volume receipt format")?;
+        let record_id = attempt_reservation_id(attempt_id, shard);
+        let record =
+            if let Some(bytes) = control.get_record("volume-attempt-reservation", &record_id)? {
+                let record: AttemptReservationRecord = decode_canonical(&bytes)?;
+                validate_attempt_reservation_record(&record)?;
+                if record.attempt_id != *attempt_id
+                    || record.guild_id != guild_id
+                    || record.shard_index != shard
+                    || record.byte_length != byte_length
+                {
+                    bail!("coding reservation conflicts with a prior attempt");
+                }
+                record
+            } else {
+                let required = u64::from(byte_length);
+                let required_physical = physical_write_reservation(byte_length as usize, 0);
+                let selected = self
+                    .volumes
+                    .iter()
+                    .filter_map(|(id, volume)| {
+                        if volume.record.state != StorageVolumeState::Online {
+                            return None;
+                        }
+                        let store = volume.store.as_ref()?;
+                        let used = store.used_bytes().ok()?;
+                        let writable = volume
+                            .record
+                            .budget_bytes
+                            .saturating_sub(volume.record.headroom_bytes);
+                        let available = fs2::available_space(&volume.record.path).ok()?;
+                        let physical = required_physical
+                            .saturating_add(shared_checkpoint_reservation(control, store).ok()?);
+                        (used.saturating_add(required) <= writable
+                            && physical <= available.saturating_sub(volume.record.headroom_bytes))
+                        .then_some((*id, used))
+                    })
+                    .min_by_key(|(id, used)| (*used, *id))
+                    .map(|(id, _)| id)
+                    .ok_or(DatabaseError::CapacityExceeded)?;
+                let record = AttemptReservationRecord {
+                    format_version: 1,
+                    attempt_id: *attempt_id,
+                    volume_id: selected,
+                    guild_id,
+                    shard_index: shard,
+                    byte_length,
+                };
+                control.put_record(
+                    "volume-attempt-reservation",
+                    &record_id,
+                    &canonical_bytes(&record)?,
+                )?;
+                record
+            };
+        let volume = self
+            .volumes
+            .get_mut(&record.volume_id)
+            .context("reserved coding volume is no longer configured")?;
+        let store = volume
+            .store
+            .as_mut()
+            .context("reserved coding volume is offline")?;
+        store
+            .reserve_coding_attempt(
+                attempt_id,
+                &guild_id,
+                shard_index,
+                byte_length,
+                volume.record.budget_bytes,
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn write_attempt_range(
+        &mut self,
+        control: &ControlStore,
+        attempt_id: &[u8; 16],
+        shard_index: u16,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<u32> {
+        let shard = u8::try_from(shard_index).context("variable parity shard index is invalid")?;
+        let record_id = attempt_reservation_id(attempt_id, shard);
+        let record: AttemptReservationRecord = decode_canonical(
+            &control
+                .get_record("volume-attempt-reservation", &record_id)?
+                .context("coding reservation is unavailable")?,
+        )?;
+        validate_attempt_reservation_record(&record)?;
+        self.volumes
+            .get_mut(&record.volume_id)
+            .and_then(|volume| volume.store.as_mut())
+            .context("reserved coding volume is offline")?
+            .write_coding_attempt_range(attempt_id, shard_index, offset, bytes)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn finish_attempt_upload(
+        &mut self,
+        control: &ControlStore,
+        attempt_id: &[u8; 16],
+        group_id: [u8; 32],
+        shard_index: u16,
+        commitment: &MerkleCommitment,
+    ) -> Result<VolumeReceipt> {
+        let shard = u8::try_from(shard_index).context("variable parity shard index is invalid")?;
+        let attempt_object_id = attempt_volume_object_id(attempt_id, &group_id, shard);
+        if let Some(bytes) = control.get_record("volume-attempt-receipt", &attempt_object_id)? {
+            let existing: AttemptVolumeRecord = decode_canonical(&bytes)?;
+            validate_attempt_volume_record(&existing)?;
+            if existing.attempt_id != *attempt_id
+                || existing.receipt.guild_id == [0; 32]
+                || existing.receipt.group_id != group_id
+                || existing.receipt.shard_index != shard
+                || existing.receipt.root != commitment.root
+            {
+                bail!("completed coding upload conflicts with its receipt");
+            }
+            return Ok(existing.receipt);
+        }
+        let reservation_id = attempt_reservation_id(attempt_id, shard);
+        let record: AttemptReservationRecord = decode_canonical(
+            &control
+                .get_record("volume-attempt-reservation", &reservation_id)?
+                .context("coding reservation is unavailable")?,
+        )?;
+        validate_attempt_reservation_record(&record)?;
+        if record.byte_length != commitment.byte_len {
+            bail!("coding upload commitment conflicts with its reservation");
+        }
+        self.volumes
+            .get_mut(&record.volume_id)
+            .and_then(|volume| volume.store.as_mut())
+            .context("reserved coding volume is offline")?
+            .finish_coding_attempt_upload(attempt_id, &group_id, shard_index, commitment)?;
+        let receipt = VolumeReceipt {
+            format_version: 2,
+            volume_id: record.volume_id,
+            guild_id: record.guild_id,
+            group_id,
+            shard_index: shard,
+            root: commitment.root,
+        };
+        let durable = AttemptVolumeRecord {
+            format_version: 1,
+            attempt_id: *attempt_id,
+            receipt: receipt.clone(),
+        };
+        control.put_record(
+            "volume-attempt-receipt",
+            &attempt_object_id,
+            &canonical_bytes(&durable)?,
+        )?;
+        control.delete_record("volume-attempt-reservation", &reservation_id)?;
+        Ok(receipt)
+    }
+
+    pub(crate) fn attach_attempt_receipt(
+        &mut self,
+        control: &ControlStore,
+        attempt_id: &[u8; 16],
+        group_id: &[u8; 32],
+        shard_index: u16,
+        receipt: &[u8],
+    ) -> Result<()> {
+        let shard = u8::try_from(shard_index).context("variable parity shard index is invalid")?;
+        let record_id = attempt_volume_object_id(attempt_id, group_id, shard);
+        let record: AttemptVolumeRecord = decode_canonical(
+            &control
+                .get_record("volume-attempt-receipt", &record_id)?
+                .context("staged parity volume receipt is unavailable")?,
+        )?;
+        validate_attempt_volume_record(&record)?;
+        self.volumes
+            .get_mut(&record.receipt.volume_id)
+            .and_then(|volume| volume.store.as_mut())
+            .context("staged parity volume is offline")?
+            .attach_coding_attempt_receipt(attempt_id, group_id, shard_index, receipt)?;
+        Ok(())
+    }
+
     pub(crate) fn open_attempt_range(
         &self,
         control: &ControlStore,
@@ -871,6 +1072,21 @@ impl StorageVolumes {
                     {
                         control.delete_record(kind, &record_id)?;
                     }
+                }
+            }
+        }
+        for (record_id, bytes) in control.records("volume-attempt-reservation")? {
+            let record: AttemptReservationRecord = decode_canonical(&bytes)?;
+            validate_attempt_reservation_record(&record)?;
+            if record.attempt_id == *attempt_id {
+                required_volumes.insert(record.volume_id);
+                if self
+                    .volumes
+                    .get(&record.volume_id)
+                    .and_then(|volume| volume.store.as_ref())
+                    .is_some()
+                {
+                    control.delete_record("volume-attempt-reservation", &record_id)?;
                 }
             }
         }
@@ -1630,6 +1846,21 @@ fn validate_attempt_volume_record(record: &AttemptVolumeRecord) -> Result<()> {
     Ok(())
 }
 
+fn validate_attempt_reservation_record(record: &AttemptReservationRecord) -> Result<()> {
+    if record.format_version != 1
+        || record.attempt_id == [0; 16]
+        || record.volume_id.is_nil()
+        || record.guild_id == [0; 32]
+        || record.shard_index >= mb_core::MAX_CODING_SHARDS as u8
+        || record.byte_length < mb_core::MIN_PROFILE_SHARD_SIZE
+        || record.byte_length > mb_core::MAX_PROFILE_SHARD_SIZE
+        || !record.byte_length.is_power_of_two()
+    {
+        bail!("invalid coding volume reservation");
+    }
+    Ok(())
+}
+
 fn validate_volume_object_record_id(record_id: &[u8], receipt: &VolumeReceipt) -> Result<()> {
     if record_id != volume_object_id(&receipt.group_id, receipt.shard_index) {
         bail!("parity volume receipt conflicts with its record key");
@@ -1675,6 +1906,13 @@ fn attempt_volume_object_id(
     let mut id = Vec::with_capacity(49);
     id.extend_from_slice(attempt_id);
     id.extend_from_slice(group_id);
+    id.push(shard_index);
+    id
+}
+
+fn attempt_reservation_id(attempt_id: &[u8; 16], shard_index: u8) -> Vec<u8> {
+    let mut id = Vec::with_capacity(17);
+    id.extend_from_slice(attempt_id);
     id.push(shard_index);
     id
 }
@@ -2687,6 +2925,9 @@ mod tests {
             .unwrap();
         external_store
             .database_shell_statement("DROP TABLE parity_objects", false)
+            .unwrap();
+        external_store
+            .database_shell_statement("DROP TABLE coding_reservations", false)
             .unwrap();
         external_store
             .database_shell_statement("DROP TABLE meta", false)

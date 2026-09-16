@@ -30,18 +30,22 @@ use mb_core::{
     CODING_SHARD_OPENING_DOMAIN, CodingAttemptPlan, CodingChallengeCommitment,
     CodingChallengeReveal, CodingGroup, CodingRootManifest, CodingShardOpening,
     CodingVerificationTranscript, GuildCheckpoint, GuildGenesis, GuildInvite, InformationRole,
-    Member, MemberSignature, NodeId, ParityRole, QuorumCheckpoint, QuorumGuildGenesis,
-    RECOVERY_LOCATOR_DOMAIN, STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN,
-    SectorId, SectorRef, ShardRole, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
-    UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES,
-    V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS,
-    V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, canonical_bytes, decode_canonical, encode_3_2,
-    open_recovery_record, sector_root,
+    MERKLE_LEAF_SIZE, Member, MemberSignature, NodeId, ParityRole, QuorumCheckpoint,
+    QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN, STAGED_STORAGE_RECEIPT_DOMAIN,
+    STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole, ShardRoleV2, SignedRecord,
+    StagedStorageReceipt, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
+    V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES,
+    V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE,
+    canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical, encode_3_2,
+    merkle_commit, open_recovery_record, replay_coding_transcript, sector_root,
 };
 use mb_store::{ParityObject, VariableParityObject};
 use uuid::Uuid;
 
-use crate::node::{CheckpointRecoveryObservation, DhtRecordObservation, GuildPhase, SnapshotInfo};
+use crate::node::{
+    CheckpointRecoveryObservation, DelegatedCodingJob, DelegatedCodingJobState,
+    DhtRecordObservation, GuildPhase, SnapshotInfo,
+};
 
 #[cfg(test)]
 use super::onion_listener_address;
@@ -2099,6 +2103,123 @@ impl P2pClient {
         Ok(receipt)
     }
 
+    pub async fn reserve_coding_parity(
+        &self,
+        peer: NodeId,
+        plan: SignedRecord<CodingAttemptPlan>,
+        shard_index: u16,
+    ) -> Result<u32> {
+        let shard_size = plan.value.geometry.profile.shard_size;
+        let response = self
+            .call(
+                peer,
+                PeerRequest::ReserveCodingParity {
+                    plan: Box::new(plan),
+                    shard_index,
+                },
+            )
+            .await?;
+        let PeerResponse::CodingRangeProgress { written_until } = response else {
+            bail!("peer returned the wrong coding-reservation response");
+        };
+        if written_until > shard_size || !written_until.is_multiple_of(MERKLE_LEAF_SIZE as u32) {
+            bail!("peer returned invalid coding-reservation progress");
+        }
+        Ok(written_until)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_coding_parity_range(
+        &self,
+        peer: NodeId,
+        plan: SignedRecord<CodingAttemptPlan>,
+        manifest: SignedRecord<CodingRootManifest>,
+        shard_index: u16,
+        offset: u32,
+        bytes: Vec<u8>,
+    ) -> Result<u32> {
+        let expected = offset
+            .checked_add(u32::try_from(bytes.len()).context("coding range is too large")?)
+            .context("coding range offset overflow")?;
+        let response = self
+            .call(
+                peer,
+                PeerRequest::UploadCodingParityRange {
+                    plan: Box::new(plan),
+                    manifest: Box::new(manifest),
+                    shard_index,
+                    offset,
+                    bytes,
+                },
+            )
+            .await?;
+        let PeerResponse::CodingRangeProgress { written_until } = response else {
+            bail!("peer returned the wrong coding-upload response");
+        };
+        if written_until != expected {
+            bail!("peer did not durably commit the complete coding range");
+        }
+        Ok(written_until)
+    }
+
+    pub async fn finalize_coding_parity(
+        &self,
+        peer: NodeId,
+        plan: SignedRecord<CodingAttemptPlan>,
+        manifest: SignedRecord<CodingRootManifest>,
+        shard_index: u16,
+    ) -> Result<SignedRecord<StagedStorageReceipt>> {
+        let attempt_id = plan.value.attempt_id;
+        let plan_hash = plan.value.hash()?;
+        let group_id = manifest.value.group.id;
+        let response = self
+            .call(
+                peer,
+                PeerRequest::FinalizeCodingParity {
+                    plan: Box::new(plan),
+                    manifest: Box::new(manifest),
+                    shard_index,
+                },
+            )
+            .await?;
+        let PeerResponse::StagedStorageReceipt(receipt) = response else {
+            bail!("peer returned the wrong coding-finalization response");
+        };
+        receipt.verify(STAGED_STORAGE_RECEIPT_DOMAIN)?;
+        if receipt.signer != peer
+            || receipt.value.holder != peer
+            || receipt.value.attempt_id != attempt_id
+            || receipt.value.plan_hash != plan_hash
+            || receipt.value.group_id != group_id
+            || receipt.value.shard_index != shard_index
+        {
+            bail!("staged parity receipt conflicts with the coding upload");
+        }
+        Ok(receipt)
+    }
+
+    pub async fn delegate_coding_attempt(
+        &self,
+        coordinator: NodeId,
+        plan: SignedRecord<CodingAttemptPlan>,
+    ) -> Result<()> {
+        if plan.value.coding_coordinator != coordinator {
+            bail!("coding plan names a different coordinator");
+        }
+        let response = self
+            .call(
+                coordinator,
+                PeerRequest::DelegateCodingAttempt {
+                    plan: Box::new(plan),
+                },
+            )
+            .await?;
+        if !matches!(response, PeerResponse::Ack) {
+            bail!("peer returned the wrong coding-delegation response");
+        }
+        Ok(())
+    }
+
     pub async fn commit_coding_challenge(
         &self,
         verifier: NodeId,
@@ -2193,6 +2314,53 @@ impl P2pClient {
         Ok(opening)
     }
 
+    pub async fn finalize_coding_verification(
+        &self,
+        verifier: NodeId,
+        transcript: CodingVerificationTranscript,
+    ) -> Result<SignedRecord<CodingVerificationTranscript>> {
+        let attempt_id = transcript.plan.value.attempt_id;
+        let response = self
+            .call(
+                verifier,
+                PeerRequest::FinalizeCodingVerification {
+                    transcript: Box::new(transcript),
+                },
+            )
+            .await?;
+        let PeerResponse::CodingVerificationTranscript(transcript) = response else {
+            bail!("peer returned the wrong coding-verification response");
+        };
+        let transcript = *transcript;
+        transcript.verify(mb_core::CODING_TRANSCRIPT_DOMAIN)?;
+        if transcript.signer != verifier || transcript.value.plan.value.attempt_id != attempt_id {
+            bail!("verifier returned a transcript for another coding attempt");
+        }
+        Ok(transcript)
+    }
+
+    pub async fn submit_coding_transcript(
+        &self,
+        delegator: NodeId,
+        transcript: SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<()> {
+        if transcript.value.plan.value.delegator != delegator {
+            bail!("coding transcript names a different delegator");
+        }
+        let response = self
+            .call(
+                delegator,
+                PeerRequest::SubmitCodingTranscript {
+                    transcript: Box::new(transcript),
+                },
+            )
+            .await?;
+        if !matches!(response, PeerResponse::Ack) {
+            bail!("peer returned the wrong coding-result response");
+        }
+        Ok(())
+    }
+
     pub async fn activate_coding_parity(
         &self,
         peer: NodeId,
@@ -2215,15 +2383,13 @@ impl P2pClient {
     pub async fn abort_coding_attempt(
         &self,
         peer: NodeId,
-        guild_id: [u8; 32],
-        attempt_id: [u8; 16],
+        plan: SignedRecord<CodingAttemptPlan>,
     ) -> Result<()> {
         let response = self
             .call(
                 peer,
                 PeerRequest::AbortCodingAttempt {
-                    guild_id,
-                    attempt_id,
+                    plan: Box::new(plan),
                 },
             )
             .await?;
@@ -5131,6 +5297,404 @@ impl P2pEventLoop {
             }
         }
     }
+}
+
+const CODING_INPUT_RANGE_BYTES: usize = 256 * 1024;
+
+pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {
+    loop {
+        if let Some(job) = node_blocking(node.clone(), |node| node.claim_delegated_coding()).await?
+        {
+            let attempt_id = job.plan.value.attempt_id;
+            if job.state == DelegatedCodingJobState::Cleanup {
+                match abort_delegated_coding(node.clone(), &p2p, &job).await {
+                    Ok(()) => {
+                        let error = job
+                            .error
+                            .as_deref()
+                            .unwrap_or("coding attempt failed and was cleaned up")
+                            .to_owned();
+                        node_blocking(node.clone(), move |node| {
+                            node.fail_delegated_coding(attempt_id, &error)
+                        })
+                        .await?;
+                    }
+                    Err(error) => {
+                        tracing::warn!(?attempt_id, %error, "coding attempt cleanup deferred");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+                continue;
+            }
+            if job.state == DelegatedCodingJobState::Submitting {
+                let transcript = job
+                    .transcript
+                    .clone()
+                    .context("coding submission job has no verifier transcript")?;
+                match submit_delegated_coding_result(node.clone(), &p2p, transcript).await {
+                    Ok(()) => {
+                        node_blocking(node.clone(), move |node| {
+                            node.complete_delegated_coding(attempt_id)
+                        })
+                        .await?;
+                    }
+                    Err(error) => {
+                        tracing::warn!(?attempt_id, %error, "coding result submission deferred");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+                continue;
+            }
+            match execute_delegated_coding(node.clone(), &p2p, &job).await {
+                Ok(transcript) => {
+                    node_blocking(node.clone(), move |node| {
+                        node.record_delegated_coding_result(attempt_id, transcript)
+                    })
+                    .await?;
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    let cleanup_message = message.clone();
+                    node_blocking(node.clone(), move |node| {
+                        node.cleanup_delegated_coding(attempt_id, &cleanup_message)
+                    })
+                    .await?;
+                    if abort_delegated_coding(node.clone(), &p2p, &job)
+                        .await
+                        .is_ok()
+                    {
+                        node_blocking(node.clone(), move |node| {
+                            node.fail_delegated_coding(attempt_id, &message)
+                        })
+                        .await?;
+                    }
+                    tracing::warn!(?attempt_id, %error, "delegated coding attempt failed");
+                }
+            }
+            continue;
+        }
+
+        if let Some(job) =
+            node_blocking(node.clone(), |node| node.claim_coding_activation()).await?
+        {
+            let attempt_id = job.transcript.value.plan.value.attempt_id;
+            match finish_coding_activation(node.clone(), &p2p, &job.transcript).await {
+                Ok(()) => {
+                    node_blocking(node.clone(), move |node| {
+                        node.complete_coding_activation(attempt_id)
+                    })
+                    .await?;
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    node_blocking(node.clone(), move |node| {
+                        node.defer_coding_activation(attempt_id, &message)
+                    })
+                    .await?;
+                    tracing::warn!(?attempt_id, %error, "coding activation deferred");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+            continue;
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn execute_delegated_coding(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    job: &DelegatedCodingJob,
+) -> Result<SignedRecord<CodingVerificationTranscript>> {
+    let plan = job.plan.clone();
+    let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
+    let estimate = coding_transfer_estimate(&plan.value)?;
+    tracing::debug!(
+        attempt_id = ?plan.value.attempt_id,
+        information_shard_transfers = estimate.information_shard_transfers,
+        parity_shard_transfers = estimate.parity_shard_transfers,
+        bulk_bytes = estimate.bulk_bytes,
+        "starting delegated coding attempt"
+    );
+    let verifier = plan.value.verification_coordinator;
+    let challenge_commitment = if verifier == local_id {
+        let local_plan = plan.clone();
+        node_blocking(node.clone(), move |node| {
+            node.commit_coding_challenge(&local_plan)
+        })
+        .await?
+    } else {
+        p2p.commit_coding_challenge(verifier, plan.clone()).await?
+    };
+
+    let parity_start = usize::from(plan.value.geometry.profile.data_shards);
+    let mut output_progress = Vec::with_capacity(plan.value.geometry.parity.len());
+    for (offset, placement) in plan.value.geometry.parity.iter().enumerate() {
+        let shard_index = (parity_start + offset) as u16;
+        let written_until = if placement.holder == local_id {
+            let local_plan = plan.clone();
+            node_blocking(node.clone(), move |node| {
+                node.reserve_coding_parity(&local_plan, shard_index)
+            })
+            .await?
+        } else {
+            p2p.reserve_coding_parity(placement.holder, plan.clone(), shard_index)
+                .await?
+        };
+        output_progress.push(written_until);
+    }
+
+    let information = fetch_coding_information(node.clone(), p2p, &plan, local_id).await?;
+    let encode_plan = plan.clone();
+    let (manifest, parity) = node_blocking(node.clone(), move |node| {
+        node.encode_delegated_coding(&encode_plan, information)
+    })
+    .await?;
+
+    let mut receipts = Vec::with_capacity(parity.len());
+    for (offset, bytes) in parity.into_iter().enumerate() {
+        let index = parity_start + offset;
+        let ShardRoleV2::Parity(role) = &manifest.value.group.roles[index] else {
+            bail!("coding manifest has an invalid parity layout");
+        };
+        let mut written_until = output_progress[offset] as usize;
+        while written_until < bytes.len() {
+            let end = written_until
+                .saturating_add(CODING_INPUT_RANGE_BYTES)
+                .min(bytes.len());
+            let chunk = bytes[written_until..end].to_vec();
+            let next = if role.holder == local_id {
+                let local_plan = plan.clone();
+                let local_manifest = manifest.clone();
+                node_blocking(node.clone(), move |node| {
+                    node.write_coding_parity_range(
+                        &local_plan,
+                        &local_manifest,
+                        index as u16,
+                        written_until as u32,
+                        &chunk,
+                    )
+                })
+                .await?
+            } else {
+                p2p.upload_coding_parity_range(
+                    role.holder,
+                    plan.clone(),
+                    manifest.clone(),
+                    index as u16,
+                    written_until as u32,
+                    chunk,
+                )
+                .await?
+            };
+            written_until = next as usize;
+        }
+        let receipt = if role.holder == local_id {
+            let local_plan = plan.clone();
+            let local_manifest = manifest.clone();
+            node_blocking(node.clone(), move |node| {
+                node.finish_coding_parity_upload(&local_plan, &local_manifest, index as u16)
+            })
+            .await?
+        } else {
+            p2p.finalize_coding_parity(role.holder, plan.clone(), manifest.clone(), index as u16)
+                .await?
+        };
+        receipts.push(receipt);
+    }
+
+    let reveal = if verifier == local_id {
+        let local_plan = plan.clone();
+        let local_manifest = manifest.clone();
+        let local_receipts = receipts.clone();
+        node_blocking(node.clone(), move |node| {
+            node.reveal_coding_challenge(&local_plan, &local_manifest, &local_receipts)
+        })
+        .await?
+    } else {
+        p2p.reveal_coding_challenge(verifier, plan.clone(), manifest.clone(), receipts.clone())
+            .await?
+    };
+    let challenge = coding_challenge(
+        plan.value.hash()?,
+        reveal.value.nonce,
+        reveal.value.evidence_hash,
+    );
+    let mut openings = Vec::with_capacity(manifest.value.group.roles.len());
+    for (index, role) in manifest.value.group.roles.iter().enumerate() {
+        let holder = match role {
+            ShardRoleV2::Information(information) => information.owner,
+            ShardRoleV2::Parity(parity) => parity.holder,
+        };
+        let opening = if holder == local_id {
+            let local_plan = plan.clone();
+            let local_manifest = manifest.clone();
+            node_blocking(node.clone(), move |node| {
+                node.coding_shard_opening(&local_plan, &local_manifest, challenge, index as u16)
+            })
+            .await?
+        } else {
+            p2p.coding_opening(
+                holder,
+                plan.clone(),
+                manifest.clone(),
+                challenge,
+                index as u16,
+            )
+            .await?
+        };
+        openings.push(opening);
+    }
+
+    let transcript = CodingVerificationTranscript {
+        format_version: 1,
+        verified_at_unix_seconds: 0,
+        plan: plan.clone(),
+        manifest,
+        challenge_commitment,
+        staged_receipts: receipts,
+        challenge_reveal: reveal,
+        openings,
+    };
+    let transcript = if verifier == local_id {
+        node_blocking(node.clone(), move |node| {
+            node.sign_coding_transcript(transcript)
+        })
+        .await?
+    } else {
+        p2p.finalize_coding_verification(verifier, transcript)
+            .await?
+    };
+    Ok(transcript)
+}
+
+async fn submit_delegated_coding_result(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    transcript: SignedRecord<CodingVerificationTranscript>,
+) -> Result<()> {
+    let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
+    let delegator = transcript.value.plan.value.delegator;
+    if delegator == local_id {
+        node_blocking(node, move |node| {
+            node.accept_coding_transcript(local_id, transcript)
+        })
+        .await
+    } else {
+        p2p.submit_coding_transcript(delegator, transcript).await
+    }
+}
+
+async fn fetch_coding_information(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    plan: &SignedRecord<CodingAttemptPlan>,
+    local_id: NodeId,
+) -> Result<Vec<Option<Vec<u8>>>> {
+    let mut inputs = Vec::with_capacity(plan.value.geometry.information.len());
+    for role in &plan.value.geometry.information {
+        if role.sector.virtual_zero {
+            inputs.push(None);
+            continue;
+        }
+        let bytes = if role.owner == local_id {
+            let guild_id = plan.value.geometry.guild_id;
+            let sector_id = role.sector.id;
+            node_blocking(node.clone(), move |node| {
+                node.sector_for_guild(&guild_id, &sector_id)
+            })
+            .await?
+        } else {
+            let total_leaves = role.sector.commitment.byte_len as usize / MERKLE_LEAF_SIZE;
+            let maximum_leaves = CODING_INPUT_RANGE_BYTES / MERKLE_LEAF_SIZE;
+            let range_leaves = total_leaves.min(maximum_leaves);
+            let mut bytes = Vec::with_capacity(role.sector.commitment.byte_len as usize);
+            for start in (0..total_leaves).step_by(range_leaves) {
+                bytes.extend_from_slice(
+                    &p2p.sector_range(
+                        role.owner,
+                        plan.value.geometry.guild_id,
+                        role.sector.id,
+                        &role.sector.commitment,
+                        start as u32,
+                        range_leaves as u32,
+                    )
+                    .await?,
+                );
+            }
+            bytes
+        };
+        if merkle_commit(&bytes)? != role.sector.commitment {
+            bail!("coding input does not match its delegated Merkle root");
+        }
+        inputs.push(Some(bytes));
+    }
+    Ok(inputs)
+}
+
+async fn abort_delegated_coding(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    job: &DelegatedCodingJob,
+) -> Result<()> {
+    let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
+    let mut holders = BTreeSet::new();
+    for placement in &job.plan.value.geometry.parity {
+        holders.insert(placement.holder);
+    }
+    for holder in holders {
+        if holder == local_id {
+            let attempt_id = job.plan.value.attempt_id;
+            let complete = node_blocking(node.clone(), move |node| {
+                node.discard_coding_attempt(&attempt_id)
+            })
+            .await?;
+            if !complete {
+                bail!("some local staged coding volumes are offline");
+            }
+        } else {
+            p2p.abort_coding_attempt(holder, job.plan.clone()).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn finish_coding_activation(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    transcript: &SignedRecord<CodingVerificationTranscript>,
+) -> Result<()> {
+    if replay_coding_transcript(transcript)? != mb_core::CodingReplayFinding::Verified {
+        let job = DelegatedCodingJob {
+            format_version: 1,
+            plan: transcript.value.plan.clone(),
+            state: DelegatedCodingJobState::Cleanup,
+            transcript: None,
+            error: Some("verifier transcript attributed invalid coding evidence".to_owned()),
+        };
+        return abort_delegated_coding(node, p2p, &job).await;
+    }
+    let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
+    let mut holders = BTreeSet::new();
+    for role in &transcript.value.manifest.value.group.roles {
+        if let ShardRoleV2::Parity(parity) = role {
+            holders.insert(parity.holder);
+        }
+    }
+    for holder in holders {
+        if holder == local_id {
+            let local_transcript = transcript.clone();
+            node_blocking(node.clone(), move |node| {
+                node.activate_coding_attempt(&local_transcript)
+            })
+            .await?;
+        } else {
+            p2p.activate_coding_parity(holder, transcript.clone())
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn run_coordinator_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {

@@ -91,6 +91,25 @@ pub(super) enum PeerRequest {
         manifest: Box<SignedRecord<CodingRootManifest>>,
         object: VariableParityObject,
     },
+    ReserveCodingParity {
+        plan: Box<SignedRecord<CodingAttemptPlan>>,
+        shard_index: u16,
+    },
+    UploadCodingParityRange {
+        plan: Box<SignedRecord<CodingAttemptPlan>>,
+        manifest: Box<SignedRecord<CodingRootManifest>>,
+        shard_index: u16,
+        offset: u32,
+        bytes: Vec<u8>,
+    },
+    FinalizeCodingParity {
+        plan: Box<SignedRecord<CodingAttemptPlan>>,
+        manifest: Box<SignedRecord<CodingRootManifest>>,
+        shard_index: u16,
+    },
+    DelegateCodingAttempt {
+        plan: Box<SignedRecord<CodingAttemptPlan>>,
+    },
     CommitCodingChallenge {
         plan: Box<SignedRecord<CodingAttemptPlan>>,
     },
@@ -105,12 +124,17 @@ pub(super) enum PeerRequest {
         challenge: [u8; 32],
         shard_index: u16,
     },
+    FinalizeCodingVerification {
+        transcript: Box<CodingVerificationTranscript>,
+    },
+    SubmitCodingTranscript {
+        transcript: Box<SignedRecord<CodingVerificationTranscript>>,
+    },
     ActivateCodingParity {
         transcript: Box<SignedRecord<CodingVerificationTranscript>>,
     },
     AbortCodingAttempt {
-        guild_id: [u8; 32],
-        attempt_id: [u8; 16],
+        plan: Box<SignedRecord<CodingAttemptPlan>>,
     },
     GetParity {
         guild_id: [u8; 32],
@@ -226,9 +250,15 @@ impl PeerRequest {
             Self::EnsureFiller { .. } => Some("ensure-filler"),
             Self::PublishParity { .. } => Some("publish-parity"),
             Self::StageCodingParity { .. } => Some("stage-coding-parity"),
+            Self::ReserveCodingParity { .. } => Some("reserve-coding-parity"),
+            Self::UploadCodingParityRange { .. } => Some("upload-coding-parity-range"),
+            Self::FinalizeCodingParity { .. } => Some("finalize-coding-parity"),
+            Self::DelegateCodingAttempt { .. } => Some("delegate-coding-attempt"),
             Self::CommitCodingChallenge { .. } => Some("commit-coding-challenge"),
             Self::RevealCodingChallenge { .. } => Some("reveal-coding-challenge"),
             Self::GetCodingOpening { .. } => Some("get-coding-opening"),
+            Self::FinalizeCodingVerification { .. } => Some("finalize-coding-verification"),
+            Self::SubmitCodingTranscript { .. } => Some("submit-coding-transcript"),
             Self::ActivateCodingParity { .. } => Some("activate-coding-parity"),
             Self::AbortCodingAttempt { .. } => Some("abort-coding-attempt"),
             Self::StoreRepairShard { .. } => Some("store-repair-shard"),
@@ -264,7 +294,7 @@ impl PeerRequest {
             | Self::FinalizeCheckpoint { guild_id, .. }
             | Self::GetCheckpointPage { guild_id, .. }
             | Self::BackupStatus { guild_id, .. } => Some(*guild_id),
-            Self::AbortCodingAttempt { guild_id, .. } => Some(*guild_id),
+            Self::AbortCodingAttempt { plan } => Some(plan.value.geometry.guild_id),
             Self::ExchangeEndpoints { guild_id } => Some(*guild_id),
             #[cfg(test)]
             Self::PrepareSource { guild_id, .. }
@@ -274,10 +304,20 @@ impl PeerRequest {
             Self::GetGuildGenesis { guild_id } => Some(*guild_id),
             Self::PublishParity { object, .. } => Some(object.guild_id),
             Self::StageCodingParity { plan, .. }
+            | Self::ReserveCodingParity { plan, .. }
+            | Self::UploadCodingParityRange { plan, .. }
+            | Self::FinalizeCodingParity { plan, .. }
+            | Self::DelegateCodingAttempt { plan }
             | Self::GetCodingOpening { plan, .. }
             | Self::CommitCodingChallenge { plan }
             | Self::RevealCodingChallenge { plan, .. } => Some(plan.value.geometry.guild_id),
             Self::ActivateCodingParity { transcript } => {
+                Some(transcript.value.plan.value.geometry.guild_id)
+            }
+            Self::FinalizeCodingVerification { transcript } => {
+                Some(transcript.plan.value.geometry.guild_id)
+            }
+            Self::SubmitCodingTranscript { transcript } => {
                 Some(transcript.value.plan.value.geometry.guild_id)
             }
         }
@@ -325,9 +365,13 @@ pub(super) enum PeerResponse {
     BackupJob(BackupJob),
     StorageAcknowledgement(SignedRecord<StorageAcknowledgement>),
     StagedStorageReceipt(SignedRecord<StagedStorageReceipt>),
+    CodingRangeProgress {
+        written_until: u32,
+    },
     CodingChallengeCommitment(SignedRecord<CodingChallengeCommitment>),
     CodingChallengeReveal(SignedRecord<CodingChallengeReveal>),
     CodingShardOpening(SignedRecord<CodingShardOpening>),
+    CodingVerificationTranscript(Box<SignedRecord<CodingVerificationTranscript>>),
     GuildGenesis(Box<QuorumGuildGenesis>),
     EndpointRecords(Vec<SignedRecord<EndpointRecord>>),
     CheckpointPage {

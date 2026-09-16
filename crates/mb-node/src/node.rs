@@ -7,17 +7,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use mb_core::{
     CODING_ATTEMPT_PLAN_DOMAIN, CODING_CHALLENGE_COMMITMENT_DOMAIN, CODING_CHALLENGE_REVEAL_DOMAIN,
-    CODING_ROOT_MANIFEST_DOMAIN, CODING_SHARD_OPENING_DOMAIN, CodingAttemptPlan,
-    CodingChallengeCommitment, CodingChallengeReveal, CodingReplayFinding, CodingRootManifest,
-    CodingShardOpening, CodingVerificationTranscript, EndpointRecord, GuildCheckpoint,
-    GuildGenesis, GuildInvite, KeyMaterial, Member, MemberSignature, NodeId, QuorumCheckpoint,
-    QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN, RecoveryBundle, RecoveryLocator,
+    CODING_ROOT_MANIFEST_DOMAIN, CODING_SHARD_OPENING_DOMAIN, CODING_TRANSCRIPT_DOMAIN,
+    CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal, CodingReplayFinding,
+    CodingRootManifest, CodingShardOpening, CodingVerificationTranscript, EndpointRecord,
+    GuildCheckpoint, GuildGenesis, GuildInvite, KeyMaterial, Member, MemberSignature, NodeId,
+    QuorumCheckpoint, QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN, RecoveryBundle, RecoveryLocator,
     STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, Seed,
     ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
     USER_REVISION_DOMAIN, UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_PAGES,
     V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes, challenged_leaf, coding_challenge_commitment,
-    coding_evidence_hash, decode_canonical, merkle_commit, merkle_open_range, open_recovery_record,
-    replay_coding_transcript, seal_recovery_record, sector_root, synthetic_filler_sector,
+    coding_evidence_hash, decode_canonical, encode_coding_attempt, merkle_commit,
+    merkle_open_range, open_recovery_record, replay_coding_transcript, seal_recovery_record,
+    sector_root, synthetic_filler_sector,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
@@ -92,6 +93,33 @@ struct VerifierChallengeState {
     plan_hash: [u8; 32],
     nonce: [u8; 32],
     commitment: SignedRecord<CodingChallengeCommitment>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum DelegatedCodingJobState {
+    Pending,
+    Running,
+    Cleanup,
+    Submitting,
+    Complete,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DelegatedCodingJob {
+    pub format_version: u16,
+    pub plan: SignedRecord<CodingAttemptPlan>,
+    pub state: DelegatedCodingJobState,
+    pub transcript: Option<SignedRecord<CodingVerificationTranscript>>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CodingActivationJob {
+    pub format_version: u16,
+    pub transcript: SignedRecord<CodingVerificationTranscript>,
+    pub complete: bool,
+    pub error: Option<String>,
 }
 
 const GUILD_INVITE_DOMAIN: &[u8] = b"mutualbackup/guild-invite/v1";
@@ -2281,6 +2309,157 @@ impl Node {
         Ok(self.control.records("emergency-shard")?.len())
     }
 
+    pub fn sign_coding_attempt_plan(
+        &self,
+        plan: CodingAttemptPlan,
+    ) -> Result<SignedRecord<CodingAttemptPlan>> {
+        if plan.delegator != self.keys.node_id() {
+            anyhow::bail!("only the named delegator may sign a coding attempt");
+        }
+        let signed = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, &self.keys)?;
+        self.validate_coding_attempt_plan(&signed)?;
+        Ok(signed)
+    }
+
+    pub fn enqueue_delegated_coding(
+        &self,
+        caller: NodeId,
+        plan: SignedRecord<CodingAttemptPlan>,
+    ) -> Result<()> {
+        self.validate_coding_attempt_plan(&plan)?;
+        if caller != plan.value.delegator || plan.value.coding_coordinator != self.keys.node_id() {
+            anyhow::bail!("coding attempt was not delegated to this node");
+        }
+        let id = plan.value.attempt_id;
+        if let Some(bytes) = self.control.get_record("delegated-coding-job", &id)? {
+            let existing: DelegatedCodingJob = decode_canonical(&bytes)?;
+            if existing.format_version != 1 || existing.plan != plan {
+                anyhow::bail!("coding attempt ID conflicts with a prior delegation");
+            }
+            return Ok(());
+        }
+        self.put_delegated_coding_job(&DelegatedCodingJob {
+            format_version: 1,
+            plan,
+            state: DelegatedCodingJobState::Pending,
+            transcript: None,
+            error: None,
+        })
+    }
+
+    pub(crate) fn claim_delegated_coding(&self) -> Result<Option<DelegatedCodingJob>> {
+        for (_, bytes) in self.control.records("delegated-coding-job")? {
+            let mut job: DelegatedCodingJob = decode_canonical(&bytes)?;
+            if job.format_version != 1 || job.plan.value.coding_coordinator != self.keys.node_id() {
+                anyhow::bail!("durable delegated coding job is invalid");
+            }
+            if job.state == DelegatedCodingJobState::Cleanup {
+                return Ok(Some(job));
+            }
+            if job.state == DelegatedCodingJobState::Submitting {
+                if job.transcript.is_none() {
+                    anyhow::bail!("coding submission job has no verifier transcript");
+                }
+                return Ok(Some(job));
+            }
+            if job.state == DelegatedCodingJobState::Running {
+                self.validate_coding_attempt_authority(&job.plan)?;
+                job.state = DelegatedCodingJobState::Cleanup;
+                job.error = Some("coding attempt was interrupted before verification".to_owned());
+                self.put_delegated_coding_job(&job)?;
+                return Ok(Some(job));
+            }
+            if job.state == DelegatedCodingJobState::Pending {
+                self.validate_coding_attempt_authority(&job.plan)?;
+                if job.plan.value.expires_at_unix_seconds < unix_seconds() {
+                    job.state = DelegatedCodingJobState::Cleanup;
+                    job.error = Some("coding attempt expired before verification".to_owned());
+                    self.put_delegated_coding_job(&job)?;
+                    return Ok(Some(job));
+                }
+                job.state = DelegatedCodingJobState::Running;
+                job.error = None;
+                self.put_delegated_coding_job(&job)?;
+                return Ok(Some(job));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn encode_delegated_coding(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+        information: Vec<Option<Vec<u8>>>,
+    ) -> Result<(SignedRecord<CodingRootManifest>, Vec<Vec<u8>>)> {
+        self.validate_coding_attempt_plan(plan)?;
+        if plan.value.coding_coordinator != self.keys.node_id() {
+            anyhow::bail!("coding attempt is assigned to another coordinator");
+        }
+        encode_coding_attempt(plan, information, &self.keys).map_err(Into::into)
+    }
+
+    pub(crate) fn complete_delegated_coding(&self, attempt_id: [u8; 16]) -> Result<()> {
+        self.update_delegated_coding_job(attempt_id, DelegatedCodingJobState::Complete, None)
+    }
+
+    pub(crate) fn record_delegated_coding_result(
+        &self,
+        attempt_id: [u8; 16],
+        transcript: SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<()> {
+        let bytes = self
+            .control
+            .get_record("delegated-coding-job", &attempt_id)?
+            .context("delegated coding job is unavailable")?;
+        let mut job: DelegatedCodingJob = decode_canonical(&bytes)?;
+        if job.plan != transcript.value.plan || transcript.value.plan.value.attempt_id != attempt_id
+        {
+            anyhow::bail!("coding result conflicts with its durable job");
+        }
+        replay_coding_transcript(&transcript)?;
+        job.state = DelegatedCodingJobState::Submitting;
+        job.transcript = Some(transcript);
+        job.error = None;
+        self.put_delegated_coding_job(&job)
+    }
+
+    pub(crate) fn fail_delegated_coding(&self, attempt_id: [u8; 16], error: &str) -> Result<()> {
+        let mut error = error.to_owned();
+        truncate_utf8(&mut error, 4096);
+        self.update_delegated_coding_job(attempt_id, DelegatedCodingJobState::Failed, Some(error))
+    }
+
+    pub(crate) fn cleanup_delegated_coding(&self, attempt_id: [u8; 16], error: &str) -> Result<()> {
+        let mut error = error.to_owned();
+        truncate_utf8(&mut error, 4096);
+        self.update_delegated_coding_job(attempt_id, DelegatedCodingJobState::Cleanup, Some(error))
+    }
+
+    fn update_delegated_coding_job(
+        &self,
+        attempt_id: [u8; 16],
+        state: DelegatedCodingJobState,
+        error: Option<String>,
+    ) -> Result<()> {
+        let bytes = self
+            .control
+            .get_record("delegated-coding-job", &attempt_id)?
+            .context("delegated coding job is unavailable")?;
+        let mut job: DelegatedCodingJob = decode_canonical(&bytes)?;
+        job.state = state;
+        job.error = error;
+        self.put_delegated_coding_job(&job)
+    }
+
+    fn put_delegated_coding_job(&self, job: &DelegatedCodingJob) -> Result<()> {
+        self.control.put_record(
+            "delegated-coding-job",
+            &job.plan.value.attempt_id,
+            &canonical_bytes(job)?,
+        )?;
+        Ok(())
+    }
+
     pub fn commit_coding_challenge(
         &self,
         plan: &SignedRecord<CodingAttemptPlan>,
@@ -2456,6 +2635,128 @@ impl Node {
         Ok(receipt)
     }
 
+    pub fn reserve_coding_parity(
+        &mut self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+        shard_index: u16,
+    ) -> Result<u32> {
+        self.validate_coding_attempt_plan(plan)?;
+        let parity_start = usize::from(plan.value.geometry.profile.data_shards);
+        let offset = usize::from(shard_index)
+            .checked_sub(parity_start)
+            .context("coding reservation is not a parity position")?;
+        let placement = plan
+            .value
+            .geometry
+            .parity
+            .get(offset)
+            .context("coding reservation is outside the delegated layout")?;
+        if placement.holder != self.keys.node_id() {
+            anyhow::bail!("coding reservation is assigned to another holder");
+        }
+        self.volumes.reserve_attempt(
+            &self.control,
+            &plan.value.attempt_id,
+            plan.value.geometry.guild_id,
+            shard_index,
+            plan.value.geometry.profile.shard_size,
+        )
+    }
+
+    pub fn write_coding_parity_range(
+        &mut self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+        manifest: &SignedRecord<CodingRootManifest>,
+        shard_index: u16,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<u32> {
+        let role = self.validate_local_coding_output(plan, manifest, shard_index)?;
+        let end = u64::from(offset)
+            .checked_add(bytes.len() as u64)
+            .context("coding upload range overflows")?;
+        if end > u64::from(role.commitment.byte_len) {
+            anyhow::bail!("coding upload range exceeds its committed parity row");
+        }
+        self.volumes.write_attempt_range(
+            &self.control,
+            &plan.value.attempt_id,
+            shard_index,
+            offset,
+            bytes,
+        )
+    }
+
+    pub fn finish_coding_parity_upload(
+        &mut self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+        manifest: &SignedRecord<CodingRootManifest>,
+        shard_index: u16,
+    ) -> Result<SignedRecord<StagedStorageReceipt>> {
+        let role = self.validate_local_coding_output(plan, manifest, shard_index)?;
+        let plan_hash = plan.value.hash()?;
+        let volume_receipt = self.volumes.finish_attempt_upload(
+            &self.control,
+            &plan.value.attempt_id,
+            manifest.value.group.id,
+            shard_index,
+            &role.commitment,
+        )?;
+        if volume_receipt.guild_id != manifest.value.group.guild_id {
+            anyhow::bail!("coding upload volume belongs to another guild");
+        }
+        let receipt = SignedRecord::sign(
+            STAGED_STORAGE_RECEIPT_DOMAIN,
+            StagedStorageReceipt {
+                format_version: 1,
+                attempt_id: plan.value.attempt_id,
+                plan_hash,
+                guild_id: manifest.value.group.guild_id,
+                group_id: manifest.value.group.id,
+                shard_index,
+                holder: self.keys.node_id(),
+                commitment: role.commitment.clone(),
+            },
+            &self.keys,
+        )?;
+        self.volumes.attach_attempt_receipt(
+            &self.control,
+            &plan.value.attempt_id,
+            &manifest.value.group.id,
+            shard_index,
+            &canonical_bytes(&receipt)?,
+        )?;
+        Ok(receipt)
+    }
+
+    fn validate_local_coding_output<'a>(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+        manifest: &'a SignedRecord<CodingRootManifest>,
+        shard_index: u16,
+    ) -> Result<&'a mb_core::ParityRoleV2> {
+        self.validate_coding_attempt_plan(plan)?;
+        let plan_hash = plan.value.hash()?;
+        manifest.verify(CODING_ROOT_MANIFEST_DOMAIN)?;
+        if manifest.signer != plan.value.coding_coordinator
+            || manifest.value.format_version != 1
+            || manifest.value.attempt_id != plan.value.attempt_id
+            || manifest.value.plan_hash != plan_hash
+        {
+            anyhow::bail!("coding root manifest conflicts with the delegated plan");
+        }
+        plan.value.geometry.validate_group(&manifest.value.group)?;
+        let Some(ShardRoleV2::Parity(role)) =
+            manifest.value.group.roles.get(usize::from(shard_index))
+        else {
+            anyhow::bail!("coding upload is not a declared parity shard");
+        };
+        if role.holder != self.keys.node_id() {
+            anyhow::bail!("coding upload is assigned to another holder");
+        }
+        Ok(role)
+    }
+
     pub fn coding_shard_opening(
         &self,
         plan: &SignedRecord<CodingAttemptPlan>,
@@ -2522,6 +2823,132 @@ impl Node {
         .map_err(Into::into)
     }
 
+    pub fn sign_coding_transcript(
+        &self,
+        mut transcript: CodingVerificationTranscript,
+    ) -> Result<SignedRecord<CodingVerificationTranscript>> {
+        self.validate_coding_attempt_plan(&transcript.plan)?;
+        let plan = &transcript.plan.value;
+        let attempt_id = plan.attempt_id;
+        let expires_at_unix_seconds = plan.expires_at_unix_seconds;
+        if plan.verification_coordinator != self.keys.node_id()
+            || transcript.challenge_commitment.signer != self.keys.node_id()
+            || transcript.challenge_reveal.signer != self.keys.node_id()
+        {
+            anyhow::bail!("coding transcript is assigned to another verifier");
+        }
+        let state: VerifierChallengeState = decode_canonical(
+            &self
+                .control
+                .get_record("coding-verifier-challenge", &attempt_id)?
+                .context("verifier challenge state is unavailable")?,
+        )?;
+        if state.commitment != transcript.challenge_commitment
+            || state.nonce != transcript.challenge_reveal.value.nonce
+        {
+            anyhow::bail!("coding transcript conflicts with the hidden challenge");
+        }
+        transcript.verified_at_unix_seconds = unix_seconds();
+        if transcript.verified_at_unix_seconds > expires_at_unix_seconds {
+            anyhow::bail!("coding attempt expired before verification completed");
+        }
+        let signed = SignedRecord::sign(CODING_TRANSCRIPT_DOMAIN, transcript, &self.keys)?;
+        replay_coding_transcript(&signed)?;
+        let bytes = canonical_bytes(&signed)?;
+        if !self
+            .control
+            .put_record_if_absent("coding-verifier-transcript", &attempt_id, &bytes)?
+            && self
+                .control
+                .get_record("coding-verifier-transcript", &attempt_id)?
+                .as_deref()
+                != Some(bytes.as_slice())
+        {
+            anyhow::bail!("verifier already signed different evidence for this attempt");
+        }
+        Ok(signed)
+    }
+
+    pub fn accept_coding_transcript(
+        &self,
+        caller: NodeId,
+        transcript: SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<()> {
+        let plan = &transcript.value.plan.value;
+        self.validate_coding_attempt_plan(&transcript.value.plan)?;
+        if plan.delegator != self.keys.node_id() || caller != plan.coding_coordinator {
+            anyhow::bail!("coding result was not submitted to its delegator by its coordinator");
+        }
+        let id = plan.attempt_id;
+        replay_coding_transcript(&transcript)?;
+        if let Some(bytes) = self.control.get_record("coding-activation-job", &id)? {
+            let existing: CodingActivationJob = decode_canonical(&bytes)?;
+            if existing.format_version != 1 || existing.transcript != transcript {
+                anyhow::bail!("coding attempt already has a different submitted result");
+            }
+            return Ok(());
+        }
+        self.put_coding_activation_job(&CodingActivationJob {
+            format_version: 1,
+            transcript,
+            complete: false,
+            error: None,
+        })
+    }
+
+    pub(crate) fn claim_coding_activation(&self) -> Result<Option<CodingActivationJob>> {
+        for (_, bytes) in self.control.records("coding-activation-job")? {
+            let mut job: CodingActivationJob = decode_canonical(&bytes)?;
+            if job.format_version != 1
+                || job.transcript.value.plan.value.delegator != self.keys.node_id()
+            {
+                anyhow::bail!("durable coding activation job is invalid");
+            }
+            if !job.complete {
+                self.validate_coding_attempt_authority(&job.transcript.value.plan)?;
+                job.error = None;
+                self.put_coding_activation_job(&job)?;
+                return Ok(Some(job));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn complete_coding_activation(&self, attempt_id: [u8; 16]) -> Result<()> {
+        self.update_coding_activation_job(attempt_id, true, None)
+    }
+
+    pub(crate) fn defer_coding_activation(&self, attempt_id: [u8; 16], error: &str) -> Result<()> {
+        let mut error = error.to_owned();
+        truncate_utf8(&mut error, 4096);
+        self.update_coding_activation_job(attempt_id, false, Some(error))
+    }
+
+    fn update_coding_activation_job(
+        &self,
+        attempt_id: [u8; 16],
+        complete: bool,
+        error: Option<String>,
+    ) -> Result<()> {
+        let bytes = self
+            .control
+            .get_record("coding-activation-job", &attempt_id)?
+            .context("coding activation job is unavailable")?;
+        let mut job: CodingActivationJob = decode_canonical(&bytes)?;
+        job.complete = complete;
+        job.error = error;
+        self.put_coding_activation_job(&job)
+    }
+
+    fn put_coding_activation_job(&self, job: &CodingActivationJob) -> Result<()> {
+        self.control.put_record(
+            "coding-activation-job",
+            &job.transcript.value.plan.value.attempt_id,
+            &canonical_bytes(job)?,
+        )?;
+        Ok(())
+    }
+
     pub fn activate_coding_attempt(
         &mut self,
         transcript: &SignedRecord<CodingVerificationTranscript>,
@@ -2531,7 +2958,7 @@ impl Node {
         }
         let plan = &transcript.value.plan.value;
         let group = &transcript.value.manifest.value.group;
-        self.validate_coding_attempt_plan(&transcript.value.plan)?;
+        self.validate_coding_attempt_authority(&transcript.value.plan)?;
         let transcript_hash = *blake3::hash(&canonical_bytes(transcript)?).as_bytes();
         let mut activated = false;
         for (index, role) in group.roles.iter().enumerate() {
@@ -2574,6 +3001,13 @@ impl Node {
         self.volumes.discard_attempt(&self.control, attempt_id)
     }
 
+    pub(crate) fn validate_coding_attempt_for_cleanup(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+    ) -> Result<()> {
+        self.validate_coding_attempt_authority(plan)
+    }
+
     pub fn variable_parity_for_guild(
         &self,
         guild_id: &[u8; 32],
@@ -2590,12 +3024,21 @@ impl Node {
     }
 
     fn validate_coding_attempt_plan(&self, plan: &SignedRecord<CodingAttemptPlan>) -> Result<()> {
+        self.validate_coding_attempt_authority(plan)?;
+        if plan.value.expires_at_unix_seconds < unix_seconds() {
+            anyhow::bail!("coding attempt delegation is expired");
+        }
+        Ok(())
+    }
+
+    fn validate_coding_attempt_authority(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+    ) -> Result<()> {
         plan.verify(CODING_ATTEMPT_PLAN_DOMAIN)?;
         plan.value.validate()?;
-        if plan.signer != plan.value.delegator
-            || plan.value.expires_at_unix_seconds < unix_seconds()
-        {
-            anyhow::bail!("coding attempt delegation is invalid or expired");
+        if plan.signer != plan.value.delegator {
+            anyhow::bail!("coding attempt delegation is invalid");
         }
         let certificate = self
             .installed_guild_certificate()?
@@ -6944,9 +7387,26 @@ mod tests {
             commitment: merkle_commit(&shards[4]).unwrap(),
             bytes: shards[4].clone(),
         };
+        assert_eq!(node.reserve_coding_parity(&plan, 4).unwrap(), 0);
+        assert_eq!(
+            node.write_coding_parity_range(&plan, &manifest, 4, 0, &local_object.bytes[..32])
+                .unwrap(),
+            32
+        );
+        assert_eq!(node.reserve_coding_parity(&plan, 4).unwrap(), 32);
+        assert_eq!(
+            node.write_coding_parity_range(&plan, &manifest, 4, 32, &local_object.bytes[32..])
+                .unwrap(),
+            64
+        );
         let local_receipt = node
-            .stage_coding_parity(&plan, &manifest, &local_object)
+            .finish_coding_parity_upload(&plan, &manifest, 4)
             .unwrap();
+        assert_eq!(
+            node.finish_coding_parity_upload(&plan, &manifest, 4)
+                .unwrap(),
+            local_receipt
+        );
         assert!(
             node.variable_parity_for_guild(&[181; 32], &manifest.value.group.id, 4)
                 .is_err()
@@ -7008,6 +7468,7 @@ mod tests {
             mb_core::CODING_TRANSCRIPT_DOMAIN,
             CodingVerificationTranscript {
                 format_version: 1,
+                verified_at_unix_seconds: unix_seconds(),
                 plan,
                 manifest,
                 challenge_commitment,

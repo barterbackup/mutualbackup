@@ -217,6 +217,9 @@ pub struct CodingShardOpening {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CodingVerificationTranscript {
     pub format_version: u16,
+    /// Verifier wall-clock time. It must fall within the delegated attempt
+    /// lifetime; holders may replay and activate this evidence afterward.
+    pub verified_at_unix_seconds: u64,
     pub plan: SignedRecord<CodingAttemptPlan>,
     pub manifest: SignedRecord<CodingRootManifest>,
     pub challenge_commitment: SignedRecord<CodingChallengeCommitment>,
@@ -239,6 +242,42 @@ pub enum CodingReplayFinding {
     InvalidCoding {
         coordinator: NodeId,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CodingTransferEstimate {
+    pub information_shard_transfers: u16,
+    pub parity_shard_transfers: u16,
+    pub bulk_bytes: u64,
+}
+
+/// Count the complete-shard-equivalent bulk paths in one immutable plan.
+/// Merkle proofs and control messages are deliberately excluded.
+pub fn coding_transfer_estimate(
+    plan: &CodingAttemptPlan,
+) -> Result<CodingTransferEstimate, CodingAttemptError> {
+    plan.validate()?;
+    let information_shard_transfers = plan
+        .geometry
+        .information
+        .iter()
+        .filter(|role| !role.sector.virtual_zero && role.owner != plan.coding_coordinator)
+        .count() as u16;
+    let parity_shard_transfers = plan
+        .geometry
+        .parity
+        .iter()
+        .filter(|role| role.holder != plan.coding_coordinator)
+        .count() as u16;
+    let total = u64::from(information_shard_transfers)
+        .checked_add(u64::from(parity_shard_transfers))
+        .and_then(|count| count.checked_mul(u64::from(plan.geometry.profile.shard_size)))
+        .ok_or(CodingAttemptError::InvalidPlan)?;
+    Ok(CodingTransferEstimate {
+        information_shard_transfers,
+        parity_shard_transfers,
+        bulk_bytes: total,
+    })
 }
 
 #[derive(Debug, Error)]
@@ -367,6 +406,8 @@ pub fn replay_coding_transcript(
     let plan = &transcript.plan.value;
     plan.validate()?;
     if transcript.format_version != 1
+        || transcript.verified_at_unix_seconds == 0
+        || transcript.verified_at_unix_seconds > plan.expires_at_unix_seconds
         || transcript.plan.signer != plan.delegator
         || signed.signer != plan.verification_coordinator
     {
@@ -584,6 +625,24 @@ mod tests {
             verification_coordinator: keys[8].node_id(),
             expires_at_unix_seconds: 2_000_000_000,
         };
+        assert_eq!(
+            coding_transfer_estimate(&plan).unwrap(),
+            CodingTransferEstimate {
+                information_shard_transfers: 4,
+                parity_shard_transfers: 2,
+                bulk_bytes: 6 * 64,
+            }
+        );
+        let mut participating_plan = plan.clone();
+        participating_plan.coding_coordinator = keys[0].node_id();
+        assert_eq!(
+            coding_transfer_estimate(&participating_plan).unwrap(),
+            CodingTransferEstimate {
+                information_shard_transfers: 3,
+                parity_shard_transfers: 2,
+                bulk_bytes: 5 * 64,
+            }
+        );
         let plan_hash = plan.hash().unwrap();
         let plan = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, &keys[6]).unwrap();
         let (manifest, parity) =
@@ -665,6 +724,7 @@ mod tests {
             .collect();
         let transcript = CodingVerificationTranscript {
             format_version: 1,
+            verified_at_unix_seconds: 1_900_000_000,
             plan,
             manifest,
             challenge_commitment,
