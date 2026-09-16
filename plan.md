@@ -752,8 +752,12 @@ local restores passed on the next gate, which then showed that the test runtime
 had omitted the daemon's peer-exchange worker. Format-7 recovery publication
 requires every active subject's certified recovery-key epoch, so the production
 test now runs peer exchange on all five nodes and waits for those epochs before
-backing up. A fresh provisioned production gate must still close before
-Milestone 5 can pass.
+backing up. Running that real task set then exposed a lifecycle race: the
+coordinator retired groups for a running checkpoint draft because they were not
+yet referenced by the prior current checkpoint. A durable `Running` backup job
+now fences group retirement until checkpoint construction commits or defers,
+while recovery-key and endpoint exchange continue. A fresh provisioned
+production gate must still close before Milestone 5 can pass.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer

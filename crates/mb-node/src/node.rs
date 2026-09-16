@@ -3388,6 +3388,20 @@ impl Node {
         Ok(false)
     }
 
+    pub(crate) fn backup_commit_in_progress(&self, guild_id: [u8; 32]) -> Result<bool> {
+        for (_, bytes) in self.control.records("backup-job")? {
+            let job: BackupJob = decode_canonical(&bytes)?;
+            validate_backup_descriptor(&job.descriptor)?;
+            if job.format_version != 1 {
+                anyhow::bail!("durable backup job is invalid");
+            }
+            if job.descriptor.guild_id == guild_id && job.state == BackupJobState::Running {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn complete_coding_launch(&self, attempt_id: [u8; 16]) -> Result<()> {
         self.update_coding_launch(attempt_id, true, None)
     }
@@ -9606,6 +9620,45 @@ mod tests {
         let message = state.blocked_reason.unwrap();
         assert!(message.len() <= 512);
         assert!(message.chars().all(|character| character == 'é'));
+    }
+
+    #[test]
+    fn running_backup_job_durably_fences_group_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([215; 32]);
+        let guild_id = [216; 32];
+        let descriptor = BackupDescriptor {
+            format_version: 2,
+            guild_id,
+            owner: KeyMaterial::from_seed(&seed).node_id(),
+            protected_root_id: Uuid::from_bytes([217; 16]),
+            revision_id: Uuid::from_bytes([218; 16]),
+            total_pages: 1,
+            object_hash: [219; 32],
+        };
+        let node = Node::open(temp.path(), seed.clone()).unwrap();
+        node.put_backup_job(&BackupJob {
+            format_version: 1,
+            descriptor: descriptor.clone(),
+            state: BackupJobState::Running,
+            checkpoint_hash: None,
+            error: None,
+        })
+        .unwrap();
+        assert!(node.backup_commit_in_progress(guild_id).unwrap());
+        drop(node);
+
+        let node = Node::open(temp.path(), seed).unwrap();
+        assert!(node.backup_commit_in_progress(guild_id).unwrap());
+        node.put_backup_job(&BackupJob {
+            format_version: 1,
+            descriptor,
+            state: BackupJobState::Committed,
+            checkpoint_hash: Some([220; 32]),
+            error: None,
+        })
+        .unwrap();
+        assert!(!node.backup_commit_in_progress(guild_id).unwrap());
     }
 
     #[test]

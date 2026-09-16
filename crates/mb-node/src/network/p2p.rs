@@ -7017,21 +7017,27 @@ async fn reconcile_variable_group_lifecycle_once(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
 ) -> Result<()> {
-    let (state, guild, checkpoint, local_id) = node_blocking(node.clone(), |node| {
-        let guild = node
-            .guild_summary()?
-            .context("coding-group lifecycle requires an installed guild")?;
-        let checkpoint = node.current_checkpoint(guild.guild_id)?;
-        Ok((
-            node.dynamic_guild_state()?
-                .context("coding-group lifecycle requires dynamic guild state")?,
-            guild,
-            checkpoint,
-            node.keys().node_id(),
-        ))
-    })
-    .await?;
+    let (state, guild, checkpoint, local_id, backup_commit_in_progress) =
+        node_blocking(node.clone(), |node| {
+            let guild = node
+                .guild_summary()?
+                .context("coding-group lifecycle requires an installed guild")?;
+            let checkpoint = node.current_checkpoint(guild.guild_id)?;
+            let backup_commit_in_progress = node.backup_commit_in_progress(guild.guild_id)?;
+            Ok((
+                node.dynamic_guild_state()?
+                    .context("coding-group lifecycle requires dynamic guild state")?,
+                guild,
+                checkpoint,
+                node.keys().node_id(),
+                backup_commit_in_progress,
+            ))
+        })
+        .await?;
     if guild.coordinator != local_id || !matches!(guild.phase, GuildPhase::Active) {
+        return Ok(());
+    }
+    if backup_commit_in_progress {
         return Ok(());
     }
     let Some(checkpoint) = checkpoint else {
@@ -17193,10 +17199,16 @@ mod tests {
                 .unwrap()
                 .prepare_protected_backup(None)
                 .unwrap();
-            let queued = nodes[0]
+            nodes[0]
                 .lock()
                 .unwrap()
                 .enqueue_backup(owner_id, descriptor.clone())
+                .unwrap();
+            let queued = nodes[0]
+                .lock()
+                .unwrap()
+                .claim_backup_job()
+                .unwrap()
                 .unwrap();
             let checkpoint_hash = commit_backup_job(nodes[0].clone(), &clients[0], &queued)
                 .await
@@ -17248,10 +17260,16 @@ mod tests {
             .unwrap()
             .prepare_protected_backup(Some(secondary_root.root_id))
             .unwrap();
-        let queued = nodes[0]
+        nodes[0]
             .lock()
             .unwrap()
             .enqueue_backup(owner_one_id, secondary_descriptor.clone())
+            .unwrap();
+        let queued = nodes[0]
+            .lock()
+            .unwrap()
+            .claim_backup_job()
+            .unwrap()
             .unwrap();
         let checkpoint_hash = commit_backup_job(nodes[0].clone(), &clients[0], &queued)
             .await
@@ -17290,10 +17308,16 @@ mod tests {
             .unwrap()
             .prepare_protected_backup(Some(owner_one_primary.root_id))
             .unwrap();
-        let queued = nodes[0]
+        nodes[0]
             .lock()
             .unwrap()
             .enqueue_backup(owner_one_id, primary_update.clone())
+            .unwrap();
+        let queued = nodes[0]
+            .lock()
+            .unwrap()
+            .claim_backup_job()
+            .unwrap()
             .unwrap();
         let checkpoint_hash = commit_backup_job(nodes[0].clone(), &clients[0], &queued)
             .await

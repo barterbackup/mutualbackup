@@ -638,14 +638,24 @@ node Clippy gate passed locally. No remote compilation server was used.
   all six publication passes returned without publishing. Run the real
   peer-exchange worker for every test node and wait for the certified recovery
   epochs before starting production backups.
-- [ ] **M5-07 / gate — Run the corrected production gate.**
+- [x] **M5-07 / P1 — Fence coding-group lifecycle during checkpoint construction.**
+  Running the production peer-exchange worker exposed that lifecycle
+  reconciliation compared newly activated groups only with the still-current
+  checkpoint. It retired every group created for the running backup draft, so
+  that draft could never reach coverage. Treat a durable `Running` backup job
+  as a checkpoint-construction fence: recovery-key and endpoint exchange still
+  proceed, while group retirement waits until the job commits or is deferred.
+  The production test now claims each backup job before constructing it, as the
+  daemon coordinator does.
+- [ ] **M5-08 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
-  M5-05, and then M5-06 after the catalog and local restore assertions passed.
-  The provisioned Btrfs production path has therefore not yet passed for the
+  M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
+  when the full daemon peer-exchange task set first ran beside backup. The
+  provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked
   all-target workspace tests, warning-free locked all-target Clippy, and the
-  local reflink/network acceptance gate after M5-01 through M5-06 close.
+  local reflink/network acceptance gate after M5-01 through M5-07 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
