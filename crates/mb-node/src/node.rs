@@ -3080,6 +3080,121 @@ impl Node {
         )
     }
 
+    pub fn reserve_coding_information(
+        &mut self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+        shard_index: u16,
+    ) -> Result<u32> {
+        let role = self.validate_local_coding_information(plan, shard_index)?;
+        if role.sector.virtual_zero {
+            anyhow::bail!("virtual-zero information requires no storage reservation");
+        }
+        self.volumes.reserve_attempt(
+            &self.control,
+            &plan.value.attempt_id,
+            plan.value.geometry.guild_id,
+            shard_index,
+            plan.value.geometry.profile.shard_size,
+        )
+    }
+
+    pub fn write_coding_information_range(
+        &mut self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+        shard_index: u16,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<u32> {
+        let role = self.validate_local_coding_information(plan, shard_index)?;
+        if role.sector.virtual_zero {
+            anyhow::bail!("virtual-zero information requires no payload upload");
+        }
+        let end = u64::from(offset)
+            .checked_add(bytes.len() as u64)
+            .context("coding information range overflows")?;
+        if end > u64::from(role.sector.commitment.byte_len) {
+            anyhow::bail!("coding information range exceeds its committed shard");
+        }
+        self.volumes.write_attempt_range(
+            &self.control,
+            &plan.value.attempt_id,
+            shard_index,
+            offset,
+            bytes,
+        )
+    }
+
+    pub fn finish_coding_information_upload(
+        &mut self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+        shard_index: u16,
+    ) -> Result<()> {
+        let role = self.validate_local_coding_information(plan, shard_index)?;
+        if role.sector.virtual_zero {
+            anyhow::bail!("virtual-zero information requires no payload upload");
+        }
+        self.volumes.finish_attempt_upload(
+            &self.control,
+            &plan.value.attempt_id,
+            role.sector.id,
+            shard_index,
+            &role.sector.commitment,
+        )?;
+        Ok(())
+    }
+
+    pub fn coding_information_range(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+        shard_index: u16,
+        start_leaf: u32,
+        leaf_count: u32,
+    ) -> Result<mb_core::MerkleRangeProof> {
+        let role = self.validate_local_coding_information(plan, shard_index)?;
+        if role.sector.virtual_zero {
+            return Ok(merkle_open_zero_range(
+                role.sector.commitment.byte_len,
+                start_leaf,
+                leaf_count,
+            )?);
+        }
+        if let Ok(bytes) = self.sector_for_guild(&plan.value.geometry.guild_id, &role.sector.id) {
+            if merkle_commit(&bytes)? != role.sector.commitment {
+                anyhow::bail!("local information bytes conflict with the coding plan");
+            }
+            return Ok(merkle_open_range(&bytes, start_leaf, leaf_count)?);
+        }
+        self.volumes.open_attempt_range(
+            &self.control,
+            &plan.value.attempt_id,
+            &role.sector.id,
+            shard_index,
+            start_leaf,
+            leaf_count,
+        )
+    }
+
+    fn validate_local_coding_information<'a>(
+        &self,
+        plan: &'a SignedRecord<CodingAttemptPlan>,
+        shard_index: u16,
+    ) -> Result<&'a mb_core::InformationRoleV2> {
+        self.validate_coding_attempt_plan(plan)?;
+        if usize::from(shard_index) >= usize::from(plan.value.geometry.profile.data_shards) {
+            anyhow::bail!("coding information index is outside the delegated layout");
+        }
+        let role = plan
+            .value
+            .geometry
+            .information
+            .get(usize::from(shard_index))
+            .context("coding information index is outside the delegated layout")?;
+        if role.owner != self.keys.node_id() {
+            anyhow::bail!("coding information is assigned to another holder");
+        }
+        Ok(role)
+    }
+
     pub fn write_coding_parity_range(
         &mut self,
         plan: &SignedRecord<CodingAttemptPlan>,
@@ -3211,11 +3326,24 @@ impl Node {
                 if information.sector.virtual_zero {
                     merkle_open_zero_range(information.sector.commitment.byte_len, leaf, 1)?
                 } else {
-                    let bytes = self.sector_for_guild(&group.guild_id, &information.sector.id)?;
-                    if merkle_commit(&bytes)? != *commitment {
-                        anyhow::bail!("local information bytes conflict with the coding plan");
+                    match self.sector_for_guild(&group.guild_id, &information.sector.id) {
+                        Ok(bytes) => {
+                            if merkle_commit(&bytes)? != *commitment {
+                                anyhow::bail!(
+                                    "local information bytes conflict with the coding plan"
+                                );
+                            }
+                            merkle_open_range(&bytes, leaf, 1)?
+                        }
+                        Err(_) => self.volumes.open_attempt_range(
+                            &self.control,
+                            &plan.value.attempt_id,
+                            &information.sector.id,
+                            shard_index,
+                            leaf,
+                            1,
+                        )?,
                     }
-                    merkle_open_range(&bytes, leaf, 1)?
                 }
             }
             ShardRoleV2::Parity(_) => self.volumes.open_attempt_range(
@@ -3527,24 +3655,48 @@ impl Node {
         let transcript_hash = *blake3::hash(&canonical_bytes(transcript)?).as_bytes();
         let mut activated = false;
         for (index, role) in group.roles.iter().enumerate() {
-            let ShardRoleV2::Parity(parity) = role else {
-                continue;
-            };
-            if parity.holder != self.keys.node_id() {
-                continue;
+            match role {
+                ShardRoleV2::Information(information)
+                    if information.owner == self.keys.node_id() =>
+                {
+                    activated = true;
+                    if information.sector.virtual_zero {
+                        continue;
+                    }
+                    if self
+                        .sector_for_guild(&group.guild_id, &information.sector.id)
+                        .is_ok_and(|bytes| {
+                            merkle_commit(&bytes).ok().as_ref()
+                                == Some(&information.sector.commitment)
+                        })
+                    {
+                        continue;
+                    }
+                    self.volumes.activate_attempt_object(
+                        &self.control,
+                        &plan.attempt_id,
+                        &information.sector.id,
+                        index as u16,
+                        &information.sector.commitment,
+                        &transcript_hash,
+                    )?;
+                }
+                ShardRoleV2::Parity(parity) if parity.holder == self.keys.node_id() => {
+                    self.volumes.activate_attempt_object(
+                        &self.control,
+                        &plan.attempt_id,
+                        &group.id,
+                        index as u16,
+                        &parity.commitment,
+                        &transcript_hash,
+                    )?;
+                    activated = true;
+                }
+                _ => {}
             }
-            self.volumes.activate_attempt_object(
-                &self.control,
-                &plan.attempt_id,
-                &group.id,
-                index as u16,
-                &parity.commitment,
-                &transcript_hash,
-            )?;
-            activated = true;
         }
         if !activated {
-            anyhow::bail!("coding attempt assigns no parity to the local node");
+            anyhow::bail!("coding attempt assigns no shard to the local node");
         }
         self.persist_coding_group_transcript(transcript)?;
         Ok(())
@@ -3572,6 +3724,21 @@ impl Node {
             .load_ready_variable(&self.control, group_id, shard_index)?;
         if object.guild_id != *guild_id {
             anyhow::bail!("variable parity object belongs to another guild");
+        }
+        Ok(object)
+    }
+
+    pub fn variable_information_for_guild(
+        &self,
+        guild_id: &[u8; 32],
+        sector_id: &[u8; 32],
+        shard_index: u16,
+    ) -> Result<VariableParityObject> {
+        let object = self
+            .volumes
+            .load_ready_variable(&self.control, sector_id, shard_index)?;
+        if object.guild_id != *guild_id || object.group_id != *sector_id {
+            anyhow::bail!("variable information object belongs to another guild or sector");
         }
         Ok(object)
     }
@@ -8213,6 +8380,8 @@ mod tests {
     fn variable_coding_attempt_stages_opens_and_activates_after_replay() {
         let data_dir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
+        let information_data_dir = tempfile::tempdir().unwrap();
+        let information_storage = tempfile::tempdir().unwrap();
         let mut identities = (0_u8..5)
             .map(|index| {
                 let seed = Seed::from_bytes([index + 180; 32]);
@@ -8253,10 +8422,19 @@ mod tests {
                 member: member.clone(),
                 endpoints: Vec::new(),
             })
-            .collect();
+            .collect::<Vec<_>>();
         let mut node = Node::open(data_dir.path(), identities[4].1.clone()).unwrap();
-        node.adopt_recovered_guild(certificate, peers).unwrap();
+        node.adopt_recovered_guild(certificate.clone(), peers.clone())
+            .unwrap();
         node.configure_storage_volumes(&[storage.path().to_path_buf()], 4096, 0)
+            .unwrap();
+        let mut information_node =
+            Node::open(information_data_dir.path(), identities[2].1.clone()).unwrap();
+        information_node
+            .adopt_recovered_guild(certificate, peers)
+            .unwrap();
+        information_node
+            .configure_storage_volumes(&[information_storage.path().to_path_buf()], 4096, 0)
             .unwrap();
 
         let profile = mb_core::CodingProfile::new(3, 2, 64);
@@ -8330,6 +8508,33 @@ mod tests {
         };
         let plan_hash = plan.hash().unwrap();
         let plan = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, &keys[0]).unwrap();
+        assert_eq!(
+            information_node
+                .reserve_coding_information(&plan, 2)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            information_node
+                .write_coding_information_range(&plan, 2, 0, &shards[2][..32])
+                .unwrap(),
+            32
+        );
+        assert_eq!(
+            information_node
+                .reserve_coding_information(&plan, 2)
+                .unwrap(),
+            32
+        );
+        assert_eq!(
+            information_node
+                .write_coding_information_range(&plan, 2, 32, &shards[2][32..])
+                .unwrap(),
+            64
+        );
+        information_node
+            .finish_coding_information_upload(&plan, 2)
+            .unwrap();
         let challenge_commitment = node.commit_coding_challenge(&plan).unwrap();
         let manifest = SignedRecord::sign(
             CODING_ROOT_MANIFEST_DOMAIN,
@@ -8404,6 +8609,14 @@ mod tests {
                 );
                 continue;
             }
+            if index == 2 {
+                openings.push(
+                    information_node
+                        .coding_shard_opening(&plan, &manifest, challenge, index as u16)
+                        .unwrap(),
+                );
+                continue;
+            }
             let commitment = match &manifest.value.group.roles[index] {
                 ShardRoleV2::Information(information) => &information.sector.commitment,
                 ShardRoleV2::Parity(parity) => &parity.commitment,
@@ -8443,6 +8656,22 @@ mod tests {
         )
         .unwrap();
         node.activate_coding_attempt(&transcript).unwrap();
+        information_node
+            .activate_coding_attempt(&transcript)
+            .unwrap();
+        assert_eq!(
+            information_node
+                .variable_information_for_guild(
+                    &[181; 32],
+                    &transcript.value.plan.value.geometry.information[2]
+                        .sector
+                        .id,
+                    2,
+                )
+                .unwrap()
+                .bytes,
+            shards[2]
+        );
         assert_eq!(
             node.variable_parity_for_guild(
                 &[181; 32],

@@ -77,6 +77,26 @@ peer-request =
         manifest: signed-coding-root-manifest,
         object: variable-parity-object
       } }
+  / { "ReserveCodingInformation": {
+        plan: signed-coding-attempt-plan,
+        shard_index: uint
+      } }
+  / { "UploadCodingInformationRange": {
+        plan: signed-coding-attempt-plan,
+        shard_index: uint,
+        offset: uint,
+        bytes: byte-vector
+      } }
+  / { "FinalizeCodingInformation": {
+        plan: signed-coding-attempt-plan,
+        shard_index: uint
+      } }
+  / { "GetCodingInformationRange": {
+        plan: signed-coding-attempt-plan,
+        shard_index: uint,
+        start_leaf: uint,
+        leaf_count: uint
+      } }
   / { "ReserveCodingParity": {
         plan: signed-coding-attempt-plan,
         shard_index: uint

@@ -1061,6 +1061,39 @@ fn execute_peer_request(
         } => Ok(PeerResponse::StagedStorageReceipt(
             node.stage_coding_parity(&plan, &manifest, &object)?,
         )),
+        PeerRequest::ReserveCodingInformation { plan, shard_index } => {
+            Ok(PeerResponse::CodingRangeProgress {
+                written_until: node.reserve_coding_information(&plan, shard_index)?,
+            })
+        }
+        PeerRequest::UploadCodingInformationRange {
+            plan,
+            shard_index,
+            offset,
+            bytes,
+        } => Ok(PeerResponse::CodingRangeProgress {
+            written_until: node.write_coding_information_range(
+                &plan,
+                shard_index,
+                offset,
+                &bytes,
+            )?,
+        }),
+        PeerRequest::FinalizeCodingInformation { plan, shard_index } => {
+            node.finish_coding_information_upload(&plan, shard_index)?;
+            Ok(PeerResponse::Ack)
+        }
+        PeerRequest::GetCodingInformationRange {
+            plan,
+            shard_index,
+            start_leaf,
+            leaf_count,
+        } => Ok(PeerResponse::MerkleRange(node.coding_information_range(
+            &plan,
+            shard_index,
+            start_leaf,
+            leaf_count,
+        )?)),
         PeerRequest::ReserveCodingParity { plan, shard_index } => {
             Ok(PeerResponse::CodingRangeProgress {
                 written_until: node.reserve_coding_parity(&plan, shard_index)?,

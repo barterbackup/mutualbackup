@@ -2266,6 +2266,121 @@ impl P2pClient {
         Ok(written_until)
     }
 
+    pub async fn reserve_coding_information(
+        &self,
+        peer: NodeId,
+        plan: SignedRecord<CodingAttemptPlan>,
+        shard_index: u16,
+    ) -> Result<u32> {
+        let shard_size = plan.value.geometry.profile.shard_size;
+        let response = self
+            .call(
+                peer,
+                PeerRequest::ReserveCodingInformation {
+                    plan: Box::new(plan),
+                    shard_index,
+                },
+            )
+            .await?;
+        let PeerResponse::CodingRangeProgress { written_until } = response else {
+            bail!("peer returned the wrong information-reservation response");
+        };
+        if written_until > shard_size || !written_until.is_multiple_of(MERKLE_LEAF_SIZE as u32) {
+            bail!("peer returned invalid information-reservation progress");
+        }
+        Ok(written_until)
+    }
+
+    pub async fn upload_coding_information_range(
+        &self,
+        peer: NodeId,
+        plan: SignedRecord<CodingAttemptPlan>,
+        shard_index: u16,
+        offset: u32,
+        bytes: Vec<u8>,
+    ) -> Result<u32> {
+        let expected = offset
+            .checked_add(u32::try_from(bytes.len()).context("coding range is too large")?)
+            .context("coding range offset overflow")?;
+        let response = self
+            .call(
+                peer,
+                PeerRequest::UploadCodingInformationRange {
+                    plan: Box::new(plan),
+                    shard_index,
+                    offset,
+                    bytes,
+                },
+            )
+            .await?;
+        let PeerResponse::CodingRangeProgress { written_until } = response else {
+            bail!("peer returned the wrong information-upload response");
+        };
+        if written_until != expected {
+            bail!("peer did not durably commit the complete information range");
+        }
+        Ok(written_until)
+    }
+
+    pub async fn finalize_coding_information(
+        &self,
+        peer: NodeId,
+        plan: SignedRecord<CodingAttemptPlan>,
+        shard_index: u16,
+    ) -> Result<()> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::FinalizeCodingInformation {
+                    plan: Box::new(plan),
+                    shard_index,
+                },
+            )
+            .await?;
+        if !matches!(response, PeerResponse::Ack) {
+            bail!("peer returned the wrong information-finalization response");
+        }
+        Ok(())
+    }
+
+    pub async fn coding_information_range(
+        &self,
+        peer: NodeId,
+        plan: SignedRecord<CodingAttemptPlan>,
+        shard_index: u16,
+        start_leaf: u32,
+        leaf_count: u32,
+    ) -> Result<mb_core::MerkleRangeProof> {
+        let commitment = plan
+            .value
+            .geometry
+            .information
+            .get(usize::from(shard_index))
+            .context("coding information index is outside its plan")?
+            .sector
+            .commitment
+            .clone();
+        let response = self
+            .call(
+                peer,
+                PeerRequest::GetCodingInformationRange {
+                    plan: Box::new(plan),
+                    shard_index,
+                    start_leaf,
+                    leaf_count,
+                },
+            )
+            .await?;
+        let PeerResponse::MerkleRange(proof) = response else {
+            bail!("peer returned the wrong coding information range response");
+        };
+        if proof.start_leaf != start_leaf || proof.leaves.len() != leaf_count as usize {
+            bail!("peer returned a different coding information range");
+        }
+        mb_core::merkle_verify_range(&commitment, &proof)?;
+        Ok(proof)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn upload_coding_parity_range(
         &self,
@@ -5941,38 +6056,42 @@ async fn fetch_coding_information(
     local_id: NodeId,
 ) -> Result<Vec<Option<Vec<u8>>>> {
     let mut inputs = Vec::with_capacity(plan.value.geometry.information.len());
-    for role in &plan.value.geometry.information {
+    for (shard_index, role) in plan.value.geometry.information.iter().enumerate() {
         if role.sector.virtual_zero {
             inputs.push(None);
             continue;
         }
-        let bytes = if role.owner == local_id {
-            let guild_id = plan.value.geometry.guild_id;
-            let sector_id = role.sector.id;
-            node_blocking(node.clone(), move |node| {
-                node.sector_for_guild(&guild_id, &sector_id)
-            })
-            .await?
-        } else {
-            let total_leaves = role.sector.commitment.byte_len as usize / MERKLE_LEAF_SIZE;
-            let maximum_leaves = CODING_INPUT_RANGE_BYTES / MERKLE_LEAF_SIZE;
-            let range_leaves = total_leaves.min(maximum_leaves);
-            let mut bytes = Vec::with_capacity(role.sector.commitment.byte_len as usize);
-            for start in (0..total_leaves).step_by(range_leaves) {
-                bytes.extend_from_slice(
-                    &p2p.sector_range(
-                        role.owner,
-                        plan.value.geometry.guild_id,
-                        role.sector.id,
-                        &role.sector.commitment,
+        let total_leaves = role.sector.commitment.byte_len as usize / MERKLE_LEAF_SIZE;
+        let maximum_leaves = CODING_INPUT_RANGE_BYTES / MERKLE_LEAF_SIZE;
+        let range_leaves = total_leaves.min(maximum_leaves);
+        let mut bytes = Vec::with_capacity(role.sector.commitment.byte_len as usize);
+        for start in (0..total_leaves).step_by(range_leaves) {
+            let local_plan = plan.clone();
+            let proof = if role.owner == local_id {
+                node_blocking(node.clone(), move |node| {
+                    node.coding_information_range(
+                        &local_plan,
+                        shard_index as u16,
                         start as u32,
                         range_leaves as u32,
                     )
-                    .await?,
-                );
-            }
-            bytes
-        };
+                })
+                .await?
+            } else {
+                p2p.coding_information_range(
+                    role.owner,
+                    local_plan,
+                    shard_index as u16,
+                    start as u32,
+                    range_leaves as u32,
+                )
+                .await?
+            };
+            bytes.extend_from_slice(&mb_core::merkle_verify_range(
+                &role.sector.commitment,
+                &proof,
+            )?);
+        }
         if merkle_commit(&bytes)? != role.sector.commitment {
             bail!("coding input does not match its delegated Merkle root");
         }
@@ -5988,6 +6107,11 @@ async fn abort_delegated_coding(
 ) -> Result<()> {
     let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
     let mut holders = BTreeSet::new();
+    for information in &job.plan.value.geometry.information {
+        if !information.sector.virtual_zero {
+            holders.insert(information.owner);
+        }
+    }
     for placement in &job.plan.value.geometry.parity {
         holders.insert(placement.holder);
     }
@@ -6123,8 +6247,13 @@ async fn finish_coding_activation(
     let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
     let mut holders = BTreeSet::new();
     for role in &transcript.value.manifest.value.group.roles {
-        if let ShardRoleV2::Parity(parity) = role {
-            holders.insert(parity.holder);
+        match role {
+            ShardRoleV2::Information(information) => {
+                holders.insert(information.owner);
+            }
+            ShardRoleV2::Parity(parity) => {
+                holders.insert(parity.holder);
+            }
         }
     }
     for holder in holders {

@@ -114,6 +114,26 @@ pub(super) enum PeerRequest {
         manifest: Box<SignedRecord<CodingRootManifest>>,
         object: VariableParityObject,
     },
+    ReserveCodingInformation {
+        plan: Box<SignedRecord<CodingAttemptPlan>>,
+        shard_index: u16,
+    },
+    UploadCodingInformationRange {
+        plan: Box<SignedRecord<CodingAttemptPlan>>,
+        shard_index: u16,
+        offset: u32,
+        bytes: Vec<u8>,
+    },
+    FinalizeCodingInformation {
+        plan: Box<SignedRecord<CodingAttemptPlan>>,
+        shard_index: u16,
+    },
+    GetCodingInformationRange {
+        plan: Box<SignedRecord<CodingAttemptPlan>>,
+        shard_index: u16,
+        start_leaf: u32,
+        leaf_count: u32,
+    },
     ReserveCodingParity {
         plan: Box<SignedRecord<CodingAttemptPlan>>,
         shard_index: u16,
@@ -284,6 +304,10 @@ impl PeerRequest {
             Self::EnsureFiller { .. } => Some("ensure-filler"),
             Self::PublishParity { .. } => Some("publish-parity"),
             Self::StageCodingParity { .. } => Some("stage-coding-parity"),
+            Self::ReserveCodingInformation { .. } => Some("reserve-coding-information"),
+            Self::UploadCodingInformationRange { .. } => Some("upload-coding-information-range"),
+            Self::FinalizeCodingInformation { .. } => Some("finalize-coding-information"),
+            Self::GetCodingInformationRange { .. } => Some("get-coding-information-range"),
             Self::ReserveCodingParity { .. } => Some("reserve-coding-parity"),
             Self::UploadCodingParityRange { .. } => Some("upload-coding-parity-range"),
             Self::FinalizeCodingParity { .. } => Some("finalize-coding-parity"),
@@ -345,6 +369,10 @@ impl PeerRequest {
             Self::GetCodingTranscript { guild_id, .. } => Some(*guild_id),
             Self::PublishParity { object, .. } => Some(object.guild_id),
             Self::StageCodingParity { plan, .. }
+            | Self::ReserveCodingInformation { plan, .. }
+            | Self::UploadCodingInformationRange { plan, .. }
+            | Self::FinalizeCodingInformation { plan, .. }
+            | Self::GetCodingInformationRange { plan, .. }
             | Self::ReserveCodingParity { plan, .. }
             | Self::UploadCodingParityRange { plan, .. }
             | Self::FinalizeCodingParity { plan, .. }
