@@ -79,7 +79,9 @@ Busy and persist incorrect protection status. No remaining blocker was found
 in the matching READY retry correction. Commit `193f67e` transfers worker
 capacity with the queued result and releases it before the response becomes
 observable. Its deterministic handoff regression and the complete local
-correction gate passed on 2026-09-15. Milestone 5 is next.
+correction gate passed on 2026-09-15. Milestone 5's efficient and flexible
+data/guild protocol passed its local closure gate on 2026-09-16; Milestone 6 is
+next.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -485,7 +487,7 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 4 have passed; Milestone 5 is
+than a daemon prerequisite. Milestones 0 through 5 have passed; Milestone 6 is
 next. Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
@@ -701,7 +703,27 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 4 are passed. Milestone 5 is next.
+**Current position:** Milestones 0 through 5 are passed. Milestone 6 is next.
+Milestone 5 replaces filler-based protection with fair incremental cross-user
+variable-profile coding. It adds authenticated resumable Merkle ranges and
+virtual zero extents, delegated coding with separate sampled verification and
+two-phase activation, live capacity-aware bounded placement, dynamic guild
+membership/quorum and writer/recovery key epochs, retained historical layouts,
+variable recovery/audit/repair, and event-driven group retention. Coding work
+is fenced across authority changes; stale attempts clean both staged and
+uncommitted ready data without deleting committed protection.
+
+The Milestone 5 source gate covers every-`k` variable-profile reconstruction,
+packing/layout stability and multiple roots, the exact `1/4096` sparse-error
+detection limit of one 16-byte sample in a 64 KiB shard, `k+m`/`k+m-1` transfer
+bounds, member changes during durable attempts, key rotation with retained
+history, production cross-user placement, live storage capacity including
+shared filesystems, retry/cleanup, activation replay, variable recovery, and
+group retention. On 2026-09-16 the exact tree passed locked all-target workspace
+tests and warning-free locked all-target workspace Clippy locally. Tests that
+explicitly require a provisioned Btrfs filesystem or private Chutney network
+remained ignored; no remote compilation server was used.
+
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer
 fencing, certified retention/tombstones
@@ -1131,7 +1153,7 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol
+### Milestone 5 — efficient and flexible data/guild protocol (passed)
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and

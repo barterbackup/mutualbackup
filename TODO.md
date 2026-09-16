@@ -574,7 +574,20 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Later guild geometry and coding protocol
+## Milestone 5 guild geometry and coding protocol (completed)
+
+Milestone 5 passed its local source and test gate on 2026-09-16. The production
+backup path now schedules fair cross-user variable coding from the active guild,
+reuses exact committed coverage incrementally, plans bounded roles from live
+per-device capacity, and commits only replay-verified groups. Delegated attempts
+reserve storage before bulk input, use resumable authenticated ranges, separate
+the coding and verification coordinators, retain explicit historical geometry,
+and clean interrupted staged or uncommitted ready objects across membership
+changes. Dynamic membership, quorum, writer/recovery key epochs, recovery,
+audit/repair, and retention use the authenticated event history. The locked
+all-target workspace tests and warning-free Clippy passed locally; tests marked
+as requiring a provisioned Btrfs or private Chutney environment remained
+ignored. No remote compilation server was used.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
