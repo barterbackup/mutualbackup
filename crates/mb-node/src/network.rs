@@ -667,12 +667,26 @@ fn process_peer_request(
         ) && request
             .guild_scope()
             .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
+        let delegated_coding = match &request {
+            PeerRequest::StageCodingParity { plan, .. } => caller == plan.value.coding_coordinator,
+            PeerRequest::GetCodingOpening { plan, .. } => {
+                caller == plan.value.verification_coordinator
+            }
+            PeerRequest::CommitCodingChallenge { plan }
+            | PeerRequest::RevealCodingChallenge { plan, .. } => {
+                caller == plan.value.verification_coordinator
+            }
+            _ => false,
+        } && request
+            .guild_scope()
+            .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
         if mutation_kind.is_some()
             && caller != config.trusted_coordinator
             && !certified_coordinator
             && !self_authorized_admission
             && !guild_onboarding
             && !member_submission
+            && !delegated_coding
         {
             bail!("caller is not the configured guild coordinator");
         }
@@ -937,6 +951,39 @@ fn execute_peer_request(
                 &object,
             )?,
         )),
+        PeerRequest::StageCodingParity { plan, object } => Ok(PeerResponse::StagedStorageReceipt(
+            node.stage_coding_parity(&plan, &object)?,
+        )),
+        PeerRequest::CommitCodingChallenge { plan } => Ok(PeerResponse::CodingChallengeCommitment(
+            node.commit_coding_challenge(&plan)?,
+        )),
+        PeerRequest::RevealCodingChallenge {
+            plan,
+            manifest,
+            receipts,
+        } => Ok(PeerResponse::CodingChallengeReveal(
+            node.reveal_coding_challenge(&plan, &manifest, &receipts)?,
+        )),
+        PeerRequest::GetCodingOpening {
+            plan,
+            challenge,
+            shard_index,
+        } => Ok(PeerResponse::CodingShardOpening(
+            node.coding_shard_opening(&plan, challenge, shard_index)?,
+        )),
+        PeerRequest::ActivateCodingParity { transcript } => {
+            node.activate_coding_attempt(&transcript)?;
+            Ok(PeerResponse::Ack)
+        }
+        PeerRequest::AbortCodingAttempt {
+            guild_id: _,
+            attempt_id,
+        } => {
+            if !node.discard_coding_attempt(&attempt_id)? {
+                anyhow::bail!("some staged attempt volumes are offline");
+            }
+            Ok(PeerResponse::Ack)
+        }
         PeerRequest::StoreRepairShard {
             repair_id,
             guild_id: _,

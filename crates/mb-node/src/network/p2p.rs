@@ -26,15 +26,19 @@ use libp2p::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use mb_core::{
-    CodingGroup, GuildCheckpoint, GuildGenesis, GuildInvite, InformationRole, Member,
-    MemberSignature, NodeId, ParityRole, QuorumCheckpoint, QuorumGuildGenesis,
-    RECOVERY_LOCATOR_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole,
-    SignedRecord, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
-    V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES,
-    V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE,
-    canonical_bytes, decode_canonical, encode_3_2, open_recovery_record, sector_root,
+    CODING_CHALLENGE_COMMITMENT_DOMAIN, CODING_CHALLENGE_REVEAL_DOMAIN,
+    CODING_SHARD_OPENING_DOMAIN, CodingAttemptPlan, CodingChallengeCommitment,
+    CodingChallengeReveal, CodingGroup, CodingRootManifest, CodingShardOpening,
+    CodingVerificationTranscript, GuildCheckpoint, GuildGenesis, GuildInvite, InformationRole,
+    Member, MemberSignature, NodeId, ParityRole, QuorumCheckpoint, QuorumGuildGenesis,
+    RECOVERY_LOCATOR_DOMAIN, STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN,
+    SectorId, SectorRef, ShardRole, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
+    UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES,
+    V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS,
+    V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE, canonical_bytes, decode_canonical, encode_3_2,
+    open_recovery_record, sector_root,
 };
-use mb_store::ParityObject;
+use mb_store::{ParityObject, VariableParityObject};
 use uuid::Uuid;
 
 use crate::node::{CheckpointRecoveryObservation, DhtRecordObservation, GuildPhase, SnapshotInfo};
@@ -2026,6 +2030,173 @@ impl P2pClient {
             bail!("parity acknowledgement has the wrong operation identity");
         }
         Ok(acknowledgement)
+    }
+
+    pub async fn stage_coding_parity(
+        &self,
+        peer: NodeId,
+        plan: SignedRecord<CodingAttemptPlan>,
+        object: VariableParityObject,
+    ) -> Result<SignedRecord<StagedStorageReceipt>> {
+        let expected_attempt = plan.value.attempt_id;
+        let expected_group = plan.value.group.id;
+        let expected_index = object.shard_index;
+        let expected_commitment = object.commitment.clone();
+        let response = self
+            .call(
+                peer,
+                PeerRequest::StageCodingParity {
+                    plan: Box::new(plan),
+                    object,
+                },
+            )
+            .await?;
+        let PeerResponse::StagedStorageReceipt(receipt) = response else {
+            bail!("peer returned the wrong staged parity response");
+        };
+        receipt.verify(STAGED_STORAGE_RECEIPT_DOMAIN)?;
+        if receipt.signer != peer
+            || receipt.value.holder != peer
+            || receipt.value.attempt_id != expected_attempt
+            || receipt.value.group_id != expected_group
+            || receipt.value.shard_index != expected_index
+            || receipt.value.commitment != expected_commitment
+        {
+            bail!("staged parity receipt conflicts with the coding plan");
+        }
+        Ok(receipt)
+    }
+
+    pub async fn commit_coding_challenge(
+        &self,
+        verifier: NodeId,
+        plan: SignedRecord<CodingAttemptPlan>,
+    ) -> Result<SignedRecord<CodingChallengeCommitment>> {
+        let expected_attempt = plan.value.attempt_id;
+        let expected_hash = plan.value.hash()?;
+        let response = self
+            .call(
+                verifier,
+                PeerRequest::CommitCodingChallenge {
+                    plan: Box::new(plan),
+                },
+            )
+            .await?;
+        let PeerResponse::CodingChallengeCommitment(commitment) = response else {
+            bail!("peer returned the wrong challenge-commitment response");
+        };
+        commitment.verify(CODING_CHALLENGE_COMMITMENT_DOMAIN)?;
+        if commitment.signer != verifier
+            || commitment.value.attempt_id != expected_attempt
+            || commitment.value.plan_hash != expected_hash
+        {
+            bail!("verifier challenge commitment conflicts with the coding plan");
+        }
+        Ok(commitment)
+    }
+
+    pub async fn reveal_coding_challenge(
+        &self,
+        verifier: NodeId,
+        plan: SignedRecord<CodingAttemptPlan>,
+        manifest: SignedRecord<CodingRootManifest>,
+        receipts: Vec<SignedRecord<StagedStorageReceipt>>,
+    ) -> Result<SignedRecord<CodingChallengeReveal>> {
+        let expected_attempt = plan.value.attempt_id;
+        let expected_hash = plan.value.hash()?;
+        let response = self
+            .call(
+                verifier,
+                PeerRequest::RevealCodingChallenge {
+                    plan: Box::new(plan),
+                    manifest: Box::new(manifest),
+                    receipts,
+                },
+            )
+            .await?;
+        let PeerResponse::CodingChallengeReveal(reveal) = response else {
+            bail!("peer returned the wrong challenge-reveal response");
+        };
+        reveal.verify(CODING_CHALLENGE_REVEAL_DOMAIN)?;
+        if reveal.signer != verifier
+            || reveal.value.attempt_id != expected_attempt
+            || reveal.value.plan_hash != expected_hash
+        {
+            bail!("verifier challenge reveal conflicts with the coding plan");
+        }
+        Ok(reveal)
+    }
+
+    pub async fn coding_opening(
+        &self,
+        peer: NodeId,
+        plan: SignedRecord<CodingAttemptPlan>,
+        challenge: [u8; 32],
+        shard_index: u16,
+    ) -> Result<SignedRecord<CodingShardOpening>> {
+        let plan_hash = plan.value.hash()?;
+        let response = self
+            .call(
+                peer,
+                PeerRequest::GetCodingOpening {
+                    plan: Box::new(plan),
+                    challenge,
+                    shard_index,
+                },
+            )
+            .await?;
+        let PeerResponse::CodingShardOpening(opening) = response else {
+            bail!("peer returned the wrong coding-opening response");
+        };
+        opening.verify(CODING_SHARD_OPENING_DOMAIN)?;
+        if opening.signer != peer
+            || opening.value.plan_hash != plan_hash
+            || opening.value.challenge != challenge
+            || opening.value.shard_index != shard_index
+        {
+            bail!("coding opening conflicts with the verifier request");
+        }
+        Ok(opening)
+    }
+
+    pub async fn activate_coding_parity(
+        &self,
+        peer: NodeId,
+        transcript: SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<()> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::ActivateCodingParity {
+                    transcript: Box::new(transcript),
+                },
+            )
+            .await?;
+        if !matches!(response, PeerResponse::Ack) {
+            bail!("peer returned the wrong coding activation response");
+        }
+        Ok(())
+    }
+
+    pub async fn abort_coding_attempt(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        attempt_id: [u8; 16],
+    ) -> Result<()> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::AbortCodingAttempt {
+                    guild_id,
+                    attempt_id,
+                },
+            )
+            .await?;
+        if !matches!(response, PeerResponse::Ack) {
+            bail!("peer returned the wrong coding abort response");
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

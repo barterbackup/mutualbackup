@@ -6,17 +6,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use mb_core::{
-    EndpointRecord, GuildCheckpoint, GuildGenesis, GuildInvite, KeyMaterial, Member,
-    MemberSignature, NodeId, QuorumCheckpoint, QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN,
-    RecoveryBundle, RecoveryLocator, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, Seed,
-    ShardRole, SignedRecord, StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision,
-    V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes,
-    decode_canonical, open_recovery_record, seal_recovery_record, sector_root,
-    synthetic_filler_sector,
+    CODING_ATTEMPT_PLAN_DOMAIN, CODING_CHALLENGE_COMMITMENT_DOMAIN, CODING_CHALLENGE_REVEAL_DOMAIN,
+    CODING_ROOT_MANIFEST_DOMAIN, CODING_SHARD_OPENING_DOMAIN, CodingAttemptPlan,
+    CodingChallengeCommitment, CodingChallengeReveal, CodingReplayFinding, CodingRootManifest,
+    CodingShardOpening, CodingVerificationTranscript, EndpointRecord, GuildCheckpoint,
+    GuildGenesis, GuildInvite, KeyMaterial, Member, MemberSignature, NodeId, QuorumCheckpoint,
+    QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN, RecoveryBundle, RecoveryLocator,
+    STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, Seed,
+    ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
+    USER_REVISION_DOMAIN, UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_PAGES,
+    V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes, challenged_leaf, coding_challenge_commitment,
+    coding_evidence_hash, decode_canonical, merkle_commit, merkle_open_range, open_recovery_record,
+    replay_coding_transcript, seal_recovery_record, sector_root, synthetic_filler_sector,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
-    filesystem_identity, probe_reflink,
+    VariableParityObject, filesystem_identity, probe_reflink,
 };
 use rand::RngCore;
 use uuid::Uuid;
@@ -78,6 +83,15 @@ struct CoordinatorCommitJournal {
     plan_hash: [u8; 32],
     guild_id: [u8; 32],
     checkpoint_hash: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct VerifierChallengeState {
+    format_version: u16,
+    attempt_id: [u8; 16],
+    plan_hash: [u8; 32],
+    nonce: [u8; 32],
+    commitment: SignedRecord<CodingChallengeCommitment>,
 }
 
 const GUILD_INVITE_DOMAIN: &[u8] = b"mutualbackup/guild-invite/v1";
@@ -2265,6 +2279,354 @@ impl Node {
     #[cfg(test)]
     pub(crate) fn emergency_shard_count(&self) -> Result<usize> {
         Ok(self.control.records("emergency-shard")?.len())
+    }
+
+    pub fn commit_coding_challenge(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+    ) -> Result<SignedRecord<CodingChallengeCommitment>> {
+        self.validate_coding_attempt_plan(plan)?;
+        if plan.value.verification_coordinator != self.keys.node_id() {
+            anyhow::bail!("coding challenge is assigned to another verifier");
+        }
+        let plan_hash = plan.value.hash()?;
+        if let Some(bytes) = self
+            .control
+            .get_record("coding-verifier-challenge", &plan.value.attempt_id)?
+        {
+            let state: VerifierChallengeState = decode_canonical(&bytes)?;
+            if state.format_version != 1
+                || state.attempt_id != plan.value.attempt_id
+                || state.plan_hash != plan_hash
+            {
+                anyhow::bail!("coding attempt already has a conflicting hidden challenge");
+            }
+            state
+                .commitment
+                .verify(CODING_CHALLENGE_COMMITMENT_DOMAIN)?;
+            return Ok(state.commitment);
+        }
+        let mut nonce = [0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let commitment = SignedRecord::sign(
+            CODING_CHALLENGE_COMMITMENT_DOMAIN,
+            CodingChallengeCommitment {
+                format_version: 1,
+                attempt_id: plan.value.attempt_id,
+                plan_hash,
+                commitment: coding_challenge_commitment(plan_hash, nonce),
+            },
+            &self.keys,
+        )?;
+        self.control.put_record_if_absent(
+            "coding-verifier-challenge",
+            &plan.value.attempt_id,
+            &canonical_bytes(&VerifierChallengeState {
+                format_version: 1,
+                attempt_id: plan.value.attempt_id,
+                plan_hash,
+                nonce,
+                commitment: commitment.clone(),
+            })?,
+        )?;
+        Ok(commitment)
+    }
+
+    pub fn reveal_coding_challenge(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+        manifest: &SignedRecord<CodingRootManifest>,
+        receipts: &[SignedRecord<StagedStorageReceipt>],
+    ) -> Result<SignedRecord<CodingChallengeReveal>> {
+        self.validate_coding_attempt_plan(plan)?;
+        if plan.value.verification_coordinator != self.keys.node_id() {
+            anyhow::bail!("coding challenge is assigned to another verifier");
+        }
+        let plan_hash = plan.value.hash()?;
+        manifest.verify(CODING_ROOT_MANIFEST_DOMAIN)?;
+        let commitments = plan
+            .value
+            .group
+            .roles
+            .iter()
+            .map(|role| match role {
+                ShardRoleV2::Information(information) => information.sector.commitment.clone(),
+                ShardRoleV2::Parity(parity) => parity.commitment.clone(),
+            })
+            .collect::<Vec<_>>();
+        if manifest.signer != plan.value.coding_coordinator
+            || manifest.value.format_version != 1
+            || manifest.value.attempt_id != plan.value.attempt_id
+            || manifest.value.plan_hash != plan_hash
+            || manifest.value.ordered_commitments != commitments
+            || receipts.len() != usize::from(plan.value.group.profile.parity_shards)
+        {
+            anyhow::bail!("coding root manifest or staged receipt set is invalid");
+        }
+        let parity_start = usize::from(plan.value.group.profile.data_shards);
+        for (offset, receipt) in receipts.iter().enumerate() {
+            receipt.verify(STAGED_STORAGE_RECEIPT_DOMAIN)?;
+            let index = parity_start + offset;
+            let ShardRoleV2::Parity(parity) = &plan.value.group.roles[index] else {
+                anyhow::bail!("coding plan parity layout is invalid");
+            };
+            if receipt.signer != parity.holder
+                || receipt.value.format_version != 1
+                || receipt.value.attempt_id != plan.value.attempt_id
+                || receipt.value.plan_hash != plan_hash
+                || receipt.value.guild_id != plan.value.group.guild_id
+                || receipt.value.group_id != plan.value.group.id
+                || usize::from(receipt.value.shard_index) != index
+                || receipt.value.holder != parity.holder
+                || receipt.value.commitment != parity.commitment
+            {
+                anyhow::bail!("staged receipt set does not cover the delegated parity rows");
+            }
+        }
+        let bytes = self
+            .control
+            .get_record("coding-verifier-challenge", &plan.value.attempt_id)?
+            .context("verifier did not durably precommit this coding challenge")?;
+        let state: VerifierChallengeState = decode_canonical(&bytes)?;
+        if state.format_version != 1
+            || state.attempt_id != plan.value.attempt_id
+            || state.plan_hash != plan_hash
+            || state.commitment.signer != self.keys.node_id()
+        {
+            anyhow::bail!("durable verifier challenge conflicts with the coding plan");
+        }
+        state
+            .commitment
+            .verify(CODING_CHALLENGE_COMMITMENT_DOMAIN)?;
+        let evidence_hash = coding_evidence_hash(manifest, receipts)?;
+        SignedRecord::sign(
+            CODING_CHALLENGE_REVEAL_DOMAIN,
+            CodingChallengeReveal {
+                format_version: 1,
+                attempt_id: plan.value.attempt_id,
+                plan_hash,
+                nonce: state.nonce,
+                evidence_hash,
+            },
+            &self.keys,
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn stage_coding_parity(
+        &mut self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+        object: &VariableParityObject,
+    ) -> Result<SignedRecord<StagedStorageReceipt>> {
+        self.validate_coding_attempt_plan(plan)?;
+        let plan_hash = plan.value.hash()?;
+        let index = usize::from(object.shard_index);
+        let Some(ShardRoleV2::Parity(role)) = plan.value.group.roles.get(index) else {
+            anyhow::bail!("coding attempt object is not a declared parity shard");
+        };
+        if role.holder != self.keys.node_id()
+            || object.format_version != 2
+            || object.guild_id != plan.value.group.guild_id
+            || object.group_id != plan.value.group.id
+            || object.commitment != role.commitment
+            || merkle_commit(&object.bytes)? != role.commitment
+        {
+            anyhow::bail!("coding attempt parity object conflicts with its delegated plan");
+        }
+        let receipt = StagedStorageReceipt {
+            format_version: 1,
+            attempt_id: plan.value.attempt_id,
+            plan_hash,
+            guild_id: object.guild_id,
+            group_id: object.group_id,
+            shard_index: object.shard_index,
+            holder: self.keys.node_id(),
+            commitment: object.commitment.clone(),
+        };
+        let receipt = SignedRecord::sign(STAGED_STORAGE_RECEIPT_DOMAIN, receipt, &self.keys)?;
+        self.volumes.stage_attempt(
+            &self.control,
+            &plan.value.attempt_id,
+            object,
+            &canonical_bytes(&receipt)?,
+        )?;
+        Ok(receipt)
+    }
+
+    pub fn coding_shard_opening(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+        challenge: [u8; 32],
+        shard_index: u16,
+    ) -> Result<SignedRecord<CodingShardOpening>> {
+        self.validate_coding_attempt_plan(plan)?;
+        let plan_hash = plan.value.hash()?;
+        let role = plan
+            .value
+            .group
+            .roles
+            .get(usize::from(shard_index))
+            .context("coding opening shard index is outside its group")?;
+        let (holder, commitment) = match role {
+            ShardRoleV2::Information(information) => {
+                (information.owner, &information.sector.commitment)
+            }
+            ShardRoleV2::Parity(parity) => (parity.holder, &parity.commitment),
+        };
+        if holder != self.keys.node_id() {
+            anyhow::bail!("coding opening is assigned to another holder");
+        }
+        let leaf = challenged_leaf(&challenge, commitment)?;
+        let proof = match role {
+            ShardRoleV2::Information(information) => {
+                let bytes =
+                    self.sector_for_guild(&plan.value.group.guild_id, &information.sector.id)?;
+                if merkle_commit(&bytes)? != *commitment {
+                    anyhow::bail!("local information bytes conflict with the coding plan");
+                }
+                merkle_open_range(&bytes, leaf, 1)?
+            }
+            ShardRoleV2::Parity(_) => self.volumes.open_attempt_range(
+                &self.control,
+                &plan.value.attempt_id,
+                &plan.value.group.id,
+                shard_index,
+                leaf,
+                1,
+            )?,
+        };
+        SignedRecord::sign(
+            CODING_SHARD_OPENING_DOMAIN,
+            CodingShardOpening {
+                format_version: 1,
+                attempt_id: plan.value.attempt_id,
+                plan_hash,
+                verifier: plan.value.verification_coordinator,
+                challenge,
+                shard_index,
+                commitment: commitment.clone(),
+                proof,
+            },
+            &self.keys,
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn activate_coding_attempt(
+        &mut self,
+        transcript: &SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<()> {
+        if replay_coding_transcript(transcript)? != CodingReplayFinding::Verified {
+            anyhow::bail!("coding transcript does not verify the delegated codeword");
+        }
+        let plan = &transcript.value.plan.value;
+        self.validate_coding_attempt_plan(&transcript.value.plan)?;
+        let transcript_hash = *blake3::hash(&canonical_bytes(transcript)?).as_bytes();
+        let mut activated = false;
+        for (index, role) in plan.group.roles.iter().enumerate() {
+            let ShardRoleV2::Parity(parity) = role else {
+                continue;
+            };
+            if parity.holder != self.keys.node_id() {
+                continue;
+            }
+            self.volumes.activate_attempt_object(
+                &self.control,
+                &plan.attempt_id,
+                &plan.group.id,
+                index as u16,
+                &parity.commitment,
+                &transcript_hash,
+            )?;
+            activated = true;
+        }
+        if !activated {
+            anyhow::bail!("coding attempt assigns no parity to the local node");
+        }
+        let transcript_bytes = canonical_bytes(transcript)?;
+        if !self.control.put_record_if_absent(
+            "coding-transcript",
+            &plan.attempt_id,
+            &transcript_bytes,
+        )? && self
+            .control
+            .get_record("coding-transcript", &plan.attempt_id)?
+            .as_deref()
+            != Some(transcript_bytes.as_slice())
+        {
+            anyhow::bail!("coding attempt already has a conflicting transcript");
+        }
+        Ok(())
+    }
+
+    pub fn discard_coding_attempt(&mut self, attempt_id: &[u8; 16]) -> Result<bool> {
+        self.volumes.discard_attempt(&self.control, attempt_id)
+    }
+
+    pub fn variable_parity_for_guild(
+        &self,
+        guild_id: &[u8; 32],
+        group_id: &[u8; 32],
+        shard_index: u16,
+    ) -> Result<VariableParityObject> {
+        let object = self
+            .volumes
+            .load_ready_variable(&self.control, group_id, shard_index)?;
+        if object.guild_id != *guild_id {
+            anyhow::bail!("variable parity object belongs to another guild");
+        }
+        Ok(object)
+    }
+
+    fn validate_coding_attempt_plan(&self, plan: &SignedRecord<CodingAttemptPlan>) -> Result<()> {
+        plan.verify(CODING_ATTEMPT_PLAN_DOMAIN)?;
+        plan.value.validate()?;
+        if plan.signer != plan.value.delegator
+            || plan.value.expires_at_unix_seconds < unix_seconds()
+        {
+            anyhow::bail!("coding attempt delegation is invalid or expired");
+        }
+        let certificate = self
+            .installed_guild_certificate()?
+            .context("node has no installed guild")?;
+        certificate.verify()?;
+        if certificate.genesis.guild_id != plan.value.group.guild_id
+            || certificate.genesis.coordinator != plan.value.delegator
+            || plan.value.membership_epoch != 1
+        {
+            anyhow::bail!("coding attempt is outside the installed guild authority");
+        }
+        for node in [
+            plan.value.delegator,
+            plan.value.coding_coordinator,
+            plan.value.verification_coordinator,
+        ] {
+            if !certificate
+                .genesis
+                .members
+                .iter()
+                .any(|member| member.node_id == node)
+            {
+                anyhow::bail!("coding attempt coordinator is not a guild member");
+            }
+        }
+        for role in &plan.value.group.roles {
+            let (node, domain) = match role {
+                ShardRoleV2::Information(information) => {
+                    (information.owner, information.failure_domain.as_str())
+                }
+                ShardRoleV2::Parity(parity) => (parity.holder, parity.failure_domain.as_str()),
+            };
+            if !certificate
+                .genesis
+                .members
+                .iter()
+                .any(|member| member.node_id == node && member.failure_domain == domain)
+            {
+                anyhow::bail!("coding attempt placement conflicts with installed membership");
+            }
+        }
+        Ok(())
     }
 
     pub fn publish_verified_parity(
@@ -6421,6 +6783,224 @@ mod tests {
             object.bytes
         );
         assert!(!source_path.exists());
+    }
+
+    #[test]
+    fn variable_coding_attempt_stages_opens_and_activates_after_replay() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let mut identities = (0_u8..5)
+            .map(|index| {
+                let seed = Seed::from_bytes([index + 180; 32]);
+                let keys = KeyMaterial::from_seed(&seed);
+                (keys.node_id(), seed, keys.recovery_public_key())
+            })
+            .collect::<Vec<_>>();
+        identities.sort_by_key(|(node_id, _, _)| *node_id);
+        let keys = identities
+            .iter()
+            .map(|(_, seed, _)| KeyMaterial::from_seed(seed))
+            .collect::<Vec<_>>();
+        let members = identities
+            .iter()
+            .enumerate()
+            .map(|(index, (node_id, _, recovery_public_key))| Member {
+                node_id: *node_id,
+                recovery_public_key: *recovery_public_key,
+                failure_domain: format!("attempt-domain-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let genesis = GuildGenesis {
+            format_version: 1,
+            guild_id: [181; 32],
+            coordinator: members[0].node_id,
+            members: members.clone(),
+        };
+        let certificate = QuorumGuildGenesis {
+            signatures: keys
+                .iter()
+                .map(|keys| genesis.member_signature(keys).unwrap())
+                .collect(),
+            genesis,
+        };
+        let peers = members
+            .iter()
+            .map(|member| GuildPeer {
+                member: member.clone(),
+                endpoints: Vec::new(),
+            })
+            .collect();
+        let mut node = Node::open(data_dir.path(), identities[4].1.clone()).unwrap();
+        node.adopt_recovered_guild(certificate, peers).unwrap();
+        node.configure_storage_volumes(&[storage.path().to_path_buf()], 4096, 0)
+            .unwrap();
+
+        let profile = mb_core::CodingProfile::new(3, 2, 64);
+        let information = vec![vec![7; 64], vec![19; 64], vec![31; 64]];
+        let shards = mb_core::encode(profile, information).unwrap();
+        let mut roles = shards[..3]
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                ShardRoleV2::Information(mb_core::InformationRoleV2 {
+                    owner: members[index].node_id,
+                    failure_domain: members[index].failure_domain.clone(),
+                    sector: mb_core::RangeSectorRef {
+                        id: [index as u8 + 1; 32],
+                        commitment: merkle_commit(bytes).unwrap(),
+                        logical_len: 64,
+                        virtual_zero: false,
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        roles.extend(shards[3..].iter().enumerate().map(|(row, bytes)| {
+            let member = &members[3 + row];
+            ShardRoleV2::Parity(mb_core::ParityRoleV2 {
+                holder: member.node_id,
+                failure_domain: member.failure_domain.clone(),
+                row: row as u16,
+                commitment: merkle_commit(bytes).unwrap(),
+            })
+        }));
+        let mut group = mb_core::CodingGroupV2 {
+            id: [0; 32],
+            format_version: 2,
+            guild_id: [181; 32],
+            profile,
+            roles,
+        };
+        group.id = group.calculate_id().unwrap();
+        let plan = CodingAttemptPlan {
+            format_version: 1,
+            attempt_id: [182; 16],
+            checkpoint_hash: [183; 32],
+            membership_epoch: 1,
+            group,
+            delegator: members[0].node_id,
+            coding_coordinator: members[1].node_id,
+            verification_coordinator: members[4].node_id,
+            expires_at_unix_seconds: unix_seconds() + 600,
+        };
+        let plan_hash = plan.hash().unwrap();
+        let plan = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, &keys[0]).unwrap();
+        let challenge_commitment = node.commit_coding_challenge(&plan).unwrap();
+        let local_object = VariableParityObject {
+            format_version: 2,
+            guild_id: [181; 32],
+            group_id: plan.value.group.id,
+            shard_index: 4,
+            commitment: merkle_commit(&shards[4]).unwrap(),
+            bytes: shards[4].clone(),
+        };
+        let local_receipt = node.stage_coding_parity(&plan, &local_object).unwrap();
+        assert!(
+            node.variable_parity_for_guild(&[181; 32], &plan.value.group.id, 4)
+                .is_err()
+        );
+        let other_receipt = SignedRecord::sign(
+            STAGED_STORAGE_RECEIPT_DOMAIN,
+            StagedStorageReceipt {
+                format_version: 1,
+                attempt_id: [182; 16],
+                plan_hash,
+                guild_id: [181; 32],
+                group_id: plan.value.group.id,
+                shard_index: 3,
+                holder: members[3].node_id,
+                commitment: merkle_commit(&shards[3]).unwrap(),
+            },
+            &keys[3],
+        )
+        .unwrap();
+        let receipts = vec![other_receipt, local_receipt];
+        let manifest = SignedRecord::sign(
+            CODING_ROOT_MANIFEST_DOMAIN,
+            CodingRootManifest {
+                format_version: 1,
+                attempt_id: [182; 16],
+                plan_hash,
+                ordered_commitments: plan
+                    .value
+                    .group
+                    .roles
+                    .iter()
+                    .map(|role| match role {
+                        ShardRoleV2::Information(information) => {
+                            information.sector.commitment.clone()
+                        }
+                        ShardRoleV2::Parity(parity) => parity.commitment.clone(),
+                    })
+                    .collect(),
+            },
+            &keys[1],
+        )
+        .unwrap();
+        let reveal = node
+            .reveal_coding_challenge(&plan, &manifest, &receipts)
+            .unwrap();
+        let challenge =
+            mb_core::coding_challenge(plan_hash, reveal.value.nonce, reveal.value.evidence_hash);
+        let mut openings = Vec::new();
+        for (index, bytes) in shards.iter().enumerate() {
+            if index == 4 {
+                openings.push(
+                    node.coding_shard_opening(&plan, challenge, index as u16)
+                        .unwrap(),
+                );
+                continue;
+            }
+            let commitment = match &plan.value.group.roles[index] {
+                ShardRoleV2::Information(information) => &information.sector.commitment,
+                ShardRoleV2::Parity(parity) => &parity.commitment,
+            };
+            let leaf = challenged_leaf(&challenge, commitment).unwrap();
+            openings.push(
+                SignedRecord::sign(
+                    CODING_SHARD_OPENING_DOMAIN,
+                    CodingShardOpening {
+                        format_version: 1,
+                        attempt_id: [182; 16],
+                        plan_hash,
+                        verifier: members[4].node_id,
+                        challenge,
+                        shard_index: index as u16,
+                        commitment: commitment.clone(),
+                        proof: merkle_open_range(bytes, leaf, 1).unwrap(),
+                    },
+                    &keys[index],
+                )
+                .unwrap(),
+            );
+        }
+        let transcript = SignedRecord::sign(
+            mb_core::CODING_TRANSCRIPT_DOMAIN,
+            CodingVerificationTranscript {
+                format_version: 1,
+                plan,
+                manifest,
+                challenge_commitment,
+                staged_receipts: receipts,
+                challenge_reveal: reveal,
+                openings,
+            },
+            node.keys(),
+        )
+        .unwrap();
+        node.activate_coding_attempt(&transcript).unwrap();
+        assert_eq!(
+            node.variable_parity_for_guild(&[181; 32], &transcript.value.plan.value.group.id, 4)
+                .unwrap(),
+            local_object
+        );
+        assert!(
+            node.discard_coding_attempt(&transcript.value.plan.value.attempt_id)
+                .unwrap()
+        );
+        assert!(
+            node.variable_parity_for_guild(&[181; 32], &transcript.value.plan.value.group.id, 4)
+                .is_ok()
+        );
     }
 
     #[test]

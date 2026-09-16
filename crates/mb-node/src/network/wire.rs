@@ -1,8 +1,10 @@
 use mb_core::{
-    CodingGroup, EndpointRecord, GuildGenesis, GuildInvite, Member, MemberSignature, NodeId,
-    QuorumGuildGenesis, SectorId, SectorRef, SignedRecord, StorageAcknowledgement,
+    CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal, CodingGroup,
+    CodingRootManifest, CodingShardOpening, CodingVerificationTranscript, EndpointRecord,
+    GuildGenesis, GuildInvite, Member, MemberSignature, NodeId, QuorumGuildGenesis, SectorId,
+    SectorRef, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
 };
-use mb_store::ParityObject;
+use mb_store::{ParityObject, VariableParityObject};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -76,6 +78,30 @@ pub(super) enum PeerRequest {
         group: Box<CodingGroup>,
         information: [Vec<u8>; 3],
         object: ParityObject,
+    },
+    StageCodingParity {
+        plan: Box<SignedRecord<CodingAttemptPlan>>,
+        object: VariableParityObject,
+    },
+    CommitCodingChallenge {
+        plan: Box<SignedRecord<CodingAttemptPlan>>,
+    },
+    RevealCodingChallenge {
+        plan: Box<SignedRecord<CodingAttemptPlan>>,
+        manifest: Box<SignedRecord<CodingRootManifest>>,
+        receipts: Vec<SignedRecord<StagedStorageReceipt>>,
+    },
+    GetCodingOpening {
+        plan: Box<SignedRecord<CodingAttemptPlan>>,
+        challenge: [u8; 32],
+        shard_index: u16,
+    },
+    ActivateCodingParity {
+        transcript: Box<SignedRecord<CodingVerificationTranscript>>,
+    },
+    AbortCodingAttempt {
+        guild_id: [u8; 32],
+        attempt_id: [u8; 16],
     },
     GetParity {
         guild_id: [u8; 32],
@@ -188,6 +214,12 @@ impl PeerRequest {
             Self::PrepareSource { .. } => Some("prepare-source"),
             Self::EnsureFiller { .. } => Some("ensure-filler"),
             Self::PublishParity { .. } => Some("publish-parity"),
+            Self::StageCodingParity { .. } => Some("stage-coding-parity"),
+            Self::CommitCodingChallenge { .. } => Some("commit-coding-challenge"),
+            Self::RevealCodingChallenge { .. } => Some("reveal-coding-challenge"),
+            Self::GetCodingOpening { .. } => Some("get-coding-opening"),
+            Self::ActivateCodingParity { .. } => Some("activate-coding-parity"),
+            Self::AbortCodingAttempt { .. } => Some("abort-coding-attempt"),
             Self::StoreRepairShard { .. } => Some("store-repair-shard"),
             Self::PutCheckpointPage { .. } => Some("put-checkpoint-page"),
             Self::SignCheckpoint { .. } => Some("sign-checkpoint"),
@@ -220,6 +252,7 @@ impl PeerRequest {
             | Self::FinalizeCheckpoint { guild_id, .. }
             | Self::GetCheckpointPage { guild_id, .. }
             | Self::BackupStatus { guild_id, .. } => Some(*guild_id),
+            Self::AbortCodingAttempt { guild_id, .. } => Some(*guild_id),
             Self::ExchangeEndpoints { guild_id } => Some(*guild_id),
             #[cfg(test)]
             Self::PrepareSource { guild_id, .. }
@@ -228,6 +261,13 @@ impl PeerRequest {
             | Self::AuthorizeRecoveryPublisher { guild_id, .. } => Some(*guild_id),
             Self::GetGuildGenesis { guild_id } => Some(*guild_id),
             Self::PublishParity { object, .. } => Some(object.guild_id),
+            Self::StageCodingParity { plan, .. }
+            | Self::GetCodingOpening { plan, .. }
+            | Self::CommitCodingChallenge { plan }
+            | Self::RevealCodingChallenge { plan, .. } => Some(plan.value.group.guild_id),
+            Self::ActivateCodingParity { transcript } => {
+                Some(transcript.value.plan.value.group.guild_id)
+            }
         }
     }
 }
@@ -271,6 +311,10 @@ pub(super) enum PeerResponse {
     GuildGenesisSignature(MemberSignature),
     BackupJob(BackupJob),
     StorageAcknowledgement(SignedRecord<StorageAcknowledgement>),
+    StagedStorageReceipt(SignedRecord<StagedStorageReceipt>),
+    CodingChallengeCommitment(SignedRecord<CodingChallengeCommitment>),
+    CodingChallengeReveal(SignedRecord<CodingChallengeReveal>),
+    CodingShardOpening(SignedRecord<CodingShardOpening>),
     GuildGenesis(Box<QuorumGuildGenesis>),
     EndpointRecords(Vec<SignedRecord<EndpointRecord>>),
     CheckpointPage {

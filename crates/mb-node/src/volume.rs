@@ -7,9 +7,13 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use mb_core::{
-    KeyMaterial, NodeId, SignedRecord, WrappedDatabaseKey, canonical_bytes, decode_canonical,
+    KeyMaterial, MerkleCommitment, MerkleRangeProof, NodeId, SignedRecord, WrappedDatabaseKey,
+    canonical_bytes, decode_canonical,
 };
-use mb_store::{ControlStore, DatabaseError, DatabaseShellResult, ParityObject, ParityStore};
+use mb_store::{
+    ControlStore, DatabaseError, DatabaseShellResult, ParityObject, ParityStore,
+    VariableParityObject,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -159,6 +163,13 @@ pub(crate) struct VolumeReceipt {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct VolumeWriteIntent {
     format_version: u16,
+    receipt: VolumeReceipt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct AttemptVolumeRecord {
+    format_version: u16,
+    attempt_id: [u8; 16],
     receipt: VolumeReceipt,
 }
 
@@ -656,6 +667,245 @@ impl StorageVolumes {
         acknowledgement: &[u8],
     ) -> Result<VolumeReceipt> {
         self.store_with_headroom(control, object, acknowledgement, true)
+    }
+
+    pub(crate) fn stage_attempt(
+        &mut self,
+        control: &ControlStore,
+        attempt_id: &[u8; 16],
+        object: &VariableParityObject,
+        staged_receipt: &[u8],
+    ) -> Result<VolumeReceipt> {
+        let shard_index = u8::try_from(object.shard_index)
+            .context("variable parity shard index exceeds the volume receipt format")?;
+        let record_id = attempt_volume_object_id(attempt_id, &object.group_id, shard_index);
+        let existing = control
+            .get_record("volume-attempt-receipt", &record_id)?
+            .or(control.get_record("volume-attempt-intent", &record_id)?)
+            .map(|bytes| decode_canonical::<AttemptVolumeRecord>(&bytes))
+            .transpose()?;
+        let receipt = if let Some(existing) = existing {
+            validate_attempt_volume_record(&existing)?;
+            if existing.attempt_id != *attempt_id
+                || existing.receipt.guild_id != object.guild_id
+                || existing.receipt.group_id != object.group_id
+                || existing.receipt.shard_index != shard_index
+                || existing.receipt.root != object.commitment.root
+            {
+                bail!("staged parity volume record conflicts with the requested object");
+            }
+            existing.receipt
+        } else {
+            let required = object.bytes.len() as u64;
+            let required_physical =
+                physical_write_reservation(object.bytes.len(), staged_receipt.len());
+            let selected = self
+                .volumes
+                .iter()
+                .filter_map(|(id, volume)| {
+                    if volume.record.state != StorageVolumeState::Online {
+                        return None;
+                    }
+                    let store = volume.store.as_ref()?;
+                    let used = store.used_bytes().ok()?;
+                    let writable = volume
+                        .record
+                        .budget_bytes
+                        .saturating_sub(volume.record.headroom_bytes);
+                    let available = fs2::available_space(&volume.record.path).ok()?;
+                    let physical = required_physical
+                        .saturating_add(shared_checkpoint_reservation(control, store).ok()?);
+                    (used.saturating_add(required) <= writable
+                        && physical <= available.saturating_sub(volume.record.headroom_bytes))
+                    .then_some((*id, used))
+                })
+                .min_by_key(|(id, used)| (*used, *id))
+                .map(|(id, _)| id)
+                .ok_or(DatabaseError::CapacityExceeded)?;
+            let receipt = VolumeReceipt {
+                format_version: 2,
+                volume_id: selected,
+                guild_id: object.guild_id,
+                group_id: object.group_id,
+                shard_index,
+                root: object.commitment.root,
+            };
+            let intent = AttemptVolumeRecord {
+                format_version: 1,
+                attempt_id: *attempt_id,
+                receipt: receipt.clone(),
+            };
+            control.put_record(
+                "volume-attempt-intent",
+                &record_id,
+                &canonical_bytes(&intent)?,
+            )?;
+            receipt
+        };
+        let volume = self
+            .volumes
+            .get_mut(&receipt.volume_id)
+            .context("staged parity volume is no longer configured")?;
+        let store = volume
+            .store
+            .as_mut()
+            .context("staged parity volume is offline")?;
+        store.stage_attempt(
+            attempt_id,
+            object,
+            staged_receipt,
+            volume.record.budget_bytes,
+        )?;
+        let durable = AttemptVolumeRecord {
+            format_version: 1,
+            attempt_id: *attempt_id,
+            receipt: receipt.clone(),
+        };
+        control.put_record(
+            "volume-attempt-receipt",
+            &record_id,
+            &canonical_bytes(&durable)?,
+        )?;
+        control.delete_record("volume-attempt-intent", &record_id)?;
+        Ok(receipt)
+    }
+
+    pub(crate) fn open_attempt_range(
+        &self,
+        control: &ControlStore,
+        attempt_id: &[u8; 16],
+        group_id: &[u8; 32],
+        shard_index: u16,
+        start_leaf: u32,
+        leaf_count: u32,
+    ) -> Result<MerkleRangeProof> {
+        let shard = u8::try_from(shard_index).context("variable parity shard index is invalid")?;
+        let record_id = attempt_volume_object_id(attempt_id, group_id, shard);
+        let bytes = control
+            .get_record("volume-attempt-receipt", &record_id)?
+            .or(control.get_record("volume-attempt-intent", &record_id)?)
+            .context("staged parity volume receipt is unavailable")?;
+        let record: AttemptVolumeRecord = decode_canonical(&bytes)?;
+        validate_attempt_volume_record(&record)?;
+        let store = self
+            .volumes
+            .get(&record.receipt.volume_id)
+            .and_then(|volume| volume.store.as_ref())
+            .context("staged parity volume is offline")?;
+        store
+            .open_attempt_range(attempt_id, group_id, shard_index, start_leaf, leaf_count)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn activate_attempt_object(
+        &mut self,
+        control: &ControlStore,
+        attempt_id: &[u8; 16],
+        group_id: &[u8; 32],
+        shard_index: u16,
+        commitment: &MerkleCommitment,
+        verification_hash: &[u8; 32],
+    ) -> Result<VolumeReceipt> {
+        let shard = u8::try_from(shard_index).context("variable parity shard index is invalid")?;
+        let record_id = attempt_volume_object_id(attempt_id, group_id, shard);
+        let bytes = control
+            .get_record("volume-attempt-receipt", &record_id)?
+            .or(control.get_record("volume-attempt-intent", &record_id)?)
+            .context("staged parity volume receipt is unavailable")?;
+        let record: AttemptVolumeRecord = decode_canonical(&bytes)?;
+        validate_attempt_volume_record(&record)?;
+        if record.attempt_id != *attempt_id
+            || record.receipt.group_id != *group_id
+            || record.receipt.shard_index != shard
+            || record.receipt.root != commitment.root
+        {
+            bail!("staged parity activation conflicts with its volume receipt");
+        }
+        let store = self
+            .volumes
+            .get_mut(&record.receipt.volume_id)
+            .and_then(|volume| volume.store.as_mut())
+            .context("staged parity volume is offline")?;
+        store.activate_attempt_object(
+            attempt_id,
+            group_id,
+            shard_index,
+            commitment,
+            verification_hash,
+        )?;
+        let active_id = volume_object_id(group_id, shard);
+        if let Some(existing) = control.get_record("volume-receipt", &active_id)? {
+            let existing: VolumeReceipt = decode_canonical(&existing)?;
+            if existing != record.receipt {
+                bail!("active parity volume receipt conflicts with attempt activation");
+            }
+        } else {
+            control.put_record(
+                "volume-receipt",
+                &active_id,
+                &canonical_bytes(&record.receipt)?,
+            )?;
+        }
+        control.delete_record("volume-attempt-receipt", &record_id)?;
+        control.delete_record("volume-attempt-intent", &record_id)?;
+        Ok(record.receipt)
+    }
+
+    pub(crate) fn discard_attempt(
+        &mut self,
+        control: &ControlStore,
+        attempt_id: &[u8; 16],
+    ) -> Result<bool> {
+        let mut required_volumes = BTreeSet::new();
+        for kind in ["volume-attempt-intent", "volume-attempt-receipt"] {
+            for (record_id, bytes) in control.records(kind)? {
+                let record: AttemptVolumeRecord = decode_canonical(&bytes)?;
+                validate_attempt_volume_record(&record)?;
+                if record.attempt_id == *attempt_id {
+                    required_volumes.insert(record.receipt.volume_id);
+                    if self
+                        .volumes
+                        .get(&record.receipt.volume_id)
+                        .and_then(|volume| volume.store.as_ref())
+                        .is_some()
+                    {
+                        control.delete_record(kind, &record_id)?;
+                    }
+                }
+            }
+        }
+        let mut complete = true;
+        for (volume_id, volume) in &mut self.volumes {
+            let Some(store) = volume.store.as_mut() else {
+                if required_volumes.contains(volume_id) {
+                    complete = false;
+                }
+                continue;
+            };
+            store.discard_staged_attempt(attempt_id)?;
+        }
+        Ok(complete)
+    }
+
+    pub(crate) fn load_ready_variable(
+        &self,
+        control: &ControlStore,
+        group_id: &[u8; 32],
+        shard_index: u16,
+    ) -> Result<VariableParityObject> {
+        let shard = u8::try_from(shard_index).context("variable parity shard index is invalid")?;
+        let receipt = self
+            .receipt(control, group_id, shard)?
+            .context("variable parity volume receipt is unavailable")?;
+        if receipt.format_version != 2 {
+            bail!("parity volume receipt is not a variable-profile object");
+        }
+        self.volumes
+            .get(&receipt.volume_id)
+            .and_then(|volume| volume.store.as_ref())
+            .context("variable parity volume is offline")?
+            .load_ready_variable(group_id, shard_index)
+            .map_err(Into::into)
     }
 
     pub(crate) fn store_repair(
@@ -1353,14 +1603,29 @@ fn validate_volume_record(record: &VolumeRecord) -> Result<()> {
 }
 
 fn validate_receipt(receipt: &VolumeReceipt) -> Result<()> {
-    if receipt.format_version != 1
+    if !matches!(receipt.format_version, 1 | 2)
         || receipt.volume_id.is_nil()
         || receipt.guild_id == [0; 32]
         || receipt.group_id == [0; 32]
-        || receipt.shard_index > 4
+        || match receipt.format_version {
+            1 => receipt.shard_index > 4,
+            2 => receipt.shard_index >= mb_core::MAX_CODING_SHARDS as u8,
+            _ => true,
+        }
         || receipt.root == [0; 32]
     {
         bail!("invalid parity volume receipt");
+    }
+    Ok(())
+}
+
+fn validate_attempt_volume_record(record: &AttemptVolumeRecord) -> Result<()> {
+    validate_receipt(&record.receipt)?;
+    if record.format_version != 1
+        || record.attempt_id == [0; 16]
+        || record.receipt.format_version != 2
+    {
+        bail!("invalid staged parity volume record");
     }
     Ok(())
 }
@@ -1397,6 +1662,18 @@ fn store_volume_records(control: &ControlStore, records: &[VolumeRecord]) -> Res
 
 fn volume_object_id(group_id: &[u8; 32], shard_index: u8) -> Vec<u8> {
     let mut id = Vec::with_capacity(33);
+    id.extend_from_slice(group_id);
+    id.push(shard_index);
+    id
+}
+
+fn attempt_volume_object_id(
+    attempt_id: &[u8; 16],
+    group_id: &[u8; 32],
+    shard_index: u8,
+) -> Vec<u8> {
+    let mut id = Vec::with_capacity(49);
+    id.extend_from_slice(attempt_id);
     id.extend_from_slice(group_id);
     id.push(shard_index);
     id

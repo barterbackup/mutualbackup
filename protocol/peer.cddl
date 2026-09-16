@@ -50,6 +50,20 @@ peer-request =
         information: [3*3 byte-vector],
         object: parity-object
       } }
+  / { "StageCodingParity": { plan: signed-coding-attempt-plan, object: variable-parity-object } }
+  / { "CommitCodingChallenge": { plan: signed-coding-attempt-plan } }
+  / { "RevealCodingChallenge": {
+        plan: signed-coding-attempt-plan,
+        manifest: signed-coding-root-manifest,
+        receipts: [* signed-staged-storage-receipt]
+      } }
+  / { "GetCodingOpening": {
+        plan: signed-coding-attempt-plan,
+        challenge: bytes32-array,
+        shard_index: uint
+      } }
+  / { "ActivateCodingParity": { transcript: signed-coding-transcript } }
+  / { "AbortCodingAttempt": { guild_id: bytes32-array, attempt_id: bytes16-array } }
   / { "GetParity": { guild_id: bytes32-array, group_id: bytes32-array, shard_index: uint8 } }
   / { "StoreRepairShard": {
         repair_id: bytes16-array,
@@ -82,6 +96,10 @@ peer-response =
   / { "GuildGenesisSignature": member-signature }
   / { "BackupJob": backup-job }
   / { "StorageAcknowledgement": signed-storage-ack }
+  / { "StagedStorageReceipt": signed-staged-storage-receipt }
+  / { "CodingChallengeCommitment": signed-coding-challenge-commitment }
+  / { "CodingChallengeReveal": signed-coding-challenge-reveal }
+  / { "CodingShardOpening": signed-coding-shard-opening }
   / { "GuildGenesis": quorum-guild-genesis }
   / { "EndpointRecords": [* signed-endpoint-record] }
   / { "CheckpointPage": { total_pages: uint, page_hash: bytes32-array, bytes: byte-vector } }
@@ -182,6 +200,17 @@ signed-storage-ack = {
   value: storage-ack,
   signature: bytes64-array
 }
+
+; Milestone-5 objects use canonical serde CBOR on this transport. Their exact
+; signed postcard/canonical models and replay validation live in mb-core.
+signed-coding-attempt-plan = any
+variable-parity-object = any
+signed-coding-transcript = any
+signed-coding-root-manifest = any
+signed-staged-storage-receipt = any
+signed-coding-challenge-commitment = any
+signed-coding-challenge-reveal = any
+signed-coding-shard-opening = any
 
 endpoint-record = {
   format_version: 1,
