@@ -736,8 +736,13 @@ across owner/root updates. Peer protocol 2 obtains fresh signed observations
 from each candidate for every real information and parity participant; coding
 selection minimizes the complete bulk-lane path cost, saves a transfer for a
 participating candidate, and keeps relay and Tor fallbacks eligible. The full
-node suite and warning-free all-target node Clippy pass for this change. A fresh
-provisioned production gate must still close before Milestone 5 can pass.
+node suite and warning-free all-target node Clippy pass for this change. The
+first fresh production-gate run then found that the plan-selected coder was
+still denied its plan-scoped information-range reads by the static coordinator
+authorization fallback, causing an unbounded sequence of otherwise durable
+retries. Those reads now admit only the active guild member named as coding
+coordinator by the signed attempt plan, matching its parity-write authority. A
+fresh provisioned production gate must still close before Milestone 5 can pass.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer

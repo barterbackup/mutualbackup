@@ -736,27 +736,10 @@ fn process_peer_request(
         ) && request
             .guild_scope()
             .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
-        let delegated_coding = match &request {
-            PeerRequest::StageCodingParity { plan, .. }
-            | PeerRequest::ReserveCodingParity { plan, .. }
-            | PeerRequest::UploadCodingParityRange { plan, .. }
-            | PeerRequest::FinalizeCodingParity { plan, .. } => {
-                caller == plan.value.coding_coordinator
-            }
-            PeerRequest::DelegateCodingAttempt { plan } => caller == plan.value.delegator,
-            PeerRequest::CommitCodingChallenge { plan }
-            | PeerRequest::RevealCodingChallenge { plan, .. }
-            | PeerRequest::GetCodingOpening { plan, .. } => {
-                caller == plan.value.coding_coordinator
-                    || caller == plan.value.verification_coordinator
-            }
-            PeerRequest::FinalizeCodingVerification { transcript } => {
-                caller == transcript.plan.value.coding_coordinator
-            }
-            _ => false,
-        } && request
-            .guild_scope()
-            .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
+        let delegated_coding = has_delegated_coding_role(&request, caller)
+            && request
+                .guild_scope()
+                .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
         let historical_coding = match &request {
             PeerRequest::SubmitCodingTranscript { transcript } => {
                 caller == transcript.value.plan.value.coding_coordinator
@@ -840,6 +823,28 @@ fn process_peer_request(
         },
         service.reader_config.keys(),
     )?)
+}
+
+fn has_delegated_coding_role(request: &PeerRequest, caller: NodeId) -> bool {
+    match request {
+        PeerRequest::StageCodingParity { plan, .. }
+        | PeerRequest::ReserveCodingParity { plan, .. }
+        | PeerRequest::UploadCodingParityRange { plan, .. }
+        | PeerRequest::FinalizeCodingParity { plan, .. }
+        | PeerRequest::GetCodingInformationRange { plan, .. } => {
+            caller == plan.value.coding_coordinator
+        }
+        PeerRequest::DelegateCodingAttempt { plan } => caller == plan.value.delegator,
+        PeerRequest::CommitCodingChallenge { plan }
+        | PeerRequest::RevealCodingChallenge { plan, .. }
+        | PeerRequest::GetCodingOpening { plan, .. } => {
+            caller == plan.value.coding_coordinator || caller == plan.value.verification_coordinator
+        }
+        PeerRequest::FinalizeCodingVerification { transcript } => {
+            caller == transcript.plan.value.coding_coordinator
+        }
+        _ => false,
+    }
 }
 
 fn peer_error_response(
@@ -2892,6 +2897,46 @@ mod tests {
         stale.issued_at_unix_seconds = 1;
         stale.expires_at_unix_seconds = 2;
         assert!(validate_request_envelope(&stale, caller.node_id(), recipient).is_err());
+    }
+
+    #[test]
+    fn signed_plan_coder_is_authorized_to_fetch_information_ranges() {
+        let delegator = KeyMaterial::from_seed(&Seed::from_bytes([84; 32]));
+        let coder = KeyMaterial::from_seed(&Seed::from_bytes([85; 32])).node_id();
+        let verifier = KeyMaterial::from_seed(&Seed::from_bytes([86; 32])).node_id();
+        let plan = SignedRecord::sign(
+            b"mutualbackup/test-coding-plan/v1",
+            mb_core::CodingAttemptPlan {
+                format_version: 1,
+                attempt_id: [87; 16],
+                checkpoint_hash: [88; 32],
+                membership_epoch: 1,
+                geometry: mb_core::CodingPlanGeometry {
+                    format_version: 1,
+                    guild_id: [89; 32],
+                    profile: mb_core::CodingProfile::new(3, 2, 64),
+                    information: Vec::new(),
+                    parity: Vec::new(),
+                },
+                delegator: delegator.node_id(),
+                coding_coordinator: coder,
+                verification_coordinator: verifier,
+                expires_at_unix_seconds: u64::MAX,
+                information_roots: None,
+            },
+            &delegator,
+        )
+        .unwrap();
+        let request = PeerRequest::GetCodingInformationRange {
+            plan: Box::new(plan),
+            shard_index: 0,
+            start_leaf: 0,
+            leaf_count: 1,
+        };
+
+        assert!(has_delegated_coding_role(&request, coder));
+        assert!(!has_delegated_coding_role(&request, verifier));
+        assert!(!has_delegated_coding_role(&request, delegator.node_id()));
     }
 
     #[test]

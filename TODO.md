@@ -614,12 +614,21 @@ node Clippy gate passed locally. No remote compilation server was used.
   available paths. The separate verifier still uses ordinary reachability and
   does not need a complete bulk-path report. Schema, snapshot, ranking, node
   library, and warning-free all-target node Clippy checks pass locally.
-- [ ] **M5-04 / gate — Run the corrected production gate.**
+- [x] **M5-04 / P1 — Authorize delegated coders to fetch their signed inputs.**
+  The first corrected production-gate run found that an ephemeral coding
+  coordinator could stage parity but `GetCodingInformationRange` still fell
+  through to the static guild-coordinator check. The first cross-user backup
+  therefore accumulated retries whenever ranking selected another member.
+  Treat the plan-scoped range request like the other delegated coder operations:
+  only the signed plan's coding coordinator may issue it, and that caller must
+  still be an active guild member.
+- [ ] **M5-05 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
-  assertion, now corrected to version 7, but the provisioned Btrfs production
-  path has not been rerun for the reopened work. Run formatting, locked
+  assertion, now corrected to version 7. Its first rerun exposed and stopped on
+  M5-04 before completing, so the provisioned Btrfs production path has not yet
+  passed for the reopened work. Run formatting, locked
   all-target workspace tests, warning-free locked all-target Clippy, and the
-  local reflink/network acceptance gate after M5-01 through M5-03 close.
+  local reflink/network acceptance gate after M5-01 through M5-04 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
