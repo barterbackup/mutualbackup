@@ -741,8 +741,14 @@ first fresh production-gate run then found that the plan-selected coder was
 still denied its plan-scoped information-range reads by the static coordinator
 authorization fallback, causing an unbounded sequence of otherwise durable
 retries. Those reads now admit only the active guild member named as coding
-coordinator by the signed attempt plan, matching its parity-write authority. A
-fresh provisioned production gate must still close before Milestone 5 can pass.
+coordinator by the signed attempt plan, matching its parity-write authority.
+The next gate completed all four checkpoints and then showed that stable slots
+alone did not ensure incremental cross-user sectors: an initial owner could
+consume every slot before another owner arrived. Single-owner sectors now keep
+one deterministic vacancy, later owners fill those vacancies first, and mixed
+sectors remain densely packed. This preserves old source positions while making
+incremental cross-user packing attainable. A fresh provisioned production gate
+must still close before Milestone 5 can pass.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer

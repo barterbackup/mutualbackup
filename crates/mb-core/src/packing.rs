@@ -227,6 +227,170 @@ pub struct PackingResult {
     pub metrics: PackingMetrics,
 }
 
+#[derive(Default)]
+struct PackingSectorState {
+    owners: std::collections::BTreeSet<NodeId>,
+    free: std::collections::BTreeSet<usize>,
+}
+
+struct StableSlotAllocator {
+    slots_per_sector: usize,
+    assignments: Vec<Option<SourceChunkId>>,
+    sectors: Vec<PackingSectorState>,
+    mixed: std::collections::BTreeSet<usize>,
+    single: std::collections::BTreeMap<NodeId, std::collections::BTreeSet<usize>>,
+    single_fillable: std::collections::BTreeMap<NodeId, std::collections::BTreeSet<usize>>,
+    empty: std::collections::BTreeSet<usize>,
+}
+
+impl StableSlotAllocator {
+    fn new(assignments: Vec<Option<SourceChunkId>>, slots_per_sector: usize) -> Self {
+        let mut allocator = Self {
+            slots_per_sector,
+            assignments,
+            sectors: Vec::new(),
+            mixed: std::collections::BTreeSet::new(),
+            single: std::collections::BTreeMap::new(),
+            single_fillable: std::collections::BTreeMap::new(),
+            empty: std::collections::BTreeSet::new(),
+        };
+        for sector_index in 0..allocator.assignments.len() / slots_per_sector {
+            let start = sector_index * slots_per_sector;
+            let mut state = PackingSectorState::default();
+            for (offset, assignment) in allocator.assignments[start..start + slots_per_sector]
+                .iter()
+                .enumerate()
+            {
+                if let Some(id) = assignment {
+                    state.owners.insert(id.owner);
+                } else {
+                    state.free.insert(start + offset);
+                }
+            }
+            allocator.sectors.push(state);
+            allocator.add_classification(sector_index);
+        }
+        allocator
+    }
+
+    fn insert_index(
+        map: &mut std::collections::BTreeMap<NodeId, std::collections::BTreeSet<usize>>,
+        owner: NodeId,
+        sector_index: usize,
+    ) {
+        map.entry(owner).or_default().insert(sector_index);
+    }
+
+    fn remove_index(
+        map: &mut std::collections::BTreeMap<NodeId, std::collections::BTreeSet<usize>>,
+        owner: NodeId,
+        sector_index: usize,
+    ) {
+        let remove_owner = map.get_mut(&owner).is_some_and(|sectors| {
+            sectors.remove(&sector_index);
+            sectors.is_empty()
+        });
+        if remove_owner {
+            map.remove(&owner);
+        }
+    }
+
+    fn add_classification(&mut self, sector_index: usize) {
+        let state = &self.sectors[sector_index];
+        if state.free.is_empty() {
+            return;
+        }
+        match state.owners.len() {
+            0 => {
+                self.empty.insert(sector_index);
+            }
+            1 => {
+                let owner = *state.owners.first().expect("one owner is present");
+                Self::insert_index(&mut self.single, owner, sector_index);
+                if state.free.len() > 1 {
+                    Self::insert_index(&mut self.single_fillable, owner, sector_index);
+                }
+            }
+            _ => {
+                self.mixed.insert(sector_index);
+            }
+        }
+    }
+
+    fn remove_classification(&mut self, sector_index: usize) {
+        let state = &self.sectors[sector_index];
+        if state.free.is_empty() {
+            return;
+        }
+        match state.owners.len() {
+            0 => {
+                self.empty.remove(&sector_index);
+            }
+            1 => {
+                let owner = *state.owners.first().expect("one owner is present");
+                Self::remove_index(&mut self.single, owner, sector_index);
+                if state.free.len() > 1 {
+                    Self::remove_index(&mut self.single_fillable, owner, sector_index);
+                }
+            }
+            _ => {
+                self.mixed.remove(&sector_index);
+            }
+        }
+    }
+
+    fn other_owner_sector(&self, owner: NodeId) -> Option<usize> {
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        self.single
+            .range(..owner)
+            .next()
+            .or_else(|| self.single.range((Excluded(owner), Unbounded)).next())
+            .and_then(|(_, sectors)| sectors.first().copied())
+    }
+
+    fn append_empty_sector(&mut self) -> usize {
+        let sector_index = self.sectors.len();
+        let start = self.assignments.len();
+        self.assignments.resize(start + self.slots_per_sector, None);
+        self.sectors.push(PackingSectorState {
+            owners: std::collections::BTreeSet::new(),
+            free: (start..start + self.slots_per_sector).collect(),
+        });
+        self.add_classification(sector_index);
+        sector_index
+    }
+
+    fn assign(&mut self, id: SourceChunkId) {
+        let sector_index = self
+            .mixed
+            .first()
+            .copied()
+            .or_else(|| self.other_owner_sector(id.owner))
+            .or_else(|| {
+                self.single_fillable
+                    .get(&id.owner)
+                    .and_then(|sectors| sectors.first().copied())
+            })
+            .or_else(|| self.empty.first().copied())
+            .unwrap_or_else(|| self.append_empty_sector());
+        self.remove_classification(sector_index);
+        let flat_index = self.sectors[sector_index]
+            .free
+            .first()
+            .copied()
+            .expect("classified sector has a free slot");
+        self.sectors[sector_index].free.remove(&flat_index);
+        self.sectors[sector_index].owners.insert(id.owner);
+        self.assignments[flat_index] = Some(id);
+        self.add_classification(sector_index);
+    }
+
+    fn into_assignments(self) -> Vec<Option<SourceChunkId>> {
+        self.assignments
+    }
+}
+
 impl PackingResult {
     pub fn validate(&self) -> Result<(), PackingError> {
         self.catalog.validate()?;
@@ -326,11 +490,7 @@ pub fn pack_incremental(
         pending.sort();
         pending.reverse();
     }
-    let mut free = assignments
-        .iter()
-        .enumerate()
-        .filter_map(|(index, assigned)| assigned.is_none().then_some(index))
-        .collect::<std::collections::VecDeque<_>>();
+    let mut allocator = StableSlotAllocator::new(assignments, slots_per_sector);
     loop {
         let mut progress = false;
         let owners = pending_by_owner.keys().copied().collect::<Vec<_>>();
@@ -338,17 +498,14 @@ pub fn pack_incremental(
             let Some(id) = pending_by_owner.get_mut(&owner).and_then(Vec::pop) else {
                 continue;
             };
-            let index = free.pop_front().unwrap_or_else(|| {
-                assignments.push(None);
-                assignments.len() - 1
-            });
-            assignments[index] = Some(id);
+            allocator.assign(id);
             progress = true;
         }
         if !progress {
             break;
         }
     }
+    let mut assignments = allocator.into_assignments();
     while assignments.last().is_some_and(Option::is_none) {
         assignments.pop();
     }
@@ -750,6 +907,47 @@ mod tests {
         assert_eq!(second.metrics.changed_sectors, 1);
         let first_locations = source_locations(&first.catalog);
         assert_eq!(source_locations(&second.catalog), first_locations);
+    }
+
+    #[test]
+    fn later_owner_fills_reserved_cross_user_slot_without_moving_sources() {
+        let owners = owners(2);
+        let first =
+            pack_incremental(profile(), None, vec![input(owners[0], 1, 10, vec![1; 64])]).unwrap();
+        let first_locations = source_locations(&first.catalog);
+        assert!(
+            first
+                .catalog
+                .sectors
+                .iter()
+                .any(|sector| { sector.slots.iter().any(|slot| slot.source().is_none()) })
+        );
+
+        let second = pack_incremental(
+            profile(),
+            Some(&first.catalog),
+            vec![
+                input(owners[0], 1, 10, vec![1; 64]),
+                input(owners[1], 2, 20, vec![2; 16]),
+            ],
+        )
+        .unwrap();
+        let second_locations = source_locations(&second.catalog);
+        assert!(
+            first_locations
+                .iter()
+                .all(|(source, position)| second_locations.get(source) == Some(position))
+        );
+        assert!(second.catalog.sectors.iter().any(|sector| {
+            sector
+                .slots
+                .iter()
+                .filter_map(PackedSlot::source)
+                .map(|source| source.id.owner)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                > 1
+        }));
     }
 
     #[test]
