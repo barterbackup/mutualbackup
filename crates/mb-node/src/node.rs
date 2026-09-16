@@ -5247,20 +5247,50 @@ impl Node {
             .collect::<BTreeSet<_>>();
         let live_sectors = current
             .checkpoint
-            .coding_groups
+            .revisions
             .iter()
-            .flat_map(|group| &group.roles)
-            .filter_map(|role| match role {
-                ShardRole::Information(information) => Some(information.sector.id),
-                ShardRole::Parity(_) => None,
+            .flat_map(|revision| {
+                revision
+                    .value
+                    .metadata_sectors
+                    .iter()
+                    .chain(&revision.value.data_sectors)
             })
+            .map(|reference| reference.id)
+            .chain(
+                current
+                    .checkpoint
+                    .coding_groups
+                    .iter()
+                    .flat_map(|group| &group.roles)
+                    .filter_map(|role| match role {
+                        ShardRole::Information(information) => Some(information.sector.id),
+                        ShardRole::Parity(_) => None,
+                    }),
+            )
             .collect::<BTreeSet<_>>();
-        let live_groups = current
+        let mut live_groups = current
             .checkpoint
             .coding_groups
             .iter()
             .map(|group| group.id)
             .collect::<BTreeSet<_>>();
+        let dynamic_groups = self
+            .dynamic_guild_state()?
+            .map(|state| state.coding_groups)
+            .unwrap_or_default();
+        live_groups.extend(dynamic_groups.iter().filter_map(|retained| {
+            retained
+                .group
+                .roles
+                .iter()
+                .any(|role| {
+                    matches!(role, ShardRoleV2::Information(information)
+                        if !information.sector.virtual_zero
+                            && live_sectors.contains(&information.sector.id))
+                })
+                .then_some(retained.group.id)
+        }));
 
         self.collect_mature_garbage(generation, &live_revisions, &live_sectors, &live_groups)?;
 
@@ -5351,6 +5381,76 @@ impl Node {
                 }
             }
         }
+        let previous_sectors = previous
+            .checkpoint
+            .revisions
+            .iter()
+            .flat_map(|revision| {
+                revision
+                    .value
+                    .metadata_sectors
+                    .iter()
+                    .chain(&revision.value.data_sectors)
+            })
+            .map(|reference| reference.id)
+            .collect::<BTreeSet<_>>();
+        for retained in &dynamic_groups {
+            let group = &retained.group;
+            if live_groups.contains(&group.id)
+                || !group.roles.iter().any(|role| {
+                    matches!(role, ShardRoleV2::Information(information)
+                        if !information.sector.virtual_zero
+                            && previous_sectors.contains(&information.sector.id))
+                })
+            {
+                continue;
+            }
+            for (index, role) in group.roles.iter().enumerate() {
+                match role {
+                    ShardRoleV2::Information(information)
+                        if information.owner == self.keys.node_id()
+                            && !information.sector.virtual_zero =>
+                    {
+                        self.schedule_garbage(
+                            "gc-variable-sector",
+                            &variable_emergency_id(&information.sector.id, index as u16),
+                            generation,
+                            checkpoint_hash,
+                            Some(information.sector.commitment.root),
+                        )?;
+                    }
+                    ShardRoleV2::Parity(parity) if parity.holder == self.keys.node_id() => {
+                        self.schedule_garbage(
+                            "gc-variable-parity",
+                            &variable_emergency_id(&group.id, index as u16),
+                            generation,
+                            checkpoint_hash,
+                            Some(parity.commitment.root),
+                        )?;
+                    }
+                    _ => {}
+                }
+                let emergency_id = variable_emergency_id(&group.id, index as u16);
+                if self
+                    .control
+                    .get_record("variable-emergency-shard", &emergency_id)?
+                    .is_some()
+                {
+                    self.schedule_garbage(
+                        "gc-variable-parity",
+                        &variable_emergency_id(&group.id, index as u16),
+                        generation,
+                        checkpoint_hash,
+                        Some(match role {
+                            ShardRoleV2::Information(information) => {
+                                information.sector.commitment.root
+                            }
+                            ShardRoleV2::Parity(parity) => parity.commitment.root,
+                        }),
+                    )?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -5384,7 +5484,14 @@ impl Node {
         live_sectors: &BTreeSet<SectorId>,
         live_groups: &BTreeSet<[u8; 32]>,
     ) -> Result<()> {
-        for kind in ["gc-anchor", "gc-revision", "gc-sector", "gc-parity"] {
+        for kind in [
+            "gc-anchor",
+            "gc-revision",
+            "gc-sector",
+            "gc-parity",
+            "gc-variable-sector",
+            "gc-variable-parity",
+        ] {
             for (record_id, bytes) in self.control.records(kind)? {
                 let candidate: GarbageCandidate = decode_canonical(&bytes)?;
                 if candidate.format_version != 1
@@ -5404,6 +5511,14 @@ impl Node {
                         .ok()
                         .is_some_and(|sector_id: [u8; 32]| live_sectors.contains(&sector_id)),
                     "gc-parity" => record_id
+                        .get(..32)
+                        .and_then(|id| id.try_into().ok())
+                        .is_some_and(|group_id: [u8; 32]| live_groups.contains(&group_id)),
+                    "gc-variable-sector" => record_id
+                        .get(..32)
+                        .and_then(|id| id.try_into().ok())
+                        .is_some_and(|sector_id: [u8; 32]| live_sectors.contains(&sector_id)),
+                    "gc-variable-parity" => record_id
                         .get(..32)
                         .and_then(|id| id.try_into().ok())
                         .is_some_and(|group_id: [u8; 32]| live_groups.contains(&group_id)),
@@ -5455,6 +5570,37 @@ impl Node {
                                 "emergency-shard",
                                 &parity_proof_id(&group_id, shard_index),
                             )?;
+                        }
+                        removed
+                    }
+                    "gc-variable-sector" | "gc-variable-parity" => {
+                        let storage_id: [u8; 32] = record_id
+                            .get(..32)
+                            .context("variable garbage key is truncated")?
+                            .try_into()?;
+                        let shard_index = u16::from_be_bytes(
+                            record_id
+                                .get(32..34)
+                                .context("variable garbage key is truncated")?
+                                .try_into()?,
+                        );
+                        let local_index = u8::try_from(shard_index)
+                            .context("variable garbage shard index exceeds storage format")?;
+                        let root = candidate
+                            .parity_root
+                            .context("variable garbage candidate has no root")?;
+                        let removed = self.volumes.remove_unreachable(
+                            &self.control,
+                            &storage_id,
+                            local_index,
+                            &root,
+                        )?;
+                        if removed && kind == "gc-variable-parity" {
+                            let emergency_id = variable_emergency_id(&storage_id, shard_index);
+                            self.control
+                                .delete_record("variable-emergency-shard", &emergency_id)?;
+                            self.control
+                                .delete_record("variable-repair", &emergency_id)?;
                         }
                         removed
                     }
@@ -9696,6 +9842,24 @@ mod tests {
                 4,
             )
             .is_ok()
+        );
+        node.schedule_garbage(
+            "gc-variable-parity",
+            &variable_emergency_id(&transcript.value.manifest.value.group.id, 4),
+            1,
+            checkpoint_hash,
+            Some(parity_root),
+        )
+        .unwrap();
+        node.collect_mature_garbage(2, &BTreeSet::new(), &BTreeSet::new(), &BTreeSet::new())
+            .unwrap();
+        assert!(
+            node.variable_shard_for_guild(
+                &[181; 32],
+                &transcript.value.manifest.value.group.id,
+                4,
+            )
+            .is_err()
         );
     }
 
