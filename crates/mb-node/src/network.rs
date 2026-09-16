@@ -680,7 +680,9 @@ fn process_peer_request(
             == Some(caller);
         let member_submission = matches!(
             &request,
-            PeerRequest::SubmitBackup { .. } | PeerRequest::StoreRepairShard { .. }
+            PeerRequest::SubmitBackup { .. }
+                | PeerRequest::StoreRepairShard { .. }
+                | PeerRequest::StoreVariableRepairShard { .. }
         ) && request
             .guild_scope()
             .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
@@ -908,9 +910,22 @@ fn execute_read_request(
             &group_id,
             shard_index,
         )?)),
-        PeerRequest::GetVariableShard { .. } => {
-            bail!("variable shard read was sent to a read-only worker")
-        }
+        PeerRequest::GetVariableShard {
+            guild_id,
+            group_id,
+            shard_index,
+        } => Ok(PeerResponse::Bytes(node.variable_shard_for_guild(
+            &guild_id,
+            &group_id,
+            shard_index,
+        )?)),
+        PeerRequest::GetVariableEmergencyShard {
+            guild_id,
+            group_id,
+            shard_index,
+        } => Ok(PeerResponse::Bytes(
+            node.variable_emergency_shard_for_guild(&guild_id, &group_id, shard_index)?,
+        )),
         PeerRequest::GetCheckpointPage {
             guild_id,
             checkpoint_hash,
@@ -1186,6 +1201,25 @@ fn execute_peer_request(
             node.install_repaired_shard(checkpoint_hash, group_id, shard_index, &bytes, emergency)?;
             Ok(PeerResponse::Ack)
         }
+        PeerRequest::StoreVariableRepairShard {
+            repair_id,
+            guild_id: _,
+            checkpoint_hash,
+            group_id,
+            shard_index,
+            emergency,
+            bytes,
+        } => {
+            node.install_repaired_variable_shard(
+                repair_id,
+                checkpoint_hash,
+                group_id,
+                shard_index,
+                &bytes,
+                emergency,
+            )?;
+            Ok(PeerResponse::Ack)
+        }
         PeerRequest::GetParity {
             guild_id,
             group_id,
@@ -1204,6 +1238,13 @@ fn execute_peer_request(
             &group_id,
             shard_index,
         )?)),
+        PeerRequest::GetVariableEmergencyShard {
+            guild_id,
+            group_id,
+            shard_index,
+        } => Ok(PeerResponse::Bytes(
+            node.variable_emergency_shard_for_guild(&guild_id, &group_id, shard_index)?,
+        )),
         PeerRequest::PutCheckpointPage {
             object_kind,
             guild_id,

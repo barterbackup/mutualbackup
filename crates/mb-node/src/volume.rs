@@ -1153,6 +1153,56 @@ impl StorageVolumes {
         self.store_with_headroom(control, object, &[], false)
     }
 
+    pub(crate) fn prepare_variable_repair(
+        &mut self,
+        control: &ControlStore,
+        object: &VariableParityObject,
+    ) -> Result<bool> {
+        let shard_index = u8::try_from(object.shard_index)
+            .context("variable repair shard index exceeds the volume receipt format")?;
+        let Some(receipt) = self.receipt(control, &object.group_id, shard_index)? else {
+            return Ok(false);
+        };
+        if receipt.format_version != 2
+            || receipt.guild_id != object.guild_id
+            || receipt.root != object.commitment.root
+        {
+            bail!("variable repair volume receipt conflicts with the requested object");
+        }
+        let mut reusable = false;
+        let mut failed = false;
+        let mut cleanup = true;
+        if let Some(volume) = self.volumes.get_mut(&receipt.volume_id)
+            && let Some(store) = volume.store.as_mut()
+        {
+            match store.load_ready_variable(&object.group_id, object.shard_index) {
+                Ok(existing) if existing == *object => reusable = true,
+                Ok(_) => failed = true,
+                Err(DatabaseError::NotReady) => cleanup = false,
+                Err(_) => failed = true,
+            }
+            if failed {
+                volume.record.state = StorageVolumeState::Failed;
+                volume.record.last_error =
+                    Some("variable repair found a corrupt committed object".to_owned());
+            }
+        }
+        if reusable {
+            return Ok(true);
+        }
+        if cleanup {
+            self.add_cleanup_volume(control, &object.group_id, shard_index, receipt.volume_id)?;
+        }
+        control.delete_record(
+            "volume-receipt",
+            &volume_object_id(&object.group_id, shard_index),
+        )?;
+        if failed {
+            self.persist(control)?;
+        }
+        Ok(false)
+    }
+
     fn store_with_headroom(
         &mut self,
         control: &ControlStore,

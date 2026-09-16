@@ -9,18 +9,19 @@ use mb_core::{
     CODING_ATTEMPT_PLAN_DOMAIN, CODING_CHALLENGE_COMMITMENT_DOMAIN, CODING_CHALLENGE_REVEAL_DOMAIN,
     CODING_FAILURE_REPORT_DOMAIN, CODING_ROOT_MANIFEST_DOMAIN, CODING_SHARD_OPENING_DOMAIN,
     CODING_TRANSCRIPT_DOMAIN, CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal,
-    CodingFailureReport, CodingReplayFinding, CodingRootManifest, CodingShardOpening,
-    CodingVerificationTranscript, DynamicGuildState, EndpointRecord, GuildCheckpoint, GuildEvent,
-    GuildEventTail, GuildGenesis, GuildInvite, KeyMaterial, MAX_GUILD_EVENT_TAIL, Member,
-    MemberSignature, NodeId, QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy,
-    QuorumRule, RECOVERY_LOCATOR_DOMAIN, RecoveryBundle, RecoveryLocator,
-    STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, Seed,
-    ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
-    USER_REVISION_DOMAIN, UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_PAGES,
-    V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes, challenged_leaf, coding_challenge_commitment,
-    coding_evidence_hash, decode_canonical, encode_coding_attempt, merkle_commit,
-    merkle_open_range, merkle_open_zero_range, open_recovery_record, replay_coding_transcript,
-    seal_recovery_record, sector_root, sign_guild_event, synthetic_filler_sector,
+    CodingFailureReport, CodingGroupV2, CodingReplayFinding, CodingRootManifest,
+    CodingShardOpening, CodingVerificationTranscript, DynamicGuildState, EndpointRecord,
+    GuildCheckpoint, GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, KeyMaterial,
+    MAX_GUILD_EVENT_TAIL, Member, MemberSignature, NodeId, QuorumCheckpoint, QuorumGuildEvent,
+    QuorumGuildGenesis, QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN, RecoveryBundle,
+    RecoveryLocator, STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId,
+    SectorRef, Seed, ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt,
+    StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision, V1_CATALOG_PAGE_BYTES,
+    V1_MAX_CATALOG_PAGES, V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes, challenged_leaf,
+    coding_challenge_commitment, coding_evidence_hash, decode_canonical, encode_coding_attempt,
+    merkle_commit, merkle_open_range, merkle_open_zero_range, open_recovery_record,
+    replay_coding_transcript, seal_recovery_record, sector_root, sign_guild_event,
+    synthetic_filler_sector,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
@@ -402,6 +403,25 @@ struct EmergencyShardRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct VariableEmergencyShardRecord {
+    format_version: u16,
+    checkpoint_hash: [u8; 32],
+    group_id: [u8; 32],
+    shard_index: u16,
+    commitment: mb_core::MerkleCommitment,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct VariableRepairRecord {
+    format_version: u16,
+    repair_id: [u8; 16],
+    group_id: [u8; 32],
+    shard_index: u16,
+    emergency: bool,
+    commitment: mb_core::MerkleCommitment,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct AutomaticBackupState {
     format_version: u16,
     dirty_since_unix_seconds: Option<u64>,
@@ -651,6 +671,150 @@ impl NodeReader {
             anyhow::bail!("parity object does not belong to the requested guild");
         }
         Ok(object.bytes)
+    }
+
+    pub(crate) fn variable_shard_for_guild(
+        &self,
+        guild_id: &[u8; 32],
+        group_id: &[u8; 32],
+        shard_index: u16,
+    ) -> Result<Vec<u8>> {
+        let state: DynamicGuildState = decode_canonical(
+            &self
+                .control
+                .get_record("guild-dynamic-state", b"primary")?
+                .context("node has no dynamic guild state")?,
+        )?;
+        state.validate()?;
+        if state.guild_id != *guild_id {
+            anyhow::bail!("variable coding group belongs to another guild");
+        }
+        let group = &state
+            .coding_groups
+            .iter()
+            .find(|retained| retained.group.id == *group_id)
+            .context("variable coding group is unavailable")?
+            .group;
+        let role = group
+            .roles
+            .get(usize::from(shard_index))
+            .context("variable shard index is outside its group")?;
+        let (holder, commitment, storage_group) = match role {
+            ShardRoleV2::Information(information) => {
+                if information.sector.virtual_zero {
+                    return Ok(vec![0; group.profile.shard_size as usize]);
+                }
+                (
+                    information.owner,
+                    &information.sector.commitment,
+                    information.sector.id,
+                )
+            }
+            ShardRoleV2::Parity(parity) => (parity.holder, &parity.commitment, group.id),
+        };
+        if holder != self.keys.node_id() {
+            anyhow::bail!("variable shard is assigned to another holder");
+        }
+        let bytes = match role {
+            ShardRoleV2::Information(information) => self
+                .sector_for_guild(guild_id, &information.sector.id)
+                .or_else(|_| {
+                    self.ready_variable_object(&storage_group, shard_index)
+                        .map(|object| object.bytes)
+                })?,
+            ShardRoleV2::Parity(_) => {
+                self.ready_variable_object(&storage_group, shard_index)?
+                    .bytes
+            }
+        };
+        if merkle_commit(&bytes)? != *commitment {
+            anyhow::bail!("variable shard conflicts with its committed Merkle root");
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn variable_emergency_shard_for_guild(
+        &self,
+        guild_id: &[u8; 32],
+        group_id: &[u8; 32],
+        shard_index: u16,
+    ) -> Result<Vec<u8>> {
+        let marker_id = variable_emergency_id(group_id, shard_index);
+        let marker: VariableEmergencyShardRecord = decode_canonical(
+            &self
+                .control
+                .get_record("variable-emergency-shard", &marker_id)?
+                .context("variable emergency shard is unavailable")?,
+        )?;
+        let (_, head_hash, _) = self
+            .control
+            .checkpoint_head(guild_id)?
+            .context("variable emergency shard checkpoint is unavailable")?;
+        let state: DynamicGuildState = decode_canonical(
+            &self
+                .control
+                .get_record("guild-dynamic-state", b"primary")?
+                .context("node has no dynamic guild state")?,
+        )?;
+        state.validate()?;
+        let group = &state
+            .coding_groups
+            .iter()
+            .find(|retained| retained.group.id == *group_id)
+            .context("variable coding group is unavailable")?
+            .group;
+        let commitment = match group.roles.get(usize::from(shard_index)) {
+            Some(ShardRoleV2::Information(information)) => &information.sector.commitment,
+            Some(ShardRoleV2::Parity(parity)) => &parity.commitment,
+            None => anyhow::bail!("variable emergency shard index is outside its group"),
+        };
+        if state.guild_id != *guild_id
+            || marker.format_version != 1
+            || marker.checkpoint_hash != head_hash
+            || marker.group_id != *group_id
+            || marker.shard_index != shard_index
+            || marker.commitment != *commitment
+        {
+            anyhow::bail!("variable emergency shard has invalid durable metadata");
+        }
+        let object = self.ready_variable_object(group_id, shard_index)?;
+        if object.guild_id != *guild_id || object.commitment != *commitment {
+            anyhow::bail!("variable emergency shard payload is invalid");
+        }
+        Ok(object.bytes)
+    }
+
+    fn ready_variable_object(
+        &self,
+        group_id: &[u8; 32],
+        shard_index: u16,
+    ) -> Result<VariableParityObject> {
+        let volumes = self
+            .volume_readers
+            .read()
+            .map_err(|_| anyhow::anyhow!("volume reader configuration lock was poisoned"))?;
+        let mut first_error = None;
+        for volume in volumes.iter() {
+            let store = match ParityStore::open_existing_with_key(
+                &volume.path,
+                volume.volume_id.as_bytes(),
+                &volume.database_key,
+            ) {
+                Ok(store) => store,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
+            match store.load_ready_variable(group_id, shard_index) {
+                Ok(found) => return Ok(found),
+                Err(DatabaseError::NotReady) => {}
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        Err(first_error.unwrap_or(DatabaseError::NotReady).into())
     }
 
     pub(crate) fn checkpoint_page(
@@ -4233,6 +4397,296 @@ impl Node {
         Ok(removed)
     }
 
+    pub(crate) fn install_repaired_variable_shard(
+        &mut self,
+        repair_id: [u8; 16],
+        checkpoint_hash: [u8; 32],
+        group_id: [u8; 32],
+        shard_index: u16,
+        bytes: &[u8],
+        emergency: bool,
+    ) -> Result<()> {
+        if repair_id == [0; 16] {
+            anyhow::bail!("repair operation ID must not be zero");
+        }
+        let (checkpoint, group, transcript) =
+            self.current_variable_group(checkpoint_hash, group_id)?;
+        let role = group
+            .roles
+            .get(usize::from(shard_index))
+            .context("variable repair shard index is outside its group")?;
+        let (assigned_holder, commitment) = match role {
+            ShardRoleV2::Information(information) => {
+                (information.owner, &information.sector.commitment)
+            }
+            ShardRoleV2::Parity(parity) => (parity.holder, &parity.commitment),
+        };
+        let assigned_locally = assigned_holder == self.keys.node_id();
+        if emergency == assigned_locally {
+            anyhow::bail!("variable repair role does not match the local assignment");
+        }
+        if bytes.len() != commitment.byte_len as usize || merkle_commit(bytes)? != *commitment {
+            anyhow::bail!("variable repair shard conflicts with its certified commitment");
+        }
+        if !emergency && let ShardRoleV2::Information(information) = role {
+            if information.sector.virtual_zero {
+                anyhow::bail!("virtual-zero information requires no repair payload");
+            }
+            let reference = checkpoint
+                .checkpoint
+                .revisions
+                .iter()
+                .filter(|revision| revision.value.owner == information.owner)
+                .flat_map(|revision| {
+                    revision
+                        .value
+                        .metadata_sectors
+                        .iter()
+                        .chain(&revision.value.data_sectors)
+                })
+                .find(|reference| {
+                    reference.id == information.sector.id
+                        && reference.logical_len == information.sector.logical_len
+                })
+                .context("variable information repair is not live in the checkpoint")?
+                .clone();
+            if sector_root(bytes) != reference.root {
+                anyhow::bail!("variable information repair conflicts with its signed revision");
+            }
+            return self.install_repaired_information_sector(group.guild_id, reference, bytes);
+        }
+
+        let marker_id = variable_emergency_id(&group.id, shard_index);
+        let repair_id = match self.control.get_record("variable-repair", &marker_id)? {
+            Some(bytes) => {
+                let existing: VariableRepairRecord = decode_canonical(&bytes)?;
+                if existing.format_version != 1
+                    || existing.repair_id == [0; 16]
+                    || existing.group_id != group.id
+                    || existing.shard_index != shard_index
+                    || existing.emergency != emergency
+                    || existing.commitment != *commitment
+                {
+                    anyhow::bail!("variable repair conflicts with durable in-flight work");
+                }
+                existing.repair_id
+            }
+            None => {
+                self.control.put_record(
+                    "variable-repair",
+                    &marker_id,
+                    &canonical_bytes(&VariableRepairRecord {
+                        format_version: 1,
+                        repair_id,
+                        group_id: group.id,
+                        shard_index,
+                        emergency,
+                        commitment: commitment.clone(),
+                    })?,
+                )?;
+                repair_id
+            }
+        };
+        if emergency {
+            self.control.put_record(
+                "variable-emergency-shard",
+                &marker_id,
+                &canonical_bytes(&VariableEmergencyShardRecord {
+                    format_version: 1,
+                    checkpoint_hash,
+                    group_id: group.id,
+                    shard_index,
+                    commitment: commitment.clone(),
+                })?,
+            )?;
+        }
+        let object = VariableParityObject {
+            format_version: 2,
+            guild_id: group.guild_id,
+            group_id: group.id,
+            shard_index,
+            commitment: commitment.clone(),
+            bytes: bytes.to_vec(),
+        };
+        if self
+            .volumes
+            .prepare_variable_repair(&self.control, &object)?
+        {
+            self.control.delete_record("variable-repair", &marker_id)?;
+            return Ok(());
+        }
+        self.volumes.reserve_attempt(
+            &self.control,
+            &repair_id,
+            group.guild_id,
+            shard_index,
+            commitment.byte_len,
+        )?;
+        let mut offset = 0_u32;
+        for chunk in bytes.chunks(1024 * 1024) {
+            offset = self.volumes.write_attempt_range(
+                &self.control,
+                &repair_id,
+                shard_index,
+                offset,
+                chunk,
+            )?;
+        }
+        if offset != commitment.byte_len {
+            anyhow::bail!("variable repair upload is incomplete");
+        }
+        self.volumes.finish_attempt_upload(
+            &self.control,
+            &repair_id,
+            group.id,
+            shard_index,
+            commitment,
+        )?;
+        let transcript_hash = blake3::hash(&canonical_bytes(&transcript)?);
+        self.volumes.attach_attempt_receipt(
+            &self.control,
+            &repair_id,
+            &group.id,
+            shard_index,
+            transcript_hash.as_bytes(),
+        )?;
+        self.volumes.activate_attempt_object(
+            &self.control,
+            &repair_id,
+            &group.id,
+            shard_index,
+            commitment,
+            transcript_hash.as_bytes(),
+        )?;
+        self.control.delete_record("variable-repair", &marker_id)?;
+        Ok(())
+    }
+
+    pub(crate) fn variable_emergency_shard_for_guild(
+        &self,
+        guild_id: &[u8; 32],
+        group_id: &[u8; 32],
+        shard_index: u16,
+    ) -> Result<Vec<u8>> {
+        let marker_id = variable_emergency_id(group_id, shard_index);
+        let marker: VariableEmergencyShardRecord = decode_canonical(
+            &self
+                .control
+                .get_record("variable-emergency-shard", &marker_id)?
+                .context("variable emergency shard is unavailable")?,
+        )?;
+        let current = self
+            .current_checkpoint_from_hash(marker.checkpoint_hash)?
+            .context("variable emergency shard checkpoint is no longer current")?;
+        if current.checkpoint.guild_id != *guild_id
+            || marker.format_version != 1
+            || marker.group_id != *group_id
+            || marker.shard_index != shard_index
+        {
+            anyhow::bail!("variable emergency shard has invalid durable metadata");
+        }
+        let (_, group, _) = self.current_variable_group(marker.checkpoint_hash, *group_id)?;
+        let commitment = match group.roles.get(usize::from(shard_index)) {
+            Some(ShardRoleV2::Information(information)) => &information.sector.commitment,
+            Some(ShardRoleV2::Parity(parity)) => &parity.commitment,
+            None => anyhow::bail!("variable emergency shard index is outside its group"),
+        };
+        if marker.commitment != *commitment {
+            anyhow::bail!("variable emergency shard conflicts with its certified group");
+        }
+        let object = self
+            .volumes
+            .load_ready_variable(&self.control, group_id, shard_index)?;
+        if object.guild_id != *guild_id || object.commitment != *commitment {
+            anyhow::bail!("variable emergency shard payload is invalid");
+        }
+        Ok(object.bytes)
+    }
+
+    pub(crate) fn remove_local_variable_emergency_shards(
+        &mut self,
+        checkpoint_hash: [u8; 32],
+        group: &CodingGroupV2,
+    ) -> Result<u64> {
+        let (_, active, _) = self.current_variable_group(checkpoint_hash, group.id)?;
+        if active != *group {
+            anyhow::bail!("variable emergency cleanup group is not active");
+        }
+        let mut removed = 0_u64;
+        for (record_id, bytes) in self.control.records("variable-emergency-shard")? {
+            let marker: VariableEmergencyShardRecord = decode_canonical(&bytes)?;
+            if marker.group_id != group.id {
+                continue;
+            }
+            let commitment = match group.roles.get(usize::from(marker.shard_index)) {
+                Some(ShardRoleV2::Information(information)) => &information.sector.commitment,
+                Some(ShardRoleV2::Parity(parity)) => &parity.commitment,
+                None => anyhow::bail!("variable emergency marker shard index is invalid"),
+            };
+            if marker.format_version != 1
+                || marker.checkpoint_hash != checkpoint_hash
+                || marker.commitment != *commitment
+                || record_id != variable_emergency_id(&group.id, marker.shard_index)
+            {
+                anyhow::bail!("variable emergency marker conflicts with its certified group");
+            }
+            let index = u8::try_from(marker.shard_index)
+                .context("variable emergency shard index exceeds local storage format")?;
+            if !self.volumes.remove_unreachable(
+                &self.control,
+                &group.id,
+                index,
+                &marker.commitment.root,
+            )? {
+                continue;
+            }
+            self.control
+                .delete_record("variable-emergency-shard", &record_id)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    fn current_variable_group(
+        &self,
+        checkpoint_hash: [u8; 32],
+        group_id: [u8; 32],
+    ) -> Result<(
+        QuorumCheckpoint,
+        CodingGroupV2,
+        SignedRecord<CodingVerificationTranscript>,
+    )> {
+        let checkpoint = self
+            .current_checkpoint_from_hash(checkpoint_hash)?
+            .context("variable repair checkpoint is unavailable")?;
+        let state = self
+            .dynamic_guild_state()?
+            .context("variable repair requires dynamic guild state")?;
+        let group = state
+            .coding_groups
+            .iter()
+            .find(|retained| retained.group.id == group_id)
+            .context("variable repair group is not retained")?
+            .group
+            .clone();
+        let live = checkpoint.checkpoint.revisions.iter().any(|revision| {
+            group.roles.iter().any(|role| {
+                matches!(role, ShardRoleV2::Information(information)
+                    if !information.sector.virtual_zero
+                        && information.owner == revision.value.owner
+                        && revision.value.metadata_sectors.iter()
+                            .chain(&revision.value.data_sectors)
+                            .any(|reference| reference.id == information.sector.id
+                                && reference.logical_len == information.sector.logical_len))
+            })
+        });
+        if !live {
+            anyhow::bail!("variable repair group protects no live checkpoint sector");
+        }
+        let transcript = self.coding_transcript_for_group(group.guild_id, group.id)?;
+        Ok((checkpoint, group, transcript))
+    }
+
     fn current_checkpoint_from_hash(
         &self,
         checkpoint_hash: [u8; 32],
@@ -7077,6 +7531,13 @@ fn parity_proof_id(group_id: &[u8; 32], shard_index: u8) -> [u8; 33] {
     id
 }
 
+fn variable_emergency_id(group_id: &[u8; 32], shard_index: u16) -> [u8; 34] {
+    let mut id = [0_u8; 34];
+    id[..32].copy_from_slice(group_id);
+    id[32..].copy_from_slice(&shard_index.to_be_bytes());
+    id
+}
+
 fn parity_operation_id(group_id: &[u8; 32], shard_index: u8) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new_derive_key("mutualbackup parity operation v1");
     hasher.update(group_id);
@@ -8787,7 +9248,7 @@ mod tests {
         let mut information_node =
             Node::open(information_data_dir.path(), identities[2].1.clone()).unwrap();
         information_node
-            .adopt_recovered_guild(certificate, peers)
+            .adopt_recovered_guild(certificate.clone(), peers)
             .unwrap();
         information_node
             .configure_storage_volumes(&[information_storage.path().to_path_buf()], 4096, 0)
@@ -9092,6 +9553,136 @@ mod tests {
                 4,
             )
             .unwrap(),
+            shards[4]
+        );
+
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[184; 32]);
+        let target = SectorRef {
+            id: transcript.value.plan.value.geometry.information[2]
+                .sector
+                .id,
+            root: sector_root(&shards[2]),
+            logical_len: 64,
+        };
+        let mut revision = UserRevision {
+            format_version: 2,
+            guild_id: [181; 32],
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id: Uuid::from_bytes([185; 16]),
+            owner: members[2].node_id,
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![target],
+            data_sectors: Vec::new(),
+        };
+        revision.sign_writer(&writer).unwrap();
+        let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, &keys[2]).unwrap();
+        let mut checkpoint = QuorumCheckpoint {
+            checkpoint: GuildCheckpoint {
+                format_version: 4,
+                guild_id: [181; 32],
+                genesis_hash: certificate.hash().unwrap(),
+                generation: 1,
+                parent: None,
+                members: members.clone(),
+                writer_fences: vec![mb_core::WriterFence {
+                    owner: members[2].node_id,
+                    epoch: 1,
+                    public_key: writer.verifying_key().to_bytes(),
+                }],
+                revision_tombstones: Vec::new(),
+                revisions: vec![revision],
+                coding_groups: Vec::new(),
+            },
+            signatures: Vec::new(),
+        };
+        for key in &keys {
+            checkpoint.add_signature(key).unwrap();
+        }
+        let checkpoint_hash = checkpoint.hash().unwrap();
+        node.pin_recovery_attempt(&checkpoint, Vec::new()).unwrap();
+        node.install_recovered_checkpoint(&checkpoint).unwrap();
+        let parity_root = match &transcript.value.manifest.value.group.roles[4] {
+            ShardRoleV2::Parity(parity) => parity.commitment.root,
+            ShardRoleV2::Information(_) => unreachable!(),
+        };
+        node.volumes
+            .remove_unreachable(
+                &node.control,
+                &transcript.value.manifest.value.group.id,
+                4,
+                &parity_root,
+            )
+            .unwrap();
+        assert!(
+            node.variable_shard_for_guild(
+                &[181; 32],
+                &transcript.value.manifest.value.group.id,
+                4,
+            )
+            .is_err()
+        );
+        node.install_repaired_variable_shard(
+            [186; 16],
+            checkpoint_hash,
+            transcript.value.manifest.value.group.id,
+            4,
+            &shards[4],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            node.variable_shard_for_guild(
+                &[181; 32],
+                &transcript.value.manifest.value.group.id,
+                4,
+            )
+            .unwrap(),
+            shards[4]
+        );
+        node.install_repaired_variable_shard(
+            [187; 16],
+            checkpoint_hash,
+            transcript.value.manifest.value.group.id,
+            2,
+            &shards[2],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            node.variable_emergency_shard_for_guild(
+                &[181; 32],
+                &transcript.value.manifest.value.group.id,
+                2,
+            )
+            .unwrap(),
+            shards[2]
+        );
+        assert_eq!(
+            node.remove_local_variable_emergency_shards(
+                checkpoint_hash,
+                &transcript.value.manifest.value.group,
+            )
+            .unwrap(),
+            1
+        );
+        assert!(
+            node.variable_emergency_shard_for_guild(
+                &[181; 32],
+                &transcript.value.manifest.value.group.id,
+                2,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            node.reader_config()
+                .open()
+                .unwrap()
+                .variable_shard_for_guild(&[181; 32], &transcript.value.manifest.value.group.id, 4,)
+                .unwrap(),
             shards[4]
         );
         assert!(

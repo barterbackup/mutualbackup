@@ -192,12 +192,26 @@ pub(super) enum PeerRequest {
         group_id: [u8; 32],
         shard_index: u16,
     },
+    GetVariableEmergencyShard {
+        guild_id: [u8; 32],
+        group_id: [u8; 32],
+        shard_index: u16,
+    },
     StoreRepairShard {
         repair_id: [u8; 16],
         guild_id: [u8; 32],
         checkpoint_hash: [u8; 32],
         group_id: [u8; 32],
         shard_index: u8,
+        emergency: bool,
+        bytes: Vec<u8>,
+    },
+    StoreVariableRepairShard {
+        repair_id: [u8; 16],
+        guild_id: [u8; 32],
+        checkpoint_hash: [u8; 32],
+        group_id: [u8; 32],
+        shard_index: u16,
         emergency: bool,
         bytes: Vec<u8>,
     },
@@ -271,6 +285,8 @@ impl PeerRequest {
                 | Self::GetSector { .. }
                 | Self::GetSectorRange { .. }
                 | Self::GetParity { .. }
+                | Self::GetVariableShard { .. }
+                | Self::GetVariableEmergencyShard { .. }
                 | Self::GetPreparedRevisionPage { .. }
                 | Self::GetCheckpointPage { .. }
                 | Self::BackupStatus { .. }
@@ -287,6 +303,8 @@ impl PeerRequest {
             | Self::GetSector { .. }
             | Self::GetSectorRange { .. }
             | Self::GetParity { .. }
+            | Self::GetVariableShard { .. }
+            | Self::GetVariableEmergencyShard { .. }
             | Self::GetPreparedRevisionPage { .. }
             | Self::GetCheckpointPage { .. }
             | Self::BackupStatus { .. }
@@ -325,8 +343,8 @@ impl PeerRequest {
             Self::SubmitCodingFailure { .. } => Some("submit-coding-failure"),
             Self::ActivateCodingParity { .. } => Some("activate-coding-parity"),
             Self::AbortCodingAttempt { .. } => Some("abort-coding-attempt"),
-            Self::GetVariableShard { .. } => Some("get-variable-shard"),
             Self::StoreRepairShard { .. } => Some("store-repair-shard"),
+            Self::StoreVariableRepairShard { .. } => Some("store-variable-repair-shard"),
             Self::PutCheckpointPage { .. } => Some("put-checkpoint-page"),
             Self::SignCheckpoint { .. } => Some("sign-checkpoint"),
             Self::FinalizeCheckpoint { .. } => Some("finalize-checkpoint"),
@@ -354,7 +372,9 @@ impl PeerRequest {
             | Self::GetSectorRange { guild_id, .. }
             | Self::GetParity { guild_id, .. }
             | Self::GetVariableShard { guild_id, .. }
+            | Self::GetVariableEmergencyShard { guild_id, .. }
             | Self::StoreRepairShard { guild_id, .. }
+            | Self::StoreVariableRepairShard { guild_id, .. }
             | Self::PutCheckpointPage { guild_id, .. }
             | Self::SignCheckpoint { guild_id, .. }
             | Self::FinalizeCheckpoint { guild_id, .. }

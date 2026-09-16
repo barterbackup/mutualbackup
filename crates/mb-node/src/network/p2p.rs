@@ -328,6 +328,16 @@ struct ShardRepair {
     bytes: Vec<u8>,
 }
 
+struct VariableShardRepair {
+    repair_id: [u8; 16],
+    guild_id: [u8; 32],
+    checkpoint_hash: [u8; 32],
+    group_id: [u8; 32],
+    shard_index: u16,
+    emergency: bool,
+    bytes: Vec<u8>,
+}
+
 pub struct P2pEventLoop {
     swarm: Swarm<Behaviour>,
     commands: mpsc::Receiver<Command>,
@@ -2112,6 +2122,39 @@ impl P2pClient {
         Ok(bytes)
     }
 
+    async fn variable_emergency_shard(
+        &self,
+        peer: NodeId,
+        group: &CodingGroupV2,
+        shard_index: u16,
+    ) -> Result<Vec<u8>> {
+        let role = group
+            .roles
+            .get(usize::from(shard_index))
+            .context("variable shard index is outside its group")?;
+        let commitment = match role {
+            ShardRoleV2::Information(information) => &information.sector.commitment,
+            ShardRoleV2::Parity(parity) => &parity.commitment,
+        };
+        let response = self
+            .call(
+                peer,
+                PeerRequest::GetVariableEmergencyShard {
+                    guild_id: group.guild_id,
+                    group_id: group.id,
+                    shard_index,
+                },
+            )
+            .await?;
+        let PeerResponse::Bytes(bytes) = response else {
+            bail!("peer returned the wrong variable emergency-shard response");
+        };
+        if merkle_commit(&bytes)? != *commitment {
+            bail!("peer returned a variable emergency shard with the wrong commitment");
+        }
+        Ok(bytes)
+    }
+
     async fn store_repair_shard(&self, peer: NodeId, repair: ShardRepair) -> Result<()> {
         let ShardRepair {
             repair_id,
@@ -2138,6 +2181,40 @@ impl P2pClient {
             .await?;
         if !matches!(response, PeerResponse::Ack) {
             bail!("peer returned the wrong repair-storage response");
+        }
+        Ok(())
+    }
+
+    async fn store_variable_repair_shard(
+        &self,
+        peer: NodeId,
+        repair: VariableShardRepair,
+    ) -> Result<()> {
+        let VariableShardRepair {
+            repair_id,
+            guild_id,
+            checkpoint_hash,
+            group_id,
+            shard_index,
+            emergency,
+            bytes,
+        } = repair;
+        let response = self
+            .call(
+                peer,
+                PeerRequest::StoreVariableRepairShard {
+                    repair_id,
+                    guild_id,
+                    checkpoint_hash,
+                    group_id,
+                    shard_index,
+                    emergency,
+                    bytes,
+                },
+            )
+            .await?;
+        if !matches!(response, PeerResponse::Ack) {
+            bail!("peer returned the wrong variable repair-storage response");
         }
         Ok(())
     }
@@ -7690,14 +7767,49 @@ pub async fn audit_guild(
     p2p: &P2pClient,
     repair: bool,
 ) -> Result<crate::GuildAuditReport> {
-    let (checkpoint, roster, local_id) = node_blocking(node.clone(), |node| {
+    let (checkpoint, roster, local_id, variable_groups) = node_blocking(node.clone(), |node| {
         let guild = node
             .guild_summary()?
             .context("guild audit requires an installed guild")?;
         let checkpoint = node
             .current_checkpoint(guild.guild_id)?
             .context("guild audit requires a committed checkpoint")?;
-        Ok((checkpoint, guild.peers, node.keys().node_id()))
+        let live = checkpoint
+            .checkpoint
+            .revisions
+            .iter()
+            .flat_map(|revision| {
+                revision
+                    .value
+                    .metadata_sectors
+                    .iter()
+                    .chain(&revision.value.data_sectors)
+                    .map(move |reference| {
+                        (reference.id, (revision.value.owner, reference.logical_len))
+                    })
+            })
+            .collect::<BTreeMap<_, _>>();
+        let variable_groups = node
+            .dynamic_guild_state()?
+            .context("guild audit requires dynamic guild state")?
+            .coding_groups
+            .into_iter()
+            .filter(|retained| {
+                retained.group.roles.iter().any(|role| {
+                    matches!(role, ShardRoleV2::Information(information)
+                        if !information.sector.virtual_zero
+                            && live.get(&information.sector.id)
+                                == Some(&(information.owner, information.sector.logical_len)))
+                })
+            })
+            .map(|retained| retained.group)
+            .collect::<Vec<_>>();
+        Ok((
+            checkpoint,
+            guild.peers,
+            node.keys().node_id(),
+            variable_groups,
+        ))
     })
     .await?;
     checkpoint.verify()?;
@@ -7945,9 +8057,339 @@ pub async fn audit_guild(
         };
         report.state = worse_protection_state(report.state, group_state);
     }
+    for group in variable_groups {
+        audit_variable_group(
+            node.clone(),
+            p2p,
+            &roster,
+            local_id,
+            checkpoint_hash,
+            &group,
+            repair,
+            &mut report,
+        )
+        .await?;
+    }
     let durable_report = report.clone();
     node_blocking(node, move |node| node.record_guild_audit(&durable_report)).await?;
     Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn audit_variable_group(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    roster: &[GuildPeer],
+    local_id: NodeId,
+    checkpoint_hash: [u8; 32],
+    group: &CodingGroupV2,
+    repair: bool,
+    report: &mut crate::GuildAuditReport,
+) -> Result<()> {
+    group.validate()?;
+    report.checked_groups += 1;
+    let mut shards = group
+        .roles
+        .iter()
+        .map(|role| match role {
+            ShardRoleV2::Information(information) if information.sector.virtual_zero => {
+                Some(vec![0; group.profile.shard_size as usize])
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let virtual_zero = group
+        .roles
+        .iter()
+        .map(|role| {
+            matches!(role, ShardRoleV2::Information(information) if information.sector.virtual_zero)
+        })
+        .collect::<Vec<_>>();
+    let mut assigned_available = virtual_zero.clone();
+    let mut shard_locations = vec![BTreeSet::new(); group.roles.len()];
+    let mut emergency_hosts = BTreeSet::new();
+    let mut assigned_probes = Vec::new();
+    for (index, role) in group.roles.iter().enumerate() {
+        if virtual_zero[index] {
+            continue;
+        }
+        let holder = variable_shard_holder(role);
+        let probe_node = node.clone();
+        assigned_probes.push(async move {
+            let result =
+                fetch_variable_audit_shard(probe_node, p2p, local_id, holder, group, index, false)
+                    .await;
+            (index, holder, result)
+        });
+    }
+    for (index, holder, result) in futures::future::join_all(assigned_probes).await {
+        match result {
+            Ok(bytes) => {
+                assigned_available[index] = true;
+                shard_locations[index].insert(holder);
+                shards[index] = Some(bytes);
+            }
+            Err(error) => {
+                report.assigned_shards_unavailable += 1;
+                if report.issues.len() < 256 {
+                    report.issues.push(format!(
+                        "variable group {} shard {index} unavailable from assigned holder {holder}: {error}",
+                        hex::encode(group.id)
+                    ));
+                }
+            }
+        }
+    }
+
+    if assigned_available
+        .iter()
+        .enumerate()
+        .any(|(index, available)| !available && !virtual_zero[index])
+    {
+        let mut emergency_probes = Vec::with_capacity(roster.len());
+        for alternate in roster.iter().map(|peer| peer.member.node_id) {
+            let probe_node = node.clone();
+            let virtual_zero = &virtual_zero;
+            emergency_probes.push(async move {
+                let mut results = Vec::new();
+                for (index, role) in group.roles.iter().enumerate() {
+                    if virtual_zero[index] || alternate == variable_shard_holder(role) {
+                        continue;
+                    }
+                    let result = fetch_variable_audit_shard(
+                        probe_node.clone(),
+                        p2p,
+                        local_id,
+                        alternate,
+                        group,
+                        index,
+                        true,
+                    )
+                    .await;
+                    results.push((index, alternate, result));
+                }
+                results
+            });
+        }
+        for holder_results in futures::future::join_all(emergency_probes).await {
+            for (index, alternate, candidate) in holder_results {
+                if let Ok(bytes) = candidate {
+                    shard_locations[index].insert(alternate);
+                    emergency_hosts.insert(alternate);
+                    if shards[index].is_none() {
+                        shards[index] = Some(bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    if repair {
+        for index in 0..group.roles.len() {
+            if assigned_available[index]
+                || virtual_zero[index]
+                || shards.iter().flatten().count() < usize::from(group.profile.data_shards)
+            {
+                continue;
+            }
+            let bytes = match &shards[index] {
+                Some(bytes) => bytes.clone(),
+                None => {
+                    let mut reconstructed = shards.clone();
+                    mb_core::reconstruct(group.profile, &mut reconstructed)?;
+                    reconstructed[index]
+                        .take()
+                        .context("variable audit did not reconstruct the missing shard")?
+                }
+            };
+            let commitment = variable_shard_commitment(&group.roles[index]);
+            if merkle_commit(&bytes)? != *commitment {
+                bail!("variable audit reconstruction failed its certified commitment");
+            }
+            let assigned_holder = variable_shard_holder(&group.roles[index]);
+            let repair_id = *Uuid::new_v4().as_bytes();
+            let assigned_repair = if assigned_holder == local_id {
+                let payload = bytes.clone();
+                let group_id = group.id;
+                node_blocking(node.clone(), move |node| {
+                    node.install_repaired_variable_shard(
+                        repair_id,
+                        checkpoint_hash,
+                        group_id,
+                        index as u16,
+                        &payload,
+                        false,
+                    )
+                })
+                .await
+            } else {
+                p2p.store_variable_repair_shard(
+                    assigned_holder,
+                    VariableShardRepair {
+                        repair_id,
+                        guild_id: group.guild_id,
+                        checkpoint_hash,
+                        group_id: group.id,
+                        shard_index: index as u16,
+                        emergency: false,
+                        bytes: bytes.clone(),
+                    },
+                )
+                .await
+            };
+            if assigned_repair.is_ok() {
+                assigned_available[index] = true;
+                shard_locations[index].insert(assigned_holder);
+                shards[index] = Some(bytes);
+                report.assigned_shards_repaired += 1;
+                continue;
+            }
+            let mut alternates = roster
+                .iter()
+                .map(|peer| peer.member.node_id)
+                .filter(|candidate| {
+                    *candidate != assigned_holder && !shard_locations[index].contains(candidate)
+                })
+                .collect::<Vec<_>>();
+            alternates.sort_by_key(|candidate| (emergency_hosts.contains(candidate), *candidate));
+            for alternate in alternates {
+                let emergency_id = *Uuid::new_v4().as_bytes();
+                let result = if alternate == local_id {
+                    let payload = bytes.clone();
+                    let group_id = group.id;
+                    node_blocking(node.clone(), move |node| {
+                        node.install_repaired_variable_shard(
+                            emergency_id,
+                            checkpoint_hash,
+                            group_id,
+                            index as u16,
+                            &payload,
+                            true,
+                        )
+                    })
+                    .await
+                } else {
+                    p2p.store_variable_repair_shard(
+                        alternate,
+                        VariableShardRepair {
+                            repair_id: emergency_id,
+                            guild_id: group.guild_id,
+                            checkpoint_hash,
+                            group_id: group.id,
+                            shard_index: index as u16,
+                            emergency: true,
+                            bytes: bytes.clone(),
+                        },
+                    )
+                    .await
+                };
+                if result.is_ok() {
+                    shard_locations[index].insert(alternate);
+                    emergency_hosts.insert(alternate);
+                    shards[index] = Some(bytes.clone());
+                    report.emergency_copies_created += 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    if assigned_available.iter().all(|available| *available) {
+        let group = group.clone();
+        report.emergency_copies_removed += node_blocking(node.clone(), move |node| {
+            node.remove_local_variable_emergency_shards(checkpoint_hash, &group)
+        })
+        .await?;
+    }
+    let available = shards.iter().flatten().count();
+    let available_after_host_loss =
+        minimum_variable_shards_after_single_host_loss(&shard_locations, &virtual_zero);
+    let required = usize::from(group.profile.data_shards);
+    let group_state = if assigned_available.iter().all(|available| *available) {
+        crate::ProtectionState::Healthy
+    } else if available >= required && available_after_host_loss >= required {
+        crate::ProtectionState::Degraded
+    } else if available >= required {
+        crate::ProtectionState::Emergency
+    } else {
+        crate::ProtectionState::Unrecoverable
+    };
+    if group_state == crate::ProtectionState::Emergency && report.issues.len() < 256 {
+        report.issues.push(format!(
+            "variable group {} has {available} shards but a surviving host loss leaves only {available_after_host_loss}",
+            hex::encode(group.id)
+        ));
+    }
+    report.state = worse_protection_state(report.state, group_state);
+    Ok(())
+}
+
+fn variable_shard_holder(role: &ShardRoleV2) -> NodeId {
+    match role {
+        ShardRoleV2::Information(information) => information.owner,
+        ShardRoleV2::Parity(parity) => parity.holder,
+    }
+}
+
+fn variable_shard_commitment(role: &ShardRoleV2) -> &mb_core::MerkleCommitment {
+    match role {
+        ShardRoleV2::Information(information) => &information.sector.commitment,
+        ShardRoleV2::Parity(parity) => &parity.commitment,
+    }
+}
+
+fn minimum_variable_shards_after_single_host_loss(
+    locations: &[BTreeSet<NodeId>],
+    virtual_zero: &[bool],
+) -> usize {
+    let hosts = locations
+        .iter()
+        .flat_map(|locations| locations.iter().copied())
+        .collect::<BTreeSet<_>>();
+    hosts
+        .iter()
+        .map(|failed| {
+            locations
+                .iter()
+                .zip(virtual_zero)
+                .filter(|(locations, virtual_zero)| {
+                    **virtual_zero || locations.iter().any(|holder| holder != failed)
+                })
+                .count()
+        })
+        .min()
+        .unwrap_or_else(|| virtual_zero.iter().filter(|value| **value).count())
+}
+
+async fn fetch_variable_audit_shard(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    local_id: NodeId,
+    holder: NodeId,
+    group: &CodingGroupV2,
+    index: usize,
+    emergency: bool,
+) -> Result<Vec<u8>> {
+    let bytes = if holder == local_id {
+        let group = group.clone();
+        node_blocking(node, move |node| {
+            if emergency {
+                node.variable_emergency_shard_for_guild(&group.guild_id, &group.id, index as u16)
+            } else {
+                node.variable_shard_for_guild(&group.guild_id, &group.id, index as u16)
+            }
+        })
+        .await?
+    } else if emergency {
+        p2p.variable_emergency_shard(holder, group, index as u16)
+            .await?
+    } else {
+        p2p.variable_shard(holder, group, index as u16).await?
+    };
+    if merkle_commit(&bytes)? != *variable_shard_commitment(&group.roles[index]) {
+        bail!("variable audit shard failed its certified commitment");
+    }
+    Ok(bytes)
 }
 
 fn minimum_shards_after_single_host_loss(locations: &[BTreeSet<NodeId>]) -> usize {

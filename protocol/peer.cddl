@@ -137,12 +137,26 @@ peer-request =
         group_id: bytes32-array,
         shard_index: uint
       } }
+  / { "GetVariableEmergencyShard": {
+        guild_id: bytes32-array,
+        group_id: bytes32-array,
+        shard_index: uint
+      } }
   / { "StoreRepairShard": {
         repair_id: bytes16-array,
         guild_id: bytes32-array,
         checkpoint_hash: bytes32-array,
         group_id: bytes32-array,
         shard_index: uint8,
+        emergency: bool,
+        bytes: byte-vector
+      } }
+  / { "StoreVariableRepairShard": {
+        repair_id: bytes16-array,
+        guild_id: bytes32-array,
+        checkpoint_hash: bytes32-array,
+        group_id: bytes32-array,
+        shard_index: uint,
         emergency: bool,
         bytes: byte-vector
       } }
