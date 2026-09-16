@@ -1005,6 +1005,7 @@ mod tests {
             coding_coordinator: keys[1].node_id(),
             verification_coordinator: keys[2].node_id(),
             expires_at_unix_seconds: 100,
+            information_roots: None,
         };
         state.validate_attempt(&plan, 50).unwrap();
 

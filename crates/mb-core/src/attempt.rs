@@ -1,11 +1,13 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{SeqAccess, Visitor};
+use serde::ser::SerializeTuple;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::{
     CodingError, CodingGroupV2, CodingProfile, InformationRoleV2, KeyMaterial, MerkleCommitment,
     MerkleRangeProof, ModelError, NodeId, ParityRoleV2, ShardRoleV2, SignedRecord, canonical_bytes,
     challenged_leaf, encode, merkle_commit, merkle_verify_range, merkle_zero_commitment,
-    verify_sampled_codeword,
+    sector_root, verify_sampled_codeword,
 };
 
 pub const CODING_ATTEMPT_PLAN_DOMAIN: &[u8] = b"mutualbackup/coding-attempt-plan/v1";
@@ -120,7 +122,7 @@ impl CodingPlanGeometry {
 }
 
 /// The immutable, narrow delegation for one complete coding attempt.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodingAttemptPlan {
     pub format_version: u16,
     pub attempt_id: [u8; 16],
@@ -131,13 +133,108 @@ pub struct CodingAttemptPlan {
     pub coding_coordinator: NodeId,
     pub verification_coordinator: NodeId,
     pub expires_at_unix_seconds: u64,
+    /// Flat roots from the signed user revisions, aligned with `information`.
+    /// Virtual-zero inputs use the all-zero sentinel. Version one plans omit
+    /// this field and retain their original canonical layout.
+    pub information_roots: Option<Vec<[u8; 32]>>,
+}
+
+impl Serialize for CodingAttemptPlan {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let field_count = match (self.format_version, &self.information_roots) {
+            (1, None) => 9,
+            (2, Some(_)) => 10,
+            _ => return Err(serde::ser::Error::custom("invalid coding plan version")),
+        };
+        let mut tuple = serializer.serialize_tuple(field_count)?;
+        tuple.serialize_element(&self.format_version)?;
+        tuple.serialize_element(&self.attempt_id)?;
+        tuple.serialize_element(&self.checkpoint_hash)?;
+        tuple.serialize_element(&self.membership_epoch)?;
+        tuple.serialize_element(&self.geometry)?;
+        tuple.serialize_element(&self.delegator)?;
+        tuple.serialize_element(&self.coding_coordinator)?;
+        tuple.serialize_element(&self.verification_coordinator)?;
+        tuple.serialize_element(&self.expires_at_unix_seconds)?;
+        if let Some(information_roots) = &self.information_roots {
+            tuple.serialize_element(information_roots)?;
+        }
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CodingAttemptPlan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CodingAttemptPlanVisitor;
+
+        impl<'de> Visitor<'de> for CodingAttemptPlanVisitor {
+            type Value = CodingAttemptPlan;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a versioned coding attempt plan")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let format_version = next_plan_field(&mut sequence, "format version")?;
+                let attempt_id = next_plan_field(&mut sequence, "attempt ID")?;
+                let checkpoint_hash = next_plan_field(&mut sequence, "checkpoint hash")?;
+                let membership_epoch = next_plan_field(&mut sequence, "membership epoch")?;
+                let geometry = next_plan_field(&mut sequence, "geometry")?;
+                let delegator = next_plan_field(&mut sequence, "delegator")?;
+                let coding_coordinator = next_plan_field(&mut sequence, "coding coordinator")?;
+                let verification_coordinator =
+                    next_plan_field(&mut sequence, "verification coordinator")?;
+                let expires_at_unix_seconds = next_plan_field(&mut sequence, "expiry")?;
+                let information_roots = match format_version {
+                    1 => None,
+                    2 => Some(next_plan_field(&mut sequence, "information roots")?),
+                    _ => return Err(serde::de::Error::custom("invalid coding plan version")),
+                };
+                Ok(CodingAttemptPlan {
+                    format_version,
+                    attempt_id,
+                    checkpoint_hash,
+                    membership_epoch,
+                    geometry,
+                    delegator,
+                    coding_coordinator,
+                    verification_coordinator,
+                    expires_at_unix_seconds,
+                    information_roots,
+                })
+            }
+        }
+
+        deserializer.deserialize_tuple(10, CodingAttemptPlanVisitor)
+    }
+}
+
+fn next_plan_field<'de, A, T>(sequence: &mut A, name: &'static str) -> Result<T, A::Error>
+where
+    A: SeqAccess<'de>,
+    T: Deserialize<'de>,
+{
+    sequence
+        .next_element()?
+        .ok_or_else(|| serde::de::Error::missing_field(name))
 }
 
 impl CodingAttemptPlan {
     pub fn validate(&self) -> Result<(), CodingAttemptError> {
         self.geometry.validate()?;
-        if self.format_version != 1
-            || self.attempt_id == [0; 16]
+        if !matches!(
+            (self.format_version, &self.information_roots),
+            (1, None) | (2, Some(_))
+        ) || self.attempt_id == [0; 16]
             || self.checkpoint_hash == [0; 32]
             || self.membership_epoch == 0
             || self.delegator == NodeId([0; 32])
@@ -148,7 +245,23 @@ impl CodingAttemptPlan {
         {
             return Err(CodingAttemptError::InvalidPlan);
         }
+        if let Some(roots) = &self.information_roots
+            && (roots.len() != self.geometry.information.len()
+                || roots
+                    .iter()
+                    .zip(&self.geometry.information)
+                    .any(|(root, role)| (*root == [0; 32]) != role.sector.virtual_zero))
+        {
+            return Err(CodingAttemptError::InvalidPlan);
+        }
         Ok(())
+    }
+
+    pub fn information_root(&self, shard_index: usize) -> Option<[u8; 32]> {
+        self.information_roots
+            .as_ref()
+            .and_then(|roots| roots.get(shard_index))
+            .copied()
     }
 
     pub fn hash(&self) -> Result<[u8; 32], CodingAttemptError> {
@@ -344,7 +457,13 @@ pub fn encode_coding_attempt(
     }
 
     let mut input_bytes = Vec::with_capacity(information.len());
-    for (role, bytes) in plan.geometry.information.iter().zip(information) {
+    for (index, (role, bytes)) in plan
+        .geometry
+        .information
+        .iter()
+        .zip(information)
+        .enumerate()
+    {
         let bytes = match (role.sector.virtual_zero, bytes) {
             (true, None) => vec![0_u8; plan.geometry.profile.shard_size as usize],
             (false, Some(bytes)) => bytes,
@@ -352,6 +471,9 @@ pub fn encode_coding_attempt(
         };
         if merkle_commit(&bytes).map_err(|_| CodingAttemptError::InvalidInformation)?
             != role.sector.commitment
+            || plan
+                .information_root(index)
+                .is_some_and(|root| !role.sector.virtual_zero && sector_root(&bytes) != root)
         {
             return Err(CodingAttemptError::InvalidInformation);
         }
@@ -653,6 +775,7 @@ mod tests {
             coding_coordinator: keys[7].node_id(),
             verification_coordinator: keys[8].node_id(),
             expires_at_unix_seconds: 2_000_000_000,
+            information_roots: None,
         };
         assert_eq!(
             coding_transfer_estimate(&plan).unwrap(),
@@ -672,6 +795,68 @@ mod tests {
                 bulk_bytes: 5 * 64,
             }
         );
+        #[derive(Serialize)]
+        struct LegacyCodingAttemptPlan {
+            format_version: u16,
+            attempt_id: [u8; 16],
+            checkpoint_hash: [u8; 32],
+            membership_epoch: u64,
+            geometry: CodingPlanGeometry,
+            delegator: NodeId,
+            coding_coordinator: NodeId,
+            verification_coordinator: NodeId,
+            expires_at_unix_seconds: u64,
+        }
+        let legacy_bytes = canonical_bytes(&LegacyCodingAttemptPlan {
+            format_version: plan.format_version,
+            attempt_id: plan.attempt_id,
+            checkpoint_hash: plan.checkpoint_hash,
+            membership_epoch: plan.membership_epoch,
+            geometry: plan.geometry.clone(),
+            delegator: plan.delegator,
+            coding_coordinator: plan.coding_coordinator,
+            verification_coordinator: plan.verification_coordinator,
+            expires_at_unix_seconds: plan.expires_at_unix_seconds,
+        })
+        .unwrap();
+        assert_eq!(canonical_bytes(&plan).unwrap(), legacy_bytes);
+        assert_eq!(
+            crate::decode_canonical::<CodingAttemptPlan>(&legacy_bytes).unwrap(),
+            plan
+        );
+
+        let mut rooted_plan = plan.clone();
+        rooted_plan.format_version = 2;
+        rooted_plan.information_roots =
+            Some(information.iter().map(|bytes| sector_root(bytes)).collect());
+        rooted_plan.validate().unwrap();
+        let rooted_plan =
+            SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, rooted_plan, &keys[6]).unwrap();
+        assert_eq!(
+            encode_coding_attempt(
+                &rooted_plan,
+                information.iter().cloned().map(Some).collect(),
+                &keys[7],
+            )
+            .unwrap()
+            .0
+            .value
+            .group,
+            group
+        );
+        let mut wrong_root = rooted_plan.value.clone();
+        wrong_root.information_roots.as_mut().unwrap()[0] = [99; 32];
+        let wrong_root =
+            SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, wrong_root, &keys[6]).unwrap();
+        assert!(matches!(
+            encode_coding_attempt(
+                &wrong_root,
+                information.iter().cloned().map(Some).collect(),
+                &keys[7],
+            ),
+            Err(CodingAttemptError::InvalidInformation)
+        ));
+
         let plan_hash = plan.hash().unwrap();
         let plan = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, &keys[6]).unwrap();
         let (manifest, parity) =

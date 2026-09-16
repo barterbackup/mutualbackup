@@ -4055,7 +4055,7 @@ impl Node {
         let plan = SignedRecord::sign(
             CODING_ATTEMPT_PLAN_DOMAIN,
             CodingAttemptPlan {
-                format_version: 1,
+                format_version: prior.format_version,
                 attempt_id,
                 checkpoint_hash: prior.checkpoint_hash,
                 membership_epoch: state.membership_epoch,
@@ -4064,6 +4064,7 @@ impl Node {
                 coding_coordinator,
                 verification_coordinator,
                 expires_at_unix_seconds,
+                information_roots: prior.information_roots.clone(),
             },
             &self.keys,
         )?;
@@ -5003,7 +5004,7 @@ impl Node {
         Ok(checkpoint.member_signature(&self.keys)?)
     }
 
-    fn validate_variable_checkpoint_coverage(
+    pub(crate) fn validate_variable_checkpoint_coverage(
         &self,
         checkpoint: &GuildCheckpoint,
         recovered_head: bool,
@@ -5069,17 +5070,22 @@ impl Node {
                 if legacy_coverage.contains(&reference.id) {
                     continue;
                 }
-                let retained = state.coding_groups.iter().filter(|retained| {
-                    retained.group.roles.iter().any(|role| {
-                        matches!(role, ShardRoleV2::Information(information)
-                                if !information.sector.virtual_zero
-                                    && information.owner == revision.value.owner
-                                    && information.sector.id == reference.id
-                                    && information.sector.logical_len == reference.logical_len)
-                    })
+                let retained = state.coding_groups.iter().filter_map(|retained| {
+                    retained
+                        .group
+                        .roles
+                        .iter()
+                        .position(|role| {
+                            matches!(role, ShardRoleV2::Information(information)
+                                    if !information.sector.virtual_zero
+                                        && information.owner == revision.value.owner
+                                        && information.sector.id == reference.id
+                                        && information.sector.logical_len == reference.logical_len)
+                        })
+                        .map(|index| (retained, index))
                 });
                 let mut covered = false;
-                for retained in retained {
+                for (retained, information_index) in retained {
                     let Some(bytes) = self
                         .control
                         .get_record("coding-group-transcript", &retained.group.id)?
@@ -5092,7 +5098,13 @@ impl Node {
                         && replay_coding_transcript(&transcript)? == CodingReplayFinding::Verified
                         && (recovered_head
                             || retained_revision
-                            || transcript.value.plan.value.checkpoint_hash == checkpoint_hash)
+                            || transcript.value.plan.value.checkpoint_hash == checkpoint_hash
+                                && transcript
+                                    .value
+                                    .plan
+                                    .value
+                                    .information_root(information_index)
+                                    == Some(reference.root))
                     {
                         covered = true;
                         break;
@@ -9790,6 +9802,7 @@ mod tests {
                 coding_coordinator: keys[remote[0]].node_id(),
                 verification_coordinator: keys[remote[1]].node_id(),
                 expires_at_unix_seconds: unix_seconds() + 600,
+                information_roots: None,
             })
             .unwrap();
         let failure = SignedRecord::sign(
@@ -10149,6 +10162,7 @@ mod tests {
             coding_coordinator: members[1].node_id,
             verification_coordinator: members[4].node_id,
             expires_at_unix_seconds: unix_seconds() + 600,
+            information_roots: None,
         };
         let plan_hash = plan.hash().unwrap();
         let plan = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, &keys[0]).unwrap();

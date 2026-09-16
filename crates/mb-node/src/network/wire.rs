@@ -2,8 +2,8 @@ use mb_core::{
     CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal, CodingFailureReport,
     CodingGroup, CodingRootManifest, CodingShardOpening, CodingVerificationTranscript,
     EndpointRecord, GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, Member, MemberSignature,
-    MerkleRangeProof, NodeId, QuorumGuildEvent, QuorumGuildGenesis, SectorId, SectorRef,
-    SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
+    MerkleCommitment, MerkleRangeProof, NodeId, QuorumGuildEvent, QuorumGuildGenesis, SectorId,
+    SectorRef, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
 };
 use mb_store::{ParityObject, VariableParityObject};
 use serde::{Deserialize, Serialize};
@@ -260,6 +260,10 @@ pub(super) enum PeerRequest {
         guild_id: [u8; 32],
         checkpoint_hash: [u8; 32],
     },
+    GetSectorCommitment {
+        guild_id: [u8; 32],
+        sector_id: SectorId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -284,6 +288,7 @@ impl PeerRequest {
             Self::Profile
                 | Self::GetSector { .. }
                 | Self::GetSectorRange { .. }
+                | Self::GetSectorCommitment { .. }
                 | Self::GetParity { .. }
                 | Self::GetVariableShard { .. }
                 | Self::GetVariableEmergencyShard { .. }
@@ -302,6 +307,7 @@ impl PeerRequest {
             Self::Profile
             | Self::GetSector { .. }
             | Self::GetSectorRange { .. }
+            | Self::GetSectorCommitment { .. }
             | Self::GetParity { .. }
             | Self::GetVariableShard { .. }
             | Self::GetVariableEmergencyShard { .. }
@@ -370,6 +376,7 @@ impl PeerRequest {
             | Self::EnsureFiller { guild_id, .. }
             | Self::GetSector { guild_id, .. }
             | Self::GetSectorRange { guild_id, .. }
+            | Self::GetSectorCommitment { guild_id, .. }
             | Self::GetParity { guild_id, .. }
             | Self::GetVariableShard { guild_id, .. }
             | Self::GetVariableEmergencyShard { guild_id, .. }
@@ -485,6 +492,7 @@ pub(super) enum PeerResponse {
     #[cfg(test)]
     RecoveryAdmission(SignedRecord<RecoveryPublisherAdmission>),
     Ack,
+    MerkleCommitment(MerkleCommitment),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

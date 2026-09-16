@@ -66,6 +66,10 @@ peer-request =
         start_leaf: uint,
         leaf_count: uint
       } }
+  / { "GetSectorCommitment": {
+        guild_id: bytes32-array,
+        sector_id: bytes32-array
+      } }
   / { "PublishParity": {
         operation_id: bytes16-array,
         group: coding-group,
@@ -178,6 +182,7 @@ peer-response =
   / { "PreparedRevisionPage": { total_pages: uint, page_hash: bytes32-array, bytes: byte-vector } }
   / { "Filler": { reference: sector-ref, bytes: byte-vector } }
   / { "Bytes": byte-vector }
+  / { "MerkleCommitment": merkle-commitment }
   / { "MerkleRange": merkle-range-proof }
   / { "CheckpointSignature": member-signature }
   / { "GuildGenesisSignature": member-signature }

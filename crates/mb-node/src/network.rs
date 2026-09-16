@@ -624,6 +624,7 @@ fn process_peer_request(
                         &request,
                         PeerRequest::GetSector { .. }
                             | PeerRequest::GetSectorRange { .. }
+                            | PeerRequest::GetSectorCommitment { .. }
                             | PeerRequest::GetPreparedRevisionPage { .. }
                     ) && caller == config.trusted_coordinator)
                 {
@@ -888,6 +889,15 @@ fn execute_read_request(
                 &bytes, start_leaf, leaf_count,
             )?))
         }
+        PeerRequest::GetSectorCommitment {
+            guild_id,
+            sector_id,
+        } => {
+            let bytes = node.sector_for_guild(&guild_id, &sector_id)?;
+            Ok(PeerResponse::MerkleCommitment(mb_core::merkle_commit(
+                &bytes,
+            )?))
+        }
         PeerRequest::GetPreparedRevisionPage {
             guild_id,
             revision_id,
@@ -1058,6 +1068,15 @@ fn execute_peer_request(
             let bytes = node.sector_for_guild(&guild_id, &sector_id)?;
             Ok(PeerResponse::MerkleRange(mb_core::merkle_open_range(
                 &bytes, start_leaf, leaf_count,
+            )?))
+        }
+        PeerRequest::GetSectorCommitment {
+            guild_id,
+            sector_id,
+        } => {
+            let bytes = node.sector_for_guild(&guild_id, &sector_id)?;
+            Ok(PeerResponse::MerkleCommitment(mb_core::merkle_commit(
+                &bytes,
             )?))
         }
         PeerRequest::PublishParity {

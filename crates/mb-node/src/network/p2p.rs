@@ -32,16 +32,17 @@ use mb_core::{
     CodingGroup, CodingGroupV2, CodingPlanGeometry, CodingProfile, CodingRootManifest,
     CodingShardOpening, CodingVerificationTranscript, DynamicGuildState, GuildCheckpoint,
     GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, InformationRoleV2, MAX_GUILD_EVENT_TAIL,
-    MERKLE_LEAF_SIZE, Member, MemberSignature, NodeId, ParityPlacementV2, ParityRoleV2,
-    QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy, QuorumRule,
-    RECOVERY_LOCATOR_DOMAIN, RangeSectorRef, STAGED_STORAGE_RECEIPT_DOMAIN,
-    STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole, ShardRoleV2, SignedRecord,
-    StagedStorageReceipt, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
-    V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES,
-    V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_SECTOR_SIZE, canonical_bytes,
-    coding_challenge, coding_transfer_estimate, decode_canonical, encode, merkle_commit,
-    merkle_zero_commitment, replay_coding_transcript, sector_root,
+    MERKLE_LEAF_SIZE, Member, MemberSignature, NodeId, ParityPlacementV2, QuorumCheckpoint,
+    QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN,
+    RangeSectorRef, STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId,
+    SectorRef, ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
+    UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES,
+    V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS,
+    V1_SECTOR_SIZE, canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical,
+    merkle_commit, merkle_zero_commitment, replay_coding_transcript, sector_root,
 };
+#[cfg(test)]
+use mb_core::{ParityRoleV2, encode};
 use mb_store::{ParityObject, VariableParityObject};
 use uuid::Uuid;
 
@@ -2065,6 +2066,28 @@ impl P2pClient {
         }
         mb_core::merkle_verify_range(commitment, &proof)
             .context("peer sector range failed Merkle verification")
+    }
+
+    pub async fn sector_commitment(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        sector_id: SectorId,
+    ) -> Result<mb_core::MerkleCommitment> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::GetSectorCommitment {
+                    guild_id,
+                    sector_id,
+                },
+            )
+            .await?;
+        let PeerResponse::MerkleCommitment(commitment) = response else {
+            bail!("peer returned the wrong sector-commitment response");
+        };
+        commitment.validate()?;
+        Ok(commitment)
     }
 
     pub(crate) async fn parity(
@@ -9649,13 +9672,13 @@ fn unix_seconds() -> u64 {
 
 struct VariableCodingLane {
     geometry: CodingPlanGeometry,
-    expected_group: CodingGroupV2,
+    information_roots: Vec<[u8; 32]>,
 }
 
 struct VariableInformationInput<'a> {
     owner: NodeId,
     sector: &'a SectorRef,
-    bytes: &'a [u8],
+    commitment: &'a mb_core::MerkleCommitment,
 }
 
 fn variable_coding_profile(peers: &[crate::GuildPeer]) -> Result<CodingProfile> {
@@ -9706,14 +9729,15 @@ fn variable_coding_lane(
     let mut used_domains = BTreeSet::new();
     let mut used_nodes = BTreeSet::new();
     let mut information = Vec::with_capacity(data_shards);
-    let mut information_bytes = Vec::with_capacity(data_shards);
+    let mut information_roots = Vec::with_capacity(data_shards);
     for source in sources {
         let peer = peers
             .iter()
             .find(|peer| peer.member.node_id == source.owner)
             .context("variable coding source owner is not an active member")?;
-        if source.bytes.len() != V1_SECTOR_SIZE
-            || sector_root(source.bytes) != source.sector.root
+        if source.sector.root == [0; 32]
+            || source.commitment.byte_len != profile.shard_size
+            || source.commitment.validate().is_err()
             || !used_nodes.insert(source.owner)
             || !used_domains.insert(peer.member.failure_domain.clone())
         {
@@ -9724,12 +9748,12 @@ fn variable_coding_lane(
             failure_domain: peer.member.failure_domain.clone(),
             sector: RangeSectorRef {
                 id: source.sector.id,
-                commitment: merkle_commit(source.bytes)?,
+                commitment: source.commitment.clone(),
                 logical_len: source.sector.logical_len,
                 virtual_zero: false,
             },
         });
-        information_bytes.push(source.bytes.to_vec());
+        information_roots.push(source.sector.root);
     }
     let mut remaining = Vec::new();
     for peer in peers {
@@ -9756,7 +9780,7 @@ fn variable_coding_lane(
                 virtual_zero: true,
             },
         });
-        information_bytes.push(vec![0; V1_SECTOR_SIZE]);
+        information_roots.push([0; 32]);
     }
     let parity = remaining
         .iter()
@@ -9777,33 +9801,9 @@ fn variable_coding_lane(
         parity,
     };
     geometry.validate()?;
-    let encoded = encode(profile, information_bytes)?;
-    let mut roles = geometry
-        .information
-        .iter()
-        .cloned()
-        .map(ShardRoleV2::Information)
-        .collect::<Vec<_>>();
-    for (offset, placement) in geometry.parity.iter().enumerate() {
-        roles.push(ShardRoleV2::Parity(ParityRoleV2 {
-            holder: placement.holder,
-            failure_domain: placement.failure_domain.clone(),
-            row: placement.row,
-            commitment: merkle_commit(&encoded[data_shards + offset])?,
-        }));
-    }
-    let mut expected_group = CodingGroupV2 {
-        id: [0; 32],
-        format_version: 2,
-        guild_id,
-        profile,
-        roles,
-    };
-    expected_group.id = expected_group.calculate_id()?;
-    expected_group.validate()?;
     Ok(VariableCodingLane {
         geometry,
-        expected_group,
+        information_roots,
     })
 }
 
@@ -9819,7 +9819,7 @@ struct CrossUserCodingContext<'a> {
 
 async fn build_cross_user_coding_lanes(
     node: Arc<Mutex<Node>>,
-    current_sectors: Vec<(SectorRef, Vec<u8>)>,
+    current_sectors: Vec<SectorRef>,
     context: CrossUserCodingContext<'_>,
 ) -> Result<Vec<VariableCodingLane>> {
     let data_shards = usize::from(variable_coding_profile(context.peers)?.data_shards);
@@ -9848,8 +9848,20 @@ async fn build_cross_user_coding_lanes(
     }
     let candidates = candidates.into_iter().collect::<Vec<_>>();
     let mut lanes = Vec::with_capacity(current_sectors.len());
-    for (ordinal, (current_sector, current_bytes)) in current_sectors.into_iter().enumerate() {
-        let mut source_data = vec![(context.current_owner, current_sector, current_bytes)];
+    for (ordinal, current_sector) in current_sectors.into_iter().enumerate() {
+        let current_commitment = load_p2p_sector_commitment(
+            node.clone(),
+            context.p2p,
+            context.local_id,
+            context.current_owner,
+            context.guild_id,
+            current_sector.id,
+        )
+        .await?;
+        if current_commitment.byte_len != V1_SECTOR_SIZE as u32 {
+            bail!("owner sector commitment has the wrong fixed size");
+        }
+        let mut source_data = vec![(context.current_owner, current_sector, current_commitment)];
         let mut used_domains = context
             .peers
             .iter()
@@ -9874,7 +9886,7 @@ async fn build_cross_user_coding_lanes(
                     continue;
                 }
                 let sector = sectors[ordinal % sectors.len()].clone();
-                let bytes = match load_p2p_sector(
+                let commitment = match load_p2p_sector_commitment(
                     node.clone(),
                     context.p2p,
                     context.local_id,
@@ -9884,13 +9896,9 @@ async fn build_cross_user_coding_lanes(
                 )
                 .await
                 {
-                    Ok(bytes)
-                        if bytes.len() == V1_SECTOR_SIZE && sector_root(&bytes) == sector.root =>
-                    {
-                        bytes
-                    }
+                    Ok(commitment) if commitment.byte_len == V1_SECTOR_SIZE as u32 => commitment,
                     Ok(_) => {
-                        tracing::debug!(%owner, sector = %hex::encode(sector.id), "retained cross-user sector failed its signed root");
+                        tracing::debug!(%owner, sector = %hex::encode(sector.id), "retained cross-user sector commitment has the wrong fixed size");
                         continue;
                     }
                     Err(error) => {
@@ -9899,15 +9907,15 @@ async fn build_cross_user_coding_lanes(
                     }
                 };
                 used_domains.insert(peer.member.failure_domain.clone());
-                source_data.push((*owner, sector, bytes));
+                source_data.push((*owner, sector, commitment));
             }
         }
         let sources = source_data
             .iter()
-            .map(|(owner, sector, bytes)| VariableInformationInput {
+            .map(|(owner, sector, commitment)| VariableInformationInput {
                 owner: *owner,
                 sector,
-                bytes,
+                commitment,
             })
             .collect::<Vec<_>>();
         lanes.push(variable_coding_lane(
@@ -9927,7 +9935,7 @@ async fn queue_variable_coding_lanes(
     membership_epoch: u64,
     peers: &[crate::GuildPeer],
     lanes: Vec<VariableCodingLane>,
-) -> Result<Vec<[u8; 32]>> {
+) -> Result<()> {
     let coding_coordinator = peers
         .first()
         .context("variable coding lane has no participant coordinator")?
@@ -9941,25 +9949,13 @@ async fn queue_variable_coding_lanes(
     let expires_at_unix_seconds = unix_seconds()
         .checked_add(24 * 60 * 60)
         .context("coding launch expiry overflow")?;
-    let mut expected_groups = Vec::with_capacity(lanes.len());
     for lane in lanes {
-        let expected_group_id = lane.expected_group.id;
-        expected_groups.push(expected_group_id);
-        let already_committed = node_blocking(node.clone(), move |node| {
-            Ok(node.dynamic_guild_state()?.is_some_and(|state| {
-                state
-                    .coding_groups
-                    .iter()
-                    .any(|retained| retained.group.id == expected_group_id)
-            }))
-        })
-        .await?;
-        if already_committed {
-            continue;
-        }
         let mut hasher = blake3::Hasher::new_derive_key("mutualbackup initial coding attempt v1");
         hasher.update(&checkpoint_hash);
-        hasher.update(&lane.expected_group.id);
+        hasher.update(&canonical_bytes(&(
+            &lane.geometry,
+            &lane.information_roots,
+        ))?);
         let mut attempt_id: [u8; 16] = hasher.finalize().as_bytes()[..16]
             .try_into()
             .expect("fixed digest prefix");
@@ -9968,7 +9964,7 @@ async fn queue_variable_coding_lanes(
         }
         node_blocking(node.clone(), move |node| {
             let plan = node.sign_coding_attempt_plan(CodingAttemptPlan {
-                format_version: 1,
+                format_version: 2,
                 attempt_id,
                 checkpoint_hash,
                 membership_epoch,
@@ -9977,41 +9973,31 @@ async fn queue_variable_coding_lanes(
                 coding_coordinator,
                 verification_coordinator,
                 expires_at_unix_seconds,
+                information_roots: Some(lane.information_roots),
             })?;
             node.enqueue_coding_launch(plan)?;
             Ok(())
         })
         .await?;
     }
-    Ok(expected_groups)
+    Ok(())
 }
 
 async fn wait_for_variable_coding_groups(
     node: Arc<Mutex<Node>>,
-    expected_groups: Vec<[u8; 32]>,
+    checkpoint: GuildCheckpoint,
 ) -> Result<()> {
-    let expected = expected_groups.into_iter().collect::<BTreeSet<_>>();
     loop {
-        let missing = node_blocking(node.clone(), {
-            let expected = expected.clone();
-            move |node| {
-                let state = node
-                    .dynamic_guild_state()?
-                    .context("backup coordinator has no dynamic guild state")?;
-                let committed = state
-                    .coding_groups
-                    .iter()
-                    .map(|retained| retained.group.id)
-                    .collect::<BTreeSet<_>>();
-                Ok(expected.difference(&committed).copied().collect::<Vec<_>>())
-            }
+        let pending_checkpoint = checkpoint.clone();
+        let coverage = node_blocking(node.clone(), move |node| {
+            node.validate_variable_checkpoint_coverage(&pending_checkpoint, false)
         })
-        .await?;
-        if missing.is_empty() {
+        .await;
+        if coverage.is_ok() {
             return Ok(());
         }
         tracing::debug!(
-            missing_groups = missing.len(),
+            error = %coverage.unwrap_err(),
             "backup is waiting for verified variable coding groups"
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -10109,22 +10095,7 @@ async fn commit_backup_job(
         bail!("prepared revision exceeds the bounded coding catalog");
     }
 
-    let mut current_sectors = Vec::with_capacity(target_sectors.len());
-    for target in &target_sectors {
-        let owner_bytes = load_p2p_sector(
-            node.clone(),
-            p2p,
-            local_id,
-            peers[0].member.node_id,
-            guild_id,
-            target.id,
-        )
-        .await?;
-        if owner_bytes.len() != V1_SECTOR_SIZE || sector_root(&owner_bytes) != target.root {
-            bail!("owner sector failed its committed root or fixed size");
-        }
-        current_sectors.push((target.clone(), owner_bytes));
-    }
+    let current_sectors = target_sectors;
 
     let (
         generation,
@@ -10199,7 +10170,7 @@ async fn commit_backup_job(
         },
     )
     .await?;
-    let expected_variable_groups = queue_variable_coding_lanes(
+    queue_variable_coding_lanes(
         node.clone(),
         checkpoint_hash,
         checkpoint_authority.membership_epoch,
@@ -10207,7 +10178,7 @@ async fn commit_backup_job(
         variable_lanes,
     )
     .await?;
-    wait_for_variable_coding_groups(node.clone(), expected_variable_groups).await?;
+    wait_for_variable_coding_groups(node.clone(), checkpoint.clone()).await?;
     let body = canonical_bytes(&checkpoint)?;
     let body_holders = publish_p2p_checkpoint_object(
         node.clone(),
@@ -10458,21 +10429,22 @@ async fn fetch_p2p_revision(
     decode_canonical(&bytes).map_err(Into::into)
 }
 
-async fn load_p2p_sector(
+async fn load_p2p_sector_commitment(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
     local_id: NodeId,
     peer: NodeId,
     guild_id: [u8; 32],
     sector_id: SectorId,
-) -> Result<Vec<u8>> {
+) -> Result<mb_core::MerkleCommitment> {
     if peer == local_id {
         node_blocking(node, move |node| {
-            node.sector_for_guild(&guild_id, &sector_id)
+            let bytes = node.sector_for_guild(&guild_id, &sector_id)?;
+            Ok(merkle_commit(&bytes)?)
         })
         .await
     } else {
-        p2p.sector(peer, guild_id, sector_id).await
+        p2p.sector_commitment(peer, guild_id, sector_id).await
     }
 }
 
@@ -10709,6 +10681,53 @@ mod tests {
         }
     }
 
+    fn materialize_variable_lane(
+        lane: &VariableCodingLane,
+        real_information: &[Vec<u8>],
+    ) -> CodingGroupV2 {
+        let mut real_information = real_information.iter();
+        let information = lane
+            .geometry
+            .information
+            .iter()
+            .map(|role| {
+                if role.sector.virtual_zero {
+                    vec![0; lane.geometry.profile.shard_size as usize]
+                } else {
+                    real_information.next().unwrap().clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(real_information.next().is_none());
+        let encoded = encode(lane.geometry.profile, information).unwrap();
+        let parity_start = usize::from(lane.geometry.profile.data_shards);
+        let mut roles = lane
+            .geometry
+            .information
+            .iter()
+            .cloned()
+            .map(ShardRoleV2::Information)
+            .collect::<Vec<_>>();
+        for (offset, placement) in lane.geometry.parity.iter().enumerate() {
+            roles.push(ShardRoleV2::Parity(ParityRoleV2 {
+                holder: placement.holder,
+                failure_domain: placement.failure_domain.clone(),
+                row: placement.row,
+                commitment: merkle_commit(&encoded[parity_start + offset]).unwrap(),
+            }));
+        }
+        let mut group = CodingGroupV2 {
+            id: [0; 32],
+            format_version: 2,
+            guild_id: lane.geometry.guild_id,
+            profile: lane.geometry.profile,
+            roles,
+        };
+        group.id = group.calculate_id().unwrap();
+        group.validate().unwrap();
+        group
+    }
+
     #[test]
     fn dynamic_recovery_confirmation_count_preserves_the_three_publisher_rule() {
         assert!(required_recovery_publishers(1).is_err());
@@ -10740,6 +10759,7 @@ mod tests {
             root: sector_root(&bytes),
             logical_len: 123,
         };
+        let commitment = merkle_commit(&bytes).unwrap();
         let lane = variable_coding_lane(
             [32; 32],
             Uuid::from_bytes([33; 16]),
@@ -10747,12 +10767,12 @@ mod tests {
             &[VariableInformationInput {
                 owner: peers[0].member.node_id,
                 sector: &source,
-                bytes: &bytes,
+                commitment: &commitment,
             }],
             &peers,
         )
         .unwrap();
-        lane.expected_group.validate().unwrap();
+        materialize_variable_lane(&lane, std::slice::from_ref(&bytes));
         assert!(!lane.geometry.information[0].sector.virtual_zero);
         assert!(
             lane.geometry.information[1..]
@@ -10760,7 +10780,7 @@ mod tests {
                 .all(|role| role.sector.virtual_zero)
         );
         let plan = CodingAttemptPlan {
-            format_version: 1,
+            format_version: 2,
             attempt_id: [34; 16],
             checkpoint_hash: [35; 32],
             membership_epoch: 1,
@@ -10769,6 +10789,7 @@ mod tests {
             coding_coordinator: peers[0].member.node_id,
             verification_coordinator: peers[1].member.node_id,
             expires_at_unix_seconds: 1,
+            information_roots: Some(lane.information_roots),
         };
         let estimate = coding_transfer_estimate(&plan).unwrap();
         assert_eq!(estimate.information_shard_transfers, 0);
@@ -10808,11 +10829,15 @@ mod tests {
                 logical_len: (index + 1) as u32,
             })
             .collect::<Vec<_>>();
+        let commitments = bytes
+            .iter()
+            .map(|bytes| merkle_commit(bytes).unwrap())
+            .collect::<Vec<_>>();
         let sources = (0..3)
             .map(|index| VariableInformationInput {
                 owner: peers[index].member.node_id,
                 sector: &sectors[index],
-                bytes: &bytes[index],
+                commitment: &commitments[index],
             })
             .collect::<Vec<_>>();
         let lane = variable_coding_lane([64; 32], Uuid::from_bytes([65; 16]), 0, &sources, &peers)
@@ -10824,7 +10849,7 @@ mod tests {
                 .all(|role| !role.sector.virtual_zero)
         );
         let plan = CodingAttemptPlan {
-            format_version: 1,
+            format_version: 2,
             attempt_id: [66; 16],
             checkpoint_hash: [67; 32],
             membership_epoch: 1,
@@ -10833,6 +10858,7 @@ mod tests {
             coding_coordinator: peers[0].member.node_id,
             verification_coordinator: peers[1].member.node_id,
             expires_at_unix_seconds: 1,
+            information_roots: Some(lane.information_roots),
         };
         let estimate = coding_transfer_estimate(&plan).unwrap();
         assert_eq!(estimate.information_shard_transfers, 2);
@@ -10870,20 +10896,22 @@ mod tests {
             root: sector_root(&second_bytes),
             logical_len: 12,
         };
-        let old = variable_coding_lane(
+        let first_commitment = merkle_commit(&first_bytes).unwrap();
+        let second_commitment = merkle_commit(&second_bytes).unwrap();
+        let old_lane = variable_coding_lane(
             [75; 32],
             Uuid::from_bytes([76; 16]),
             0,
             &[VariableInformationInput {
                 owner: peers[0].member.node_id,
                 sector: &first,
-                bytes: &first_bytes,
+                commitment: &first_commitment,
             }],
             &peers,
         )
-        .unwrap()
-        .expected_group;
-        let replacement = variable_coding_lane(
+        .unwrap();
+        let old = materialize_variable_lane(&old_lane, std::slice::from_ref(&first_bytes));
+        let replacement_lane = variable_coding_lane(
             [75; 32],
             Uuid::from_bytes([77; 16]),
             0,
@@ -10891,18 +10919,19 @@ mod tests {
                 VariableInformationInput {
                     owner: peers[0].member.node_id,
                     sector: &first,
-                    bytes: &first_bytes,
+                    commitment: &first_commitment,
                 },
                 VariableInformationInput {
                     owner: peers[1].member.node_id,
                     sector: &second,
-                    bytes: &second_bytes,
+                    commitment: &second_commitment,
                 },
             ],
             &peers,
         )
-        .unwrap()
-        .expected_group;
+        .unwrap();
+        let replacement =
+            materialize_variable_lane(&replacement_lane, &[first_bytes, second_bytes]);
         let old_id = old.id;
         let replacement_id = replacement.id;
         let mut state = DynamicGuildState::new(
@@ -10979,6 +11008,7 @@ mod tests {
             root: sector_root(&bytes),
             logical_len: 321,
         };
+        let commitment = merkle_commit(&bytes).unwrap();
         for (members, expected_data, expected_parity) in [(3, 2, 1), (5, 3, 2), (6, 4, 2)] {
             let lane = variable_coding_lane(
                 [42; 32],
@@ -10987,15 +11017,15 @@ mod tests {
                 &[VariableInformationInput {
                     owner: peers[0].member.node_id,
                     sector: &source,
-                    bytes: &bytes,
+                    commitment: &commitment,
                 }],
                 &peers[..members],
             )
             .unwrap();
             assert_eq!(lane.geometry.profile.data_shards, expected_data);
             assert_eq!(lane.geometry.profile.parity_shards, expected_parity);
-            assert_eq!(lane.expected_group.roles.len(), members);
-            lane.expected_group.validate().unwrap();
+            assert_eq!(lane.geometry.profile.total_shards().unwrap(), members);
+            materialize_variable_lane(&lane, std::slice::from_ref(&bytes));
         }
     }
 
