@@ -111,6 +111,46 @@ pub fn merkle_open_range(
     })
 }
 
+/// Open one aligned range of a virtual all-zero shard without materializing
+/// the complete shard. The result is byte-for-byte identical to opening the
+/// same range from an allocated zero buffer.
+pub fn merkle_open_zero_range(
+    byte_len: u32,
+    start_leaf: u32,
+    leaf_count: u32,
+) -> Result<MerkleRangeProof, MerkleError> {
+    validate_data_len(byte_len as usize)?;
+    let total_leaves = byte_len as usize / MERKLE_LEAF_SIZE;
+    let start = usize::try_from(start_leaf).map_err(|_| MerkleError::InvalidRange)?;
+    let count = usize::try_from(leaf_count).map_err(|_| MerkleError::InvalidRange)?;
+    if count == 0
+        || !count.is_power_of_two()
+        || start % count != 0
+        || start
+            .checked_add(count)
+            .is_none_or(|end| end > total_leaves)
+    {
+        return Err(MerkleError::InvalidRange);
+    }
+
+    let subtree_level = count.ilog2() as usize;
+    let tree_height = total_leaves.ilog2() as usize;
+    let mut zero_root = hash_leaf(&[0; MERKLE_LEAF_SIZE]);
+    let mut siblings = Vec::with_capacity(tree_height - subtree_level);
+    for level in 0..tree_height {
+        if level >= subtree_level {
+            siblings.push(zero_root);
+        }
+        zero_root = hash_node(&zero_root, &zero_root);
+    }
+    Ok(MerkleRangeProof {
+        format_version: MERKLE_SUITE_V1,
+        start_leaf,
+        leaves: vec![[0; MERKLE_LEAF_SIZE]; count],
+        siblings,
+    })
+}
+
 /// Verify and return the exact authenticated range carried by `proof`.
 pub fn merkle_verify_range(
     commitment: &MerkleCommitment,
@@ -260,6 +300,24 @@ mod tests {
                     bytes[start * MERKLE_LEAF_SIZE..(start + count) * MERKLE_LEAF_SIZE]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn virtual_zero_ranges_match_materialized_proofs() {
+        let bytes = vec![0; 64 * 1024];
+        let commitment = merkle_zero_commitment(bytes.len() as u32).unwrap();
+        for count in [1_u32, 2, 64, 4096] {
+            let start = 4096 - count;
+            let virtual_proof = merkle_open_zero_range(bytes.len() as u32, start, count).unwrap();
+            assert_eq!(
+                virtual_proof,
+                merkle_open_range(&bytes, start, count).unwrap()
+            );
+            assert_eq!(
+                merkle_verify_range(&commitment, &virtual_proof).unwrap(),
+                vec![0; count as usize * MERKLE_LEAF_SIZE]
+            );
         }
     }
 

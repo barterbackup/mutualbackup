@@ -58,7 +58,8 @@ pub use packing::{
 };
 pub use range::{
     MERKLE_LEAF_SIZE, MERKLE_SUITE_V1, MerkleCommitment, MerkleError, MerkleRangeProof,
-    challenged_leaf, merkle_commit, merkle_open_range, merkle_verify_range, merkle_zero_commitment,
+    challenged_leaf, merkle_commit, merkle_open_range, merkle_open_zero_range, merkle_verify_range,
+    merkle_zero_commitment,
 };
 pub use recovery::{
     RecoveryCryptoError, RecoveryLocator, SealedRecoveryRecord, open_recovery_record,

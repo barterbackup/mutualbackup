@@ -19,8 +19,8 @@ use mb_core::{
     USER_REVISION_DOMAIN, UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_PAGES,
     V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes, challenged_leaf, coding_challenge_commitment,
     coding_evidence_hash, decode_canonical, encode_coding_attempt, merkle_commit,
-    merkle_open_range, open_recovery_record, replay_coding_transcript, seal_recovery_record,
-    sector_root, sign_guild_event, synthetic_filler_sector,
+    merkle_open_range, merkle_open_zero_range, open_recovery_record, replay_coding_transcript,
+    seal_recovery_record, sector_root, sign_guild_event, synthetic_filler_sector,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
@@ -3208,11 +3208,15 @@ impl Node {
         let leaf = challenged_leaf(&challenge, commitment)?;
         let proof = match role {
             ShardRoleV2::Information(information) => {
-                let bytes = self.sector_for_guild(&group.guild_id, &information.sector.id)?;
-                if merkle_commit(&bytes)? != *commitment {
-                    anyhow::bail!("local information bytes conflict with the coding plan");
+                if information.sector.virtual_zero {
+                    merkle_open_zero_range(information.sector.commitment.byte_len, leaf, 1)?
+                } else {
+                    let bytes = self.sector_for_guild(&group.guild_id, &information.sector.id)?;
+                    if merkle_commit(&bytes)? != *commitment {
+                        anyhow::bail!("local information bytes conflict with the coding plan");
+                    }
+                    merkle_open_range(&bytes, leaf, 1)?
                 }
-                merkle_open_range(&bytes, leaf, 1)?
             }
             ShardRoleV2::Parity(_) => self.volumes.open_attempt_range(
                 &self.control,
