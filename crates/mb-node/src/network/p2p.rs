@@ -9847,13 +9847,15 @@ struct VariableInformationInput<'a> {
     commitment: &'a mb_core::MerkleCommitment,
 }
 
+const MAX_VARIABLE_CODING_PARTICIPANTS: usize = 5;
+
 fn variable_coding_profile(peers: &[crate::GuildPeer]) -> Result<CodingProfile> {
     let participant_count = peers
         .iter()
         .map(|peer| peer.member.failure_domain.as_str())
         .collect::<BTreeSet<_>>()
         .len()
-        .min(mb_core::MAX_CODING_SHARDS as usize);
+        .min(MAX_VARIABLE_CODING_PARTICIPANTS);
     if participant_count < 3 {
         bail!("variable coding requires at least three distinct failure domains");
     }
@@ -9921,18 +9923,31 @@ fn variable_coding_lane(
         });
         information_roots.push(source.sector.root);
     }
-    let mut remaining = Vec::new();
-    for peer in peers {
-        if used_nodes.contains(&peer.member.node_id)
-            || !used_domains.insert(peer.member.failure_domain.clone())
-        {
-            continue;
-        }
-        used_nodes.insert(peer.member.node_id);
-        remaining.push(peer);
-    }
     let virtual_count = data_shards - information.len();
-    if remaining.len() < virtual_count + usize::from(profile.parity_shards) {
+    let remaining_count = virtual_count + usize::from(profile.parity_shards);
+    let mut candidates = peers
+        .iter()
+        .filter(|peer| !used_nodes.contains(&peer.member.node_id))
+        .map(|peer| {
+            let mut hasher = blake3::Hasher::new_derive_key("mutualbackup variable placement v1");
+            hasher.update(&guild_id);
+            hasher.update(revision_id.as_bytes());
+            hasher.update(&ordinal.to_be_bytes());
+            hasher.update(&peer.member.node_id.0);
+            (*hasher.finalize().as_bytes(), peer.member.node_id, peer)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(score, node_id, _)| (*score, *node_id));
+    let mut remaining = Vec::with_capacity(remaining_count);
+    for (_, _, peer) in candidates {
+        if used_domains.insert(peer.member.failure_domain.clone()) {
+            remaining.push(peer);
+            if remaining.len() == remaining_count {
+                break;
+            }
+        }
+    }
+    if remaining.len() < remaining_count {
         bail!("variable coding roster has too few distinct placement domains");
     }
     for (lane, peer) in remaining.iter().take(virtual_count).enumerate() {
@@ -9981,6 +9996,46 @@ struct CrossUserCodingContext<'a> {
     current_owner: NodeId,
     retained_revisions: &'a [SignedRecord<UserRevision>],
     peers: &'a [crate::GuildPeer],
+}
+
+async fn reachable_coding_peers(
+    p2p: &P2pClient,
+    local_id: NodeId,
+    peers: &[crate::GuildPeer],
+) -> Vec<crate::GuildPeer> {
+    let mut reachable = peers
+        .iter()
+        .filter(|peer| peer.member.node_id == local_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut requests = FuturesUnordered::new();
+    for peer in peers
+        .iter()
+        .filter(|peer| peer.member.node_id != local_id)
+        .cloned()
+    {
+        requests.push(async move {
+            let result = p2p.profile(peer.member.node_id).await;
+            (peer, result)
+        });
+    }
+    while let Some((peer, result)) = requests.next().await {
+        match result {
+            Ok(profile) if profile.member == peer.member => reachable.push(peer),
+            Ok(profile) => tracing::warn!(
+                peer = %peer.member.node_id,
+                advertised = %profile.member.node_id,
+                "coding candidate profile conflicts with the authenticated guild roster"
+            ),
+            Err(error) => tracing::debug!(
+                peer = %peer.member.node_id,
+                %error,
+                "guild member is unavailable for new coding placement"
+            ),
+        }
+    }
+    reachable.sort_by_key(|peer| peer.member.node_id);
+    reachable
 }
 
 async fn build_cross_user_coding_lanes(
@@ -10372,6 +10427,13 @@ async fn commit_backup_job(
     };
     checkpoint.validate()?;
     let checkpoint_hash = checkpoint.hash()?;
+    let coding_peers = reachable_coding_peers(p2p, local_id, &peers).await;
+    if !coding_peers
+        .iter()
+        .any(|peer| peer.member.node_id == job.descriptor.owner)
+    {
+        bail!("backup owner is unavailable for new coding placement");
+    }
     let variable_lanes = build_cross_user_coding_lanes(
         node.clone(),
         current_sectors,
@@ -10382,7 +10444,7 @@ async fn commit_backup_job(
             revision_id: job.descriptor.revision_id,
             current_owner: job.descriptor.owner,
             retained_revisions: &checkpoint.revisions,
-            peers: &peers,
+            peers: &coding_peers,
         },
     )
     .await?;
@@ -10392,7 +10454,7 @@ async fn commit_backup_job(
         local_id,
         checkpoint_hash,
         checkpoint_authority.membership_epoch,
-        &peers,
+        &coding_peers,
         variable_lanes,
     )
     .await?;
@@ -11243,7 +11305,7 @@ mod tests {
             logical_len: 321,
         };
         let commitment = merkle_commit(&bytes).unwrap();
-        for (members, expected_data, expected_parity) in [(3, 2, 1), (5, 3, 2), (6, 4, 2)] {
+        for (members, expected_data, expected_parity) in [(3, 2, 1), (5, 3, 2), (6, 3, 2)] {
             let lane = variable_coding_lane(
                 [42; 32],
                 Uuid::from_bytes([43; 16]),
@@ -11258,9 +11320,67 @@ mod tests {
             .unwrap();
             assert_eq!(lane.geometry.profile.data_shards, expected_data);
             assert_eq!(lane.geometry.profile.parity_shards, expected_parity);
-            assert_eq!(lane.geometry.profile.total_shards().unwrap(), members);
+            assert_eq!(
+                lane.geometry.profile.total_shards().unwrap(),
+                members.min(MAX_VARIABLE_CODING_PARTICIPANTS)
+            );
             materialize_variable_lane(&lane, std::slice::from_ref(&bytes));
         }
+    }
+
+    #[test]
+    fn production_variable_lanes_share_bounded_roles_across_large_rosters() {
+        let peers = (0_u8..12)
+            .map(|index| {
+                let keys = KeyMaterial::from_seed(&Seed::from_bytes([index + 90; 32]));
+                crate::GuildPeer {
+                    member: Member {
+                        node_id: keys.node_id(),
+                        recovery_public_key: keys.recovery_public_key(),
+                        failure_domain: format!("large-lane-domain-{index}"),
+                    },
+                    endpoints: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let bytes = vec![91; V1_SECTOR_SIZE];
+        let source = SectorRef {
+            id: [92; 32],
+            root: sector_root(&bytes),
+            logical_len: 321,
+        };
+        let commitment = merkle_commit(&bytes).unwrap();
+        let mut assigned = BTreeSet::new();
+        for ordinal in 0..128 {
+            let lane = variable_coding_lane(
+                [93; 32],
+                Uuid::from_bytes([94; 16]),
+                ordinal,
+                &[VariableInformationInput {
+                    owner: peers[0].member.node_id,
+                    sector: &source,
+                    commitment: &commitment,
+                }],
+                &peers,
+            )
+            .unwrap();
+            assert_eq!(lane.geometry.profile, CodingProfile::new(3, 2, 64 * 1024));
+            assert_eq!(
+                lane.geometry.information.len() + lane.geometry.parity.len(),
+                5
+            );
+            assigned.extend(
+                lane.geometry
+                    .information
+                    .iter()
+                    .map(|role| role.owner)
+                    .chain(lane.geometry.parity.iter().map(|role| role.holder)),
+            );
+        }
+        assert_eq!(
+            assigned,
+            peers.iter().map(|peer| peer.member.node_id).collect()
+        );
     }
 
     fn register_request_connection(
