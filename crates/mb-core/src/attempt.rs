@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    CodingGroupV2, MerkleCommitment, MerkleRangeProof, ModelError, NodeId, ShardRoleV2,
-    SignedRecord, canonical_bytes, challenged_leaf, merkle_verify_range, verify_sampled_codeword,
+    CodingGroupV2, CodingProfile, InformationRoleV2, MerkleCommitment, MerkleRangeProof,
+    ModelError, NodeId, ShardRoleV2, SignedRecord, canonical_bytes, challenged_leaf,
+    merkle_verify_range, merkle_zero_commitment, verify_sampled_codeword,
 };
 
 pub const CODING_ATTEMPT_PLAN_DOMAIN: &[u8] = b"mutualbackup/coding-attempt-plan/v1";
@@ -17,12 +18,113 @@ pub const CODING_TRANSCRIPT_DOMAIN: &[u8] = b"mutualbackup/coding-transcript/v1"
 
 /// The immutable, narrow delegation for one complete coding attempt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ParityPlacementV2 {
+    pub holder: NodeId,
+    pub failure_domain: String,
+    pub row: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CodingPlanGeometry {
+    pub format_version: u16,
+    pub guild_id: [u8; 32],
+    pub profile: CodingProfile,
+    pub information: Vec<InformationRoleV2>,
+    pub parity: Vec<ParityPlacementV2>,
+}
+
+impl CodingPlanGeometry {
+    pub fn validate(&self) -> Result<(), CodingAttemptError> {
+        self.profile
+            .validate()
+            .map_err(|_| CodingAttemptError::InvalidPlan)?;
+        if self.format_version != 1
+            || self.guild_id == [0; 32]
+            || self.information.len() != usize::from(self.profile.data_shards)
+            || self.parity.len() != usize::from(self.profile.parity_shards)
+        {
+            return Err(CodingAttemptError::InvalidPlan);
+        }
+        let mut domains = std::collections::BTreeSet::new();
+        for information in &self.information {
+            information
+                .sector
+                .commitment
+                .validate()
+                .map_err(|_| CodingAttemptError::InvalidPlan)?;
+            if information.owner == NodeId([0; 32])
+                || information.failure_domain.is_empty()
+                || information.failure_domain.len() > 256
+                || information.sector.id == [0; 32]
+                || information.sector.commitment.byte_len != self.profile.shard_size
+                || information.sector.logical_len > self.profile.shard_size
+                || !domains.insert(information.failure_domain.as_str())
+            {
+                return Err(CodingAttemptError::InvalidPlan);
+            }
+            if information.sector.virtual_zero {
+                if information.sector.logical_len != self.profile.shard_size
+                    || information.sector.commitment
+                        != merkle_zero_commitment(self.profile.shard_size)
+                            .map_err(|_| CodingAttemptError::InvalidPlan)?
+                {
+                    return Err(CodingAttemptError::InvalidPlan);
+                }
+            } else if information.sector.logical_len == 0 {
+                return Err(CodingAttemptError::InvalidPlan);
+            }
+        }
+        for (row, parity) in self.parity.iter().enumerate() {
+            if parity.holder == NodeId([0; 32])
+                || parity.row != row as u16
+                || parity.failure_domain.is_empty()
+                || parity.failure_domain.len() > 256
+                || !domains.insert(parity.failure_domain.as_str())
+            {
+                return Err(CodingAttemptError::InvalidPlan);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_group(&self, group: &CodingGroupV2) -> Result<(), CodingAttemptError> {
+        group.validate()?;
+        if group.guild_id != self.guild_id
+            || group.profile != self.profile
+            || group.roles.len() != self.information.len() + self.parity.len()
+        {
+            return Err(CodingAttemptError::InvalidTranscript);
+        }
+        for (index, information) in self.information.iter().enumerate() {
+            if group.roles[index] != ShardRoleV2::Information(information.clone()) {
+                return Err(CodingAttemptError::InvalidTranscript);
+            }
+        }
+        for (offset, placement) in self.parity.iter().enumerate() {
+            let Some(ShardRoleV2::Parity(parity)) =
+                group.roles.get(self.information.len() + offset)
+            else {
+                return Err(CodingAttemptError::InvalidTranscript);
+            };
+            if parity.holder != placement.holder
+                || parity.failure_domain != placement.failure_domain
+                || parity.row != placement.row
+            {
+                return Err(CodingAttemptError::InvalidTranscript);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The immutable, narrow delegation for one complete coding attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CodingAttemptPlan {
     pub format_version: u16,
     pub attempt_id: [u8; 16],
     pub checkpoint_hash: [u8; 32],
     pub membership_epoch: u64,
-    pub group: CodingGroupV2,
+    pub geometry: CodingPlanGeometry,
     pub delegator: NodeId,
     pub coding_coordinator: NodeId,
     pub verification_coordinator: NodeId,
@@ -31,7 +133,7 @@ pub struct CodingAttemptPlan {
 
 impl CodingAttemptPlan {
     pub fn validate(&self) -> Result<(), CodingAttemptError> {
-        self.group.validate()?;
+        self.geometry.validate()?;
         if self.format_version != 1
             || self.attempt_id == [0; 16]
             || self.checkpoint_hash == [0; 32]
@@ -53,14 +155,14 @@ impl CodingAttemptPlan {
     }
 }
 
-/// The coordinator's signed acceptance of the exact ordered input and output
-/// commitments in the delegated plan.
+/// The coordinator's signed result, binding the delegated inputs and placement
+/// geometry to the parity commitments produced by this attempt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CodingRootManifest {
     pub format_version: u16,
     pub attempt_id: [u8; 16],
     pub plan_hash: [u8; 32],
-    pub ordered_commitments: Vec<MerkleCommitment>,
+    pub group: CodingGroupV2,
 }
 
 /// A parity holder's durable fact that one attempt's bytes are present but not
@@ -195,32 +297,26 @@ pub fn replay_coding_transcript(
     transcript.plan.verify(CODING_ATTEMPT_PLAN_DOMAIN)?;
     let plan_hash = plan.hash()?;
 
-    let commitments = plan
-        .group
-        .roles
-        .iter()
-        .map(role_commitment)
-        .cloned()
-        .collect::<Vec<_>>();
     let manifest = &transcript.manifest.value;
     transcript.manifest.verify(CODING_ROOT_MANIFEST_DOMAIN)?;
     if transcript.manifest.signer != plan.coding_coordinator
         || manifest.format_version != 1
         || manifest.attempt_id != plan.attempt_id
         || manifest.plan_hash != plan_hash
-        || manifest.ordered_commitments != commitments
     {
         return Err(CodingAttemptError::InvalidTranscript);
     }
+    plan.geometry.validate_group(&manifest.group)?;
+    let group = &manifest.group;
 
-    let parity_start = usize::from(plan.group.profile.data_shards);
-    if transcript.staged_receipts.len() != usize::from(plan.group.profile.parity_shards) {
+    let parity_start = usize::from(group.profile.data_shards);
+    if transcript.staged_receipts.len() != usize::from(group.profile.parity_shards) {
         return Err(CodingAttemptError::Incomplete);
     }
     for (offset, receipt) in transcript.staged_receipts.iter().enumerate() {
         receipt.verify(STAGED_STORAGE_RECEIPT_DOMAIN)?;
         let index = parity_start + offset;
-        let ShardRoleV2::Parity(parity) = &plan.group.roles[index] else {
+        let ShardRoleV2::Parity(parity) = &group.roles[index] else {
             return Err(CodingAttemptError::InvalidTranscript);
         };
         let value = &receipt.value;
@@ -228,8 +324,8 @@ pub fn replay_coding_transcript(
             || value.format_version != 1
             || value.attempt_id != plan.attempt_id
             || value.plan_hash != plan_hash
-            || value.guild_id != plan.group.guild_id
-            || value.group_id != plan.group.id
+            || value.guild_id != group.guild_id
+            || value.group_id != group.id
             || usize::from(value.shard_index) != index
             || value.holder != parity.holder
             || value.commitment != parity.commitment
@@ -258,12 +354,12 @@ pub fn replay_coding_transcript(
     }
     let challenge = coding_challenge(plan_hash, reveal.value.nonce, evidence_hash);
 
-    if transcript.openings.len() != plan.group.roles.len() {
+    if transcript.openings.len() != group.roles.len() {
         return Err(CodingAttemptError::Incomplete);
     }
     let mut symbols = Vec::with_capacity(transcript.openings.len());
     for (index, opening) in transcript.openings.iter().enumerate() {
-        let (holder, expected_commitment) = role_holder_and_commitment(&plan.group.roles[index]);
+        let (holder, expected_commitment) = role_holder_and_commitment(&group.roles[index]);
         opening.verify(CODING_SHARD_OPENING_DOMAIN)?;
         if opening.signer != holder {
             return Err(CodingAttemptError::InvalidTranscript);
@@ -300,19 +396,12 @@ pub fn replay_coding_transcript(
         };
         symbols.push(symbol);
     }
-    if verify_sampled_codeword(plan.group.profile, &symbols).is_err() {
+    if verify_sampled_codeword(group.profile, &symbols).is_err() {
         return Ok(CodingReplayFinding::InvalidCoding {
             coordinator: plan.coding_coordinator,
         });
     }
     Ok(CodingReplayFinding::Verified)
-}
-
-fn role_commitment(role: &ShardRoleV2) -> &MerkleCommitment {
-    match role {
-        ShardRoleV2::Information(information) => &information.sector.commitment,
-        ShardRoleV2::Parity(parity) => &parity.commitment,
-    }
 }
 
 fn role_holder_and_commitment(role: &ShardRoleV2) -> (NodeId, &MerkleCommitment) {
@@ -389,7 +478,29 @@ mod tests {
             attempt_id: [4; 16],
             checkpoint_hash: [5; 32],
             membership_epoch: 3,
-            group,
+            geometry: CodingPlanGeometry {
+                format_version: 1,
+                guild_id: group.guild_id,
+                profile,
+                information: group.roles[..4]
+                    .iter()
+                    .map(|role| match role {
+                        ShardRoleV2::Information(information) => information.clone(),
+                        ShardRoleV2::Parity(_) => unreachable!(),
+                    })
+                    .collect(),
+                parity: group.roles[4..]
+                    .iter()
+                    .map(|role| match role {
+                        ShardRoleV2::Parity(parity) => ParityPlacementV2 {
+                            holder: parity.holder,
+                            failure_domain: parity.failure_domain.clone(),
+                            row: parity.row,
+                        },
+                        ShardRoleV2::Information(_) => unreachable!(),
+                    })
+                    .collect(),
+            },
             delegator: keys[6].node_id(),
             coding_coordinator: keys[7].node_id(),
             verification_coordinator: keys[8].node_id(),
@@ -397,28 +508,20 @@ mod tests {
         };
         let plan_hash = plan.hash().unwrap();
         let plan = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, &keys[6]).unwrap();
-        let ordered_commitments = plan
-            .value
-            .group
-            .roles
-            .iter()
-            .map(role_commitment)
-            .cloned()
-            .collect();
         let manifest = SignedRecord::sign(
             CODING_ROOT_MANIFEST_DOMAIN,
             CodingRootManifest {
                 format_version: 1,
                 attempt_id: [4; 16],
                 plan_hash,
-                ordered_commitments,
+                group,
             },
             &keys[7],
         )
         .unwrap();
         let staged_receipts = (4_usize..6)
             .map(|index| {
-                let ShardRoleV2::Parity(parity) = &plan.value.group.roles[index] else {
+                let ShardRoleV2::Parity(parity) = &manifest.value.group.roles[index] else {
                     unreachable!();
                 };
                 SignedRecord::sign(
@@ -428,7 +531,7 @@ mod tests {
                         attempt_id: [4; 16],
                         plan_hash,
                         guild_id: [8; 32],
-                        group_id: plan.value.group.id,
+                        group_id: manifest.value.group.id,
                         shard_index: index as u16,
                         holder: parity.holder,
                         commitment: parity.commitment.clone(),
@@ -469,7 +572,7 @@ mod tests {
             .enumerate()
             .map(|(index, bytes)| {
                 let (holder, commitment) =
-                    role_holder_and_commitment(&plan.value.group.roles[index]);
+                    role_holder_and_commitment(&manifest.value.group.roles[index]);
                 let leaf = challenged_leaf(&challenge, commitment).unwrap();
                 SignedRecord::sign(
                     CODING_SHARD_OPENING_DOMAIN,
@@ -543,37 +646,36 @@ mod tests {
             *byte ^= 1;
         }
         let commitment = merkle_commit(&shards[5]).unwrap();
-        let ShardRoleV2::Parity(parity) = &mut transcript.value.plan.value.group.roles[5] else {
+        let ShardRoleV2::Parity(parity) = &mut transcript.value.manifest.value.group.roles[5]
+        else {
             unreachable!();
         };
         parity.commitment = commitment.clone();
-        transcript.value.plan.value.group.id =
-            transcript.value.plan.value.group.calculate_id().unwrap();
+        transcript.value.manifest.value.group.id = transcript
+            .value
+            .manifest
+            .value
+            .group
+            .calculate_id()
+            .unwrap();
         let plan_hash = transcript.value.plan.value.hash().unwrap();
-        transcript.value.plan = SignedRecord::sign(
-            CODING_ATTEMPT_PLAN_DOMAIN,
-            transcript.value.plan.value,
-            &keys[6],
-        )
-        .unwrap();
-        transcript.value.manifest.value.plan_hash = plan_hash;
-        transcript.value.manifest.value.ordered_commitments[5] = commitment.clone();
         transcript.value.manifest = SignedRecord::sign(
             CODING_ROOT_MANIFEST_DOMAIN,
             transcript.value.manifest.value,
             &keys[7],
         )
         .unwrap();
-        let ShardRoleV2::Parity(parity) = &transcript.value.plan.value.group.roles[5] else {
+        let ShardRoleV2::Parity(parity) = &transcript.value.manifest.value.group.roles[5] else {
             unreachable!();
         };
         for (offset, receipt) in transcript.value.staged_receipts.iter_mut().enumerate() {
             let index = 4 + offset;
-            let ShardRoleV2::Parity(role) = &transcript.value.plan.value.group.roles[index] else {
+            let ShardRoleV2::Parity(role) = &transcript.value.manifest.value.group.roles[index]
+            else {
                 unreachable!();
             };
             receipt.value.plan_hash = plan_hash;
-            receipt.value.group_id = transcript.value.plan.value.group.id;
+            receipt.value.group_id = transcript.value.manifest.value.group.id;
             receipt.value.commitment = role.commitment.clone();
             *receipt = SignedRecord::sign(
                 STAGED_STORAGE_RECEIPT_DOMAIN,
@@ -609,7 +711,7 @@ mod tests {
         .unwrap();
         for (index, opening) in transcript.value.openings.iter_mut().enumerate() {
             let (_, expected) =
-                role_holder_and_commitment(&transcript.value.plan.value.group.roles[index]);
+                role_holder_and_commitment(&transcript.value.manifest.value.group.roles[index]);
             let leaf = challenged_leaf(&challenge, expected).unwrap();
             opening.value.plan_hash = plan_hash;
             opening.value.challenge = challenge;

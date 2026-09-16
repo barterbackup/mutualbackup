@@ -50,7 +50,11 @@ peer-request =
         information: [3*3 byte-vector],
         object: parity-object
       } }
-  / { "StageCodingParity": { plan: signed-coding-attempt-plan, object: variable-parity-object } }
+  / { "StageCodingParity": {
+        plan: signed-coding-attempt-plan,
+        manifest: signed-coding-root-manifest,
+        object: variable-parity-object
+      } }
   / { "CommitCodingChallenge": { plan: signed-coding-attempt-plan } }
   / { "RevealCodingChallenge": {
         plan: signed-coding-attempt-plan,
@@ -59,6 +63,7 @@ peer-request =
       } }
   / { "GetCodingOpening": {
         plan: signed-coding-attempt-plan,
+        manifest: signed-coding-root-manifest,
         challenge: bytes32-array,
         shard_index: uint
       } }

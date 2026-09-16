@@ -81,6 +81,7 @@ pub(super) enum PeerRequest {
     },
     StageCodingParity {
         plan: Box<SignedRecord<CodingAttemptPlan>>,
+        manifest: Box<SignedRecord<CodingRootManifest>>,
         object: VariableParityObject,
     },
     CommitCodingChallenge {
@@ -93,6 +94,7 @@ pub(super) enum PeerRequest {
     },
     GetCodingOpening {
         plan: Box<SignedRecord<CodingAttemptPlan>>,
+        manifest: Box<SignedRecord<CodingRootManifest>>,
         challenge: [u8; 32],
         shard_index: u16,
     },
@@ -264,9 +266,9 @@ impl PeerRequest {
             Self::StageCodingParity { plan, .. }
             | Self::GetCodingOpening { plan, .. }
             | Self::CommitCodingChallenge { plan }
-            | Self::RevealCodingChallenge { plan, .. } => Some(plan.value.group.guild_id),
+            | Self::RevealCodingChallenge { plan, .. } => Some(plan.value.geometry.guild_id),
             Self::ActivateCodingParity { transcript } => {
-                Some(transcript.value.plan.value.group.guild_id)
+                Some(transcript.value.plan.value.geometry.guild_id)
             }
         }
     }

@@ -2036,10 +2036,11 @@ impl P2pClient {
         &self,
         peer: NodeId,
         plan: SignedRecord<CodingAttemptPlan>,
+        manifest: SignedRecord<CodingRootManifest>,
         object: VariableParityObject,
     ) -> Result<SignedRecord<StagedStorageReceipt>> {
         let expected_attempt = plan.value.attempt_id;
-        let expected_group = plan.value.group.id;
+        let expected_group = manifest.value.group.id;
         let expected_index = object.shard_index;
         let expected_commitment = object.commitment.clone();
         let response = self
@@ -2047,6 +2048,7 @@ impl P2pClient {
                 peer,
                 PeerRequest::StageCodingParity {
                     plan: Box::new(plan),
+                    manifest: Box::new(manifest),
                     object,
                 },
             )
@@ -2131,6 +2133,7 @@ impl P2pClient {
         &self,
         peer: NodeId,
         plan: SignedRecord<CodingAttemptPlan>,
+        manifest: SignedRecord<CodingRootManifest>,
         challenge: [u8; 32],
         shard_index: u16,
     ) -> Result<SignedRecord<CodingShardOpening>> {
@@ -2140,6 +2143,7 @@ impl P2pClient {
                 peer,
                 PeerRequest::GetCodingOpening {
                     plan: Box::new(plan),
+                    manifest: Box::new(manifest),
                     challenge,
                     shard_index,
                 },

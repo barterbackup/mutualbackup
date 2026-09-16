@@ -951,8 +951,12 @@ fn execute_peer_request(
                 &object,
             )?,
         )),
-        PeerRequest::StageCodingParity { plan, object } => Ok(PeerResponse::StagedStorageReceipt(
-            node.stage_coding_parity(&plan, &object)?,
+        PeerRequest::StageCodingParity {
+            plan,
+            manifest,
+            object,
+        } => Ok(PeerResponse::StagedStorageReceipt(
+            node.stage_coding_parity(&plan, &manifest, &object)?,
         )),
         PeerRequest::CommitCodingChallenge { plan } => Ok(PeerResponse::CodingChallengeCommitment(
             node.commit_coding_challenge(&plan)?,
@@ -966,10 +970,11 @@ fn execute_peer_request(
         )),
         PeerRequest::GetCodingOpening {
             plan,
+            manifest,
             challenge,
             shard_index,
         } => Ok(PeerResponse::CodingShardOpening(
-            node.coding_shard_opening(&plan, challenge, shard_index)?,
+            node.coding_shard_opening(&plan, &manifest, challenge, shard_index)?,
         )),
         PeerRequest::ActivateCodingParity { transcript } => {
             node.activate_coding_attempt(&transcript)?;

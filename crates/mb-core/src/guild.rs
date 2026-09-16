@@ -547,7 +547,7 @@ impl DynamicGuildState {
     ) -> Result<(), GuildStateError> {
         plan.validate()
             .map_err(|_| GuildStateError::InvalidAttempt)?;
-        if plan.group.guild_id != self.guild_id
+        if plan.geometry.guild_id != self.guild_id
             || plan.membership_epoch != self.membership_epoch
             || plan.expires_at_unix_seconds < now_unix_seconds
         {
@@ -561,8 +561,23 @@ impl DynamicGuildState {
             self.require_active_member(node)
                 .map_err(|_| GuildStateError::InvalidAttempt)?;
         }
-        self.validate_new_group_placement(&plan.group)
-            .map_err(|_| GuildStateError::InvalidAttempt)
+        for information in &plan.geometry.information {
+            let member = self
+                .require_active_member(information.owner)
+                .map_err(|_| GuildStateError::InvalidAttempt)?;
+            if member.member.failure_domain != information.failure_domain {
+                return Err(GuildStateError::InvalidAttempt);
+            }
+        }
+        for parity in &plan.geometry.parity {
+            let member = self
+                .require_active_member(parity.holder)
+                .map_err(|_| GuildStateError::InvalidAttempt)?;
+            if member.member.failure_domain != parity.failure_domain {
+                return Err(GuildStateError::InvalidAttempt);
+            }
+        }
+        Ok(())
     }
 
     pub fn writer_key_for_retained_revision(&self, owner: NodeId, epoch: u64) -> Option<[u8; 32]> {
@@ -802,7 +817,8 @@ pub enum GuildStateError {
 #[cfg(test)]
 mod tests {
     use crate::{
-        CodingProfile, InformationRoleV2, ParityRoleV2, RangeSectorRef, Seed, encode, merkle_commit,
+        CodingPlanGeometry, CodingProfile, InformationRoleV2, ParityPlacementV2, ParityRoleV2,
+        RangeSectorRef, Seed, encode, merkle_commit,
     };
 
     use super::*;
@@ -902,12 +918,35 @@ mod tests {
         let keys = keys(8);
         let mut state = state(&keys);
         let group = group(&state, &keys);
+        let geometry = CodingPlanGeometry {
+            format_version: 1,
+            guild_id: group.guild_id,
+            profile: group.profile,
+            information: group.roles[..3]
+                .iter()
+                .map(|role| match role {
+                    ShardRoleV2::Information(information) => information.clone(),
+                    ShardRoleV2::Parity(_) => unreachable!(),
+                })
+                .collect(),
+            parity: group.roles[3..]
+                .iter()
+                .map(|role| match role {
+                    ShardRoleV2::Parity(parity) => ParityPlacementV2 {
+                        holder: parity.holder,
+                        failure_domain: parity.failure_domain.clone(),
+                        row: parity.row,
+                    },
+                    ShardRoleV2::Information(_) => unreachable!(),
+                })
+                .collect(),
+        };
         let plan = CodingAttemptPlan {
             format_version: 1,
             attempt_id: [3; 16],
             checkpoint_hash: [4; 32],
             membership_epoch: state.membership_epoch,
-            group,
+            geometry,
             delegator: keys[0].node_id(),
             coding_coordinator: keys[1].node_id(),
             verification_coordinator: keys[2].node_id(),
