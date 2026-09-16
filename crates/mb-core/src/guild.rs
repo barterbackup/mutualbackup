@@ -15,7 +15,7 @@ use crate::{
 
 pub const GUILD_EVENT_DOMAIN: &[u8] = b"mutualbackup/guild-event/v1";
 const MAX_DYNAMIC_MEMBERS: usize = 256;
-const MAX_EVENT_TAIL: usize = 4096;
+pub const MAX_GUILD_EVENT_TAIL: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum QuorumRule {
@@ -332,6 +332,25 @@ impl DynamicGuildState {
         Ok(())
     }
 
+    /// Validate the exact next event and its resulting state before collecting
+    /// signatures. Quorum authorization remains a property of `verify_event`.
+    pub fn validate_event_proposal(&self, event: &GuildEvent) -> Result<(), GuildStateError> {
+        self.validate()?;
+        if event.format_version != 1
+            || event.guild_id != self.guild_id
+            || event.sequence != self.event_sequence + 1
+            || event.parent != self.event_head
+        {
+            return Err(GuildStateError::InvalidEvent);
+        }
+        let mut next = self.clone();
+        next.apply_verified_event(&QuorumGuildEvent {
+            event: event.clone(),
+            signatures: Vec::new(),
+        })?;
+        Ok(())
+    }
+
     pub fn apply_event(&mut self, certified: &QuorumGuildEvent) -> Result<(), GuildStateError> {
         self.verify_event(certified)?;
         let mut next = self.clone();
@@ -524,8 +543,7 @@ impl DynamicGuildState {
         if tail.format_version != 1
             || tail.base_sequence != self.event_sequence
             || tail.base_head != self.event_head
-            || tail.events.is_empty()
-            || tail.events.len() > MAX_EVENT_TAIL
+            || tail.events.len() > MAX_GUILD_EVENT_TAIL
         {
             return Err(GuildStateError::InvalidEvent);
         }
@@ -545,11 +563,23 @@ impl DynamicGuildState {
         plan: &CodingAttemptPlan,
         now_unix_seconds: u64,
     ) -> Result<(), GuildStateError> {
+        self.validate_attempt_authority(plan)?;
+        if plan.expires_at_unix_seconds < now_unix_seconds {
+            return Err(GuildStateError::InvalidAttempt);
+        }
+        Ok(())
+    }
+
+    /// Validate the membership epoch, active roles, and placement snapshot
+    /// without consulting the attempt deadline. This is used only to finish
+    /// replay or cleanup work whose authority was established before expiry.
+    pub fn validate_attempt_authority(
+        &self,
+        plan: &CodingAttemptPlan,
+    ) -> Result<(), GuildStateError> {
         plan.validate()
             .map_err(|_| GuildStateError::InvalidAttempt)?;
-        if plan.geometry.guild_id != self.guild_id
-            || plan.membership_epoch != self.membership_epoch
-            || plan.expires_at_unix_seconds < now_unix_seconds
+        if plan.geometry.guild_id != self.guild_id || plan.membership_epoch != self.membership_epoch
         {
             return Err(GuildStateError::InvalidAttempt);
         }

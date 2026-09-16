@@ -658,6 +658,13 @@ fn process_peer_request(
             }
             _ => false,
         };
+        let trusted_coordinator_admission = caller == config.trusted_coordinator
+            && (guild_onboarding
+                || node_guard.dynamic_guild_state()?.is_none()
+                || request.guild_scope().is_none()
+                || request.guild_scope().is_some_and(|guild_id| {
+                    node_guard.authorize_member(&guild_id, caller).is_ok()
+                }));
         let certified_coordinator = request
             .guild_scope()
             .map(|guild_id| node_guard.guild_coordinator(&guild_id))
@@ -667,6 +674,12 @@ fn process_peer_request(
         let member_submission = matches!(
             &request,
             PeerRequest::SubmitBackup { .. } | PeerRequest::StoreRepairShard { .. }
+        ) && request
+            .guild_scope()
+            .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
+        let guild_transition = matches!(
+            &request,
+            PeerRequest::SignGuildEvent { .. } | PeerRequest::InstallGuildEvent { .. }
         ) && request
             .guild_scope()
             .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
@@ -698,11 +711,12 @@ fn process_peer_request(
             .guild_scope()
             .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
         if mutation_kind.is_some()
-            && caller != config.trusted_coordinator
+            && !trusted_coordinator_admission
             && !certified_coordinator
             && !self_authorized_admission
             && !guild_onboarding
             && !member_submission
+            && !guild_transition
             && !delegated_coding
         {
             bail!("caller is not the configured guild coordinator");
@@ -896,6 +910,13 @@ fn execute_read_request(
         PeerRequest::GetGuildGenesis { guild_id } => Ok(PeerResponse::GuildGenesis(Box::new(
             node.installed_guild_certificate(guild_id)?,
         ))),
+        PeerRequest::GetGuildEventTail {
+            guild_id: _,
+            base_sequence,
+            base_head,
+        } => Ok(PeerResponse::GuildEventTail(Box::new(
+            node.guild_event_tail(base_sequence, base_head)?,
+        ))),
         PeerRequest::ExchangeEndpoints { guild_id } => Ok(PeerResponse::EndpointRecords(
             node.peer_exchange_endpoints(guild_id)?,
         )),
@@ -924,6 +945,13 @@ fn execute_peer_request(
         )),
         PeerRequest::InstallGuildGenesis { certificate, peers } => {
             node.install_guild_genesis(*certificate, peers)?;
+            Ok(PeerResponse::Ack)
+        }
+        PeerRequest::SignGuildEvent { event } => Ok(PeerResponse::GuildEventSignature(
+            node.sign_guild_event_proposal(&event)?,
+        )),
+        PeerRequest::InstallGuildEvent { certified } => {
+            node.install_guild_event(*certified)?;
             Ok(PeerResponse::Ack)
         }
         PeerRequest::SubmitBackup { descriptor } => Ok(PeerResponse::BackupJob(
@@ -1144,6 +1172,9 @@ fn execute_peer_request(
         }
         PeerRequest::GetGuildGenesis { .. } => {
             bail!("guild genesis read was sent to a mutation worker")
+        }
+        PeerRequest::GetGuildEventTail { .. } => {
+            bail!("guild event-tail read was sent to a mutation worker")
         }
         PeerRequest::ExchangeEndpoints { .. } => {
             bail!("endpoint exchange was sent to a mutation worker")

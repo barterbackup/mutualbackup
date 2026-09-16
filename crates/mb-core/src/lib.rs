@@ -35,8 +35,8 @@ pub use content::{
 };
 pub use guild::{
     DynamicGuildState, DynamicMember, GUILD_EVENT_DOMAIN, GuildEvent, GuildEventKind,
-    GuildEventTail, GuildStateError, QuorumGuildEvent, QuorumPolicy, QuorumRule,
-    RecoveryEpochSecret, RecoveryKeyEnvelope, RecoveryKeyEpoch, RetainedCodingGroup,
+    GuildEventTail, GuildStateError, MAX_GUILD_EVENT_TAIL, QuorumGuildEvent, QuorumPolicy,
+    QuorumRule, RecoveryEpochSecret, RecoveryKeyEnvelope, RecoveryKeyEpoch, RetainedCodingGroup,
     WriterKeyEpoch, create_recovery_key_envelope, open_recovery_key_envelope, sign_guild_event,
 };
 pub use keys::{

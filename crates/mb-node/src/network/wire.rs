@@ -1,9 +1,9 @@
 use mb_core::{
     CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal, CodingGroup,
     CodingRootManifest, CodingShardOpening, CodingVerificationTranscript, EndpointRecord,
-    GuildGenesis, GuildInvite, Member, MemberSignature, MerkleRangeProof, NodeId,
-    QuorumGuildGenesis, SectorId, SectorRef, SignedRecord, StagedStorageReceipt,
-    StorageAcknowledgement,
+    GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, Member, MemberSignature,
+    MerkleRangeProof, NodeId, QuorumGuildEvent, QuorumGuildGenesis, SectorId, SectorRef,
+    SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
 };
 use mb_store::{ParityObject, VariableParityObject};
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,17 @@ pub(super) enum PeerRequest {
     },
     GetGuildGenesis {
         guild_id: [u8; 32],
+    },
+    GetGuildEventTail {
+        guild_id: [u8; 32],
+        base_sequence: u64,
+        base_head: [u8; 32],
+    },
+    SignGuildEvent {
+        event: Box<GuildEvent>,
+    },
+    InstallGuildEvent {
+        certified: Box<QuorumGuildEvent>,
     },
     ExchangeEndpoints {
         guild_id: [u8; 32],
@@ -224,6 +235,7 @@ impl PeerRequest {
                 | Self::GetCheckpointPage { .. }
                 | Self::BackupStatus { .. }
                 | Self::GetGuildGenesis { .. }
+                | Self::GetGuildEventTail { .. }
                 | Self::ExchangeEndpoints { .. }
         )
     }
@@ -238,12 +250,15 @@ impl PeerRequest {
             | Self::GetCheckpointPage { .. }
             | Self::BackupStatus { .. }
             | Self::GetGuildGenesis { .. }
+            | Self::GetGuildEventTail { .. }
             | Self::ExchangeEndpoints { .. } => None,
             #[cfg(test)]
             Self::BeginCommit { .. } => Some("begin-commit"),
             Self::JoinGuild { .. } => Some("join-guild"),
             Self::ProposeGuildGenesis { .. } => Some("propose-guild-genesis"),
             Self::InstallGuildGenesis { .. } => Some("install-guild-genesis"),
+            Self::SignGuildEvent { .. } => Some("sign-guild-event"),
+            Self::InstallGuildEvent { .. } => Some("install-guild-event"),
             Self::SubmitBackup { .. } => Some("submit-backup"),
             #[cfg(test)]
             Self::PrepareSource { .. } => Some("prepare-source"),
@@ -302,6 +317,9 @@ impl PeerRequest {
             | Self::BuildRecoveryRecord { guild_id, .. }
             | Self::AuthorizeRecoveryPublisher { guild_id, .. } => Some(*guild_id),
             Self::GetGuildGenesis { guild_id } => Some(*guild_id),
+            Self::GetGuildEventTail { guild_id, .. } => Some(*guild_id),
+            Self::SignGuildEvent { event } => Some(event.guild_id),
+            Self::InstallGuildEvent { certified } => Some(certified.event.guild_id),
             Self::PublishParity { object, .. } => Some(object.guild_id),
             Self::StageCodingParity { plan, .. }
             | Self::ReserveCodingParity { plan, .. }
@@ -362,6 +380,7 @@ pub(super) enum PeerResponse {
     MerkleRange(MerkleRangeProof),
     CheckpointSignature(MemberSignature),
     GuildGenesisSignature(MemberSignature),
+    GuildEventSignature(MemberSignature),
     BackupJob(BackupJob),
     StorageAcknowledgement(SignedRecord<StorageAcknowledgement>),
     StagedStorageReceipt(SignedRecord<StagedStorageReceipt>),
@@ -373,6 +392,7 @@ pub(super) enum PeerResponse {
     CodingShardOpening(SignedRecord<CodingShardOpening>),
     CodingVerificationTranscript(Box<SignedRecord<CodingVerificationTranscript>>),
     GuildGenesis(Box<QuorumGuildGenesis>),
+    GuildEventTail(Box<GuildEventTail>),
     EndpointRecords(Vec<SignedRecord<EndpointRecord>>),
     CheckpointPage {
         total_pages: u32,

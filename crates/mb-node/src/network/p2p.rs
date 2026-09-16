@@ -29,15 +29,15 @@ use mb_core::{
     CODING_CHALLENGE_COMMITMENT_DOMAIN, CODING_CHALLENGE_REVEAL_DOMAIN,
     CODING_SHARD_OPENING_DOMAIN, CodingAttemptPlan, CodingChallengeCommitment,
     CodingChallengeReveal, CodingGroup, CodingRootManifest, CodingShardOpening,
-    CodingVerificationTranscript, GuildCheckpoint, GuildGenesis, GuildInvite, InformationRole,
-    MERKLE_LEAF_SIZE, Member, MemberSignature, NodeId, ParityRole, QuorumCheckpoint,
-    QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN, STAGED_STORAGE_RECEIPT_DOMAIN,
-    STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole, ShardRoleV2, SignedRecord,
-    StagedStorageReceipt, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
-    V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES,
-    V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE,
-    canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical, encode_3_2,
-    merkle_commit, open_recovery_record, replay_coding_transcript, sector_root,
+    CodingVerificationTranscript, GuildCheckpoint, GuildEvent, GuildEventTail, GuildGenesis,
+    GuildInvite, InformationRole, MERKLE_LEAF_SIZE, Member, MemberSignature, NodeId, ParityRole,
+    QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN,
+    STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole,
+    ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement, UserRevision,
+    V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS,
+    V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS,
+    V1_SECTOR_SIZE, canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical,
+    encode_3_2, merkle_commit, open_recovery_record, replay_coding_transcript, sector_root,
 };
 use mb_store::{ParityObject, VariableParityObject};
 use uuid::Uuid;
@@ -1799,6 +1799,73 @@ impl P2pClient {
             .await?;
         if !matches!(response, PeerResponse::Ack) {
             bail!("peer returned the wrong response to guild genesis installation");
+        }
+        Ok(())
+    }
+
+    pub async fn guild_event_tail(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        base_sequence: u64,
+        base_head: [u8; 32],
+    ) -> Result<GuildEventTail> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::GetGuildEventTail {
+                    guild_id,
+                    base_sequence,
+                    base_head,
+                },
+            )
+            .await?;
+        let PeerResponse::GuildEventTail(tail) = response else {
+            bail!("peer returned the wrong guild event-tail response");
+        };
+        if tail.base_sequence != base_sequence || tail.base_head != base_head {
+            bail!("peer returned a guild event tail for another base");
+        }
+        Ok(*tail)
+    }
+
+    pub async fn sign_guild_event(
+        &self,
+        peer: NodeId,
+        event: GuildEvent,
+    ) -> Result<MemberSignature> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::SignGuildEvent {
+                    event: Box::new(event),
+                },
+            )
+            .await?;
+        let PeerResponse::GuildEventSignature(signature) = response else {
+            bail!("peer returned the wrong guild event signature response");
+        };
+        if signature.signer != peer {
+            bail!("peer returned another member's guild event signature");
+        }
+        Ok(signature)
+    }
+
+    pub async fn install_guild_event(
+        &self,
+        peer: NodeId,
+        certified: QuorumGuildEvent,
+    ) -> Result<()> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::InstallGuildEvent {
+                    certified: Box::new(certified),
+                },
+            )
+            .await?;
+        if !matches!(response, PeerResponse::Ack) {
+            bail!("peer returned the wrong guild event installation response");
         }
         Ok(())
     }
