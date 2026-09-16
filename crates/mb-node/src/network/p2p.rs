@@ -6034,11 +6034,84 @@ pub async fn run_dht_publications(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Res
 
 pub async fn run_peer_exchange(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {
     loop {
+        if let Err(error) = sync_guild_events_once(node.clone(), &p2p).await {
+            tracing::warn!(%error, "guild event-tail synchronization failed");
+        }
         if let Err(error) = exchange_guild_endpoints_once(node.clone(), &p2p).await {
             tracing::warn!(%error, "guild peer endpoint exchange failed");
         }
         tokio::time::sleep(PEER_EXCHANGE_INTERVAL).await;
     }
+}
+
+async fn sync_guild_events_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
+    let (guild, state, local_id) = node_blocking(node.clone(), |node| {
+        Ok((
+            node.guild_summary()?,
+            node.dynamic_guild_state()?,
+            node.keys().node_id(),
+        ))
+    })
+    .await?;
+    let (Some(guild), Some(state)) = (guild, state) else {
+        return Ok(());
+    };
+    if !matches!(guild.phase, GuildPhase::Active) {
+        return Ok(());
+    }
+    let guild_id = guild.guild_id;
+    let base_sequence = state.event_sequence;
+    let base_head = state.event_head;
+    let mut requests = FuturesUnordered::new();
+    for peer in guild
+        .peers
+        .into_iter()
+        .filter(|peer| peer.member.node_id != local_id)
+    {
+        for endpoint in peer.endpoints {
+            if let Ok(address) = endpoint.parse() {
+                let _ = p2p.add_peer_address(peer.member.node_id, address).await;
+            }
+        }
+        let member = peer.member.node_id;
+        requests.push(async move {
+            (
+                member,
+                p2p.guild_event_tail(member, guild_id, base_sequence, base_head)
+                    .await,
+            )
+        });
+    }
+    let mut tails = Vec::new();
+    while let Some((source, result)) = requests.next().await {
+        let tail = match result {
+            Ok(tail) => tail,
+            Err(error) => {
+                tracing::debug!(%source, %error, "guild event-tail request failed");
+                continue;
+            }
+        };
+        let mut replay = state.clone();
+        if let Err(error) = replay.apply_tail(&tail) {
+            tracing::warn!(%source, %error, "peer returned an invalid guild event tail");
+            continue;
+        }
+        tails.push((source, tail));
+    }
+    tails.sort_by_key(|(source, tail)| (std::cmp::Reverse(tail.events.len()), *source));
+    let Some((_, selected)) = tails.first() else {
+        return Ok(());
+    };
+    for (_, tail) in tails.iter().skip(1) {
+        let shared = selected.events.len().min(tail.events.len());
+        if selected.events[..shared] != tail.events[..shared] {
+            bail!("peers returned conflicting quorum-certified guild event tails");
+        }
+    }
+    for event in selected.events.clone() {
+        node_blocking(node.clone(), move |node| node.install_guild_event(event)).await?;
+    }
+    Ok(())
 }
 
 pub async fn run_relay_membership_sync(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {

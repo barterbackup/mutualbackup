@@ -497,6 +497,14 @@ impl NodeReader {
         authorize_member(&self.control, guild_id, caller)
     }
 
+    pub(crate) fn authorize_historical_member(
+        &self,
+        guild_id: &[u8; 32],
+        caller: NodeId,
+    ) -> Result<()> {
+        authorize_historical_member(&self.control, guild_id, caller)
+    }
+
     pub(crate) fn backup_job(&self, guild_id: [u8; 32], revision_id: Uuid) -> Result<BackupJob> {
         backup_job(&self.control, guild_id, revision_id)
     }
@@ -6017,6 +6025,27 @@ fn authorize_member(control: &ControlStore, guild_id: &[u8; 32], caller: NodeId)
     Ok(())
 }
 
+fn authorize_historical_member(
+    control: &ControlStore,
+    guild_id: &[u8; 32],
+    caller: NodeId,
+) -> Result<()> {
+    if let Some(bytes) = control.get_record("guild-dynamic-state", b"primary")? {
+        let state: DynamicGuildState = decode_canonical(&bytes)?;
+        state.validate()?;
+        if state.guild_id == *guild_id
+            && state
+                .members
+                .iter()
+                .any(|member| member.member.node_id == caller)
+        {
+            return Ok(());
+        }
+        anyhow::bail!("caller is not a historical guild member");
+    }
+    authorize_member(control, guild_id, caller)
+}
+
 fn guild_coordinator(control: &ControlStore, guild_id: &[u8; 32]) -> Result<Option<NodeId>> {
     let Some(bytes) = control.get_record("guild-installed", b"primary")? else {
         return Ok(None);
@@ -7732,6 +7761,11 @@ mod tests {
         node.authorize_member(&guild_id, added_keys.node_id())
             .unwrap();
         assert!(node.authorize_member(&guild_id, removed).is_err());
+        let reader = node.reader_config().open().unwrap();
+        reader
+            .authorize_historical_member(&guild_id, removed)
+            .unwrap();
+        assert!(reader.authorize_member(&guild_id, removed).is_err());
         let summary = node.guild_summary().unwrap().unwrap();
         assert_eq!(summary.peers.len(), 5);
         assert!(

@@ -626,12 +626,14 @@ fn process_peer_request(
                             | PeerRequest::GetPreparedRevisionPage { .. }
                     ) && caller == config.trusted_coordinator)
                 {
-                    reader.authorize_member(
-                        &request
-                            .guild_scope()
-                            .context("guild-scoped request has no scope")?,
-                        caller,
-                    )?;
+                    let guild_id = request
+                        .guild_scope()
+                        .context("guild-scoped request has no scope")?;
+                    if matches!(&request, PeerRequest::GetGuildEventTail { .. }) {
+                        reader.authorize_historical_member(&guild_id, caller)?;
+                    } else {
+                        reader.authorize_member(&guild_id, caller)?;
+                    }
                 }
                 execute_read_request(&reader, config, request)
             })();
