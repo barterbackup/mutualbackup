@@ -29,16 +29,18 @@ use mb_core::{
     CODING_CHALLENGE_COMMITMENT_DOMAIN, CODING_CHALLENGE_REVEAL_DOMAIN,
     CODING_FAILURE_REPORT_DOMAIN, CODING_SHARD_OPENING_DOMAIN, CodingAttemptPlan,
     CodingChallengeCommitment, CodingChallengeReveal, CodingFailureReport, CodingGroup,
-    CodingRootManifest, CodingShardOpening, CodingVerificationTranscript, GuildCheckpoint,
-    GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, InformationRole, MERKLE_LEAF_SIZE,
-    Member, MemberSignature, NodeId, ParityRole, QuorumCheckpoint, QuorumGuildEvent,
-    QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN, STAGED_STORAGE_RECEIPT_DOMAIN,
+    CodingGroupV2, CodingPlanGeometry, CodingProfile, CodingRootManifest, CodingShardOpening,
+    CodingVerificationTranscript, GuildCheckpoint, GuildEvent, GuildEventTail, GuildGenesis,
+    GuildInvite, InformationRole, InformationRoleV2, MERKLE_LEAF_SIZE, Member, MemberSignature,
+    NodeId, ParityPlacementV2, ParityRole, ParityRoleV2, QuorumCheckpoint, QuorumGuildEvent,
+    QuorumGuildGenesis, RECOVERY_LOCATOR_DOMAIN, RangeSectorRef, STAGED_STORAGE_RECEIPT_DOMAIN,
     STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole, ShardRoleV2, SignedRecord,
     StagedStorageReceipt, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
     V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES,
     V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_RS_PARITY_SHARDS, V1_SECTOR_SIZE,
-    canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical, encode_3_2,
-    merkle_commit, open_recovery_record, replay_coding_transcript, sector_root,
+    canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical, encode,
+    encode_3_2, merkle_commit, merkle_zero_commitment, open_recovery_record,
+    replay_coding_transcript, sector_root,
 };
 use mb_store::{ParityObject, VariableParityObject};
 use uuid::Uuid;
@@ -5718,6 +5720,40 @@ pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -
             continue;
         }
 
+        if let Some(job) = node_blocking(node.clone(), |node| node.claim_coding_launch()).await? {
+            let attempt_id = job.plan.value.attempt_id;
+            let coordinator = job.plan.value.coding_coordinator;
+            let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
+            let result = if coordinator == local_id {
+                let plan = job.plan.clone();
+                node_blocking(node.clone(), move |node| {
+                    node.enqueue_delegated_coding(local_id, plan)
+                })
+                .await
+            } else {
+                p2p.delegate_coding_attempt(coordinator, job.plan.clone())
+                    .await
+            };
+            match result {
+                Ok(()) => {
+                    node_blocking(node.clone(), move |node| {
+                        node.complete_coding_launch(attempt_id)
+                    })
+                    .await?;
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    node_blocking(node.clone(), move |node| {
+                        node.defer_coding_launch(attempt_id, &message)
+                    })
+                    .await?;
+                    tracing::warn!(?attempt_id, %error, "coding launch deferred");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+            continue;
+        }
+
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
@@ -8333,13 +8369,197 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
+struct VariableCodingLane {
+    geometry: CodingPlanGeometry,
+    expected_group: CodingGroupV2,
+}
+
+fn variable_coding_lane(
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    ordinal: u64,
+    source: &SectorRef,
+    source_bytes: &[u8],
+    peers: &[crate::GuildPeer],
+) -> Result<VariableCodingLane> {
+    if peers.len() != 5 || source_bytes.len() != V1_SECTOR_SIZE {
+        bail!("variable coding lane requires five placements and one complete source sector");
+    }
+    let profile = CodingProfile::new(3, 2, V1_SECTOR_SIZE as u32);
+    profile.validate()?;
+    let zero_commitment = merkle_zero_commitment(profile.shard_size)?;
+    let source_commitment = merkle_commit(source_bytes)?;
+    let virtual_sector = |lane: u8| {
+        let mut hasher = blake3::Hasher::new_derive_key("mutualbackup virtual zero information v1");
+        hasher.update(&guild_id);
+        hasher.update(revision_id.as_bytes());
+        hasher.update(&ordinal.to_be_bytes());
+        hasher.update(&[lane]);
+        let mut id = *hasher.finalize().as_bytes();
+        if id == [0; 32] {
+            id[0] = 1;
+        }
+        id
+    };
+    let information = vec![
+        InformationRoleV2 {
+            owner: peers[0].member.node_id,
+            failure_domain: peers[0].member.failure_domain.clone(),
+            sector: RangeSectorRef {
+                id: source.id,
+                commitment: source_commitment,
+                logical_len: source.logical_len,
+                virtual_zero: false,
+            },
+        },
+        InformationRoleV2 {
+            owner: peers[1].member.node_id,
+            failure_domain: peers[1].member.failure_domain.clone(),
+            sector: RangeSectorRef {
+                id: virtual_sector(0),
+                commitment: zero_commitment.clone(),
+                logical_len: profile.shard_size,
+                virtual_zero: true,
+            },
+        },
+        InformationRoleV2 {
+            owner: peers[2].member.node_id,
+            failure_domain: peers[2].member.failure_domain.clone(),
+            sector: RangeSectorRef {
+                id: virtual_sector(1),
+                commitment: zero_commitment,
+                logical_len: profile.shard_size,
+                virtual_zero: true,
+            },
+        },
+    ];
+    let parity = vec![
+        ParityPlacementV2 {
+            holder: peers[3].member.node_id,
+            failure_domain: peers[3].member.failure_domain.clone(),
+            row: 0,
+        },
+        ParityPlacementV2 {
+            holder: peers[4].member.node_id,
+            failure_domain: peers[4].member.failure_domain.clone(),
+            row: 1,
+        },
+    ];
+    let geometry = CodingPlanGeometry {
+        format_version: 1,
+        guild_id,
+        profile,
+        information,
+        parity,
+    };
+    geometry.validate()?;
+    let encoded = encode(
+        profile,
+        vec![
+            source_bytes.to_vec(),
+            vec![0; V1_SECTOR_SIZE],
+            vec![0; V1_SECTOR_SIZE],
+        ],
+    )?;
+    let mut roles = geometry
+        .information
+        .iter()
+        .cloned()
+        .map(ShardRoleV2::Information)
+        .collect::<Vec<_>>();
+    for (offset, placement) in geometry.parity.iter().enumerate() {
+        roles.push(ShardRoleV2::Parity(ParityRoleV2 {
+            holder: placement.holder,
+            failure_domain: placement.failure_domain.clone(),
+            row: placement.row,
+            commitment: merkle_commit(&encoded[3 + offset])?,
+        }));
+    }
+    let mut expected_group = CodingGroupV2 {
+        id: [0; 32],
+        format_version: 2,
+        guild_id,
+        profile,
+        roles,
+    };
+    expected_group.id = expected_group.calculate_id()?;
+    expected_group.validate()?;
+    Ok(VariableCodingLane {
+        geometry,
+        expected_group,
+    })
+}
+
+async fn queue_variable_coding_lanes(
+    node: Arc<Mutex<Node>>,
+    checkpoint_hash: [u8; 32],
+    membership_epoch: u64,
+    peers: &[crate::GuildPeer],
+    lanes: Vec<VariableCodingLane>,
+) -> Result<()> {
+    let coding_coordinator = peers
+        .first()
+        .context("variable coding lane has no participant coordinator")?
+        .member
+        .node_id;
+    let verification_coordinator = peers
+        .get(1)
+        .context("variable coding lane has no separate verifier")?
+        .member
+        .node_id;
+    let expires_at_unix_seconds = unix_seconds()
+        .checked_add(24 * 60 * 60)
+        .context("coding launch expiry overflow")?;
+    for lane in lanes {
+        let expected_group_id = lane.expected_group.id;
+        let already_committed = node_blocking(node.clone(), move |node| {
+            Ok(node.dynamic_guild_state()?.is_some_and(|state| {
+                state
+                    .coding_groups
+                    .iter()
+                    .any(|retained| retained.group.id == expected_group_id)
+            }))
+        })
+        .await?;
+        if already_committed {
+            continue;
+        }
+        let mut hasher = blake3::Hasher::new_derive_key("mutualbackup initial coding attempt v1");
+        hasher.update(&checkpoint_hash);
+        hasher.update(&lane.expected_group.id);
+        let mut attempt_id: [u8; 16] = hasher.finalize().as_bytes()[..16]
+            .try_into()
+            .expect("fixed digest prefix");
+        if attempt_id == [0; 16] {
+            attempt_id[0] = 1;
+        }
+        node_blocking(node.clone(), move |node| {
+            let plan = node.sign_coding_attempt_plan(CodingAttemptPlan {
+                format_version: 1,
+                attempt_id,
+                checkpoint_hash,
+                membership_epoch,
+                geometry: lane.geometry,
+                delegator: node.keys().node_id(),
+                coding_coordinator,
+                verification_coordinator,
+                expires_at_unix_seconds,
+            })?;
+            node.enqueue_coding_launch(plan)?;
+            Ok(())
+        })
+        .await?;
+    }
+    Ok(())
+}
+
 async fn commit_backup_job(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
     job: &BackupJob,
 ) -> Result<[u8; 32]> {
     let guild_id = job.descriptor.guild_id;
-    let (certificate, mut peers, local_id, previous, retention_revisions) =
+    let (certificate, mut peers, local_id, previous, retention_revisions, membership_epoch) =
         node_blocking(node.clone(), move |node| {
             let certificate = node
                 .installed_guild_certificate()?
@@ -8354,6 +8574,9 @@ async fn commit_backup_job(
                 node.keys().node_id(),
                 previous,
                 node.retention_revisions()?,
+                node.dynamic_guild_state()?
+                    .context("coordinator has no dynamic guild state")?
+                    .membership_epoch,
             ))
         })
         .await?;
@@ -8407,6 +8630,7 @@ async fn commit_backup_job(
     }
 
     let mut new_groups = Vec::with_capacity(target_sectors.len());
+    let mut variable_lanes = Vec::with_capacity(target_sectors.len());
     for (ordinal, target) in target_sectors.iter().enumerate() {
         let owner_bytes = load_p2p_sector(
             node.clone(),
@@ -8420,6 +8644,14 @@ async fn commit_backup_job(
         if owner_bytes.len() != V1_SECTOR_SIZE || sector_root(&owner_bytes) != target.root {
             bail!("owner sector failed its committed root or fixed size");
         }
+        variable_lanes.push(variable_coding_lane(
+            guild_id,
+            revision.value.revision_id,
+            ordinal as u64,
+            target,
+            &owner_bytes,
+            &peers,
+        )?);
         let helper_a = ensure_p2p_filler(
             node.clone(),
             p2p,
@@ -8556,6 +8788,14 @@ async fn commit_backup_job(
     };
     checkpoint.validate()?;
     let checkpoint_hash = checkpoint.hash()?;
+    queue_variable_coding_lanes(
+        node.clone(),
+        checkpoint_hash,
+        membership_epoch,
+        &peers,
+        variable_lanes,
+    )
+    .await?;
     let body = canonical_bytes(&checkpoint)?;
     publish_p2p_checkpoint_object(
         node.clone(),
@@ -8967,6 +9207,63 @@ mod tests {
             max_connections: 8,
             tor_mode: TorMode::DisableTor,
         }
+    }
+
+    #[test]
+    fn production_variable_lane_eliminates_filler_transfers() {
+        let peers = (0_u8..5)
+            .map(|index| {
+                let keys = KeyMaterial::from_seed(&Seed::from_bytes([index + 30; 32]));
+                crate::GuildPeer {
+                    member: Member {
+                        node_id: keys.node_id(),
+                        recovery_public_key: keys.recovery_public_key(),
+                        failure_domain: format!("lane-domain-{index}"),
+                    },
+                    endpoints: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let bytes = vec![77; V1_SECTOR_SIZE];
+        let source = SectorRef {
+            id: [31; 32],
+            root: sector_root(&bytes),
+            logical_len: 123,
+        };
+        let lane = variable_coding_lane(
+            [32; 32],
+            Uuid::from_bytes([33; 16]),
+            7,
+            &source,
+            &bytes,
+            &peers,
+        )
+        .unwrap();
+        lane.expected_group.validate().unwrap();
+        assert!(!lane.geometry.information[0].sector.virtual_zero);
+        assert!(
+            lane.geometry.information[1..]
+                .iter()
+                .all(|role| role.sector.virtual_zero)
+        );
+        let plan = CodingAttemptPlan {
+            format_version: 1,
+            attempt_id: [34; 16],
+            checkpoint_hash: [35; 32],
+            membership_epoch: 1,
+            geometry: lane.geometry,
+            delegator: peers[4].member.node_id,
+            coding_coordinator: peers[0].member.node_id,
+            verification_coordinator: peers[1].member.node_id,
+            expires_at_unix_seconds: 1,
+        };
+        let estimate = coding_transfer_estimate(&plan).unwrap();
+        assert_eq!(estimate.information_shard_transfers, 0);
+        assert_eq!(estimate.parity_shard_transfers, 2);
+        assert_eq!(
+            estimate.bulk_bytes,
+            2 * u64::try_from(V1_SECTOR_SIZE).unwrap()
+        );
     }
 
     fn register_request_connection(

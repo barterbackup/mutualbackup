@@ -134,6 +134,14 @@ pub(crate) struct CodingRetryJob {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CodingLaunchJob {
+    pub format_version: u16,
+    pub plan: SignedRecord<CodingAttemptPlan>,
+    pub dispatched: bool,
+    pub error: Option<String>,
+}
+
 const GUILD_INVITE_DOMAIN: &[u8] = b"mutualbackup/guild-invite/v1";
 
 #[cfg(test)]
@@ -2667,6 +2675,97 @@ impl Node {
         Ok(signed)
     }
 
+    pub(crate) fn enqueue_coding_launch(
+        &self,
+        plan: SignedRecord<CodingAttemptPlan>,
+    ) -> Result<SignedRecord<CodingAttemptPlan>> {
+        self.validate_coding_attempt_plan(&plan)?;
+        if plan.value.delegator != self.keys.node_id() {
+            anyhow::bail!("only the coding delegator may queue its launch");
+        }
+        let attempt_id = plan.value.attempt_id;
+        if let Some(bytes) = self.control.get_record("coding-launch-job", &attempt_id)? {
+            let mut existing: CodingLaunchJob = decode_canonical(&bytes)?;
+            if existing.format_version != 1
+                || existing.plan.value.attempt_id != attempt_id
+                || existing.plan.value.checkpoint_hash != plan.value.checkpoint_hash
+                || existing.plan.value.geometry != plan.value.geometry
+                || existing.plan.value.delegator != plan.value.delegator
+                || existing.plan.value.coding_coordinator != plan.value.coding_coordinator
+                || existing.plan.value.verification_coordinator
+                    != plan.value.verification_coordinator
+            {
+                anyhow::bail!("coding launch conflicts with a durable attempt");
+            }
+            existing.dispatched = false;
+            existing.error = None;
+            self.put_coding_launch_job(&existing)?;
+            return Ok(existing.plan);
+        }
+        self.put_coding_launch_job(&CodingLaunchJob {
+            format_version: 1,
+            plan: plan.clone(),
+            dispatched: false,
+            error: None,
+        })?;
+        Ok(plan)
+    }
+
+    pub(crate) fn claim_coding_launch(&self) -> Result<Option<CodingLaunchJob>> {
+        for (_, bytes) in self.control.records("coding-launch-job")? {
+            let job: CodingLaunchJob = decode_canonical(&bytes)?;
+            if job.format_version != 1
+                || job.plan.value.delegator != self.keys.node_id()
+                || job.plan.value.attempt_id == [0; 16]
+            {
+                anyhow::bail!("durable coding launch job is invalid");
+            }
+            if !job.dispatched {
+                self.validate_coding_attempt_plan(&job.plan)?;
+                return Ok(Some(job));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn complete_coding_launch(&self, attempt_id: [u8; 16]) -> Result<()> {
+        self.update_coding_launch(attempt_id, true, None)
+    }
+
+    pub(crate) fn defer_coding_launch(&self, attempt_id: [u8; 16], error: &str) -> Result<()> {
+        let mut error = error.to_owned();
+        truncate_utf8(&mut error, 4096);
+        self.update_coding_launch(attempt_id, false, Some(error))
+    }
+
+    fn update_coding_launch(
+        &self,
+        attempt_id: [u8; 16],
+        dispatched: bool,
+        error: Option<String>,
+    ) -> Result<()> {
+        let bytes = self
+            .control
+            .get_record("coding-launch-job", &attempt_id)?
+            .context("coding launch job is unavailable")?;
+        let mut job: CodingLaunchJob = decode_canonical(&bytes)?;
+        if job.format_version != 1 || job.plan.value.attempt_id != attempt_id {
+            anyhow::bail!("durable coding launch job is invalid");
+        }
+        job.dispatched = dispatched;
+        job.error = error;
+        self.put_coding_launch_job(&job)
+    }
+
+    fn put_coding_launch_job(&self, job: &CodingLaunchJob) -> Result<()> {
+        self.control.put_record(
+            "coding-launch-job",
+            &job.plan.value.attempt_id,
+            &canonical_bytes(job)?,
+        )?;
+        Ok(())
+    }
+
     pub fn enqueue_delegated_coding(
         &self,
         caller: NodeId,
@@ -3481,7 +3580,10 @@ impl Node {
             retry_plan: None,
             complete: false,
             error: None,
-        })
+        })?;
+        self.control
+            .delete_record("coding-launch-job", &attempt_id)?;
+        Ok(())
     }
 
     pub(crate) fn claim_coding_retry(&self) -> Result<Option<CodingRetryJob>> {
@@ -3608,7 +3710,10 @@ impl Node {
     }
 
     pub(crate) fn complete_coding_activation(&self, attempt_id: [u8; 16]) -> Result<()> {
-        self.update_coding_activation_job(attempt_id, true, None)
+        self.update_coding_activation_job(attempt_id, true, None)?;
+        self.control
+            .delete_record("coding-launch-job", &attempt_id)?;
+        Ok(())
     }
 
     pub(crate) fn defer_coding_activation(&self, attempt_id: [u8; 16], error: &str) -> Result<()> {
@@ -8166,6 +8271,12 @@ mod tests {
             &keys[remote[0]],
         )
         .unwrap();
+        assert_eq!(node.enqueue_coding_launch(failed.clone()).unwrap(), failed);
+        drop(node);
+        let node = Node::open(temp.path(), local_seed.clone()).unwrap();
+        assert_eq!(node.claim_coding_launch().unwrap().unwrap().plan, failed);
+        node.complete_coding_launch([212; 16]).unwrap();
+        assert!(node.claim_coding_launch().unwrap().is_none());
         node.accept_coding_failure(keys[remote[0]].node_id(), failure.clone())
             .unwrap();
         node.accept_coding_failure(keys[remote[0]].node_id(), failure)
@@ -8173,6 +8284,7 @@ mod tests {
 
         drop(node);
         let mut node = Node::open(temp.path(), local_seed).unwrap();
+        assert!(node.claim_coding_launch().unwrap().is_none());
         let retry = node.claim_coding_retry().unwrap().unwrap();
         assert!(retry.retry_plan.is_none());
         let fresh = node
