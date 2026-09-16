@@ -19,10 +19,11 @@ pub use attempt::{
     CODING_FAILURE_REPORT_DOMAIN, CODING_ROOT_MANIFEST_DOMAIN, CODING_SHARD_OPENING_DOMAIN,
     CODING_TRANSCRIPT_DOMAIN, CodingAttemptError, CodingAttemptPlan, CodingChallengeCommitment,
     CodingChallengeReveal, CodingFailureReport, CodingPlanGeometry, CodingReplayFinding,
-    CodingRootManifest, CodingShardOpening, CodingTransferEstimate, CodingVerificationTranscript,
-    ParityPlacementV2, STAGED_STORAGE_RECEIPT_DOMAIN, StagedStorageReceipt, coding_challenge,
-    coding_challenge_commitment, coding_evidence_hash, coding_transfer_estimate,
-    encode_coding_attempt, replay_coding_transcript,
+    CodingRootManifest, CodingSampleGuarantee, CodingShardOpening, CodingTransferEstimate,
+    CodingVerificationTranscript, ParityPlacementV2, STAGED_STORAGE_RECEIPT_DOMAIN,
+    StagedStorageReceipt, coding_challenge, coding_challenge_commitment, coding_evidence_hash,
+    coding_sample_guarantee, coding_transfer_estimate, encode_coding_attempt,
+    replay_coding_transcript,
 };
 pub use coding::{
     CodingError, CodingProfile, MAX_CODING_SHARDS, MAX_PROFILE_SHARD_SIZE, MIN_PROFILE_SHARD_SIZE,

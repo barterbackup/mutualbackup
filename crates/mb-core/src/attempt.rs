@@ -4,10 +4,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::{
-    CodingError, CodingGroupV2, CodingProfile, InformationRoleV2, KeyMaterial, MerkleCommitment,
-    MerkleRangeProof, ModelError, NodeId, ParityRoleV2, ShardRoleV2, SignedRecord, canonical_bytes,
-    challenged_leaf, encode, merkle_commit, merkle_verify_range, merkle_zero_commitment,
-    sector_root, verify_sampled_codeword,
+    CodingError, CodingGroupV2, CodingProfile, InformationRoleV2, KeyMaterial, MERKLE_LEAF_SIZE,
+    MerkleCommitment, MerkleRangeProof, ModelError, NodeId, ParityRoleV2, ShardRoleV2,
+    SignedRecord, canonical_bytes, challenged_leaf, encode, merkle_commit, merkle_verify_range,
+    merkle_zero_commitment, sector_root, verify_sampled_codeword,
 };
 
 pub const CODING_ATTEMPT_PLAN_DOMAIN: &[u8] = b"mutualbackup/coding-attempt-plan/v1";
@@ -391,6 +391,41 @@ pub struct CodingTransferEstimate {
     pub information_shard_transfers: u16,
     pub parity_shard_transfers: u16,
     pub bulk_bytes: u64,
+}
+
+/// Exact coverage of the protocol's one uniformly selected Merkle leaf.
+///
+/// A proof authenticates the selected bytes but provides no coverage for
+/// other leaves. If `bad_leaves` leaves are corrupt, detection is
+/// `bad_leaves / leaf_count` and the miss probability is the complementary
+/// fraction. The counts deliberately avoid floating-point ambiguity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CodingSampleGuarantee {
+    pub leaf_count: u32,
+    pub bad_leaves: u32,
+    pub detection_numerator: u32,
+    pub miss_numerator: u32,
+    pub denominator: u32,
+}
+
+pub fn coding_sample_guarantee(
+    commitment: &MerkleCommitment,
+    bad_leaves: u32,
+) -> Result<CodingSampleGuarantee, CodingAttemptError> {
+    commitment
+        .validate()
+        .map_err(|_| CodingAttemptError::InvalidPlan)?;
+    let leaf_count = commitment.byte_len / MERKLE_LEAF_SIZE as u32;
+    if bad_leaves > leaf_count {
+        return Err(CodingAttemptError::InvalidPlan);
+    }
+    Ok(CodingSampleGuarantee {
+        leaf_count,
+        bad_leaves,
+        detection_numerator: bad_leaves,
+        miss_numerator: leaf_count - bad_leaves,
+        denominator: leaf_count,
+    })
 }
 
 /// Count the complete-shard-equivalent bulk paths in one immutable plan.
@@ -951,6 +986,28 @@ mod tests {
             keys,
             shards,
         )
+    }
+
+    #[test]
+    fn one_sample_guarantee_does_not_overstate_sparse_corruption_detection() {
+        let commitment = merkle_commit(&vec![0; 64 * 1024]).unwrap();
+        assert_eq!(
+            coding_sample_guarantee(&commitment, 1).unwrap(),
+            CodingSampleGuarantee {
+                leaf_count: 4096,
+                bad_leaves: 1,
+                detection_numerator: 1,
+                miss_numerator: 4095,
+                denominator: 4096,
+            }
+        );
+        assert_eq!(
+            coding_sample_guarantee(&commitment, 4096)
+                .unwrap()
+                .miss_numerator,
+            0
+        );
+        assert!(coding_sample_guarantee(&commitment, 4097).is_err());
     }
 
     #[test]
