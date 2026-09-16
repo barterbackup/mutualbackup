@@ -1751,6 +1751,7 @@ pub async fn commit_source_over_network_with_intent(
         revisions: vec![revision],
         coding_groups: groups,
         authority: None,
+        packing_catalog: None,
     };
     checkpoint_body.validate()?;
     let checkpoint_hash = checkpoint_body.hash()?;

@@ -269,6 +269,7 @@ impl PrototypeGuild {
                 revisions: vec![revision],
                 coding_groups: groups,
                 authority: None,
+                packing_catalog: None,
             },
             signatures: Vec::new(),
         };

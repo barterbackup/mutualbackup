@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::guild::RecoveryKeyEnvelope;
 use crate::keys::{KeyMaterial, NodeId, RecoveryPublicKey, signing_payload};
+use crate::packing::{PackedCatalog, packing_protected_root};
 use crate::recovery::{RecoveryLocator, SealedRecoveryRecord};
 use crate::{
     CodingProfile, MerkleCommitment, MerkleRangeProof, V1_CIPHER_PROFILE, V1_MAX_CODING_GROUPS,
@@ -523,6 +524,7 @@ pub struct GuildCheckpoint {
     pub revisions: Vec<SignedRecord<UserRevision>>,
     pub coding_groups: Vec<CodingGroup>,
     pub authority: Option<CheckpointAuthority>,
+    pub packing_catalog: Option<PackedCatalog>,
 }
 
 impl Serialize for GuildCheckpoint {
@@ -530,12 +532,17 @@ impl Serialize for GuildCheckpoint {
     where
         S: Serializer,
     {
-        let field_count = match (self.format_version, self.authority) {
-            (3 | 4, None) => 10,
-            (5 | 6, Some(_)) => 11,
+        let field_count = match (
+            self.format_version,
+            self.authority,
+            self.packing_catalog.as_ref(),
+        ) {
+            (3 | 4, None, None) => 10,
+            (5 | 6, Some(_), None) => 11,
+            (7, Some(_), Some(_)) => 12,
             _ => {
                 return Err(serde::ser::Error::custom(
-                    "invalid checkpoint authority version",
+                    "invalid checkpoint extension version",
                 ));
             }
         };
@@ -552,6 +559,9 @@ impl Serialize for GuildCheckpoint {
         tuple.serialize_element(&self.coding_groups)?;
         if let Some(authority) = self.authority {
             tuple.serialize_element(&authority)?;
+        }
+        if let Some(catalog) = &self.packing_catalog {
+            tuple.serialize_element(catalog)?;
         }
         tuple.end()
     }
@@ -588,7 +598,12 @@ impl<'de> Deserialize<'de> for GuildCheckpoint {
                 let coding_groups = next_checkpoint_field(&mut sequence, "coding groups")?;
                 let authority = match format_version {
                     3 | 4 => None,
-                    5 | 6 => Some(next_checkpoint_field(&mut sequence, "authority")?),
+                    5..=7 => Some(next_checkpoint_field(&mut sequence, "authority")?),
+                    _ => return Err(serde::de::Error::custom("invalid checkpoint version")),
+                };
+                let packing_catalog = match format_version {
+                    3..=6 => None,
+                    7 => Some(next_checkpoint_field(&mut sequence, "packing catalog")?),
                     _ => return Err(serde::de::Error::custom("invalid checkpoint version")),
                 };
                 Ok(GuildCheckpoint {
@@ -603,11 +618,12 @@ impl<'de> Deserialize<'de> for GuildCheckpoint {
                     revisions,
                     coding_groups,
                     authority,
+                    packing_catalog,
                 })
             }
         }
 
-        deserializer.deserialize_tuple(11, GuildCheckpointVisitor)
+        deserializer.deserialize_tuple(12, GuildCheckpointVisitor)
     }
 }
 
@@ -635,14 +651,14 @@ pub struct QuorumCheckpoint {
 
 impl GuildCheckpoint {
     pub fn validate(&self) -> Result<(), ModelError> {
-        if !matches!(self.format_version, 3..=6)
+        if !matches!(self.format_version, 3..=7)
             || self.genesis_hash == [0; 32]
             || self.generation == 0
             || self.generation > i64::MAX as u64
             || (self.generation == 1) != self.parent.is_none()
             || match self.format_version {
                 3 => self.members.len() != 5,
-                4..=6 => self.members.is_empty() || self.members.len() > 256,
+                4..=7 => self.members.is_empty() || self.members.len() > 256,
                 _ => true,
             }
             || self.revisions.is_empty()
@@ -652,12 +668,21 @@ impl GuildCheckpoint {
         {
             return Err(ModelError::InvalidCheckpoint);
         }
-        match (self.format_version, self.authority) {
-            (3 | 4, None) => {}
-            (5 | 6, Some(authority))
+        match (
+            self.format_version,
+            self.authority,
+            self.packing_catalog.as_ref(),
+        ) {
+            (3 | 4, None, None) => {}
+            (5 | 6, Some(authority), None)
                 if authority.format_version == 1
                     && authority.membership_epoch > 0
                     && authority.quorum.required(self.members.len()).is_ok() => {}
+            (7, Some(authority), Some(catalog))
+                if authority.format_version == 1
+                    && authority.membership_epoch > 0
+                    && authority.quorum.required(self.members.len()).is_ok()
+                    && catalog.validate().is_ok() => {}
             _ => return Err(ModelError::InvalidCheckpoint),
         }
         let mut member_ids = std::collections::BTreeSet::new();
@@ -683,6 +708,7 @@ impl GuildCheckpoint {
         let mut revision_ids = std::collections::BTreeSet::new();
         let mut revision_order = None;
         let mut revision_sectors = std::collections::BTreeMap::new();
+        let mut scoped_revision_sectors = std::collections::BTreeMap::new();
         let mut revision_heads =
             std::collections::BTreeMap::<(NodeId, Uuid), (u64, [u8; 32], u64)>::new();
         let mut fences = std::collections::BTreeMap::<(NodeId, u64), [u8; 32]>::new();
@@ -774,14 +800,23 @@ impl GuildCheckpoint {
                 .iter()
                 .chain(&revision.value.data_sectors)
             {
-                if reference.logical_len == 0
-                    || reference.logical_len as usize > V1_SECTOR_SIZE
-                    || revision_sectors
-                        .insert(reference.id, (revision.value.owner, reference.clone()))
-                        .is_some()
+                if reference.logical_len == 0 || reference.logical_len as usize > V1_SECTOR_SIZE {
+                    return Err(ModelError::InvalidCheckpoint);
+                }
+                let scoped = (
+                    revision.value.owner,
+                    revision.value.protected_root_id,
+                    reference.clone(),
+                );
+                if scoped_revision_sectors
+                    .insert(reference.id, scoped.clone())
+                    .is_some_and(|previous| previous != scoped)
                 {
                     return Err(ModelError::InvalidCheckpoint);
                 }
+                revision_sectors
+                    .entry(reference.id)
+                    .or_insert((revision.value.owner, reference.clone()));
             }
             revision_heads.insert(
                 chain,
@@ -808,6 +843,42 @@ impl GuildCheckpoint {
             .all(|chain| revision_heads.contains_key(chain))
         {
             return Err(ModelError::InvalidCheckpoint);
+        }
+        if let Some(catalog) = &self.packing_catalog {
+            let expected = scoped_revision_sectors
+                .iter()
+                .map(|(sector_id, (owner, protected_root_id, _))| {
+                    (
+                        *owner,
+                        packing_protected_root(*protected_root_id),
+                        *sector_id,
+                    )
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut actual = std::collections::BTreeMap::<_, u64>::new();
+            for source in catalog
+                .sectors
+                .iter()
+                .flat_map(|sector| &sector.slots)
+                .filter_map(|slot| slot.source())
+            {
+                *actual
+                    .entry((
+                        source.id.owner,
+                        source.id.protected_root,
+                        source.id.object_id,
+                    ))
+                    .or_default() += u64::from(source.logical_len);
+            }
+            if actual
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                != expected
+                || actual.values().any(|bytes| *bytes != V1_SECTOR_SIZE as u64)
+            {
+                return Err(ModelError::InvalidCheckpoint);
+            }
         }
 
         let mut group_ids = std::collections::BTreeSet::new();
@@ -1589,6 +1660,7 @@ mod tests {
                 revisions: vec![revision],
                 coding_groups: vec![group],
                 authority: None,
+                packing_catalog: None,
             },
             signatures: Vec::new(),
         };
@@ -1726,6 +1798,44 @@ mod tests {
         assert_eq!(
             decode_canonical::<GuildCheckpoint>(&root_scoped_bytes).unwrap(),
             root_scoped_checkpoint
+        );
+        let packing_inputs = root_scoped_checkpoint
+            .revisions
+            .iter()
+            .flat_map(|revision| {
+                revision
+                    .value
+                    .metadata_sectors
+                    .iter()
+                    .chain(&revision.value.data_sectors)
+                    .map(move |reference| crate::PackingInput {
+                        owner: revision.value.owner,
+                        protected_root: crate::packing_protected_root(
+                            revision.value.protected_root_id,
+                        ),
+                        object_id: reference.id,
+                        bytes: vec![reference.id[0]; V1_SECTOR_SIZE],
+                    })
+            })
+            .collect();
+        let packing = crate::pack_incremental(
+            crate::PackingProfile {
+                format_version: 1,
+                sector_size: V1_SECTOR_SIZE as u32,
+                slot_size: 16 * 1024,
+            },
+            None,
+            packing_inputs,
+        )
+        .unwrap();
+        let mut packed_checkpoint = root_scoped_checkpoint.clone();
+        packed_checkpoint.format_version = 7;
+        packed_checkpoint.packing_catalog = Some(packing.catalog);
+        packed_checkpoint.validate().unwrap();
+        let packed_bytes = canonical_bytes(&packed_checkpoint).unwrap();
+        assert_eq!(
+            decode_canonical::<GuildCheckpoint>(&packed_bytes).unwrap(),
+            packed_checkpoint
         );
         let mut invalid_signature = policy_quorum.signatures[0].clone();
         invalid_signature.signature[0] ^= 1;

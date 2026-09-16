@@ -584,7 +584,7 @@ old layout readability. Its complete node library suite and warning-free core/
 node Clippy gate passed locally. No remote compilation server was used.
 
 - [x] **M5-01 / P1 — Protect multiple named roots with independent revision chains.**
-  Signed revision format 3 and checkpoint format 6 bind every revision and
+  Signed revision format 3 and checkpoint format 6 or later bind every revision and
   retention tombstone to a protected-root UUID. The node keeps durable heads,
   dirty state, watcher signals, automatic scheduling, status, explicit backup
   selection, snapshot selection, and retention per root. Recovery atomically
@@ -593,13 +593,17 @@ node Clippy gate passed locally. No remote compilation server was used.
   recovery-store, local-control, and restart regressions pass; the ignored
   provisioned Btrfs/QUIC gate now covers two roots for one owner and exact-root
   restore.
-- [ ] **M5-02 / P1 — Integrate stable-slot incremental packing into production.**
-  `mb_core::pack_incremental` and `unpack_object` are exercised only by core
-  tests. The production backup path groups complete 64 KiB owner sectors into
-  coding lanes and never persists or consumes a `PackedCatalog`. Connect the
-  authenticated packing catalog to capture, coding, recovery, and restore, and
-  prove unchanged slots/ranges are reused across updates from different roots
-  and owners.
+- [x] **M5-02 / P1 — Integrate stable-slot incremental packing into production.**
+  Checkpoint format 7 authenticates the incremental `PackedCatalog`, including
+  each packed sector's flat root and Merkle commitment. Backup packs all
+  retained signed sectors into stable 16 KiB slots, persists the resulting
+  64 KiB sectors, and codes their catalog IDs through the variable protocol.
+  Coverage, lifecycle replacement, delayed GC, seed recovery, normal repair,
+  and restore all resolve signed revision sectors through that catalog.
+  Repacking can reuse a prior locally stored or reconstructed packed copy when
+  an original owner is offline. Core partial-unpack and layout regressions plus
+  node persistence/reopen coverage pass; the production Btrfs/QUIC gate checks
+  stable slot positions across updates from two owners and two roots.
 - [ ] **M5-03 / P2 — Rank a delegated coder by every bulk lane path.**
   `coding_candidate_path_rank` observes only the checkpoint coordinator's
   current path to a candidate. It does not establish the candidate's direct or
@@ -608,7 +612,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   preferring participants and retaining relay/onion availability.
 - [ ] **M5-04 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
-  assertion, now corrected to version 6, but the provisioned Btrfs production
+  assertion, now corrected to version 7, but the provisioned Btrfs production
   path has not been rerun for the reopened work. Run formatting, locked
   all-target workspace tests, warning-free locked all-target Clippy, and the
   local reflink/network acceptance gate after M5-01 through M5-03 close.

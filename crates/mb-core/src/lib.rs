@@ -55,7 +55,7 @@ pub use model::{
 pub use packing::{
     PackedCatalog, PackedSector, PackedSectorDescriptor, PackedSlot, PackedSourceChunk,
     PackingError, PackingInput, PackingMetrics, PackingProfile, PackingResult, SourceChunkId,
-    pack_incremental, unpack_object,
+    pack_incremental, packing_protected_root, unpack_object, unpack_object_from_sectors,
 };
 pub use range::{
     MERKLE_LEAF_SIZE, MERKLE_SUITE_V1, MerkleCommitment, MerkleError, MerkleRangeProof,

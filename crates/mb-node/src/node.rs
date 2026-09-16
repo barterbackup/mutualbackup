@@ -12,16 +12,17 @@ use mb_core::{
     CodingFailureReport, CodingGroupV2, CodingReplayFinding, CodingRootManifest,
     CodingShardOpening, CodingVerificationTranscript, DynamicGuildState, EndpointRecord,
     GuildCheckpoint, GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, KeyMaterial,
-    MAX_GUILD_EVENT_TAIL, Member, MemberSignature, NodeId, QuorumCheckpoint, QuorumGuildEvent,
-    QuorumGuildGenesis, QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN, RecoveryBundle,
-    RecoveryLocator, STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId,
-    SectorRef, Seed, ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt,
-    StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision, V1_CATALOG_PAGE_BYTES,
-    V1_MAX_CATALOG_PAGES, V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes, challenged_leaf,
-    coding_challenge_commitment, coding_evidence_hash, decode_canonical, encode_coding_attempt,
-    merkle_commit, merkle_open_range, merkle_open_zero_range, open_recovery_key_envelope,
-    open_recovery_record, replay_coding_transcript, seal_recovery_record, sector_root,
-    sign_guild_event, synthetic_filler_sector,
+    MAX_GUILD_EVENT_TAIL, Member, MemberSignature, NodeId, PackedSector, PackingProfile,
+    PackingResult, QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy,
+    QuorumRule, RECOVERY_LOCATOR_DOMAIN, RecoveryBundle, RecoveryLocator,
+    STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, Seed,
+    ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
+    USER_REVISION_DOMAIN, UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_PAGES,
+    V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes, challenged_leaf, coding_challenge_commitment,
+    coding_evidence_hash, decode_canonical, encode_coding_attempt, merkle_commit,
+    merkle_open_range, merkle_open_zero_range, open_recovery_key_envelope, open_recovery_record,
+    replay_coding_transcript, seal_recovery_record, sector_root, sign_guild_event,
+    synthetic_filler_sector,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
@@ -70,6 +71,13 @@ struct RecoveryAttempt {
     guild_id: [u8; 32],
     checkpoint_hash: [u8; 32],
     generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct PackedSectorRecord {
+    format_version: u16,
+    guild_id: [u8; 32],
+    sector: PackedSector,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -641,6 +649,7 @@ impl NodeReader {
         sector_id: &SectorId,
     ) -> Result<Vec<u8>> {
         render_sector(&self.control, &self.keys, sector_id, Some(guild_id))
+            .or_else(|_| load_packed_sector(&self.control, guild_id, sector_id))
     }
 
     pub(crate) fn parity_for_guild(
@@ -2040,7 +2049,7 @@ impl Node {
             certificate,
         };
         let guild_id = installed.certificate.genesis.guild_id;
-        if !matches!(checkpoint.checkpoint.format_version, 4..=6)
+        if !matches!(checkpoint.checkpoint.format_version, 4..=7)
             || checkpoint.checkpoint.guild_id != guild_id
             || checkpoint.checkpoint.genesis_hash != installed.certificate.hash()?
         {
@@ -3170,6 +3179,48 @@ impl Node {
 
     pub fn sector_for_guild(&self, guild_id: &[u8; 32], sector_id: &SectorId) -> Result<Vec<u8>> {
         render_sector(&self.control, &self.keys, sector_id, Some(guild_id))
+            .or_else(|_| load_packed_sector(&self.control, guild_id, sector_id))
+    }
+
+    pub(crate) fn store_packing_result(
+        &mut self,
+        guild_id: [u8; 32],
+        result: &PackingResult,
+    ) -> Result<()> {
+        result.validate()?;
+        let mut records = Vec::with_capacity(result.sectors.len());
+        for sector in &result.sectors {
+            records.push((
+                "packed-sector".to_owned(),
+                packed_record_id(&guild_id, &sector.descriptor.id),
+                canonical_bytes(&PackedSectorRecord {
+                    format_version: 1,
+                    guild_id,
+                    sector: sector.clone(),
+                })?,
+            ));
+        }
+        self.control.put_records(&records)?;
+        Ok(())
+    }
+
+    pub(crate) fn store_packed_sector(
+        &mut self,
+        guild_id: [u8; 32],
+        profile: PackingProfile,
+        sector: PackedSector,
+    ) -> Result<()> {
+        validate_packed_sector(profile, &sector)?;
+        self.control.put_record(
+            "packed-sector",
+            &packed_record_id(&guild_id, &sector.descriptor.id),
+            &canonical_bytes(&PackedSectorRecord {
+                format_version: 1,
+                guild_id,
+                sector,
+            })?,
+        )?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -4937,6 +4988,25 @@ impl Node {
             if information.sector.virtual_zero {
                 anyhow::bail!("virtual-zero information requires no repair payload");
             }
+            if let Some(catalog) = &checkpoint.checkpoint.packing_catalog {
+                let descriptor = catalog
+                    .sectors
+                    .iter()
+                    .find(|descriptor| {
+                        descriptor.id == information.sector.id
+                            && descriptor.commitment == information.sector.commitment
+                    })
+                    .context("packed information repair is not live in the checkpoint")?
+                    .clone();
+                return self.store_packed_sector(
+                    group.guild_id,
+                    catalog.profile,
+                    PackedSector {
+                        descriptor,
+                        bytes: bytes.to_vec(),
+                    },
+                );
+            }
             let reference = checkpoint
                 .checkpoint
                 .revisions
@@ -5174,18 +5244,7 @@ impl Node {
             .context("variable repair group is not retained")?
             .group
             .clone();
-        let live = checkpoint.checkpoint.revisions.iter().any(|revision| {
-            group.roles.iter().any(|role| {
-                matches!(role, ShardRoleV2::Information(information)
-                    if !information.sector.virtual_zero
-                        && information.owner == revision.value.owner
-                        && revision.value.metadata_sectors.iter()
-                            .chain(&revision.value.data_sectors)
-                            .any(|reference| reference.id == information.sector.id
-                                && reference.logical_len == information.sector.logical_len))
-            })
-        });
-        if !live {
+        if !variable_group_protects_checkpoint(&checkpoint.checkpoint, &group) {
             anyhow::bail!("variable repair group protects no live checkpoint sector");
         }
         let transcript = self.coding_transcript_for_group(group.guild_id, group.id)?;
@@ -5278,7 +5337,7 @@ impl Node {
         checkpoint: &GuildCheckpoint,
         recovered_head: bool,
     ) -> Result<()> {
-        if !matches!(checkpoint.format_version, 4..=6) {
+        if !matches!(checkpoint.format_version, 4..=7) {
             return Ok(());
         }
         let checkpoint_hash = checkpoint.hash()?;
@@ -5336,6 +5395,9 @@ impl Node {
                 .iter()
                 .chain(&revision.value.data_sectors)
             {
+                if checkpoint.format_version == 7 {
+                    continue;
+                }
                 if legacy_coverage.contains(&reference.id) {
                     continue;
                 }
@@ -5351,7 +5413,63 @@ impl Node {
                 }
             }
         }
+        if let Some(catalog) = &checkpoint.packing_catalog {
+            for descriptor in &catalog.sectors {
+                if !self.verified_packed_sector_coverage(&state, descriptor, recovered_head)? {
+                    anyhow::bail!("checkpoint packed sector has no verified variable coding group");
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn verified_packed_sector_coverage(
+        &self,
+        state: &DynamicGuildState,
+        descriptor: &mb_core::PackedSectorDescriptor,
+        allow_legacy_placement: bool,
+    ) -> Result<bool> {
+        for retained in state
+            .coding_groups
+            .iter()
+            .filter(|retained| retained.retired_at_event.is_none())
+        {
+            if !allow_legacy_placement
+                && state
+                    .validate_current_group_placement(&retained.group)
+                    .is_err()
+            {
+                continue;
+            }
+            let Some(information_index) = retained.group.roles.iter().position(|role| {
+                matches!(role, ShardRoleV2::Information(information)
+                    if !information.sector.virtual_zero
+                        && information.sector.id == descriptor.id
+                        && information.sector.logical_len == descriptor.commitment.byte_len
+                        && information.sector.commitment == descriptor.commitment)
+            }) else {
+                continue;
+            };
+            let Some(bytes) = self
+                .control
+                .get_record("coding-group-transcript", &retained.group.id)?
+            else {
+                continue;
+            };
+            let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(&bytes)?;
+            if transcript.value.manifest.value.group == retained.group
+                && replay_coding_transcript(&transcript)? == CodingReplayFinding::Verified
+                && transcript
+                    .value
+                    .plan
+                    .value
+                    .information_root(information_index)
+                    == Some(descriptor.flat_root)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn uncovered_variable_sectors(
@@ -5600,6 +5718,17 @@ impl Node {
         } else {
             decode_canonical::<QuorumCheckpoint>(&bytes)?.checkpoint
         };
+        match (
+            previous.packing_catalog.as_ref(),
+            checkpoint.packing_catalog.as_ref(),
+        ) {
+            (Some(previous), Some(current))
+                if previous.revision.checked_add(1) == Some(current.revision)
+                    && current.parent == Some(previous.id) => {}
+            (None, Some(current)) if current.revision == 1 && current.parent.is_none() => {}
+            (None, None) => {}
+            _ => anyhow::bail!("checkpoint packing catalog does not extend its parent"),
+        }
         if !previous
             .writer_fences
             .iter()
@@ -5917,6 +6046,13 @@ impl Node {
                         ShardRole::Parity(_) => None,
                     }),
             )
+            .chain(
+                current
+                    .checkpoint
+                    .packing_catalog
+                    .iter()
+                    .flat_map(|catalog| catalog.sectors.iter().map(|sector| sector.id)),
+            )
             .collect::<BTreeSet<_>>();
         let mut live_groups = current
             .checkpoint
@@ -5942,6 +6078,25 @@ impl Node {
         }));
 
         self.collect_mature_garbage(generation, &live_revisions, &live_sectors, &live_groups)?;
+
+        for (record_id, _) in self.control.records("packed-sector")? {
+            if record_id.len() != 64 {
+                anyhow::bail!("packed sector record key has the wrong length");
+            }
+            if record_id[..32] != current.checkpoint.guild_id {
+                continue;
+            }
+            let sector_id: [u8; 32] = record_id[32..].try_into()?;
+            if !live_sectors.contains(&sector_id) {
+                self.schedule_garbage(
+                    "gc-packed-sector",
+                    &record_id,
+                    generation,
+                    checkpoint_hash,
+                    None,
+                )?;
+            }
+        }
 
         let Some(parent_hash) = current.checkpoint.parent else {
             return Ok(());
@@ -5991,6 +6146,28 @@ impl Node {
                 )?;
             }
         }
+        let current_packed = current
+            .checkpoint
+            .packing_catalog
+            .iter()
+            .flat_map(|catalog| catalog.sectors.iter().map(|sector| sector.id))
+            .collect::<BTreeSet<_>>();
+        for sector in previous
+            .checkpoint
+            .packing_catalog
+            .iter()
+            .flat_map(|catalog| &catalog.sectors)
+        {
+            if !current_packed.contains(&sector.id) {
+                self.schedule_garbage(
+                    "gc-packed-sector",
+                    &packed_record_id(&current.checkpoint.guild_id, &sector.id),
+                    generation,
+                    checkpoint_hash,
+                    None,
+                )?;
+            }
+        }
         for group in &previous.checkpoint.coding_groups {
             if live_groups.contains(&group.id) {
                 continue;
@@ -6032,17 +6209,30 @@ impl Node {
         }
         let previous_sectors = previous
             .checkpoint
-            .revisions
-            .iter()
-            .flat_map(|revision| {
-                revision
-                    .value
-                    .metadata_sectors
+            .packing_catalog
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .sectors
                     .iter()
-                    .chain(&revision.value.data_sectors)
+                    .map(|sector| sector.id)
+                    .collect::<BTreeSet<_>>()
             })
-            .map(|reference| reference.id)
-            .collect::<BTreeSet<_>>();
+            .unwrap_or_else(|| {
+                previous
+                    .checkpoint
+                    .revisions
+                    .iter()
+                    .flat_map(|revision| {
+                        revision
+                            .value
+                            .metadata_sectors
+                            .iter()
+                            .chain(&revision.value.data_sectors)
+                    })
+                    .map(|reference| reference.id)
+                    .collect()
+            });
         for retained in &dynamic_groups {
             let group = &retained.group;
             if live_groups.contains(&group.id)
@@ -6140,6 +6330,7 @@ impl Node {
             "gc-parity",
             "gc-variable-sector",
             "gc-variable-parity",
+            "gc-packed-sector",
         ] {
             for (record_id, bytes) in self.control.records(kind)? {
                 let candidate: GarbageCandidate = decode_canonical(&bytes)?;
@@ -6171,6 +6362,10 @@ impl Node {
                         .get(..32)
                         .and_then(|id| id.try_into().ok())
                         .is_some_and(|group_id: [u8; 32]| live_groups.contains(&group_id)),
+                    "gc-packed-sector" => record_id
+                        .get(32..64)
+                        .and_then(|id| id.try_into().ok())
+                        .is_some_and(|sector_id: [u8; 32]| live_sectors.contains(&sector_id)),
                     _ => unreachable!(),
                 };
                 if live {
@@ -6252,6 +6447,10 @@ impl Node {
                                 .delete_record("variable-repair", &emergency_id)?;
                         }
                         removed
+                    }
+                    "gc-packed-sector" => {
+                        self.control.delete_record("packed-sector", &record_id)?;
+                        true
                     }
                     _ => unreachable!(),
                 };
@@ -6350,7 +6549,7 @@ impl Node {
         let checkpoint_hash = checkpoint.hash()?;
         let local_id = self.keys.node_id();
         let (publication_members, recovery_envelopes) =
-            if matches!(checkpoint.checkpoint.format_version, 4..=6) {
+            if matches!(checkpoint.checkpoint.format_version, 4..=7) {
                 let state = self
                     .dynamic_guild_state()?
                     .context("dynamic DHT publication requires dynamic guild state")?;
@@ -7014,7 +7213,7 @@ impl Node {
         checkpoint: &QuorumCheckpoint,
     ) -> Result<(BTreeSet<NodeId>, usize)> {
         let local_id = self.keys.node_id();
-        let members = if matches!(checkpoint.checkpoint.format_version, 4..=6) {
+        let members = if matches!(checkpoint.checkpoint.format_version, 4..=7) {
             let state = self
                 .dynamic_guild_state()?
                 .context("dynamic recovery readiness requires dynamic guild state")?;
@@ -7968,6 +8167,49 @@ impl Node {
     }
 }
 
+fn packed_record_id(guild_id: &[u8; 32], object_id: &[u8; 32]) -> Vec<u8> {
+    let mut record_id = Vec::with_capacity(64);
+    record_id.extend_from_slice(guild_id);
+    record_id.extend_from_slice(object_id);
+    record_id
+}
+
+fn validate_packed_sector(profile: PackingProfile, sector: &PackedSector) -> Result<()> {
+    profile.validate()?;
+    if sector.descriptor.calculate_id(profile)? != sector.descriptor.id
+        || sector.descriptor.commitment.byte_len != profile.sector_size
+        || sector.bytes.len() != profile.sector_size as usize
+        || *blake3::hash(&sector.bytes).as_bytes() != sector.descriptor.flat_root
+        || merkle_commit(&sector.bytes)? != sector.descriptor.commitment
+    {
+        anyhow::bail!("packed sector conflicts with its authenticated descriptor");
+    }
+    Ok(())
+}
+
+fn load_packed_sector(
+    control: &ControlStore,
+    guild_id: &[u8; 32],
+    sector_id: &SectorId,
+) -> Result<Vec<u8>> {
+    let record: PackedSectorRecord = decode_canonical(
+        &control
+            .get_record("packed-sector", &packed_record_id(guild_id, sector_id))?
+            .context("packed sector is unavailable")?,
+    )?;
+    if record.format_version != 1
+        || record.guild_id != *guild_id
+        || record.sector.descriptor.id != *sector_id
+        || record.sector.bytes.len()
+            != usize::try_from(record.sector.descriptor.commitment.byte_len)?
+        || *blake3::hash(&record.sector.bytes).as_bytes() != record.sector.descriptor.flat_root
+        || merkle_commit(&record.sector.bytes)? != record.sector.descriptor.commitment
+    {
+        anyhow::bail!("packed sector record is invalid");
+    }
+    Ok(record.sector.bytes)
+}
+
 fn truncate_utf8(value: &mut String, maximum_bytes: usize) {
     if value.len() <= maximum_bytes {
         return;
@@ -8193,13 +8435,45 @@ pub(crate) fn checkpoint_matches_dynamic_authority(
     }
     match checkpoint.format_version {
         4 => checkpoint.authority.is_none(),
-        5 | 6 => checkpoint.authority.is_some_and(|authority| {
+        5..=7 => checkpoint.authority.is_some_and(|authority| {
             authority.format_version == 1
                 && authority.membership_epoch == state.membership_epoch
                 && authority.quorum == state.quorum
         }),
         _ => false,
     }
+}
+
+pub(crate) fn variable_group_protects_checkpoint(
+    checkpoint: &GuildCheckpoint,
+    group: &CodingGroupV2,
+) -> bool {
+    checkpoint
+        .packing_catalog
+        .as_ref()
+        .map(|catalog| {
+            group.roles.iter().any(|role| {
+                matches!(role, ShardRoleV2::Information(information)
+                if !information.sector.virtual_zero
+                    && catalog.sectors.iter().any(|descriptor| {
+                        descriptor.id == information.sector.id
+                            && descriptor.commitment == information.sector.commitment
+                    }))
+            })
+        })
+        .unwrap_or_else(|| {
+            checkpoint.revisions.iter().any(|revision| {
+                group.roles.iter().any(|role| {
+                    matches!(role, ShardRoleV2::Information(information)
+                        if !information.sector.virtual_zero
+                            && information.owner == revision.value.owner
+                            && revision.value.metadata_sectors.iter()
+                                .chain(&revision.value.data_sectors)
+                                .any(|reference| reference.id == information.sector.id
+                                    && reference.logical_len == information.sector.logical_len))
+                })
+            })
+        })
 }
 
 fn validate_dynamic_state_origin(
@@ -8765,6 +9039,7 @@ mod tests {
                 revisions: vec![revision],
                 coding_groups: vec![group],
                 authority: None,
+                packing_catalog: None,
             },
             signatures: Vec::new(),
         };
@@ -8928,6 +9203,7 @@ mod tests {
                 revisions: vec![revision.clone()],
                 coding_groups: vec![group],
                 authority: None,
+                packing_catalog: None,
             },
             signatures: Vec::new(),
         };
@@ -9213,6 +9489,108 @@ mod tests {
             )
             .unwrap();
         assert!(reopened.protected_roots().is_err());
+    }
+
+    #[test]
+    fn packed_sectors_are_durable_and_guild_scoped() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([218; 32]);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        let guild_id = [217; 32];
+        let packed = mb_core::pack_incremental(
+            mb_core::PackingProfile {
+                format_version: 1,
+                sector_size: 64,
+                slot_size: 16,
+            },
+            None,
+            vec![mb_core::PackingInput {
+                owner: node.keys().node_id(),
+                protected_root: [1; 32],
+                object_id: [2; 32],
+                bytes: (0_u8..48).collect(),
+            }],
+        )
+        .unwrap();
+        node.store_packing_result(guild_id, &packed).unwrap();
+        for sector in &packed.sectors {
+            assert_eq!(
+                node.sector_for_guild(&guild_id, &sector.descriptor.id)
+                    .unwrap(),
+                sector.bytes
+            );
+            assert!(
+                node.sector_for_guild(&[216; 32], &sector.descriptor.id)
+                    .is_err()
+            );
+        }
+        drop(node);
+
+        let reopened = Node::open(temp.path(), seed).unwrap();
+        assert_eq!(
+            reopened
+                .sector_for_guild(&guild_id, &packed.sectors[0].descriptor.id)
+                .unwrap(),
+            packed.sectors[0].bytes
+        );
+    }
+
+    #[test]
+    fn packed_catalog_sectors_are_live_variable_information() {
+        let owner = KeyMaterial::from_seed(&Seed::from_bytes([215; 32])).node_id();
+        let guild_id = [214; 32];
+        let packed = mb_core::pack_incremental(
+            mb_core::PackingProfile {
+                format_version: 1,
+                sector_size: 64,
+                slot_size: 16,
+            },
+            None,
+            vec![mb_core::PackingInput {
+                owner,
+                protected_root: [1; 32],
+                object_id: [2; 32],
+                bytes: vec![3; 64],
+            }],
+        )
+        .unwrap();
+        let descriptor = &packed.catalog.sectors[0];
+        let mut group = CodingGroupV2 {
+            id: [4; 32],
+            format_version: 2,
+            guild_id,
+            profile: mb_core::CodingProfile::new(3, 2, 64),
+            roles: vec![ShardRoleV2::Information(mb_core::InformationRoleV2 {
+                owner,
+                failure_domain: "packed-owner".to_owned(),
+                sector: mb_core::RangeSectorRef {
+                    id: descriptor.id,
+                    commitment: descriptor.commitment.clone(),
+                    logical_len: 64,
+                    virtual_zero: false,
+                },
+            })],
+        };
+        let checkpoint = GuildCheckpoint {
+            format_version: 7,
+            guild_id,
+            genesis_hash: [5; 32],
+            generation: 1,
+            parent: None,
+            members: Vec::new(),
+            writer_fences: Vec::new(),
+            revision_tombstones: Vec::new(),
+            revisions: Vec::new(),
+            coding_groups: Vec::new(),
+            authority: None,
+            packing_catalog: Some(packed.catalog),
+        };
+        assert!(variable_group_protects_checkpoint(&checkpoint, &group));
+        match &mut group.roles[0] {
+            ShardRoleV2::Information(information) => information.sector.commitment.root[0] ^= 1,
+            ShardRoleV2::Parity(_) => unreachable!(),
+        }
+        assert!(!variable_group_protects_checkpoint(&checkpoint, &group));
     }
 
     #[test]
@@ -9735,6 +10113,7 @@ mod tests {
                 revisions: vec![revision],
                 coding_groups: vec![group],
                 authority: None,
+                packing_catalog: None,
             },
             signatures: Vec::new(),
         };
@@ -10187,6 +10566,7 @@ mod tests {
                 revisions: vec![revision],
                 coding_groups: Vec::new(),
                 authority: None,
+                packing_catalog: None,
             },
             signatures: Vec::new(),
         };
@@ -10994,6 +11374,7 @@ mod tests {
                 revisions: vec![revision],
                 coding_groups: Vec::new(),
                 authority: None,
+                packing_catalog: None,
             },
             signatures: Vec::new(),
         };
@@ -11362,6 +11743,7 @@ mod tests {
                 revisions: vec![revision],
                 coding_groups: Vec::new(),
                 authority: None,
+                packing_catalog: None,
             },
             signatures: Vec::new(),
         };

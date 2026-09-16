@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::{
     MAX_PROFILE_SHARD_SIZE, MERKLE_LEAF_SIZE, MerkleCommitment, NodeId, canonical_bytes,
@@ -74,7 +75,7 @@ pub enum PackedSlot {
 }
 
 impl PackedSlot {
-    fn source(&self) -> Option<&PackedSourceChunk> {
+    pub fn source(&self) -> Option<&PackedSourceChunk> {
         match self {
             Self::Data(source)
             | Self::VirtualZero {
@@ -85,10 +86,17 @@ impl PackedSlot {
     }
 }
 
+pub fn packing_protected_root(root_id: Uuid) -> [u8; 32] {
+    let mut protected_root = [0_u8; 32];
+    protected_root[..16].copy_from_slice(root_id.as_bytes());
+    protected_root
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PackedSectorDescriptor {
     pub id: [u8; 32],
     pub sector_index: u32,
+    pub flat_root: [u8; 32],
     pub commitment: MerkleCommitment,
     pub slots: Vec<PackedSlot>,
 }
@@ -130,6 +138,7 @@ impl PackedCatalog {
         for (sector_index, sector) in self.sectors.iter().enumerate() {
             if sector.sector_index != sector_index as u32
                 || sector.slots.len() != expected_slots
+                || sector.flat_root == [0; 32]
                 || sector.commitment.byte_len != self.profile.sector_size
                 || sector.calculate_id(self.profile)? != sector.id
             {
@@ -187,6 +196,7 @@ impl PackedSectorDescriptor {
         hasher.update(&canonical_bytes(&(
             profile,
             self.sector_index,
+            self.flat_root,
             &self.commitment,
             &self.slots,
         ))?);
@@ -194,7 +204,7 @@ impl PackedSectorDescriptor {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PackedSector {
     pub descriptor: PackedSectorDescriptor,
     pub bytes: Vec<u8>,
@@ -226,6 +236,7 @@ impl PackingResult {
         for (packed, descriptor) in self.sectors.iter().zip(&self.catalog.sectors) {
             if &packed.descriptor != descriptor
                 || packed.bytes.len() != self.catalog.profile.sector_size as usize
+                || *blake3::hash(&packed.bytes).as_bytes() != descriptor.flat_root
                 || merkle_commit(&packed.bytes).map_err(|_| PackingError::InvalidCatalog)?
                     != descriptor.commitment
             {
@@ -381,6 +392,7 @@ pub fn pack_incremental(
         let mut descriptor = PackedSectorDescriptor {
             id: [0; 32],
             sector_index: sector_index as u32,
+            flat_root: *blake3::hash(&bytes).as_bytes(),
             commitment,
             slots,
         };
@@ -438,10 +450,55 @@ pub fn unpack_object(
     object_id: [u8; 32],
 ) -> Result<Vec<u8>, PackingError> {
     packed.validate()?;
+    unpack_object_from_sectors(
+        &packed.catalog,
+        &packed.sectors,
+        owner,
+        protected_root,
+        object_id,
+    )
+}
+
+/// Recover one catalog object from the authenticated packed sectors that
+/// contain it. Callers need not materialize unrelated catalog sectors.
+pub fn unpack_object_from_sectors(
+    catalog: &PackedCatalog,
+    sectors: &[PackedSector],
+    owner: NodeId,
+    protected_root: [u8; 32],
+    object_id: [u8; 32],
+) -> Result<Vec<u8>, PackingError> {
+    catalog.validate()?;
+    let available = sectors
+        .iter()
+        .map(|sector| (sector.descriptor.id, sector))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let mut chunks = Vec::<(u32, Vec<u8>)>::new();
-    let slot_size = packed.catalog.profile.slot_size as usize;
-    for sector in &packed.sectors {
-        for (slot_index, slot) in sector.descriptor.slots.iter().enumerate() {
+    let slot_size = catalog.profile.slot_size as usize;
+    for descriptor in &catalog.sectors {
+        if !descriptor.slots.iter().any(|slot| {
+            slot.source().is_some_and(|source| {
+                (
+                    source.id.owner,
+                    source.id.protected_root,
+                    source.id.object_id,
+                ) == (owner, protected_root, object_id)
+            })
+        }) {
+            continue;
+        }
+        let sector = available
+            .get(&descriptor.id)
+            .ok_or(PackingError::MissingObject)?;
+        if sector.descriptor != *descriptor
+            || sector.bytes.len() != catalog.profile.sector_size as usize
+            || *blake3::hash(&sector.bytes).as_bytes() != descriptor.flat_root
+            || merkle_commit(&sector.bytes).map_err(|_| PackingError::InvalidCatalog)?
+                != descriptor.commitment
+        {
+            return Err(PackingError::InvalidCatalog);
+        }
+        for (slot_index, slot) in descriptor.slots.iter().enumerate() {
             let Some(source) = slot.source() else {
                 continue;
             };
@@ -611,6 +668,27 @@ mod tests {
         );
         assert_eq!(
             unpack_object(&packed, owners[1], [3; 32], [12; 32]).unwrap(),
+            vec![3; 35]
+        );
+        let partial = packed
+            .sectors
+            .iter()
+            .filter(|sector| {
+                sector.descriptor.slots.iter().any(|slot| {
+                    slot.source().is_some_and(|source| {
+                        (
+                            source.id.owner,
+                            source.id.protected_root,
+                            source.id.object_id,
+                        ) == (owners[1], [3; 32], [12; 32])
+                    })
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unpack_object_from_sectors(&packed.catalog, &partial, owners[1], [3; 32], [12; 32],)
+                .unwrap(),
             vec![3; 35]
         );
         let scheduled = packed
