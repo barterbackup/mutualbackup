@@ -6036,6 +6036,37 @@ fn coding_candidate_path_rank(candidate: NodeId, local_id: NodeId, status: &P2pS
         .unwrap_or(usize::MAX)
 }
 
+fn choose_coding_coordinators(
+    reachable: &[NodeId],
+    participants: &BTreeSet<NodeId>,
+    path_ranks: &BTreeMap<NodeId, usize>,
+) -> Result<(NodeId, NodeId)> {
+    if reachable.len() < 2 {
+        bail!("coding attempt has fewer than two reachable coordinators");
+    }
+    let mut ranked = reachable.to_vec();
+    ranked.sort_by_key(|candidate| {
+        (
+            !participants.contains(candidate),
+            path_ranks.get(candidate).copied().unwrap_or(usize::MAX),
+            *candidate,
+        )
+    });
+    let coding_coordinator = ranked[0];
+    let verification_coordinator = ranked
+        .iter()
+        .copied()
+        .filter(|candidate| *candidate != coding_coordinator)
+        .min_by_key(|candidate| {
+            (
+                path_ranks.get(candidate).copied().unwrap_or(usize::MAX),
+                *candidate,
+            )
+        })
+        .context("coding attempt has no separate reachable verifier")?;
+    Ok((coding_coordinator, verification_coordinator))
+}
+
 async fn execute_delegated_coding(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
@@ -9931,25 +9962,61 @@ async fn build_cross_user_coding_lanes(
 
 async fn queue_variable_coding_lanes(
     node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    local_id: NodeId,
     checkpoint_hash: [u8; 32],
     membership_epoch: u64,
     peers: &[crate::GuildPeer],
     lanes: Vec<VariableCodingLane>,
 ) -> Result<()> {
-    let coding_coordinator = peers
-        .first()
-        .context("variable coding lane has no participant coordinator")?
-        .member
-        .node_id;
-    let verification_coordinator = peers
-        .get(1)
-        .context("variable coding lane has no separate verifier")?
-        .member
-        .node_id;
+    let mut reachable = Vec::new();
+    let mut reachability_requests = FuturesUnordered::new();
+    for peer in peers {
+        let candidate = peer.member.node_id;
+        if candidate == local_id {
+            reachable.push(candidate);
+        } else {
+            reachability_requests.push(async move {
+                (
+                    candidate,
+                    p2p.profile(candidate)
+                        .await
+                        .is_ok_and(|profile| profile.member.node_id == candidate),
+                )
+            });
+        }
+    }
+    while let Some((candidate, is_reachable)) = reachability_requests.next().await {
+        if is_reachable {
+            reachable.push(candidate);
+        }
+    }
+    if reachable.len() < 2 {
+        bail!("variable coding has fewer than two reachable coordinators");
+    }
+    let status = p2p.status().await?;
+    let path_ranks = reachable
+        .iter()
+        .map(|candidate| {
+            (
+                *candidate,
+                coding_candidate_path_rank(*candidate, local_id, &status),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let expires_at_unix_seconds = unix_seconds()
         .checked_add(24 * 60 * 60)
         .context("coding launch expiry overflow")?;
     for lane in lanes {
+        let participants = lane
+            .geometry
+            .information
+            .iter()
+            .map(|role| role.owner)
+            .chain(lane.geometry.parity.iter().map(|role| role.holder))
+            .collect::<BTreeSet<_>>();
+        let (coding_coordinator, verification_coordinator) =
+            choose_coding_coordinators(&reachable, &participants, &path_ranks)?;
         let mut hasher = blake3::Hasher::new_derive_key("mutualbackup initial coding attempt v1");
         hasher.update(&checkpoint_hash);
         hasher.update(&canonical_bytes(&(
@@ -10172,6 +10239,8 @@ async fn commit_backup_job(
     .await?;
     queue_variable_coding_lanes(
         node.clone(),
+        p2p,
+        local_id,
         checkpoint_hash,
         checkpoint_authority.membership_epoch,
         &peers,
@@ -10736,6 +10805,22 @@ mod tests {
         assert_eq!(required_recovery_publishers(4).unwrap(), 3);
         assert_eq!(required_recovery_publishers(5).unwrap(), 3);
         assert_eq!(required_recovery_publishers(256).unwrap(), 3);
+    }
+
+    #[test]
+    fn coding_coordinator_prefers_a_participant_and_keeps_a_separate_best_verifier() {
+        let candidates = (0_u8..3)
+            .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([index + 20; 32])).node_id())
+            .collect::<Vec<_>>();
+        let participants = BTreeSet::from([candidates[2]]);
+        let path_ranks =
+            BTreeMap::from([(candidates[0], 0), (candidates[1], 1), (candidates[2], 2)]);
+        let (coder, verifier) =
+            choose_coding_coordinators(&candidates, &participants, &path_ranks).unwrap();
+        assert_eq!(coder, candidates[2]);
+        assert_eq!(verifier, candidates[0]);
+        assert_ne!(coder, verifier);
+        assert!(choose_coding_coordinators(&candidates[..1], &participants, &path_ranks).is_err());
     }
 
     #[test]
