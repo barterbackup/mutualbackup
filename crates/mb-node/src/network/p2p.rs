@@ -119,6 +119,23 @@ const MAX_SESSION_HISTORY: usize = 256;
 
 type RelayMembers = Arc<RwLock<BTreeSet<PeerId>>>;
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct RetryableP2pRequestError(String);
+
+fn retryable_p2p_request_failure(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(RetryableP2pRequestError(message.into()))
+}
+
+pub(crate) fn is_retryable_p2p_request_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<RetryableP2pRequestError>().is_some()
+            || cause
+                .downcast_ref::<crate::WireError>()
+                .is_some_and(|error| error.retryable)
+    })
+}
+
 struct PolicyTransport<T> {
     inner: T,
     mode: TorMode,
@@ -3547,12 +3564,14 @@ impl P2pEventLoop {
             return;
         }
         if pending.deadline <= tokio::time::Instant::now() {
-            pending.finish(Err(anyhow::anyhow!("libp2p request deadline expired")));
+            pending.finish(Err(retryable_p2p_request_failure(
+                "libp2p request deadline expired",
+            )));
             return;
         }
         if pending.attempts >= MAX_REQUEST_TRANSPORT_ATTEMPTS {
-            pending.finish(Err(anyhow::anyhow!(
-                "libp2p request exhausted its transport attempt budget"
+            pending.finish(Err(retryable_p2p_request_failure(
+                "libp2p request exhausted its transport attempt budget",
             )));
             return;
         }
@@ -3603,12 +3622,14 @@ impl P2pEventLoop {
             return;
         }
         if pending.deadline <= tokio::time::Instant::now() {
-            pending.finish(Err(anyhow::anyhow!("libp2p request deadline expired")));
+            pending.finish(Err(retryable_p2p_request_failure(
+                "libp2p request deadline expired",
+            )));
             return;
         }
         if pending.attempts >= MAX_REQUEST_TRANSPORT_ATTEMPTS {
-            pending.finish(Err(anyhow::anyhow!(
-                "libp2p request exhausted its transport attempt budget"
+            pending.finish(Err(retryable_p2p_request_failure(
+                "libp2p request exhausted its transport attempt budget",
             )));
             return;
         }
@@ -3680,14 +3701,18 @@ impl P2pEventLoop {
             }
             if pending.deadline <= now {
                 released_peers.insert(pending.peer);
-                pending.finish(Err(anyhow::anyhow!("libp2p request deadline expired")));
+                pending.finish(Err(retryable_p2p_request_failure(
+                    "libp2p request deadline expired",
+                )));
             } else {
                 self.queued_requests.push_back(pending);
             }
         }
         for pending in self.pending_requests.values_mut() {
             if pending.deadline <= now && pending.caller_waiting() {
-                pending.finish(Err(anyhow::anyhow!("libp2p request deadline expired")));
+                pending.finish(Err(retryable_p2p_request_failure(
+                    "libp2p request deadline expired",
+                )));
             }
         }
         self.closed_connection_paths
@@ -4296,7 +4321,7 @@ impl P2pEventLoop {
                 break;
             };
             if pending.peer == peer {
-                pending.finish(Err(anyhow::anyhow!(message.to_owned())));
+                pending.finish(Err(retryable_p2p_request_failure(message)));
             } else {
                 self.queued_requests.push_back(pending);
             }
@@ -5532,7 +5557,9 @@ impl P2pEventLoop {
                     if healthy_duplicate || advanced || selected_tier != attempted_tier {
                         self.queue_or_dispatch_request(pending);
                     } else {
-                        pending.finish(Err(anyhow::anyhow!("libp2p request failed: {error}")));
+                        pending.finish(Err(retryable_p2p_request_failure(format!(
+                            "libp2p request failed: {error}"
+                        ))));
                     }
                     self.forget_transport_selection_if_unretained(request_peer);
                 }
@@ -15003,6 +15030,24 @@ mod tests {
         assert!(event_loop.pending_requests.is_empty());
         assert!(event_loop.queued_requests.is_empty());
         assert_eq!(client.outbound_permits.available_permits(), 8);
+    }
+
+    #[test]
+    fn retryable_request_errors_preserve_transport_and_peer_classification() {
+        let transport =
+            retryable_p2p_request_failure("libp2p exhausted every configured transport tier")
+                .context("backup submission failed");
+        assert!(is_retryable_p2p_request_error(&transport));
+
+        let busy = anyhow::Error::new(crate::WireError::busy("peer capacity exhausted"))
+            .context("backup status failed");
+        assert!(is_retryable_p2p_request_error(&busy));
+
+        let permanent = anyhow::Error::new(crate::WireError::operation("not authorized"));
+        assert!(!is_retryable_p2p_request_error(&permanent));
+        assert!(!is_retryable_p2p_request_error(&anyhow::anyhow!(
+            "peer response context mismatch"
+        )));
     }
 
     #[tokio::test]

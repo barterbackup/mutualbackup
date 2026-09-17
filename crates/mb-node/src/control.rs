@@ -1,4 +1,5 @@
 use std::fs;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream as SyncUnixStream;
@@ -22,7 +23,10 @@ use zeroize::Zeroizing;
 use crate::{
     AutomaticBackupStatus, BackupJob, BackupJobState, GuildAuditReport, Node, P2pClient, P2pStatus,
     ProtectionState, StorageVolumeStatus, WireError, audit_guild,
-    network::{GuildAdministration, commit_guild_administration, restore_snapshot_with_p2p},
+    network::{
+        GuildAdministration, commit_guild_administration, is_retryable_p2p_request_error,
+        restore_snapshot_with_p2p,
+    },
     recover_from_dht,
 };
 
@@ -584,8 +588,10 @@ pub(crate) async fn submit_local_backup(
         .await?
     } else {
         add_peer_endpoints(p2p, guild.coordinator, &coordinator.endpoints).await?;
-        p2p.submit_backup(guild.coordinator, descriptor.clone())
-            .await?
+        retry_waiting_backup_request(wait, || {
+            p2p.submit_backup(guild.coordinator, descriptor.clone())
+        })
+        .await?
     };
     while wait
         && !matches!(
@@ -594,9 +600,31 @@ pub(crate) async fn submit_local_backup(
         )
     {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        job = query_local_backup_job(node.clone(), p2p, descriptor.revision_id).await?;
+        job = retry_waiting_backup_request(true, || {
+            query_local_backup_job(node.clone(), p2p, descriptor.revision_id)
+        })
+        .await?;
     }
     Ok(job)
+}
+
+async fn retry_waiting_backup_request<T, Operation, Request>(
+    wait: bool,
+    mut operation: Operation,
+) -> Result<T>
+where
+    Operation: FnMut() -> Request,
+    Request: Future<Output = Result<T>>,
+{
+    loop {
+        match operation().await {
+            Err(error) if wait && is_retryable_p2p_request_error(&error) => {
+                tracing::warn!(%error, "waiting backup request deferred");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            result => return result,
+        }
+    }
 }
 
 pub(crate) async fn query_local_backup_job(
@@ -845,5 +873,46 @@ mod tests {
             },
             71,
         ));
+    }
+
+    #[tokio::test]
+    async fn waiting_backup_request_retries_retryable_peer_errors() {
+        let mut attempts = 0_u8;
+        let value = retry_waiting_backup_request(true, || {
+            attempts += 1;
+            let attempt = attempts;
+            async move {
+                if attempt == 1 {
+                    Err(anyhow::Error::new(WireError::busy(
+                        "temporary peer capacity",
+                    )))
+                } else {
+                    Ok(41_u8)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(value, 41);
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn nonwaiting_backup_request_returns_retryable_peer_error() {
+        let mut attempts = 0_u8;
+        let error = retry_waiting_backup_request(false, || {
+            attempts += 1;
+            async {
+                Err::<u8, _>(anyhow::Error::new(WireError::busy(
+                    "temporary peer capacity",
+                )))
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(is_retryable_p2p_request_error(&error));
+        assert_eq!(attempts, 1);
     }
 }

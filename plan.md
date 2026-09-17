@@ -922,6 +922,16 @@ after about fifty additional minutes, for more than fifty-three minutes of
 useful work across the interruption. The constrained-topology backup now has a
 separate ninety-minute allowance, with durable failure states still rejected
 immediately.
+The next clean gate passed the repeated multi-owner production scenario in
+2,699 seconds and reached the final isolated-topology backup. The coordinator
+had durably accepted that fourth job, but the owner's `backup --wait` returned
+when an acknowledgement or status request exhausted its transport tiers amid
+the concurrent relay and coding load. P2P delivery deadlines, transport-attempt
+exhaustion, terminal outbound failures, and explicitly retryable peer responses
+now retain a retryable type through contextual errors. A waited backup retries
+both idempotent descriptor submission and status polling across those failures;
+non-waiting calls and permanent authorization, identity, and protocol errors
+retain their immediate result.
 A fresh provisioned production gate must still close before Milestone 5 can
 pass.
 

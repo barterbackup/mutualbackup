@@ -861,7 +861,19 @@ node Clippy gate passed locally. No remote compilation server was used.
   after about fifty more minutes, over fifty-three minutes of useful work in
   total. The constrained-topology backup now has a separate ninety-minute
   bound; durable failed jobs still terminate immediately.
-- [ ] **M5-29 / gate — Run the corrected production gate.**
+- [x] **M5-29 / P1 — Keep a waited backup attached across transient transport loss.**
+  The next fresh gate passed the repeated multi-owner production scenario in
+  2,699 seconds and reached the final isolated-topology backup. The coordinator
+  durably contained that fourth backup job, but the owner's `backup --wait`
+  command terminated when a submission acknowledgement or later status poll
+  exhausted every transport tier during concurrent relay/coding traffic.
+  Classify delivery deadlines, transport-attempt exhaustion, terminal outbound
+  failures, and explicit retryable peer responses as retryable P2P failures.
+  A waited backup now resubmits its deterministic descriptor and repeats status
+  polling across those failures; idempotent coordinator admission preserves the
+  one durable job. Non-waiting calls and permanent peer/protocol failures still
+  return immediately. Focused regressions cover retry and classification.
+- [ ] **M5-30 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -921,7 +933,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-28 close.
+  acceptance gate after M5-01 through M5-29 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
