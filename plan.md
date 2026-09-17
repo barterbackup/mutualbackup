@@ -894,14 +894,23 @@ durable inspection found it fixed at event sequence 22. A retirement proposal
 signed between backups held the next sequence while the running-job fence
 prevented lifecycle replay; activation chose other groups ahead of the locked
 event; and restart planning resurrected an initial deterministic launch whose
-completed fresh retry was already durable. Backup claims now wait behind any
-locally signed next event. Lifecycle replay may finish an exact locked
+completed fresh retry was already durable. Backup claims now wait behind an
+unrelated locally signed next event. Lifecycle replay may finish an exact locked
 retire/forget event across a running job, activation selects the transcript
 named by a locked group event, and durable retry or verifier evidence prevents
 the original launch from being reissued. The preserved run advanced through
 sequence 42 and committed in 1,138 seconds without another conflict. The large
 process allowance is sixty minutes for its measured coding and event-activation
 workload.
+The next fresh process run revealed one necessary exception to that claim
+fence. Its first backup signed a writer-key rotation, collected four of five
+signatures, and deferred; the blanket fence then prevented the same pending job
+from resuming the exact event it owned. Backup claiming now admits a locked
+`RotateWriterKey` only when its owner matches the job, while every unrelated
+event still blocks it. A regression pins both branches. The preserved run
+resumed immediately with the corrected binary and committed checkpoint
+`882eca8d785f5952bae322a50b16a331e4a278b51f87dc9445ee4f813c678ad1`
+in about two minutes.
 A fresh provisioned production gate must still close before Milestone 5 can
 pass.
 

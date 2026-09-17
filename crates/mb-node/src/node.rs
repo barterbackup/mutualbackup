@@ -2846,15 +2846,19 @@ impl Node {
             .event_sequence
             .checked_add(1)
             .context("guild event sequence exhausted")?;
-        if self
-            .locked_guild_event_proposal(next_event_sequence)?
-            .is_some()
-        {
-            return Ok(None);
-        }
+        let locked_event = self.locked_guild_event_proposal(next_event_sequence)?;
         for (_, bytes) in self.control.records("backup-job")? {
             let mut job: BackupJob = decode_canonical(&bytes)?;
             if matches!(job.state, BackupJobState::Pending | BackupJobState::Running) {
+                if locked_event.as_ref().is_some_and(|event| {
+                    !matches!(
+                        &event.kind,
+                        mb_core::GuildEventKind::RotateWriterKey { owner, .. }
+                            if *owner == job.descriptor.owner
+                    )
+                }) {
+                    continue;
+                }
                 job.state = BackupJobState::Running;
                 job.error = None;
                 self.put_backup_job(&job)?;
@@ -10826,6 +10830,20 @@ mod tests {
             signatures,
         })
         .unwrap();
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[213; 32]);
+        let rotate_writer = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RotateWriterKey {
+                owner: job.descriptor.owner,
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            },
+        };
+        node.sign_guild_event_proposal(&rotate_writer).unwrap();
         let claimed = node.claim_backup_job().unwrap().unwrap();
         assert_eq!(claimed.descriptor, job.descriptor);
         assert_eq!(claimed.state, BackupJobState::Running);
