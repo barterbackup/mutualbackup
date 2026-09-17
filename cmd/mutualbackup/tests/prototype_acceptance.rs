@@ -28,6 +28,8 @@ use uuid::Uuid;
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const MIN_BULK_TRANSFER_BYTES: u64 = 64 * 1024;
+const PROCESS_SMALL_BACKUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const PROCESS_LARGE_BACKUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 struct Daemon {
     args: Vec<OsString>,
@@ -1200,9 +1202,17 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     cli_path(&sockets[1], ["root", "add"], &owner_one_source);
     cli_path(&sockets[2], ["root", "add"], &owner_two_source);
 
-    let first = cli(&sockets[1], ["backup", "--wait"], Duration::from_secs(120));
+    let first = cli(
+        &sockets[1],
+        ["backup", "--wait"],
+        PROCESS_SMALL_BACKUP_TIMEOUT,
+    );
     assert!(first.contains("state:      Committed"));
-    let second = cli(&sockets[2], ["backup", "--wait"], Duration::from_secs(120));
+    let second = cli(
+        &sockets[2],
+        ["backup", "--wait"],
+        PROCESS_SMALL_BACKUP_TIMEOUT,
+    );
     assert!(second.contains("state:      Committed"));
 
     let expected_latest = deterministic_bytes(1024 * 1024 + 31, 41);
@@ -1217,7 +1227,11 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     daemons[0].stop();
     daemons[0].start();
     wait_for_status(&sockets[0], &mut daemons[0], Duration::from_secs(30));
-    wait_for_backup(&sockets[1], &interrupted_revision, Duration::from_secs(180));
+    wait_for_backup(
+        &sockets[1],
+        &interrupted_revision,
+        PROCESS_LARGE_BACKUP_TIMEOUT,
+    );
 
     let snapshots = cli(&sockets[1], ["snapshot", "list"], CLI_TIMEOUT);
     assert_eq!(snapshots.lines().count(), 2);

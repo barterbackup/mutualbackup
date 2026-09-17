@@ -882,6 +882,13 @@ backup claims now remain pending until every active member has a current
 recovery-key epoch, preserving the registration sequence before coding starts.
 A subject whose registration attempt lacks quorum reloads and resubmits the
 exact event already held by its durable signature lock.
+The next direct process run committed its first backup and timed out while the
+second job remained healthy and continued producing verified coding groups.
+That preserved 190 KiB job resumed immediately and committed after another 212
+seconds, exceeding 332 seconds of useful work across the interruption. The old
+120-second process bound predated sampled delegated coding. The gate now allows
+ten minutes for its small backups and thirty minutes for its interrupted 1 MiB
+backup, with durable failure states still rejected immediately.
 A fresh provisioned production gate must still close before Milestone 5 can
 pass.
 
