@@ -812,8 +812,15 @@ recovered transcripts but again activated only two of 21 local variable shards
 before the integration deadline. Those independent group reconstructions were
 still serialized. Recovery now probes one group to seed shared holder health,
 then reconstructs and activates the remaining groups with bounded two-group
-concurrency under the unchanged global outbound semaphore. A fresh provisioned
-production gate must still close before Milestone 5 can pass.
+concurrency under the unchanged global outbound semaphore. The next production
+run completed all four checkpoints, installed all 59 guild events and all 51
+transcripts on the fresh node, and no longer retried dead holders, but two-group
+concurrency activated only five of 21 local shards before the same recovery
+deadline. Recovery now keeps up to eight independent group workflows in flight
+so shard transfer, Reed-Solomon reconstruction, commitment checks, and durable
+activation overlap; the P2P client's global outbound semaphore continues to
+enforce the configured network-request bound. A fresh provisioned production
+gate must still close before Milestone 5 can pass.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer

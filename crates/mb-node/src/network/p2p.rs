@@ -101,7 +101,10 @@ const MAX_RELAY_CIRCUIT_BYTES: u64 = 8 * 1024 * 1024;
 const DHT_RECOVERY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DHT_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const RECOVERY_TRANSCRIPT_FETCH_CONCURRENCY: usize = 8;
-const RECOVERY_VARIABLE_GROUP_CONCURRENCY: usize = 2;
+// Keep enough independent reconstructions in flight to overlap shard transfer,
+// Reed-Solomon work, and durable activation. Individual shard requests remain
+// capped by the P2P client's configured global outbound semaphore.
+const RECOVERY_VARIABLE_GROUP_CONCURRENCY: usize = 8;
 const SHARD_FETCH_ATTEMPTS: usize = 3;
 const PEER_EXCHANGE_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_EXCHANGED_ENDPOINT_RECORDS: usize = 64;

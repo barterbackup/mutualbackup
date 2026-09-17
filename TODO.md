@@ -725,7 +725,18 @@ node Clippy gate passed locally. No remote compilation server was used.
   reconstruct and activate the remaining groups with bounded two-group
   concurrency. Each group still uses the existing bounded candidate set and
   every request remains subject to the global outbound semaphore.
-- [ ] **M5-17 / gate — Run the corrected production gate.**
+- [x] **M5-17 / P1 — Keep the variable-recovery pipeline full.**
+  The first run with concurrent variable recovery completed all four production
+  checkpoints, installed all 59 guild events and all 51 transcripts on the
+  fresh node, and proved that known-dead holders no longer consumed the global
+  request budget. It still timed out after activating only five of 21 local
+  shards. Limiting the whole recovery to two groups serialized too much local
+  Reed-Solomon, commitment, and durable activation work after each bounded
+  shard fetch. Allow eight independent group workflows in flight; their shard
+  traffic remains constrained by the P2P client's existing global outbound
+  semaphore, so this fills the local pipeline without weakening the transport
+  request bound.
+- [ ] **M5-18 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -750,11 +761,15 @@ node Clippy gate passed locally. No remote compilation server was used.
   so abandoned requests again consumed the global budget. The following run
   installed all 51 transcripts and proved that selection correction, but
   exposed M5-16 because 21 independent local shard reconstructions still ran
-  strictly serially inside the same 60-second recovery bound.
+  strictly serially inside the same 60-second recovery bound. The next run
+  proved bounded concurrent reconstruction but exposed M5-17: a two-group
+  pipeline activated only five of 21 shards because it still underfilled local
+  reconstruction and durable activation work behind the globally bounded
+  network fetches.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-16 close.
+  acceptance gate after M5-01 through M5-17 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
