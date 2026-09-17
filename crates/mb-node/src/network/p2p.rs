@@ -101,6 +101,7 @@ const MAX_RELAY_CIRCUIT_BYTES: u64 = 8 * 1024 * 1024;
 const DHT_RECOVERY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DHT_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const RECOVERY_TRANSCRIPT_FETCH_CONCURRENCY: usize = 8;
+const RECOVERY_VARIABLE_GROUP_CONCURRENCY: usize = 2;
 const SHARD_FETCH_ATTEMPTS: usize = 3;
 const PEER_EXCHANGE_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_EXCHANGED_ENDPOINT_RECORDS: usize = 64;
@@ -9748,49 +9749,32 @@ async fn recover_p2p_variable_shards(
         Ok(plans)
     })
     .await?;
-    let deferred_holders = Mutex::new(BTreeSet::new());
-    for (transcript, targets) in plans {
-        let group = &transcript.value.manifest.value.group;
-        for target_index in targets {
-            let group_for_check = group.clone();
-            let already_ready = node_blocking(node.clone(), move |node| {
-                Ok(node
-                    .variable_shard_for_guild(
-                        &group_for_check.guild_id,
-                        &group_for_check.id,
-                        target_index as u16,
-                    )
-                    .is_ok())
-            })
-            .await?;
-            if already_ready {
-                continue;
-            }
-            let bytes = reconstruct_variable_shard_from_peers(
-                node.clone(),
-                p2p,
-                group,
-                target_index,
-                roster,
-                &deferred_holders,
-            )
-            .await?;
-            let transcript_for_stage = transcript.clone();
-            node_blocking(node.clone(), move |node| {
-                node.stage_recovered_variable_shard(
-                    &checkpoint_hash,
-                    &transcript_for_stage,
-                    target_index as u16,
-                    &bytes,
-                )
-            })
-            .await?;
-        }
-        node_blocking(node.clone(), move |node| {
-            node.activate_coding_attempt(&transcript)
-        })
+    let deferred_holders = Arc::new(Mutex::new(BTreeSet::new()));
+    let mut plans = plans.into_iter();
+    if let Some((transcript, targets)) = plans.next() {
+        recover_variable_plan(
+            node.clone(),
+            p2p,
+            checkpoint_hash,
+            transcript,
+            targets,
+            roster,
+            deferred_holders.clone(),
+        )
         .await?;
     }
+    let requests = plans.map(|(transcript, targets)| {
+        recover_variable_plan(
+            node.clone(),
+            p2p,
+            checkpoint_hash,
+            transcript,
+            targets,
+            roster,
+            deferred_holders.clone(),
+        )
+    });
+    collect_bounded_recovery_requests(requests, RECOVERY_VARIABLE_GROUP_CONCURRENCY).await?;
     if let Some(catalog) = &checkpoint.checkpoint.packing_catalog {
         let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
         let recovered_catalog = catalog.clone();
@@ -9879,6 +9863,54 @@ async fn recover_p2p_variable_shards(
         }
     }
     Ok(())
+}
+
+async fn recover_variable_plan(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    checkpoint_hash: [u8; 32],
+    transcript: SignedRecord<CodingVerificationTranscript>,
+    targets: Vec<usize>,
+    roster: &[GuildPeer],
+    deferred_holders: Arc<Mutex<BTreeSet<NodeId>>>,
+) -> Result<()> {
+    let group = transcript.value.manifest.value.group.clone();
+    for target_index in targets {
+        let group_for_check = group.clone();
+        let already_ready = node_blocking(node.clone(), move |node| {
+            Ok(node
+                .variable_shard_for_guild(
+                    &group_for_check.guild_id,
+                    &group_for_check.id,
+                    target_index as u16,
+                )
+                .is_ok())
+        })
+        .await?;
+        if already_ready {
+            continue;
+        }
+        let bytes = reconstruct_variable_shard_from_peers(
+            node.clone(),
+            p2p,
+            &group,
+            target_index,
+            roster,
+            deferred_holders.as_ref(),
+        )
+        .await?;
+        let transcript_for_stage = transcript.clone();
+        node_blocking(node.clone(), move |node| {
+            node.stage_recovered_variable_shard(
+                &checkpoint_hash,
+                &transcript_for_stage,
+                target_index as u16,
+                &bytes,
+            )
+        })
+        .await?;
+    }
+    node_blocking(node, move |node| node.activate_coding_attempt(&transcript)).await
 }
 
 async fn recover_local_shards_with<F, Fut>(

@@ -807,7 +807,12 @@ exactly `k` healthy holders were known. The fresh local assignment is now
 deferred before the first fetch; the first probe uses every remote candidate,
 and later groups use only the `k` preferred holders once enough are known. This
 matches the existing legacy recovery rule and prevents abandoned calls from
-consuming the global request budget. A fresh provisioned
+consuming the global request budget. The following run installed all 51
+recovered transcripts but again activated only two of 21 local variable shards
+before the integration deadline. Those independent group reconstructions were
+still serialized. Recovery now probes one group to seed shared holder health,
+then reconstructs and activates the remaining groups with bounded two-group
+concurrency under the unchanged global outbound semaphore. A fresh provisioned
 production gate must still close before Milestone 5 can pass.
 
 Milestone 4 implements quiet-period

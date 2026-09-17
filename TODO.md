@@ -716,7 +716,16 @@ node Clippy gate passed locally. No remote compilation server was used.
   deferred before fetching, use all remote candidates for the first probe, and
   once `k` preferred holders remain issue only those `k`, matching the bounded
   legacy recovery schedule. A focused regression pins both selections.
-- [ ] **M5-16 / gate — Run the corrected production gate.**
+- [x] **M5-16 / P1 — Reconstruct independent variable groups concurrently.**
+  The next run again completed the production workload and installed all 51
+  recovered transcripts, but still timed out after activating two of 21 local
+  variable shards. Holder selection no longer repeated known-dead requests;
+  the remaining work was serialized across otherwise independent groups. Probe
+  one group first so its results seed the shared deferred-holder set, then
+  reconstruct and activate the remaining groups with bounded two-group
+  concurrency. Each group still uses the existing bounded candidate set and
+  every request remains subject to the global outbound semaphore.
+- [ ] **M5-17 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -738,11 +747,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   adopted. The next run passed head certification and exposed M5-15 after two
   variable groups: unlike legacy recovery, variable recovery kept issuing a
   request to a deferred holder even when exactly `k` preferred holders remained,
-  so abandoned requests again consumed the global budget.
+  so abandoned requests again consumed the global budget. The following run
+  installed all 51 transcripts and proved that selection correction, but
+  exposed M5-16 because 21 independent local shard reconstructions still ran
+  strictly serially inside the same 60-second recovery bound.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-15 close.
+  acceptance gate after M5-01 through M5-16 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
