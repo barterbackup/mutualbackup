@@ -959,6 +959,14 @@ all retained entries, emits `ConnectionClosed` failures for every pending
 request using the owning connection ID, and safely ignores a later close for
 already reconciled state. A focused vendor regression covers stale inbound and
 outbound work plus the duplicate-close case.
+A corrected gate passed the repeated multi-owner scenario in 3,244.68 seconds.
+The fresh process test then passed onboarding, both small backups, interrupted
+large-backup resume, both seed-recovery roles, and the connection-rejection
+trigger with all five topology daemons still alive. Its 512,031-byte topology
+backup committed after about 70 minutes. The following 512,047-byte
+relay-fallback backup began healthy durable work but still inherited a legacy
+180-second CLI allowance. Both isolated-topology backups now use the measured
+ninety-minute bound; durable failure states continue to terminate immediately.
 A fresh provisioned production gate must still close before Milestone 5 can
 pass.
 

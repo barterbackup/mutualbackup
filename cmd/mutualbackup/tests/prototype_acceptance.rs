@@ -1714,7 +1714,11 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         deterministic_bytes(512_047, 89),
     )
     .unwrap();
-    let relay_backup = cli(&sockets[2], ["backup", "--wait"], Duration::from_secs(180));
+    let relay_backup = cli(
+        &sockets[2],
+        ["backup", "--wait"],
+        PROCESS_TOPOLOGY_BACKUP_TIMEOUT,
+    );
     assert!(relay_backup.contains("state:      Committed"));
     wait_for_peer_transfer(
         &sockets[0],

@@ -901,7 +901,18 @@ node Clippy gate passed locally. No remote compilation server was used.
   requests. A later close for already reconciled state is harmless. The focused
   vendor regression covers outbound work on the real closed connection,
   inbound work on the stale connection, full cleanup, and a duplicate close.
-- [ ] **M5-32 / gate — Run the corrected production gate.**
+- [x] **M5-32 / P2 — Give both isolated-topology backups the measured bound.**
+  The corrected gate passed the repeated multi-owner production scenario in
+  3,244.68 seconds. Its fresh process test passed onboarding, both small
+  backups, the interrupted large backup, owner and storage-only seed recovery,
+  and the first isolated-topology backup. All five topology daemons remained
+  alive through the connection-rejection trigger, proving M5-31. That
+  512,031-byte backup committed after about 70 minutes, but the immediately
+  following 512,047-byte relay-fallback backup still used a legacy 180-second
+  CLI allowance and timed out with healthy durable work in progress. Both
+  constrained-topology backups now use the same measured ninety-minute bound;
+  durable failures still return immediately.
+- [ ] **M5-33 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -961,7 +972,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-31 close.
+  acceptance gate after M5-01 through M5-32 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
