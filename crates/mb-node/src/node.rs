@@ -7724,8 +7724,7 @@ impl Node {
         let Some(checkpoint) = self.current_checkpoint(guild_id)? else {
             return Ok(None);
         };
-        checkpoint.verify()?;
-        self.validate_local_member(&checkpoint.checkpoint, false)?;
+        self.validate_local_recovery_resume(&installed, &checkpoint)?;
         let checkpoint_hash = checkpoint.hash()?;
         let revision = checkpoint
             .checkpoint
@@ -7750,6 +7749,40 @@ impl Node {
             generation: checkpoint.checkpoint.generation,
             revision_id,
         }))
+    }
+
+    fn validate_local_recovery_resume(
+        &self,
+        installed: &InstalledGuild,
+        checkpoint: &QuorumCheckpoint,
+    ) -> Result<()> {
+        checkpoint.checkpoint.validate()?;
+        let local_id = self.keys.node_id();
+        let local_checkpoint_member = checkpoint
+            .checkpoint
+            .members
+            .iter()
+            .find(|member| member.node_id == local_id)
+            .context("installed recovery checkpoint excludes the local seed identity")?;
+        if checkpoint.checkpoint.guild_id != installed.certificate.genesis.guild_id
+            || checkpoint.checkpoint.genesis_hash != installed.certificate.genesis.hash()?
+            || local_checkpoint_member.recovery_public_key != self.keys.recovery_public_key()
+            || checkpoint.checkpoint.format_version < 5 && !checkpoint.has_signature(local_id)
+        {
+            anyhow::bail!("installed recovery checkpoint is not bound to the local seed");
+        }
+        if let Some(state) = self.dynamic_guild_state()? {
+            let local_state_member = state
+                .active_members()
+                .find(|member| member.node_id == local_id)
+                .context("installed recovery guild no longer authorizes the local seed")?;
+            if state.guild_id != checkpoint.checkpoint.guild_id
+                || local_state_member.recovery_public_key != self.keys.recovery_public_key()
+            {
+                anyhow::bail!("installed recovery state is not bound to the local seed");
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn pin_recovery_attempt(

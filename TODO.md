@@ -750,7 +750,19 @@ node Clippy gate passed locally. No remote compilation server was used.
   reactor, and a live assigned target shard is fetched directly before falling
   back to any-`k` reconstruction. The same durable resume path fell from 53.27
   seconds to 11.91 seconds while retaining full evidence validation at ingress.
-- [ ] **M5-19 / gate — Run the corrected production gate.**
+- [x] **M5-19 / P1 — Resume an installed recovery without replaying guild history.**
+  The fresh gate completed cold recovery within its 60-second bound, installed
+  all 59 guild events and 51 transcripts, and restored the selected root. After
+  the original peers stopped, however, its required one-second offline resume
+  timed out because `resume_local_recovery` replayed the complete certified
+  event history through ordinary membership validation. The local resume path
+  now treats the atomically installed recovery state as its trust boundary. It
+  still validates checkpoint structure; binds the installed guild and genesis,
+  local Node ID and recovery key, legacy local signature, and current active
+  member; and lets the completed recovery job revalidate its target identity.
+  A diagnostic against the preserved production state fell to 325 ms without
+  any live peer or DHT path.
+- [ ] **M5-20 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -782,11 +794,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   network fetches. Durable resume profiling then exposed M5-18: recovery
   repeatedly replayed already verified coding proofs and the complete authority
   history during adoption, planning, staging, and activation, consuming almost
-  the whole bound even when shard data was already present.
+  the whole bound even when shard data was already present. The corrected run
+  then completed cold recovery inside the bound and exposed M5-19 when local
+  installed-state resume replayed that same 59-event history under a one-second
+  offline deadline.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-18 close.
+  acceptance gate after M5-01 through M5-19 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

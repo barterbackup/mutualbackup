@@ -831,8 +831,17 @@ group, and byte-identical durable evidence instead of replaying the same proofs
 and authority history. Reed-Solomon reconstruction runs on blocking workers,
 and recovery fetches a live assigned target directly before using any-`k`
 fallback reconstruction. The already staged durable resume path fell from
-53.27 seconds to 11.91 seconds. A fresh provisioned production gate must still
-close before Milestone 5 can pass.
+53.27 seconds to 11.91 seconds. The next production run completed cold recovery
+within 60 seconds, installed all 59 events and 51 transcripts, and restored the
+selected root, but its required one-second offline local resume timed out after
+the original peers stopped. That resume had replayed the complete certified
+event history through ordinary membership validation. Installed recovery now
+uses its already verified, atomically committed durable state as the trust
+boundary while still validating checkpoint structure and binding the installed
+guild/genesis, local identity and recovery key, legacy local signature, current
+active member, and completed recovery target. The preserved production state
+resumed in 325 ms without a live peer or DHT path. A fresh provisioned
+production gate must still close before Milestone 5 can pass.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer
