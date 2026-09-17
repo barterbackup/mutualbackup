@@ -10132,6 +10132,10 @@ async fn reconstruct_variable_shard_from_peers(
         bail!("target shard index is outside its variable coding group");
     }
     let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
+    deferred_holders
+        .lock()
+        .map_err(|_| anyhow::anyhow!("shard holder health lock is poisoned"))?
+        .insert(local_id);
     for peer in roster {
         for endpoint in &peer.endpoints {
             if let Ok(address) = endpoint.parse::<Multiaddr>() {
@@ -10154,7 +10158,7 @@ async fn reconstruct_variable_shard_from_peers(
             .lock()
             .map_err(|_| anyhow::anyhow!("shard holder health lock is poisoned"))?
             .clone();
-        let mut candidates = std::iter::once(target_index)
+        let candidates = std::iter::once(target_index)
             .chain((0..group.roles.len()).filter(|index| *index != target_index))
             .filter_map(|index| {
                 if shards[index].is_some() {
@@ -10170,12 +10174,12 @@ async fn reconstruct_variable_shard_from_peers(
                     .then_some((index, holder))
             })
             .collect::<Vec<_>>();
-        candidates.sort_by_key(|(_, holder)| deferred.contains(holder));
         let needed =
             usize::from(group.profile.data_shards).saturating_sub(shards.iter().flatten().count());
+        let candidates = select_variable_recovery_candidates(candidates, &deferred, needed);
         let mut requests = FuturesUnordered::new();
         let mut issued = Vec::new();
-        for (index, holder) in candidates.into_iter().take(needed.saturating_add(1)) {
+        for (index, holder) in candidates {
             issued.push((index, holder));
             let client = p2p.clone();
             let node = node.clone();
@@ -10251,6 +10255,25 @@ async fn reconstruct_variable_shard_from_peers(
         bail!("reconstructed variable shard has the wrong Merkle commitment");
     }
     Ok(bytes)
+}
+
+fn select_variable_recovery_candidates(
+    mut candidates: Vec<(usize, NodeId)>,
+    deferred: &BTreeSet<NodeId>,
+    needed: usize,
+) -> Vec<(usize, NodeId)> {
+    candidates.sort_by_key(|(_, holder)| deferred.contains(holder));
+    let preferred_count = candidates
+        .iter()
+        .take_while(|(_, holder)| !deferred.contains(holder))
+        .count();
+    let request_count = if preferred_count >= needed {
+        preferred_count.min(needed.saturating_add(1))
+    } else {
+        candidates.len()
+    };
+    candidates.truncate(request_count);
+    candidates
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12018,6 +12041,32 @@ mod tests {
         assert_eq!(collected, (0_usize..12).collect::<Vec<_>>());
         assert_eq!(maximum.load(Ordering::SeqCst), 4);
         assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn variable_recovery_stops_retrying_deferred_holders_once_k_are_preferred() {
+        let holders = (31_u8..=35)
+            .map(|seed| KeyMaterial::from_seed(&Seed::from_bytes([seed; 32])).node_id())
+            .collect::<Vec<_>>();
+        let candidates = vec![
+            (4, holders[0]),
+            (0, holders[1]),
+            (1, holders[2]),
+            (2, holders[3]),
+            (3, holders[4]),
+        ];
+        let mut deferred = BTreeSet::from([holders[0]]);
+
+        let initial = select_variable_recovery_candidates(candidates.clone(), &deferred, 3);
+        assert_eq!(initial.len(), 4);
+        assert!(initial.iter().all(|(_, holder)| *holder != holders[0]));
+
+        deferred.insert(holders[2]);
+        let subsequent = select_variable_recovery_candidates(candidates, &deferred, 3);
+        assert_eq!(
+            subsequent,
+            vec![(0, holders[1]), (2, holders[3]), (3, holders[4])]
+        );
     }
 
     #[test]

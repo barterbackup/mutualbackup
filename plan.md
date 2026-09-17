@@ -798,7 +798,16 @@ transcript fetch, so redundant work and stopped publishers could consume the
 complete global eight-request budget. Candidate genesis, checkpoint, and event
 history are now certified before transcript retrieval; only a publisher whose
 state has enough independent current locators fetches the evidence, with a
-later certified publisher used if that fetch fails. A fresh provisioned
+later certified publisher used if that fetch fails. The next run passed that
+phase, installed the complete recovered state and began rebuilding 21 local
+variable shards, but timed out after activating two. Variable recovery always
+issued `needed + 1` requests, allowing the absent local assignment to displace
+the useful initial spare and continuing to retry a known-offline holder after
+exactly `k` healthy holders were known. The fresh local assignment is now
+deferred before the first fetch; the first probe uses every remote candidate,
+and later groups use only the `k` preferred holders once enough are known. This
+matches the existing legacy recovery rule and prevents abandoned calls from
+consuming the global request budget. A fresh provisioned
 production gate must still close before Milestone 5 can pass.
 
 Milestone 4 implements quiet-period

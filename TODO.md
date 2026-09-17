@@ -704,7 +704,19 @@ node Clippy gate passed locally. No remote compilation server was used.
   transcript evidence only from a publisher whose state has enough independent
   current locators. If that publisher cannot serve the evidence, continue with
   another certified candidate rather than starting duplicate bulk fetches.
-- [ ] **M5-15 / gate — Run the corrected production gate.**
+- [x] **M5-15 / P1 — Stop retrying known-missing holders during variable recovery.**
+  The next run completed all four checkpoints, certified one recovery head,
+  installed the full event history and 50 retained transcripts, then timed out
+  after activating only two of 21 locally assigned variable shards. The
+  variable recovery scheduler always issued `needed + 1` requests. It let the
+  fresh node's known-missing local assignment occupy the initial spare, then
+  continued including a known-offline holder even after exactly `k` healthy
+  remote holders had been learned. Each abandoned request retained a global
+  outbound permit until its terminal event. Mark the absent local assignment
+  deferred before fetching, use all remote candidates for the first probe, and
+  once `k` preferred holders remain issue only those `k`, matching the bounded
+  legacy recovery schedule. A focused regression pins both selections.
+- [ ] **M5-16 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -723,11 +735,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   completed the same production workload but exposed M5-14: parallelizing each
   candidate's transcript list allowed redundant and offline candidate fetches
   to consume the complete global outbound budget before any certified state was
-  adopted.
+  adopted. The next run passed head certification and exposed M5-15 after two
+  variable groups: unlike legacy recovery, variable recovery kept issuing a
+  request to a deferred holder even when exactly `k` preferred holders remained,
+  so abandoned requests again consumed the global budget.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-14 close.
+  acceptance gate after M5-01 through M5-15 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
