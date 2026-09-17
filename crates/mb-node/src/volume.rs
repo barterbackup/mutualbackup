@@ -3237,9 +3237,13 @@ mod tests {
         let required = physical_write_reservation(object.bytes.len(), b"ack".len());
         assert!(required > V1_SECTOR_SIZE as u64);
         assert!(available > required);
-        let headroom = available.saturating_add(required);
         volumes
-            .configure(&control, &[volume.path().to_path_buf()], u64::MAX, headroom)
+            .configure(
+                &control,
+                &[volume.path().to_path_buf()],
+                u64::MAX,
+                u64::MAX - 1,
+            )
             .unwrap();
 
         assert!(matches!(
