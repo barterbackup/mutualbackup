@@ -356,6 +356,7 @@ pub struct P2pEventLoop {
     inbound_results: mpsc::Receiver<InboundResult>,
     inbound_sender: mpsc::Sender<InboundResult>,
     inbound_permits: Arc<Semaphore>,
+    inbound_workers: tokio::task::JoinSet<()>,
     #[cfg(test)]
     inbound_worker_pause: Arc<Mutex<Option<InboundWorkerPause>>>,
     pending_requests: HashMap<request_response::OutboundRequestId, PendingRequest>,
@@ -1555,6 +1556,7 @@ pub fn build_p2p_with_tor(
             inbound_results,
             inbound_sender,
             inbound_permits: Arc::new(Semaphore::new(config.max_connections)),
+            inbound_workers: tokio::task::JoinSet::new(),
             #[cfg(test)]
             inbound_worker_pause: Arc::new(Mutex::new(None)),
             pending_requests: HashMap::new(),
@@ -3050,9 +3052,18 @@ impl P2pEventLoop {
 
     pub async fn run(mut self) -> Result<()> {
         drop(self.startup_receiver.take());
-        let result = self.run_inner().await;
+        let mut result = self.run_inner().await;
         if let Err(error) = &result {
             self.fail_startup(format!("{error:#}"));
+        }
+        self.inbound_results.close();
+        while let Some(worker) = self.inbound_workers.join_next().await {
+            if let Err(error) = worker {
+                tracing::warn!(%error, "peer request worker panicked during shutdown");
+                if result.is_ok() {
+                    result = Err(anyhow::anyhow!("peer request worker panicked: {error}"));
+                }
+            }
         }
         result
     }
@@ -3697,6 +3708,9 @@ impl P2pEventLoop {
 
     async fn run_inner(&mut self) -> Result<()> {
         loop {
+            while let Some(worker) = self.inbound_workers.try_join_next() {
+                worker.context("peer request worker panicked")?;
+            }
             tokio::select! {
                 Some(command) = self.commands.recv() => {
                     if self.handle_command(command)? {
@@ -5372,7 +5386,7 @@ impl P2pEventLoop {
                             .lock()
                             .expect("inbound worker pause lock is poisoned")
                             .take();
-                        tokio::task::spawn_blocking(move || {
+                        self.inbound_workers.spawn_blocking(move || {
                             let response = process_peer_request(service, &config, request);
                             let _ = sender.blocking_send(InboundResult {
                                 peer,
@@ -16360,6 +16374,68 @@ mod tests {
         second_client.shutdown().await.unwrap();
         first_task.await.unwrap().unwrap();
         second_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_inbound_workers_before_releasing_node() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_seed = Seed::from_bytes([66; 32]);
+        let second_seed = Seed::from_bytes([67; 32]);
+        let first_path = temp.path().join("first");
+        let second_path = temp.path().join("second");
+        let first_node = Arc::new(Mutex::new(Node::open(&first_path, first_seed).unwrap()));
+        let second_node = Arc::new(Mutex::new(
+            Node::open(&second_path, second_seed.clone()).unwrap(),
+        ));
+        let first_id = first_node.lock().unwrap().keys().node_id();
+        let second_id = second_node.lock().unwrap().keys().node_id();
+        let (first_client, first_loop) = build_p2p(first_node.clone(), config(first_id)).unwrap();
+        let (second_client, second_loop) =
+            build_p2p(second_node.clone(), config(second_id)).unwrap();
+        let worker_pause = second_loop.inbound_worker_pause.clone();
+        let first_task = tokio::spawn(first_loop.run());
+        let mut second_task = tokio::spawn(second_loop.run());
+
+        first_client
+            .add_peer_address(second_id, listening_address(&second_client).await)
+            .await
+            .unwrap();
+        let (reached, reached_receiver) = oneshot::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        *worker_pause.lock().unwrap() = Some(InboundWorkerPause {
+            reached,
+            release: release_receiver,
+        });
+        assert_eq!(
+            first_client
+                .profile(second_id)
+                .await
+                .unwrap()
+                .member
+                .node_id,
+            second_id
+        );
+        reached_receiver
+            .await
+            .expect("inbound worker did not reach its shutdown pause");
+
+        second_client.shutdown().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second_task)
+                .await
+                .is_err(),
+            "event loop returned while an inbound worker still owned its node"
+        );
+        release.send(()).unwrap();
+        second_task.await.unwrap().unwrap();
+
+        first_client.shutdown().await.unwrap();
+        first_task.await.unwrap().unwrap();
+        drop(first_client);
+        drop(second_client);
+        drop(first_node);
+        drop(second_node);
+        Node::open(&second_path, second_seed).unwrap();
     }
 
     #[tokio::test]

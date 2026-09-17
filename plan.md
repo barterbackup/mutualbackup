@@ -848,8 +848,16 @@ transitions. Accepted recovery locators already carry signed, unexpired
 endpoints, and head validation already requires enough independent current
 locators. Recovery now installs those endpoints directly and adopts the
 certified state without a redundant DHT round; ordinary peer exchange refreshes
-them afterward. A fresh provisioned production gate must still close before
-Milestone 5 can pass.
+them afterward. The next clean run passed bounded cold recovery,
+post-recovery publication, and the one-second offline local resume, then could
+not reopen the recovered data directory after P2P shutdown. Inbound request
+handlers were detached blocking tasks, allowing the event loop to return while
+a handler retained `Arc<Node>` and its directory lock. The event loop now
+tracks and reaps those workers during service and joins every remaining worker
+after closing its result receiver during shutdown. A focused paused-worker
+regression proves that shutdown does not return until the node can be reopened.
+A fresh provisioned production gate must still close before Milestone 5 can
+pass.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer

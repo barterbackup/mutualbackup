@@ -773,7 +773,18 @@ node Clippy gate passed locally. No remote compilation server was used.
   Recovery now installs those locator endpoints directly and adopts certified
   state without waiting for another DHT round. Normal peer exchange can refresh
   endpoints after adoption.
-- [ ] **M5-21 / gate — Run the corrected production gate.**
+- [x] **M5-21 / P1 — Drain inbound workers before releasing the node runtime.**
+  The next clean gate passed bounded cold recovery, post-recovery publication,
+  and the one-second offline local resume, then failed when reopening the
+  recovered data directory after P2P shutdown. Inbound request handlers were
+  detached blocking tasks, so the event loop could return while a completed
+  handler still retained `Arc<Node>` and its process-lifetime directory lock.
+  The event loop now tracks and reaps completed workers during normal service,
+  closes their result receiver at shutdown, and joins every remaining worker
+  before returning. A focused regression pauses a worker after its response is
+  visible, proves shutdown remains pending, releases it, and reopens the same
+  data directory successfully.
+- [ ] **M5-22 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -811,11 +822,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   offline deadline. The next clean run verified and pinned its recovery head
   but exposed M5-20 before state adoption: redundant DHT endpoint-record
   refreshes consumed the remaining bound despite already validated locator
-  endpoints.
+  endpoints. The following run passed cold recovery and the offline local
+  resume, then exposed M5-21 when P2P shutdown returned before a detached
+  inbound worker released the recovered node's directory lock.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-20 close.
+  acceptance gate after M5-01 through M5-21 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
