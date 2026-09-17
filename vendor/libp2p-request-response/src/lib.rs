@@ -703,40 +703,80 @@ where
             ..
         }: ConnectionClosed,
     ) {
-        let connections = self
-            .connected
-            .get_mut(&peer_id)
-            .expect("Expected some established connection to peer before closing.");
+        self.reconcile_connection_closed(peer_id, connection_id, remaining_established);
+    }
 
-        let connection = connections
-            .iter()
-            .position(|c| c.id == connection_id)
-            .map(|p: usize| connections.remove(p))
-            .expect("Expected connection to be established before closing.");
+    fn reconcile_connection_closed(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        remaining_established: usize,
+    ) {
+        let mut closed = SmallVec::<[Connection; 2]>::new();
+        let remove_peer = if let Some(connections) = self.connected.get_mut(&peer_id) {
+            if let Some(position) = connections
+                .iter()
+                .position(|connection| connection.id == connection_id)
+            {
+                closed.push(connections.remove(position));
+            } else {
+                tracing::debug!(
+                    %peer_id,
+                    %connection_id,
+                    "connection closed after request-response state was already removed"
+                );
+            }
 
-        debug_assert_eq!(connections.is_empty(), remaining_established == 0);
-        if connections.is_empty() {
+            // `handle_established_*_connection` runs before every behaviour in a
+            // derived composite has accepted the connection. If a later
+            // behaviour denies it, request-response can retain an entry that the
+            // Swarm never counted as established. The Swarm's zero count is
+            // authoritative, so discard every such stale entry and fail its
+            // pending requests instead of panicking or leaking them.
+            if remaining_established == 0 {
+                closed.extend(connections.drain(..));
+            } else if connections.len() != remaining_established {
+                tracing::debug!(
+                    %peer_id,
+                    tracked = connections.len(),
+                    remaining_established,
+                    "request-response connection state differs from the Swarm"
+                );
+            }
+            connections.is_empty()
+        } else {
+            tracing::debug!(
+                %peer_id,
+                %connection_id,
+                "connection closed for an untracked request-response peer"
+            );
+            false
+        };
+
+        if remove_peer {
             self.connected.remove(&peer_id);
         }
 
-        for request_id in connection.pending_inbound_responses {
-            self.pending_events
-                .push_back(ToSwarm::GenerateEvent(Event::InboundFailure {
-                    peer: peer_id,
-                    connection_id,
-                    request_id,
-                    error: InboundFailure::ConnectionClosed,
-                }));
-        }
+        for connection in closed {
+            for request_id in connection.pending_inbound_responses {
+                self.pending_events
+                    .push_back(ToSwarm::GenerateEvent(Event::InboundFailure {
+                        peer: peer_id,
+                        connection_id: connection.id,
+                        request_id,
+                        error: InboundFailure::ConnectionClosed,
+                    }));
+            }
 
-        for request_id in connection.pending_outbound_responses {
-            self.pending_events
-                .push_back(ToSwarm::GenerateEvent(Event::OutboundFailure {
-                    peer: peer_id,
-                    connection_id,
-                    request_id,
-                    error: OutboundFailure::ConnectionClosed,
-                }));
+            for request_id in connection.pending_outbound_responses {
+                self.pending_events
+                    .push_back(ToSwarm::GenerateEvent(Event::OutboundFailure {
+                        peer: peer_id,
+                        connection_id: connection.id,
+                        request_id,
+                        error: OutboundFailure::ConnectionClosed,
+                    }));
+            }
         }
     }
 
@@ -1094,5 +1134,76 @@ impl Connection {
             pending_outbound_responses: Default::default(),
             pending_inbound_responses: Default::default(),
         }
+    }
+}
+
+#[cfg(all(test, feature = "cbor"))]
+mod tests {
+    use super::*;
+    use libp2p_swarm::StreamProtocol;
+
+    #[test]
+    fn last_swarm_connection_clears_preloaded_stale_entries() {
+        let mut behaviour = cbor::Behaviour::<u8, u8>::new(
+            [(
+                StreamProtocol::new("/request-response/test"),
+                ProtocolSupport::Full,
+            )],
+            Config::default(),
+        );
+        let peer = PeerId::random();
+        let closing_id = ConnectionId::new_unchecked(1);
+        let stale_id = ConnectionId::new_unchecked(2);
+        let outbound_id = OutboundRequestId(10);
+        let inbound_id = InboundRequestId(20);
+
+        let mut closing = Connection::new(closing_id, None);
+        closing.pending_outbound_responses.insert(outbound_id);
+        let mut stale = Connection::new(stale_id, None);
+        stale.pending_inbound_responses.insert(inbound_id);
+        behaviour
+            .connected
+            .insert(peer, SmallVec::from_vec(vec![closing, stale]));
+
+        behaviour.reconcile_connection_closed(peer, closing_id, 0);
+
+        assert!(!behaviour.connected.contains_key(&peer));
+        let mut saw_outbound = false;
+        let mut saw_inbound = false;
+        while let Some(event) = behaviour.pending_events.pop_front() {
+            match event {
+                ToSwarm::GenerateEvent(Event::OutboundFailure {
+                    peer: event_peer,
+                    connection_id,
+                    request_id,
+                    error: OutboundFailure::ConnectionClosed,
+                }) => {
+                    assert_eq!(event_peer, peer);
+                    assert_eq!(connection_id, closing_id);
+                    assert_eq!(request_id, outbound_id);
+                    saw_outbound = true;
+                }
+                ToSwarm::GenerateEvent(Event::InboundFailure {
+                    peer: event_peer,
+                    connection_id,
+                    request_id,
+                    error: InboundFailure::ConnectionClosed,
+                }) => {
+                    assert_eq!(event_peer, peer);
+                    assert_eq!(connection_id, stale_id);
+                    assert_eq!(request_id, inbound_id);
+                    saw_inbound = true;
+                }
+                event => panic!("unexpected request-response action: {event:?}"),
+            }
+        }
+        assert!(saw_outbound);
+        assert!(saw_inbound);
+
+        // A later close for an entry discarded during reconciliation is also
+        // harmless and cannot recreate stale state.
+        behaviour.reconcile_connection_closed(peer, stale_id, 0);
+        assert!(!behaviour.connected.contains_key(&peer));
+        assert!(behaviour.pending_events.is_empty());
     }
 }

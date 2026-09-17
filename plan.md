@@ -945,6 +945,20 @@ so the recovery path no longer blocks shard work on a redundant post-adoption
 tail request. The integration allowance is two minutes to cover the measured
 evidence and reconstruction work; focused tests continue to enforce request
 and abandoned-request bounds.
+A fresh gate then passed the complete repeated multi-owner production scenario,
+including three-holder cold recovery, in 3,281.88 seconds. The direct process
+test passed both small backups, interruption and restart of the large backup,
+owner seed recovery, and storage-only seed recovery before reaching the
+isolated topology backup. Relay load caused the connection-limits behaviour to
+reject replacement connections after the earlier request-response behaviour
+had preloaded them. When the Swarm later closed its last counted connection,
+the vendored request-response behaviour still held an uncounted entry and its
+debug assertion killed both the coordinator and hole-punched daemon. Connection
+closure now treats the Swarm's zero remaining count as authoritative: it drains
+all retained entries, emits `ConnectionClosed` failures for every pending
+request using the owning connection ID, and safely ignores a later close for
+already reconciled state. A focused vendor regression covers stale inbound and
+outbound work plus the duplicate-close case.
 A fresh provisioned production gate must still close before Milestone 5 can
 pass.
 

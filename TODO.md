@@ -886,7 +886,22 @@ node Clippy gate passed locally. No remote compilation server was used.
   request before shard work. The production recovery allowance is two minutes,
   covering the observed evidence ingestion plus reconstruction while focused
   tests retain the individual request and abandoned-request bounds.
-- [ ] **M5-31 / gate — Run the corrected production gate.**
+- [x] **M5-31 / P1 — Reconcile request state after composite connection rejection.**
+  The next fresh gate passed the repeated multi-owner production scenario,
+  including three-holder cold recovery, in 3,281.88 seconds. Its process test
+  then passed both small backups, the interrupted large backup, owner and
+  storage-only seed recovery, and reached the isolated topology backup. Under
+  concurrent relay load, the connection-limits behaviour rejected replacement
+  connections after the earlier request-response behaviour had preloaded them.
+  When the Swarm later reported its last live connection closed, the vendored
+  request-response code retained one of those uncounted entries and aborted
+  both the coordinator and hole-punched daemon on a debug assertion. Treat the
+  Swarm's zero remaining-connection count as authoritative, drain every stale
+  entry, and emit a typed `ConnectionClosed` failure for all of its pending
+  requests. A later close for already reconciled state is harmless. The focused
+  vendor regression covers outbound work on the real closed connection,
+  inbound work on the stale connection, full cleanup, and a duplicate close.
+- [ ] **M5-32 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -946,7 +961,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-30 close.
+  acceptance gate after M5-01 through M5-31 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
