@@ -736,7 +736,21 @@ node Clippy gate passed locally. No remote compilation server was used.
   traffic remains constrained by the P2P client's existing global outbound
   semaphore, so this fills the local pipeline without weakening the transport
   request bound.
-- [ ] **M5-18 / gate — Run the corrected production gate.**
+- [x] **M5-18 / P1 — Verify recovered coding evidence once.**
+  A durable-state resume probe showed that group concurrency was no longer the
+  dominant cost: even with every assigned shard already present, recovery spent
+  about 50 seconds replaying the same 21 coding transcripts and their 59-event
+  authority history during planning and activation. Each remote transcript is
+  now fully replayed once on a bounded blocking worker before a typed verified
+  value crosses the recovery trust boundary. Adoption stores that evidence in
+  both durable indexes atomically with certified guild state; later staging and
+  activation require an active checkpoint pin, an exact retained group, and
+  byte-identical records in both indexes instead of repeating the proof and
+  event-history replay. Reed-Solomon reconstruction also runs off the async
+  reactor, and a live assigned target shard is fetched directly before falling
+  back to any-`k` reconstruction. The same durable resume path fell from 53.27
+  seconds to 11.91 seconds while retaining full evidence validation at ingress.
+- [ ] **M5-19 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -765,11 +779,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   proved bounded concurrent reconstruction but exposed M5-17: a two-group
   pipeline activated only five of 21 shards because it still underfilled local
   reconstruction and durable activation work behind the globally bounded
-  network fetches.
+  network fetches. Durable resume profiling then exposed M5-18: recovery
+  repeatedly replayed already verified coding proofs and the complete authority
+  history during adoption, planning, staging, and activation, consuming almost
+  the whole bound even when shard data was already present.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-17 close.
+  acceptance gate after M5-01 through M5-18 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

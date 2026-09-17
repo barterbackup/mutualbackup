@@ -151,6 +151,26 @@ pub(crate) struct CodingLaunchJob {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct VerifiedCodingTranscript(SignedRecord<CodingVerificationTranscript>);
+
+impl VerifiedCodingTranscript {
+    pub(crate) fn verify(transcript: SignedRecord<CodingVerificationTranscript>) -> Result<Self> {
+        if replay_coding_transcript(&transcript)? != CodingReplayFinding::Verified {
+            anyhow::bail!("coding transcript does not verify the delegated codeword");
+        }
+        Ok(Self(transcript))
+    }
+
+    pub(crate) fn into_inner(self) -> SignedRecord<CodingVerificationTranscript> {
+        self.0
+    }
+
+    pub(crate) fn as_inner(&self) -> &SignedRecord<CodingVerificationTranscript> {
+        &self.0
+    }
+}
+
 const GUILD_INVITE_DOMAIN: &[u8] = b"mutualbackup/guild-invite/v1";
 
 #[cfg(test)]
@@ -2034,13 +2054,13 @@ impl Node {
         Ok(())
     }
 
-    pub fn adopt_recovered_dynamic_guild(
+    pub(crate) fn adopt_recovered_dynamic_guild(
         &mut self,
         certificate: QuorumGuildGenesis,
         checkpoint: &QuorumCheckpoint,
         events: Vec<QuorumGuildEvent>,
         mut peers: Vec<GuildPeer>,
-        transcripts: Vec<SignedRecord<CodingVerificationTranscript>>,
+        transcripts: Vec<VerifiedCodingTranscript>,
     ) -> Result<()> {
         certificate.verify()?;
         checkpoint.verify()?;
@@ -2108,6 +2128,7 @@ impl Node {
         }
         let transcript_by_group = transcripts
             .into_iter()
+            .map(VerifiedCodingTranscript::into_inner)
             .map(|transcript| (transcript.value.manifest.value.group.id, transcript))
             .collect::<BTreeMap<_, _>>();
         if transcript_by_group.len() != state.coding_groups.len() {
@@ -2122,9 +2143,7 @@ impl Node {
                 .get(&transcript.value.plan.value.membership_epoch)
                 .context("coding transcript membership epoch is absent from event history")?;
             authority.validate_attempt_authority(&transcript.value.plan.value)?;
-            if transcript.value.manifest.value.group != retained.group
-                || replay_coding_transcript(transcript)? != CodingReplayFinding::Verified
-            {
+            if transcript.value.manifest.value.group != retained.group {
                 anyhow::bail!("dynamic recovery coding transcript is invalid");
             }
             let bytes = canonical_bytes(transcript)?;
@@ -2552,6 +2571,56 @@ impl Node {
             anyhow::bail!("stored coding-group verifier transcript is invalid");
         }
         Ok(transcript)
+    }
+
+    pub(crate) fn recovery_coding_transcript_for_group(
+        &self,
+        checkpoint_hash: [u8; 32],
+        guild_id: [u8; 32],
+        group_id: [u8; 32],
+    ) -> Result<SignedRecord<CodingVerificationTranscript>> {
+        let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(
+            &self
+                .control
+                .get_record("coding-group-transcript", &group_id)?
+                .context("coding-group verifier transcript is unavailable")?,
+        )?;
+        if transcript.value.manifest.value.group.guild_id != guild_id
+            || transcript.value.manifest.value.group.id != group_id
+        {
+            anyhow::bail!("stored coding-group verifier transcript has the wrong group");
+        }
+        self.validate_certified_recovery_transcript(checkpoint_hash, &transcript)?;
+        Ok(transcript)
+    }
+
+    fn validate_certified_recovery_transcript(
+        &self,
+        checkpoint_hash: [u8; 32],
+        transcript: &SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<()> {
+        let plan = &transcript.value.plan.value;
+        let group = &transcript.value.manifest.value.group;
+        self.require_active_recovery_attempt(group.guild_id, checkpoint_hash)?;
+        if !self
+            .dynamic_guild_state()?
+            .context("node has no dynamic guild state")?
+            .coding_groups
+            .iter()
+            .any(|retained| retained.group == *group)
+        {
+            anyhow::bail!("recovery transcript is absent from certified guild state");
+        }
+        let bytes = canonical_bytes(transcript)?;
+        for (kind, record_id) in [
+            ("coding-transcript", plan.attempt_id.as_slice()),
+            ("coding-group-transcript", group.id.as_slice()),
+        ] {
+            if self.control.get_record(kind, record_id)?.as_deref() != Some(bytes.as_slice()) {
+                anyhow::bail!("recovery transcript differs from certified durable evidence");
+            }
+        }
+        Ok(())
     }
 
     pub fn pending_guild_join(&self) -> Result<Option<(SignedRecord<GuildInvite>, GuildPeer)>> {
@@ -4462,9 +4531,25 @@ impl Node {
         if replay_coding_transcript(transcript)? != CodingReplayFinding::Verified {
             anyhow::bail!("coding transcript does not verify the delegated codeword");
         }
+        self.validate_coding_attempt_authority(&transcript.value.plan)?;
+        self.activate_verified_coding_attempt(transcript)
+    }
+
+    pub(crate) fn activate_recovered_coding_attempt(
+        &mut self,
+        checkpoint_hash: [u8; 32],
+        transcript: &SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<()> {
+        self.validate_certified_recovery_transcript(checkpoint_hash, transcript)?;
+        self.activate_verified_coding_attempt(transcript)
+    }
+
+    fn activate_verified_coding_attempt(
+        &mut self,
+        transcript: &SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<()> {
         let plan = &transcript.value.plan.value;
         let group = &transcript.value.manifest.value.group;
-        self.validate_coding_attempt_authority(&transcript.value.plan)?;
         let group_committed = self.dynamic_guild_state()?.is_some_and(|state| {
             state
                 .coding_groups
@@ -7833,18 +7918,7 @@ impl Node {
     ) -> Result<()> {
         let plan = &transcript.value.plan;
         let group = &transcript.value.manifest.value.group;
-        self.require_active_recovery_attempt(group.guild_id, *checkpoint_hash)?;
-        self.validate_coding_attempt_authority(plan)?;
-        if replay_coding_transcript(transcript)? != CodingReplayFinding::Verified
-            || !self
-                .dynamic_guild_state()?
-                .context("node has no dynamic guild state")?
-                .coding_groups
-                .iter()
-                .any(|retained| retained.group == *group)
-        {
-            anyhow::bail!("recovered variable shard has no certified coding group");
-        }
+        self.validate_certified_recovery_transcript(*checkpoint_hash, transcript)?;
         let (storage_group, commitment) = match group.roles.get(usize::from(shard_index)) {
             Some(ShardRoleV2::Information(information))
                 if information.owner == self.keys.node_id() && !information.sector.virtual_zero =>

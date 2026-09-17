@@ -50,8 +50,8 @@ use uuid::Uuid;
 
 use crate::node::{
     CheckpointRecoveryObservation, CodingRetryJob, DelegatedCodingJob, DelegatedCodingJobState,
-    DhtRecordObservation, GuildPhase, SnapshotInfo, checkpoint_matches_dynamic_authority,
-    variable_group_protects_checkpoint,
+    DhtRecordObservation, GuildPhase, SnapshotInfo, VerifiedCodingTranscript,
+    checkpoint_matches_dynamic_authority, variable_group_protects_checkpoint,
 };
 
 #[cfg(test)]
@@ -1997,12 +1997,12 @@ impl P2pClient {
         Ok(())
     }
 
-    pub async fn coding_transcript(
+    pub(crate) async fn coding_transcript(
         &self,
         peer: NodeId,
         guild_id: [u8; 32],
         group_id: [u8; 32],
-    ) -> Result<SignedRecord<CodingVerificationTranscript>> {
+    ) -> Result<VerifiedCodingTranscript> {
         let response = self
             .call(
                 peer,
@@ -2015,11 +2015,12 @@ impl P2pClient {
         let transcript = *transcript;
         if transcript.value.manifest.value.group.guild_id != guild_id
             || transcript.value.manifest.value.group.id != group_id
-            || replay_coding_transcript(&transcript)? != mb_core::CodingReplayFinding::Verified
         {
             bail!("peer returned invalid coding-group verifier evidence");
         }
-        Ok(transcript)
+        tokio::task::spawn_blocking(move || VerifiedCodingTranscript::verify(transcript))
+            .await
+            .context("coding-transcript verifier failed")?
     }
 
     pub async fn submit_backup(
@@ -7589,7 +7590,7 @@ async fn sync_guild_event_page(
                 }
                 match p2p.coding_transcript(*source, guild_id, group.id).await {
                     Ok(found) => {
-                        transcript = Some(found);
+                        transcript = Some(found.into_inner());
                         break;
                     }
                     Err(error) => {
@@ -7993,7 +7994,7 @@ struct ValidatedRecoveryHead {
     candidates: Vec<RecoveryCandidate>,
     state: DynamicGuildState,
     events: Vec<QuorumGuildEvent>,
-    transcripts: Vec<SignedRecord<CodingVerificationTranscript>>,
+    transcripts: Vec<VerifiedCodingTranscript>,
 }
 
 pub async fn recover_from_dht(
@@ -8532,7 +8533,7 @@ async fn fetch_recovery_transcripts(
     publisher: NodeId,
     guild_id: [u8; 32],
     state: &DynamicGuildState,
-) -> Result<Vec<SignedRecord<CodingVerificationTranscript>>> {
+) -> Result<Vec<VerifiedCodingTranscript>> {
     let group_ids = state
         .coding_groups
         .iter()
@@ -8543,7 +8544,7 @@ async fn fetch_recovery_transcripts(
         .map(|group_id| async move { p2p.coding_transcript(publisher, guild_id, group_id).await });
     let mut transcripts =
         collect_bounded_recovery_requests(requests, RECOVERY_TRANSCRIPT_FETCH_CONCURRENCY).await?;
-    transcripts.sort_by_key(|transcript| transcript.value.manifest.value.group.id);
+    transcripts.sort_by_key(|transcript| transcript.as_inner().value.manifest.value.group.id);
     Ok(transcripts)
 }
 
@@ -9744,7 +9745,11 @@ async fn recover_p2p_variable_shards(
                 .collect::<Vec<_>>();
             if !targets.is_empty() {
                 plans.push((
-                    node.coding_transcript_for_group(retained.group.guild_id, retained.group.id)?,
+                    node.recovery_coding_transcript_for_group(
+                        checkpoint_hash,
+                        retained.group.guild_id,
+                        retained.group.id,
+                    )?,
                     targets,
                 ));
             }
@@ -9913,7 +9918,10 @@ async fn recover_variable_plan(
         })
         .await?;
     }
-    node_blocking(node, move |node| node.activate_coding_attempt(&transcript)).await
+    node_blocking(node, move |node| {
+        node.activate_recovered_coding_attempt(checkpoint_hash, &transcript)
+    })
+    .await
 }
 
 async fn recover_local_shards_with<F, Fut>(
@@ -10178,6 +10186,37 @@ async fn reconstruct_variable_shard_from_peers(
             }
         }
     }
+    let target_holder = variable_shard_holder(&group.roles[target_index]);
+    let target_is_preferred = !deferred_holders
+        .lock()
+        .map_err(|_| anyhow::anyhow!("shard holder health lock is poisoned"))?
+        .contains(&target_holder);
+    if target_holder != local_id
+        && target_is_preferred
+        && roster
+            .iter()
+            .any(|peer| peer.member.node_id == target_holder)
+    {
+        match p2p
+            .variable_shard(target_holder, group, target_index as u16)
+            .await
+        {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => {
+                deferred_holders
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("shard holder health lock is poisoned"))?
+                    .insert(target_holder);
+                tracing::warn!(
+                    group = %hex::encode(group.id),
+                    shard_index = target_index,
+                    holder = %target_holder,
+                    %error,
+                    "could not fetch the assigned variable recovery shard directly"
+                );
+            }
+        }
+    }
     let mut shards = group
         .roles
         .iter()
@@ -10278,18 +10317,24 @@ async fn reconstruct_variable_shard_from_peers(
     if let Some(bytes) = shards[target_index].take() {
         return Ok(bytes);
     }
-    mb_core::reconstruct(group.profile, &mut shards)?;
-    let bytes = shards[target_index]
-        .take()
-        .context("target variable shard was not reconstructed")?;
+    let profile = group.profile;
     let commitment = match &group.roles[target_index] {
         ShardRoleV2::Information(information) => &information.sector.commitment,
         ShardRoleV2::Parity(parity) => &parity.commitment,
-    };
-    if merkle_commit(&bytes)? != *commitment {
-        bail!("reconstructed variable shard has the wrong Merkle commitment");
     }
-    Ok(bytes)
+    .clone();
+    tokio::task::spawn_blocking(move || {
+        mb_core::reconstruct(profile, &mut shards)?;
+        let bytes = shards[target_index]
+            .take()
+            .context("target variable shard was not reconstructed")?;
+        if merkle_commit(&bytes)? != commitment {
+            bail!("reconstructed variable shard has the wrong Merkle commitment");
+        }
+        Ok(bytes)
+    })
+    .await
+    .context("variable shard reconstruction worker failed")?
 }
 
 fn select_variable_recovery_candidates(

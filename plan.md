@@ -819,8 +819,20 @@ concurrency activated only five of 21 local shards before the same recovery
 deadline. Recovery now keeps up to eight independent group workflows in flight
 so shard transfer, Reed-Solomon reconstruction, commitment checks, and durable
 activation overlap; the P2P client's global outbound semaphore continues to
-enforce the configured network-request bound. A fresh provisioned production
-gate must still close before Milestone 5 can pass.
+enforce the configured network-request bound. A durable-state resume probe then
+showed that the remaining dominant cost was redundant trust work: even with all
+assigned shards present, planning and activation spent about 50 seconds
+replaying 21 coding transcripts and the 59-event authority history. Remote
+transcripts are now fully replayed once on bounded blocking workers and carried
+through adoption as typed verified values. Atomic adoption stores the evidence
+in both transcript indexes with certified guild state; recovery staging and
+activation subsequently require the active checkpoint pin, the exact retained
+group, and byte-identical durable evidence instead of replaying the same proofs
+and authority history. Reed-Solomon reconstruction runs on blocking workers,
+and recovery fetches a live assigned target directly before using any-`k`
+fallback reconstruction. The already staged durable resume path fell from
+53.27 seconds to 11.91 seconds. A fresh provisioned production gate must still
+close before Milestone 5 can pass.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer
