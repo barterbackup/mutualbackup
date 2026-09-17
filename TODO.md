@@ -795,7 +795,17 @@ node Clippy gate passed locally. No remote compilation server was used.
   Synchronization now advances on the first valid certified tail and retries
   other peers on the next periodic pass. Coding-group evidence is fetched from
   the selected event source before that event is installed.
-- [ ] **M5-23 / gate — Run the corrected production gate.**
+- [x] **M5-23 / P2 — Keep process acceptance aligned with dynamic guild status.**
+  The corrected multi-owner QUIC production scenario passed from a fresh
+  Btrfs image in 2,521 seconds, including cold recovery, offline resume, and
+  shutdown/reopen. The following five-daemon CLI test then stopped immediately
+  after a successful finalize because two process tests still expected the old
+  fixed-size `members: 5 of 5` display. Milestone 5 intentionally removed that
+  hard-coded denominator when guild membership became dynamic; the live and
+  reopened coordinator both reported an active epoch-1 guild containing all
+  five authenticated members. Both direct and onion process tests now assert
+  the current exact `members: 5` status line.
+- [ ] **M5-24 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -838,11 +848,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   inbound worker released the recovered node's directory lock. The next clean
   run exposed M5-22 when one delayed guild-event-tail request blocked every
   node's recovery-key reconciliation behind the request's 90-second logical
-  deadline.
+  deadline. The corrected 2,521-second production scenario passed all of its
+  recovery and shutdown checks, then exposed M5-23 in the next process test's
+  stale fixed-size guild-status assertion.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-22 close.
+  acceptance gate after M5-01 through M5-23 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

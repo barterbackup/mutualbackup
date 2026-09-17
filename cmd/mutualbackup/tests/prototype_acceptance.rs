@@ -1181,7 +1181,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         assert!(cli(socket, ["guild", "status"], CLI_TIMEOUT).contains("Active"));
     }
     let finalized = cli(&sockets[0], ["guild", "finalize"], Duration::from_secs(60));
-    assert!(finalized.contains("members:     5 of 5"));
+    assert!(finalized.lines().any(|line| line == "members:     5"));
 
     let owner_one_source = run_root.join("p1/source");
     let owner_two_source = run_root.join("p2/source");
@@ -1995,7 +1995,7 @@ fn five_daemons_recover_from_seed_over_onion_only_libp2p() {
         join_guild_with_retry(&sockets[index], &token, Duration::from_secs(240));
     }
     let finalized = cli(&sockets[0], ["guild", "finalize"], Duration::from_secs(300));
-    assert!(finalized.contains("members:     5 of 5"));
+    assert!(finalized.lines().any(|line| line == "members:     5"));
 
     let source = run_root.join("p1/source");
     fs::create_dir_all(source.join("documents")).unwrap();

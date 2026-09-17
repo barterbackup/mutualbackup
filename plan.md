@@ -865,6 +865,14 @@ tail is independently quorum-certified and replay-validated; synchronization
 now advances on the first valid tail and retries other peers on its next
 periodic pass. Coding-group evidence is obtained from that selected event
 source before its event is installed.
+The corrected multi-owner QUIC scenario then passed from a fresh Btrfs image in
+2,521 seconds, including cold recovery, offline resume, publication, shutdown,
+and recovered-directory reopen. The following five-daemon CLI test stopped
+after a successful finalize because it still expected the pre-Milestone-5
+fixed-size `members: 5 of 5` display. Dynamic membership intentionally removed
+that hard-coded denominator; the preserved coordinator reopened as an active
+epoch-1 guild with all five authenticated members. Both direct and onion
+process tests now assert the current exact `members: 5` status line.
 A fresh provisioned production gate must still close before Milestone 5 can
 pass.
 
