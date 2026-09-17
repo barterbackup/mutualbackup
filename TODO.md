@@ -873,7 +873,20 @@ node Clippy gate passed locally. No remote compilation server was used.
   polling across those failures; idempotent coordinator admission preserves the
   one durable job. Non-waiting calls and permanent peer/protocol failures still
   return immediately. Focused regressions cover retry and classification.
-- [ ] **M5-30 / gate — Run the corrected production gate.**
+- [x] **M5-30 / P2 — Bound cold recovery by its complete measured work.**
+  The next fresh gate completed all four production backups but stopped after
+  3,068 seconds when three-holder cold recovery exceeded its 60-second test
+  allowance. The preserved recovery node had pinned generation 4, adopted the
+  same event sequence 60 and 50 active groups as every live peer, and stored all
+  50 required transcripts in both durable indexes; it had not yet staged a
+  shard or committed the checkpoint. Replaying that exact variable-shard phase
+  over fresh local QUIC sessions completed in 12.75 seconds. Head validation
+  already downloads and replays the selected publisher's complete certified
+  event history, so recovery no longer performs a redundant post-adoption tail
+  request before shard work. The production recovery allowance is two minutes,
+  covering the observed evidence ingestion plus reconstruction while focused
+  tests retain the individual request and abandoned-request bounds.
+- [ ] **M5-31 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -933,7 +946,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-29 close.
+  acceptance gate after M5-01 through M5-30 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

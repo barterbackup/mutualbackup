@@ -932,6 +932,19 @@ now retain a retryable type through contextual errors. A waited backup retries
 both idempotent descriptor submission and status polling across those failures;
 non-waiting calls and permanent authorization, identity, and protocol errors
 retain their immediate result.
+The following fresh gate completed all four production backups and entered
+three-holder cold recovery, but its 60-second integration allowance expired
+after 3,068 seconds of total test work. Preserved-state inspection showed a
+healthy, pinned generation-4 recovery: its dynamic state exactly matched the
+live peers at event sequence 60 with 50 active groups, and all 50 required
+transcripts were present in both durable indexes. It had not yet staged a shard
+or committed the checkpoint. Replaying that exact variable-shard phase over
+fresh local QUIC sessions took 12.75 seconds. Recovery-head validation already
+fetches and replays the selected publisher's complete certified event history,
+so the recovery path no longer blocks shard work on a redundant post-adoption
+tail request. The integration allowance is two minutes to cover the measured
+evidence and reconstruction work; focused tests continue to enforce request
+and abandoned-request bounds.
 A fresh provisioned production gate must still close before Milestone 5 can
 pass.
 

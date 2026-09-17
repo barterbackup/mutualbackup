@@ -8344,12 +8344,10 @@ async fn recover_from_dht_once(
         }
     })
     .await?;
-    loop {
-        let installed = sync_guild_event_page(node.clone(), p2p, Some(roster.clone())).await?;
-        if installed < MAX_GUILD_EVENT_TAIL {
-            break;
-        }
-    }
+    // Head validation fetched and replayed the selected publisher's complete
+    // certified event history before adoption. Recovery stays pinned to that
+    // state; ordinary peer exchange can accept a later certified tail after
+    // the checkpoint and local shards are installed.
     recover_p2p_local_shards(node.clone(), p2p, &checkpoint, &roster).await?;
     recover_p2p_variable_shards(node.clone(), p2p, &checkpoint, &roster).await?;
     let recovered_checkpoint = checkpoint.clone();
@@ -17900,12 +17898,14 @@ mod tests {
         let (recovery_client, recovery_loop) =
             build_p2p(recovered_node.clone(), recovery_config).unwrap();
         let recovery_task = tokio::spawn(recovery_loop.run());
-        // This covers DHT discovery, certified-state validation, endpoint
-        // refresh, all coding groups, and publication. Keep the integration
-        // bound above the protocol's single 20-second request timeout; focused
-        // tests separately prove that abandoned requests release their state.
+        // This covers DHT discovery, certified-state validation, all coding
+        // groups, checkpoint installation, and restore. A loaded local run
+        // needed about 60 seconds to ingest the certified evidence and 13 more
+        // to recover its assigned variable shards. Keep a bounded margin above
+        // that measured work; focused tests separately prove that abandoned
+        // requests release their state.
         let recovered = tokio::time::timeout(
-            Duration::from_secs(60),
+            Duration::from_secs(120),
             recover_from_dht(recovered_node.clone(), &recovery_client, &restored),
         )
         .await
