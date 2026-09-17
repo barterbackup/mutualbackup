@@ -762,7 +762,18 @@ node Clippy gate passed locally. No remote compilation server was used.
   member; and lets the completed recovery job revalidate its target identity.
   A diagnostic against the preserved production state fell to 325 ms without
   any live peer or DHT path.
-- [ ] **M5-20 / gate — Run the corrected production gate.**
+- [x] **M5-20 / P1 — Do not block certified-state adoption on endpoint refresh.**
+  The fresh gate reached a pinned recovery attempt but again exceeded 60
+  seconds before adopting guild state. Its durable database contained the four
+  validated recovery observations and the active attempt, but no installed
+  checkpoint, event, or transcript record. Source review found four optional
+  DHT endpoint-record lookups between those transitions. Every accepted
+  recovery locator already contains a signed, unexpired endpoint set, and the
+  validator requires enough independent current locators before pinning.
+  Recovery now installs those locator endpoints directly and adopts certified
+  state without waiting for another DHT round. Normal peer exchange can refresh
+  endpoints after adoption.
+- [ ] **M5-21 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -797,11 +808,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   the whole bound even when shard data was already present. The corrected run
   then completed cold recovery inside the bound and exposed M5-19 when local
   installed-state resume replayed that same 59-event history under a one-second
-  offline deadline.
+  offline deadline. The next clean run verified and pinned its recovery head
+  but exposed M5-20 before state adoption: redundant DHT endpoint-record
+  refreshes consumed the remaining bound despite already validated locator
+  endpoints.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-19 close.
+  acceptance gate after M5-01 through M5-20 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

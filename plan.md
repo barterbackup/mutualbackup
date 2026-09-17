@@ -841,7 +841,15 @@ boundary while still validating checkpoint structure and binding the installed
 guild/genesis, local identity and recovery key, legacy local signature, current
 active member, and completed recovery target. The preserved production state
 resumed in 325 ms without a live peer or DHT path. A fresh provisioned
-production gate must still close before Milestone 5 can pass.
+production run then verified its recovery head and pinned all four observations
+but exceeded 60 seconds before adopting guild state. The durable boundary and
+source path identified four optional DHT endpoint-record lookups between those
+transitions. Accepted recovery locators already carry signed, unexpired
+endpoints, and head validation already requires enough independent current
+locators. Recovery now installs those endpoints directly and adopts the
+certified state without a redundant DHT round; ordinary peer exchange refreshes
+them afterward. A fresh provisioned production gate must still close before
+Milestone 5 can pass.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer

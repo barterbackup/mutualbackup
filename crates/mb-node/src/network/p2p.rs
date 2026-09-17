@@ -8234,58 +8234,18 @@ async fn recover_from_dht_once(
             endpoints: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let mut endpoint_queries = FuturesUnordered::new();
-    for peer in &roster {
-        if peer.member.node_id == subject {
-            continue;
-        }
-        let member = peer.member.node_id;
-        let peer_id = member.libp2p_peer_id()?.to_string();
-        endpoint_queries
-            .push(async move { (member, p2p.get_record(endpoint_record_key(&peer_id)).await) });
-    }
-    let mut endpoint_records = HashMap::new();
-    while let Some((member, records)) = endpoint_queries.next().await {
-        match records {
-            Ok(records) => {
-                endpoint_records.insert(member, records);
-            }
-            Err(error) => {
-                tracing::warn!(%member, %error, "endpoint lookup failed during recovery");
-            }
-        }
-    }
     for peer in &mut roster {
         if peer.member.node_id == subject {
             peer.endpoints = local_endpoints.clone();
             continue;
         }
-        let mut endpoints_expire_at = None;
-        if let Some(candidate) = candidates
+        let Some(candidate) = candidates
             .iter()
             .find(|candidate| candidate.publisher == peer.member.node_id)
-        {
-            peer.endpoints = candidate.locator.endpoints.clone();
-            endpoints_expire_at = Some(candidate.locator.expires_at_unix_seconds);
-        }
-        match select_durable_endpoint_record(
-            node.clone(),
-            peer.member.node_id,
-            endpoint_records
-                .remove(&peer.member.node_id)
-                .unwrap_or_default(),
-        )
-        .await
-        {
-            Ok(Some(endpoint)) => {
-                endpoints_expire_at = Some(endpoint.value.expires_at_unix_seconds);
-                peer.endpoints = endpoint.value.endpoints;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(member = %peer.member.node_id, %error, "ignored conflicting endpoint records");
-            }
-        }
+        else {
+            continue;
+        };
+        peer.endpoints = candidate.locator.endpoints.clone();
         let mut usable_endpoints = Vec::new();
         for endpoint in &peer.endpoints {
             let Ok(address) = endpoint.parse::<Multiaddr>() else {
@@ -8294,22 +8254,20 @@ async fn recover_from_dht_once(
             };
             usable_endpoints.push((endpoint.clone(), address));
         }
-        if let Some(expires_at_unix_seconds) = endpoints_expire_at {
-            let addresses = usable_endpoints
-                .iter()
-                .map(|(_, address)| address.clone())
-                .collect();
-            if let Err(error) = p2p
-                .replace_learned_peer_addresses(
-                    peer.member.node_id,
-                    addresses,
-                    expires_at_unix_seconds,
-                )
-                .await
-            {
-                tracing::warn!(member = %peer.member.node_id, %error, "ignored unusable endpoint set");
-                usable_endpoints.clear();
-            }
+        let addresses = usable_endpoints
+            .iter()
+            .map(|(_, address)| address.clone())
+            .collect();
+        if let Err(error) = p2p
+            .replace_learned_peer_addresses(
+                peer.member.node_id,
+                addresses,
+                candidate.locator.expires_at_unix_seconds,
+            )
+            .await
+        {
+            tracing::warn!(member = %peer.member.node_id, %error, "ignored unusable endpoint set");
+            usable_endpoints.clear();
         }
         peer.endpoints = usable_endpoints
             .into_iter()
