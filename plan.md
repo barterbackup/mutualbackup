@@ -873,6 +873,15 @@ fixed-size `members: 5 of 5` display. Dynamic membership intentionally removed
 that hard-coded denominator; the preserved coordinator reopened as an active
 epoch-1 guild with all five authenticated members. Both direct and onion
 process tests now assert the current exact `members: 5` status line.
+Continuing the direct process test then timed out on its first backup. Recovery
+registration and coding activation had concurrently proposed different events
+at sequence 2, dividing the unanimous signatures two-to-three and leaving both
+below quorum. A retry also regenerated randomized recovery-envelope bytes and
+therefore could not reuse its durable anti-equivocation locks. Coordinator
+backup claims now remain pending until every active member has a current
+recovery-key epoch, preserving the registration sequence before coding starts.
+A subject whose registration attempt lacks quorum reloads and resubmits the
+exact event already held by its durable signature lock.
 A fresh provisioned production gate must still close before Milestone 5 can
 pass.
 

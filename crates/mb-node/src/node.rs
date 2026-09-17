@@ -2338,6 +2338,26 @@ impl Node {
         self.sign_guild_event_proposal_inner(event)
     }
 
+    pub(crate) fn locked_guild_event_proposal(&self, sequence: u64) -> Result<Option<GuildEvent>> {
+        let record_id = sequence.to_be_bytes();
+        let Some(bytes) = self
+            .control
+            .get_record("guild-event-signature-lock", &record_id)?
+        else {
+            return Ok(None);
+        };
+        let lock: GuildEventSignatureLock = decode_canonical(&bytes)?;
+        let expected_signature = sign_guild_event(&lock.event, &self.keys)?;
+        if lock.format_version != 1
+            || lock.event.sequence != sequence
+            || lock.event_hash != lock.event.hash()?
+            || lock.signature != expected_signature
+        {
+            anyhow::bail!("local guild event signature lock is invalid");
+        }
+        Ok(Some(lock.event))
+    }
+
     pub fn sign_coding_group_event_proposal(
         &self,
         event: &GuildEvent,
@@ -2804,6 +2824,12 @@ impl Node {
             .dynamic_guild_state()?
             .context("this node has no dynamic guild state")?;
         if dynamic_guild_coordinator(&installed, &state)? != self.keys.node_id() {
+            return Ok(None);
+        }
+        if state
+            .active_members()
+            .any(|member| state.current_recovery_key(member.node_id).is_none())
+        {
             return Ok(None);
         }
         for (_, bytes) in self.control.records("backup-job")? {
@@ -10517,6 +10543,10 @@ mod tests {
         };
         let local_signature = node.sign_guild_event_proposal(&add).unwrap();
         assert_eq!(local_signature.signer, node.keys().node_id());
+        assert_eq!(
+            node.locked_guild_event_proposal(add.sequence).unwrap(),
+            Some(add.clone())
+        );
         let conflicting = GuildEvent {
             kind: mb_core::GuildEventKind::RelabelMember {
                 node_id: certificate.genesis.coordinator,
@@ -10653,6 +10683,69 @@ mod tests {
         }));
         assert!(node.authorize_member(&guild_id, removed).is_err());
         assert_eq!(node.guild_event_tail(0, genesis_hash).unwrap(), tail);
+    }
+
+    #[test]
+    fn backup_claim_waits_for_every_current_recovery_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, certificate, peers) = recovery_guild_fixture();
+        let mut signer_seeds = (0_u8..5)
+            .map(|index| Seed::from_bytes([index + 120; 32]))
+            .collect::<Vec<_>>();
+        signer_seeds.sort_by_key(|seed| KeyMaterial::from_seed(seed).node_id());
+        let signer_keys = signer_seeds
+            .iter()
+            .map(KeyMaterial::from_seed)
+            .collect::<Vec<_>>();
+        let coordinator_seed = signer_seeds
+            .iter()
+            .find(|seed| KeyMaterial::from_seed(seed).node_id() == certificate.genesis.coordinator)
+            .unwrap()
+            .clone();
+        let mut node = Node::open(temp.path(), coordinator_seed).unwrap();
+        node.adopt_recovered_guild(certificate.clone(), peers)
+            .unwrap();
+        let job = BackupJob {
+            format_version: 1,
+            descriptor: BackupDescriptor {
+                format_version: 1,
+                guild_id: certificate.genesis.guild_id,
+                owner: signer_keys[1].node_id(),
+                protected_root_id: Uuid::from_bytes([210; 16]),
+                revision_id: Uuid::from_bytes([211; 16]),
+                total_pages: 1,
+                object_hash: [212; 32],
+            },
+            state: BackupJobState::Pending,
+            checkpoint_hash: None,
+            error: None,
+        };
+        node.put_backup_job(&job).unwrap();
+        assert!(node.claim_backup_job().unwrap().is_none());
+
+        for subject in &signer_keys {
+            let state = node.dynamic_guild_state().unwrap().unwrap();
+            let (envelope, _) =
+                mb_core::create_recovery_key_envelope(subject, certificate.genesis.guild_id, 1)
+                    .unwrap();
+            let event = GuildEvent {
+                format_version: 1,
+                guild_id: certificate.genesis.guild_id,
+                sequence: state.event_sequence + 1,
+                parent: state.event_head,
+                kind: mb_core::GuildEventKind::RotateRecoveryKey { envelope },
+            };
+            let signatures = signer_keys
+                .iter()
+                .map(|keys| sign_guild_event(&event, keys).unwrap())
+                .collect();
+            node.install_guild_event(QuorumGuildEvent { event, signatures })
+                .unwrap();
+        }
+
+        let claimed = node.claim_backup_job().unwrap().unwrap();
+        assert_eq!(claimed.descriptor, job.descriptor);
+        assert_eq!(claimed.state, BackupJobState::Running);
     }
 
     #[test]

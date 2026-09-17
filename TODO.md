@@ -805,7 +805,18 @@ node Clippy gate passed locally. No remote compilation server was used.
   reopened coordinator both reported an active epoch-1 guild containing all
   five authenticated members. Both direct and onion process tests now assert
   the current exact `members: 5` status line.
-- [ ] **M5-24 / gate — Run the corrected production gate.**
+- [x] **M5-24 / P1 — Serialize initial recovery registration before coding.**
+  After the status assertion was corrected, the direct five-daemon process
+  test timed out on its first backup. All nodes had converged on event sequence
+  1, but recovery-key registration and coding activation concurrently proposed
+  different events at sequence 2. Their unanimous votes split two-to-three, so
+  neither event could commit; subsequent recovery retries also generated fresh
+  randomized envelope bytes and correctly hit the durable anti-equivocation
+  locks. Coordinator backup claims now remain pending until every active member
+  has a current recovery-key epoch. A subject whose registration attempt lacks
+  quorum reloads and resubmits its exact durably signed event. Focused tests
+  prove both the admission fence and exact signature-lock recovery.
+- [ ] **M5-25 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -850,11 +861,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   node's recovery-key reconciliation behind the request's 90-second logical
   deadline. The corrected 2,521-second production scenario passed all of its
   recovery and shutdown checks, then exposed M5-23 in the next process test's
-  stale fixed-size guild-status assertion.
+  stale fixed-size guild-status assertion. Continuing that process test exposed
+  M5-24 when initial recovery registration and the first coding activation
+  divided the unanimous signatures for one sequence, leaving both proposals
+  below quorum.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-23 close.
+  acceptance gate after M5-01 through M5-24 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

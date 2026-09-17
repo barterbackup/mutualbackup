@@ -7008,17 +7008,31 @@ async fn reconcile_recovery_key_epoch_once(node: Arc<Mutex<Node>>, p2p: &P2pClie
             .unwrap_or(0)
             .checked_add(1)
             .context("recovery-key epoch exhausted")?;
-        let (envelope, _) =
-            mb_core::create_recovery_key_envelope(node.keys(), state.guild_id, epoch)?;
-        let event = GuildEvent {
-            format_version: 1,
-            guild_id: state.guild_id,
-            sequence: state
-                .event_sequence
-                .checked_add(1)
-                .context("guild event sequence exhausted")?,
-            parent: state.event_head,
-            kind: mb_core::GuildEventKind::RotateRecoveryKey { envelope },
+        let sequence = state
+            .event_sequence
+            .checked_add(1)
+            .context("guild event sequence exhausted")?;
+        let event = if let Some(locked) = node.locked_guild_event_proposal(sequence)? {
+            match &locked.kind {
+                mb_core::GuildEventKind::RotateRecoveryKey { envelope }
+                    if envelope.subject == local_id && envelope.epoch == epoch =>
+                {
+                    locked
+                }
+                _ => bail!(
+                    "local seed has already signed another guild event at sequence {sequence}"
+                ),
+            }
+        } else {
+            let (envelope, _) =
+                mb_core::create_recovery_key_envelope(node.keys(), state.guild_id, epoch)?;
+            GuildEvent {
+                format_version: 1,
+                guild_id: state.guild_id,
+                sequence,
+                parent: state.event_head,
+                kind: mb_core::GuildEventKind::RotateRecoveryKey { envelope },
+            }
         };
         state.validate_event_proposal(&event)?;
         let guild = node
