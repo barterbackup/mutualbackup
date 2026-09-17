@@ -7051,24 +7051,43 @@ async fn reconcile_variable_group_lifecycle_once(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
 ) -> Result<()> {
-    let (state, guild, checkpoint, local_id, backup_commit_in_progress) =
+    let (state, guild, checkpoint, local_id, backup_commit_in_progress, locked_event) =
         node_blocking(node.clone(), |node| {
             let guild = node
                 .guild_summary()?
                 .context("coding-group lifecycle requires an installed guild")?;
             let checkpoint = node.current_checkpoint(guild.guild_id)?;
             let backup_commit_in_progress = node.backup_commit_in_progress(guild.guild_id)?;
+            let state = node
+                .dynamic_guild_state()?
+                .context("coding-group lifecycle requires dynamic guild state")?;
+            let next_event_sequence = state
+                .event_sequence
+                .checked_add(1)
+                .context("guild event sequence exhausted")?;
+            let locked_event = node.locked_guild_event_proposal(next_event_sequence)?;
             Ok((
-                node.dynamic_guild_state()?
-                    .context("coding-group lifecycle requires dynamic guild state")?,
+                state,
                 guild,
                 checkpoint,
                 node.keys().node_id(),
                 backup_commit_in_progress,
+                locked_event,
             ))
         })
         .await?;
     if guild.coordinator != local_id || !matches!(guild.phase, GuildPhase::Active) {
+        return Ok(());
+    }
+    if let Some(event) = locked_event {
+        if matches!(
+            event.kind,
+            mb_core::GuildEventKind::RetireCodingGroup { .. }
+                | mb_core::GuildEventKind::ForgetCodingGroup { .. }
+        ) {
+            state.validate_event_proposal(&event)?;
+            return commit_plain_guild_event(node, p2p, state, guild, local_id, event).await;
+        }
         return Ok(());
     }
     if backup_commit_in_progress {

@@ -245,6 +245,16 @@ pub struct DhtSequenceFloors {
     pub recovery: BTreeMap<NodeId, u64>,
 }
 
+fn same_coding_lane_attempt(left: &CodingAttemptPlan, right: &CodingAttemptPlan) -> bool {
+    left.format_version == right.format_version
+        && left.attempt_id == right.attempt_id
+        && left.checkpoint_hash == right.checkpoint_hash
+        && left.membership_epoch == right.membership_epoch
+        && left.geometry == right.geometry
+        && left.delegator == right.delegator
+        && left.information_roots == right.information_roots
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct DhtPublicationState {
     format_version: u16,
@@ -2832,6 +2842,16 @@ impl Node {
         {
             return Ok(None);
         }
+        let next_event_sequence = state
+            .event_sequence
+            .checked_add(1)
+            .context("guild event sequence exhausted")?;
+        if self
+            .locked_guild_event_proposal(next_event_sequence)?
+            .is_some()
+        {
+            return Ok(None);
+        }
         for (_, bytes) in self.control.records("backup-job")? {
             let mut job: BackupJob = decode_canonical(&bytes)?;
             if matches!(job.state, BackupJobState::Pending | BackupJobState::Running) {
@@ -3397,16 +3417,35 @@ impl Node {
             anyhow::bail!("only the coding delegator may queue its launch");
         }
         let attempt_id = plan.value.attempt_id;
+        if let Some(bytes) = self.control.get_record("coding-retry-job", &attempt_id)? {
+            let existing: CodingRetryJob = decode_canonical(&bytes)?;
+            existing.failure.verify(CODING_FAILURE_REPORT_DOMAIN)?;
+            existing.failure.value.validate()?;
+            let prior = &existing.failure.value.plan;
+            if existing.format_version != 1 || !same_coding_lane_attempt(&prior.value, &plan.value)
+            {
+                anyhow::bail!("coding launch conflicts with a durable retry");
+            }
+            self.control
+                .delete_record("coding-launch-job", &attempt_id)?;
+            return Ok(prior.clone());
+        }
+        if let Some(bytes) = self
+            .control
+            .get_record("coding-activation-job", &attempt_id)?
+        {
+            let existing: CodingActivationJob = decode_canonical(&bytes)?;
+            let prior = &existing.transcript.value.plan;
+            if existing.format_version != 1 || !same_coding_lane_attempt(&prior.value, &plan.value)
+            {
+                anyhow::bail!("coding launch conflicts with durable verifier evidence");
+            }
+            return Ok(prior.clone());
+        }
         if let Some(bytes) = self.control.get_record("coding-launch-job", &attempt_id)? {
             let mut existing: CodingLaunchJob = decode_canonical(&bytes)?;
             if existing.format_version != 1
-                || existing.plan.value.attempt_id != attempt_id
-                || existing.plan.value.checkpoint_hash != plan.value.checkpoint_hash
-                || existing.plan.value.geometry != plan.value.geometry
-                || existing.plan.value.delegator != plan.value.delegator
-                || existing.plan.value.coding_coordinator != plan.value.coding_coordinator
-                || existing.plan.value.verification_coordinator
-                    != plan.value.verification_coordinator
+                || !same_coding_lane_attempt(&existing.plan.value, &plan.value)
             {
                 anyhow::bail!("coding launch conflicts with a durable attempt");
             }
@@ -4486,10 +4525,22 @@ impl Node {
         if records.is_empty() {
             return Ok(None);
         }
-        let current_membership_epoch = self
+        let state = self
             .dynamic_guild_state()?
-            .context("coding activation requires dynamic guild state")?
-            .membership_epoch;
+            .context("coding activation requires dynamic guild state")?;
+        let current_membership_epoch = state.membership_epoch;
+        let next_event_sequence = state
+            .event_sequence
+            .checked_add(1)
+            .context("guild event sequence exhausted")?;
+        let locked_group = match self.locked_guild_event_proposal(next_event_sequence)? {
+            Some(GuildEvent {
+                kind: mb_core::GuildEventKind::AddCodingGroup { group },
+                ..
+            }) => Some(group),
+            Some(_) => return Ok(None),
+            None => None,
+        };
         let mut stale = None;
         for (_, bytes) in records {
             let mut job: CodingActivationJob = decode_canonical(&bytes)?;
@@ -4504,12 +4555,22 @@ impl Node {
                     stale.get_or_insert(job);
                     continue;
                 }
+                if locked_group
+                    .as_ref()
+                    .is_some_and(|group| job.transcript.value.manifest.value.group != *group)
+                {
+                    continue;
+                }
                 job.error = None;
                 self.put_coding_activation_job(&job)?;
                 return Ok(Some(job));
             }
         }
-        Ok(stale)
+        if locked_group.is_some() {
+            Ok(None)
+        } else {
+            Ok(stale)
+        }
     }
 
     pub(crate) fn complete_coding_activation(&self, attempt_id: [u8; 16]) -> Result<()> {
@@ -10743,6 +10804,28 @@ mod tests {
                 .unwrap();
         }
 
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let relabel = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RelabelMember {
+                node_id: certificate.genesis.coordinator,
+                failure_domain: "coordinator-after-recovery-keys".to_owned(),
+            },
+        };
+        node.sign_guild_event_proposal(&relabel).unwrap();
+        assert!(node.claim_backup_job().unwrap().is_none());
+        let signatures = signer_keys
+            .iter()
+            .map(|keys| sign_guild_event(&relabel, keys).unwrap())
+            .collect();
+        node.install_guild_event(QuorumGuildEvent {
+            event: relabel,
+            signatures,
+        })
+        .unwrap();
         let claimed = node.claim_backup_job().unwrap().unwrap();
         assert_eq!(claimed.descriptor, job.descriptor);
         assert_eq!(claimed.state, BackupJobState::Running);
@@ -11032,7 +11115,12 @@ mod tests {
         node.complete_coding_retry([212; 16]).unwrap();
         assert!(node.claim_coding_retry().unwrap().is_none());
         assert!(!node.coding_checkpoint_has_pending([213; 32]).unwrap());
-        node.enqueue_coding_launch(failed.clone()).unwrap();
+        assert_eq!(node.enqueue_coding_launch(failed.clone()).unwrap(), failed);
+        assert!(node.claim_coding_launch().unwrap().is_none());
+        let mut stale = failed.value.clone();
+        stale.attempt_id = [216; 16];
+        let stale = node.sign_coding_attempt_plan(stale).unwrap();
+        node.enqueue_coding_launch(stale.clone()).unwrap();
 
         let state = node.dynamic_guild_state().unwrap().unwrap();
         let relabel = GuildEvent {
@@ -11065,8 +11153,8 @@ mod tests {
         node.enqueue_coding_launch(current.clone()).unwrap();
         assert_eq!(node.claim_coding_launch().unwrap().unwrap().plan, current);
         node.complete_coding_launch([215; 16]).unwrap();
-        assert_eq!(node.claim_coding_launch().unwrap().unwrap().plan, failed);
-        node.abandon_coding_launch([212; 16]).unwrap();
+        assert_eq!(node.claim_coding_launch().unwrap().unwrap().plan, stale);
+        node.abandon_coding_launch([216; 16]).unwrap();
         assert!(node.claim_coding_launch().unwrap().is_none());
     }
 

@@ -889,6 +889,19 @@ seconds, exceeding 332 seconds of useful work across the interruption. The old
 120-second process bound predated sampled delegated coding. The gate now allows
 ten minutes for its small backups and thirty minutes for its interrupted 1 MiB
 backup, with durable failure states still rejected immediately.
+The large interrupted job then remained `Running` through that bound, but
+durable inspection found it fixed at event sequence 22. A retirement proposal
+signed between backups held the next sequence while the running-job fence
+prevented lifecycle replay; activation chose other groups ahead of the locked
+event; and restart planning resurrected an initial deterministic launch whose
+completed fresh retry was already durable. Backup claims now wait behind any
+locally signed next event. Lifecycle replay may finish an exact locked
+retire/forget event across a running job, activation selects the transcript
+named by a locked group event, and durable retry or verifier evidence prevents
+the original launch from being reissued. The preserved run advanced through
+sequence 42 and committed in 1,138 seconds without another conflict. The large
+process allowance is sixty minutes for its measured coding and event-activation
+workload.
 A fresh provisioned production gate must still close before Milestone 5 can
 pass.
 

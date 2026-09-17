@@ -825,7 +825,21 @@ node Clippy gate passed locally. No remote compilation server was used.
   delegated coding. Process acceptance now allows ten minutes for its 180–190
   KiB backups and thirty minutes for its interrupted 1 MiB backup, while still
   treating failed durable jobs as immediate failures.
-- [ ] **M5-26 / gate — Run the corrected production gate.**
+- [x] **M5-26 / P1 — Converge interrupted coding and lifecycle events.**
+  The large interrupted process backup remained `Running` through its initial
+  thirty-minute bound. Durable inspection showed no useful progress at event
+  sequence 22: a retirement proposal signed between backups held sequence 23,
+  the running backup fence prevented lifecycle replay, activation selected
+  other groups ahead of the locked event, and restart planning reissued an
+  initial deterministic attempt whose completed retry was already durable.
+  Backup claims now wait behind any locally signed next event; lifecycle may
+  finish its exact locked retire/forget event across a running job; activation
+  selects the transcript named by a locked group event; and durable retry or
+  verifier evidence suppresses resurrection of the original launch. The
+  preserved deadlocked run advanced from sequence 22 through 42 and committed
+  in 1,138 seconds with no recurring conflict. The large process bound is sixty
+  minutes to cover its measured coding and serial event-activation workload.
+- [ ] **M5-27 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -875,11 +889,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   divided the unanimous signatures for one sequence, leaving both proposals
   below quorum. After that ordering correction, the first backup passed and the
   healthy second backup exposed M5-25 by outliving the process test's legacy
-  120-second coding bound.
+  120-second coding bound. Continuing through the large interrupted backup
+  exposed M5-26 when a pre-backup lifecycle signature lock and already retried
+  coding attempts could not converge after coordinator restart.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-25 close.
+  acceptance gate after M5-01 through M5-26 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

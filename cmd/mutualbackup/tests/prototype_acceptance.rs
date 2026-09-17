@@ -29,7 +29,7 @@ use uuid::Uuid;
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const MIN_BULK_TRANSFER_BYTES: u64 = 64 * 1024;
 const PROCESS_SMALL_BACKUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const PROCESS_LARGE_BACKUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const PROCESS_LARGE_BACKUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 struct Daemon {
     args: Vec<OsString>,
