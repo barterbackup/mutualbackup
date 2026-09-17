@@ -856,6 +856,15 @@ a handler retained `Arc<Node>` and its directory lock. The event loop now
 tracks and reaps those workers during service and joins every remaining worker
 after closing its result receiver during shutdown. A focused paused-worker
 regression proves that shutdown does not return until the node can be reopened.
+The next clean run stopped at initial recovery-key readiness with all five
+nodes at exactly event sequence 2 and two current recovery keys. Event-tail
+synchronization had waited for every peer request before accepting any result,
+so one delayed request with a 90-second logical deadline blocked the following
+recovery-key reconciliation beyond the test's 60-second bound. Each accepted
+tail is independently quorum-certified and replay-validated; synchronization
+now advances on the first valid tail and retries other peers on its next
+periodic pass. Coding-group evidence is obtained from that selected event
+source before its event is installed.
 A fresh provisioned production gate must still close before Milestone 5 can
 pass.
 

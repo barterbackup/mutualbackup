@@ -7567,7 +7567,7 @@ async fn sync_guild_event_page(
             )
         });
     }
-    let mut tails = Vec::new();
+    let mut selected_tail = None;
     while let Some((source, result)) = requests.next().await {
         let tail = match result {
             Ok(tail) => tail,
@@ -7581,47 +7581,26 @@ async fn sync_guild_event_page(
             tracing::warn!(%source, %error, "peer returned an invalid guild event tail");
             continue;
         }
-        tails.push((source, tail));
+        selected_tail = Some((source, tail));
+        break;
     }
-    tails.sort_by_key(|(source, tail)| (std::cmp::Reverse(tail.events.len()), *source));
-    let Some((_, selected)) = tails.first() else {
+    let Some((source, selected)) = selected_tail else {
         return Ok(0);
     };
-    for (_, tail) in tails.iter().skip(1) {
-        let shared = selected.events.len().min(tail.events.len());
-        if selected.events[..shared] != tail.events[..shared] {
-            bail!("peers returned conflicting quorum-certified guild event tails");
-        }
-    }
     let installed = selected.events.len();
     for (event_index, event) in selected.events.clone().into_iter().enumerate() {
         if let mb_core::GuildEventKind::AddCodingGroup { group } = &event.event.kind {
-            let mut transcript = None;
-            let mut last_error = None;
-            for (source, tail) in &tails {
-                if tail.events.get(event_index) != Some(&event) {
-                    continue;
-                }
-                match p2p.coding_transcript(*source, guild_id, group.id).await {
-                    Ok(found) => {
-                        transcript = Some(found.into_inner());
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::debug!(%source, %error, group = %hex::encode(group.id), "coding-group evidence request failed");
-                        last_error = Some(error);
-                    }
-                }
-            }
-            let transcript = transcript.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no peer supplied verifier evidence for coding group {}: {}",
-                    hex::encode(group.id),
-                    last_error
-                        .map(|error| error.to_string())
-                        .unwrap_or_else(|| "no eligible event source".to_owned())
-                )
-            })?;
+            debug_assert_eq!(selected.events.get(event_index), Some(&event));
+            let transcript = p2p
+                .coding_transcript(source, guild_id, group.id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "peer {source} did not supply verifier evidence for coding group {}",
+                        hex::encode(group.id)
+                    )
+                })?
+                .into_inner();
             node_blocking(node.clone(), move |node| {
                 node.install_coding_group_event(event, transcript)
             })

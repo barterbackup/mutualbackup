@@ -784,7 +784,18 @@ node Clippy gate passed locally. No remote compilation server was used.
   before returning. A focused regression pauses a worker after its response is
   visible, proves shutdown remains pending, releases it, and reopens the same
   data directory successfully.
-- [ ] **M5-22 / gate — Run the corrected production gate.**
+- [x] **M5-22 / P1 — Do not let one peer stall guild-event synchronization.**
+  The next clean run stopped at initial recovery-key readiness. Every one of the
+  five nodes had converged on exactly event sequence 2 with two current recovery
+  keys, then made no progress for the rest of the 60-second bound. Guild-event
+  synchronization issued requests to every peer and awaited all of them before
+  accepting any tail, while one logical request may retry for 90 seconds. That
+  put the reconciliation step behind a single delayed peer even though each
+  accepted event tail is independently quorum-certified and replay-validated.
+  Synchronization now advances on the first valid certified tail and retries
+  other peers on the next periodic pass. Coding-group evidence is fetched from
+  the selected event source before that event is installed.
+- [ ] **M5-23 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -824,11 +835,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   refreshes consumed the remaining bound despite already validated locator
   endpoints. The following run passed cold recovery and the offline local
   resume, then exposed M5-21 when P2P shutdown returned before a detached
-  inbound worker released the recovered node's directory lock.
+  inbound worker released the recovered node's directory lock. The next clean
+  run exposed M5-22 when one delayed guild-event-tail request blocked every
+  node's recovery-key reconciliation behind the request's 90-second logical
+  deadline.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-21 close.
+  acceptance gate after M5-01 through M5-22 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
