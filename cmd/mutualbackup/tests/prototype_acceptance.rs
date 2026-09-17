@@ -30,6 +30,7 @@ const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const MIN_BULK_TRANSFER_BYTES: u64 = 64 * 1024;
 const PROCESS_SMALL_BACKUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PROCESS_LARGE_BACKUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const PROCESS_TOPOLOGY_BACKUP_TIMEOUT: Duration = Duration::from_secs(90 * 60);
 
 struct Daemon {
     args: Vec<OsString>,
@@ -1594,7 +1595,11 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         &final_owner_two,
     )
     .unwrap();
-    let topology_backup = cli(&sockets[2], ["backup", "--wait"], Duration::from_secs(180));
+    let topology_backup = cli(
+        &sockets[2],
+        ["backup", "--wait"],
+        PROCESS_TOPOLOGY_BACKUP_TIMEOUT,
+    );
     assert!(topology_backup.contains("state:      Committed"));
     wait_for_peer_transfer(
         &sockets[0],

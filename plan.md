@@ -911,6 +911,17 @@ event still blocks it. A regression pins both branches. The preserved run
 resumed immediately with the corrected binary and committed checkpoint
 `882eca8d785f5952bae322a50b16a331e4a278b51f87dc9445ee4f813c678ad1`
 in about two minutes.
+That fresh run then passed both small backups, the interrupted large-backup
+restart, DHT renewal, and cold-recovery setup before its 512,031-byte topology
+backup exceeded a legacy three-minute CLI bound. Durable inspection found 51
+activation jobs, 41 completed transcripts, 27 launch jobs, and only that fourth
+revision still running. Resuming the exact databases advanced the guild from
+event sequence 52 through 80 and committed checkpoint
+`3a1abf9e4163b2ca4a81f971f9737687a9c4a3fb0f9ddb9cbd340b7e15a35f24`
+after about fifty additional minutes, for more than fifty-three minutes of
+useful work across the interruption. The constrained-topology backup now has a
+separate ninety-minute allowance, with durable failure states still rejected
+immediately.
 A fresh provisioned production gate must still close before Milestone 5 can
 pass.
 

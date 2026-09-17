@@ -850,7 +850,18 @@ node Clippy gate passed locally. No remote compilation server was used.
   that preserved run with the corrected binary advanced immediately and
   committed checkpoint `882eca8d785f5952bae322a50b16a331e4a278b51f87dc9445ee4f813c678ad1`
   in about two minutes.
-- [ ] **M5-28 / gate — Run the corrected production gate.**
+- [x] **M5-28 / P1 — Bound the isolated-topology coding workload realistically.**
+  After the backup/restart path passed, the fresh process run reached its
+  512,031-byte topology backup over direct, hole-punched, and relay paths but
+  hit that step's legacy 180-second CLI timeout. Its durable state contained 51
+  activation jobs, 41 completed transcripts, and 27 launch jobs, with only the
+  topology revision still running. Resuming those exact databases locally
+  advanced the guild from event sequence 52 through 80 and committed checkpoint
+  `3a1abf9e4163b2ca4a81f971f9737687a9c4a3fb0f9ddb9cbd340b7e15a35f24`
+  after about fifty more minutes, over fifty-three minutes of useful work in
+  total. The constrained-topology backup now has a separate ninety-minute
+  bound; durable failed jobs still terminate immediately.
+- [ ] **M5-29 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -904,11 +915,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   exposed M5-26 when a pre-backup lifecycle signature lock and already retried
   coding attempts could not converge after coordinator restart. The next fresh
   run exposed M5-27 when the resulting backup fence also rejected the writer
-  rotation owned by the same pending job.
+  rotation owned by the same pending job. That run then passed the interrupted
+  large backup and cold-recovery setup before exposing M5-28: the isolated
+  topology backup's three-minute bound predated production delegated coding.
   The provisioned Btrfs production path has therefore not yet passed for the
   reopened work. Run formatting, locked all-target workspace tests,
   warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-27 close.
+  acceptance gate after M5-01 through M5-28 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
