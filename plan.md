@@ -1029,9 +1029,10 @@ blockers (details, source locations, and regression scenarios are in `TODO.md`):
   reconciliation now resume the exact signature-locked proposal. Focused
   coverage exercises CLI retry, automatic completion, and durable reuse after
   restart without weakening event anti-equivocation.
-- **M5-39:** A fast empty event tail can repeatedly win synchronization over
-  reachable peers with newer certified state; evidence-fetch failures also
-  need bounded fallback.
+- **M5-39 (resolved):** Event synchronization gives empty tails a bounded grace
+  for an advancing response, and coding-event evidence falls back concurrently
+  across eligible peers until a valid transcript installs. Focused tests cover
+  the former fast-empty race and both failed and invalid evidence sources.
 - **M5-40:** One unavailable root starves automatic backups of other roots and
   prevents their watches from being installed.
 - **M5-41:** Failed relay reservation acceptance retains an unexpiring slot;

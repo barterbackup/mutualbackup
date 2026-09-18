@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::pin::Pin;
@@ -105,6 +106,7 @@ const RECOVERY_TRANSCRIPT_FETCH_CONCURRENCY: usize = 8;
 const RECOVERY_VARIABLE_GROUP_CONCURRENCY: usize = 8;
 const SHARD_FETCH_ATTEMPTS: usize = 3;
 const PEER_EXCHANGE_INTERVAL: Duration = Duration::from_secs(5);
+const EVENT_TAIL_ADVANCE_GRACE: Duration = Duration::from_secs(5);
 const MAX_EXCHANGED_ENDPOINT_RECORDS: usize = 64;
 const PREFERRED_PATH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -7642,12 +7644,17 @@ async fn sync_guild_event_page(
     let guild_id = guild.guild_id;
     let base_sequence = state.event_sequence;
     let base_head = state.event_head;
-    let mut requests = FuturesUnordered::new();
-    for peer in recovery_peers
+    let requests = FuturesUnordered::new();
+    let peers = recovery_peers
         .unwrap_or(guild.peers)
         .into_iter()
         .filter(|peer| peer.member.node_id != local_id)
-    {
+        .collect::<Vec<_>>();
+    let transcript_sources = peers
+        .iter()
+        .map(|peer| peer.member.node_id)
+        .collect::<Vec<_>>();
+    for peer in peers {
         for endpoint in peer.endpoints {
             if let Ok(address) = endpoint.parse() {
                 let _ = p2p.add_peer_address(peer.member.node_id, address).await;
@@ -7662,8 +7669,51 @@ async fn sync_guild_event_page(
             )
         });
     }
-    let mut selected_tail = None;
-    while let Some((source, result)) = requests.next().await {
+    let Some((source, selected)) =
+        select_advancing_guild_tail(&state, requests, EVENT_TAIL_ADVANCE_GRACE).await
+    else {
+        return Ok(0);
+    };
+    let installed = selected.events.len();
+    for event in selected.events {
+        if let mb_core::GuildEventKind::AddCodingGroup { group } = &event.event.kind {
+            let group_id = group.id;
+            install_coding_group_event_from_sources(
+                node.clone(),
+                p2p,
+                event,
+                guild_id,
+                group_id,
+                source,
+                &transcript_sources,
+            )
+            .await?;
+        } else {
+            node_blocking(node.clone(), move |node| node.install_guild_event(event)).await?;
+        }
+    }
+    Ok(installed)
+}
+
+async fn select_advancing_guild_tail<F>(
+    state: &DynamicGuildState,
+    mut requests: FuturesUnordered<F>,
+    grace: Duration,
+) -> Option<(NodeId, GuildEventTail)>
+where
+    F: Future<Output = (NodeId, Result<GuildEventTail>)>,
+{
+    let mut empty_deadline = None;
+    loop {
+        let next = if let Some(deadline) = empty_deadline {
+            match tokio::time::timeout_at(deadline, requests.next()).await {
+                Ok(next) => next,
+                Err(_) => return None,
+            }
+        } else {
+            requests.next().await
+        };
+        let (source, result) = next?;
         let tail = match result {
             Ok(tail) => tail,
             Err(error) => {
@@ -7676,35 +7726,91 @@ async fn sync_guild_event_page(
             tracing::warn!(%source, %error, "peer returned an invalid guild event tail");
             continue;
         }
-        selected_tail = Some((source, tail));
-        break;
+        if tail.events.is_empty() {
+            empty_deadline.get_or_insert_with(|| tokio::time::Instant::now() + grace);
+            continue;
+        }
+        return Some((source, tail));
     }
-    let Some((source, selected)) = selected_tail else {
-        return Ok(0);
-    };
-    let installed = selected.events.len();
-    for (event_index, event) in selected.events.clone().into_iter().enumerate() {
-        if let mb_core::GuildEventKind::AddCodingGroup { group } = &event.event.kind {
-            debug_assert_eq!(selected.events.get(event_index), Some(&event));
-            let transcript = p2p
-                .coding_transcript(source, guild_id, group.id)
-                .await
-                .with_context(|| {
-                    format!(
-                        "peer {source} did not supply verifier evidence for coding group {}",
-                        hex::encode(group.id)
-                    )
-                })?
-                .into_inner();
-            node_blocking(node.clone(), move |node| {
-                node.install_coding_group_event(event, transcript)
+}
+
+async fn install_coding_group_event_from_sources(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    event: QuorumGuildEvent,
+    guild_id: [u8; 32],
+    group_id: [u8; 32],
+    preferred_source: NodeId,
+    sources: &[NodeId],
+) -> Result<()> {
+    let mut ordered = Vec::with_capacity(sources.len());
+    ordered.push(preferred_source);
+    ordered.extend(
+        sources
+            .iter()
+            .copied()
+            .filter(|source| *source != preferred_source),
+    );
+    let mut seen = BTreeSet::new();
+    ordered.retain(|source| seen.insert(*source));
+    let requests = FuturesUnordered::new();
+    for source in ordered {
+        requests.push(async move {
+            (
+                source,
+                p2p.coding_transcript(source, guild_id, group_id).await,
+            )
+        });
+    }
+    accept_first_peer_response(requests, move |source, transcript| {
+        let node = node.clone();
+        let candidate_event = event.clone();
+        async move {
+            node_blocking(node, move |node| {
+                node.install_coding_group_event(candidate_event, transcript.into_inner())
             })
-            .await?;
-        } else {
-            node_blocking(node.clone(), move |node| node.install_guild_event(event)).await?;
+            .await
+            .with_context(|| format!("peer {source} returned invalid coding evidence"))
+        }
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "no guild peer supplied verifier evidence for coding group {}",
+            hex::encode(group_id)
+        )
+    })?;
+    Ok(())
+}
+
+async fn accept_first_peer_response<T, F, Accept, Accepted>(
+    mut requests: FuturesUnordered<F>,
+    mut accept: Accept,
+) -> Result<NodeId>
+where
+    F: Future<Output = (NodeId, Result<T>)>,
+    Accept: FnMut(NodeId, T) -> Accepted,
+    Accepted: Future<Output = Result<()>>,
+{
+    let mut last_error = None;
+    while let Some((source, result)) = requests.next().await {
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::debug!(%source, %error, "peer fallback request failed");
+                last_error = Some(error);
+                continue;
+            }
+        };
+        match accept(source, response).await {
+            Ok(()) => return Ok(source),
+            Err(error) => {
+                tracing::warn!(%source, %error, "peer fallback response was rejected");
+                last_error = Some(error);
+            }
         }
     }
-    Ok(installed)
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no peer fallback response was available")))
 }
 
 pub async fn run_relay_membership_sync(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {
@@ -12081,6 +12187,140 @@ mod tests {
             max_connections: 8,
             tor_mode: TorMode::DisableTor,
         }
+    }
+
+    #[tokio::test]
+    async fn event_tail_selection_prefers_bounded_advancing_response() {
+        type TailRequest =
+            Pin<Box<dyn Future<Output = (NodeId, Result<GuildEventTail>)> + Send + 'static>>;
+
+        let keys = (0_u8..3)
+            .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([index + 31; 32])))
+            .collect::<Vec<_>>();
+        let mut members = keys
+            .iter()
+            .enumerate()
+            .map(|(index, keys)| Member {
+                node_id: keys.node_id(),
+                recovery_public_key: keys.recovery_public_key(),
+                failure_domain: format!("tail-domain-{index}"),
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| member.node_id);
+        let state = DynamicGuildState::new(
+            [41; 32],
+            [42; 32],
+            QuorumPolicy {
+                format_version: 1,
+                rule: QuorumRule::Unanimous,
+            },
+            members,
+        )
+        .unwrap();
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::SetQuorum {
+                policy: QuorumPolicy {
+                    format_version: 1,
+                    rule: QuorumRule::Majority,
+                },
+            },
+        };
+        let mut signatures = keys
+            .iter()
+            .map(|keys| mb_core::sign_guild_event(&event, keys).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        let advancing = GuildEventTail {
+            format_version: 1,
+            base_sequence: state.event_sequence,
+            base_head: state.event_head,
+            events: vec![QuorumGuildEvent { event, signatures }],
+        };
+        let empty = GuildEventTail {
+            format_version: 1,
+            base_sequence: state.event_sequence,
+            base_head: state.event_head,
+            events: Vec::new(),
+        };
+        let fast_source = keys[0].node_id();
+        let advancing_source = keys[1].node_id();
+        let requests = FuturesUnordered::<TailRequest>::new();
+        let fast_empty = empty.clone();
+        requests.push(Box::pin(async move { (fast_source, Ok(fast_empty)) }));
+        requests.push(Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            (advancing_source, Ok(advancing))
+        }));
+
+        let selected = select_advancing_guild_tail(&state, requests, Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert_eq!(selected.0, advancing_source);
+        assert_eq!(selected.1.events.len(), 1);
+
+        let requests = FuturesUnordered::<TailRequest>::new();
+        requests.push(Box::pin(async move { (fast_source, Ok(empty)) }));
+        let delayed_source = keys[2].node_id();
+        requests.push(Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            (
+                delayed_source,
+                Err(anyhow::anyhow!("delayed request unexpectedly completed")),
+            )
+        }));
+        let started = tokio::time::Instant::now();
+        assert!(
+            select_advancing_guild_tail(&state, requests, Duration::from_millis(25))
+                .await
+                .is_none()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn peer_response_fallback_skips_failed_and_invalid_sources() {
+        type PeerRequest = Pin<Box<dyn Future<Output = (NodeId, Result<u8>)> + Send + 'static>>;
+
+        let sources = (0_u8..3)
+            .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([index + 51; 32])).node_id())
+            .collect::<Vec<_>>();
+        let requests = FuturesUnordered::<PeerRequest>::new();
+        let failed_source = sources[0];
+        requests.push(Box::pin(async move {
+            (failed_source, Err(anyhow::anyhow!("source unavailable")))
+        }));
+        let invalid_source = sources[1];
+        requests.push(Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            (invalid_source, Ok(1))
+        }));
+        let valid_source = sources[2];
+        requests.push(Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            (valid_source, Ok(2))
+        }));
+        let accepted = Arc::new(Mutex::new(None));
+        let accepted_for_callback = accepted.clone();
+
+        let source = accept_first_peer_response(requests, move |source, value| {
+            let accepted = accepted_for_callback.clone();
+            async move {
+                if value != 2 {
+                    anyhow::bail!("invalid evidence")
+                }
+                *accepted.lock().unwrap() = Some((source, value));
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(source, valid_source);
+        assert_eq!(*accepted.lock().unwrap(), Some((valid_source, 2)));
     }
 
     fn materialize_variable_lane(

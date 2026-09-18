@@ -1081,7 +1081,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   proposal, verifies byte-identical CLI preparation, commits that proposal,
   exercises automatic completion of another locked rotation, and proves a
   further proposal remains byte-identical after reopening the node.
-- [ ] **M5-39 / P1 — Do not let an empty event tail win synchronization.**
+- [x] **M5-39 / P1 — Do not let an empty event tail win synchronization.**
   The M5-22 shortcut accepts the first valid tail and abandons the other
   requests even when it contains no events
   (`crates/mb-node/src/network/p2p.rs:7636`). Empty tails from a peer at the
@@ -1093,6 +1093,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   if its source cannot supply required coding evidence (`:7651`). Gate a fast
   empty responder, a slower advancing responder, and a selected source whose
   transcript request fails.
+  Tail selection now treats an empty valid response as a bounded five-second
+  fallback rather than success, so an advancing response can win without an
+  all-peer logical-timeout wait. Coding-event evidence requests run concurrently
+  across the eligible roster; invalid or unavailable sources are skipped until
+  one transcript validates and installs. Focused asynchronous regressions cover
+  the fast-empty/slow-advance deadline and unavailable plus invalid transcript
+  sources before a valid fallback.
 - [ ] **M5-40 / P1 — Isolate unavailable roots in automatic scheduling and watching.**
   Roots are UUID-sorted and `next_dirty_root` always chooses the first dirty
   one (`crates/mb-node/src/node.rs:1004`, `:1410`). A failed scan of that root
