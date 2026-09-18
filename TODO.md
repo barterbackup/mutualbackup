@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (reopened)
+## Milestone 5 guild geometry and coding protocol (passed)
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -944,7 +944,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   reservation isolation, and circuit byte and duration bounds still constrain
   resources. A regression admits 64 immediate requests from one member through
   both limiter lists and continues to reject a nonmember.
-- [ ] **M5-35 / gate — Run the corrected production gate.**
+- [x] **M5-35 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -1007,10 +1007,20 @@ node Clippy gate passed locally. No remote compilation server was used.
   the next fresh run reached that route substantially faster and kept useful
   work moving for the complete timeout, but exposed M5-34 when inherited
   public-relay time windows throttled authenticated guild circuit churn. The
-  provisioned Btrfs production path has therefore not yet passed for the
-  reopened work. Run formatting, locked all-target workspace tests,
-  warning-free locked all-target Clippy, and the local reflink/network
-  acceptance gate after M5-01 through M5-34 close.
+  corrected tree at `3d0bdbf` passed the complete local gate on 2026-09-18.
+  A fresh `network-smoke.sh` run passed the five-daemon process scenario in
+  9,288.94 seconds: both small backups, interrupted large-backup resume, owner
+  and storage-only seed recovery, and both isolated topologies committed. The
+  512,031-byte topology backup took about 75 minutes 9 seconds; the decisive
+  512,047-byte relay-fallback backup committed in about 40 minutes with three
+  simultaneous relayed peers and zero `resource limit exceeded` denials. A
+  second fresh Btrfs image passed every preceding `reflink-acceptance.sh`
+  command: all 19 provisioned filesystem/metadata/headroom tests, five-active-
+  node seed recovery in 51.95 seconds, signed network commit/recovery in 94.76
+  seconds, and repeated multi-owner QUIC backup/recovery in 2,796.81 seconds.
+  Formatting, the complete locked all-target workspace suite, and warning-free
+  locked all-target Clippy also pass. All compilation and execution were local;
+  no remote compilation server was used.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

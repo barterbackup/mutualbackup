@@ -82,8 +82,9 @@ observable. Its deterministic handoff regression and the complete local
 correction gate passed on 2026-09-15. Milestone 5's first closure record was
 reopened by follow-up source review. Root-scoped signed revision chains,
 checkpoint-authenticated production stable-slot packing, and authenticated
-candidate-to-lane path ranking are now implemented. The fresh provisioned
-production gate remains, so Milestone 5 is still current.
+candidate-to-lane path ranking are now implemented. The corrected source and
+complete local provisioned gate passed on 2026-09-18. Milestones 0 through 5
+are closed; Milestone 6 is next.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -490,8 +491,8 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 4 have passed; Milestone 5 is
-in progress. Later wire or durable-state changes
+than a daemon prerequisite. Milestones 0 through 5 have passed; Milestone 6 is
+next. Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
 
@@ -706,7 +707,7 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 4 are passed. Milestone 5 is current.
+**Current position:** Milestones 0 through 5 are passed. Milestone 6 is next.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -716,7 +717,7 @@ variable recovery/audit/repair, and event-driven group retention. Coding work
 is fenced across authority changes; stale attempts clean both staged and
 uncommitted ready data without deleting committed protection.
 
-The eventual Milestone 5 source gate covers every-`k` variable-profile reconstruction,
+The Milestone 5 source gate covers every-`k` variable-profile reconstruction,
 packing/layout stability and multiple roots, the exact `1/4096` sparse-error
 detection limit of one 16-byte sample in a 64 KiB shard, `k+m`/`k+m-1` transfer
 bounds, member changes during durable attempts, key rotation with retained
@@ -991,8 +992,21 @@ admission limiter. Total and per-peer capacity plus circuit byte and duration
 bounds remain in force, while repeated requests from one admitted member are
 not time-throttled. A focused regression exercises 64 immediate admitted
 requests and verifies that a nonmember remains denied.
-A fresh provisioned production gate must still close before Milestone 5 can
-pass.
+
+The corrected tree at `3d0bdbf` passed the complete local gate on 2026-09-18.
+The fresh five-daemon process scenario passed in 9,288.94 seconds, including
+both small backups, interrupted large-backup resume, both seed-recovery roles,
+and both isolated topologies. The first 512,031-byte topology backup committed
+in about 75 minutes 9 seconds. The decisive 512,047-byte relay-fallback backup
+then committed in about 40 minutes with three simultaneous relayed peers and no
+resource-limit denials. On a second fresh Btrfs image, all 19 provisioned
+filesystem, metadata, headroom, and recovery tests passed; five-active-node
+seed recovery passed in 51.95 seconds; signed network commit and recovery passed
+in 94.76 seconds; and repeated multi-owner QUIC backup and recovery passed in
+2,796.81 seconds. Formatting, the complete locked all-target workspace suite,
+and warning-free locked all-target Clippy also pass. All compilation and
+execution were local; no remote compilation server was used. Milestone 5 is
+closed.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer
@@ -1423,7 +1437,7 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (in progress)
+### Milestone 5 — efficient and flexible data/guild protocol (passed)
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and
