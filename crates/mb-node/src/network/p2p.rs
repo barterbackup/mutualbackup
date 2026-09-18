@@ -95,8 +95,6 @@ const MAX_RECOVERY_ADDRESS_SCOPES: usize = 4;
 const MAX_RECOVERY_ADDRESS_PEERS: usize = 64;
 const MAX_RECOVERY_QUARANTINED_PEERS: usize =
     MAX_RECOVERY_ADDRESS_SCOPES * MAX_RECOVERY_ADDRESS_PEERS;
-const MAX_RELAY_RESERVATIONS: usize = 5;
-const MAX_RELAY_CIRCUITS: usize = 8;
 const MAX_RELAY_CIRCUIT_BYTES: u64 = 8 * 1024 * 1024;
 const DHT_RECOVERY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DHT_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
@@ -685,6 +683,26 @@ fn guild_relay_admission(members: RelayMembers) -> Box<dyn relay::RateLimiter> {
             admitted
         },
     )
+}
+
+fn guild_relay_config(max_connections: usize, members: RelayMembers) -> relay::Config {
+    let mut config = relay::Config {
+        max_reservations: max_connections,
+        max_reservations_per_peer: 1,
+        reservation_duration: Duration::from_secs(15 * 60),
+        max_circuits: max_connections,
+        max_circuits_per_peer: max_connections,
+        max_circuit_duration: Duration::from_secs(2 * 60),
+        max_circuit_bytes: MAX_RELAY_CIRCUIT_BYTES,
+        ..relay::Config::default()
+    };
+    config
+        .reservation_rate_limiters
+        .push(guild_relay_admission(members.clone()));
+    config
+        .circuit_src_rate_limiters
+        .push(guild_relay_admission(members));
+    config
 }
 
 fn peer_codec() -> request_response::cbor::codec::Codec<
@@ -1278,22 +1296,7 @@ pub fn build_p2p_with_tor(
     let hole_punching_enabled = config.enable_hole_punching;
     let max_connections =
         u32::try_from(config.max_connections).context("libp2p connection limit exceeds u32")?;
-    let mut relay_config = relay::Config {
-        max_reservations: MAX_RELAY_RESERVATIONS,
-        max_reservations_per_peer: 1,
-        reservation_duration: Duration::from_secs(15 * 60),
-        max_circuits: MAX_RELAY_CIRCUITS,
-        max_circuits_per_peer: 2,
-        max_circuit_duration: Duration::from_secs(2 * 60),
-        max_circuit_bytes: MAX_RELAY_CIRCUIT_BYTES,
-        ..relay::Config::default()
-    };
-    relay_config
-        .reservation_rate_limiters
-        .push(guild_relay_admission(relay_members.clone()));
-    relay_config
-        .circuit_src_rate_limiters
-        .push(guild_relay_admission(relay_members.clone()));
+    let relay_config = guild_relay_config(config.max_connections, relay_members.clone());
     let tor_listen_address = tor_transport
         .as_ref()
         .map(|transport| transport.listen_address().clone());
@@ -15258,6 +15261,17 @@ mod tests {
         *members.write().unwrap() = BTreeSet::from([denied]);
         assert!(!admission.try_next(allowed, &address, std::time::Instant::now()));
         assert!(admission.try_next(denied, &address, std::time::Instant::now()));
+    }
+
+    #[test]
+    fn relay_capacity_follows_the_connection_budget() {
+        let config = guild_relay_config(32, Arc::new(RwLock::new(BTreeSet::new())));
+
+        assert_eq!(config.max_reservations, 32);
+        assert_eq!(config.max_reservations_per_peer, 1);
+        assert_eq!(config.max_circuits, 32);
+        assert_eq!(config.max_circuits_per_peer, 32);
+        assert_eq!(config.max_circuit_bytes, MAX_RELAY_CIRCUIT_BYTES);
     }
 
     #[test]

@@ -166,6 +166,10 @@ impl Default for Config {
     }
 }
 
+fn capacity_reached(current: usize, maximum: usize) -> bool {
+    current >= maximum
+}
+
 /// The events produced by the relay `Behaviour`.
 #[derive(Debug)]
 pub enum Event {
@@ -410,16 +414,17 @@ impl NetworkBehaviour for Behaviour {
                 );
 
                 let action = if
-                // Deny if it is a new reservation and exceeds
+                // Deny if it is a new reservation and reaches
                 // `max_reservations_per_peer`.
                 (!renewed
-                    && self
-                        .reservations
-                        .get(&event_source)
-                        .map(|cs| cs.len())
-                        .unwrap_or(0)
-                        > self.config.max_reservations_per_peer)
-                    // Deny if it exceeds `max_reservations`.
+                    && capacity_reached(
+                        self.reservations
+                            .get(&event_source)
+                            .map(|cs| cs.len())
+                            .unwrap_or(0),
+                        self.config.max_reservations_per_peer,
+                    ))
+                    // Deny if it reaches `max_reservations`.
                     || self
                         .reservations
                         .values()
@@ -547,9 +552,10 @@ impl NetworkBehaviour for Behaviour {
                      denies all inbound substreams."
                 );
 
-                let action = if self.circuits.num_circuits_of_peer(event_source)
-                    > self.config.max_circuits_per_peer
-                    || self.circuits.len() >= self.config.max_circuits
+                let action = if capacity_reached(
+                    self.circuits.num_circuits_of_peer(event_source),
+                    self.config.max_circuits_per_peer,
+                ) || self.circuits.len() >= self.config.max_circuits
                     || !self
                         .config
                         .circuit_src_rate_limiters
@@ -853,5 +859,15 @@ impl From<proto::Status> for StatusCode {
             proto::Status::MALFORMED_MESSAGE => Self::MalformedMessage,
             proto::Status::UNEXPECTED_MESSAGE => Self::UnexpectedMessage,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn configured_capacity_is_reached_at_the_exact_limit() {
+        assert!(!super::capacity_reached(1, 2));
+        assert!(super::capacity_reached(2, 2));
+        assert!(super::capacity_reached(3, 2));
     }
 }

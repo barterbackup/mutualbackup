@@ -967,6 +967,18 @@ backup committed after about 70 minutes. The following 512,047-byte
 relay-fallback backup began healthy durable work but still inherited a legacy
 180-second CLI allowance. Both isolated-topology backups now use the measured
 ninety-minute bound; durable failure states continue to terminate immediately.
+A fresh process run then passed the complete recovery path and committed its
+first constrained-topology backup in about 76 minutes 50 seconds. The
+relay-fallback backup consumed its full ninety-minute allowance while all five
+daemons remained alive: its coordinator repeatedly received relay resource-limit
+failures while activating the same group. Relay service still used the fixed
+five-node beta limits of five reservations, eight total circuits, and two
+circuits touching one peer. Reservation and circuit capacity now follows the
+operator's `max_connections` resource budget, while membership admission and
+per-circuit byte and duration bounds remain. The vendored relay enforces these
+limits at equality rather than admitting one extra resource. Focused relay
+regressions, the complete locked all-target workspace tests, and warning-free
+locked all-target Clippy pass locally.
 A fresh provisioned production gate must still close before Milestone 5 can
 pass.
 
