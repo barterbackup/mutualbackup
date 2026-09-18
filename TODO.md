@@ -1062,7 +1062,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   all use that same rule. The core version matrix proves legacy unanimity plus
   majority authorization and nonsigner recovery for formats 5, 6, and 7;
   focused core, node recovery-pinning, and DHT-publication tests pass locally.
-- [ ] **M5-38 / P1 — Resume the exact durable proposal for explicit recovery-key rotation.**
+- [x] **M5-38 / P1 — Resume the exact durable proposal for explicit recovery-key rotation.**
   `guild rotate-recovery-key` generates a fresh randomized envelope on every
   call (`crates/mb-node/src/network/p2p.rs:7488`). If the first call signs
   locally but fails to collect quorum, the next call proposes different bytes
@@ -1074,6 +1074,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   across restart. Reuse and resume the persisted rotation proposal without
   weakening anti-equivocation. Gate partial signing, quorum failure, repeated
   CLI retry, restart, and eventual rotation followed by backup.
+  Explicit rotation preparation now loads the signature-locked proposal at the
+  next sequence instead of generating another envelope. Periodic recovery-key
+  reconciliation also resumes a locked local rotation before deciding that a
+  current key needs no work. The active-guild regression locks an incomplete
+  proposal, verifies byte-identical CLI preparation, commits that proposal,
+  exercises automatic completion of another locked rotation, and proves a
+  further proposal remains byte-identical after reopening the node.
 - [ ] **M5-39 / P1 — Do not let an empty event tail win synchronization.**
   The M5-22 shortcut accepts the first valid tail and abandons the other
   requests even when it contains no events

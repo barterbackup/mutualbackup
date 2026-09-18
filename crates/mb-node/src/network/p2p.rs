@@ -7014,6 +7014,24 @@ async fn reconcile_recovery_key_epoch_once(node: Arc<Mutex<Node>>, p2p: &P2pClie
             .dynamic_guild_state()?
             .context("recovery-key registration requires dynamic guild state")?;
         let local_id = node.keys().node_id();
+        let sequence = state
+            .event_sequence
+            .checked_add(1)
+            .context("guild event sequence exhausted")?;
+        if let Some(locked) = node.locked_guild_event_proposal(sequence)? {
+            if matches!(
+                &locked.kind,
+                mb_core::GuildEventKind::RotateRecoveryKey { envelope }
+                    if envelope.subject == local_id
+            ) {
+                state.validate_event_proposal(&locked)?;
+                let guild = node
+                    .guild_summary()?
+                    .context("recovery-key registration requires an installed guild")?;
+                return Ok(Some((state, guild, local_id, locked)));
+            }
+            return Ok(None);
+        }
         let next_subject = state
             .active_members()
             .find(|member| state.current_recovery_key(member.node_id).is_none());
@@ -7032,31 +7050,14 @@ async fn reconcile_recovery_key_epoch_once(node: Arc<Mutex<Node>>, p2p: &P2pClie
             .unwrap_or(0)
             .checked_add(1)
             .context("recovery-key epoch exhausted")?;
-        let sequence = state
-            .event_sequence
-            .checked_add(1)
-            .context("guild event sequence exhausted")?;
-        let event = if let Some(locked) = node.locked_guild_event_proposal(sequence)? {
-            match &locked.kind {
-                mb_core::GuildEventKind::RotateRecoveryKey { envelope }
-                    if envelope.subject == local_id && envelope.epoch == epoch =>
-                {
-                    locked
-                }
-                _ => bail!(
-                    "local seed has already signed another guild event at sequence {sequence}"
-                ),
-            }
-        } else {
-            let (envelope, _) =
-                mb_core::create_recovery_key_envelope(node.keys(), state.guild_id, epoch)?;
-            GuildEvent {
-                format_version: 1,
-                guild_id: state.guild_id,
-                sequence,
-                parent: state.event_head,
-                kind: mb_core::GuildEventKind::RotateRecoveryKey { envelope },
-            }
+        let (envelope, _) =
+            mb_core::create_recovery_key_envelope(node.keys(), state.guild_id, epoch)?;
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RotateRecoveryKey { envelope },
         };
         state.validate_event_proposal(&event)?;
         let guild = node
@@ -7456,72 +7457,109 @@ pub(crate) async fn commit_guild_administration(
     administration: GuildAdministration,
 ) -> Result<(u64, [u8; 32])> {
     let (state, guild, local_id, event) = node_blocking(node.clone(), move |node| {
-        let state = node
-            .dynamic_guild_state()?
-            .context("guild administration requires dynamic guild state")?;
-        let guild = node
-            .guild_summary()?
-            .context("guild administration requires an installed guild")?;
-        if !matches!(guild.phase, GuildPhase::Active) {
-            bail!("guild administration requires an active guild");
-        }
-        let local_id = node.keys().node_id();
-        let kind = match administration {
-            GuildAdministration::RemoveMember(node_id) => {
-                require_guild_administrator(&guild, local_id)?;
-                mb_core::GuildEventKind::RemoveMember { node_id }
-            }
-            GuildAdministration::RelabelMember {
-                node_id,
-                failure_domain,
-            } => {
-                require_guild_administrator(&guild, local_id)?;
-                mb_core::GuildEventKind::RelabelMember {
-                    node_id,
-                    failure_domain,
-                }
-            }
-            GuildAdministration::SetQuorum(policy) => {
-                require_guild_administrator(&guild, local_id)?;
-                mb_core::GuildEventKind::SetQuorum { policy }
-            }
-            GuildAdministration::RotateLocalRecoveryKey => {
-                let epoch = state
-                    .recovery_keys
-                    .iter()
-                    .filter(|entry| entry.envelope.subject == local_id)
-                    .map(|entry| entry.envelope.epoch)
-                    .max()
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .context("recovery-key epoch exhausted")?;
-                let (envelope, _) =
-                    mb_core::create_recovery_key_envelope(node.keys(), state.guild_id, epoch)?;
-                mb_core::GuildEventKind::RotateRecoveryKey { envelope }
-            }
-            GuildAdministration::RevokeRecoveryKey { subject, epoch } => {
-                require_guild_administrator(&guild, local_id)?;
-                mb_core::GuildEventKind::RevokeRecoveryKey { subject, epoch }
-            }
-        };
-        let event = GuildEvent {
-            format_version: 1,
-            guild_id: state.guild_id,
-            sequence: state
-                .event_sequence
-                .checked_add(1)
-                .context("guild event sequence exhausted")?,
-            parent: state.event_head,
-            kind,
-        };
-        state.validate_event_proposal(&event)?;
-        Ok((state, guild, local_id, event))
+        prepare_guild_administration(node, administration)
     })
     .await?;
     let sequence = event.sequence;
     let event_hash = event.hash()?;
     commit_plain_guild_event(node, p2p, state, guild, local_id, event).await?;
     Ok((sequence, event_hash))
+}
+
+fn prepare_guild_administration(
+    node: &mut Node,
+    administration: GuildAdministration,
+) -> Result<(
+    mb_core::DynamicGuildState,
+    crate::GuildSummary,
+    NodeId,
+    GuildEvent,
+)> {
+    let state = node
+        .dynamic_guild_state()?
+        .context("guild administration requires dynamic guild state")?;
+    let guild = node
+        .guild_summary()?
+        .context("guild administration requires an installed guild")?;
+    if !matches!(guild.phase, GuildPhase::Active) {
+        bail!("guild administration requires an active guild");
+    }
+    let local_id = node.keys().node_id();
+    let sequence = state
+        .event_sequence
+        .checked_add(1)
+        .context("guild event sequence exhausted")?;
+    let event = match administration {
+        GuildAdministration::RotateLocalRecoveryKey => {
+            let epoch = state
+                .recovery_keys
+                .iter()
+                .filter(|entry| entry.envelope.subject == local_id)
+                .map(|entry| entry.envelope.epoch)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .context("recovery-key epoch exhausted")?;
+            if let Some(locked) = node.locked_guild_event_proposal(sequence)? {
+                match &locked.kind {
+                    mb_core::GuildEventKind::RotateRecoveryKey { envelope }
+                        if envelope.subject == local_id && envelope.epoch == epoch =>
+                    {
+                        locked
+                    }
+                    _ => bail!(
+                        "local seed has already signed another guild event at sequence {sequence}"
+                    ),
+                }
+            } else {
+                let (envelope, _) =
+                    mb_core::create_recovery_key_envelope(node.keys(), state.guild_id, epoch)?;
+                GuildEvent {
+                    format_version: 1,
+                    guild_id: state.guild_id,
+                    sequence,
+                    parent: state.event_head,
+                    kind: mb_core::GuildEventKind::RotateRecoveryKey { envelope },
+                }
+            }
+        }
+        administration => {
+            let kind = match administration {
+                GuildAdministration::RemoveMember(node_id) => {
+                    require_guild_administrator(&guild, local_id)?;
+                    mb_core::GuildEventKind::RemoveMember { node_id }
+                }
+                GuildAdministration::RelabelMember {
+                    node_id,
+                    failure_domain,
+                } => {
+                    require_guild_administrator(&guild, local_id)?;
+                    mb_core::GuildEventKind::RelabelMember {
+                        node_id,
+                        failure_domain,
+                    }
+                }
+                GuildAdministration::SetQuorum(policy) => {
+                    require_guild_administrator(&guild, local_id)?;
+                    mb_core::GuildEventKind::SetQuorum { policy }
+                }
+                GuildAdministration::RevokeRecoveryKey { subject, epoch } => {
+                    require_guild_administrator(&guild, local_id)?;
+                    mb_core::GuildEventKind::RevokeRecoveryKey { subject, epoch }
+                }
+                GuildAdministration::RotateLocalRecoveryKey => unreachable!(),
+            };
+            GuildEvent {
+                format_version: 1,
+                guild_id: state.guild_id,
+                sequence,
+                parent: state.event_head,
+                kind,
+            }
+        }
+    };
+    state.validate_event_proposal(&event)?;
+    Ok((state, guild, local_id, event))
 }
 
 fn require_guild_administrator(guild: &crate::GuildSummary, local_id: NodeId) -> Result<()> {
@@ -16914,12 +16952,108 @@ mod tests {
         assert_eq!(removed_state.event_sequence, 3);
         assert_eq!(removed_state.active_members().count(), 4);
 
+        let locked_rotation = {
+            let mut node = nodes[1].lock().unwrap();
+            let (_, _, _, proposal) = prepare_guild_administration(
+                &mut node,
+                GuildAdministration::RotateLocalRecoveryKey,
+            )
+            .unwrap();
+            node.sign_guild_event_proposal(&proposal).unwrap();
+            let (_, _, _, retry) = prepare_guild_administration(
+                &mut node,
+                GuildAdministration::RotateLocalRecoveryKey,
+            )
+            .unwrap();
+            assert_eq!(retry, proposal);
+            proposal
+        };
+        assert_eq!(
+            commit_guild_administration(
+                nodes[1].clone(),
+                &clients[1],
+                GuildAdministration::RotateLocalRecoveryKey,
+            )
+            .await
+            .unwrap(),
+            (locked_rotation.sequence, locked_rotation.hash().unwrap())
+        );
+        for node in nodes.iter().take(4) {
+            let state = node.lock().unwrap().dynamic_guild_state().unwrap().unwrap();
+            assert_eq!(state.event_sequence, 6);
+            assert_eq!(
+                state
+                    .current_recovery_key(rotating_subject)
+                    .unwrap()
+                    .envelope
+                    .epoch,
+                2
+            );
+        }
+
+        let automatically_resumed_rotation = {
+            let mut node = nodes[1].lock().unwrap();
+            let (_, _, _, proposal) = prepare_guild_administration(
+                &mut node,
+                GuildAdministration::RotateLocalRecoveryKey,
+            )
+            .unwrap();
+            node.sign_guild_event_proposal(&proposal).unwrap();
+            proposal
+        };
+        reconcile_recovery_key_epoch_once(nodes[1].clone(), &clients[1])
+            .await
+            .unwrap();
+        let resumed_state = nodes[1]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (resumed_state.event_sequence, resumed_state.event_head),
+            (
+                automatically_resumed_rotation.sequence,
+                automatically_resumed_rotation.hash().unwrap()
+            )
+        );
+        assert_eq!(
+            resumed_state
+                .current_recovery_key(rotating_subject)
+                .unwrap()
+                .envelope
+                .epoch,
+            3
+        );
+
+        let restart_locked_rotation = {
+            let mut node = nodes[1].lock().unwrap();
+            let (_, _, _, proposal) = prepare_guild_administration(
+                &mut node,
+                GuildAdministration::RotateLocalRecoveryKey,
+            )
+            .unwrap();
+            node.sign_guild_event_proposal(&proposal).unwrap();
+            proposal
+        };
+
         for client in &clients {
             client.shutdown().await.unwrap();
         }
         for task in tasks {
             task.await.unwrap().unwrap();
         }
+        drop(clients);
+        drop(nodes);
+
+        let mut reopened =
+            Node::open(temp.path().join("node-1"), Seed::from_bytes([122; 32])).unwrap();
+        let (_, _, _, resumed) = prepare_guild_administration(
+            &mut reopened,
+            GuildAdministration::RotateLocalRecoveryKey,
+        )
+        .unwrap();
+        assert_eq!(resumed, restart_locked_rotation);
     }
 
     #[tokio::test]

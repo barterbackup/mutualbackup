@@ -1025,8 +1025,10 @@ blockers (details, source locations, and regression scenarios are in `TODO.md`):
   state adoption, installation, and resume share the rule that any certified
   member may recover without having personally signed the checkpoint; legacy
   formats remain unanimous.
-- **M5-38:** Retrying an explicit recovery-key rotation after partial signing
-  creates different envelope bytes and conflicts with its durable event lock.
+- **M5-38 (resolved):** Explicit recovery-key rotation and periodic
+  reconciliation now resume the exact signature-locked proposal. Focused
+  coverage exercises CLI retry, automatic completion, and durable reuse after
+  restart without weakening event anti-equivocation.
 - **M5-39:** A fast empty event tail can repeatedly win synchronization over
   reachable peers with newer certified state; evidence-fetch failures also
   need bounded fallback.
