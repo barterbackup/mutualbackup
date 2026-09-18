@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -79,12 +80,6 @@ async fn watch_once(
     roots: &[ProtectedRoot],
     ready: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
-    let opened = roots
-        .iter()
-        .map(|root| {
-            open_watched_root(root).map(|(handle, identity)| (root.clone(), handle, identity))
-        })
-        .collect::<Result<Vec<_>>>()?;
     let (sender, mut receiver) = tokio::sync::mpsc::channel(WATCH_EVENT_CAPACITY);
     let watcher_failure = Arc::new(Mutex::new(None::<String>));
     let callback_failure = watcher_failure.clone();
@@ -118,22 +113,45 @@ async fn watch_once(
         }
     })
     .context("cannot create recursive filesystem watcher")?;
+    let mut opened = BTreeMap::new();
+    let mut unavailable = BTreeMap::<uuid::Uuid, (tokio::time::Instant, Duration)>::new();
     for root in roots {
-        watcher
-            .watch(&root.path, RecursiveMode::Recursive)
-            .with_context(|| format!("cannot watch protected root {}", root.path.display()))?;
-    }
-    // Attach every watch before advancing the dirty generation. Events which
-    // arrive during reconciliation remain queued, so a capture started after
-    // readiness cannot miss a change between the full scan and watcher setup.
-    for root in roots {
-        persist_dirty(
-            node.clone(),
-            root.root_id,
-            "startup or watcher restart reconciliation required",
-            false,
-        )
-        .await?;
+        match attach_watched_root(&mut watcher, root) {
+            Ok((handle, identity)) => {
+                // Attach the watch before advancing the dirty generation.
+                // Events during reconciliation remain queued, so capture
+                // cannot miss a change between the full scan and readiness.
+                persist_dirty(
+                    node.clone(),
+                    root.root_id,
+                    "startup or watcher restart reconciliation required",
+                    false,
+                )
+                .await?;
+                opened.insert(root.root_id, (root.clone(), handle, identity));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    root = %root.path.display(),
+                    %error,
+                    "protected root watch is unavailable; healthy roots remain watched"
+                );
+                mark_dirty(
+                    node.clone(),
+                    root.root_id,
+                    "protected root watcher unavailable; reconciliation required",
+                    false,
+                )
+                .await;
+                unavailable.insert(
+                    root.root_id,
+                    (
+                        tokio::time::Instant::now() + WATCH_RETRY_MIN,
+                        WATCH_RETRY_MIN,
+                    ),
+                );
+            }
+        }
     }
     if let Some(ready) = ready.take() {
         let _ = ready.send(());
@@ -163,20 +181,83 @@ async fn watch_once(
                 None => anyhow::bail!("filesystem watcher callback stopped"),
             },
             _ = health.tick() => {
-                for (root, _handle, expected) in &opened {
-                    let current = watched_root_identity(root)
-                        .context("protected root health check failed")?;
-                    if current != *expected {
-                        anyhow::bail!("protected root was removed, replaced, or remounted");
-                    }
-                }
                 let current_roots = node_blocking(node.clone(), |node| node.protected_roots()).await?;
                 if current_roots != roots {
                     anyhow::bail!("protected-root configuration changed");
                 }
+                let failed = opened
+                    .iter()
+                    .filter_map(|(root_id, (root, _handle, expected))| {
+                        match watched_root_identity(root) {
+                            Ok(current) if current == *expected => None,
+                            Ok(_) => Some((*root_id, "protected root was replaced or remounted".to_owned())),
+                            Err(error) => Some((*root_id, format!("protected root health check failed: {error:#}"))),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                for (root_id, error) in failed {
+                    let (root, _handle, _expected) = opened
+                        .remove(&root_id)
+                        .expect("failed watched root must still be tracked");
+                    let _ = watcher.unwatch(&root.path);
+                    tracing::warn!(root = %root.path.display(), %error, "protected root watch became unavailable");
+                    mark_dirty(
+                        node.clone(),
+                        root_id,
+                        "protected root watcher unavailable; reconciliation required",
+                        false,
+                    )
+                    .await;
+                    unavailable.insert(
+                        root_id,
+                        (tokio::time::Instant::now() + WATCH_RETRY_MIN, WATCH_RETRY_MIN),
+                    );
+                }
+                let now = tokio::time::Instant::now();
+                for root in roots {
+                    if opened.contains_key(&root.root_id)
+                        || unavailable
+                            .get(&root.root_id)
+                            .is_some_and(|(retry_at, _)| *retry_at > now)
+                    {
+                        continue;
+                    }
+                    match attach_watched_root(&mut watcher, root) {
+                        Ok((handle, identity)) => {
+                            persist_dirty(
+                                node.clone(),
+                                root.root_id,
+                                "protected root watcher restored; reconciliation required",
+                                false,
+                            )
+                            .await?;
+                            opened.insert(root.root_id, (root.clone(), handle, identity));
+                            unavailable.remove(&root.root_id);
+                        }
+                        Err(error) => {
+                            let delay = unavailable
+                                .get(&root.root_id)
+                                .map(|(_, delay)| next_retry_delay(*delay))
+                                .unwrap_or(WATCH_RETRY_MIN);
+                            tracing::debug!(root = %root.path.display(), %error, ?delay, "protected root watch retry deferred");
+                            unavailable.insert(root.root_id, (now + delay, delay));
+                        }
+                    }
+                }
             }
         }
     }
+}
+
+fn attach_watched_root(
+    watcher: &mut notify::RecommendedWatcher,
+    root: &ProtectedRoot,
+) -> Result<(File, WatchedRootIdentity)> {
+    let opened = open_watched_root(root)?;
+    watcher
+        .watch(&root.path, RecursiveMode::Recursive)
+        .with_context(|| format!("cannot watch protected root {}", root.path.display()))?;
+    Ok(opened)
 }
 
 fn event_requires_reconciliation(kind: &EventKind) -> bool {
@@ -317,5 +398,74 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         assert!(watched_root_identity(&root).is_err());
         assert_eq!(before.inode, root.root_inode);
+    }
+
+    #[tokio::test]
+    async fn unavailable_root_does_not_block_healthy_root_watch() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_path = temp.path().join("missing");
+        let healthy_path = temp.path().join("healthy");
+        std::fs::create_dir(&missing_path).unwrap();
+        std::fs::create_dir(&healthy_path).unwrap();
+        let missing_filesystem = filesystem_identity(&missing_path).unwrap();
+        let healthy_filesystem = filesystem_identity(&healthy_path).unwrap();
+        let missing_inode = std::fs::metadata(&missing_path).unwrap().ino();
+        let healthy_inode = std::fs::metadata(&healthy_path).unwrap().ino();
+        let missing_id = uuid::Uuid::from_bytes([1; 16]);
+        let healthy_id = uuid::Uuid::from_bytes([2; 16]);
+        let mut node = Node::open(
+            temp.path().join("state"),
+            mb_core::Seed::from_bytes([91; 32]),
+        )
+        .unwrap();
+        node.install_test_protected_root(ProtectedRoot {
+            format_version: 3,
+            root_id: missing_id,
+            path: missing_path.clone(),
+            filesystem_id: missing_filesystem.stable_id,
+            root_inode: missing_inode,
+        })
+        .unwrap();
+        node.install_test_protected_root(ProtectedRoot {
+            format_version: 3,
+            root_id: healthy_id,
+            path: healthy_path.clone(),
+            filesystem_id: healthy_filesystem.stable_id,
+            root_inode: healthy_inode,
+        })
+        .unwrap();
+        std::fs::remove_dir_all(&missing_path).unwrap();
+        let node = Arc::new(Mutex::new(node));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let watcher = tokio::spawn(run_root_watcher_ready(node.clone(), ready_tx));
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        std::fs::write(healthy_path.join("changed"), b"changed").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let sequence = node
+                    .lock()
+                    .unwrap()
+                    .test_root_change_sequence(healthy_id)
+                    .unwrap();
+                if sequence >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            node.lock()
+                .unwrap()
+                .test_root_change_sequence(missing_id)
+                .unwrap(),
+            1
+        );
+        watcher.abort();
     }
 }

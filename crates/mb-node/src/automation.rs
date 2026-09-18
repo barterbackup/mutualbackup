@@ -19,7 +19,7 @@ pub async fn run_automatic_backups(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Re
                 match query_local_backup_job(node.clone(), &p2p, revision_id).await {
                     Ok(job) if job.state == BackupJobState::Committed => {
                         node_blocking(node.clone(), move |node| {
-                            node.automatic_backup_finished(Some(revision_id), true, None)
+                            node.automatic_backup_finished(Some(revision_id), None, true, None)
                         })
                         .await?;
                     }
@@ -28,7 +28,12 @@ pub async fn run_automatic_backups(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Re
                             .error
                             .unwrap_or_else(|| "automatic backup failed".into());
                         node_blocking(node.clone(), move |node| {
-                            node.automatic_backup_finished(Some(revision_id), false, Some(&error))
+                            node.automatic_backup_finished(
+                                Some(revision_id),
+                                None,
+                                false,
+                                Some(&error),
+                            )
                         })
                         .await?;
                     }
@@ -38,12 +43,16 @@ pub async fn run_automatic_backups(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Re
                     }
                 }
             }
-            AutomaticBackupPoll::Start { estimated_bytes } => {
-                match submit_local_backup(node.clone(), &p2p, false, None).await {
+            AutomaticBackupPoll::Start {
+                protected_root_id,
+                estimated_bytes,
+            } => {
+                match submit_local_backup(node.clone(), &p2p, false, Some(protected_root_id)).await
+                {
                     Ok(job) => {
                         let revision_id = job.descriptor.revision_id;
                         node_blocking(node.clone(), move |node| {
-                            node.automatic_backup_submitted(revision_id)
+                            node.automatic_backup_submitted(revision_id, protected_root_id)
                         })
                         .await?;
                         tracing::info!(
@@ -56,7 +65,12 @@ pub async fn run_automatic_backups(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Re
                         let message = format!("{error:#}");
                         tracing::warn!(%error, "automatic backup submission deferred");
                         node_blocking(node.clone(), move |node| {
-                            node.automatic_backup_finished(None, false, Some(&message))
+                            node.automatic_backup_finished(
+                                None,
+                                Some(protected_root_id),
+                                false,
+                                Some(&message),
+                            )
                         })
                         .await?;
                     }

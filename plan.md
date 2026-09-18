@@ -1033,8 +1033,10 @@ blockers (details, source locations, and regression scenarios are in `TODO.md`):
   for an advancing response, and coding-event evidence falls back concurrently
   across eligible peers until a valid transcript installs. Focused tests cover
   the former fast-empty race and both failed and invalid evidence sources.
-- **M5-40:** One unavailable root starves automatic backups of other roots and
-  prevents their watches from being installed.
+- **M5-40 (resolved):** Automatic selection and retry state are root-scoped and
+  submission carries the selected root UUID. Watch attachment, health checks,
+  and exponential retry are isolated per root. Focused scheduling and live
+  filesystem-event tests keep a healthy root active beside a missing sibling.
 - **M5-41:** Failed relay reservation acceptance retains an unexpiring slot;
   full-capacity renewal is also incorrectly rejected.
 - **M5-42:** Tentative request connections rejected by the composite limiter

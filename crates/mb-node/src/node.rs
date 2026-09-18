@@ -477,14 +477,28 @@ struct AutomaticBackupState {
     window_backup_count: u32,
     window_bytes: u64,
     in_flight_revision: Option<Uuid>,
+    #[serde(default)]
+    in_flight_root_id: Option<Uuid>,
     retry_at_unix_seconds: Option<u64>,
     blocked_reason: Option<String>,
+    #[serde(default)]
+    root_retries: Vec<AutomaticRootRetry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct AutomaticRootRetry {
+    protected_root_id: Uuid,
+    retry_at_unix_seconds: u64,
+    reason: String,
 }
 
 pub(crate) enum AutomaticBackupPoll {
     Idle,
     InFlight(Uuid),
-    Start { estimated_bytes: u64 },
+    Start {
+        protected_root_id: Uuid,
+        estimated_bytes: u64,
+    },
 }
 
 #[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -1184,6 +1198,35 @@ impl Node {
         Ok(state)
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_test_protected_root(&mut self, root: ProtectedRoot) -> Result<()> {
+        self.control.put_record(
+            "protected-root",
+            root.root_id.as_bytes(),
+            &canonical_bytes(&root)?,
+        )?;
+        self.control.put_record(
+            "root-dirty",
+            root.root_id.as_bytes(),
+            &canonical_bytes(&RootDirtyState {
+                format_version: 3,
+                protected_root_id: root.root_id,
+                dirty: false,
+                reason: "test root starts clean".to_owned(),
+                change_sequence: 0,
+            })?,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_root_change_sequence(&self, root_id: Uuid) -> Result<u64> {
+        Ok(self
+            .root_dirty_state(root_id)?
+            .map(|state| state.change_sequence)
+            .unwrap_or(0))
+    }
+
     pub fn configure_automatic_backup(&self, policy: &AutomaticBackupPolicy) -> Result<()> {
         validate_automatic_backup_policy(policy)?;
         self.control.put_record(
@@ -1228,10 +1271,22 @@ impl Node {
                 window_backup_count: 0,
                 window_bytes: 0,
                 in_flight_revision: None,
+                in_flight_root_id: None,
                 retry_at_unix_seconds: None,
                 blocked_reason: None,
+                root_retries: Vec::new(),
             });
-        if state.format_version != 1 {
+        if state.format_version != 1
+            || state.in_flight_root_id.is_some() && state.in_flight_revision.is_none()
+            || state
+                .root_retries
+                .iter()
+                .any(|retry| retry.protected_root_id.is_nil() || retry.reason.is_empty())
+            || state
+                .root_retries
+                .windows(2)
+                .any(|retries| retries[0].protected_root_id >= retries[1].protected_root_id)
+        {
             anyhow::bail!("unsupported automatic-backup state version");
         }
         Ok(state)
@@ -1246,6 +1301,10 @@ impl Node {
     pub fn automatic_backup_status(&self) -> Result<AutomaticBackupStatus> {
         let policy = self.automatic_backup_policy()?;
         let state = self.automatic_backup_state(unix_seconds())?;
+        let root_retry = state
+            .root_retries
+            .iter()
+            .min_by_key(|retry| retry.retry_at_unix_seconds);
         Ok(AutomaticBackupStatus {
             enabled: policy.enabled,
             dirty_since_unix_seconds: state.dirty_since_unix_seconds,
@@ -1254,8 +1313,12 @@ impl Node {
             in_flight_revision: state.in_flight_revision,
             window_backup_count: state.window_backup_count,
             window_bytes: state.window_bytes,
-            retry_at_unix_seconds: state.retry_at_unix_seconds,
-            blocked_reason: state.blocked_reason,
+            retry_at_unix_seconds: state
+                .retry_at_unix_seconds
+                .or_else(|| root_retry.map(|retry| retry.retry_at_unix_seconds)),
+            blocked_reason: state
+                .blocked_reason
+                .or_else(|| root_retry.map(|retry| retry.reason.clone())),
         })
     }
 
@@ -1287,6 +1350,7 @@ impl Node {
             return Ok(AutomaticBackupPoll::InFlight(revision_id));
         }
         if !self.root_dirty()? {
+            state.root_retries.clear();
             self.store_automatic_backup_state(&state)?;
             return Ok(AutomaticBackupPoll::Idle);
         }
@@ -1314,20 +1378,56 @@ impl Node {
             self.store_automatic_backup_state(&state)?;
             return Ok(AutomaticBackupPoll::Idle);
         }
-        let root = self
-            .next_dirty_root()?
-            .context("automatic backup has no dirty protected root")?;
-        let estimated_bytes = match self.protected_root_logical_bytes(&root) {
-            Ok(estimated_bytes) => estimated_bytes,
-            Err(error) => {
-                let mut message = format!("automatic full reconciliation failed: {error:#}");
-                truncate_utf8(&mut message, 512);
-                state.blocked_reason = Some(message);
-                state.retry_at_unix_seconds =
-                    Some(now.saturating_add(policy.minimum_interval_seconds));
-                self.store_automatic_backup_state(&state)?;
-                return Ok(AutomaticBackupPoll::Idle);
+        let roots = self.protected_roots()?;
+        let configured = roots
+            .iter()
+            .map(|root| root.root_id)
+            .collect::<BTreeSet<_>>();
+        state
+            .root_retries
+            .retain(|retry| configured.contains(&retry.protected_root_id));
+        let mut selected = None;
+        for root in roots {
+            if !self
+                .root_dirty_state(root.root_id)?
+                .is_none_or(|dirty| dirty.dirty)
+                || state.root_retries.iter().any(|retry| {
+                    retry.protected_root_id == root.root_id && retry.retry_at_unix_seconds > now
+                })
+            {
+                continue;
             }
+            match self.protected_root_logical_bytes(&root) {
+                Ok(estimated_bytes) => {
+                    state
+                        .root_retries
+                        .retain(|retry| retry.protected_root_id != root.root_id);
+                    selected = Some((root.root_id, estimated_bytes));
+                    break;
+                }
+                Err(error) => {
+                    let mut reason = format!(
+                        "automatic full reconciliation failed for root {}: {error:#}",
+                        root.root_id
+                    );
+                    truncate_utf8(&mut reason, 512);
+                    state
+                        .root_retries
+                        .retain(|retry| retry.protected_root_id != root.root_id);
+                    state.root_retries.push(AutomaticRootRetry {
+                        protected_root_id: root.root_id,
+                        retry_at_unix_seconds: now.saturating_add(policy.minimum_interval_seconds),
+                        reason,
+                    });
+                    state
+                        .root_retries
+                        .sort_by_key(|retry| retry.protected_root_id);
+                }
+            }
+        }
+        let Some((protected_root_id, estimated_bytes)) = selected else {
+            self.store_automatic_backup_state(&state)?;
+            return Ok(AutomaticBackupPoll::Idle);
         };
         if state.window_backup_count >= policy.daily_backup_limit {
             state.blocked_reason = Some("daily automatic-backup count limit reached".into());
@@ -1355,12 +1455,20 @@ impl Node {
         state.retry_at_unix_seconds = None;
         state.blocked_reason = None;
         self.store_automatic_backup_state(&state)?;
-        Ok(AutomaticBackupPoll::Start { estimated_bytes })
+        Ok(AutomaticBackupPoll::Start {
+            protected_root_id,
+            estimated_bytes,
+        })
     }
 
-    pub(crate) fn automatic_backup_submitted(&self, revision_id: Uuid) -> Result<()> {
+    pub(crate) fn automatic_backup_submitted(
+        &self,
+        revision_id: Uuid,
+        protected_root_id: Uuid,
+    ) -> Result<()> {
         let mut state = self.automatic_backup_state(unix_seconds())?;
         state.in_flight_revision = Some(revision_id);
+        state.in_flight_root_id = Some(protected_root_id);
         state.blocked_reason = None;
         state.retry_at_unix_seconds = None;
         self.store_automatic_backup_state(&state)
@@ -1369,6 +1477,7 @@ impl Node {
     pub(crate) fn automatic_backup_finished(
         &self,
         revision_id: Option<Uuid>,
+        protected_root_id: Option<Uuid>,
         succeeded: bool,
         error: Option<&str>,
     ) -> Result<()> {
@@ -1377,25 +1486,52 @@ impl Node {
         if revision_id.is_some() && state.in_flight_revision != revision_id {
             anyhow::bail!("automatic-backup completion conflicts with its durable revision");
         }
+        let affected_root = protected_root_id.or(state.in_flight_root_id);
         state.in_flight_revision = None;
+        state.in_flight_root_id = None;
         if succeeded {
             state.last_success_unix_seconds = Some(now);
             state.blocked_reason = None;
             state.retry_at_unix_seconds = None;
+            if let Some(root_id) = affected_root {
+                state
+                    .root_retries
+                    .retain(|retry| retry.protected_root_id != root_id);
+            }
         } else {
             let mut message = error.unwrap_or("automatic backup failed").to_owned();
             truncate_utf8(&mut message, 512);
             let hard = message.contains("budget")
                 || message.contains("capacity")
                 || message.contains("space");
-            state.blocked_reason = Some(message);
-            state.retry_at_unix_seconds = (!hard).then(|| {
-                now.saturating_add(
-                    self.automatic_backup_policy()
-                        .map(|policy| policy.minimum_interval_seconds)
-                        .unwrap_or(60),
-                )
-            });
+            if !hard && let Some(root_id) = affected_root {
+                state
+                    .root_retries
+                    .retain(|retry| retry.protected_root_id != root_id);
+                state.root_retries.push(AutomaticRootRetry {
+                    protected_root_id: root_id,
+                    retry_at_unix_seconds: now.saturating_add(
+                        self.automatic_backup_policy()
+                            .map(|policy| policy.minimum_interval_seconds)
+                            .unwrap_or(60),
+                    ),
+                    reason: message,
+                });
+                state
+                    .root_retries
+                    .sort_by_key(|retry| retry.protected_root_id);
+                state.blocked_reason = None;
+                state.retry_at_unix_seconds = None;
+            } else {
+                state.blocked_reason = Some(message);
+                state.retry_at_unix_seconds = (!hard).then(|| {
+                    now.saturating_add(
+                        self.automatic_backup_policy()
+                            .map(|policy| policy.minimum_interval_seconds)
+                            .unwrap_or(60),
+                    )
+                });
+            }
         }
         self.store_automatic_backup_state(&state)
     }
@@ -9641,10 +9777,14 @@ mod tests {
         node.clear_automatic_backup_block().unwrap();
         assert!(matches!(
             node.poll_automatic_backup(110).unwrap(),
-            AutomaticBackupPoll::Start { estimated_bytes: 4 }
+            AutomaticBackupPoll::Start {
+                protected_root_id,
+                estimated_bytes: 4
+            } if protected_root_id == root_id
         ));
         let revision_id = Uuid::new_v4();
-        node.automatic_backup_submitted(revision_id).unwrap();
+        node.automatic_backup_submitted(revision_id, root_id)
+            .unwrap();
         drop(node);
 
         let mut reopened = Node::open(&state, seed).unwrap();
@@ -9653,7 +9793,7 @@ mod tests {
             AutomaticBackupPoll::InFlight(actual) if actual == revision_id
         ));
         reopened
-            .automatic_backup_finished(Some(revision_id), false, Some("capacity exhausted"))
+            .automatic_backup_finished(Some(revision_id), None, false, Some("capacity exhausted"))
             .unwrap();
         let status = reopened.automatic_backup_status().unwrap();
         assert!(status.blocked_reason.unwrap().contains("capacity"));
@@ -9848,7 +9988,7 @@ mod tests {
         let node = Node::open(temp.path(), Seed::from_bytes([227; 32])).unwrap();
         let unicode_error = "é".repeat(300);
 
-        node.automatic_backup_finished(None, false, Some(&unicode_error))
+        node.automatic_backup_finished(None, None, false, Some(&unicode_error))
             .unwrap();
 
         let state = node.automatic_backup_state(0).unwrap();
@@ -9941,7 +10081,7 @@ mod tests {
             node.poll_automatic_backup(101).unwrap(),
             AutomaticBackupPoll::Idle
         ));
-        let blocked = node.automatic_backup_state(101).unwrap();
+        let blocked = node.automatic_backup_status().unwrap();
         assert!(
             blocked
                 .blocked_reason
@@ -9960,8 +10100,80 @@ mod tests {
         ));
         assert!(matches!(
             node.poll_automatic_backup(111).unwrap(),
-            AutomaticBackupPoll::Start { .. }
+            AutomaticBackupPoll::Start {
+                protected_root_id,
+                ..
+            } if protected_root_id == root_id
         ));
+    }
+
+    #[test]
+    fn automatic_backup_skips_unavailable_dirty_root() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-root");
+        let healthy = temp.path().join("healthy-root");
+        fs::create_dir(&missing).unwrap();
+        fs::create_dir(&healthy).unwrap();
+        fs::write(healthy.join("payload"), b"healthy").unwrap();
+        let missing_filesystem = filesystem_identity(&missing).unwrap();
+        let healthy_filesystem = filesystem_identity(&healthy).unwrap();
+        let missing_inode = fs::metadata(&missing).unwrap().ino();
+        let healthy_inode = fs::metadata(&healthy).unwrap().ino();
+        let missing_id = Uuid::from_bytes([1; 16]);
+        let healthy_id = Uuid::from_bytes([2; 16]);
+        let (seed, certificate, peers) = recovery_guild_fixture();
+        let mut node = Node::open(temp.path().join("state"), seed).unwrap();
+        node.adopt_recovered_guild(certificate, peers).unwrap();
+        for root in [
+            ProtectedRoot {
+                format_version: 3,
+                root_id: missing_id,
+                path: missing.clone(),
+                filesystem_id: missing_filesystem.stable_id,
+                root_inode: missing_inode,
+            },
+            ProtectedRoot {
+                format_version: 3,
+                root_id: healthy_id,
+                path: healthy,
+                filesystem_id: healthy_filesystem.stable_id,
+                root_inode: healthy_inode,
+            },
+        ] {
+            node.control
+                .put_record(
+                    "protected-root",
+                    root.root_id.as_bytes(),
+                    &canonical_bytes(&root).unwrap(),
+                )
+                .unwrap();
+            node.mark_root_dirty_at(root.root_id, "changed", true, 100)
+                .unwrap();
+        }
+        node.configure_automatic_backup(&AutomaticBackupPolicy {
+            enabled: true,
+            quiet_period_seconds: 1,
+            minimum_interval_seconds: 10,
+            full_reconcile_interval_seconds: 60,
+            daily_backup_limit: 10,
+            daily_byte_limit: 1024,
+        })
+        .unwrap();
+        fs::remove_dir_all(&missing).unwrap();
+
+        assert!(matches!(
+            node.poll_automatic_backup(101).unwrap(),
+            AutomaticBackupPoll::Start {
+                protected_root_id,
+                estimated_bytes: 7,
+            } if protected_root_id == healthy_id
+        ));
+        let state = node.automatic_backup_state(101).unwrap();
+        assert_eq!(state.root_retries.len(), 1);
+        assert_eq!(state.root_retries[0].protected_root_id, missing_id);
+        assert_eq!(state.root_retries[0].retry_at_unix_seconds, 111);
     }
 
     #[test]

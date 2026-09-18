@@ -1100,7 +1100,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   one transcript validates and installs. Focused asynchronous regressions cover
   the fast-empty/slow-advance deadline and unavailable plus invalid transcript
   sources before a valid fallback.
-- [ ] **M5-40 / P1 — Isolate unavailable roots in automatic scheduling and watching.**
+- [x] **M5-40 / P1 — Isolate unavailable roots in automatic scheduling and watching.**
   Roots are UUID-sorted and `next_dirty_root` always chooses the first dirty
   one (`crates/mb-node/src/node.rs:1004`, `:1410`). A failed scan of that root
   sets the global retry state and returns without considering another root
@@ -1111,6 +1111,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   root, select eligible roots fairly, and bind submission to the selected
   root. Gate an unavailable first root beside a healthy dirty root: the latter
   must remain watched and commit automatically before the former returns.
+  Automatic polling now stores sorted per-root retry records, scans past roots
+  in backoff, and returns the selected root UUID with its estimate; submission
+  uses that exact UUID. Non-capacity submission and job failures also back off
+  only the affected root. The watcher attaches, health-checks, detaches, and
+  exponentially retries each root independently while its healthy siblings
+  remain live. Focused tests prove an unavailable lower-UUID root does not
+  prevent selection of the healthy root and that a real filesystem event on
+  the healthy root is persisted while its sibling path is absent.
 - [ ] **M5-41 / P1 — Release failed relay reservation admissions and permit full-capacity renewal.**
   Relay admission inserts a reservation before its acceptance response
   succeeds, but `ReservationReqAcceptFailed` does not undo the insertion
