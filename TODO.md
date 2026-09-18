@@ -1044,7 +1044,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   preserved through recovery and repair. Gate with substituted source bytes
   under authentic IDs and valid packed roots/RS transcripts; reject before
   checkpoint approval, including when the original owner is absent.
-- [ ] **M5-37 / P1 — Apply dynamic quorum and recovery rules to every supported checkpoint version.**
+- [x] **M5-37 / P1 — Apply dynamic quorum and recovery rules to every supported checkpoint version.**
   `QuorumCheckpoint::verify` honors `authority.quorum` only for version 5;
   versions 6 and 7 fall back to every member (`crates/mb-core/src/model.rs:1099`).
   Production creates version 7 and gathers policy-authorized signatures, then
@@ -1056,6 +1056,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   Preserve legacy unanimous rules while applying certified policy consistently
   to versions 5–7 and their cold-recovery paths. Gate majority/threshold commit
   with an absent nonrequired member and seed-only recovery of that nonsigner.
+  `QuorumCheckpoint` now centralizes member recovery authorization and applies
+  the configured policy to every authority-bearing format. Locator validation,
+  dynamic-state adoption, DHT publication, cold installation, and local resume
+  all use that same rule. The core version matrix proves legacy unanimity plus
+  majority authorization and nonsigner recovery for formats 5, 6, and 7;
+  focused core, node recovery-pinning, and DHT-publication tests pass locally.
 - [ ] **M5-38 / P1 — Resume the exact durable proposal for explicit recovery-key rotation.**
   `guild rotate-recovery-key` generates a fresh randomized envelope on every
   call (`crates/mb-node/src/network/p2p.rs:7488`). If the first call signs

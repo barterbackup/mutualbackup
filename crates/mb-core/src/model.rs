@@ -1093,11 +1093,12 @@ impl QuorumCheckpoint {
             previous_signer = Some(member_signature.signer);
         }
         // Legacy certificates used each member signature as both checkpoint
-        // authorization and storage attestation. Version five separates those
-        // facts: replayable coding transcripts contain signed holder receipts,
-        // so the epoch-bound guild policy authorizes the checkpoint itself.
+        // authorization and storage attestation. Authority-bearing versions
+        // separate those facts: replayable coding transcripts contain signed
+        // holder receipts, so the epoch-bound guild policy authorizes the
+        // checkpoint itself.
         let quorum = match self.checkpoint.authority {
-            Some(authority) if self.checkpoint.format_version == 5 => authority
+            Some(authority) if matches!(self.checkpoint.format_version, 5..=7) => authority
                 .quorum
                 .required(member_ids.len())
                 .map_err(|_| ModelError::InvalidCheckpoint)?,
@@ -1120,6 +1121,14 @@ impl QuorumCheckpoint {
         self.signatures
             .binary_search_by_key(&signer, |signature| signature.signer)
             .is_ok()
+    }
+
+    pub fn authorizes_member_recovery(&self, subject: NodeId) -> bool {
+        self.checkpoint
+            .members
+            .binary_search_by_key(&subject, |member| member.node_id)
+            .is_ok()
+            && (self.checkpoint.format_version >= 5 || self.has_signature(subject))
     }
 
     pub fn validate_recovery_authority(
@@ -1156,7 +1165,7 @@ impl QuorumCheckpoint {
                 .members
                 .iter()
                 .any(|member| member.node_id == locator.publisher)
-            || self.checkpoint.format_version < 5 && !self.has_signature(subject)
+            || !self.authorizes_member_recovery(subject)
         {
             return Err(ModelError::InvalidRecoveryAuthority);
         }
@@ -1764,6 +1773,12 @@ mod tests {
             }
         }
         dynamic_quorum.verify().unwrap();
+        let mut insufficient_dynamic = dynamic_quorum.clone();
+        insufficient_dynamic.signatures.pop();
+        assert!(matches!(
+            insufficient_dynamic.verify(),
+            Err(ModelError::InsufficientQuorum { .. })
+        ));
 
         let mut policy_checkpoint = variable_checkpoint.clone();
         policy_checkpoint.format_version = 5;
@@ -1775,25 +1790,42 @@ mod tests {
                 rule: crate::QuorumRule::Majority,
             },
         });
-        let mut policy_quorum = QuorumCheckpoint {
-            checkpoint: policy_checkpoint,
-            signatures: Vec::new(),
-        };
-        for key in keys.iter().filter(|key| {
-            variable_checkpoint
+        let sign_policy_checkpoint = |checkpoint: GuildCheckpoint| {
+            let member_ids = checkpoint
                 .members
                 .iter()
-                .any(|member| member.node_id == key.node_id())
-        }) {
-            if policy_quorum.signatures.len() == 3 {
-                break;
+                .map(|member| member.node_id)
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut quorum = QuorumCheckpoint {
+                checkpoint,
+                signatures: Vec::new(),
+            };
+            for key in keys
+                .iter()
+                .filter(|key| member_ids.contains(&key.node_id()))
+            {
+                if quorum.signatures.len() == 3 {
+                    break;
+                }
+                quorum.add_signature(key).unwrap();
             }
-            policy_quorum.add_signature(key).unwrap();
-        }
+            quorum
+        };
+        let mut policy_quorum = sign_policy_checkpoint(policy_checkpoint);
         policy_quorum.verify().unwrap();
+        let unsigned_member = policy_quorum
+            .checkpoint
+            .members
+            .iter()
+            .find(|member| !policy_quorum.has_signature(member.node_id))
+            .unwrap()
+            .node_id;
+        assert!(policy_quorum.authorizes_member_recovery(unsigned_member));
         let mut root_scoped_checkpoint = policy_quorum.checkpoint.clone();
         root_scoped_checkpoint.format_version = 6;
-        root_scoped_checkpoint.validate().unwrap();
+        let root_scoped_quorum = sign_policy_checkpoint(root_scoped_checkpoint.clone());
+        root_scoped_quorum.verify().unwrap();
+        assert!(root_scoped_quorum.authorizes_member_recovery(unsigned_member));
         let root_scoped_bytes = canonical_bytes(&root_scoped_checkpoint).unwrap();
         assert_eq!(
             decode_canonical::<GuildCheckpoint>(&root_scoped_bytes).unwrap(),
@@ -1831,7 +1863,9 @@ mod tests {
         let mut packed_checkpoint = root_scoped_checkpoint.clone();
         packed_checkpoint.format_version = 7;
         packed_checkpoint.packing_catalog = Some(packing.catalog);
-        packed_checkpoint.validate().unwrap();
+        let packed_quorum = sign_policy_checkpoint(packed_checkpoint.clone());
+        packed_quorum.verify().unwrap();
+        assert!(packed_quorum.authorizes_member_recovery(unsigned_member));
         let packed_bytes = canonical_bytes(&packed_checkpoint).unwrap();
         assert_eq!(
             decode_canonical::<GuildCheckpoint>(&packed_bytes).unwrap(),

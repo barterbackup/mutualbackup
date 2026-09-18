@@ -494,7 +494,7 @@ machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
 than a daemon prerequisite. Milestones 0 through 4 have passed; Milestone 5 is
-reopened for M5-36 through M5-44 and the M5-45 correction gate. Later wire or
+reopened for the open items in M5-36 through M5-44 and the M5-45 correction gate. Later wire or
 durable-state changes require the review and gate of the milestone that owns
 them. Build and run all subsequent validation locally; do not use a remote
 compilation server.
@@ -711,8 +711,9 @@ integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
 **Current position:** Milestones 0 through 4 are passed. Milestone 5 is reopened
-after source review of `8135e0b..da8974a`; M5-36 through M5-44 and the M5-45
-correction gate block completion. Milestone 6 remains subsequent work.
+after source review of `8135e0b..da8974a`; the open items in M5-36 through
+M5-44 and the M5-45 correction gate block completion. Milestone 6 remains
+subsequent work.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1019,9 +1020,11 @@ blockers (details, source locations, and regression scenarios are in `TODO.md`):
 - **M5-36:** Checkpoint approval does not authenticate packed contents against
   the source roots in owner-signed revisions. Correct RS over substituted
   ciphertext can pass signing and fail only at restore.
-- **M5-37:** Versions 6/7 incorrectly require unanimous checkpoint signatures,
-  and cold-recovery installation still requires the recovering member's own
-  signature despite the dynamic quorum rule.
+- **M5-37 (resolved):** Authority-bearing versions 5–7 now apply the configured
+  checkpoint quorum consistently. Recovery locator validation, DHT publication,
+  state adoption, installation, and resume share the rule that any certified
+  member may recover without having personally signed the checkpoint; legacy
+  formats remain unanimous.
 - **M5-38:** Retrying an explicit recovery-key rotation after partial signing
   creates different envelope bytes and conflicts with its durable event lock.
 - **M5-39:** A fast empty event tail can repeatedly win synchronization over
@@ -1478,9 +1481,9 @@ source locations, failure cases, and recorded gate evidence.
 
 ### Milestone 5 — efficient and flexible data/guild protocol (reopened)
 
-Completion is blocked by M5-36 through M5-44 in `TODO.md`, followed by the
-M5-45 correction gate. The recorded 2026-09-18 production run passed its
-scenarios but did not establish all requirements below.
+Completion is blocked by the open items in M5-36 through M5-44 in `TODO.md`,
+followed by the M5-45 correction gate. The recorded 2026-09-18 production run
+passed its scenarios but did not establish all requirements below.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and

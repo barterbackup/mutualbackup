@@ -2115,7 +2115,7 @@ impl Node {
             .map(|member| member.member.clone())
             .context("recovered dynamic guild does not authorize this seed identity")?;
         if local_member.recovery_public_key != self.keys.recovery_public_key()
-            || checkpoint.checkpoint.format_version < 5 && !checkpoint.has_signature(local_id)
+            || !checkpoint.authorizes_member_recovery(local_id)
             || !checkpoint.checkpoint.members.iter().any(|member| {
                 member.node_id == local_id
                     && member.recovery_public_key == self.keys.recovery_public_key()
@@ -6765,7 +6765,7 @@ impl Node {
             .iter()
             .map(|(subject, envelope)| (*subject, envelope.epoch))
             .collect::<Vec<_>>();
-        if !checkpoint.has_signature(local_id)
+        if !checkpoint.authorizes_member_recovery(local_id)
             || !publication_members
                 .iter()
                 .any(|member| member.node_id == local_id)
@@ -7717,7 +7717,7 @@ impl Node {
         checkpoint.verify()?;
         self.validate_local_member(&checkpoint.checkpoint, false)?;
         self.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, true)?;
-        if !checkpoint.has_signature(self.keys.node_id()) {
+        if !checkpoint.authorizes_member_recovery(self.keys.node_id()) {
             anyhow::bail!("checkpoint is not authorized by the recovering seed");
         }
         let checkpoint_hash = checkpoint.hash()?;
@@ -7858,7 +7858,7 @@ impl Node {
         if checkpoint.checkpoint.guild_id != installed.certificate.genesis.guild_id
             || checkpoint.checkpoint.genesis_hash != installed.certificate.genesis.hash()?
             || local_checkpoint_member.recovery_public_key != self.keys.recovery_public_key()
-            || checkpoint.checkpoint.format_version < 5 && !checkpoint.has_signature(local_id)
+            || !checkpoint.authorizes_member_recovery(local_id)
         {
             anyhow::bail!("installed recovery checkpoint is not bound to the local seed");
         }
