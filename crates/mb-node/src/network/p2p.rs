@@ -686,23 +686,17 @@ fn guild_relay_admission(members: RelayMembers) -> Box<dyn relay::RateLimiter> {
 }
 
 fn guild_relay_config(max_connections: usize, members: RelayMembers) -> relay::Config {
-    let mut config = relay::Config {
+    relay::Config {
         max_reservations: max_connections,
         max_reservations_per_peer: 1,
         reservation_duration: Duration::from_secs(15 * 60),
+        reservation_rate_limiters: vec![guild_relay_admission(members.clone())],
         max_circuits: max_connections,
         max_circuits_per_peer: max_connections,
         max_circuit_duration: Duration::from_secs(2 * 60),
         max_circuit_bytes: MAX_RELAY_CIRCUIT_BYTES,
-        ..relay::Config::default()
-    };
-    config
-        .reservation_rate_limiters
-        .push(guild_relay_admission(members.clone()));
-    config
-        .circuit_src_rate_limiters
-        .push(guild_relay_admission(members));
-    config
+        circuit_src_rate_limiters: vec![guild_relay_admission(members)],
+    }
 }
 
 fn peer_codec() -> request_response::cbor::codec::Codec<
@@ -15265,13 +15259,49 @@ mod tests {
 
     #[test]
     fn relay_capacity_follows_the_connection_budget() {
-        let config = guild_relay_config(32, Arc::new(RwLock::new(BTreeSet::new())));
+        let allowed = mb_core::KeyMaterial::from_seed(&Seed::from_bytes([76; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let denied = mb_core::KeyMaterial::from_seed(&Seed::from_bytes([77; 32]))
+            .node_id()
+            .libp2p_peer_id()
+            .unwrap();
+        let mut config = guild_relay_config(32, Arc::new(RwLock::new(BTreeSet::from([allowed]))));
+        let address: Multiaddr = "/ip4/127.0.0.1/udp/1234/quic-v1".parse().unwrap();
 
         assert_eq!(config.max_reservations, 32);
         assert_eq!(config.max_reservations_per_peer, 1);
         assert_eq!(config.max_circuits, 32);
         assert_eq!(config.max_circuits_per_peer, 32);
         assert_eq!(config.max_circuit_bytes, MAX_RELAY_CIRCUIT_BYTES);
+        assert_eq!(config.reservation_rate_limiters.len(), 1);
+        assert_eq!(config.circuit_src_rate_limiters.len(), 1);
+
+        for _ in 0..64 {
+            assert!(
+                config.reservation_rate_limiters.iter_mut().all(|limiter| {
+                    limiter.try_next(allowed, &address, std::time::Instant::now())
+                })
+            );
+            assert!(
+                config.circuit_src_rate_limiters.iter_mut().all(|limiter| {
+                    limiter.try_next(allowed, &address, std::time::Instant::now())
+                })
+            );
+        }
+        assert!(
+            config
+                .reservation_rate_limiters
+                .iter_mut()
+                .any(|limiter| { !limiter.try_next(denied, &address, std::time::Instant::now()) })
+        );
+        assert!(
+            config
+                .circuit_src_rate_limiters
+                .iter_mut()
+                .any(|limiter| { !limiter.try_next(denied, &address, std::time::Instant::now()) })
+        );
     }
 
     #[test]

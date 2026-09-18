@@ -929,7 +929,22 @@ node Clippy gate passed locally. No remote compilation server was used.
   equality instead of admitting one extra reservation or circuit. Focused
   relay regressions, the complete locked all-target workspace tests, and
   warning-free locked all-target Clippy pass locally.
-- [ ] **M5-34 / gate — Run the corrected production gate.**
+- [x] **M5-34 / P1 — Do not apply public-relay time throttles to authenticated guild traffic.**
+  A fresh 10,391.43-second process run passed onboarding, both small backups,
+  interrupted large-backup resume, both seed-recovery roles, and its first
+  isolated-topology backup in about 44 minutes 45 seconds. The relay-fallback
+  backup then used its complete ninety-minute allowance while all five daemons
+  remained alive, transferred application bytes, and wrote durable state. The
+  relay still inherited libp2p's public-service rate limiters, however: one new
+  circuit per source peer every two minutes and one per source IP every minute.
+  Those fixed windows returned `resource limit exceeded` during legitimate
+  guild coding and cleanup retries, so the backup could not commit. Relay
+  reservations and circuits now use replaceable guild membership as their sole
+  source-admission limiter; configured reservation/circuit totals, per-peer
+  reservation isolation, and circuit byte and duration bounds still constrain
+  resources. A regression admits 64 immediate requests from one member through
+  both limiter lists and continues to reject a nonmember.
+- [ ] **M5-35 / gate — Run the corrected production gate.**
   The ignored repeated multi-owner QUIC test had a stale checkpoint-version
   assertion, now corrected to version 7. Successive reruns exposed M5-04,
   M5-05, M5-06 after the catalog and local restore assertions passed, and M5-07
@@ -988,11 +1003,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   topology backup's three-minute bound predated production delegated coding.
   The next fresh process run completed its first constrained-topology backup
   but exposed M5-33 when the relay's fixed-profile capacity made the required
-  fallback route permanently unavailable. The provisioned Btrfs production
-  path has therefore not yet passed for the reopened work. Run formatting,
-  locked all-target workspace tests, warning-free locked all-target Clippy,
-  and the local reflink/network acceptance gate after M5-01 through M5-33
-  close.
+  fallback route permanently unavailable. After M5-33 raised relay capacity,
+  the next fresh run reached that route substantially faster and kept useful
+  work moving for the complete timeout, but exposed M5-34 when inherited
+  public-relay time windows throttled authenticated guild circuit churn. The
+  provisioned Btrfs production path has therefore not yet passed for the
+  reopened work. Run formatting, locked all-target workspace tests,
+  warning-free locked all-target Clippy, and the local reflink/network
+  acceptance gate after M5-01 through M5-34 close.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

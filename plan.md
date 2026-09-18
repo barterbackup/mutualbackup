@@ -979,6 +979,18 @@ per-circuit byte and duration bounds remain. The vendored relay enforces these
 limits at equality rather than admitting one extra resource. Focused relay
 regressions, the complete locked all-target workspace tests, and warning-free
 locked all-target Clippy pass locally.
+A subsequent fresh process run completed all earlier phases and its first
+isolated-topology backup in about 44 minutes 45 seconds, then kept the
+relay-fallback route active for its complete ninety-minute allowance without
+committing. The relay configuration still inherited libp2p's public-service
+time windows: one circuit per source peer every two minutes and one per source
+IP every minute. Their generic `resource limit exceeded` denials throttled
+authenticated guild coding and cleanup retries despite available configured
+capacity. Guild membership is now the sole reservation and circuit-source
+admission limiter. Total and per-peer capacity plus circuit byte and duration
+bounds remain in force, while repeated requests from one admitted member are
+not time-throttled. A focused regression exercises 64 immediate admitted
+requests and verifies that a nonmember remains denied.
 A fresh provisioned production gate must still close before Milestone 5 can
 pass.
 
