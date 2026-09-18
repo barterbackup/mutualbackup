@@ -574,7 +574,13 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (passed)
+## Milestone 5 guild geometry and coding protocol (reopened)
+
+Source-only review of `8135e0b..da8974a` on 2026-09-18 found the open
+M5-36 through M5-44 blockers below. The production gate recorded in M5-35
+remains valid evidence for those scenarios, but does not close these gaps.
+Milestone 5 is not finished; Milestone 6 waits for the correction gate.
+This review ran no builds, tests, daemons, or remote compilation.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -1021,6 +1027,140 @@ node Clippy gate passed locally. No remote compilation server was used.
   Formatting, the complete locked all-target workspace suite, and warning-free
   locked all-target Clippy also pass. All compilation and execution were local;
   no remote compilation server was used.
+
+- [ ] **M5-36 / P1 — Authenticate packed contents against owner-signed source roots.**
+  `GuildCheckpoint::validate` checks catalog source identities and aggregate
+  lengths, without relating slot contents to the original `SectorRef.root`
+  (`crates/mb-core/src/model.rs:847`). Format-7 signing skips original-sector
+  coverage and checks RS transcripts for the coordinator-selected packed
+  descriptors instead (`crates/mb-node/src/node.rs:5588`, `:5606`). The local
+  durability check visits only legacy groups, which production clears
+  (`node.rs:6038`; `network/p2p.rs:11459`). A faulty or malicious coordinator
+  can retain an authentic revision, label different ciphertext with its source
+  IDs, and obtain honest coding and checkpoint signatures. Restore discovers
+  the mismatch only when checking the reconstructed original root
+  (`network/p2p.rs:10555`); the certified backup can therefore be unrestorable.
+  Require authenticated source-to-packed-content evidence before signing,
+  preserved through recovery and repair. Gate with substituted source bytes
+  under authentic IDs and valid packed roots/RS transcripts; reject before
+  checkpoint approval, including when the original owner is absent.
+- [ ] **M5-37 / P1 — Apply dynamic quorum and recovery rules to every supported checkpoint version.**
+  `QuorumCheckpoint::verify` honors `authority.quorum` only for version 5;
+  versions 6 and 7 fall back to every member (`crates/mb-core/src/model.rs:1099`).
+  Production creates version 7 and gathers policy-authorized signatures, then
+  fails certificate verification if any nonrequired member is unavailable
+  (`crates/mb-node/src/network/p2p.rs:11556`, `:11601`). After correcting that
+  branch, `install_recovered_checkpoint` still rejects a recovering member
+  who did not personally sign (`node.rs:7720`), although the core recovery rule
+  explicitly permits this for authority-bearing versions (`model.rs:1159`).
+  Preserve legacy unanimous rules while applying certified policy consistently
+  to versions 5–7 and their cold-recovery paths. Gate majority/threshold commit
+  with an absent nonrequired member and seed-only recovery of that nonsigner.
+- [ ] **M5-38 / P1 — Resume the exact durable proposal for explicit recovery-key rotation.**
+  `guild rotate-recovery-key` generates a fresh randomized envelope on every
+  call (`crates/mb-node/src/network/p2p.rs:7488`). If the first call signs
+  locally but fails to collect quorum, the next call proposes different bytes
+  at the same sequence and conflicts with the durable signature lock
+  (`node.rs:2383`). The registration reconciler only handles members with no
+  current key (`network/p2p.rs:7017`), and lifecycle reconciliation leaves this
+  locked event alone (`:7106`). For an already registered member, an ordinary
+  quorum outage can thus leave rotation and subsequent guild writes stuck
+  across restart. Reuse and resume the persisted rotation proposal without
+  weakening anti-equivocation. Gate partial signing, quorum failure, repeated
+  CLI retry, restart, and eventual rotation followed by backup.
+- [ ] **M5-39 / P1 — Do not let an empty event tail win synchronization.**
+  The M5-22 shortcut accepts the first valid tail and abandons the other
+  requests even when it contains no events
+  (`crates/mb-node/src/network/p2p.rs:7636`). Empty tails from a peer at the
+  caller's head are valid. Two lagging peers on a consistently faster path can
+  keep selecting each other and never install certified events available from
+  slower reachable peers. Membership, revocation, recovery-key registration,
+  and coding activation can stop converging. Select a tail that advances the
+  local state, without reinstating an all-peer wait; retain bounded fallback
+  if its source cannot supply required coding evidence (`:7651`). Gate a fast
+  empty responder, a slower advancing responder, and a selected source whose
+  transcript request fails.
+- [ ] **M5-40 / P1 — Isolate unavailable roots in automatic scheduling and watching.**
+  Roots are UUID-sorted and `next_dirty_root` always chooses the first dirty
+  one (`crates/mb-node/src/node.rs:1004`, `:1410`). A failed scan of that root
+  sets the global retry state and returns without considering another root
+  (`:1317`). A missing or unreadable first root therefore indefinitely starves
+  healthy dirty roots. `watch_once` also opens all roots as one fallible
+  collection (`crates/mb-node/src/watcher.rs:82`), so one absent root prevents
+  watches on every other root. Keep failure/backoff and watch recovery per
+  root, select eligible roots fairly, and bind submission to the selected
+  root. Gate an unavailable first root beside a healthy dirty root: the latter
+  must remain watched and commit automatically before the former returns.
+- [ ] **M5-41 / P1 — Release failed relay reservation admissions and permit full-capacity renewal.**
+  Relay admission inserts a reservation before its acceptance response
+  succeeds, but `ReservationReqAcceptFailed` does not undo the insertion
+  (`vendor/libp2p-relay/src/behaviour.rs:452`, `:494`). The handler starts the
+  expiry timer only on success (`src/behaviour/handler.rs:836`). With M5-33's
+  one-reservation-per-peer cap enforced at equality, a reset acceptance stream
+  leaves an unexpiring slot while the connection survives; later requests on
+  that connection are new reservations and are rejected. The client reuses
+  the connection, so periodic listener retries cannot repair relay-only
+  reachability. Roll back failed first accepts without dropping a previously
+  active reservation. Also exempt true renewals from the total-new-reservation
+  cap (`behaviour.rs:427`). Gate failed acceptance followed by successful retry
+  on the same connection at per-peer cap 1, and renewal at full global capacity.
+- [ ] **M5-42 / P2 — Reconcile tentative request connections on rejection itself.**
+  Request-response records a connection before the later composite connection
+  limiter accepts it (`vendor/libp2p-request-response/src/lib.rs:818`;
+  `crates/mb-node/src/network/p2p.rs:441`). A rejected established handshake
+  yields `DialFailure` or `ListenFailure`, without a `ConnectionClosed` event.
+  Neither failure path removes the tentative `connected` entry (`lib.rs:783`,
+  `:915`). M5-31 only drains stale entries after an accepted connection to the
+  same peer closes with zero remaining (`:736`), which never happens for peers
+  having only rejected connections. Repeated denied handshakes under fresh
+  identities can grow this map beyond `max_connections`; requests preloaded
+  into rejected handlers can also remain pending. Clean up the exact denied
+  connection and its work on both failure paths. Gate repeated inbound and
+  outbound denials with no accepted connection and with a surviving sibling.
+- [ ] **M5-43 / P2 — Make small production updates incremental in data and resource cost.**
+  Snapshot capture assigns every data sector an ID derived from the new
+  revision UUID (`crates/mb-node/src/snapshot.rs:729`;
+  `crates/mb-core/src/content.rs:37`), which also changes its encryption nonce.
+  Unchanged file bytes therefore become new source IDs/ciphertext and need new
+  packing/coding; stable slots only preserve IDs from retained old revisions
+  (`crates/mb-core/src/packing.rs:475`). Additionally, every backup refetches
+  every distinct source sector referenced by retained revisions before
+  considering its prior packed copy (`crates/mb-node/src/network/p2p.rs:11189`),
+  materializes the full input set, and rewrites all packed payloads
+  (`node.rs:3309`). A no-change or single-byte update has work proportional to
+  retained data, including network transfer for sources on other members.
+  Preserve authenticated references for unchanged data, reuse unchanged packed
+  payloads before remote fetch, and bound packing memory and durable writes to
+  appropriate batches. Gate no-change and one-chunk updates over a large
+  retained multi-owner corpus, asserting actual source reads, transferred
+  bytes, new coding work, peak memory, and durable bytes rather than only old
+  slot positions. Preserve safe encryption nonce use when changing identities.
+- [ ] **M5-44 / P2 — Integrate fair information placement and reusable coding geometry.**
+  Production assigns every packed information sector to the checkpoint
+  coordinator and passes no other candidate information into the lane builder
+  (`crates/mb-node/src/network/p2p.rs:11494`, `:11525`). Each group consequently
+  has one real input; for the five-domain 3+2 profile, the other two information
+  rows are virtual zero even with abundant multi-user data (`:10945`, `:10773`).
+  The coordinator keeps the entire packed corpus in `control.db`
+  (`node.rs:3313`), outside the parity placement admission path, and placement
+  hashes each revision/sector ordinal separately (`network/p2p.rs:10730`).
+  This does not implement the planned fair, capacity-aware information hosts
+  and reusable geometry for adjacent ranges. Place and account for packed
+  information across eligible failure domains, fill real information lanes
+  when available, and persist geometry reusable across bounded runs. Gate a
+  multi-owner workload with enough real inputs, a coordinator with limited
+  storage, per-member information/parity accounting, and explicit storage and
+  transfer amplification bounds.
+- [ ] **M5-45 / gate — Recheck the corrected tree before closing Milestone 5.**
+  Close M5-36 through M5-44 with focused source review and the regressions
+  described above. Then run the required formatting, locked workspace tests,
+  warning-free Clippy, and provisioned filesystem/network acceptance locally.
+  Include adversarial packed-source substitution, nonunanimous checkpoint and
+  seed recovery, interrupted explicit rotation, lagging-peer convergence,
+  root failure isolation, rejected connection/reservation lifecycles, and
+  measured incremental/placement efficiency. Prior happy-path gate results do
+  not replace this evidence. No build or runtime checks were run in this
+  source-only review.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

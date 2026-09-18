@@ -83,8 +83,10 @@ correction gate passed on 2026-09-15. Milestone 5's first closure record was
 reopened by follow-up source review. Root-scoped signed revision chains,
 checkpoint-authenticated production stable-slot packing, and authenticated
 candidate-to-lane path ranking are now implemented. The corrected source and
-complete local provisioned gate passed on 2026-09-18. Milestones 0 through 5
-are closed; Milestone 6 is next.
+complete local provisioned gate passed on 2026-09-18. Follow-up source review
+of `8135e0b..da8974a` found the M5-36 through M5-44 blockers in `TODO.md`.
+Milestones 0 through 4 remain closed; Milestone 5 is reopened and must pass its
+correction gate before Milestone 6 starts.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -491,10 +493,11 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 5 have passed; Milestone 6 is
-next. Later wire or durable-state changes
-require the review and gate of the milestone that owns them. Build and run all
-subsequent validation locally; do not use a remote compilation server.
+than a daemon prerequisite. Milestones 0 through 4 have passed; Milestone 5 is
+reopened for M5-36 through M5-44 and the M5-45 correction gate. Later wire or
+durable-state changes require the review and gate of the milestone that owns
+them. Build and run all subsequent validation locally; do not use a remote
+compilation server.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -707,7 +710,9 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 5 are passed. Milestone 6 is next.
+**Current position:** Milestones 0 through 4 are passed. Milestone 5 is reopened
+after source review of `8135e0b..da8974a`; M5-36 through M5-44 and the M5-45
+correction gate block completion. Milestone 6 remains subsequent work.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1005,8 +1010,42 @@ seed recovery passed in 51.95 seconds; signed network commit and recovery passed
 in 94.76 seconds; and repeated multi-owner QUIC backup and recovery passed in
 2,796.81 seconds. Formatting, the complete locked all-target workspace suite,
 and warning-free locked all-target Clippy also pass. All compilation and
-execution were local; no remote compilation server was used. Milestone 5 is
-closed.
+execution were local; no remote compilation server was used. These are
+historical gate results; follow-up source review reopens Milestone 5.
+
+The source-only review of `8135e0b..da8974a` on 2026-09-18 found nine remaining
+blockers (details, source locations, and regression scenarios are in `TODO.md`):
+
+- **M5-36:** Checkpoint approval does not authenticate packed contents against
+  the source roots in owner-signed revisions. Correct RS over substituted
+  ciphertext can pass signing and fail only at restore.
+- **M5-37:** Versions 6/7 incorrectly require unanimous checkpoint signatures,
+  and cold-recovery installation still requires the recovering member's own
+  signature despite the dynamic quorum rule.
+- **M5-38:** Retrying an explicit recovery-key rotation after partial signing
+  creates different envelope bytes and conflicts with its durable event lock.
+- **M5-39:** A fast empty event tail can repeatedly win synchronization over
+  reachable peers with newer certified state; evidence-fetch failures also
+  need bounded fallback.
+- **M5-40:** One unavailable root starves automatic backups of other roots and
+  prevents their watches from being installed.
+- **M5-41:** Failed relay reservation acceptance retains an unexpiring slot;
+  full-capacity renewal is also incorrectly rejected.
+- **M5-42:** Tentative request connections rejected by the composite limiter
+  remain tracked when no accepted connection later closes for that peer.
+- **M5-43:** Unchanged snapshot data gets new IDs/ciphertext, and packing
+  refetches and materializes the retained corpus on every update.
+- **M5-44:** All packed information stays at the checkpoint coordinator;
+  production lanes use one real input plus zeros and lack the planned fair
+  information placement and reusable geometry.
+
+Fix the source-authentication and authority/retry/convergence defects first,
+then complete root and transport failure isolation and incremental, bounded
+information placement. M5-45 requires focused regressions for each finding
+and the complete applicable local gate on the corrected tree. Preserve
+anti-equivocation, seed-only recovery, retained-layout readability, failure-
+domain separation, and storage/transfer bounds throughout the corrections.
+This review ran no compilation, tests, daemons, or remote commands.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer
@@ -1437,7 +1476,11 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (passed)
+### Milestone 5 — efficient and flexible data/guild protocol (reopened)
+
+Completion is blocked by M5-36 through M5-44 in `TODO.md`, followed by the
+M5-45 correction gate. The recorded 2026-09-18 production run passed its
+scenarios but did not establish all requirements below.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and
