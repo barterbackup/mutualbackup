@@ -1244,8 +1244,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   every distinct ID matched exactly. The fixture now protects each distinct
   sector once and restore accepts repeated identical references while retaining
   exact per-ID checks. The formerly failing signed network commit and seed
-  recovery scenario passes on the provisioned Btrfs filesystem; the full gate
-  must still be rerun after this correction.
+  recovery scenario passes on the provisioned Btrfs filesystem. The
+  multi-owner production assertion now checks exact active coverage, bounded
+  three-input group count, and actual multi-input use instead of requiring the
+  obsolete one-group-per-sector layout; its full real-QUIC scenario passes.
+  The complete gate must still be rerun from the committed tree after these
+  corrections.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

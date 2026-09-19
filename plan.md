@@ -1066,7 +1066,10 @@ blockers (details, source locations, and regression scenarios are in `TODO.md`):
   fixture now creates one coding group per distinct sector, and recovered
   anchor validation compares every distinct ID and exact reference without
   rejecting repeated identical references. The provisioned signed commit and
-  seed recovery regression passes after the correction.
+  seed recovery regression passes after the correction. The provisioned
+  multi-owner workload now asserts exact active packed-sector coverage,
+  bounded three-input group count, and at least one real multi-input lane; the
+  real-QUIC scenario passes with those M5-44 invariants.
 
 Fix the source-authentication and authority/retry/convergence defects first,
 then complete root and transport failure isolation and incremental, bounded

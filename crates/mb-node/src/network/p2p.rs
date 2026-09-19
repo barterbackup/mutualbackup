@@ -18890,7 +18890,58 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(protected_sector_count > 0);
-        assert!(dynamic.coding_groups.len() >= final_catalog.sectors.len());
+        let final_sector_ids = final_catalog
+            .sectors
+            .iter()
+            .map(|sector| sector.id)
+            .collect::<BTreeSet<_>>();
+        let covering_groups = dynamic
+            .coding_groups
+            .iter()
+            .filter(|retained| retained.retired_at_event.is_none())
+            .filter(|retained| {
+                retained.group.roles.iter().any(|role| {
+                    matches!(role, ShardRoleV2::Information(information)
+                        if !information.sector.virtual_zero
+                            && final_sector_ids.contains(&information.sector.id))
+                })
+            })
+            .collect::<Vec<_>>();
+        let covered_sector_ids = covering_groups
+            .iter()
+            .flat_map(|retained| &retained.group.roles)
+            .filter_map(|role| match role {
+                ShardRoleV2::Information(information)
+                    if !information.sector.virtual_zero
+                        && final_sector_ids.contains(&information.sector.id) =>
+                {
+                    Some(information.sector.id)
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(covered_sector_ids, final_sector_ids);
+        assert!(
+            covering_groups.len()
+                >= final_catalog
+                    .sectors
+                    .len()
+                    .div_ceil(MAX_VARIABLE_CODING_PARTICIPANTS - 2)
+        );
+        assert!(covering_groups.len() <= final_catalog.sectors.len());
+        assert!(covering_groups.iter().any(|retained| {
+            retained
+                .group
+                .roles
+                .iter()
+                .filter(|role| {
+                    matches!(role, ShardRoleV2::Information(information)
+                        if !information.sector.virtual_zero
+                            && final_sector_ids.contains(&information.sector.id))
+                })
+                .count()
+                > 1
+        }));
         let secondary_restore = run_root.join("secondary-restore-node-1");
         restore_snapshot_with_p2p(
             nodes[1].clone(),
