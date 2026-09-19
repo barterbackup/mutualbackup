@@ -1061,6 +1061,12 @@ blockers (details, source locations, and regression scenarios are in `TODO.md`):
   and stable descriptors retain their existing groups. Focused coverage bounds
   coordinator storage and all information/parity debits and verifies repeated
   geometry.
+- **M5-45 gate finding (resolved):** Content-derived sector IDs may repeat when
+  a revision contains identical plaintext sectors. The legacy signed-network
+  fixture now creates one coding group per distinct sector, and recovered
+  anchor validation compares every distinct ID and exact reference without
+  rejecting repeated identical references. The provisioned signed commit and
+  seed recovery regression passes after the correction.
 
 Fix the source-authentication and authority/retry/convergence defects first,
 then complete root and transport failure isolation and incremental, bounded

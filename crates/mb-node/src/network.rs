@@ -1664,6 +1664,8 @@ pub async fn commit_source_over_network_with_intent(
 
     let mut target_sectors = revision.value.metadata_sectors.clone();
     target_sectors.extend(revision.value.data_sectors.clone());
+    target_sectors.sort_by_key(|sector| sector.id);
+    target_sectors.dedup_by_key(|sector| sector.id);
     if target_sectors.is_empty() || target_sectors.len() > V1_MAX_CODING_GROUPS {
         bail!("prepared revision exceeds the bounded v1 coding catalog");
     }

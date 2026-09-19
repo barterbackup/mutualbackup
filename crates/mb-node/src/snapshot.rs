@@ -1536,8 +1536,7 @@ fn recovered_anchor_recipes(
         .iter()
         .map(|reference| (reference.id, reference))
         .collect::<BTreeMap<_, _>>();
-    if expected.len() != revision.value.data_sectors.len()
-        || expected.len() != by_id.len()
+    if expected.len() != by_id.len()
         || expected.iter().any(|(id, reference)| {
             by_id.get(id).map(|recipe| &recipe.reference) != Some(*reference)
         })

@@ -1237,7 +1237,15 @@ node Clippy gate passed locally. No remote compilation server was used.
   root failure isolation, rejected connection/reservation lifecycles, and
   measured incremental/placement efficiency. Prior happy-path gate results do
   not replace this evidence. No build or runtime checks were run in this
-  source-only review.
+  source-only review. The first corrected-tree provisioned run exposed two
+  duplicate-content assumptions after M5-43 made sector IDs content-derived:
+  the legacy signed-network fixture coded repeated IDs more than once, and
+  recovered-anchor validation rejected repeated signed references even when
+  every distinct ID matched exactly. The fixture now protects each distinct
+  sector once and restore accepts repeated identical references while retaining
+  exact per-ID checks. The formerly failing signed network commit and seed
+  recovery scenario passes on the provisioned Btrfs filesystem; the full gate
+  must still be rerun after this correction.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
