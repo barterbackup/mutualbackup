@@ -1041,8 +1041,10 @@ blockers (details, source locations, and regression scenarios are in `TODO.md`):
   their acceptance response fails, while failed renewals preserve an existing
   reservation. Renewals bypass new-slot capacity checks. Focused relay tests
   cover per-peer cap 1 and full global capacity.
-- **M5-42:** Tentative request connections rejected by the composite limiter
-  remain tracked when no accepted connection later closes for that peer.
+- **M5-42 (resolved):** Request-response reconciles the exact tentative
+  connection on both outbound and inbound composite rejection, completes its
+  preloaded work with terminal failures, and preserves accepted siblings.
+  Focused tests cover repeated fresh-peer denials and sibling isolation.
 - **M5-43:** Unchanged snapshot data gets new IDs/ciphertext, and packing
   refetches and materializes the retained corpus on every update.
 - **M5-44:** All packed information stays at the checkpoint coordinator;

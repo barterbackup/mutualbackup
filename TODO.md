@@ -1139,7 +1139,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   Focused vendored-relay regressions cover slot release at per-peer cap 1 and
   renewal failure while both peer and global capacity are full; all relay
   library tests pass locally.
-- [ ] **M5-42 / P2 — Reconcile tentative request connections on rejection itself.**
+- [x] **M5-42 / P2 — Reconcile tentative request connections on rejection itself.**
   Request-response records a connection before the later composite connection
   limiter accepts it (`vendor/libp2p-request-response/src/lib.rs:818`;
   `crates/mb-node/src/network/p2p.rs:441`). A rejected established handshake
@@ -1152,6 +1152,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   into rejected handlers can also remain pending. Clean up the exact denied
   connection and its work on both failure paths. Gate repeated inbound and
   outbound denials with no accepted connection and with a surviving sibling.
+  Request-response now removes the exact tentatively tracked connection on
+  both `DialFailure` and `ListenFailure`. Its preloaded inbound and outbound
+  work receives terminal failure events, while any accepted sibling remains
+  tracked. Focused regressions alternate repeated denials under fresh peer
+  identities without map growth and verify exact cleanup beside a surviving
+  connection; the vendored library tests and strict clippy pass locally.
 - [ ] **M5-43 / P2 — Make small production updates incremental in data and resource cost.**
   Snapshot capture assigns every data sector an ID derived from the new
   revision UUID (`crates/mb-node/src/snapshot.rs:729`;

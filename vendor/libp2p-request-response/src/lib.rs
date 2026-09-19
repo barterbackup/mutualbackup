@@ -88,7 +88,7 @@ pub use handler::ProtocolSupport;
 use libp2p_core::{transport::PortUse, ConnectedPoint, Endpoint, Multiaddr};
 use libp2p_identity::PeerId;
 use libp2p_swarm::{
-    behaviour::{AddressChange, ConnectionClosed, DialFailure, FromSwarm},
+    behaviour::{AddressChange, ConnectionClosed, DialFailure, FromSwarm, ListenFailure},
     dial_opts::DialOpts,
     ConnectionDenied, ConnectionHandler, ConnectionId, DialError, NetworkBehaviour, NotifyHandler,
     PeerAddresses, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
@@ -793,6 +793,8 @@ where
             return;
         }
         if let Some(peer) = peer_id {
+            self.reconcile_rejected_connection(peer, connection_id, RejectedConnection::Outbound);
+
             // If there are pending outgoing requests when a dial failure occurs,
             // it is implied that we are not connected to the peer, since pending
             // outgoing requests are drained when a connection is established and
@@ -810,6 +812,69 @@ where
                         }));
                 }
             }
+        }
+    }
+
+    fn on_listen_failure(
+        &mut self,
+        ListenFailure {
+            peer_id,
+            connection_id,
+            ..
+        }: ListenFailure,
+    ) {
+        if let Some(peer) = peer_id {
+            self.reconcile_rejected_connection(peer, connection_id, RejectedConnection::Inbound);
+        }
+    }
+
+    fn reconcile_rejected_connection(
+        &mut self,
+        peer: PeerId,
+        connection_id: ConnectionId,
+        rejection: RejectedConnection,
+    ) {
+        let rejected = self.connected.get_mut(&peer).and_then(|connections| {
+            connections
+                .iter()
+                .position(|connection| connection.id == connection_id)
+                .map(|position| connections.remove(position))
+        });
+
+        let remove_peer = self
+            .connected
+            .get(&peer)
+            .is_some_and(|connections| connections.is_empty());
+        if remove_peer {
+            self.connected.remove(&peer);
+        }
+
+        let Some(rejected) = rejected else {
+            return;
+        };
+
+        for request_id in rejected.pending_inbound_responses {
+            self.pending_events
+                .push_back(ToSwarm::GenerateEvent(Event::InboundFailure {
+                    peer,
+                    connection_id,
+                    request_id,
+                    error: InboundFailure::ConnectionClosed,
+                }));
+        }
+
+        for request_id in rejected.pending_outbound_responses {
+            let error = match rejection {
+                RejectedConnection::Outbound => OutboundFailure::DialFailure,
+                RejectedConnection::Inbound => OutboundFailure::ConnectionClosed,
+            };
+            self.pending_events
+                .push_back(ToSwarm::GenerateEvent(Event::OutboundFailure {
+                    peer,
+                    connection_id,
+                    request_id,
+                    error,
+                }));
         }
     }
 
@@ -921,6 +986,7 @@ where
             }
             FromSwarm::AddressChange(address_change) => self.on_address_change(address_change),
             FromSwarm::DialFailure(dial_failure) => self.on_dial_failure(dial_failure),
+            FromSwarm::ListenFailure(listen_failure) => self.on_listen_failure(listen_failure),
             _ => {}
         }
     }
@@ -1126,6 +1192,12 @@ struct Connection {
     pending_inbound_responses: HashSet<InboundRequestId>,
 }
 
+#[derive(Clone, Copy)]
+enum RejectedConnection {
+    Inbound,
+    Outbound,
+}
+
 impl Connection {
     fn new(id: ConnectionId, remote_address: Option<Multiaddr>) -> Self {
         Self {
@@ -1142,15 +1214,19 @@ mod tests {
     use super::*;
     use libp2p_swarm::StreamProtocol;
 
-    #[test]
-    fn last_swarm_connection_clears_preloaded_stale_entries() {
-        let mut behaviour = cbor::Behaviour::<u8, u8>::new(
+    fn test_behaviour() -> cbor::Behaviour<u8, u8> {
+        cbor::Behaviour::<u8, u8>::new(
             [(
                 StreamProtocol::new("/request-response/test"),
                 ProtocolSupport::Full,
             )],
             Config::default(),
-        );
+        )
+    }
+
+    #[test]
+    fn last_swarm_connection_clears_preloaded_stale_entries() {
+        let mut behaviour = test_behaviour();
         let peer = PeerId::random();
         let closing_id = ConnectionId::new_unchecked(1);
         let stale_id = ConnectionId::new_unchecked(2);
@@ -1205,5 +1281,97 @@ mod tests {
         behaviour.reconcile_connection_closed(peer, stale_id, 0);
         assert!(!behaviour.connected.contains_key(&peer));
         assert!(behaviour.pending_events.is_empty());
+    }
+
+    #[test]
+    fn repeated_rejected_connections_do_not_accumulate() {
+        let mut behaviour = test_behaviour();
+
+        for index in 0..32 {
+            let peer = PeerId::random();
+            let connection_id = ConnectionId::new_unchecked(index + 1);
+            let request_id = OutboundRequestId(index as u64 + 100);
+            let mut connection = Connection::new(connection_id, None);
+            connection.pending_outbound_responses.insert(request_id);
+            behaviour
+                .connected
+                .entry(peer)
+                .or_default()
+                .push(connection);
+
+            let rejection = if index % 2 == 0 {
+                RejectedConnection::Outbound
+            } else {
+                RejectedConnection::Inbound
+            };
+            behaviour.reconcile_rejected_connection(peer, connection_id, rejection);
+
+            assert!(!behaviour.connected.contains_key(&peer));
+            match behaviour.pending_events.pop_front() {
+                Some(ToSwarm::GenerateEvent(Event::OutboundFailure {
+                    peer: event_peer,
+                    connection_id: event_connection,
+                    request_id: event_request,
+                    error,
+                })) => {
+                    assert_eq!(event_peer, peer);
+                    assert_eq!(event_connection, connection_id);
+                    assert_eq!(event_request, request_id);
+                    assert!(matches!(
+                        (rejection, error),
+                        (RejectedConnection::Outbound, OutboundFailure::DialFailure)
+                            | (
+                                RejectedConnection::Inbound,
+                                OutboundFailure::ConnectionClosed
+                            )
+                    ));
+                }
+                event => panic!("unexpected request-response action: {event:?}"),
+            }
+            assert!(behaviour.pending_events.is_empty());
+        }
+    }
+
+    #[test]
+    fn rejection_removes_only_the_exact_connection() {
+        let mut behaviour = test_behaviour();
+        let peer = PeerId::random();
+        let surviving_id = ConnectionId::new_unchecked(1);
+        let rejected_id = ConnectionId::new_unchecked(2);
+        let inbound_id = InboundRequestId(10);
+        let outbound_id = OutboundRequestId(20);
+
+        let surviving = Connection::new(surviving_id, None);
+        let mut rejected = Connection::new(rejected_id, None);
+        rejected.pending_inbound_responses.insert(inbound_id);
+        rejected.pending_outbound_responses.insert(outbound_id);
+        behaviour
+            .connected
+            .insert(peer, SmallVec::from_vec(vec![surviving, rejected]));
+
+        behaviour.reconcile_rejected_connection(peer, rejected_id, RejectedConnection::Outbound);
+
+        let connections = behaviour.connected.get(&peer).unwrap();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].id, surviving_id);
+        assert_eq!(behaviour.pending_events.len(), 2);
+        assert!(behaviour.pending_events.iter().any(|event| matches!(
+            event,
+            ToSwarm::GenerateEvent(Event::InboundFailure {
+                connection_id,
+                request_id,
+                error: InboundFailure::ConnectionClosed,
+                ..
+            }) if *connection_id == rejected_id && *request_id == inbound_id
+        )));
+        assert!(behaviour.pending_events.iter().any(|event| matches!(
+            event,
+            ToSwarm::GenerateEvent(Event::OutboundFailure {
+                connection_id,
+                request_id,
+                error: OutboundFailure::DialFailure,
+                ..
+            }) if *connection_id == rejected_id && *request_id == outbound_id
+        )));
     }
 }
