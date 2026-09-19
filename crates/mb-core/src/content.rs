@@ -48,6 +48,28 @@ pub fn make_sector_id(
     *hasher.finalize().as_bytes()
 }
 
+/// Stable encrypted-sector identity for content-preserving revisions. The
+/// guild scope separates encryption keys, and the logical length prevents two
+/// differently truncated plaintexts with identical zero padding from sharing
+/// a nonce. Equal IDs therefore imply equal plaintext under the same key.
+pub fn make_content_sector_id(
+    owner: NodeId,
+    guild_id: [u8; 32],
+    purpose: SectorPurpose,
+    plaintext: &[u8],
+) -> Result<SectorId, ContentError> {
+    if plaintext.len() > V1_SECTOR_SIZE {
+        return Err(ContentError::TooLarge);
+    }
+    let mut hasher = Hasher::new_derive_key("mutualbackup content sector id v1");
+    hasher.update(&owner.0);
+    hasher.update(&guild_id);
+    hasher.update(&[purpose.tag()]);
+    hasher.update(&(plaintext.len() as u64).to_be_bytes());
+    hasher.update(plaintext);
+    Ok(*hasher.finalize().as_bytes())
+}
+
 /// Pad and encrypt one protocol sector. Integrity is supplied by the signed
 /// sector root, so this representation intentionally has no per-sector tag.
 pub fn encrypted_sector(
@@ -116,5 +138,28 @@ mod tests {
         let (_, first) = encrypted_sector(&[1; 32], id, b"same").unwrap();
         let (_, second) = encrypted_sector(&[2; 32], id, b"same").unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn content_sector_ids_reuse_nonces_only_for_identical_plaintext() {
+        let owner = NodeId([8; 32]);
+        let guild = [7; 32];
+        let first = make_content_sector_id(owner, guild, SectorPurpose::Data, b"same").unwrap();
+        assert_eq!(
+            first,
+            make_content_sector_id(owner, guild, SectorPurpose::Data, b"same").unwrap()
+        );
+        assert_ne!(
+            first,
+            make_content_sector_id(owner, guild, SectorPurpose::Data, b"same\0").unwrap()
+        );
+        assert_ne!(
+            first,
+            make_content_sector_id(owner, guild, SectorPurpose::Metadata, b"same").unwrap()
+        );
+        assert_ne!(
+            first,
+            make_content_sector_id(owner, [6; 32], SectorPurpose::Data, b"same").unwrap()
+        );
     }
 }

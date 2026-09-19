@@ -31,8 +31,8 @@ pub use coding::{
     verify_sampled_codeword,
 };
 pub use content::{
-    ContentError, SectorPurpose, crypt_sector, encrypted_sector, make_sector_id,
-    synthetic_filler_sector,
+    ContentError, SectorPurpose, crypt_sector, encrypted_sector, make_content_sector_id,
+    make_sector_id, synthetic_filler_sector,
 };
 pub use guild::{
     DynamicGuildState, DynamicMember, GUILD_EVENT_DOMAIN, GuildEvent, GuildEventKind,

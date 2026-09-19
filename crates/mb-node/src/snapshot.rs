@@ -6,11 +6,13 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::SigningKey;
 use fs2::FileExt;
+#[cfg(test)]
+use mb_core::make_sector_id;
 use mb_core::{
     KeyMaterial, MerkleCommitment, SectorId, SectorPurpose, SectorRef, SignedRecord,
     USER_REVISION_DOMAIN, UserRevision, V1_CIPHER_PROFILE, V1_MAX_CATALOG_BYTES,
     V1_MAX_CODING_GROUPS, V1_SECTOR_SIZE, canonical_bytes, crypt_sector, decode_canonical,
-    encrypted_sector, make_sector_id, merkle_commit, sector_root,
+    encrypted_sector, make_content_sector_id, merkle_commit, sector_root,
 };
 use mb_store::{
     AnchorFileLocator, CapturedEntry, ControlStore, FileExtent, NativeFileId, PinnedDirectory,
@@ -516,12 +518,12 @@ pub(crate) fn prepare_revision(
                         let logical_len = remaining.min(V1_SECTOR_SIZE as u64) as usize;
                         let mut plaintext = vec![0_u8; logical_len];
                         file.read_exact(&mut plaintext)?;
-                        let id = make_sector_id(
+                        let id = make_content_sector_id(
                             keys.node_id(),
-                            revision_id,
+                            guild_id,
                             SectorPurpose::Data,
-                            ordinal,
-                        );
+                            &plaintext,
+                        )?;
                         ordinal += 1;
                         let (reference, ciphertext) =
                             encrypted_sector(&encryption_key, id, &plaintext)?;
@@ -576,7 +578,6 @@ pub(crate) fn prepare_revision(
                         &mut recipe_records,
                         keys,
                         guild_id,
-                        revision_id,
                         &mut ordinal,
                         &mut sector_commitments,
                         &locator,
@@ -619,13 +620,13 @@ pub(crate) fn prepare_revision(
             bail!("private metadata exceeds the v1 bounded-object limit");
         }
         let mut metadata_references = Vec::new();
-        for (metadata_ordinal, plaintext) in metadata_bytes.chunks(V1_SECTOR_SIZE).enumerate() {
-            let id = make_sector_id(
+        for plaintext in metadata_bytes.chunks(V1_SECTOR_SIZE) {
+            let id = make_content_sector_id(
                 keys.node_id(),
-                revision_id,
+                guild_id,
                 SectorPurpose::Metadata,
-                metadata_ordinal as u64,
-            );
+                plaintext,
+            )?;
             let (reference, ciphertext) = encrypted_sector(&encryption_key, id, plaintext)?;
             sector_commitments.insert(id, merkle_commit(&ciphertext)?);
             metadata_references.push(reference.clone());
@@ -723,7 +724,6 @@ fn prepare_sparse_file(
     recipe_records: &mut Vec<RecordWrite>,
     keys: &KeyMaterial,
     guild_id: [u8; 32],
-    revision_id: Uuid,
     ordinal: &mut u64,
     sector_commitments: &mut BTreeMap<SectorId, MerkleCommitment>,
     locator: &StableAnchorFileLocator,
@@ -748,7 +748,8 @@ fn prepare_sparse_file(
             let logical_len = remaining.min(V1_SECTOR_SIZE as u64) as usize;
             let mut plaintext = vec![0_u8; logical_len];
             file.read_exact(&mut plaintext)?;
-            let id = make_sector_id(keys.node_id(), revision_id, SectorPurpose::Data, *ordinal);
+            let id =
+                make_content_sector_id(keys.node_id(), guild_id, SectorPurpose::Data, &plaintext)?;
             *ordinal = ordinal
                 .checked_add(1)
                 .context("too many sectors in one revision")?;
