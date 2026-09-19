@@ -85,8 +85,9 @@ checkpoint-authenticated production stable-slot packing, and authenticated
 candidate-to-lane path ranking are now implemented. The corrected source and
 complete local provisioned gate passed on 2026-09-18. Follow-up source review
 of `8135e0b..da8974a` found the M5-36 through M5-44 blockers in `TODO.md`.
-Milestones 0 through 4 remain closed; Milestone 5 is reopened and must pass its
-correction gate before Milestone 6 starts.
+Those source corrections are now implemented. Milestones 0 through 4 remain
+closed; Milestone 5 must pass its M5-45 correction gate before Milestone 6
+starts.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -493,11 +494,11 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 4 have passed; Milestone 5 is
-reopened for the open items in M5-36 through M5-44 and the M5-45 correction gate. Later wire or
-durable-state changes require the review and gate of the milestone that owns
-them. Build and run all subsequent validation locally; do not use a remote
-compilation server.
+than a daemon prerequisite. Milestones 0 through 4 have passed; the M5-36
+through M5-44 corrections are implemented and Milestone 5 awaits the M5-45
+correction gate. Later wire or durable-state changes require the review and
+gate of the milestone that owns them. Build and run all subsequent validation
+locally; do not use a remote compilation server.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -710,10 +711,9 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 4 are passed. Milestone 5 is reopened
-after source review of `8135e0b..da8974a`; the open items in M5-36 through
-M5-44 and the M5-45 correction gate block completion. Milestone 6 remains
-subsequent work.
+**Current position:** Milestones 0 through 4 are passed. The reopened Milestone
+5 source findings M5-36 through M5-44 are resolved; the M5-45 correction gate
+blocks completion. Milestone 6 remains subsequent work.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1052,9 +1052,15 @@ blockers (details, source locations, and regression scenarios are in `TODO.md`):
   coding work; changed revisions fetch only new sources and load/write only
   affected packed sectors. Metrics and focused multi-owner tests bound source
   reads, transfer, coding work, durable bytes, and peak payload memory.
-- **M5-44:** All packed information stays at the checkpoint coordinator;
-  production lanes use one real input plus zeros and lack the planned fair
-  information placement and reusable geometry.
+- **M5-44 (resolved):** Production groups batch adjacent packed sectors into
+  full real-information lanes and balance holders across reachable,
+  capacity-bearing failure domains. Information and parity share one capacity
+  ledger. Assigned information is durably staged and activated on configured
+  volumes, while the finalized coordinator drops its packed payload cache.
+  Incremental packing reads only changed prior sectors from certified holders,
+  and stable descriptors retain their existing groups. Focused coverage bounds
+  coordinator storage and all information/parity debits and verifies repeated
+  geometry.
 
 Fix the source-authentication and authority/retry/convergence defects first,
 then complete root and transport failure isolation and incremental, bounded
@@ -1493,11 +1499,11 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (reopened)
+### Milestone 5 — efficient and flexible data/guild protocol (correction gate)
 
-Completion is blocked by the open items in M5-36 through M5-44 in `TODO.md`,
-followed by the M5-45 correction gate. The recorded 2026-09-18 production run
-passed its scenarios but did not establish all requirements below.
+M5-36 through M5-44 are implemented. Completion now requires the M5-45
+correction gate. The recorded 2026-09-18 production run passed its scenarios
+but predates these corrections and does not replace the new gate.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and

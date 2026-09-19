@@ -12,17 +12,17 @@ use mb_core::{
     CodingFailureReport, CodingGroupV2, CodingReplayFinding, CodingRootManifest,
     CodingShardOpening, CodingVerificationTranscript, DynamicGuildState, EndpointRecord,
     GuildCheckpoint, GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, KeyMaterial,
-    MAX_GUILD_EVENT_TAIL, Member, MemberSignature, NodeId, PackedSector, PackingProfile,
-    PackingResult, PackingUpdate, QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis,
-    QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN, RecoveryBundle, RecoveryLocator,
-    STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, Seed,
-    ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
-    USER_REVISION_DOMAIN, UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_PAGES,
-    V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes, challenged_leaf, coding_challenge_commitment,
-    coding_evidence_hash, decode_canonical, encode_coding_attempt, merkle_commit,
-    merkle_open_range, merkle_open_zero_range, open_recovery_key_envelope, open_recovery_record,
-    replay_coding_transcript, seal_recovery_record, sector_root, sign_guild_event,
-    synthetic_filler_sector,
+    MAX_GUILD_EVENT_TAIL, Member, MemberSignature, NodeId, PackedCatalog, PackedSector,
+    PackedSectorDescriptor, PackingProfile, PackingResult, PackingUpdate, QuorumCheckpoint,
+    QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN,
+    RecoveryBundle, RecoveryLocator, STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN,
+    SectorId, SectorRef, Seed, ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt,
+    StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision, V1_CATALOG_PAGE_BYTES,
+    V1_MAX_CATALOG_PAGES, V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes, challenged_leaf,
+    coding_challenge_commitment, coding_evidence_hash, decode_canonical, encode_coding_attempt,
+    merkle_commit, merkle_open_range, merkle_open_zero_range, open_recovery_key_envelope,
+    open_recovery_record, replay_coding_transcript, seal_recovery_record, sector_root,
+    sign_guild_event, synthetic_filler_sector,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
@@ -3509,6 +3509,60 @@ impl Node {
         Ok(())
     }
 
+    pub(crate) fn release_distributed_packed_sectors(
+        &mut self,
+        guild_id: [u8; 32],
+        catalog: &PackedCatalog,
+    ) -> Result<u64> {
+        catalog.validate()?;
+        let state = self
+            .dynamic_guild_state()?
+            .context("packed release requires dynamic guild state")?;
+        let mut released = 0_u64;
+        for descriptor in &catalog.sectors {
+            let (shard_index, owner) = state
+                .coding_groups
+                .iter()
+                .filter(|retained| retained.retired_at_event.is_none())
+                .find_map(|retained| {
+                    retained
+                        .group
+                        .roles
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, role)| match role {
+                            ShardRoleV2::Information(information)
+                                if !information.sector.virtual_zero
+                                    && information.sector.id == descriptor.id
+                                    && information.sector.commitment == descriptor.commitment =>
+                            {
+                                Some((index as u16, information.owner))
+                            }
+                            _ => None,
+                        })
+                })
+                .context("packed sector has no active distributed placement")?;
+            if owner == self.keys.node_id() {
+                let object =
+                    self.volumes
+                        .load_ready_variable(&self.control, &descriptor.id, shard_index)?;
+                if object.guild_id != guild_id
+                    || object.group_id != descriptor.id
+                    || object.commitment != descriptor.commitment
+                {
+                    anyhow::bail!("local packed placement conflicts with its coding group");
+                }
+            }
+            if self.control.delete_record(
+                "packed-sector",
+                &packed_record_id(&guild_id, &descriptor.id),
+            )? {
+                released += 1;
+            }
+        }
+        Ok(released)
+    }
+
     #[cfg(test)]
     pub(crate) fn local_sector_is_inline(&self, sector_id: &SectorId) -> Result<bool> {
         crate::snapshot::local_recipe_is_inline(&self.control, sector_id)
@@ -4840,6 +4894,22 @@ impl Node {
                     {
                         continue;
                     }
+                    if self.volumes.has_staged_attempt_object(
+                        &self.control,
+                        &plan.attempt_id,
+                        &information.sector.id,
+                        index as u16,
+                    )? {
+                        self.volumes.activate_attempt_object(
+                            &self.control,
+                            &plan.attempt_id,
+                            &information.sector.id,
+                            index as u16,
+                            &information.sector.commitment,
+                            &transcript_hash,
+                        )?;
+                        continue;
+                    }
                     if self
                         .sector_for_guild(&group.guild_id, &information.sector.id)
                         .is_ok_and(|bytes| {
@@ -5844,6 +5914,25 @@ impl Node {
             }
         }
         Ok(uncovered)
+    }
+
+    pub(crate) fn uncovered_packed_sectors(
+        &self,
+        descriptors: &[PackedSectorDescriptor],
+    ) -> Result<Vec<PackedSectorDescriptor>> {
+        let state = self
+            .dynamic_guild_state()?
+            .context("packed coverage requires dynamic guild state")?;
+        descriptors
+            .iter()
+            .filter_map(|descriptor| {
+                match self.verified_packed_sector_coverage(&state, descriptor, false) {
+                    Ok(true) => None,
+                    Ok(false) => Some(Ok(descriptor.clone())),
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect()
     }
 
     fn verified_variable_sector_coverage(

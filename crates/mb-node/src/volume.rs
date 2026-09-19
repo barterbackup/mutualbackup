@@ -1013,6 +1013,23 @@ impl StorageVolumes {
             .map_err(Into::into)
     }
 
+    pub(crate) fn has_staged_attempt_object(
+        &self,
+        control: &ControlStore,
+        attempt_id: &[u8; 16],
+        group_id: &[u8; 32],
+        shard_index: u16,
+    ) -> Result<bool> {
+        let shard = u8::try_from(shard_index).context("variable parity shard index is invalid")?;
+        let record_id = attempt_volume_object_id(attempt_id, group_id, shard);
+        Ok(control
+            .get_record("volume-attempt-receipt", &record_id)?
+            .is_some()
+            || control
+                .get_record("volume-attempt-intent", &record_id)?
+                .is_some())
+    }
+
     pub(crate) fn activate_attempt_object(
         &mut self,
         control: &ControlStore,

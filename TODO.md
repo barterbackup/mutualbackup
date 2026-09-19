@@ -576,10 +576,11 @@ implementation; Milestone 4 was reopened until they were resolved.
 
 ## Milestone 5 guild geometry and coding protocol (reopened)
 
-Source-only review of `8135e0b..da8974a` on 2026-09-18 found the open
-M5-36 through M5-44 blockers below. The production gate recorded in M5-35
-remains valid evidence for those scenarios, but does not close these gaps.
-Milestone 5 is not finished; Milestone 6 waits for the correction gate.
+Source-only review of `8135e0b..da8974a` on 2026-09-18 found the M5-36 through
+M5-44 blockers below; all are now corrected. The production gate recorded in
+M5-35 remains valid evidence for those scenarios, but predates the corrected
+tree. Milestone 5 is not finished; Milestone 6 waits for the M5-45 correction
+gate.
 This review ran no builds, tests, daemons, or remote compilation.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
@@ -1197,7 +1198,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   coverage proves a one-source addition remains below retained-corpus reads and
   memory while unchanged descriptors remain byte-identical; strict clippy and
   core tests pass locally.
-- [ ] **M5-44 / P2 — Integrate fair information placement and reusable coding geometry.**
+- [x] **M5-44 / P2 — Integrate fair information placement and reusable coding geometry.**
   Production assigns every packed information sector to the checkpoint
   coordinator and passes no other candidate information into the lane builder
   (`crates/mb-node/src/network/p2p.rs:11494`, `:11525`). Each group consequently
@@ -1212,7 +1213,21 @@ node Clippy gate passed locally. No remote compilation server was used.
   when available, and persist geometry reusable across bounded runs. Gate a
   multi-owner workload with enough real inputs, a coordinator with limited
   storage, per-member information/parity accounting, and explicit storage and
-  transfer amplification bounds.
+  transfer amplification bounds. Production now batches adjacent uncovered
+  packed sectors into full real-information lanes and selects distinct,
+  reachable information holders by available capacity and balanced assignment.
+  Information and parity placements debit one shared capacity view. The
+  checkpoint coordinator stages each packed input once, serves locally held
+  inputs directly to its coder, and removes its packed payload cache after the
+  checkpoint finalizes; later incremental updates fetch only prior packed
+  sectors whose slots change from their certified holders. Attempt staging is
+  resumable and cleaned up on failure, local assignments activate on configured
+  storage volumes, and unchanged descriptors retain their existing certified
+  groups. A six-domain, nine-sector regression fills all three information rows,
+  limits the coordinator to one stored shard, checks all 15 information/parity
+  capacity debits, and proves deterministic geometry on a repeated bounded run.
+  The full `mb-node` library suite passes locally (222 passed, 10 provisioned
+  tests ignored), as does strict package Clippy.
 - [ ] **M5-45 / gate — Recheck the corrected tree before closing Milestone 5.**
   Close M5-36 through M5-44 with focused source review and the regressions
   described above. Then run the required formatting, locked workspace tests,

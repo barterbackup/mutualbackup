@@ -34,14 +34,15 @@ use mb_core::{
     CodingShardOpening, CodingVerificationTranscript, DynamicGuildState, GuildCheckpoint,
     GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, InformationRoleV2, MAX_GUILD_EVENT_TAIL,
     MERKLE_LEAF_SIZE, Member, MemberSignature, MerkleCommitment, NodeId, PackedCatalog,
-    PackedSector, PackingInput, PackingProfile, ParityPlacementV2, QuorumCheckpoint,
-    QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN,
-    RangeSectorRef, STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId,
-    SectorRef, ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
-    UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES,
-    V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS,
-    V1_SECTOR_SIZE, canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical,
-    merkle_commit, merkle_zero_commitment, pack_incremental, pack_incremental_authenticated,
+    PackedSector, PackedSectorDescriptor, PackingInput, PackingProfile, ParityPlacementV2,
+    QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy, QuorumRule,
+    RECOVERY_LOCATOR_DOMAIN, RangeSectorRef, STAGED_STORAGE_RECEIPT_DOMAIN,
+    STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole, ShardRoleV2, SignedRecord,
+    StagedStorageReceipt, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
+    V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES,
+    V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_SECTOR_SIZE, canonical_bytes,
+    coding_challenge, coding_transfer_estimate, decode_canonical, merkle_commit,
+    merkle_zero_commitment, pack_incremental, pack_incremental_authenticated,
     packing_protected_root, replay_coding_transcript, sector_root, unpack_object_from_sectors,
 };
 #[cfg(test)]
@@ -6484,6 +6485,32 @@ fn choose_coding_coordinators(
     Ok((coding_coordinator, verification_coordinator))
 }
 
+fn choose_packed_coding_coordinators(
+    local_id: NodeId,
+    reachable: &[NodeId],
+    lane_scores: &BTreeMap<NodeId, (u64, u64)>,
+    verifier_path_ranks: &BTreeMap<NodeId, usize>,
+) -> Result<(NodeId, NodeId)> {
+    if !reachable.contains(&local_id) || !lane_scores.contains_key(&local_id) {
+        bail!("packed coding coordinator has no complete bulk path set");
+    }
+    let verification_coordinator = reachable
+        .iter()
+        .copied()
+        .filter(|candidate| *candidate != local_id)
+        .min_by_key(|candidate| {
+            (
+                verifier_path_ranks
+                    .get(candidate)
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                *candidate,
+            )
+        })
+        .context("packed coding has no separate reachable verifier")?;
+    Ok((local_id, verification_coordinator))
+}
+
 async fn execute_delegated_coding(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
@@ -6678,6 +6705,19 @@ async fn fetch_coding_information(
     for (shard_index, role) in plan.value.geometry.information.iter().enumerate() {
         if role.sector.virtual_zero {
             inputs.push(None);
+            continue;
+        }
+        let guild_id = plan.value.geometry.guild_id;
+        let sector_id = role.sector.id;
+        if let Ok(bytes) = node_blocking(node.clone(), move |node| {
+            node.sector_for_guild(&guild_id, &sector_id)
+        })
+        .await
+        {
+            if merkle_commit(&bytes)? != role.sector.commitment {
+                bail!("local coding input conflicts with its delegated Merkle root");
+            }
+            inputs.push(Some(bytes));
             continue;
         }
         let total_leaves = role.sector.commitment.byte_len as usize / MERKLE_LEAF_SIZE;
@@ -7168,22 +7208,14 @@ async fn reconcile_variable_group_lifecycle_once(
         .await?;
         if !pending {
             if let Some(catalog) = &checkpoint.checkpoint.packing_catalog {
-                let sectors = catalog
-                    .sectors
-                    .iter()
-                    .map(|sector| SectorRef {
-                        id: sector.id,
-                        root: sector.flat_root,
-                        logical_len: sector.commitment.byte_len,
-                    })
-                    .collect::<Vec<_>>();
+                let descriptors = catalog.sectors.clone();
                 let uncovered = node_blocking(node.clone(), move |node| {
-                    node.uncovered_variable_sectors(local_id, &sectors)
+                    node.uncovered_packed_sectors(&descriptors)
                 })
                 .await?;
                 if !uncovered.is_empty() {
                     let coding_peers = reachable_coding_peers(p2p, local_id, &guild.peers).await;
-                    let mut parity_capacity = coding_capacity_by_peer(
+                    let mut placement_capacity = coding_capacity_by_peer(
                         node.clone(),
                         p2p,
                         local_id,
@@ -7197,21 +7229,15 @@ async fn reconcile_variable_group_lifecycle_once(
                             .try_into()
                             .expect("fixed catalog ID prefix"),
                     );
-                    let lanes = build_cross_user_coding_lanes(
-                        node.clone(),
+                    let lanes = build_packed_coding_lanes(
                         uncovered,
-                        CrossUserCodingContext {
-                            p2p,
-                            local_id,
+                        PackedCodingContext {
                             guild_id: state.guild_id,
-                            revision_id,
-                            current_owner: local_id,
-                            retained_revisions: &[],
+                            geometry_id: revision_id,
                             peers: &coding_peers,
-                            parity_capacity: &mut parity_capacity,
+                            placement_capacity: &mut placement_capacity,
                         },
-                    )
-                    .await?;
+                    )?;
                     queue_variable_coding_lanes(
                         node,
                         p2p,
@@ -10769,6 +10795,7 @@ fn unix_seconds() -> u64 {
 struct VariableCodingLane {
     geometry: CodingPlanGeometry,
     information_roots: Vec<[u8; 32]>,
+    packed_information: BTreeMap<SectorId, PackedSectorDescriptor>,
 }
 
 struct VariableInformationInput<'a> {
@@ -10902,13 +10929,13 @@ fn variable_coding_lane_with_capacity(
         .collect::<BTreeSet<_>>();
     let mut virtual_peers = Vec::with_capacity(virtual_count);
     for (_, _, peer) in candidates {
+        if virtual_peers.len() == virtual_count {
+            break;
+        }
         if !parity_nodes.contains(&peer.member.node_id)
             && placement_domains.insert(peer.member.failure_domain.clone())
         {
             virtual_peers.push(peer);
-            if virtual_peers.len() == virtual_count {
-                break;
-            }
         }
     }
     if virtual_peers.len() < virtual_count {
@@ -10943,10 +10970,17 @@ fn variable_coding_lane_with_capacity(
         information,
         parity,
     };
-    geometry.validate()?;
+    geometry.validate().with_context(|| {
+        format!(
+            "variable coding geometry rejected {} information and {} parity roles",
+            geometry.information.len(),
+            geometry.parity.len()
+        )
+    })?;
     Ok(VariableCodingLane {
         geometry,
         information_roots,
+        packed_information: BTreeMap::new(),
     })
 }
 
@@ -10959,6 +10993,13 @@ struct CrossUserCodingContext<'a> {
     retained_revisions: &'a [SignedRecord<UserRevision>],
     peers: &'a [crate::GuildPeer],
     parity_capacity: &'a mut BTreeMap<NodeId, u64>,
+}
+
+struct PackedCodingContext<'a> {
+    guild_id: [u8; 32],
+    geometry_id: Uuid,
+    peers: &'a [crate::GuildPeer],
+    placement_capacity: &'a mut BTreeMap<NodeId, u64>,
 }
 
 async fn reachable_coding_peers(
@@ -11040,6 +11081,149 @@ async fn coding_capacity_by_peer(
         }
     }
     Ok(capacity)
+}
+
+fn packed_information_hosts(
+    guild_id: [u8; 32],
+    sectors: &[PackedSectorDescriptor],
+    peers: &[crate::GuildPeer],
+    placement_capacity: &BTreeMap<NodeId, u64>,
+    information_load: &BTreeMap<NodeId, u64>,
+    parity_shards: usize,
+) -> Result<Vec<NodeId>> {
+    let mut selected = Vec::with_capacity(sectors.len());
+    let mut used_domains = BTreeSet::new();
+    for (row, sector) in sectors.iter().enumerate() {
+        let remaining_information = sectors.len() - row - 1;
+        let mut candidates = peers
+            .iter()
+            .filter(|peer| {
+                placement_capacity
+                    .get(&peer.member.node_id)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+                    && !used_domains.contains(&peer.member.failure_domain)
+            })
+            .map(|peer| {
+                let mut hasher =
+                    blake3::Hasher::new_derive_key("mutualbackup packed information placement v1");
+                hasher.update(&guild_id);
+                hasher.update(&sector.id);
+                hasher.update(&peer.member.node_id.0);
+                (
+                    information_load
+                        .get(&peer.member.node_id)
+                        .copied()
+                        .unwrap_or(0),
+                    *hasher.finalize().as_bytes(),
+                    peer.member.node_id,
+                    peer.member.failure_domain.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(load, score, node_id, _)| (*load, *score, *node_id));
+        let candidate = candidates.into_iter().find(|(_, _, node_id, domain)| {
+            let mut reserved_domains = used_domains.clone();
+            reserved_domains.insert(domain.clone());
+            let remaining_domains = peers
+                .iter()
+                .filter(|peer| {
+                    peer.member.node_id != *node_id
+                        && placement_capacity
+                            .get(&peer.member.node_id)
+                            .copied()
+                            .unwrap_or(0)
+                            > 0
+                        && !reserved_domains.contains(&peer.member.failure_domain)
+                })
+                .map(|peer| peer.member.failure_domain.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
+            remaining_domains >= remaining_information + parity_shards
+        });
+        let (_, _, node_id, domain) = candidate
+            .context("packed information has too few distinct domains with available capacity")?;
+        used_domains.insert(domain);
+        selected.push(node_id);
+    }
+    Ok(selected)
+}
+
+fn build_packed_coding_lanes(
+    mut sectors: Vec<PackedSectorDescriptor>,
+    context: PackedCodingContext<'_>,
+) -> Result<Vec<VariableCodingLane>> {
+    sectors.sort_by_key(|sector| sector.id);
+    let profile = variable_coding_profile(context.peers)?;
+    let data_shards = usize::from(profile.data_shards);
+    let parity_shards = usize::from(profile.parity_shards);
+    let mut information_load = BTreeMap::<NodeId, u64>::new();
+    let mut lanes = Vec::with_capacity(sectors.len().div_ceil(data_shards));
+    for (ordinal, lane_sectors) in sectors.chunks(data_shards).enumerate() {
+        let owners = packed_information_hosts(
+            context.guild_id,
+            lane_sectors,
+            context.peers,
+            context.placement_capacity,
+            &information_load,
+            parity_shards,
+        )?;
+        let mut references = Vec::with_capacity(lane_sectors.len());
+        for descriptor in lane_sectors {
+            if descriptor.commitment.byte_len != profile.shard_size {
+                bail!("packed sector commitment has the wrong fixed size");
+            }
+            references.push(SectorRef {
+                id: descriptor.id,
+                root: descriptor.flat_root,
+                logical_len: descriptor.commitment.byte_len,
+            });
+        }
+        let sources = references
+            .iter()
+            .zip(&owners)
+            .zip(lane_sectors)
+            .map(|((sector, owner), descriptor)| VariableInformationInput {
+                owner: *owner,
+                sector,
+                commitment: &descriptor.commitment,
+            })
+            .collect::<Vec<_>>();
+        let mut lane = variable_coding_lane_with_capacity(
+            context.guild_id,
+            context.geometry_id,
+            ordinal as u64,
+            &sources,
+            context.peers,
+            Some(&*context.placement_capacity),
+        )?;
+        lane.packed_information = lane_sectors
+            .iter()
+            .map(|descriptor| (descriptor.id, descriptor.clone()))
+            .collect();
+        for owner in owners {
+            let available = context
+                .placement_capacity
+                .get_mut(&owner)
+                .context("selected information holder has no capacity record")?;
+            *available = available
+                .checked_sub(1)
+                .context("selected information holder capacity was exhausted")?;
+            *information_load.entry(owner).or_default() += 1;
+        }
+        for parity in &lane.geometry.parity {
+            let available = context
+                .placement_capacity
+                .get_mut(&parity.holder)
+                .context("selected parity holder has no capacity record")?;
+            *available = available
+                .checked_sub(1)
+                .context("selected parity holder capacity was exhausted")?;
+        }
+        lanes.push(lane);
+    }
+    Ok(lanes)
 }
 
 async fn build_cross_user_coding_lanes(
@@ -11233,6 +11417,8 @@ async fn queue_variable_coding_lanes(
         .checked_add(24 * 60 * 60)
         .context("coding launch expiry overflow")?;
     for lane in lanes {
+        let packed_information = lane.packed_information;
+        let is_packed_lane = !packed_information.is_empty();
         let participants = lane
             .geometry
             .information
@@ -11248,12 +11434,21 @@ async fn queue_variable_coding_lanes(
                     .map(|score| (*candidate, score))
             })
             .collect::<BTreeMap<_, _>>();
-        let (coding_coordinator, verification_coordinator) = choose_coding_coordinators(
-            &reachable,
-            &participants,
-            &lane_scores,
-            &verifier_path_ranks,
-        )?;
+        let (coding_coordinator, verification_coordinator) = if is_packed_lane {
+            choose_packed_coding_coordinators(
+                local_id,
+                &reachable,
+                &lane_scores,
+                &verifier_path_ranks,
+            )?
+        } else {
+            choose_coding_coordinators(
+                &reachable,
+                &participants,
+                &lane_scores,
+                &verifier_path_ranks,
+            )?
+        };
         let mut hasher = blake3::Hasher::new_derive_key("mutualbackup initial coding attempt v1");
         hasher.update(&checkpoint_hash);
         hasher.update(&canonical_bytes(&(
@@ -11266,8 +11461,8 @@ async fn queue_variable_coding_lanes(
         if attempt_id == [0; 16] {
             attempt_id[0] = 1;
         }
-        node_blocking(node.clone(), move |node| {
-            let plan = node.sign_coding_attempt_plan(CodingAttemptPlan {
+        let plan = node_blocking(node.clone(), move |node| {
+            node.sign_coding_attempt_plan(CodingAttemptPlan {
                 format_version: 2,
                 attempt_id,
                 checkpoint_hash,
@@ -11278,11 +11473,113 @@ async fn queue_variable_coding_lanes(
                 verification_coordinator,
                 expires_at_unix_seconds,
                 information_roots: Some(lane.information_roots),
-            })?;
-            node.enqueue_coding_launch(plan)?;
-            Ok(())
+            })
         })
         .await?;
+        if let Err(error) = stage_locally_available_information(
+            node.clone(),
+            p2p,
+            local_id,
+            &plan,
+            &packed_information,
+        )
+        .await
+        {
+            let cleanup = DelegatedCodingJob {
+                format_version: 1,
+                plan: plan.clone(),
+                state: DelegatedCodingJobState::Cleanup,
+                transcript: None,
+                error: Some(format!("information placement failed: {error:#}")),
+            };
+            if let Err(cleanup_error) = abort_delegated_coding(node.clone(), p2p, &cleanup).await {
+                tracing::warn!(%cleanup_error, "failed information placement cleanup was incomplete");
+            }
+            return Err(error);
+        }
+        node_blocking(node.clone(), move |node| node.enqueue_coding_launch(plan)).await?;
+    }
+    Ok(())
+}
+
+async fn stage_locally_available_information(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    local_id: NodeId,
+    plan: &SignedRecord<CodingAttemptPlan>,
+    packed_information: &BTreeMap<SectorId, PackedSectorDescriptor>,
+) -> Result<()> {
+    for (index, role) in plan.value.geometry.information.iter().enumerate() {
+        if role.sector.virtual_zero {
+            continue;
+        }
+        let guild_id = plan.value.geometry.guild_id;
+        let sector_id = role.sector.id;
+        let bytes = match node_blocking(node.clone(), move |node| {
+            node.sector_for_guild(&guild_id, &sector_id)
+        })
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                let Some(descriptor) = packed_information.get(&sector_id) else {
+                    continue;
+                };
+                load_distributed_packed_sector(node.clone(), p2p, local_id, guild_id, descriptor)
+                    .await?
+            }
+        };
+        if merkle_commit(&bytes)? != role.sector.commitment {
+            bail!("local coding source conflicts with its delegated commitment");
+        }
+        let shard_index = u16::try_from(index).context("information index exceeds protocol")?;
+        let mut written_until = if role.owner == local_id {
+            let local_plan = plan.clone();
+            node_blocking(node.clone(), move |node| {
+                node.reserve_coding_information(&local_plan, shard_index)
+            })
+            .await? as usize
+        } else {
+            p2p.reserve_coding_information(role.owner, plan.clone(), shard_index)
+                .await? as usize
+        };
+        while written_until < bytes.len() {
+            let end = written_until
+                .saturating_add(CODING_INPUT_RANGE_BYTES)
+                .min(bytes.len());
+            let chunk = bytes[written_until..end].to_vec();
+            written_until = if role.owner == local_id {
+                let local_plan = plan.clone();
+                node_blocking(node.clone(), move |node| {
+                    node.write_coding_information_range(
+                        &local_plan,
+                        shard_index,
+                        written_until as u32,
+                        &chunk,
+                    )
+                })
+                .await? as usize
+            } else {
+                p2p.upload_coding_information_range(
+                    role.owner,
+                    plan.clone(),
+                    shard_index,
+                    written_until as u32,
+                    chunk,
+                )
+                .await? as usize
+            };
+        }
+        if role.owner == local_id {
+            let local_plan = plan.clone();
+            node_blocking(node.clone(), move |node| {
+                node.finish_coding_information_upload(&local_plan, shard_index)
+            })
+            .await?;
+        } else {
+            p2p.finalize_coding_information(role.owner, plan.clone(), shard_index)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -11494,23 +11791,57 @@ async fn build_production_packing(
                 },
             )
             .collect::<Vec<_>>();
-        return node_blocking(node, move |node| {
-            let update = pack_incremental_authenticated(
-                profile,
-                &previous,
-                authenticated_sources,
-                inputs,
-                |descriptor| {
-                    node.sector_for_guild(&guild_id, &descriptor.id)
-                        .map_err(|_| mb_core::PackingError::MissingObject)
-                },
-            )?;
-            node.store_packing_update(guild_id, &update)?;
-            Ok(ProductionPacking {
-                catalog: update.catalog,
+        let mut distributed = BTreeMap::<SectorId, Vec<u8>>::new();
+        loop {
+            let missing = Arc::new(Mutex::new(None::<PackedSectorDescriptor>));
+            let missing_from_loader = missing.clone();
+            let previous_attempt = previous.clone();
+            let sources_attempt = authenticated_sources.clone();
+            let inputs_attempt = inputs.clone();
+            let distributed_attempt = distributed.clone();
+            let result = node_blocking(node.clone(), move |node| {
+                let update = pack_incremental_authenticated(
+                    profile,
+                    &previous_attempt,
+                    sources_attempt,
+                    inputs_attempt,
+                    |descriptor| {
+                        node.sector_for_guild(&guild_id, &descriptor.id)
+                            .or_else(|_| {
+                                distributed_attempt
+                                    .get(&descriptor.id)
+                                    .cloned()
+                                    .context("distributed packed sector is unavailable")
+                            })
+                            .map_err(|_| {
+                                if let Ok(mut missing) = missing_from_loader.lock() {
+                                    missing.get_or_insert_with(|| descriptor.clone());
+                                }
+                                mb_core::PackingError::MissingObject
+                            })
+                    },
+                )?;
+                node.store_packing_update(guild_id, &update)?;
+                Ok(ProductionPacking {
+                    catalog: update.catalog,
+                })
             })
-        })
-        .await;
+            .await;
+            if result.is_ok() {
+                return result;
+            }
+            let descriptor = missing
+                .lock()
+                .map_err(|_| anyhow::anyhow!("packing loader lock was poisoned"))?
+                .take();
+            let Some(descriptor) = descriptor else {
+                return result;
+            };
+            let bytes =
+                load_distributed_packed_sector(node.clone(), p2p, local_id, guild_id, &descriptor)
+                    .await?;
+            distributed.insert(descriptor.id, bytes);
+        }
     }
     let result = pack_incremental(profile, previous, inputs)?;
     let stored = result.clone();
@@ -11521,6 +11852,61 @@ async fn build_production_packing(
     Ok(ProductionPacking {
         catalog: result.catalog,
     })
+}
+
+async fn load_distributed_packed_sector(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    local_id: NodeId,
+    guild_id: [u8; 32],
+    descriptor: &PackedSectorDescriptor,
+) -> Result<Vec<u8>> {
+    let descriptor_id = descriptor.id;
+    let descriptor_commitment = descriptor.commitment.clone();
+    let (group, shard_index, holder) = node_blocking(node.clone(), move |node| {
+        let state = node
+            .dynamic_guild_state()?
+            .context("distributed packed read requires dynamic guild state")?;
+        state
+            .coding_groups
+            .iter()
+            .filter(|retained| retained.retired_at_event.is_none())
+            .find_map(|retained| {
+                retained
+                    .group
+                    .roles
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, role)| match role {
+                        ShardRoleV2::Information(information)
+                            if !information.sector.virtual_zero
+                                && information.sector.id == descriptor_id
+                                && information.sector.commitment == descriptor_commitment =>
+                        {
+                            Some((retained.group.clone(), index as u16, information.owner))
+                        }
+                        _ => None,
+                    })
+            })
+            .context("prior packed sector has no active distributed placement")
+    })
+    .await?;
+    let bytes = if holder == local_id {
+        let group_id = group.id;
+        node_blocking(node, move |node| {
+            node.variable_shard_for_guild(&guild_id, &group_id, shard_index)
+        })
+        .await?
+    } else {
+        p2p.variable_shard(holder, &group, shard_index).await?
+    };
+    if bytes.len() != V1_SECTOR_SIZE
+        || sector_root(&bytes) != descriptor.flat_root
+        || merkle_commit(&bytes)? != descriptor.commitment
+    {
+        bail!("distributed packed sector conflicts with its catalog descriptor");
+    }
+    Ok(bytes)
 }
 
 struct ProductionPacking {
@@ -11722,16 +12108,6 @@ async fn commit_backup_job(
         previous_packing_catalog.as_ref(),
     )
     .await?;
-    let packed_sectors = packing
-        .catalog
-        .sectors
-        .iter()
-        .map(|descriptor| SectorRef {
-            id: descriptor.id,
-            root: descriptor.flat_root,
-            logical_len: V1_SECTOR_SIZE as u32,
-        })
-        .collect::<Vec<_>>();
     let checkpoint = GuildCheckpoint {
         format_version: 7,
         guild_id,
@@ -11748,20 +12124,19 @@ async fn commit_backup_job(
     };
     checkpoint.validate()?;
     let checkpoint_hash = checkpoint.hash()?;
-    let current_owner = local_id;
+    let packed_descriptors = checkpoint
+        .packing_catalog
+        .as_ref()
+        .context("production checkpoint lost its packing catalog")?
+        .sectors
+        .clone();
     let current_sectors = node_blocking(node.clone(), move |node| {
-        node.uncovered_variable_sectors(current_owner, &packed_sectors)
+        node.uncovered_packed_sectors(&packed_descriptors)
     })
     .await?;
     if !current_sectors.is_empty() {
         let coding_peers = reachable_coding_peers(p2p, local_id, &peers).await;
-        if !coding_peers
-            .iter()
-            .any(|peer| peer.member.node_id == current_owner)
-        {
-            bail!("backup owner is unavailable for new coding placement");
-        }
-        let mut parity_capacity = coding_capacity_by_peer(
+        let mut placement_capacity = coding_capacity_by_peer(
             node.clone(),
             p2p,
             local_id,
@@ -11770,21 +12145,24 @@ async fn commit_backup_job(
             V1_SECTOR_SIZE as u32,
         )
         .await?;
-        let variable_lanes = build_cross_user_coding_lanes(
-            node.clone(),
+        let geometry_id = Uuid::from_bytes(
+            checkpoint
+                .packing_catalog
+                .as_ref()
+                .context("production checkpoint lost its packing catalog")?
+                .id[..16]
+                .try_into()
+                .expect("fixed catalog ID prefix"),
+        );
+        let variable_lanes = build_packed_coding_lanes(
             current_sectors,
-            CrossUserCodingContext {
-                p2p,
-                local_id,
+            PackedCodingContext {
                 guild_id,
-                revision_id: job.descriptor.revision_id,
-                current_owner,
-                retained_revisions: &[],
+                geometry_id,
                 peers: &coding_peers,
-                parity_capacity: &mut parity_capacity,
+                placement_capacity: &mut placement_capacity,
             },
-        )
-        .await?;
+        )?;
         queue_variable_coding_lanes(
             node.clone(),
             p2p,
@@ -11907,12 +12285,25 @@ async fn commit_backup_job(
             finalized.len() + 1
         );
     }
-    let finalized_hash = node_blocking(node, move |node| {
+    let finalized_catalog = quorum
+        .checkpoint
+        .packing_catalog
+        .clone()
+        .context("production checkpoint lost its packing catalog")?;
+    let finalized_hash = node_blocking(node.clone(), move |node| {
         node.finalize_staged_checkpoint(&guild_id, &checkpoint_hash)
     })
     .await?;
     if finalized_hash != checkpoint_hash {
         bail!("local checkpoint finalization returned another checkpoint");
+    }
+    if let Err(error) = node_blocking(node, move |node| {
+        node.release_distributed_packed_sectors(guild_id, &finalized_catalog)
+            .map(|_| ())
+    })
+    .await
+    {
+        tracing::warn!(%error, "finalized checkpoint retained a local packed-sector cache");
     }
     Ok(checkpoint_hash)
 }
@@ -12869,6 +13260,128 @@ mod tests {
         assert_eq!(
             estimate.bulk_bytes,
             4 * u64::try_from(V1_SECTOR_SIZE).unwrap()
+        );
+    }
+
+    #[test]
+    fn packed_lanes_fill_real_rows_and_account_for_limited_hosts() {
+        let local_keys = KeyMaterial::from_seed(&Seed::from_bytes([112; 32]));
+        let local_id = local_keys.node_id();
+        let peers = std::iter::once(crate::GuildPeer {
+            member: Member {
+                node_id: local_id,
+                recovery_public_key: local_keys.recovery_public_key(),
+                failure_domain: "packed-domain-0".to_owned(),
+            },
+            endpoints: Vec::new(),
+        })
+        .chain((1_u8..6).map(|index| {
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([112 + index; 32]));
+            crate::GuildPeer {
+                member: Member {
+                    node_id: keys.node_id(),
+                    recovery_public_key: keys.recovery_public_key(),
+                    failure_domain: format!("packed-domain-{index}"),
+                },
+                endpoints: Vec::new(),
+            }
+        }))
+        .collect::<Vec<_>>();
+        let profile = PackingProfile {
+            format_version: 1,
+            sector_size: V1_SECTOR_SIZE as u32,
+            slot_size: 16 * 1024,
+        };
+        let inputs = (0_u8..9)
+            .map(|index| {
+                let bytes = vec![index + 1; V1_SECTOR_SIZE];
+                PackingInput {
+                    owner: peers[usize::from(index) % peers.len()].member.node_id,
+                    protected_root: [index + 1; 32],
+                    object_id: [index + 10; 32],
+                    source_commitment: Some(merkle_commit(&bytes).unwrap()),
+                    bytes,
+                }
+            })
+            .collect::<Vec<_>>();
+        let packed = pack_incremental(profile, None, inputs).unwrap();
+        assert_eq!(packed.catalog.sectors.len(), 9);
+        let guild_id = [121; 32];
+        let initial_capacity = peers
+            .iter()
+            .map(|peer| {
+                (
+                    peer.member.node_id,
+                    if peer.member.node_id == local_id {
+                        1
+                    } else {
+                        8
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut capacity = initial_capacity.clone();
+        let lanes = build_packed_coding_lanes(
+            packed.catalog.sectors.clone(),
+            PackedCodingContext {
+                guild_id,
+                geometry_id: Uuid::from_bytes([122; 16]),
+                peers: &peers,
+                placement_capacity: &mut capacity,
+            },
+        )
+        .unwrap();
+        assert_eq!(lanes.len(), 3);
+        assert!(lanes.iter().all(|lane| {
+            lane.geometry
+                .information
+                .iter()
+                .all(|role| !role.sector.virtual_zero)
+        }));
+        let placements = lanes
+            .iter()
+            .flat_map(|lane| {
+                lane.geometry
+                    .information
+                    .iter()
+                    .map(|role| role.owner)
+                    .chain(lane.geometry.parity.iter().map(|role| role.holder))
+            })
+            .fold(BTreeMap::<NodeId, u64>::new(), |mut counts, holder| {
+                *counts.entry(holder).or_default() += 1;
+                counts
+            });
+        assert_eq!(placements.values().sum::<u64>(), 15);
+        assert!(placements.get(&local_id).copied().unwrap_or(0) <= 1);
+        for peer in &peers {
+            let used = placements.get(&peer.member.node_id).copied().unwrap_or(0);
+            assert_eq!(
+                capacity[&peer.member.node_id],
+                initial_capacity[&peer.member.node_id] - used
+            );
+        }
+
+        let first_geometry = lanes
+            .iter()
+            .map(|lane| lane.geometry.clone())
+            .collect::<Vec<_>>();
+        let mut repeated_capacity = initial_capacity;
+        let repeated = build_packed_coding_lanes(
+            packed.catalog.sectors,
+            PackedCodingContext {
+                guild_id,
+                geometry_id: Uuid::from_bytes([122; 16]),
+                peers: &peers,
+                placement_capacity: &mut repeated_capacity,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_geometry,
+            repeated
+                .into_iter()
+                .map(|lane| lane.geometry)
+                .collect::<Vec<_>>()
         );
     }
 
