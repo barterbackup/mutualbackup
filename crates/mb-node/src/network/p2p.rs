@@ -34,7 +34,7 @@ use mb_core::{
     CodingShardOpening, CodingVerificationTranscript, DynamicGuildState, GuildCheckpoint,
     GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, InformationRoleV2, MAX_GUILD_EVENT_TAIL,
     MERKLE_LEAF_SIZE, Member, MemberSignature, MerkleCommitment, NodeId, PackedCatalog,
-    PackedSector, PackingInput, PackingProfile, PackingResult, ParityPlacementV2, QuorumCheckpoint,
+    PackedSector, PackingInput, PackingProfile, ParityPlacementV2, QuorumCheckpoint,
     QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN,
     RangeSectorRef, STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId,
     SectorRef, ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
@@ -11329,7 +11329,7 @@ async fn build_production_packing(
     guild_id: [u8; 32],
     revisions: &[SignedRecord<UserRevision>],
     previous: Option<&PackedCatalog>,
-) -> Result<PackingResult> {
+) -> Result<ProductionPacking> {
     let mut sources =
         BTreeMap::<(NodeId, [u8; 32], SectorId), (SectorRef, MerkleCommitment)>::new();
     for revision in revisions {
@@ -11358,6 +11358,13 @@ async fn build_production_packing(
                 bail!("retained revisions disagree about a packed source sector");
             }
         }
+    }
+    if let Some(catalog) = previous
+        .map(|previous| advance_unchanged_catalog(previous, &sources))
+        .transpose()?
+        .flatten()
+    {
+        return Ok(ProductionPacking { catalog });
     }
     let mut inputs = Vec::with_capacity(sources.len());
     for ((owner, protected_root, object_id), (reference, source_commitment)) in sources {
@@ -11473,7 +11480,49 @@ async fn build_production_packing(
         node.store_packing_result(guild_id, &stored)
     })
     .await?;
-    Ok(result)
+    Ok(ProductionPacking {
+        catalog: result.catalog,
+    })
+}
+
+struct ProductionPacking {
+    catalog: PackedCatalog,
+}
+
+fn advance_unchanged_catalog(
+    catalog: &PackedCatalog,
+    sources: &BTreeMap<(NodeId, [u8; 32], SectorId), (SectorRef, MerkleCommitment)>,
+) -> Result<Option<PackedCatalog>> {
+    catalog.validate()?;
+    let Some(authentication) = &catalog.source_authentication else {
+        return Ok(None);
+    };
+    let mut authenticated = BTreeMap::new();
+    for entry in authentication {
+        let key = (entry.id.owner, entry.id.protected_root, entry.id.object_id);
+        if authenticated
+            .insert(key, entry.source_commitment.clone())
+            .is_some_and(|previous| previous != entry.source_commitment)
+        {
+            return Ok(None);
+        }
+    }
+    let expected = sources
+        .iter()
+        .map(|(key, (_, commitment))| (*key, commitment.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if authenticated != expected {
+        return Ok(None);
+    }
+    let mut next = catalog.clone();
+    next.revision = next
+        .revision
+        .checked_add(1)
+        .context("packing catalog revision exhausted")?;
+    next.parent = Some(catalog.id);
+    next.id = next.calculate_id()?;
+    next.validate()?;
+    Ok(Some(next))
 }
 
 async fn commit_backup_job(
@@ -11626,11 +11675,12 @@ async fn commit_backup_job(
     )
     .await?;
     let packed_sectors = packing
+        .catalog
         .sectors
         .iter()
-        .map(|sector| SectorRef {
-            id: sector.descriptor.id,
-            root: sector.descriptor.flat_root,
+        .map(|descriptor| SectorRef {
+            id: descriptor.id,
+            root: descriptor.flat_root,
             logical_len: V1_SECTOR_SIZE as u32,
         })
         .collect::<Vec<_>>();
@@ -12202,6 +12252,63 @@ mod tests {
             max_connections: 8,
             tor_mode: TorMode::DisableTor,
         }
+    }
+
+    #[test]
+    fn unchanged_authenticated_sources_advance_catalog_without_payloads() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([199; 32]));
+        let bytes = vec![7; V1_SECTOR_SIZE];
+        let commitment = merkle_commit(&bytes).unwrap();
+        let protected_root = [8; 32];
+        let object_id = [9; 32];
+        let packed = pack_incremental(
+            PackingProfile {
+                format_version: 1,
+                sector_size: V1_SECTOR_SIZE as u32,
+                slot_size: 16 * 1024,
+            },
+            None,
+            vec![PackingInput {
+                owner: keys.node_id(),
+                protected_root,
+                object_id,
+                source_commitment: Some(commitment.clone()),
+                bytes,
+            }],
+        )
+        .unwrap();
+        let mut sources = BTreeMap::from([(
+            (keys.node_id(), protected_root, object_id),
+            (
+                SectorRef {
+                    id: object_id,
+                    root: [10; 32],
+                    logical_len: V1_SECTOR_SIZE as u32,
+                },
+                commitment,
+            ),
+        )]);
+
+        let next = advance_unchanged_catalog(&packed.catalog, &sources)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.parent, Some(packed.catalog.id));
+        assert_eq!(next.revision, packed.catalog.revision + 1);
+        assert_eq!(next.sectors, packed.catalog.sectors);
+        assert_eq!(
+            next.source_authentication,
+            packed.catalog.source_authentication
+        );
+
+        sources
+            .get_mut(&(keys.node_id(), protected_root, object_id))
+            .unwrap()
+            .1 = merkle_commit(&vec![6; V1_SECTOR_SIZE]).unwrap();
+        assert!(
+            advance_unchanged_catalog(&packed.catalog, &sources)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
