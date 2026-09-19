@@ -1119,7 +1119,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   remain live. Focused tests prove an unavailable lower-UUID root does not
   prevent selection of the healthy root and that a real filesystem event on
   the healthy root is persisted while its sibling path is absent.
-- [ ] **M5-41 / P1 — Release failed relay reservation admissions and permit full-capacity renewal.**
+- [x] **M5-41 / P1 — Release failed relay reservation admissions and permit full-capacity renewal.**
   Relay admission inserts a reservation before its acceptance response
   succeeds, but `ReservationReqAcceptFailed` does not undo the insertion
   (`vendor/libp2p-relay/src/behaviour.rs:452`, `:494`). The handler starts the
@@ -1132,6 +1132,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   active reservation. Also exempt true renewals from the total-new-reservation
   cap (`behaviour.rs:427`). Gate failed acceptance followed by successful retry
   on the same connection at per-peer cap 1, and renewal at full global capacity.
+  The relay now distinguishes provisional new reservations from established
+  ones. A failed first acceptance removes only its provisional `(peer,
+  connection)` slot, while failed renewal preserves the established
+  reservation. New-reservation capacity checks no longer apply to renewals.
+  Focused vendored-relay regressions cover slot release at per-peer cap 1 and
+  renewal failure while both peer and global capacity are full; all relay
+  library tests pass locally.
 - [ ] **M5-42 / P2 — Reconcile tentative request connections on rejection itself.**
   Request-response records a connection before the later composite connection
   limiter accepts it (`vendor/libp2p-request-response/src/lib.rs:818`;

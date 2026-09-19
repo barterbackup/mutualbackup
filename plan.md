@@ -1037,8 +1037,10 @@ blockers (details, source locations, and regression scenarios are in `TODO.md`):
   submission carries the selected root UUID. Watch attachment, health checks,
   and exponential retry are isolated per root. Focused scheduling and live
   filesystem-event tests keep a healthy root active beside a missing sibling.
-- **M5-41:** Failed relay reservation acceptance retains an unexpiring slot;
-  full-capacity renewal is also incorrectly rejected.
+- **M5-41 (resolved):** Provisional relay reservations are rolled back when
+  their acceptance response fails, while failed renewals preserve an existing
+  reservation. Renewals bypass new-slot capacity checks. Focused relay tests
+  cover per-peer cap 1 and full global capacity.
 - **M5-42:** Tentative request connections rejected by the composite limiter
   remain tracked when no accepted connection later closes for that peer.
 - **M5-43:** Unchanged snapshot data gets new IDs/ciphertext, and packing
