@@ -85,9 +85,9 @@ checkpoint-authenticated production stable-slot packing, and authenticated
 candidate-to-lane path ranking are now implemented. The corrected source and
 complete local provisioned gate passed on 2026-09-18. Follow-up source review
 of `8135e0b..da8974a` found the M5-36 through M5-44 blockers in `TODO.md`.
-Those source corrections are now implemented. Milestones 0 through 4 remain
-closed; Milestone 5 must pass its M5-45 correction gate before Milestone 6
-starts.
+Those source corrections are implemented, and the complete local M5-45
+correction gate passed on 2026-09-19. Milestones 0 through 5 are closed;
+Milestone 6 is next.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -494,9 +494,9 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 4 have passed; the M5-36
-through M5-44 corrections are implemented and Milestone 5 awaits the M5-45
-correction gate. Later wire or durable-state changes require the review and
+than a daemon prerequisite. Milestones 0 through 5 have passed; the M5-36
+through M5-44 corrections and the complete M5-45 correction gate are included
+in that closure. Later wire or durable-state changes require the review and
 gate of the milestone that owns them. Build and run all subsequent validation
 locally; do not use a remote compilation server.
 
@@ -711,9 +711,9 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 4 are passed. The reopened Milestone
-5 source findings M5-36 through M5-44 are resolved; the M5-45 correction gate
-blocks completion. Milestone 6 remains subsequent work.
+**Current position:** Milestones 0 through 5 are passed. The reopened Milestone
+5 source findings M5-36 through M5-44 are resolved and the M5-45 correction
+gate passed locally on 2026-09-19. Milestone 6 is next.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1071,13 +1071,17 @@ blockers (details, source locations, and regression scenarios are in `TODO.md`):
   bounded three-input group count, and at least one real multi-input lane; the
   real-QUIC scenario passes with those M5-44 invariants.
 
-Fix the source-authentication and authority/retry/convergence defects first,
-then complete root and transport failure isolation and incremental, bounded
-information placement. M5-45 requires focused regressions for each finding
-and the complete applicable local gate on the corrected tree. Preserve
-anti-equivocation, seed-only recovery, retained-layout readability, failure-
-domain separation, and storage/transfer bounds throughout the corrections.
-This review ran no compilation, tests, daemons, or remote commands.
+The final corrected tree passes `cargo fmt --all -- --check`,
+`cargo test --locked --workspace --all-targets`, and
+`cargo clippy --locked --workspace --all-targets -- -D warnings`. A fresh
+locally provisioned 2 GiB Btrfs image passes the complete
+`scripts/reflink-acceptance.sh` gate, including every provisioned filesystem,
+interruption, headroom, relocated recovery, five-node seed recovery, signed
+network recovery, repeated multi-owner QUIC, and five-daemon namespace/NAT/DHT
+recovery scenario. This closes M5-45 while preserving anti-equivocation,
+seed-only recovery, retained-layout readability, failure-domain separation,
+and storage/transfer bounds. All compilation and execution were local; no
+remote compilation server was used.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer
@@ -1508,11 +1512,12 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (correction gate)
+### Milestone 5 — efficient and flexible data/guild protocol (complete)
 
-M5-36 through M5-44 are implemented. Completion now requires the M5-45
-correction gate. The recorded 2026-09-18 production run passed its scenarios
-but predates these corrections and does not replace the new gate.
+M5-36 through M5-44 are implemented, and the complete M5-45 correction gate
+passed locally on 2026-09-19. The final committed tree passed formatting,
+locked all-target workspace tests, warning-free locked all-target Clippy, and
+the full provisioned filesystem/network acceptance script.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and

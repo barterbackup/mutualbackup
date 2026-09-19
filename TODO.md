@@ -574,13 +574,13 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (reopened)
+## Milestone 5 guild geometry and coding protocol (complete)
 
 Source-only review of `8135e0b..da8974a` on 2026-09-18 found the M5-36 through
 M5-44 blockers below; all are now corrected. The production gate recorded in
 M5-35 remains valid evidence for those scenarios, but predates the corrected
-tree. Milestone 5 is not finished; Milestone 6 waits for the M5-45 correction
-gate.
+tree. The complete M5-45 correction gate passed locally on 2026-09-19, so
+Milestone 5 is finished and Milestone 6 is next.
 This review ran no builds, tests, daemons, or remote compilation.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
@@ -1228,7 +1228,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   capacity debits, and proves deterministic geometry on a repeated bounded run.
   The full `mb-node` library suite passes locally (222 passed, 10 provisioned
   tests ignored), as does strict package Clippy.
-- [ ] **M5-45 / gate — Recheck the corrected tree before closing Milestone 5.**
+- [x] **M5-45 / gate — Recheck the corrected tree before closing Milestone 5.**
   Close M5-36 through M5-44 with focused source review and the regressions
   described above. Then run the required formatting, locked workspace tests,
   warning-free Clippy, and provisioned filesystem/network acceptance locally.
@@ -1248,8 +1248,15 @@ node Clippy gate passed locally. No remote compilation server was used.
   multi-owner production assertion now checks exact active coverage, bounded
   three-input group count, and actual multi-input use instead of requiring the
   obsolete one-group-per-sector layout; its full real-QUIC scenario passes.
-  The complete gate must still be rerun from the committed tree after these
-  corrections.
+  The final committed tree passes `cargo fmt --all -- --check`,
+  `cargo test --locked --workspace --all-targets`, and
+  `cargo clippy --locked --workspace --all-targets -- -D warnings`. A fresh
+  locally provisioned 2 GiB Btrfs image also passes the complete
+  `scripts/reflink-acceptance.sh` gate: all provisioned anchor/reflink,
+  interruption, headroom, relocated recovery, five-node seed recovery, signed
+  network recovery, repeated multi-owner QUIC, and five-daemon namespace/NAT/
+  DHT recovery scenarios pass. All compilation and execution were local; no
+  remote compilation server was used.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
