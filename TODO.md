@@ -1028,7 +1028,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   locked all-target Clippy also pass. All compilation and execution were local;
   no remote compilation server was used.
 
-- [ ] **M5-36 / P1 — Authenticate packed contents against owner-signed source roots.**
+- [x] **M5-36 / P1 — Authenticate packed contents against owner-signed source roots.**
   `GuildCheckpoint::validate` checks catalog source identities and aggregate
   lengths, without relating slot contents to the original `SectorRef.root`
   (`crates/mb-core/src/model.rs:847`). Format-7 signing skips original-sector
@@ -1044,6 +1044,15 @@ node Clippy gate passed locally. No remote compilation server was used.
   preserved through recovery and repair. Gate with substituted source bytes
   under authentic IDs and valid packed roots/RS transcripts; reject before
   checkpoint approval, including when the original owner is absent.
+  New user revisions sign an ordered Merkle commitment for every encrypted
+  source sector while version-three revisions keep their original canonical
+  encoding. Version-two packed catalogs carry compact aligned subtree proofs;
+  validation authenticates each proof against the matching signed commitment
+  and recomposes every packed-sector commitment from its ordered slot roots.
+  Recovery and repair retain the proof table inside the certified catalog.
+  Focused regressions reject substituted source bytes even after recomputing a
+  self-consistent packed payload, catalog, and roots, without consulting the
+  source owner. Core tests and the complete local node library suite pass.
 - [x] **M5-37 / P1 — Apply dynamic quorum and recovery rules to every supported checkpoint version.**
   `QuorumCheckpoint::verify` honors `authority.quorum` only for version 5;
   versions 6 and 7 fall back to every member (`crates/mb-core/src/model.rs:1099`).

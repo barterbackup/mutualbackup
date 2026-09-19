@@ -709,6 +709,7 @@ impl GuildCheckpoint {
         let mut revision_order = None;
         let mut revision_sectors = std::collections::BTreeMap::new();
         let mut scoped_revision_sectors = std::collections::BTreeMap::new();
+        let mut revision_commitments = std::collections::BTreeMap::new();
         let mut revision_heads =
             std::collections::BTreeMap::<(NodeId, Uuid), (u64, [u8; 32], u64)>::new();
         let mut fences = std::collections::BTreeMap::<(NodeId, u64), [u8; 32]>::new();
@@ -763,13 +764,34 @@ impl GuildCheckpoint {
             if revision_order.is_some_and(|previous| previous >= order)
                 || revision.signer != revision.value.owner
                 || self.format_version == 3 && !member_ids.contains(&revision.signer)
-                || revision.value.format_version != 3
+                || !matches!(
+                    (
+                        revision.value.format_version,
+                        &revision.value.sector_commitments
+                    ),
+                    (3, None) | (4, Some(_))
+                )
                 || revision.value.guild_id != self.guild_id
                 || revision.value.protected_root_id.is_nil()
                 || revision.value.cipher_profile != V1_CIPHER_PROFILE
                 || revision.value.sequence == 0
                 || revision.value.metadata_sectors.is_empty()
                 || !revision_ids.insert(revision.value.revision_id)
+            {
+                return Err(ModelError::InvalidCheckpoint);
+            }
+            let sector_count = revision
+                .value
+                .metadata_sectors
+                .len()
+                .checked_add(revision.value.data_sectors.len())
+                .ok_or(ModelError::InvalidCheckpoint)?;
+            if let Some(commitments) = &revision.value.sector_commitments
+                && (commitments.len() != sector_count
+                    || commitments.iter().any(|commitment| {
+                        commitment.byte_len != V1_SECTOR_SIZE as u32
+                            || commitment.validate().is_err()
+                    }))
             {
                 return Err(ModelError::InvalidCheckpoint);
             }
@@ -794,11 +816,12 @@ impl GuildCheckpoint {
                 },
                 Some(_) => return Err(ModelError::InvalidCheckpoint),
             }
-            for reference in revision
+            for (sector_index, reference) in revision
                 .value
                 .metadata_sectors
                 .iter()
                 .chain(&revision.value.data_sectors)
+                .enumerate()
             {
                 if reference.logical_len == 0 || reference.logical_len as usize > V1_SECTOR_SIZE {
                     return Err(ModelError::InvalidCheckpoint);
@@ -817,6 +840,17 @@ impl GuildCheckpoint {
                 revision_sectors
                     .entry(reference.id)
                     .or_insert((revision.value.owner, reference.clone()));
+                if let Some(commitment) = revision
+                    .value
+                    .sector_commitments
+                    .as_ref()
+                    .and_then(|commitments| commitments.get(sector_index))
+                    && revision_commitments
+                        .insert(reference.id, commitment.clone())
+                        .is_some_and(|previous| previous != *commitment)
+                {
+                    return Err(ModelError::InvalidCheckpoint);
+                }
             }
             revision_heads.insert(
                 chain,
@@ -878,6 +912,18 @@ impl GuildCheckpoint {
                 || actual.values().any(|bytes| *bytes != V1_SECTOR_SIZE as u64)
             {
                 return Err(ModelError::InvalidCheckpoint);
+            }
+            match (catalog.format_version, &catalog.source_authentication) {
+                (1, None) => {}
+                (2, Some(authentication)) => {
+                    if authentication.iter().any(|entry| {
+                        revision_commitments.get(&entry.id.object_id)
+                            != Some(&entry.source_commitment)
+                    }) {
+                        return Err(ModelError::InvalidCheckpoint);
+                    }
+                }
+                _ => return Err(ModelError::InvalidCheckpoint),
             }
         }
 
@@ -1179,7 +1225,7 @@ impl GuildCheckpoint {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserRevision {
     pub format_version: u16,
     pub guild_id: [u8; 32],
@@ -1194,6 +1240,116 @@ pub struct UserRevision {
     pub parent: Option<[u8; 32]>,
     pub metadata_sectors: Vec<SectorRef>,
     pub data_sectors: Vec<SectorRef>,
+    /// Merkle commitments aligned with metadata sectors followed by data
+    /// sectors. Version three revisions retain their original encoding.
+    pub sector_commitments: Option<Vec<MerkleCommitment>>,
+}
+
+impl Serialize for UserRevision {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let field_count = match (self.format_version, &self.sector_commitments) {
+            (3, None) => 13,
+            (4, Some(_)) => 14,
+            _ => return Err(serde::ser::Error::custom("invalid user revision version")),
+        };
+        let mut tuple = serializer.serialize_tuple(field_count)?;
+        tuple.serialize_element(&self.format_version)?;
+        tuple.serialize_element(&self.guild_id)?;
+        tuple.serialize_element(&self.protected_root_id)?;
+        tuple.serialize_element(&self.cipher_profile)?;
+        tuple.serialize_element(&self.revision_id)?;
+        tuple.serialize_element(&self.owner)?;
+        tuple.serialize_element(&self.writer_epoch)?;
+        tuple.serialize_element(&self.writer_public_key)?;
+        tuple.serialize_element(&self.writer_signature)?;
+        tuple.serialize_element(&self.sequence)?;
+        tuple.serialize_element(&self.parent)?;
+        tuple.serialize_element(&self.metadata_sectors)?;
+        tuple.serialize_element(&self.data_sectors)?;
+        if let Some(commitments) = &self.sector_commitments {
+            tuple.serialize_element(commitments)?;
+        }
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for UserRevision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct UserRevisionVisitor;
+
+        impl<'de> Visitor<'de> for UserRevisionVisitor {
+            type Value = UserRevision;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a versioned user revision")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let format_version = next_user_revision_field(&mut sequence, "format version")?;
+                let guild_id = next_user_revision_field(&mut sequence, "guild ID")?;
+                let protected_root_id =
+                    next_user_revision_field(&mut sequence, "protected root ID")?;
+                let cipher_profile = next_user_revision_field(&mut sequence, "cipher profile")?;
+                let revision_id = next_user_revision_field(&mut sequence, "revision ID")?;
+                let owner = next_user_revision_field(&mut sequence, "owner")?;
+                let writer_epoch = next_user_revision_field(&mut sequence, "writer epoch")?;
+                let writer_public_key =
+                    next_user_revision_field(&mut sequence, "writer public key")?;
+                let writer_signature = next_user_revision_field(&mut sequence, "writer signature")?;
+                let sequence_number = next_user_revision_field(&mut sequence, "sequence")?;
+                let parent = next_user_revision_field(&mut sequence, "parent")?;
+                let metadata_sectors = next_user_revision_field(&mut sequence, "metadata sectors")?;
+                let data_sectors = next_user_revision_field(&mut sequence, "data sectors")?;
+                let sector_commitments = match format_version {
+                    3 => None,
+                    4 => Some(next_user_revision_field(
+                        &mut sequence,
+                        "sector commitments",
+                    )?),
+                    _ => {
+                        return Err(serde::de::Error::custom("invalid user revision version"));
+                    }
+                };
+                Ok(UserRevision {
+                    format_version,
+                    guild_id,
+                    protected_root_id,
+                    cipher_profile,
+                    revision_id,
+                    owner,
+                    writer_epoch,
+                    writer_public_key,
+                    writer_signature,
+                    sequence: sequence_number,
+                    parent,
+                    metadata_sectors,
+                    data_sectors,
+                    sector_commitments,
+                })
+            }
+        }
+
+        deserializer.deserialize_tuple(14, UserRevisionVisitor)
+    }
+}
+
+fn next_user_revision_field<'de, A, T>(sequence: &mut A, name: &'static str) -> Result<T, A::Error>
+where
+    A: SeqAccess<'de>,
+    T: Deserialize<'de>,
+{
+    sequence
+        .next_element()?
+        .ok_or_else(|| serde::de::Error::missing_field(name))
 }
 
 impl UserRevision {
@@ -1230,7 +1386,12 @@ impl UserRevision {
 
     /// Stable identity used by the next revision's `parent` field.
     pub fn hash(&self) -> Result<[u8; 32], ModelError> {
-        let mut hasher = blake3::Hasher::new_derive_key("mutualbackup user revision body v3");
+        let domain = match self.format_version {
+            3 => "mutualbackup user revision body v3",
+            4 => "mutualbackup user revision body v4",
+            _ => return Err(ModelError::InvalidCheckpoint),
+        };
+        let mut hasher = blake3::Hasher::new_derive_key(domain);
         hasher.update(&canonical_bytes(self)?);
         Ok(*hasher.finalize().as_bytes())
     }
@@ -1648,6 +1809,7 @@ mod tests {
             parent: None,
             metadata_sectors: vec![target],
             data_sectors: Vec::new(),
+            sector_commitments: None,
         };
         revision_body.sign_writer(&writer).unwrap();
         let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision_body, &keys[0]).unwrap();
@@ -1831,7 +1993,23 @@ mod tests {
             decode_canonical::<GuildCheckpoint>(&root_scoped_bytes).unwrap(),
             root_scoped_checkpoint
         );
-        let packing_inputs = root_scoped_checkpoint
+        let mut authenticated_checkpoint = root_scoped_checkpoint.clone();
+        for signed in &mut authenticated_checkpoint.revisions {
+            let mut body = signed.value.clone();
+            body.format_version = 4;
+            body.sector_commitments = Some(
+                body.metadata_sectors
+                    .iter()
+                    .chain(&body.data_sectors)
+                    .map(|reference| {
+                        crate::merkle_commit(&vec![reference.id[0]; V1_SECTOR_SIZE]).unwrap()
+                    })
+                    .collect(),
+            );
+            body.sign_writer(&writer).unwrap();
+            *signed = SignedRecord::sign(USER_REVISION_DOMAIN, body, &keys[0]).unwrap();
+        }
+        let packing_inputs = authenticated_checkpoint
             .revisions
             .iter()
             .flat_map(|revision| {
@@ -1840,13 +2018,30 @@ mod tests {
                     .metadata_sectors
                     .iter()
                     .chain(&revision.value.data_sectors)
-                    .map(move |reference| crate::PackingInput {
-                        owner: revision.value.owner,
-                        protected_root: crate::packing_protected_root(
-                            revision.value.protected_root_id,
-                        ),
-                        object_id: reference.id,
-                        bytes: vec![reference.id[0]; V1_SECTOR_SIZE],
+                    .map(move |reference| {
+                        let bytes = vec![reference.id[0]; V1_SECTOR_SIZE];
+                        crate::PackingInput {
+                            owner: revision.value.owner,
+                            protected_root: crate::packing_protected_root(
+                                revision.value.protected_root_id,
+                            ),
+                            object_id: reference.id,
+                            source_commitment: revision
+                                .value
+                                .sector_commitments
+                                .as_ref()
+                                .and_then(|commitments| {
+                                    revision
+                                        .value
+                                        .metadata_sectors
+                                        .iter()
+                                        .chain(&revision.value.data_sectors)
+                                        .position(|candidate| candidate.id == reference.id)
+                                        .and_then(|index| commitments.get(index))
+                                })
+                                .cloned(),
+                            bytes,
+                        }
                     })
             })
             .collect();
@@ -1860,7 +2055,7 @@ mod tests {
             packing_inputs,
         )
         .unwrap();
-        let mut packed_checkpoint = root_scoped_checkpoint.clone();
+        let mut packed_checkpoint = authenticated_checkpoint;
         packed_checkpoint.format_version = 7;
         packed_checkpoint.packing_catalog = Some(packing.catalog);
         let packed_quorum = sign_policy_checkpoint(packed_checkpoint.clone());
@@ -1871,6 +2066,45 @@ mod tests {
             decode_canonical::<GuildCheckpoint>(&packed_bytes).unwrap(),
             packed_checkpoint
         );
+        let substituted_inputs = packed_checkpoint
+            .revisions
+            .iter()
+            .flat_map(|revision| {
+                revision
+                    .value
+                    .metadata_sectors
+                    .iter()
+                    .chain(&revision.value.data_sectors)
+                    .map(move |reference| {
+                        let bytes = vec![reference.id[0] ^ 1; V1_SECTOR_SIZE];
+                        crate::PackingInput {
+                            owner: revision.value.owner,
+                            protected_root: crate::packing_protected_root(
+                                revision.value.protected_root_id,
+                            ),
+                            object_id: reference.id,
+                            source_commitment: Some(crate::merkle_commit(&bytes).unwrap()),
+                            bytes,
+                        }
+                    })
+            })
+            .collect();
+        let substituted = crate::pack_incremental(
+            crate::PackingProfile {
+                format_version: 1,
+                sector_size: V1_SECTOR_SIZE as u32,
+                slot_size: 16 * 1024,
+            },
+            None,
+            substituted_inputs,
+        )
+        .unwrap();
+        let mut substituted_checkpoint = packed_checkpoint.clone();
+        substituted_checkpoint.packing_catalog = Some(substituted.catalog);
+        assert!(matches!(
+            substituted_checkpoint.validate(),
+            Err(ModelError::InvalidCheckpoint)
+        ));
         let mut invalid_signature = policy_quorum.signatures[0].clone();
         invalid_signature.signature[0] ^= 1;
         assert!(
@@ -1947,6 +2181,7 @@ mod tests {
             parent: Some(previous),
             metadata_sectors: vec![next_target.clone()],
             data_sectors: Vec::new(),
+            sector_commitments: None,
         };
         next_revision.sign_writer(&writer).unwrap();
         chained

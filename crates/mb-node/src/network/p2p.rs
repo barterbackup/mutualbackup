@@ -33,16 +33,16 @@ use mb_core::{
     CodingGroup, CodingGroupV2, CodingPlanGeometry, CodingProfile, CodingRootManifest,
     CodingShardOpening, CodingVerificationTranscript, DynamicGuildState, GuildCheckpoint,
     GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, InformationRoleV2, MAX_GUILD_EVENT_TAIL,
-    MERKLE_LEAF_SIZE, Member, MemberSignature, NodeId, PackedCatalog, PackedSector, PackingInput,
-    PackingProfile, PackingResult, ParityPlacementV2, QuorumCheckpoint, QuorumGuildEvent,
-    QuorumGuildGenesis, QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN, RangeSectorRef,
-    STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole,
-    ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement, UserRevision,
-    V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS,
-    V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_SECTOR_SIZE,
-    canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical, merkle_commit,
-    merkle_zero_commitment, pack_incremental, packing_protected_root, replay_coding_transcript,
-    sector_root, unpack_object_from_sectors,
+    MERKLE_LEAF_SIZE, Member, MemberSignature, MerkleCommitment, NodeId, PackedCatalog,
+    PackedSector, PackingInput, PackingProfile, PackingResult, ParityPlacementV2, QuorumCheckpoint,
+    QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN,
+    RangeSectorRef, STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId,
+    SectorRef, ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
+    UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES,
+    V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS,
+    V1_SECTOR_SIZE, canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical,
+    merkle_commit, merkle_zero_commitment, pack_incremental, packing_protected_root,
+    replay_coding_transcript, sector_root, unpack_object_from_sectors,
 };
 #[cfg(test)]
 use mb_core::{ParityRoleV2, encode};
@@ -11330,26 +11330,37 @@ async fn build_production_packing(
     revisions: &[SignedRecord<UserRevision>],
     previous: Option<&PackedCatalog>,
 ) -> Result<PackingResult> {
-    let mut sources = BTreeMap::<(NodeId, [u8; 32], SectorId), SectorRef>::new();
+    let mut sources =
+        BTreeMap::<(NodeId, [u8; 32], SectorId), (SectorRef, MerkleCommitment)>::new();
     for revision in revisions {
         let protected_root = packing_protected_root(revision.value.protected_root_id);
-        for reference in revision
+        let commitments = revision
+            .value
+            .sector_commitments
+            .as_ref()
+            .context("retained revision lacks signed source commitments")?;
+        for (index, reference) in revision
             .value
             .metadata_sectors
             .iter()
             .chain(&revision.value.data_sectors)
+            .enumerate()
         {
+            let commitment = commitments
+                .get(index)
+                .context("retained revision source commitment is missing")?
+                .clone();
             let key = (revision.value.owner, protected_root, reference.id);
             if sources
-                .insert(key, reference.clone())
-                .is_some_and(|existing| existing != *reference)
+                .insert(key, (reference.clone(), commitment.clone()))
+                .is_some_and(|existing| existing != (reference.clone(), commitment))
             {
                 bail!("retained revisions disagree about a packed source sector");
             }
         }
     }
     let mut inputs = Vec::with_capacity(sources.len());
-    for ((owner, protected_root, object_id), reference) in sources {
+    for ((owner, protected_root, object_id), (reference, source_commitment)) in sources {
         let source = if owner == local_id {
             node_blocking(node.clone(), move |node| {
                 node.sector_for_guild(&guild_id, &object_id)
@@ -11437,10 +11448,14 @@ async fn build_production_packing(
         if bytes.len() != V1_SECTOR_SIZE || sector_root(&bytes) != reference.root {
             bail!("packed source sector conflicts with its signed revision");
         }
+        if merkle_commit(&bytes)? != source_commitment {
+            bail!("packed source sector conflicts with its signed Merkle commitment");
+        }
         inputs.push(PackingInput {
             owner,
             protected_root,
             object_id,
+            source_commitment: Some(source_commitment),
             bytes,
         });
     }
@@ -13032,6 +13047,7 @@ mod tests {
                 parent: None,
                 metadata_sectors: Vec::new(),
                 data_sectors: Vec::new(),
+                sector_commitments: None,
             };
             revision.sign_writer(writer).unwrap();
             revision
@@ -13074,6 +13090,7 @@ mod tests {
                         logical_len: 1,
                     }],
                     data_sectors: Vec::new(),
+                    sector_commitments: None,
                 };
                 revision.sign_writer(&writer).unwrap();
                 parent = Some(revision.hash().unwrap());
@@ -17412,6 +17429,7 @@ mod tests {
                 parent: None,
                 metadata_sectors: vec![reference.clone()],
                 data_sectors: Vec::new(),
+                sector_commitments: None,
             };
             revision.sign_writer(&writer).unwrap();
             writer_fences.push(mb_core::WriterFence {

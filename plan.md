@@ -1017,9 +1017,11 @@ historical gate results; follow-up source review reopens Milestone 5.
 The source-only review of `8135e0b..da8974a` on 2026-09-18 found nine remaining
 blockers (details, source locations, and regression scenarios are in `TODO.md`):
 
-- **M5-36:** Checkpoint approval does not authenticate packed contents against
-  the source roots in owner-signed revisions. Correct RS over substituted
-  ciphertext can pass signing and fail only at restore.
+- **M5-36 (resolved):** Version-four owner revisions sign source Merkle
+  commitments, and version-two packed catalogs prove each aligned slot against
+  them. Checkpoint validation recomposes packed commitments from those proofs,
+  so substituted source bytes are rejected before approval even when the owner
+  is absent. Legacy revision and catalog encodings remain readable.
 - **M5-37 (resolved):** Authority-bearing versions 5–7 now apply the configured
   checkpoint quorum consistently. Recovery locator validation, DHT publication,
   state adoption, installation, and resume share the rule that any certified

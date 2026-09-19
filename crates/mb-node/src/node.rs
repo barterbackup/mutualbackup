@@ -9321,6 +9321,7 @@ mod tests {
             parent: None,
             metadata_sectors: vec![reference],
             data_sectors: Vec::new(),
+            sector_commitments: None,
         };
         revision.sign_writer(&writer).unwrap();
         SignedRecord::sign(USER_REVISION_DOMAIN, revision, node.keys()).unwrap()
@@ -9403,6 +9404,7 @@ mod tests {
             parent: None,
             metadata_sectors: vec![target],
             data_sectors: Vec::new(),
+            sector_commitments: None,
         };
         revision_body.sign_writer(&writer).unwrap();
         let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision_body, &keys[0]).unwrap();
@@ -9886,6 +9888,7 @@ mod tests {
         let seed = Seed::from_bytes([218; 32]);
         let mut node = Node::open(temp.path(), seed.clone()).unwrap();
         let guild_id = [217; 32];
+        let source_bytes = (0_u8..64).collect::<Vec<_>>();
         let packed = mb_core::pack_incremental(
             mb_core::PackingProfile {
                 format_version: 1,
@@ -9897,7 +9900,8 @@ mod tests {
                 owner: node.keys().node_id(),
                 protected_root: [1; 32],
                 object_id: [2; 32],
-                bytes: (0_u8..48).collect(),
+                source_commitment: Some(mb_core::merkle_commit(&source_bytes).unwrap()),
+                bytes: source_bytes,
             }],
         )
         .unwrap();
@@ -9928,6 +9932,7 @@ mod tests {
     fn packed_catalog_sectors_are_live_variable_information() {
         let owner = KeyMaterial::from_seed(&Seed::from_bytes([215; 32])).node_id();
         let guild_id = [214; 32];
+        let source_bytes = vec![3; 64];
         let packed = mb_core::pack_incremental(
             mb_core::PackingProfile {
                 format_version: 1,
@@ -9939,7 +9944,8 @@ mod tests {
                 owner,
                 protected_root: [1; 32],
                 object_id: [2; 32],
-                bytes: vec![3; 64],
+                source_commitment: Some(mb_core::merkle_commit(&source_bytes).unwrap()),
+                bytes: source_bytes,
             }],
         )
         .unwrap();
@@ -10590,6 +10596,7 @@ mod tests {
             parent: Some(retired.value.hash().unwrap()),
             metadata_sectors: vec![target],
             data_sectors: Vec::new(),
+            sector_commitments: None,
         };
         revision.sign_writer(&writer).unwrap();
         let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, node.keys()).unwrap();
@@ -11149,6 +11156,7 @@ mod tests {
                 logical_len: 1,
             }],
             data_sectors: Vec::new(),
+            sector_commitments: None,
         };
         revision.sign_writer(&writer).unwrap();
         let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, &added_keys).unwrap();
@@ -11449,6 +11457,7 @@ mod tests {
             parent: None,
             metadata_sectors: Vec::new(),
             data_sectors: Vec::new(),
+            sector_commitments: None,
         };
         revision_body.sign_writer(&writer).unwrap();
         let revision =
@@ -11962,6 +11971,7 @@ mod tests {
             parent: None,
             metadata_sectors: vec![target.clone()],
             data_sectors: Vec::new(),
+            sector_commitments: None,
         };
         revision.sign_writer(&writer).unwrap();
         let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, &keys[2]).unwrap();
@@ -12332,6 +12342,7 @@ mod tests {
                 logical_len: 1,
             }],
             data_sectors: Vec::new(),
+            sector_commitments: None,
         };
         revision.sign_writer(&writer).unwrap();
         let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, node.keys()).unwrap();
@@ -13010,6 +13021,7 @@ mod tests {
             parent: None,
             metadata_sectors: Vec::new(),
             data_sectors: Vec::new(),
+            sector_commitments: None,
         };
         revision_body.sign_writer(&writer).unwrap();
         let revision =

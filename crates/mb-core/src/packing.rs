@@ -1,10 +1,13 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{SeqAccess, Visitor};
+use serde::ser::SerializeTuple;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    MAX_PROFILE_SHARD_SIZE, MERKLE_LEAF_SIZE, MerkleCommitment, NodeId, canonical_bytes,
-    merkle_commit,
+    MAX_PROFILE_SHARD_SIZE, MERKLE_LEAF_SIZE, MerkleCommitment, MerkleSubtreeProof, NodeId,
+    canonical_bytes, merkle_commit, merkle_commit_subtrees, merkle_open_subtree,
+    merkle_verify_subtree,
 };
 
 const MAX_PACKED_CHUNKS: usize = 1_000_000;
@@ -45,6 +48,7 @@ pub struct PackingInput {
     pub owner: NodeId,
     pub protected_root: [u8; 32],
     pub object_id: [u8; 32],
+    pub source_commitment: Option<MerkleCommitment>,
     pub bytes: Vec<u8>,
 }
 
@@ -102,6 +106,13 @@ pub struct PackedSectorDescriptor {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackedSourceAuthentication {
+    pub id: SourceChunkId,
+    pub source_commitment: MerkleCommitment,
+    pub proof: MerkleSubtreeProof,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackedCatalog {
     pub id: [u8; 32],
     pub format_version: u16,
@@ -109,6 +120,90 @@ pub struct PackedCatalog {
     pub parent: Option<[u8; 32]>,
     pub profile: PackingProfile,
     pub sectors: Vec<PackedSectorDescriptor>,
+    /// Compact source-to-slot proofs. Version-one catalogs predate source
+    /// authentication and retain their original six-field encoding.
+    pub source_authentication: Option<Vec<PackedSourceAuthentication>>,
+}
+
+impl Serialize for PackedCatalog {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let field_count = match (self.format_version, &self.source_authentication) {
+            (1, None) => 6,
+            (2, Some(_)) => 7,
+            _ => return Err(serde::ser::Error::custom("invalid packed catalog version")),
+        };
+        let mut tuple = serializer.serialize_tuple(field_count)?;
+        tuple.serialize_element(&self.id)?;
+        tuple.serialize_element(&self.format_version)?;
+        tuple.serialize_element(&self.revision)?;
+        tuple.serialize_element(&self.parent)?;
+        tuple.serialize_element(&self.profile)?;
+        tuple.serialize_element(&self.sectors)?;
+        if let Some(authentication) = &self.source_authentication {
+            tuple.serialize_element(authentication)?;
+        }
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for PackedCatalog {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PackedCatalogVisitor;
+
+        impl<'de> Visitor<'de> for PackedCatalogVisitor {
+            type Value = PackedCatalog;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a versioned packed catalog")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let id = next_catalog_field(&mut sequence, "catalog ID")?;
+                let format_version = next_catalog_field(&mut sequence, "format version")?;
+                let revision = next_catalog_field(&mut sequence, "revision")?;
+                let parent = next_catalog_field(&mut sequence, "parent")?;
+                let profile = next_catalog_field(&mut sequence, "profile")?;
+                let sectors = next_catalog_field(&mut sequence, "sectors")?;
+                let source_authentication = match format_version {
+                    1 => None,
+                    2 => Some(next_catalog_field(&mut sequence, "source authentication")?),
+                    _ => {
+                        return Err(serde::de::Error::custom("invalid packed catalog version"));
+                    }
+                };
+                Ok(PackedCatalog {
+                    id,
+                    format_version,
+                    revision,
+                    parent,
+                    profile,
+                    sectors,
+                    source_authentication,
+                })
+            }
+        }
+
+        deserializer.deserialize_tuple(7, PackedCatalogVisitor)
+    }
+}
+
+fn next_catalog_field<'de, A, T>(sequence: &mut A, name: &'static str) -> Result<T, A::Error>
+where
+    A: SeqAccess<'de>,
+    T: Deserialize<'de>,
+{
+    sequence
+        .next_element()?
+        .ok_or_else(|| serde::de::Error::missing_field(name))
 }
 
 impl PackedCatalog {
@@ -119,13 +214,16 @@ impl PackedCatalog {
             self.parent,
             self.profile,
             &self.sectors,
+            self.source_authentication.as_deref(),
         )
     }
 
     pub fn validate(&self) -> Result<(), PackingError> {
         self.profile.validate()?;
-        if self.format_version != 1
-            || self.revision == 0
+        if !matches!(
+            (self.format_version, &self.source_authentication),
+            (1, None) | (2, Some(_))
+        ) || self.revision == 0
             || (self.revision == 1) != self.parent.is_none()
             || self.calculate_id()? != self.id
         {
@@ -182,6 +280,81 @@ impl PackedCatalog {
                 .iter()
                 .enumerate()
                 .any(|(index, chunk)| *chunk != index as u32)
+            {
+                return Err(PackingError::InvalidCatalog);
+            }
+        }
+        if self.format_version == 2 {
+            self.validate_source_authentication(&source_ids)?;
+        }
+        Ok(())
+    }
+
+    fn validate_source_authentication(
+        &self,
+        source_ids: &std::collections::BTreeSet<SourceChunkId>,
+    ) -> Result<(), PackingError> {
+        let authentication = self
+            .source_authentication
+            .as_ref()
+            .ok_or(PackingError::InvalidCatalog)?;
+        let expected_leaf_count = self.profile.slot_size / MERKLE_LEAF_SIZE as u32;
+        let mut proofs = std::collections::BTreeMap::new();
+        for entry in authentication {
+            if entry.source_commitment.byte_len != self.profile.sector_size
+                || entry.proof.start_leaf
+                    != entry
+                        .id
+                        .chunk_index
+                        .checked_mul(expected_leaf_count)
+                        .ok_or(PackingError::InvalidCatalog)?
+                || entry.proof.leaf_count != expected_leaf_count
+                || merkle_verify_subtree(&entry.source_commitment, &entry.proof).is_err()
+                || proofs.insert(entry.id, entry).is_some()
+            {
+                return Err(PackingError::InvalidCatalog);
+            }
+        }
+        if proofs
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            != *source_ids
+        {
+            return Err(PackingError::InvalidCatalog);
+        }
+
+        let zeros = vec![0_u8; self.profile.slot_size as usize];
+        let zero_root = merkle_open_subtree(&zeros, 0, expected_leaf_count)
+            .map_err(|_| PackingError::InvalidCatalog)?
+            .subtree_root;
+        for descriptor in &self.sectors {
+            let mut roots = Vec::with_capacity(descriptor.slots.len());
+            for slot in &descriptor.slots {
+                let root = match slot {
+                    PackedSlot::Data(source) => {
+                        if source.logical_len != self.profile.slot_size {
+                            return Err(PackingError::InvalidCatalog);
+                        }
+                        proofs[&source.id].proof.subtree_root
+                    }
+                    PackedSlot::VirtualZero {
+                        source: Some(source),
+                    } => {
+                        if source.logical_len != self.profile.slot_size
+                            || proofs[&source.id].proof.subtree_root != zero_root
+                        {
+                            return Err(PackingError::InvalidCatalog);
+                        }
+                        zero_root
+                    }
+                    PackedSlot::VirtualZero { source: None } => zero_root,
+                };
+                roots.push(root);
+            }
+            if merkle_commit_subtrees(self.profile.sector_size, self.profile.slot_size, &roots)
+                .map_err(|_| PackingError::InvalidCatalog)?
+                != descriptor.commitment
             {
                 return Err(PackingError::InvalidCatalog);
             }
@@ -560,15 +733,31 @@ pub fn pack_incremental(
         .iter()
         .map(|sector| sector.descriptor.clone())
         .collect::<Vec<_>>();
+    let authenticated_chunks = chunks
+        .iter()
+        .filter_map(|chunk| chunk.authentication.clone())
+        .collect::<Vec<_>>();
+    let source_authentication = if authenticated_chunks.is_empty() {
+        None
+    } else if authenticated_chunks.len() == chunks.len() {
+        Some(authenticated_chunks)
+    } else {
+        return Err(PackingError::InvalidInput);
+    };
     let revision = previous.map_or(1, |catalog| catalog.revision + 1);
     let parent = previous.map(|catalog| catalog.id);
     let mut catalog = PackedCatalog {
         id: [0; 32],
-        format_version: 1,
+        format_version: if source_authentication.is_some() {
+            2
+        } else {
+            1
+        },
         revision,
         parent,
         profile,
         sectors: descriptors,
+        source_authentication,
     };
     catalog.id = catalog.calculate_id()?;
     let changed_sectors = sectors
@@ -694,6 +883,7 @@ pub fn unpack_object_from_sectors(
 #[derive(Debug)]
 struct InputChunk {
     source: PackedSourceChunk,
+    authentication: Option<PackedSourceAuthentication>,
     bytes: Vec<u8>,
     virtual_zero: bool,
 }
@@ -710,6 +900,10 @@ fn input_chunks(
             || input.protected_root == [0; 32]
             || input.object_id == [0; 32]
             || input.bytes.is_empty()
+            || input.source_commitment.as_ref().is_some_and(|commitment| {
+                commitment.byte_len != input.bytes.len() as u32
+                    || merkle_commit(&input.bytes).ok().as_ref() != Some(commitment)
+            })
             || !seen_objects.insert(object)
         {
             return Err(PackingError::InvalidInput);
@@ -719,18 +913,39 @@ fn input_chunks(
                 return Err(PackingError::TooManyChunks);
             }
             let chunk_index = u32::try_from(index).map_err(|_| PackingError::TooManyChunks)?;
+            let start_leaf = chunk_index
+                .checked_mul(profile.slot_size / MERKLE_LEAF_SIZE as u32)
+                .ok_or(PackingError::TooManyChunks)?;
+            let id = SourceChunkId {
+                owner: input.owner,
+                protected_root: input.protected_root,
+                object_id: input.object_id,
+                chunk_index,
+            };
+            let authentication = input
+                .source_commitment
+                .as_ref()
+                .map(|commitment| -> Result<_, PackingError> {
+                    Ok(PackedSourceAuthentication {
+                        id,
+                        source_commitment: commitment.clone(),
+                        proof: merkle_open_subtree(
+                            &input.bytes,
+                            start_leaf,
+                            profile.slot_size / MERKLE_LEAF_SIZE as u32,
+                        )
+                        .map_err(|_| PackingError::InvalidInput)?,
+                    })
+                })
+                .transpose()?;
             chunks.push(InputChunk {
                 source: PackedSourceChunk {
-                    id: SourceChunkId {
-                        owner: input.owner,
-                        protected_root: input.protected_root,
-                        object_id: input.object_id,
-                        chunk_index,
-                    },
+                    id,
                     source_offset: u64::from(chunk_index) * u64::from(profile.slot_size),
                     logical_len: bytes.len() as u32,
                     content_hash: *blake3::hash(bytes).as_bytes(),
                 },
+                authentication,
                 bytes: bytes.to_vec(),
                 virtual_zero: bytes.iter().all(|byte| *byte == 0),
             });
@@ -746,15 +961,27 @@ fn catalog_id(
     parent: Option<[u8; 32]>,
     profile: PackingProfile,
     sectors: &[PackedSectorDescriptor],
+    source_authentication: Option<&[PackedSourceAuthentication]>,
 ) -> Result<[u8; 32], PackingError> {
-    let mut hasher = blake3::Hasher::new_derive_key("mutualbackup packed catalog v1");
-    hasher.update(&canonical_bytes(&(
-        format_version,
-        revision,
-        parent,
-        profile,
-        sectors,
-    ))?);
+    let domain = match (format_version, source_authentication) {
+        (1, None) => "mutualbackup packed catalog v1",
+        (2, Some(_)) => "mutualbackup packed catalog v2",
+        _ => return Err(PackingError::InvalidCatalog),
+    };
+    let mut hasher = blake3::Hasher::new_derive_key(domain);
+    let bytes = if let Some(authentication) = source_authentication {
+        canonical_bytes(&(
+            format_version,
+            revision,
+            parent,
+            profile,
+            sectors,
+            authentication,
+        ))?
+    } else {
+        canonical_bytes(&(format_version, revision, parent, profile, sectors))?
+    };
+    hasher.update(&bytes);
     Ok(*hasher.finalize().as_bytes())
 }
 
@@ -793,6 +1020,7 @@ mod tests {
             owner,
             protected_root: [protected_root; 32],
             object_id: [object_id; 32],
+            source_commitment: None,
             bytes,
         }
     }
@@ -803,6 +1031,41 @@ mod tests {
             sector_size: 64,
             slot_size: 16,
         }
+    }
+
+    #[test]
+    fn authenticated_catalog_rejects_substituted_packed_content() {
+        let owner = owners(1)[0];
+        let bytes = (0..64_u8).collect::<Vec<_>>();
+        let mut packed = pack_incremental(
+            profile(),
+            None,
+            vec![PackingInput {
+                owner,
+                protected_root: [1; 32],
+                object_id: [2; 32],
+                source_commitment: Some(merkle_commit(&bytes).unwrap()),
+                bytes,
+            }],
+        )
+        .unwrap();
+        assert_eq!(packed.catalog.format_version, 2);
+        packed.validate().unwrap();
+
+        packed.sectors[0].bytes[0] ^= 1;
+        packed.sectors[0].descriptor.flat_root = *blake3::hash(&packed.sectors[0].bytes).as_bytes();
+        packed.sectors[0].descriptor.commitment = merkle_commit(&packed.sectors[0].bytes).unwrap();
+        packed.sectors[0].descriptor.id = packed.sectors[0]
+            .descriptor
+            .calculate_id(packed.catalog.profile)
+            .unwrap();
+        packed.catalog.sectors[0] = packed.sectors[0].descriptor.clone();
+        packed.catalog.id = packed.catalog.calculate_id().unwrap();
+
+        assert!(matches!(
+            packed.validate(),
+            Err(PackingError::InvalidCatalog)
+        ));
     }
 
     #[test]

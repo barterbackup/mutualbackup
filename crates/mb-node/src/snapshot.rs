@@ -7,9 +7,10 @@ use anyhow::{Context, Result, bail};
 use ed25519_dalek::SigningKey;
 use fs2::FileExt;
 use mb_core::{
-    KeyMaterial, SectorId, SectorPurpose, SectorRef, SignedRecord, USER_REVISION_DOMAIN,
-    UserRevision, V1_CIPHER_PROFILE, V1_MAX_CATALOG_BYTES, V1_MAX_CODING_GROUPS, V1_SECTOR_SIZE,
-    canonical_bytes, crypt_sector, decode_canonical, encrypted_sector, make_sector_id, sector_root,
+    KeyMaterial, MerkleCommitment, SectorId, SectorPurpose, SectorRef, SignedRecord,
+    USER_REVISION_DOMAIN, UserRevision, V1_CIPHER_PROFILE, V1_MAX_CATALOG_BYTES,
+    V1_MAX_CODING_GROUPS, V1_SECTOR_SIZE, canonical_bytes, crypt_sector, decode_canonical,
+    encrypted_sector, make_sector_id, merkle_commit, sector_root,
 };
 use mb_store::{
     AnchorFileLocator, CapturedEntry, ControlStore, FileExtent, NativeFileId, PinnedDirectory,
@@ -423,7 +424,7 @@ pub(crate) fn prepare_revision(
                 || previous.value.owner != keys.node_id()
                 || previous.value.guild_id != guild_id
                 || previous.value.protected_root_id != protected_root_id
-                || previous.value.format_version != 3
+                || !matches!(previous.value.format_version, 3 | 4)
                 || previous.value.cipher_profile != V1_CIPHER_PROFILE
                 || previous.value.sequence.checked_add(1) != Some(sequence)
             {
@@ -477,6 +478,7 @@ pub(crate) fn prepare_revision(
         validate_capture_sector_budget(&anchor.manifest)?;
         let encryption_key = keys.guild_data_key(&guild_id);
         let mut data_references = Vec::new();
+        let mut sector_commitments = BTreeMap::<SectorId, MerkleCommitment>::new();
         let mut private_entries = Vec::new();
         let mut recipe_records = Vec::with_capacity(256);
         let mut ordinal = 0_u64;
@@ -521,7 +523,9 @@ pub(crate) fn prepare_revision(
                             ordinal,
                         );
                         ordinal += 1;
-                        let (reference, _) = encrypted_sector(&encryption_key, id, &plaintext)?;
+                        let (reference, ciphertext) =
+                            encrypted_sector(&encryption_key, id, &plaintext)?;
+                        sector_commitments.insert(id, merkle_commit(&ciphertext)?);
                         push_data_reference(&mut data_references, reference.clone())?;
                         file_references.push(reference.clone());
                         queue_recipe(
@@ -574,6 +578,7 @@ pub(crate) fn prepare_revision(
                         guild_id,
                         revision_id,
                         &mut ordinal,
+                        &mut sector_commitments,
                         &locator,
                         *logical_len,
                         data_extents,
@@ -621,7 +626,8 @@ pub(crate) fn prepare_revision(
                 SectorPurpose::Metadata,
                 metadata_ordinal as u64,
             );
-            let (reference, _) = encrypted_sector(&encryption_key, id, plaintext)?;
+            let (reference, ciphertext) = encrypted_sector(&encryption_key, id, plaintext)?;
+            sector_commitments.insert(id, merkle_commit(&ciphertext)?);
             metadata_references.push(reference.clone());
             queue_recipe(
                 &mut recipe_records,
@@ -634,8 +640,18 @@ pub(crate) fn prepare_revision(
         }
 
         let writer = SigningKey::from_bytes(writer_secret);
+        let signed_sector_commitments = metadata_references
+            .iter()
+            .chain(&data_references)
+            .map(|reference| {
+                sector_commitments
+                    .get(&reference.id)
+                    .cloned()
+                    .context("captured sector is missing its Merkle commitment")
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut revision = UserRevision {
-            format_version: 3,
+            format_version: 4,
             guild_id,
             protected_root_id,
             cipher_profile: V1_CIPHER_PROFILE,
@@ -648,6 +664,7 @@ pub(crate) fn prepare_revision(
             parent,
             metadata_sectors: metadata_references,
             data_sectors: data_references,
+            sector_commitments: Some(signed_sector_commitments),
         };
         revision.sign_writer(&writer)?;
         let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision, keys)?;
@@ -708,6 +725,7 @@ fn prepare_sparse_file(
     guild_id: [u8; 32],
     revision_id: Uuid,
     ordinal: &mut u64,
+    sector_commitments: &mut BTreeMap<SectorId, MerkleCommitment>,
     locator: &StableAnchorFileLocator,
     logical_len: u64,
     extents: &[FileExtent],
@@ -734,7 +752,8 @@ fn prepare_sparse_file(
             *ordinal = ordinal
                 .checked_add(1)
                 .context("too many sectors in one revision")?;
-            let (reference, _) = encrypted_sector(&encryption_key, id, &plaintext)?;
+            let (reference, ciphertext) = encrypted_sector(&encryption_key, id, &plaintext)?;
+            sector_commitments.insert(id, merkle_commit(&ciphertext)?);
             sectors.push(reference.clone());
             queue_recipe(
                 recipe_records,
@@ -1847,7 +1866,7 @@ fn validate_restore_revision(
     if revision.signer != keys.node_id()
         || revision.value.owner != keys.node_id()
         || revision.value.guild_id != guild_id
-        || revision.value.format_version != 3
+        || !matches!(revision.value.format_version, 3 | 4)
         || revision.value.cipher_profile != V1_CIPHER_PROFILE
     {
         bail!("revision does not belong to the recovering seed and guild");
@@ -2088,7 +2107,7 @@ where
     if revision.signer != keys.node_id()
         || revision.value.owner != keys.node_id()
         || revision.value.guild_id != guild_id
-        || revision.value.format_version != 3
+        || !matches!(revision.value.format_version, 3 | 4)
         || revision.value.cipher_profile != V1_CIPHER_PROFILE
     {
         bail!("revision does not belong to the recovering seed and guild");
@@ -2711,6 +2730,7 @@ mod metadata_compatibility_tests {
             parent: None,
             metadata_sectors,
             data_sectors,
+            sector_commitments: None,
         };
         revision_body.sign_writer(&writer).unwrap();
         let revision = SignedRecord::sign(USER_REVISION_DOMAIN, revision_body, keys).unwrap();

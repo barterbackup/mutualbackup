@@ -28,6 +28,19 @@ pub struct MerkleRangeProof {
     pub siblings: Vec<[u8; 32]>,
 }
 
+/// Compact authentication of one aligned subtree without carrying its bytes.
+/// This is suitable when another signed object commits to the complete source
+/// and a catalog only needs to bind a packed range to that source.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MerkleSubtreeProof {
+    pub format_version: u16,
+    pub start_leaf: u32,
+    pub leaf_count: u32,
+    pub subtree_root: [u8; 32],
+    /// Siblings ordered from the proved subtree toward the root.
+    pub siblings: Vec<[u8; 32]>,
+}
+
 #[derive(Debug, Error)]
 pub enum MerkleError {
     #[error("Merkle data length must be a bounded power-of-two multiple of 16 bytes")]
@@ -108,6 +121,119 @@ pub fn merkle_open_range(
         start_leaf,
         leaves,
         siblings,
+    })
+}
+
+/// Open one aligned subtree without embedding its leaves in the proof.
+pub fn merkle_open_subtree(
+    bytes: &[u8],
+    start_leaf: u32,
+    leaf_count: u32,
+) -> Result<MerkleSubtreeProof, MerkleError> {
+    validate_data_len(bytes.len())?;
+    let total_leaves = bytes.len() / MERKLE_LEAF_SIZE;
+    let start = usize::try_from(start_leaf).map_err(|_| MerkleError::InvalidRange)?;
+    let count = usize::try_from(leaf_count).map_err(|_| MerkleError::InvalidRange)?;
+    if count == 0
+        || !count.is_power_of_two()
+        || start % count != 0
+        || start
+            .checked_add(count)
+            .is_none_or(|end| end > total_leaves)
+    {
+        return Err(MerkleError::InvalidRange);
+    }
+
+    let levels = merkle_levels(bytes);
+    let subtree_level = count.ilog2() as usize;
+    let mut node_index = start >> subtree_level;
+    let subtree_root = levels[subtree_level][node_index];
+    let mut siblings = Vec::with_capacity(levels.len() - subtree_level - 1);
+    for level in levels.iter().take(levels.len() - 1).skip(subtree_level) {
+        siblings.push(level[node_index ^ 1]);
+        node_index >>= 1;
+    }
+    Ok(MerkleSubtreeProof {
+        format_version: MERKLE_SUITE_V1,
+        start_leaf,
+        leaf_count,
+        subtree_root,
+        siblings,
+    })
+}
+
+/// Verify that a compact subtree opens the supplied complete commitment.
+pub fn merkle_verify_subtree(
+    commitment: &MerkleCommitment,
+    proof: &MerkleSubtreeProof,
+) -> Result<[u8; 32], MerkleError> {
+    validate_commitment(commitment)?;
+    let total_leaves = commitment.byte_len as usize / MERKLE_LEAF_SIZE;
+    let start = usize::try_from(proof.start_leaf).map_err(|_| MerkleError::InvalidProof)?;
+    let count = usize::try_from(proof.leaf_count).map_err(|_| MerkleError::InvalidProof)?;
+    if proof.format_version != MERKLE_SUITE_V1
+        || count == 0
+        || !count.is_power_of_two()
+        || start % count != 0
+        || start
+            .checked_add(count)
+            .is_none_or(|end| end > total_leaves)
+        || proof.subtree_root == [0; 32]
+    {
+        return Err(MerkleError::InvalidProof);
+    }
+    let subtree_level = count.ilog2() as usize;
+    let tree_height = total_leaves.ilog2() as usize;
+    if proof.siblings.len() != tree_height - subtree_level {
+        return Err(MerkleError::InvalidProof);
+    }
+
+    let mut current = proof.subtree_root;
+    let mut node_index = start >> subtree_level;
+    for sibling in &proof.siblings {
+        current = if node_index & 1 == 0 {
+            hash_node(&current, sibling)
+        } else {
+            hash_node(sibling, &current)
+        };
+        node_index >>= 1;
+    }
+    if bind_root(commitment.byte_len, current) != commitment.root {
+        return Err(MerkleError::RootMismatch);
+    }
+    Ok(proof.subtree_root)
+}
+
+/// Compose a complete commitment from equal, ordered subtree roots.
+pub fn merkle_commit_subtrees(
+    byte_len: u32,
+    subtree_byte_len: u32,
+    subtree_roots: &[[u8; 32]],
+) -> Result<MerkleCommitment, MerkleError> {
+    validate_data_len(byte_len as usize)?;
+    validate_data_len(subtree_byte_len as usize)?;
+    if subtree_byte_len > byte_len
+        || !byte_len.is_multiple_of(subtree_byte_len)
+        || subtree_roots.len() != (byte_len / subtree_byte_len) as usize
+        || !subtree_roots.len().is_power_of_two()
+        || subtree_roots.contains(&[0; 32])
+    {
+        return Err(MerkleError::InvalidProof);
+    }
+    let mut nodes = subtree_roots.to_vec();
+    while nodes.len() > 1 {
+        nodes = nodes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| hash_node(&pair[0], &pair[1]))
+            .collect();
+    }
+    Ok(MerkleCommitment {
+        format_version: MERKLE_SUITE_V1,
+        leaf_size: MERKLE_LEAF_SIZE as u16,
+        byte_len,
+        root: bind_root(byte_len, nodes[0]),
     })
 }
 
@@ -301,6 +427,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn compact_subtrees_authenticate_and_recompose_the_complete_commitment() {
+        let bytes = (0..64_u8).collect::<Vec<_>>();
+        let commitment = merkle_commit(&bytes).unwrap();
+        let proofs = (0..4)
+            .map(|index| merkle_open_subtree(&bytes, index, 1).unwrap())
+            .collect::<Vec<_>>();
+        for proof in &proofs {
+            assert_eq!(
+                merkle_verify_subtree(&commitment, proof).unwrap(),
+                proof.subtree_root
+            );
+        }
+        let roots = proofs
+            .iter()
+            .map(|proof| proof.subtree_root)
+            .collect::<Vec<_>>();
+        assert_eq!(merkle_commit_subtrees(64, 16, &roots).unwrap(), commitment);
+
+        let mut substituted = proofs[0].clone();
+        substituted.subtree_root[0] ^= 1;
+        assert!(matches!(
+            merkle_verify_subtree(&commitment, &substituted),
+            Err(MerkleError::RootMismatch)
+        ));
     }
 
     #[test]

@@ -53,13 +53,15 @@ pub use model::{
     canonical_bytes, coding_group_id, coding_group_v2_id, decode_canonical,
 };
 pub use packing::{
-    PackedCatalog, PackedSector, PackedSectorDescriptor, PackedSlot, PackedSourceChunk,
-    PackingError, PackingInput, PackingMetrics, PackingProfile, PackingResult, SourceChunkId,
-    pack_incremental, packing_protected_root, unpack_object, unpack_object_from_sectors,
+    PackedCatalog, PackedSector, PackedSectorDescriptor, PackedSlot, PackedSourceAuthentication,
+    PackedSourceChunk, PackingError, PackingInput, PackingMetrics, PackingProfile, PackingResult,
+    SourceChunkId, pack_incremental, packing_protected_root, unpack_object,
+    unpack_object_from_sectors,
 };
 pub use range::{
     MERKLE_LEAF_SIZE, MERKLE_SUITE_V1, MerkleCommitment, MerkleError, MerkleRangeProof,
-    challenged_leaf, merkle_commit, merkle_open_range, merkle_open_zero_range, merkle_verify_range,
+    MerkleSubtreeProof, challenged_leaf, merkle_commit, merkle_commit_subtrees, merkle_open_range,
+    merkle_open_subtree, merkle_open_zero_range, merkle_verify_range, merkle_verify_subtree,
     merkle_zero_commitment,
 };
 pub use recovery::{
