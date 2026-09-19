@@ -27,7 +27,7 @@ use libp2p::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use mb_core::{
-    CODING_CHALLENGE_COMMITMENT_DOMAIN, CODING_CHALLENGE_REVEAL_DOMAIN,
+    AuthenticatedPackingSource, CODING_CHALLENGE_COMMITMENT_DOMAIN, CODING_CHALLENGE_REVEAL_DOMAIN,
     CODING_FAILURE_REPORT_DOMAIN, CODING_SHARD_OPENING_DOMAIN, CheckpointAuthority,
     CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal, CodingFailureReport,
     CodingGroup, CodingGroupV2, CodingPlanGeometry, CodingProfile, CodingRootManifest,
@@ -41,8 +41,8 @@ use mb_core::{
     UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES,
     V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS,
     V1_SECTOR_SIZE, canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical,
-    merkle_commit, merkle_zero_commitment, pack_incremental, packing_protected_root,
-    replay_coding_transcript, sector_root, unpack_object_from_sectors,
+    merkle_commit, merkle_zero_commitment, pack_incremental, pack_incremental_authenticated,
+    packing_protected_root, replay_coding_transcript, sector_root, unpack_object_from_sectors,
 };
 #[cfg(test)]
 use mb_core::{ParityRoleV2, encode};
@@ -11330,8 +11330,7 @@ async fn build_production_packing(
     revisions: &[SignedRecord<UserRevision>],
     previous: Option<&PackedCatalog>,
 ) -> Result<ProductionPacking> {
-    let mut sources =
-        BTreeMap::<(NodeId, [u8; 32], SectorId), (SectorRef, MerkleCommitment)>::new();
+    let mut sources = PackingSources::new();
     for revision in revisions {
         let protected_root = packing_protected_root(revision.value.protected_root_id);
         let commitments = revision
@@ -11366,8 +11365,17 @@ async fn build_production_packing(
     {
         return Ok(ProductionPacking { catalog });
     }
-    let mut inputs = Vec::with_capacity(sources.len());
-    for ((owner, protected_root, object_id), (reference, source_commitment)) in sources {
+    let previously_authenticated = previous
+        .map(authenticated_source_objects)
+        .transpose()?
+        .unwrap_or_default();
+    let mut inputs = Vec::new();
+    for (&(owner, protected_root, object_id), (reference, source_commitment)) in &sources {
+        if previously_authenticated.get(&(owner, protected_root, object_id))
+            == Some(source_commitment)
+        {
+            continue;
+        }
         let source = if owner == local_id {
             node_blocking(node.clone(), move |node| {
                 node.sector_for_guild(&guild_id, &object_id)
@@ -11455,26 +11463,56 @@ async fn build_production_packing(
         if bytes.len() != V1_SECTOR_SIZE || sector_root(&bytes) != reference.root {
             bail!("packed source sector conflicts with its signed revision");
         }
-        if merkle_commit(&bytes)? != source_commitment {
+        if merkle_commit(&bytes)? != *source_commitment {
             bail!("packed source sector conflicts with its signed Merkle commitment");
         }
         inputs.push(PackingInput {
             owner,
             protected_root,
             object_id,
-            source_commitment: Some(source_commitment),
+            source_commitment: Some(source_commitment.clone()),
             bytes,
         });
     }
-    let result = pack_incremental(
-        PackingProfile {
-            format_version: 1,
-            sector_size: V1_SECTOR_SIZE as u32,
-            slot_size: 16 * 1024,
-        },
-        previous,
-        inputs,
-    )?;
+    let profile = PackingProfile {
+        format_version: 1,
+        sector_size: V1_SECTOR_SIZE as u32,
+        slot_size: 16 * 1024,
+    };
+    if let Some(previous) = previous.filter(|catalog| catalog.format_version == 2) {
+        let previous = previous.clone();
+        let authenticated_sources = sources
+            .into_iter()
+            .map(
+                |((owner, protected_root, object_id), (_, source_commitment))| {
+                    AuthenticatedPackingSource {
+                        owner,
+                        protected_root,
+                        object_id,
+                        source_commitment,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        return node_blocking(node, move |node| {
+            let update = pack_incremental_authenticated(
+                profile,
+                &previous,
+                authenticated_sources,
+                inputs,
+                |descriptor| {
+                    node.sector_for_guild(&guild_id, &descriptor.id)
+                        .map_err(|_| mb_core::PackingError::MissingObject)
+                },
+            )?;
+            node.store_packing_update(guild_id, &update)?;
+            Ok(ProductionPacking {
+                catalog: update.catalog,
+            })
+        })
+        .await;
+    }
+    let result = pack_incremental(profile, previous, inputs)?;
     let stored = result.clone();
     node_blocking(node, move |node| {
         node.store_packing_result(guild_id, &stored)
@@ -11489,24 +11527,16 @@ struct ProductionPacking {
     catalog: PackedCatalog,
 }
 
+type PackingObjectKey = (NodeId, [u8; 32], SectorId);
+type PackingSources = BTreeMap<PackingObjectKey, (SectorRef, MerkleCommitment)>;
+type PackingCommitments = BTreeMap<PackingObjectKey, MerkleCommitment>;
+
 fn advance_unchanged_catalog(
     catalog: &PackedCatalog,
-    sources: &BTreeMap<(NodeId, [u8; 32], SectorId), (SectorRef, MerkleCommitment)>,
+    sources: &PackingSources,
 ) -> Result<Option<PackedCatalog>> {
     catalog.validate()?;
-    let Some(authentication) = &catalog.source_authentication else {
-        return Ok(None);
-    };
-    let mut authenticated = BTreeMap::new();
-    for entry in authentication {
-        let key = (entry.id.owner, entry.id.protected_root, entry.id.object_id);
-        if authenticated
-            .insert(key, entry.source_commitment.clone())
-            .is_some_and(|previous| previous != entry.source_commitment)
-        {
-            return Ok(None);
-        }
-    }
+    let authenticated = authenticated_source_objects(catalog)?;
     let expected = sources
         .iter()
         .map(|(key, (_, commitment))| (*key, commitment.clone()))
@@ -11523,6 +11553,24 @@ fn advance_unchanged_catalog(
     next.id = next.calculate_id()?;
     next.validate()?;
     Ok(Some(next))
+}
+
+fn authenticated_source_objects(catalog: &PackedCatalog) -> Result<PackingCommitments> {
+    catalog.validate()?;
+    let Some(authentication) = &catalog.source_authentication else {
+        return Ok(BTreeMap::new());
+    };
+    let mut authenticated = BTreeMap::new();
+    for entry in authentication {
+        let key = (entry.id.owner, entry.id.protected_root, entry.id.object_id);
+        if authenticated
+            .insert(key, entry.source_commitment.clone())
+            .is_some_and(|previous| previous != entry.source_commitment)
+        {
+            bail!("packing catalog authenticates conflicting source commitments");
+        }
+    }
+    Ok(authenticated)
 }
 
 async fn commit_backup_job(

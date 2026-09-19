@@ -1167,7 +1167,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   tracked. Focused regressions alternate repeated denials under fresh peer
   identities without map growth and verify exact cleanup beside a surviving
   connection; the vendored library tests and strict clippy pass locally.
-- [ ] **M5-43 / P2 — Make small production updates incremental in data and resource cost.**
+- [x] **M5-43 / P2 — Make small production updates incremental in data and resource cost.**
   Snapshot capture assigns every data sector an ID derived from the new
   revision UUID (`crates/mb-node/src/snapshot.rs:729`;
   `crates/mb-core/src/content.rs:37`), which also changes its encryption nonce.
@@ -1185,6 +1185,18 @@ node Clippy gate passed locally. No remote compilation server was used.
   retained multi-owner corpus, asserting actual source reads, transferred
   bytes, new coding work, peak memory, and durable bytes rather than only old
   slot positions. Preserve safe encryption nonce use when changing identities.
+  Revision capture now derives sector IDs from owner, guild, purpose, logical
+  length, and plaintext, so a nonce is reused only for identical plaintext
+  under the same guild key. A metadata-only catalog advance handles no-change
+  revisions with no source reads, packed writes, or new coding descriptors.
+  Changed revisions fetch only source objects absent from the prior authenticated
+  catalog. The incremental packer retains prior proofs and descriptors, loads
+  only packed sectors whose slots change, and durably emits only those sectors.
+  Its metrics expose transferred source bytes, changed coding sectors, packed
+  durable bytes, and peak materialized payload. Focused large multi-owner
+  coverage proves a one-source addition remains below retained-corpus reads and
+  memory while unchanged descriptors remain byte-identical; strict clippy and
+  core tests pass locally.
 - [ ] **M5-44 / P2 — Integrate fair information placement and reusable coding geometry.**
   Production assigns every packed information sector to the checkpoint
   coordinator and passes no other candidate information into the lane builder

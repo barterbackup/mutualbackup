@@ -1047,8 +1047,11 @@ blockers (details, source locations, and regression scenarios are in `TODO.md`):
   connection on both outbound and inbound composite rejection, completes its
   preloaded work with terminal failures, and preserves accepted siblings.
   Focused tests cover repeated fresh-peer denials and sibling isolation.
-- **M5-43:** Unchanged snapshot data gets new IDs/ciphertext, and packing
-  refetches and materializes the retained corpus on every update.
+- **M5-43 (resolved):** Content-scoped sector identities safely reuse unchanged
+  ciphertext. No-change revisions advance catalog metadata without payload or
+  coding work; changed revisions fetch only new sources and load/write only
+  affected packed sectors. Metrics and focused multi-owner tests bound source
+  reads, transfer, coding work, durable bytes, and peak payload memory.
 - **M5-44:** All packed information stays at the checkpoint coordinator;
   production lanes use one real input plus zeros and lack the planned fair
   information placement and reusable geometry.

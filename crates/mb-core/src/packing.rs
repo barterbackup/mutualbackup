@@ -52,6 +52,14 @@ pub struct PackingInput {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedPackingSource {
+    pub owner: NodeId,
+    pub protected_root: [u8; 32],
+    pub object_id: [u8; 32],
+    pub source_commitment: MerkleCommitment,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SourceChunkId {
     pub owner: NodeId,
@@ -391,12 +399,20 @@ pub struct PackingMetrics {
     pub virtual_zero_bytes: u64,
     pub reused_slots: u64,
     pub changed_sectors: u64,
+    pub peak_materialized_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackingResult {
     pub catalog: PackedCatalog,
     pub sectors: Vec<PackedSector>,
+    pub metrics: PackingMetrics,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackingUpdate {
+    pub catalog: PackedCatalog,
+    pub changed_sectors: Vec<PackedSector>,
     pub metrics: PackingMetrics,
 }
 
@@ -779,12 +795,296 @@ pub fn pack_incremental(
             virtual_zero_bytes,
             reused_slots,
             changed_sectors,
+            peak_materialized_bytes: logical_bytes
+                .saturating_add(sector_count as u64 * u64::from(profile.sector_size)),
         },
         catalog,
         sectors,
     };
     result.validate()?;
     Ok(result)
+}
+
+/// Incrementally update an authenticated catalog. Only source objects absent
+/// from the previous catalog need payloads in `new_inputs`; `load_previous`
+/// is called only for packed sectors whose slot layout changes.
+pub fn pack_incremental_authenticated<F>(
+    profile: PackingProfile,
+    previous: &PackedCatalog,
+    sources: Vec<AuthenticatedPackingSource>,
+    new_inputs: Vec<PackingInput>,
+    mut load_previous: F,
+) -> Result<PackingUpdate, PackingError>
+where
+    F: FnMut(&PackedSectorDescriptor) -> Result<Vec<u8>, PackingError>,
+{
+    profile.validate()?;
+    previous.validate()?;
+    if previous.format_version != 2 || previous.profile != profile {
+        return Err(PackingError::ProfileChanged);
+    }
+    let previous_authentication = previous
+        .source_authentication
+        .as_ref()
+        .ok_or(PackingError::InvalidCatalog)?
+        .iter()
+        .map(|entry| (entry.id, entry))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let previous_chunks = previous
+        .sectors
+        .iter()
+        .flat_map(|sector| sector.slots.iter())
+        .filter_map(PackedSlot::source)
+        .map(|source| (source.id, source))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let previous_virtual = previous
+        .sectors
+        .iter()
+        .flat_map(|sector| &sector.slots)
+        .filter_map(|slot| match slot {
+            PackedSlot::VirtualZero {
+                source: Some(source),
+            } => Some(source.id),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let input_count = new_inputs.len();
+    let mut inputs = new_inputs
+        .into_iter()
+        .map(|input| ((input.owner, input.protected_root, input.object_id), input))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if inputs.len() != input_count || sources.is_empty() {
+        return Err(PackingError::InvalidInput);
+    }
+    let mut seen_sources = std::collections::BTreeSet::new();
+    let mut desired = std::collections::BTreeMap::<SourceChunkId, InputChunk>::new();
+    let chunks_per_source = profile.sector_size / profile.slot_size;
+    for source in sources {
+        let object = (source.owner, source.protected_root, source.object_id);
+        if source.owner == NodeId([0; 32])
+            || source.protected_root == [0; 32]
+            || source.object_id == [0; 32]
+            || source.source_commitment.byte_len != profile.sector_size
+            || source.source_commitment.validate().is_err()
+            || !seen_sources.insert(object)
+        {
+            return Err(PackingError::InvalidInput);
+        }
+        if let Some(input) = inputs.remove(&object) {
+            if input.source_commitment.as_ref() != Some(&source.source_commitment)
+                || input.bytes.len() != profile.sector_size as usize
+            {
+                return Err(PackingError::InvalidInput);
+            }
+            for chunk in input_chunks(profile, vec![input])? {
+                desired.insert(chunk.source.id, chunk);
+            }
+            continue;
+        }
+        for chunk_index in 0..chunks_per_source {
+            let id = SourceChunkId {
+                owner: source.owner,
+                protected_root: source.protected_root,
+                object_id: source.object_id,
+                chunk_index,
+            };
+            let prior = previous_chunks
+                .get(&id)
+                .ok_or(PackingError::MissingObject)?;
+            let authentication = previous_authentication
+                .get(&id)
+                .ok_or(PackingError::InvalidCatalog)?;
+            if authentication.source_commitment != source.source_commitment
+                || prior.logical_len != profile.slot_size
+            {
+                return Err(PackingError::InvalidInput);
+            }
+            let virtual_zero = previous_virtual.contains(&id);
+            desired.insert(
+                id,
+                InputChunk {
+                    source: (*prior).clone(),
+                    authentication: Some((*authentication).clone()),
+                    bytes: Vec::new(),
+                    virtual_zero,
+                },
+            );
+        }
+    }
+    if !inputs.is_empty() || desired.len() > MAX_PACKED_CHUNKS {
+        return Err(PackingError::InvalidInput);
+    }
+
+    let slots_per_sector = profile.slots_per_sector()? as usize;
+    let previous_slot_count = previous.sectors.len() * slots_per_sector;
+    let mut assignments = vec![None::<SourceChunkId>; previous_slot_count];
+    let mut assigned = std::collections::BTreeSet::new();
+    let mut reused_slots = 0_u64;
+    for (flat_index, slot) in previous
+        .sectors
+        .iter()
+        .flat_map(|sector| &sector.slots)
+        .enumerate()
+    {
+        if let Some(source) = slot.source()
+            && desired.contains_key(&source.id)
+        {
+            assignments[flat_index] = Some(source.id);
+            assigned.insert(source.id);
+            reused_slots += 1;
+        }
+    }
+    let mut pending_by_owner = std::collections::BTreeMap::<NodeId, Vec<SourceChunkId>>::new();
+    for id in desired.keys().filter(|id| !assigned.contains(id)) {
+        pending_by_owner.entry(id.owner).or_default().push(*id);
+    }
+    for pending in pending_by_owner.values_mut() {
+        pending.sort();
+        pending.reverse();
+    }
+    let mut allocator = StableSlotAllocator::new(assignments, slots_per_sector);
+    loop {
+        let mut progress = false;
+        for owner in pending_by_owner.keys().copied().collect::<Vec<_>>() {
+            let Some(id) = pending_by_owner.get_mut(&owner).and_then(Vec::pop) else {
+                continue;
+            };
+            allocator.assign(id);
+            progress = true;
+        }
+        if !progress {
+            break;
+        }
+    }
+    let mut assignments = allocator.into_assignments();
+    while assignments.last().is_some_and(Option::is_none) {
+        assignments.pop();
+    }
+    let sector_count = assignments.len().div_ceil(slots_per_sector);
+    assignments.resize(sector_count * slots_per_sector, None);
+
+    let mut descriptors = Vec::with_capacity(sector_count);
+    let mut changed_sectors = Vec::new();
+    let mut virtual_zero_bytes = 0_u64;
+    for sector_index in 0..sector_count {
+        let mut slots = Vec::with_capacity(slots_per_sector);
+        for slot_index in 0..slots_per_sector {
+            let assignment = assignments[sector_index * slots_per_sector + slot_index];
+            let slot = match assignment {
+                Some(id) => {
+                    let chunk = &desired[&id];
+                    if chunk.virtual_zero {
+                        PackedSlot::VirtualZero {
+                            source: Some(chunk.source.clone()),
+                        }
+                    } else {
+                        PackedSlot::Data(chunk.source.clone())
+                    }
+                }
+                None => PackedSlot::VirtualZero { source: None },
+            };
+            if matches!(slot, PackedSlot::VirtualZero { .. }) {
+                virtual_zero_bytes += u64::from(profile.slot_size);
+            }
+            slots.push(slot);
+        }
+        if let Some(prior) = previous.sectors.get(sector_index)
+            && prior.slots == slots
+        {
+            descriptors.push(prior.clone());
+            continue;
+        }
+
+        let mut bytes = if let Some(prior) = previous.sectors.get(sector_index) {
+            let bytes = load_previous(prior)?;
+            if bytes.len() != profile.sector_size as usize
+                || *blake3::hash(&bytes).as_bytes() != prior.flat_root
+                || merkle_commit(&bytes).map_err(|_| PackingError::InvalidCatalog)?
+                    != prior.commitment
+            {
+                return Err(PackingError::InvalidCatalog);
+            }
+            bytes
+        } else {
+            vec![0; profile.sector_size as usize]
+        };
+        for (slot_index, slot) in slots.iter().enumerate() {
+            let start = slot_index * profile.slot_size as usize;
+            let end = start + profile.slot_size as usize;
+            match slot {
+                PackedSlot::Data(source) => {
+                    let chunk = &desired[&source.id];
+                    if chunk.bytes.is_empty() {
+                        let preserved = previous
+                            .sectors
+                            .get(sector_index)
+                            .and_then(|sector| sector.slots.get(slot_index))
+                            .is_some_and(|old| old.source().map(|old| old.id) == Some(source.id));
+                        if !preserved {
+                            return Err(PackingError::MissingObject);
+                        }
+                    } else {
+                        bytes[start..end].fill(0);
+                        bytes[start..start + chunk.bytes.len()].copy_from_slice(&chunk.bytes);
+                    }
+                }
+                PackedSlot::VirtualZero { .. } => bytes[start..end].fill(0),
+            }
+        }
+        let commitment = merkle_commit(&bytes).map_err(|_| PackingError::InvalidCatalog)?;
+        let mut descriptor = PackedSectorDescriptor {
+            id: [0; 32],
+            sector_index: sector_index as u32,
+            flat_root: *blake3::hash(&bytes).as_bytes(),
+            commitment,
+            slots,
+        };
+        descriptor.id = descriptor.calculate_id(profile)?;
+        descriptors.push(descriptor.clone());
+        changed_sectors.push(PackedSector { descriptor, bytes });
+    }
+    let source_authentication = desired
+        .values()
+        .map(|chunk| {
+            chunk
+                .authentication
+                .clone()
+                .ok_or(PackingError::InvalidCatalog)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut catalog = PackedCatalog {
+        id: [0; 32],
+        format_version: 2,
+        revision: previous
+            .revision
+            .checked_add(1)
+            .ok_or(PackingError::InvalidCatalog)?,
+        parent: Some(previous.id),
+        profile,
+        sectors: descriptors,
+        source_authentication: Some(source_authentication),
+    };
+    catalog.id = catalog.calculate_id()?;
+    catalog.validate()?;
+    let removed_sectors = previous.sectors.len().saturating_sub(catalog.sectors.len()) as u64;
+    Ok(PackingUpdate {
+        metrics: PackingMetrics {
+            logical_bytes: desired.len() as u64 * u64::from(profile.slot_size),
+            source_upload_bytes: desired.values().map(|chunk| chunk.bytes.len() as u64).sum(),
+            packed_sector_bytes: changed_sectors.len() as u64 * u64::from(profile.sector_size),
+            virtual_zero_bytes,
+            reused_slots,
+            changed_sectors: changed_sectors.len() as u64 + removed_sectors,
+            peak_materialized_bytes: desired
+                .values()
+                .map(|chunk| chunk.bytes.len() as u64)
+                .sum::<u64>()
+                .saturating_add(changed_sectors.len() as u64 * u64::from(profile.sector_size))
+                .saturating_add(u64::from(profile.sector_size)),
+        },
+        catalog,
+        changed_sectors,
+    })
 }
 
 /// Recover one logical protected-root object from authenticated packed sector
@@ -1066,6 +1366,87 @@ mod tests {
             packed.validate(),
             Err(PackingError::InvalidCatalog)
         ));
+    }
+
+    #[test]
+    fn authenticated_update_reads_and_writes_only_changed_packed_sectors() {
+        let owners = owners(8);
+        let mut original_inputs = Vec::new();
+        let mut sources = Vec::new();
+        for (index, owner) in owners.iter().copied().enumerate() {
+            let bytes = vec![index as u8 + 1; 64];
+            let commitment = merkle_commit(&bytes).unwrap();
+            original_inputs.push(PackingInput {
+                owner,
+                protected_root: [1; 32],
+                object_id: [index as u8 + 1; 32],
+                source_commitment: Some(commitment.clone()),
+                bytes,
+            });
+            sources.push(AuthenticatedPackingSource {
+                owner,
+                protected_root: [1; 32],
+                object_id: [index as u8 + 1; 32],
+                source_commitment: commitment,
+            });
+        }
+        let previous = pack_incremental(profile(), None, original_inputs).unwrap();
+        let changed_bytes = vec![99; 64];
+        let changed_commitment = merkle_commit(&changed_bytes).unwrap();
+        sources.push(AuthenticatedPackingSource {
+            owner: owners[0],
+            protected_root: [1; 32],
+            object_id: [99; 32],
+            source_commitment: changed_commitment.clone(),
+        });
+        let prior_bytes = previous
+            .sectors
+            .iter()
+            .map(|sector| (sector.descriptor.id, sector.bytes.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut reads = 0_u64;
+        let update = pack_incremental_authenticated(
+            profile(),
+            &previous.catalog,
+            sources,
+            vec![PackingInput {
+                owner: owners[0],
+                protected_root: [1; 32],
+                object_id: [99; 32],
+                source_commitment: Some(changed_commitment),
+                bytes: changed_bytes,
+            }],
+            |descriptor| {
+                reads += 1;
+                prior_bytes
+                    .get(&descriptor.id)
+                    .cloned()
+                    .ok_or(PackingError::MissingObject)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(update.catalog.parent, Some(previous.catalog.id));
+        assert_eq!(update.metrics.source_upload_bytes, 64);
+        assert!(reads as usize <= update.changed_sectors.len());
+        assert!(reads < previous.sectors.len() as u64);
+        assert_eq!(
+            update.metrics.packed_sector_bytes,
+            update.changed_sectors.len() as u64 * u64::from(profile().sector_size)
+        );
+        assert_eq!(
+            update.metrics.changed_sectors,
+            update.changed_sectors.len() as u64
+        );
+        assert!(
+            update.metrics.peak_materialized_bytes
+                < previous.sectors.len() as u64 * u64::from(profile().sector_size)
+        );
+        for sector in &update.changed_sectors {
+            let descriptor = &update.catalog.sectors[sector.descriptor.sector_index as usize];
+            assert_eq!(&sector.descriptor, descriptor);
+            assert_eq!(merkle_commit(&sector.bytes).unwrap(), descriptor.commitment);
+        }
     }
 
     #[test]

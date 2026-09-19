@@ -13,8 +13,8 @@ use mb_core::{
     CodingShardOpening, CodingVerificationTranscript, DynamicGuildState, EndpointRecord,
     GuildCheckpoint, GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, KeyMaterial,
     MAX_GUILD_EVENT_TAIL, Member, MemberSignature, NodeId, PackedSector, PackingProfile,
-    PackingResult, QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy,
-    QuorumRule, RECOVERY_LOCATOR_DOMAIN, RecoveryBundle, RecoveryLocator,
+    PackingResult, PackingUpdate, QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis,
+    QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN, RecoveryBundle, RecoveryLocator,
     STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, Seed,
     ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
     USER_REVISION_DOMAIN, UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_PAGES,
@@ -3445,6 +3445,37 @@ impl Node {
         result.validate()?;
         let mut records = Vec::with_capacity(result.sectors.len());
         for sector in &result.sectors {
+            records.push((
+                "packed-sector".to_owned(),
+                packed_record_id(&guild_id, &sector.descriptor.id),
+                canonical_bytes(&PackedSectorRecord {
+                    format_version: 1,
+                    guild_id,
+                    sector: sector.clone(),
+                })?,
+            ));
+        }
+        self.control.put_records(&records)?;
+        Ok(())
+    }
+
+    pub(crate) fn store_packing_update(
+        &mut self,
+        guild_id: [u8; 32],
+        update: &PackingUpdate,
+    ) -> Result<()> {
+        update.catalog.validate()?;
+        let mut records = Vec::with_capacity(update.changed_sectors.len());
+        for sector in &update.changed_sectors {
+            validate_packed_sector(update.catalog.profile, sector)?;
+            if update
+                .catalog
+                .sectors
+                .get(sector.descriptor.sector_index as usize)
+                != Some(&sector.descriptor)
+            {
+                anyhow::bail!("packed update sector is absent from its catalog");
+            }
             records.push((
                 "packed-sector".to_owned(),
                 packed_record_id(&guild_id, &sector.descriptor.id),
