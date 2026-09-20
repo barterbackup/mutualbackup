@@ -1092,8 +1092,9 @@ Milestone 5. Exact source locations and correction gates are in `TODO.md`:
   certificate is sent only to signers. That can leave too few independent
   current publishers for seed recovery, and an active nonsigner has no normal
   way to install the missed head or sign its successor.
-- **M5-47:** A fast empty event tail starts a five-second cutoff that repeatedly
-  cancels the only advancing request on a legitimate slower relay or Tor path.
+- **M5-47 (resolved):** A fast empty event tail preserves other requests for
+  their bounded logical lifetime, allowing a slower relay or Tor path to
+  advance the local event head.
 - **M5-48:** Automatic backup still shares one quiet timestamp and a fixed
   UUID-first selector across roots, so a noisy root can starve a quiet sibling.
 - **M5-49 and M5-50 (resolved):** Revision format 5 derives stable IDs with a

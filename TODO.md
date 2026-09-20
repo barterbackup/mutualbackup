@@ -1275,7 +1275,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   authorization. Gate the minimum policy quorum, failed finalization, a later
   rejoin, loss of each finalized member, seed recovery, and a subsequent
   checkpoint.
-- [ ] **M5-47 / P1 — Let slow advancing event tails beat fast empty peers.**
+- [x] **M5-47 / P1 — Let slow advancing event tails beat fast empty peers.**
   The event synchronizer starts a fixed five-second deadline after any valid
   empty response and cancels every still-pending request when it expires
   (`crates/mb-node/src/network/p2p.rs:110`, `:7724`). A reachable relay or Tor
@@ -1285,6 +1285,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   peer. Preserve bounded progress without discarding the only advancing
   request on every pass. Gate repeated fast-empty responses beside an
   advancing response arriving after five seconds on a supported slow path.
+  Empty tails now leave outstanding paths alive for the full 90-second logical
+  request lifetime. The selector therefore accepts a later valid advancing
+  tail while retaining a hard bound for stalled peers. The scaled slow-path
+  regression and strict node Clippy pass locally.
 - [ ] **M5-48 / P1 — Debounce and schedule automatic backups per protected root.**
   Every changed root rewrites one global quiet-period timestamp
   (`crates/mb-node/src/node.rs:1138`, `:1166`), while eligible roots are scanned

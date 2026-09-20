@@ -107,11 +107,14 @@ const RECOVERY_TRANSCRIPT_FETCH_CONCURRENCY: usize = 8;
 const RECOVERY_VARIABLE_GROUP_CONCURRENCY: usize = 8;
 const SHARD_FETCH_ATTEMPTS: usize = 3;
 const PEER_EXCHANGE_INTERVAL: Duration = Duration::from_secs(5);
-const EVENT_TAIL_ADVANCE_GRACE: Duration = Duration::from_secs(5);
 const MAX_EXCHANGED_ENDPOINT_RECORDS: usize = 64;
 const PREFERRED_PATH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const LOGICAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+// A valid empty tail is only evidence that one peer is current. Keep other
+// requests alive for their full bounded logical lifetime so a slow relay or
+// Tor path can still supply the advancing tail.
+const EVENT_TAIL_ADVANCE_WAIT: Duration = LOGICAL_REQUEST_TIMEOUT;
 const REQUEST_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_REQUEST_TRANSPORT_ATTEMPTS: u8 = 6;
 const CLOSED_CONNECTION_PATH_RETENTION: Duration = Duration::from_secs(40);
@@ -7696,7 +7699,7 @@ async fn sync_guild_event_page(
         });
     }
     let Some((source, selected)) =
-        select_advancing_guild_tail(&state, requests, EVENT_TAIL_ADVANCE_GRACE).await
+        select_advancing_guild_tail(&state, requests, EVENT_TAIL_ADVANCE_WAIT).await
     else {
         return Ok(0);
     };
@@ -12751,7 +12754,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_tail_selection_prefers_bounded_advancing_response() {
+    async fn event_tail_selection_keeps_slow_advancing_requests_bounded() {
         type TailRequest =
             Pin<Box<dyn Future<Output = (NodeId, Result<GuildEventTail>)> + Send + 'static>>;
 
@@ -12809,6 +12812,8 @@ mod tests {
         };
         let fast_source = keys[0].node_id();
         let advancing_source = keys[1].node_id();
+        assert_eq!(EVENT_TAIL_ADVANCE_WAIT, LOGICAL_REQUEST_TIMEOUT);
+        assert!(EVENT_TAIL_ADVANCE_WAIT > REQUEST_TIMEOUT);
         let requests = FuturesUnordered::<TailRequest>::new();
         let fast_empty = empty.clone();
         requests.push(Box::pin(async move { (fast_source, Ok(fast_empty)) }));
