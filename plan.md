@@ -1105,12 +1105,13 @@ Milestone 5. Exact source locations and correction gates are in `TODO.md`:
   checkpoint cannot introduce one or downgrade to it.
 - **M5-52:** The production packer cannot yet advance a retained version-three
   revision without signed source commitments.
-- **M5-53 and M5-54:** Incremental packed reads do not use available any-`k`
-  reconstruction, and packed `flat_root` is not cryptographically bound to the
+- **M5-53 (resolved):** Incremental and replacement packed reads use bounded
+  any-`k` reconstruction and verify the reconstructed catalog commitment.
+- **M5-54:** Packed `flat_root` is not cryptographically bound to the
   owner-authenticated Merkle commitment before checkpoint signing.
 - **M5-55 and M5-56:** Greedy lane allocation can reject feasible fragmented
-  capacity, and lanes are ordered by content ID rather than adjacent catalog
-  range, so the claimed reusable range geometry is absent.
+  capacity. Lanes now follow adjacent catalog indexes, but exact compatible
+  holder-geometry reuse across runs is still absent.
 - **M5-57:** Relay reservation state still races across overlapping first
   requests and expiry during renewal, stranding provisional capacity or
   exceeding the configured cap; provisional entries can also receive circuits.

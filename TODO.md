@@ -1354,7 +1354,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   path that keeps old committed layouts recoverable until retirement. Gate an
   upgrade from a legacy format-7 head, another backup by each owner/root, and
   restore of both legacy and new retained revisions.
-- [ ] **M5-53 / P1 — Reconstruct prior packed sectors from any surviving `k` shards.**
+- [x] **M5-53 / P1 — Reconstruct prior packed sectors from any surviving `k` shards.**
   Incremental repacking selects a packed sector's assigned information holder
   and reads only that holder (`crates/mb-node/src/network/p2p.rs:11857`), even
   though restore already has an any-`k` reconstruction path (`:10575`). This
@@ -1365,6 +1365,11 @@ node Clippy gate passed locally. No remote compilation server was used.
   bounded reconstruction path with commitment checks. Gate incremental update
   and member replacement with the assigned holder absent and each valid set of
   `k` surviving shards.
+  The distributed packed-sector loader now invokes the same bounded variable
+  shard reconstruction used by restore. It first tries the assigned holder,
+  then fetches any sufficient information/parity set, verifies the reconstructed
+  Merkle commitment, and finally checks both catalog roots. Focused recovery and
+  packed-lane regressions plus strict node Clippy pass locally.
 - [ ] **M5-54 / P1 — Bind each packed flat root to its authenticated bytes.**
   Catalog authentication recomposes the Merkle commitment from owner-signed
   source proofs but does not bind `descriptor.flat_root` to that commitment
@@ -1396,6 +1401,9 @@ node Clippy gate passed locally. No remote compilation server was used.
   planned range coalescing. Order by catalog range, reuse exact compatible
   holder geometry across bounded runs, and gate descriptors whose ID order
   differs from index order across an incremental update.
+  Lane input is now ordered by canonical `sector_index`, with a regression that
+  reverses ID/input order and still obtains adjacent ranges. Exact compatible
+  holder-geometry reuse across runs remains open.
 - [ ] **M5-57 / P1 — Serialize relay reservation admission, acceptance, and expiry.**
   A first reservation is inserted before its acceptance settles
   (`vendor/libp2p-relay/src/behaviour.rs:346`). An overlapping request at the

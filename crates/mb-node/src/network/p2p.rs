@@ -11154,7 +11154,7 @@ fn build_packed_coding_lanes(
     mut sectors: Vec<PackedSectorDescriptor>,
     context: PackedCodingContext<'_>,
 ) -> Result<Vec<VariableCodingLane>> {
-    sectors.sort_by_key(|sector| sector.id);
+    sectors.sort_by_key(|sector| sector.sector_index);
     let profile = variable_coding_profile(context.peers)?;
     let data_shards = usize::from(profile.data_shards);
     let parity_shards = usize::from(profile.parity_shards);
@@ -11525,8 +11525,7 @@ async fn stage_locally_available_information(
                 let Some(descriptor) = packed_information.get(&sector_id) else {
                     continue;
                 };
-                load_distributed_packed_sector(node.clone(), p2p, local_id, guild_id, descriptor)
-                    .await?
+                load_distributed_packed_sector(node.clone(), p2p, descriptor).await?
             }
         };
         if merkle_commit(&bytes)? != role.sector.commitment {
@@ -11837,9 +11836,7 @@ async fn build_production_packing(
             let Some(descriptor) = descriptor else {
                 return result;
             };
-            let bytes =
-                load_distributed_packed_sector(node.clone(), p2p, local_id, guild_id, &descriptor)
-                    .await?;
+            let bytes = load_distributed_packed_sector(node.clone(), p2p, &descriptor).await?;
             distributed.insert(descriptor.id, bytes);
         }
     }
@@ -11857,17 +11854,15 @@ async fn build_production_packing(
 async fn load_distributed_packed_sector(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
-    local_id: NodeId,
-    guild_id: [u8; 32],
     descriptor: &PackedSectorDescriptor,
 ) -> Result<Vec<u8>> {
     let descriptor_id = descriptor.id;
     let descriptor_commitment = descriptor.commitment.clone();
-    let (group, shard_index, holder) = node_blocking(node.clone(), move |node| {
+    let (group, shard_index, roster) = node_blocking(node.clone(), move |node| {
         let state = node
             .dynamic_guild_state()?
             .context("distributed packed read requires dynamic guild state")?;
-        state
+        let (group, shard_index) = state
             .coding_groups
             .iter()
             .filter(|retained| retained.retired_at_event.is_none())
@@ -11883,23 +11878,28 @@ async fn load_distributed_packed_sector(
                                 && information.sector.id == descriptor_id
                                 && information.sector.commitment == descriptor_commitment =>
                         {
-                            Some((retained.group.clone(), index as u16, information.owner))
+                            Some((retained.group.clone(), index))
                         }
                         _ => None,
                     })
             })
-            .context("prior packed sector has no active distributed placement")
+            .context("prior packed sector has no active distributed placement")?;
+        let roster = node
+            .guild_summary()?
+            .context("distributed packed read requires an installed guild")?
+            .peers;
+        Ok((group, shard_index, roster))
     })
     .await?;
-    let bytes = if holder == local_id {
-        let group_id = group.id;
-        node_blocking(node, move |node| {
-            node.variable_shard_for_guild(&guild_id, &group_id, shard_index)
-        })
-        .await?
-    } else {
-        p2p.variable_shard(holder, &group, shard_index).await?
-    };
+    let bytes = reconstruct_variable_shard_from_peers(
+        node,
+        p2p,
+        &group,
+        shard_index,
+        &roster,
+        &Mutex::new(BTreeSet::new()),
+    )
+    .await?;
     if bytes.len() != V1_SECTOR_SIZE
         || sector_root(&bytes) != descriptor.flat_root
         || merkle_commit(&bytes)? != descriptor.commitment
@@ -13321,8 +13321,16 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
         let mut capacity = initial_capacity.clone();
+        let descriptor_indexes = packed
+            .catalog
+            .sectors
+            .iter()
+            .map(|descriptor| (descriptor.id, descriptor.sector_index))
+            .collect::<BTreeMap<_, _>>();
+        let mut shuffled_sectors = packed.catalog.sectors.clone();
+        shuffled_sectors.reverse();
         let lanes = build_packed_coding_lanes(
-            packed.catalog.sectors.clone(),
+            shuffled_sectors,
             PackedCodingContext {
                 guild_id,
                 geometry_id: Uuid::from_bytes([122; 16]),
@@ -13332,6 +13340,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lanes.len(), 3);
+        for (lane_index, lane) in lanes.iter().enumerate() {
+            for (offset, role) in lane.geometry.information.iter().enumerate() {
+                assert_eq!(
+                    descriptor_indexes[&role.sector.id] as usize,
+                    lane_index * usize::from(lane.geometry.profile.data_shards) + offset
+                );
+            }
+        }
         assert!(lanes.iter().all(|lane| {
             lane.geometry
                 .information
