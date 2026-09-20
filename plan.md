@@ -1122,6 +1122,13 @@ Milestone 5. Exact source locations and correction gates are in `TODO.md`:
   admissions cannot receive circuits, and pending renewals retain their bounded
   capacity claim across expiry until acceptance settles.
 
+The fresh local correction tree passes `cargo fmt --all -- --check`, locked
+all-target workspace tests, and warning-free locked all-target workspace
+Clippy. The provisioned Btrfs/network acceptance gate has not been rerun after
+M5-46 through M5-57, so the formal milestone closure remains pending that
+runtime evidence. All compilation and execution was local; no remote
+compilation server was used.
+
 The M5-42 rejected-connection cleanup was source-reviewed and found to remove
 only the rejected connection while preserving accepted siblings. This review
 ran no builds, tests, daemons, runtime probes, or remote compilation.
