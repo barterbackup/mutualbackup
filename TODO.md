@@ -1260,7 +1260,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   DHT recovery scenarios pass. All compilation and execution were local; no
   remote compilation server was used.
 
-- [ ] **M5-46 / P1 — Make quorum checkpoint completion recoverable and convergent.**
+- [x] **M5-46 / P1 — Make quorum checkpoint completion recoverable and convergent.**
   Production accepts finalization on exactly the configured quorum
   (`crates/mb-node/src/network/p2p.rs:12191`, `:12282`) and sends the
   certificate only to its signers (`:12238`, `:12243`). With a five-member
@@ -1275,6 +1275,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   authorization. Gate the minimum policy quorum, failed finalization, a later
   rejoin, loss of each finalized member, seed recovery, and a subsequent
   checkpoint.
+  Certificate staging and finalization now target all reachable active members,
+  including nonsigners. Completion requires the policy quorum and up to four
+  durable holders, which leaves the three independent publishers required by
+  five-member seed recovery after any holder loses its copy. A quorum-certified
+  checkpoint may be stored without a local signature but must extend the exact
+  local head. Peer exchange advertises signed head locators and walks a bounded,
+  verified parent chain so a rejoining member converges before later signing.
+  Focused recovery/wire tests and strict node Clippy pass locally.
 - [x] **M5-47 / P1 — Let slow advancing event tails beat fast empty peers.**
   The event synchronizer starts a fixed five-second deadline after any valid
   empty response and cancels every still-pending request when it expires

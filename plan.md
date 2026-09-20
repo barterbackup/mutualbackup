@@ -1088,10 +1088,10 @@ remote compilation server was used.
 Follow-up source-only review of `56bb57d..f7d0503` on 2026-09-20 reopens
 Milestone 5. Exact source locations and correction gates are in `TODO.md`:
 
-- **M5-46:** A checkpoint can finalize on only a policy quorum while its
-  certificate is sent only to signers. That can leave too few independent
-  current publishers for seed recovery, and an active nonsigner has no normal
-  way to install the missed head or sign its successor.
+- **M5-46 (resolved):** Checkpoint completion requires enough staged/finalized
+  holders for the seed-recovery publisher rule, disseminates certificates to
+  nonsigners, and periodically catches rejoining members up over verified
+  parent chains.
 - **M5-47 (resolved):** A fast empty event tail preserves other requests for
   their bounded logical lifetime, allowing a slower relay or Tor path to
   advance the local event head.

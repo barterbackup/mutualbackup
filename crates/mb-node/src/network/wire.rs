@@ -23,6 +23,12 @@ pub(super) struct PeerProfile {
     pub(super) endpoint: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct CheckpointHead {
+    pub(super) generation: u64,
+    pub(super) hash: [u8; 32],
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub(super) enum CodingPathClass {
     Direct,
@@ -261,6 +267,9 @@ pub(super) enum PeerRequest {
         checkpoint_hash: [u8; 32],
         page_index: u32,
     },
+    GetCheckpointHead {
+        guild_id: [u8; 32],
+    },
     #[cfg(test)]
     BuildRecoveryRecord {
         publication_id: [u8; 16],
@@ -323,6 +332,7 @@ impl PeerRequest {
                 | Self::GetVariableEmergencyShard { .. }
                 | Self::GetPreparedRevisionPage { .. }
                 | Self::GetCheckpointPage { .. }
+                | Self::GetCheckpointHead { .. }
                 | Self::BackupStatus { .. }
                 | Self::GetGuildGenesis { .. }
                 | Self::GetGuildEventTail { .. }
@@ -386,6 +396,7 @@ impl PeerRequest {
             Self::PutCheckpointPage { .. } => Some("put-checkpoint-page"),
             Self::SignCheckpoint { .. } => Some("sign-checkpoint"),
             Self::FinalizeCheckpoint { .. } => Some("finalize-checkpoint"),
+            Self::GetCheckpointHead { .. } => Some("get-checkpoint-head"),
             #[cfg(test)]
             Self::BuildRecoveryRecord { .. } => Some("build-recovery-record"),
             #[cfg(test)]
@@ -419,6 +430,7 @@ impl PeerRequest {
             | Self::SignCheckpoint { guild_id, .. }
             | Self::FinalizeCheckpoint { guild_id, .. }
             | Self::GetCheckpointPage { guild_id, .. }
+            | Self::GetCheckpointHead { guild_id }
             | Self::BackupStatus { guild_id, .. } => Some(*guild_id),
             Self::AbortCodingAttempt { plan } => Some(plan.value.geometry.guild_id),
             Self::ExchangeEndpoints { guild_id } | Self::CodingCapacity { guild_id, .. } => {
@@ -523,6 +535,7 @@ pub(super) enum PeerResponse {
         page_hash: [u8; 32],
         bytes: Vec<u8>,
     },
+    CheckpointHead(Option<CheckpointHead>),
     #[cfg(test)]
     RecoveryRecord(Box<SignedRecord<PublishedRecoveryRecord>>),
     #[cfg(test)]

@@ -1013,6 +1013,10 @@ fn execute_read_request(
                 bytes,
             })
         }
+        PeerRequest::GetCheckpointHead { guild_id } => Ok(PeerResponse::CheckpointHead(
+            node.checkpoint_head(&guild_id)?
+                .map(|(generation, hash)| wire::CheckpointHead { generation, hash }),
+        )),
         PeerRequest::BackupStatus {
             guild_id,
             revision_id,
@@ -1391,6 +1395,10 @@ fn execute_peer_request(
         PeerRequest::GetPreparedRevisionPage { .. } => {
             bail!("revision-page read was sent to a mutation worker")
         }
+        PeerRequest::GetCheckpointHead { guild_id } => Ok(PeerResponse::CheckpointHead(
+            node.checkpoint_head(&guild_id)?
+                .map(|(generation, hash)| wire::CheckpointHead { generation, hash }),
+        )),
         PeerRequest::BackupStatus { .. } => {
             bail!("backup status read was sent to a mutation worker")
         }

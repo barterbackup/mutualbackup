@@ -2936,6 +2936,20 @@ impl P2pClient {
         Ok(())
     }
 
+    async fn checkpoint_head(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+    ) -> Result<Option<crate::network::wire::CheckpointHead>> {
+        let response = self
+            .call(peer, PeerRequest::GetCheckpointHead { guild_id })
+            .await?;
+        let PeerResponse::CheckpointHead(head) = response else {
+            bail!("peer returned the wrong checkpoint-head response");
+        };
+        Ok(head)
+    }
+
     pub(crate) async fn sign_checkpoint(
         &self,
         peer: NodeId,
@@ -7040,6 +7054,9 @@ pub async fn run_peer_exchange(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result
         if let Err(error) = sync_guild_events_once(node.clone(), &p2p).await {
             tracing::warn!(%error, "guild event-tail synchronization failed");
         }
+        if let Err(error) = sync_checkpoint_head_once(node.clone(), &p2p).await {
+            tracing::warn!(%error, "certified checkpoint-head synchronization failed");
+        }
         if let Err(error) = reconcile_recovery_key_epoch_once(node.clone(), &p2p).await {
             tracing::warn!(%error, "recovery-key epoch reconciliation failed");
         }
@@ -7051,6 +7068,94 @@ pub async fn run_peer_exchange(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result
         }
         tokio::time::sleep(PEER_EXCHANGE_INTERVAL).await;
     }
+}
+
+async fn sync_checkpoint_head_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<usize> {
+    let (guild, local_head, local_id) = node_blocking(node.clone(), |node| {
+        let guild = node
+            .guild_summary()?
+            .context("checkpoint synchronization requires an installed guild")?;
+        Ok((
+            guild.clone(),
+            node.checkpoint_head(&guild.guild_id)?,
+            node.keys().node_id(),
+        ))
+    })
+    .await?;
+    let guild_id = guild.guild_id;
+    let mut requests = FuturesUnordered::new();
+    for peer in guild
+        .peers
+        .iter()
+        .filter(|peer| peer.member.node_id != local_id)
+    {
+        for endpoint in &peer.endpoints {
+            if let Ok(address) = endpoint.parse::<Multiaddr>() {
+                let _ = p2p.add_peer_address(peer.member.node_id, address).await;
+            }
+        }
+        let source = peer.member.node_id;
+        requests.push(async move { (source, p2p.checkpoint_head(source, guild_id).await) });
+    }
+    let local_generation = local_head.map(|(generation, _)| generation).unwrap_or(0);
+    let local_hash = local_head.map(|(_, hash)| hash);
+    let mut candidates = Vec::new();
+    while let Some((source, result)) = requests.next().await {
+        if let Ok(Some(head)) = result
+            && head.generation > local_generation
+            && head.hash != [0; 32]
+        {
+            candidates.push((std::cmp::Reverse(head.generation), source, head.hash));
+        }
+    }
+    candidates.sort();
+    for (std::cmp::Reverse(generation), source, head_hash) in candidates {
+        let distance = generation.saturating_sub(local_generation);
+        if distance > 1_024 {
+            tracing::warn!(%source, generation, local_generation, "checkpoint catch-up chain exceeds the bounded page walk");
+            continue;
+        }
+        let mut chain = Vec::with_capacity(distance as usize);
+        let mut expected_generation = generation;
+        let mut cursor = head_hash;
+        let mut complete = false;
+        while expected_generation > local_generation {
+            let checkpoint = match fetch_p2p_checkpoint(p2p, source, guild_id, cursor).await {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => {
+                    tracing::debug!(%source, %error, "checkpoint catch-up source could not serve its certified chain");
+                    break;
+                }
+            };
+            if checkpoint.checkpoint.generation != expected_generation
+                || checkpoint.checkpoint.guild_id != guild_id
+                || checkpoint.hash()? != cursor
+            {
+                break;
+            }
+            cursor = checkpoint.checkpoint.parent.unwrap_or([0; 32]);
+            chain.push(checkpoint);
+            expected_generation -= 1;
+            complete = if expected_generation == local_generation {
+                match local_hash {
+                    Some(hash) => cursor == hash,
+                    None => cursor == [0; 32],
+                }
+            } else {
+                false
+            };
+        }
+        if !complete {
+            continue;
+        }
+        chain.reverse();
+        let installed = chain.len();
+        for checkpoint in chain {
+            node_blocking(node.clone(), move |node| node.store_checkpoint(&checkpoint)).await?;
+        }
+        return Ok(installed);
+    }
+    Ok(0)
 }
 
 async fn reconcile_recovery_key_epoch_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
@@ -8750,6 +8855,13 @@ fn required_recovery_publishers(active_members: usize) -> Result<usize> {
         bail!("cold recovery requires another active guild member");
     }
     Ok((active_members - 1).min(3))
+}
+
+fn checkpoint_recovery_holder_requirement(active_members: usize) -> Result<usize> {
+    if active_members < 2 {
+        bail!("recoverable checkpoints require at least two active guild members");
+    }
+    Ok(active_members.min(4))
 }
 
 fn recovery_bundle_shape_is_valid(bundle: &mb_core::RecoveryBundle) -> bool {
@@ -12321,17 +12433,12 @@ async fn commit_backup_job(
     };
     quorum.verify()?;
     let certificate_bytes = canonical_bytes(&quorum)?;
-    let certificate_signers = quorum
-        .signatures
-        .iter()
-        .map(|signature| signature.signer)
-        .collect::<BTreeSet<_>>();
     let certificate_holders = publish_p2p_checkpoint_object(
         node.clone(),
         p2p,
         local_id,
         &peers,
-        Some(&certificate_signers),
+        None,
         CheckpointObjectKind::Certificate,
         guild_id,
         checkpoint_hash,
@@ -12343,31 +12450,40 @@ async fn commit_backup_job(
     if !certificate_holders.contains(&local_id) {
         bail!("local checkpoint coordinator did not stage its certificate");
     }
-    for signer in certificate_holders
+    let required_holders = required_signers.max(checkpoint_recovery_holder_requirement(
+        quorum.checkpoint.members.len(),
+    )?);
+    if certificate_holders.len() < required_holders {
+        bail!(
+            "checkpoint certificate reached only {} guild members but recoverability requires {required_holders}",
+            certificate_holders.len()
+        );
+    }
+    for holder in certificate_holders
         .into_iter()
-        .filter(|signer| *signer != local_id)
+        .filter(|holder| *holder != local_id)
     {
         finalization_requests.push(async move {
             (
-                signer,
-                p2p.finalize_checkpoint(signer, guild_id, checkpoint_hash)
+                holder,
+                p2p.finalize_checkpoint(holder, guild_id, checkpoint_hash)
                     .await,
             )
         });
     }
-    while let Some((signer, result)) = finalization_requests.next().await {
+    while let Some((holder, result)) = finalization_requests.next().await {
         match result {
             Ok(()) => {
-                finalized.insert(signer);
+                finalized.insert(holder);
             }
             Err(error) => {
-                tracing::debug!(%signer, %error, "guild member did not finalize checkpoint");
+                tracing::debug!(%holder, %error, "guild member did not finalize checkpoint");
             }
         }
     }
-    if finalized.len() + 1 < required_signers {
+    if finalized.len() + 1 < required_holders {
         bail!(
-            "checkpoint can finalize on only {} guild members but policy requires {required_signers}",
+            "checkpoint can finalize on only {} guild members but recoverability requires {required_holders}",
             finalized.len() + 1
         );
     }
@@ -13027,6 +13143,12 @@ mod tests {
         assert_eq!(required_recovery_publishers(4).unwrap(), 3);
         assert_eq!(required_recovery_publishers(5).unwrap(), 3);
         assert_eq!(required_recovery_publishers(256).unwrap(), 3);
+        assert!(checkpoint_recovery_holder_requirement(1).is_err());
+        assert_eq!(checkpoint_recovery_holder_requirement(2).unwrap(), 2);
+        assert_eq!(checkpoint_recovery_holder_requirement(3).unwrap(), 3);
+        assert_eq!(checkpoint_recovery_holder_requirement(4).unwrap(), 4);
+        assert_eq!(checkpoint_recovery_holder_requirement(5).unwrap(), 4);
+        assert_eq!(checkpoint_recovery_holder_requirement(256).unwrap(), 4);
     }
 
     #[tokio::test]

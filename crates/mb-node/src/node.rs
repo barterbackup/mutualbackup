@@ -915,6 +915,13 @@ impl NodeReader {
         checkpoint_page(&self.control, guild_id, checkpoint_hash, page_index)
     }
 
+    pub(crate) fn checkpoint_head(&self, guild_id: &[u8; 32]) -> Result<Option<(u64, [u8; 32])>> {
+        Ok(self
+            .control
+            .checkpoint_head(guild_id)?
+            .map(|(generation, hash, _)| (generation, hash)))
+    }
+
     pub(crate) fn prepared_revision_page(
         &self,
         guild_id: &[u8; 32],
@@ -5813,9 +5820,7 @@ impl Node {
         checkpoint.verify()?;
         self.validate_local_member(&checkpoint.checkpoint, true)?;
         self.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, false)?;
-        if !checkpoint.has_signature(self.keys.node_id()) {
-            anyhow::bail!("local node did not authorize this checkpoint");
-        }
+        self.validate_checkpoint_transition(&checkpoint.checkpoint)?;
         let hash = checkpoint.hash()?;
         let body = canonical_bytes(&checkpoint.checkpoint)?;
         let certificate = canonical_bytes(checkpoint)?;
@@ -6167,6 +6172,13 @@ impl Node {
         page_index: u32,
     ) -> Result<(u32, Vec<u8>)> {
         checkpoint_page(&self.control, guild_id, checkpoint_hash, page_index)
+    }
+
+    pub(crate) fn checkpoint_head(&self, guild_id: &[u8; 32]) -> Result<Option<(u64, [u8; 32])>> {
+        Ok(self
+            .control
+            .checkpoint_head(guild_id)?
+            .map(|(generation, hash, _)| (generation, hash)))
     }
 
     fn validate_local_member(
