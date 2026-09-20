@@ -1356,11 +1356,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   unauthenticated catalog and a v2-to-v1 transition.
   Checkpoint signing now applies a current-format authorization gate after
   structural validation: every newly signed format-7 body must carry a
-  version-2 authenticated catalog. Historical version-1 catalogs remain
-  decodable and verifiable for recovery, but cannot be signed into another
-  current checkpoint or accepted as a downgrade. The focused node regression,
-  complete core suite, and strict core/node library Clippy pass locally.
-- [ ] **M5-52 / P1 — Migrate retained legacy revisions through authenticated packing.**
+  root-bound version-3 or migration version-4 authenticated catalog.
+  Historical version-1 and version-2 catalogs remain decodable and verifiable
+  for recovery, but cannot be signed into another current checkpoint or
+  accepted as a downgrade. The focused node regression, complete core suite,
+  and strict core/node library Clippy pass locally.
+- [x] **M5-52 / P1 — Migrate retained legacy revisions through authenticated packing.**
   Version-three revisions remain valid and readable without signed source
   commitments, but production packing requires commitments on every retained
   revision (`crates/mb-node/src/network/p2p.rs:11631`). The backup path retains
@@ -1372,6 +1373,15 @@ node Clippy gate passed locally. No remote compilation server was used.
   path that keeps old committed layouts recoverable until retirement. Gate an
   upgrade from a legacy format-7 head, another backup by each owner/root, and
   restore of both legacy and new retained revisions.
+  Catalog version 4 now carries owner-signed migration bindings from each
+  retained legacy revision's signed flat root to its source Merkle commitment.
+  Production obtains a binding once, verifies both hashes against the source,
+  reuses it from later catalogs, and can recover unavailable source bytes from
+  the prior packed layout. Checkpoint validation requires an exact binding for
+  every legacy authenticated source and rejects mismatches or unused bindings.
+  Core migration/serialization/checkpoint regressions, focused node binding
+  and catalog-advance regressions, and strict core/node library Clippy pass
+  locally.
 - [x] **M5-53 / P1 — Reconstruct prior packed sectors from any surviving `k` shards.**
   Incremental repacking selects a packed sector's assigned information holder
   and reads only that holder (`crates/mb-node/src/network/p2p.rs:11857`), even
@@ -1388,7 +1398,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   then fetches any sufficient information/parity set, verifies the reconstructed
   Merkle commitment, and finally checks both catalog roots. Focused recovery and
   packed-lane regressions plus strict node Clippy pass locally.
-- [ ] **M5-54 / P1 — Bind each packed flat root to its authenticated bytes.**
+- [x] **M5-54 / P1 — Bind each packed flat root to its authenticated bytes.**
   Catalog authentication recomposes the Merkle commitment from owner-signed
   source proofs but does not bind `descriptor.flat_root` to that commitment
   (`crates/mb-core/src/packing.rs:301`). Coding copies the asserted flat root
@@ -1400,6 +1410,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   Remove the redundant root or add independently verifiable binding evidence.
   Gate a false-flat-root plan with valid source proofs, Merkle openings, parity,
   and verifier transcript, rejecting it before checkpoint signature.
+  Authenticated catalog versions 3 and 4 now define the canonical packed root
+  as the already authenticated Merkle commitment root and reject any unequal
+  `flat_root`. Current checkpoint signing admits only those root-bound catalog
+  versions, while historical versions 1 and 2 remain readable. Coding accepts
+  the Merkle root as its information root, and focused catalog, coding, and
+  checkpoint tests reject substituted or mismatched roots. The complete core
+  suite and strict core/node library Clippy pass locally.
 - [x] **M5-55 / P1 — Plan feasible multi-lane placement without greedy capacity fragmentation.**
   Information and parity selection treat every positive remaining capacity
   alike (`crates/mb-node/src/network/p2p.rs:10897`, `:11098`) and plan/debit

@@ -87,8 +87,9 @@ complete local provisioned gate passed on 2026-09-18. Follow-up source review
 of `8135e0b..da8974a` found the M5-36 through M5-44 blockers in `TODO.md`.
 Those source corrections are implemented, and the complete local M5-45
 correction gate passed on 2026-09-19. Follow-up source-only review of
-`56bb57d..f7d0503` on 2026-09-20 found M5-46 through M5-57, so Milestone 5 is
-reopened. Milestone 6 waits for those corrections and a new closure gate.
+`56bb57d..f7d0503` on 2026-09-20 found M5-46 through M5-57, so Milestone 5 was
+reopened. Those corrections are now implemented; Milestone 6 waits for the new
+closure gate.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -495,11 +496,11 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 4 have passed. Milestone 5 is
-reopened for M5-46 through M5-57 after its historical M5-45 gate. Later wire or
-durable-state changes require the review and gate of the milestone that owns
-them. Build and run all subsequent validation locally; do not use a remote
-compilation server.
+than a daemon prerequisite. Milestones 0 through 4 have passed. Milestone 5's
+M5-46 through M5-57 corrections are implemented after its historical M5-45
+gate, and its new closure gate is pending. Later wire or durable-state changes
+require the review and gate of the milestone that owns them. Build and run all
+subsequent validation locally; do not use a remote compilation server.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -713,9 +714,10 @@ integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
 **Current position:** Milestones 0 through 4 are passed. The M5-36 through
-M5-44 corrections and M5-45 gate remain historical evidence, but source-only
-review of `56bb57d..f7d0503` on 2026-09-20 found M5-46 through M5-57 and
-reopened Milestone 5. Milestone 6 waits for their correction and a new gate.
+M5-44 corrections and M5-45 gate remain historical evidence. The M5-46 through
+M5-57 findings from the 2026-09-20 source review are implemented, and
+Milestone 5 remains open for its new closure gate. Milestone 6 waits for that
+gate.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1101,15 +1103,18 @@ Milestone 5. Exact source locations and correction gates are in `TODO.md`:
   separate owner-secret key and protected-root scope. Same-root unchanged data
   retains reuse, cross-root recipes no longer collide, public plaintext guesses
   do not reproduce IDs, and legacy revision formats remain readable.
-- **M5-51 (resolved):** Current format-7 signing requires an authenticated
-  version-2 catalog. Historical version-1 catalogs remain readable, but a new
-  checkpoint cannot introduce one or downgrade to it.
-- **M5-52:** The production packer cannot yet advance a retained version-three
-  revision without signed source commitments.
+- **M5-51 (resolved):** Current format-7 signing requires a root-bound
+  authenticated version-3 or migration version-4 catalog. Historical
+  version-1 and version-2 catalogs remain readable, but a new checkpoint cannot
+  introduce or downgrade to one.
+- **M5-52 (resolved):** Owner-signed migration bindings authenticate retained
+  version-3 revision bytes once, remain reusable in version-4 catalogs, and
+  keep prior packed copies available for later repacking and restore.
 - **M5-53 (resolved):** Incremental and replacement packed reads use bounded
   any-`k` reconstruction and verify the reconstructed catalog commitment.
-- **M5-54:** Packed `flat_root` is not cryptographically bound to the
-  owner-authenticated Merkle commitment before checkpoint signing.
+- **M5-54 (resolved):** Current catalogs use the authenticated Merkle root as
+  their canonical packed root, reject a distinct `flat_root`, and carry that
+  root through coding plans and checkpoint coverage.
 - **M5-55 and M5-56 (resolved):** A whole-run domain-capacity planner accepts
   feasible fragmented capacity, rejects infeasible demand, orders lanes by
   adjacent catalog index, and reuses compatible holder geometry across runs.
@@ -1550,15 +1555,15 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (reopened)
+### Milestone 5 — efficient and flexible data/guild protocol (closure gate pending)
 
 M5-36 through M5-44 are implemented, and the complete M5-45 correction gate
 passed locally on 2026-09-19. The final committed tree passed formatting,
 locked all-target workspace tests, warning-free locked all-target Clippy, and
 the full provisioned filesystem/network acceptance script. A later source-only
-review found M5-46 through M5-57; those unchecked findings supersede the
-closure status. Completion requires their correction, focused regressions, and
-a fresh local source/workspace/provisioned gate before Milestone 6 begins.
+review found M5-46 through M5-57; their corrections and focused regressions are
+now implemented. Completion requires a fresh local source/workspace/provisioned
+gate before Milestone 6 begins.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and
