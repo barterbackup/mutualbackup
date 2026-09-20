@@ -1392,7 +1392,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   Remove the redundant root or add independently verifiable binding evidence.
   Gate a false-flat-root plan with valid source proofs, Merkle openings, parity,
   and verifier transcript, rejecting it before checkpoint signature.
-- [ ] **M5-55 / P1 — Plan feasible multi-lane placement without greedy capacity fragmentation.**
+- [x] **M5-55 / P1 — Plan feasible multi-lane placement without greedy capacity fragmentation.**
   Information and parity selection treat every positive remaining capacity
   alike (`crates/mb-node/src/network/p2p.rs:10897`, `:11098`) and plan/debit
   lanes sequentially without look-ahead or backtracking (`:11163`). A two-lane
@@ -1402,7 +1402,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   that preserves enough distinct future domains while maintaining fairness.
   Gate fragmented feasible capacities for initial production and replacement
   coding, plus a truly infeasible control case.
-- [ ] **M5-56 / P2 — Build and reuse coding geometry over adjacent packed ranges.**
+  Packed placement is now planned over the complete ordered lane run. A
+  Havel-Hakimi-style highest-remaining-domain allocation preserves capacity for
+  later lanes, selects an actual holder within each domain, and forces both the
+  planned information and parity roles into geometry construction. The exact
+  `1,1,2,2,2,2` case succeeds and a nine-slot control fails as infeasible.
+- [x] **M5-56 / P2 — Build and reuse coding geometry over adjacent packed ranges.**
   `build_packed_coding_lanes` sorts descriptors by content-derived sector ID
   before chunking (`crates/mb-node/src/network/p2p.rs:11153`), so its lanes are
   unrelated to canonical catalog `sector_index`. It also derives each new
@@ -1413,7 +1418,9 @@ node Clippy gate passed locally. No remote compilation server was used.
   differs from index order across an incremental update.
   Lane input is now ordered by canonical `sector_index`, with a regression that
   reverses ID/input order and still obtains adjacent ranges. Exact compatible
-  holder-geometry reuse across runs remains open.
+  holder geometry is now preferred from the preceding lane whenever the
+  whole-run capacity plan permits it. Regressions prove stable adjacent holder
+  layouts and repeatable geometry; strict node Clippy passes locally.
 - [ ] **M5-57 / P1 — Serialize relay reservation admission, acceptance, and expiry.**
   A first reservation is inserted before its acceptance settles
   (`vendor/libp2p-relay/src/behaviour.rs:346`). An overlapping request at the

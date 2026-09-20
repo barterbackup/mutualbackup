@@ -10837,7 +10837,7 @@ fn variable_coding_lane(
     sources: &[VariableInformationInput<'_>],
     peers: &[crate::GuildPeer],
 ) -> Result<VariableCodingLane> {
-    variable_coding_lane_with_capacity(guild_id, revision_id, ordinal, sources, peers, None)
+    variable_coding_lane_with_capacity(guild_id, revision_id, ordinal, sources, peers, None, None)
 }
 
 fn variable_coding_lane_with_capacity(
@@ -10847,6 +10847,7 @@ fn variable_coding_lane_with_capacity(
     sources: &[VariableInformationInput<'_>],
     peers: &[crate::GuildPeer],
     parity_capacity: Option<&BTreeMap<NodeId, u64>>,
+    required_parity: Option<&[NodeId]>,
 ) -> Result<VariableCodingLane> {
     let profile = variable_coding_profile(peers)?;
     let data_shards = usize::from(profile.data_shards);
@@ -10912,14 +10913,34 @@ fn variable_coding_lane_with_capacity(
     candidates.sort_by_key(|(score, node_id, _)| (*score, *node_id));
     let mut placement_domains = used_domains;
     let mut parity_peers = Vec::with_capacity(parity_count);
-    for (_, _, peer) in &candidates {
-        if parity_capacity
-            .is_none_or(|capacity| capacity.get(&peer.member.node_id).copied().unwrap_or(0) > 0)
-            && placement_domains.insert(peer.member.failure_domain.clone())
-        {
-            parity_peers.push(*peer);
-            if parity_peers.len() == parity_count {
-                break;
+    if let Some(required) = required_parity {
+        if required.len() != parity_count {
+            bail!("planned variable parity has the wrong width");
+        }
+        for node_id in required {
+            let peer = peers
+                .iter()
+                .find(|peer| peer.member.node_id == *node_id)
+                .context("planned variable parity holder is not active")?;
+            if used_nodes.contains(node_id)
+                || parity_capacity
+                    .is_some_and(|capacity| capacity.get(node_id).copied().unwrap_or(0) == 0)
+                || !placement_domains.insert(peer.member.failure_domain.clone())
+            {
+                bail!("planned variable parity holder is unavailable or reuses a domain");
+            }
+            parity_peers.push(peer);
+        }
+    } else {
+        for (_, _, peer) in &candidates {
+            if parity_capacity
+                .is_none_or(|capacity| capacity.get(&peer.member.node_id).copied().unwrap_or(0) > 0)
+                && placement_domains.insert(peer.member.failure_domain.clone())
+            {
+                parity_peers.push(*peer);
+                if parity_peers.len() == parity_count {
+                    break;
+                }
             }
         }
     }
@@ -11086,71 +11107,127 @@ async fn coding_capacity_by_peer(
     Ok(capacity)
 }
 
-fn packed_information_hosts(
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PackedLanePlacement {
+    information: Vec<NodeId>,
+    parity: Vec<NodeId>,
+}
+
+fn plan_packed_lane_placements(
     guild_id: [u8; 32],
-    sectors: &[PackedSectorDescriptor],
+    lane_sizes: &[usize],
     peers: &[crate::GuildPeer],
     placement_capacity: &BTreeMap<NodeId, u64>,
-    information_load: &BTreeMap<NodeId, u64>,
     parity_shards: usize,
-) -> Result<Vec<NodeId>> {
-    let mut selected = Vec::with_capacity(sectors.len());
-    let mut used_domains = BTreeSet::new();
-    for (row, sector) in sectors.iter().enumerate() {
-        let remaining_information = sectors.len() - row - 1;
-        let mut candidates = peers
-            .iter()
-            .filter(|peer| {
-                placement_capacity
-                    .get(&peer.member.node_id)
-                    .copied()
-                    .unwrap_or(0)
-                    > 0
-                    && !used_domains.contains(&peer.member.failure_domain)
+) -> Result<Vec<PackedLanePlacement>> {
+    let mut remaining = placement_capacity.clone();
+    let peer_by_id = peers
+        .iter()
+        .map(|peer| (peer.member.node_id, peer))
+        .collect::<BTreeMap<_, _>>();
+    let mut placements = Vec::<PackedLanePlacement>::with_capacity(lane_sizes.len());
+    for (ordinal, information_count) in lane_sizes.iter().copied().enumerate() {
+        let storage_count = information_count + parity_shards;
+        let remaining_lane_count = lane_sizes.len() - ordinal;
+        let previous = placements.last();
+        let previous_order = previous
+            .into_iter()
+            .flat_map(|placement| placement.information.iter().chain(&placement.parity))
+            .filter_map(|node_id| {
+                peer_by_id
+                    .get(node_id)
+                    .map(|peer| peer.member.failure_domain.as_str())
             })
-            .map(|peer| {
+            .enumerate()
+            .map(|(rank, domain)| (domain, rank))
+            .collect::<BTreeMap<_, _>>();
+        let mut domains = BTreeMap::<String, Vec<NodeId>>::new();
+        for peer in peers {
+            if remaining.get(&peer.member.node_id).copied().unwrap_or(0) > 0 {
+                domains
+                    .entry(peer.member.failure_domain.clone())
+                    .or_default()
+                    .push(peer.member.node_id);
+            }
+        }
+        let mut ranked = domains
+            .iter()
+            .map(|(domain, nodes)| {
+                let capacity = nodes
+                    .iter()
+                    .map(|node| remaining.get(node).copied().unwrap_or(0))
+                    .sum::<u64>()
+                    .min(remaining_lane_count as u64);
                 let mut hasher =
-                    blake3::Hasher::new_derive_key("mutualbackup packed information placement v1");
+                    blake3::Hasher::new_derive_key("mutualbackup packed lane planner v1");
                 hasher.update(&guild_id);
-                hasher.update(&sector.id);
-                hasher.update(&peer.member.node_id.0);
+                hasher.update(&(ordinal as u64).to_be_bytes());
+                hasher.update(domain.as_bytes());
                 (
-                    information_load
-                        .get(&peer.member.node_id)
+                    std::cmp::Reverse(capacity),
+                    previous_order
+                        .get(domain.as_str())
                         .copied()
-                        .unwrap_or(0),
+                        .unwrap_or(usize::MAX),
                     *hasher.finalize().as_bytes(),
-                    peer.member.node_id,
-                    peer.member.failure_domain.clone(),
+                    domain,
                 )
             })
             .collect::<Vec<_>>();
-        candidates.sort_by_key(|(load, score, node_id, _)| (*load, *score, *node_id));
-        let candidate = candidates.into_iter().find(|(_, _, node_id, domain)| {
-            let mut reserved_domains = used_domains.clone();
-            reserved_domains.insert(domain.clone());
-            let remaining_domains = peers
-                .iter()
-                .filter(|peer| {
-                    peer.member.node_id != *node_id
-                        && placement_capacity
-                            .get(&peer.member.node_id)
-                            .copied()
-                            .unwrap_or(0)
-                            > 0
-                        && !reserved_domains.contains(&peer.member.failure_domain)
-                })
-                .map(|peer| peer.member.failure_domain.as_str())
-                .collect::<BTreeSet<_>>()
-                .len();
-            remaining_domains >= remaining_information + parity_shards
+        ranked.sort_by_key(|(capacity, previous, score, domain)| {
+            (*capacity, *previous, *score, domain.as_str())
         });
-        let (_, _, node_id, domain) = candidate
-            .context("packed information has too few distinct domains with available capacity")?;
-        used_domains.insert(domain);
-        selected.push(node_id);
+        if ranked.len() < storage_count {
+            bail!("packed coding capacity cannot satisfy every lane");
+        }
+        let selected_domains = ranked
+            .into_iter()
+            .take(storage_count)
+            .map(|(_, _, _, domain)| domain)
+            .collect::<BTreeSet<_>>();
+        let mut ordered_domains = previous
+            .into_iter()
+            .flat_map(|placement| placement.information.iter().chain(&placement.parity))
+            .filter_map(|node_id| peer_by_id.get(node_id))
+            .map(|peer| &peer.member.failure_domain)
+            .filter(|domain| selected_domains.contains(*domain))
+            .collect::<Vec<_>>();
+        for domain in &selected_domains {
+            if !ordered_domains.contains(domain) {
+                ordered_domains.push(domain);
+            }
+        }
+        let mut holders = Vec::with_capacity(storage_count);
+        for domain in ordered_domains {
+            let previous_holder = previous.into_iter().find_map(|placement| {
+                placement
+                    .information
+                    .iter()
+                    .chain(&placement.parity)
+                    .find(|node_id| {
+                        peer_by_id[*node_id].member.failure_domain == *domain
+                            && remaining.get(*node_id).copied().unwrap_or(0) > 0
+                    })
+                    .copied()
+            });
+            let holder = previous_holder.or_else(|| {
+                domains[domain]
+                    .iter()
+                    .copied()
+                    .max_by_key(|node_id| (remaining.get(node_id).copied().unwrap_or(0), *node_id))
+            });
+            let holder = holder.context("selected packed domain has no remaining holder")?;
+            *remaining
+                .get_mut(&holder)
+                .context("selected packed holder has no capacity record")? -= 1;
+            holders.push(holder);
+        }
+        placements.push(PackedLanePlacement {
+            information: holders[..information_count].to_vec(),
+            parity: holders[information_count..].to_vec(),
+        });
     }
-    Ok(selected)
+    Ok(placements)
 }
 
 fn build_packed_coding_lanes(
@@ -11161,17 +11238,22 @@ fn build_packed_coding_lanes(
     let profile = variable_coding_profile(context.peers)?;
     let data_shards = usize::from(profile.data_shards);
     let parity_shards = usize::from(profile.parity_shards);
-    let mut information_load = BTreeMap::<NodeId, u64>::new();
-    let mut lanes = Vec::with_capacity(sectors.len().div_ceil(data_shards));
-    for (ordinal, lane_sectors) in sectors.chunks(data_shards).enumerate() {
-        let owners = packed_information_hosts(
-            context.guild_id,
-            lane_sectors,
-            context.peers,
-            context.placement_capacity,
-            &information_load,
-            parity_shards,
-        )?;
+    let lane_sizes = sectors
+        .chunks(data_shards)
+        .map(<[PackedSectorDescriptor]>::len)
+        .collect::<Vec<_>>();
+    let placements = plan_packed_lane_placements(
+        context.guild_id,
+        &lane_sizes,
+        context.peers,
+        context.placement_capacity,
+        parity_shards,
+    )?;
+    let mut lanes = Vec::with_capacity(lane_sizes.len());
+    for (ordinal, (lane_sectors, placement)) in
+        sectors.chunks(data_shards).zip(placements).enumerate()
+    {
+        let owners = placement.information;
         let mut references = Vec::with_capacity(lane_sectors.len());
         for descriptor in lane_sectors {
             if descriptor.commitment.byte_len != profile.shard_size {
@@ -11200,6 +11282,7 @@ fn build_packed_coding_lanes(
             &sources,
             context.peers,
             Some(&*context.placement_capacity),
+            Some(&placement.parity),
         )?;
         lane.packed_information = lane_sectors
             .iter()
@@ -11213,7 +11296,6 @@ fn build_packed_coding_lanes(
             *available = available
                 .checked_sub(1)
                 .context("selected information holder capacity was exhausted")?;
-            *information_load.entry(owner).or_default() += 1;
         }
         for parity in &lane.geometry.parity {
             let available = context
@@ -11337,6 +11419,7 @@ async fn build_cross_user_coding_lanes(
             &sources,
             context.peers,
             Some(&*context.parity_capacity),
+            None,
         )?;
         for parity in &lane.geometry.parity {
             let available = context
@@ -13359,6 +13442,25 @@ mod tests {
                 .iter()
                 .all(|role| !role.sector.virtual_zero)
         }));
+        let holder_geometry = |lane: &VariableCodingLane| {
+            (
+                lane.geometry
+                    .information
+                    .iter()
+                    .map(|role| role.owner)
+                    .collect::<Vec<_>>(),
+                lane.geometry
+                    .parity
+                    .iter()
+                    .map(|role| role.holder)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert!(
+            lanes
+                .windows(2)
+                .all(|lanes| holder_geometry(&lanes[0]) == holder_geometry(&lanes[1]))
+        );
         let placements = lanes
             .iter()
             .flat_map(|lane| {
@@ -13404,6 +13506,49 @@ mod tests {
                 .map(|lane| lane.geometry)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn packed_lane_planner_handles_fragmented_feasible_capacity() {
+        let peers = (0_u8..6)
+            .map(|index| {
+                let keys = KeyMaterial::from_seed(&Seed::from_bytes([index + 140; 32]));
+                crate::GuildPeer {
+                    member: Member {
+                        node_id: keys.node_id(),
+                        recovery_public_key: keys.recovery_public_key(),
+                        failure_domain: format!("fragmented-domain-{index}"),
+                    },
+                    endpoints: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let capacity = peers
+            .iter()
+            .enumerate()
+            .map(|(index, peer)| (peer.member.node_id, if index < 2 { 1 } else { 2 }))
+            .collect::<BTreeMap<_, _>>();
+        let placements =
+            plan_packed_lane_placements([141; 32], &[3, 3], &peers, &capacity, 2).unwrap();
+        assert_eq!(placements.len(), 2);
+        assert!(placements.iter().all(|placement| {
+            placement.information.len() == 3
+                && placement.parity.len() == 2
+                && placement
+                    .information
+                    .iter()
+                    .chain(&placement.parity)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    == 5
+        }));
+
+        let infeasible = peers
+            .iter()
+            .enumerate()
+            .map(|(index, peer)| (peer.member.node_id, if index < 3 { 1 } else { 2 }))
+            .collect::<BTreeMap<_, _>>();
+        assert!(plan_packed_lane_placements([141; 32], &[3, 3], &peers, &infeasible, 2).is_err());
     }
 
     #[test]
@@ -13658,6 +13803,7 @@ mod tests {
             }],
             &peers,
             Some(&capacity),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -13682,6 +13828,7 @@ mod tests {
                 }],
                 &peers,
                 Some(&insufficient),
+                None,
             )
             .is_err()
         );

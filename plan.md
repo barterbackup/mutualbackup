@@ -1110,9 +1110,9 @@ Milestone 5. Exact source locations and correction gates are in `TODO.md`:
   any-`k` reconstruction and verify the reconstructed catalog commitment.
 - **M5-54:** Packed `flat_root` is not cryptographically bound to the
   owner-authenticated Merkle commitment before checkpoint signing.
-- **M5-55 and M5-56:** Greedy lane allocation can reject feasible fragmented
-  capacity. Lanes now follow adjacent catalog indexes, but exact compatible
-  holder-geometry reuse across runs is still absent.
+- **M5-55 and M5-56 (resolved):** A whole-run domain-capacity planner accepts
+  feasible fragmented capacity, rejects infeasible demand, orders lanes by
+  adjacent catalog index, and reuses compatible holder geometry across runs.
 - **M5-57:** Relay reservation state still races across overlapping first
   requests and expiry during renewal, stranding provisional capacity or
   exceeding the configured cap; provisional entries can also receive circuits.
