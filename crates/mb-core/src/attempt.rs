@@ -133,7 +133,8 @@ pub struct CodingAttemptPlan {
     pub coding_coordinator: NodeId,
     pub verification_coordinator: NodeId,
     pub expires_at_unix_seconds: u64,
-    /// Flat roots from the signed user revisions, aligned with `information`.
+    /// Canonical roots aligned with `information`. Historical inputs use flat
+    /// roots; root-bound packed inputs use their authenticated Merkle root.
     /// Virtual-zero inputs use the all-zero sentinel. Version one plans omit
     /// this field and retain their original canonical layout.
     pub information_roots: Option<Vec<[u8; 32]>>,
@@ -506,9 +507,11 @@ pub fn encode_coding_attempt(
         };
         if merkle_commit(&bytes).map_err(|_| CodingAttemptError::InvalidInformation)?
             != role.sector.commitment
-            || plan
-                .information_root(index)
-                .is_some_and(|root| !role.sector.virtual_zero && sector_root(&bytes) != root)
+            || plan.information_root(index).is_some_and(|root| {
+                !role.sector.virtual_zero
+                    && root != role.sector.commitment.root
+                    && sector_root(&bytes) != root
+            })
         {
             return Err(CodingAttemptError::InvalidInformation);
         }
@@ -879,6 +882,22 @@ mod tests {
             .group,
             group
         );
+        let mut commitment_rooted_plan = rooted_plan.value.clone();
+        commitment_rooted_plan.information_roots = Some(
+            information
+                .iter()
+                .map(|bytes| merkle_commit(bytes).unwrap().root)
+                .collect(),
+        );
+        let commitment_rooted_plan =
+            SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, commitment_rooted_plan, &keys[6])
+                .unwrap();
+        encode_coding_attempt(
+            &commitment_rooted_plan,
+            information.iter().cloned().map(Some).collect(),
+            &keys[7],
+        )
+        .unwrap();
         let mut wrong_root = rooted_plan.value.clone();
         wrong_root.information_roots.as_mut().unwrap()[0] = [99; 32];
         let wrong_root =

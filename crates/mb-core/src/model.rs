@@ -710,6 +710,7 @@ impl GuildCheckpoint {
         let mut revision_sectors = std::collections::BTreeMap::new();
         let mut scoped_revision_sectors = std::collections::BTreeMap::new();
         let mut revision_commitments = std::collections::BTreeMap::new();
+        let mut revision_flat_roots = std::collections::BTreeMap::new();
         let mut revision_heads =
             std::collections::BTreeMap::<(NodeId, Uuid), (u64, [u8; 32], u64)>::new();
         let mut fences = std::collections::BTreeMap::<(NodeId, u64), [u8; 32]>::new();
@@ -840,13 +841,33 @@ impl GuildCheckpoint {
                 revision_sectors
                     .entry(reference.id)
                     .or_insert((revision.value.owner, reference.clone()));
+                if revision_flat_roots
+                    .insert(
+                        (
+                            revision.value.owner,
+                            packing_protected_root(revision.value.protected_root_id),
+                            reference.id,
+                        ),
+                        reference.root,
+                    )
+                    .is_some_and(|previous| previous != reference.root)
+                {
+                    return Err(ModelError::InvalidCheckpoint);
+                }
                 if let Some(commitment) = revision
                     .value
                     .sector_commitments
                     .as_ref()
                     .and_then(|commitments| commitments.get(sector_index))
                     && revision_commitments
-                        .insert(reference.id, commitment.clone())
+                        .insert(
+                            (
+                                revision.value.owner,
+                                packing_protected_root(revision.value.protected_root_id),
+                                reference.id,
+                            ),
+                            commitment.clone(),
+                        )
                         .is_some_and(|previous| previous != *commitment)
                 {
                     return Err(ModelError::InvalidCheckpoint);
@@ -915,11 +936,51 @@ impl GuildCheckpoint {
             }
             match (catalog.format_version, &catalog.source_authentication) {
                 (1, None) => {}
-                (2, Some(authentication)) => {
+                (2 | 3, Some(authentication)) => {
                     if authentication.iter().any(|entry| {
-                        revision_commitments.get(&entry.id.object_id)
-                            != Some(&entry.source_commitment)
+                        revision_commitments.get(&(
+                            entry.id.owner,
+                            entry.id.protected_root,
+                            entry.id.object_id,
+                        )) != Some(&entry.source_commitment)
                     }) {
+                        return Err(ModelError::InvalidCheckpoint);
+                    }
+                }
+                (4, Some(authentication)) => {
+                    let bindings = catalog
+                        .legacy_bindings
+                        .as_ref()
+                        .ok_or(ModelError::InvalidCheckpoint)?
+                        .iter()
+                        .map(|binding| {
+                            (
+                                (
+                                    binding.value.owner,
+                                    binding.value.protected_root,
+                                    binding.value.object_id,
+                                ),
+                                &binding.value,
+                            )
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    let mut used_bindings = std::collections::BTreeSet::new();
+                    for entry in authentication {
+                        let key = (entry.id.owner, entry.id.protected_root, entry.id.object_id);
+                        if revision_commitments.get(&key) == Some(&entry.source_commitment) {
+                            continue;
+                        }
+                        let Some(binding) = bindings.get(&key) else {
+                            return Err(ModelError::InvalidCheckpoint);
+                        };
+                        if binding.source_commitment != entry.source_commitment
+                            || revision_flat_roots.get(&key) != Some(&binding.flat_root)
+                        {
+                            return Err(ModelError::InvalidCheckpoint);
+                        }
+                        used_bindings.insert(key);
+                    }
+                    if used_bindings.len() != bindings.len() {
                         return Err(ModelError::InvalidCheckpoint);
                     }
                 }
@@ -1994,6 +2055,101 @@ mod tests {
             decode_canonical::<GuildCheckpoint>(&root_scoped_bytes).unwrap(),
             root_scoped_checkpoint
         );
+        let mut legacy_packed_checkpoint = root_scoped_checkpoint.clone();
+        for revision in &mut legacy_packed_checkpoint.revisions {
+            let mut body = revision.value.clone();
+            for reference in body
+                .metadata_sectors
+                .iter_mut()
+                .chain(&mut body.data_sectors)
+            {
+                reference.root = sector_root(&vec![reference.id[0]; V1_SECTOR_SIZE]);
+            }
+            body.sign_writer(&writer).unwrap();
+            *revision = SignedRecord::sign(USER_REVISION_DOMAIN, body, &keys[0]).unwrap();
+        }
+        let legacy_inputs = legacy_packed_checkpoint
+            .revisions
+            .iter()
+            .flat_map(|revision| {
+                revision
+                    .value
+                    .metadata_sectors
+                    .iter()
+                    .chain(&revision.value.data_sectors)
+                    .map(move |reference| {
+                        let bytes = vec![reference.id[0]; V1_SECTOR_SIZE];
+                        crate::PackingInput {
+                            owner: revision.value.owner,
+                            protected_root: crate::packing_protected_root(
+                                revision.value.protected_root_id,
+                            ),
+                            object_id: reference.id,
+                            source_commitment: Some(merkle_commit(&bytes).unwrap()),
+                            bytes,
+                        }
+                    })
+            })
+            .collect::<Vec<_>>();
+        let legacy_owner_keys = &keys[0];
+        let legacy_bindings = legacy_packed_checkpoint
+            .revisions
+            .iter()
+            .flat_map(|revision| {
+                revision
+                    .value
+                    .metadata_sectors
+                    .iter()
+                    .chain(&revision.value.data_sectors)
+                    .map(move |reference| {
+                        let bytes = vec![reference.id[0]; V1_SECTOR_SIZE];
+                        SignedRecord::sign(
+                            crate::LEGACY_PACKING_BINDING_DOMAIN,
+                            crate::LegacyPackingBinding {
+                                format_version: 1,
+                                owner: revision.value.owner,
+                                protected_root: crate::packing_protected_root(
+                                    revision.value.protected_root_id,
+                                ),
+                                object_id: reference.id,
+                                flat_root: reference.root,
+                                source_commitment: merkle_commit(&bytes).unwrap(),
+                            },
+                            legacy_owner_keys,
+                        )
+                        .unwrap()
+                    })
+            })
+            .collect::<Vec<_>>();
+        let legacy_packing = crate::pack_incremental(
+            crate::PackingProfile {
+                format_version: 1,
+                sector_size: V1_SECTOR_SIZE as u32,
+                slot_size: 16 * 1024,
+            },
+            None,
+            legacy_inputs,
+        )
+        .unwrap();
+        legacy_packed_checkpoint.format_version = 7;
+        legacy_packed_checkpoint.packing_catalog = Some(
+            crate::attach_legacy_packing_bindings(legacy_packing.catalog, legacy_bindings).unwrap(),
+        );
+        legacy_packed_checkpoint.validate().unwrap();
+
+        let mut mismatched_binding = legacy_packed_checkpoint.clone();
+        let catalog = mismatched_binding.packing_catalog.as_mut().unwrap();
+        let mut value = catalog.legacy_bindings.as_ref().unwrap()[0].value.clone();
+        value.flat_root[0] ^= 1;
+        catalog.legacy_bindings.as_mut().unwrap()[0] =
+            SignedRecord::sign(crate::LEGACY_PACKING_BINDING_DOMAIN, value, &keys[0]).unwrap();
+        catalog.id = catalog.calculate_id().unwrap();
+        catalog.validate().unwrap();
+        assert!(matches!(
+            mismatched_binding.validate(),
+            Err(ModelError::InvalidCheckpoint)
+        ));
+
         let mut authenticated_checkpoint = root_scoped_checkpoint.clone();
         for signed in &mut authenticated_checkpoint.revisions {
             let mut body = signed.value.clone();

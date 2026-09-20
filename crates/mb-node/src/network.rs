@@ -1017,6 +1017,13 @@ fn execute_read_request(
             node.checkpoint_head(&guild_id)?
                 .map(|(generation, hash)| wire::CheckpointHead { generation, hash }),
         )),
+        PeerRequest::SignLegacyPackingBinding {
+            guild_id,
+            protected_root_id,
+            reference,
+        } => Ok(PeerResponse::LegacyPackingBinding(
+            node.sign_legacy_packing_binding(&guild_id, protected_root_id, &reference)?,
+        )),
         PeerRequest::BackupStatus {
             guild_id,
             revision_id,
@@ -1399,6 +1406,9 @@ fn execute_peer_request(
             node.checkpoint_head(&guild_id)?
                 .map(|(generation, hash)| wire::CheckpointHead { generation, hash }),
         )),
+        PeerRequest::SignLegacyPackingBinding { .. } => {
+            bail!("legacy-packing binding read was sent to a mutation worker")
+        }
         PeerRequest::BackupStatus { .. } => {
             bail!("backup status read was sent to a mutation worker")
         }

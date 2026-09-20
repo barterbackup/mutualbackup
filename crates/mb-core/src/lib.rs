@@ -53,9 +53,10 @@ pub use model::{
     canonical_bytes, coding_group_id, coding_group_v2_id, decode_canonical,
 };
 pub use packing::{
-    AuthenticatedPackingSource, PackedCatalog, PackedSector, PackedSectorDescriptor, PackedSlot,
-    PackedSourceAuthentication, PackedSourceChunk, PackingError, PackingInput, PackingMetrics,
-    PackingProfile, PackingResult, PackingUpdate, SourceChunkId, pack_incremental,
+    AuthenticatedPackingSource, LEGACY_PACKING_BINDING_DOMAIN, LegacyPackingBinding, PackedCatalog,
+    PackedSector, PackedSectorDescriptor, PackedSlot, PackedSourceAuthentication,
+    PackedSourceChunk, PackingError, PackingInput, PackingMetrics, PackingProfile, PackingResult,
+    PackingUpdate, SourceChunkId, attach_legacy_packing_bindings, pack_incremental,
     pack_incremental_authenticated, packing_protected_root, unpack_object,
     unpack_object_from_sectors,
 };

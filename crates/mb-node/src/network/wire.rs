@@ -1,9 +1,10 @@
 use mb_core::{
     CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal, CodingFailureReport,
     CodingGroup, CodingRootManifest, CodingShardOpening, CodingVerificationTranscript,
-    EndpointRecord, GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, Member, MemberSignature,
-    MerkleCommitment, MerkleRangeProof, NodeId, QuorumGuildEvent, QuorumGuildGenesis, SectorId,
-    SectorRef, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
+    EndpointRecord, GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, LegacyPackingBinding,
+    Member, MemberSignature, MerkleCommitment, MerkleRangeProof, NodeId, QuorumGuildEvent,
+    QuorumGuildGenesis, SectorId, SectorRef, SignedRecord, StagedStorageReceipt,
+    StorageAcknowledgement,
 };
 use mb_store::{ParityObject, VariableParityObject};
 use serde::{Deserialize, Serialize};
@@ -270,6 +271,11 @@ pub(super) enum PeerRequest {
     GetCheckpointHead {
         guild_id: [u8; 32],
     },
+    SignLegacyPackingBinding {
+        guild_id: [u8; 32],
+        protected_root_id: Uuid,
+        reference: SectorRef,
+    },
     #[cfg(test)]
     BuildRecoveryRecord {
         publication_id: [u8; 16],
@@ -333,6 +339,7 @@ impl PeerRequest {
                 | Self::GetPreparedRevisionPage { .. }
                 | Self::GetCheckpointPage { .. }
                 | Self::GetCheckpointHead { .. }
+                | Self::SignLegacyPackingBinding { .. }
                 | Self::BackupStatus { .. }
                 | Self::GetGuildGenesis { .. }
                 | Self::GetGuildEventTail { .. }
@@ -397,6 +404,7 @@ impl PeerRequest {
             Self::SignCheckpoint { .. } => Some("sign-checkpoint"),
             Self::FinalizeCheckpoint { .. } => Some("finalize-checkpoint"),
             Self::GetCheckpointHead { .. } => Some("get-checkpoint-head"),
+            Self::SignLegacyPackingBinding { .. } => Some("sign-legacy-packing-binding"),
             #[cfg(test)]
             Self::BuildRecoveryRecord { .. } => Some("build-recovery-record"),
             #[cfg(test)]
@@ -431,6 +439,7 @@ impl PeerRequest {
             | Self::FinalizeCheckpoint { guild_id, .. }
             | Self::GetCheckpointPage { guild_id, .. }
             | Self::GetCheckpointHead { guild_id }
+            | Self::SignLegacyPackingBinding { guild_id, .. }
             | Self::BackupStatus { guild_id, .. } => Some(*guild_id),
             Self::AbortCodingAttempt { plan } => Some(plan.value.geometry.guild_id),
             Self::ExchangeEndpoints { guild_id } | Self::CodingCapacity { guild_id, .. } => {
@@ -536,6 +545,7 @@ pub(super) enum PeerResponse {
         bytes: Vec<u8>,
     },
     CheckpointHead(Option<CheckpointHead>),
+    LegacyPackingBinding(SignedRecord<LegacyPackingBinding>),
     #[cfg(test)]
     RecoveryRecord(Box<SignedRecord<PublishedRecoveryRecord>>),
     #[cfg(test)]

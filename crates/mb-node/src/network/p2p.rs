@@ -32,18 +32,19 @@ use mb_core::{
     CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal, CodingFailureReport,
     CodingGroup, CodingGroupV2, CodingPlanGeometry, CodingProfile, CodingRootManifest,
     CodingShardOpening, CodingVerificationTranscript, DynamicGuildState, GuildCheckpoint,
-    GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, InformationRoleV2, MAX_GUILD_EVENT_TAIL,
-    MERKLE_LEAF_SIZE, Member, MemberSignature, MerkleCommitment, NodeId, PackedCatalog,
-    PackedSector, PackedSectorDescriptor, PackingInput, PackingProfile, ParityPlacementV2,
-    QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy, QuorumRule,
-    RECOVERY_LOCATOR_DOMAIN, RangeSectorRef, STAGED_STORAGE_RECEIPT_DOMAIN,
-    STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole, ShardRoleV2, SignedRecord,
-    StagedStorageReceipt, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
-    V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES,
-    V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_SECTOR_SIZE, canonical_bytes,
-    coding_challenge, coding_transfer_estimate, decode_canonical, merkle_commit,
-    merkle_zero_commitment, pack_incremental, pack_incremental_authenticated,
-    packing_protected_root, replay_coding_transcript, sector_root, unpack_object_from_sectors,
+    GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, InformationRoleV2,
+    LEGACY_PACKING_BINDING_DOMAIN, LegacyPackingBinding, MAX_GUILD_EVENT_TAIL, MERKLE_LEAF_SIZE,
+    Member, MemberSignature, MerkleCommitment, NodeId, PackedCatalog, PackedSector,
+    PackedSectorDescriptor, PackingInput, PackingProfile, ParityPlacementV2, QuorumCheckpoint,
+    QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN,
+    RangeSectorRef, STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId,
+    SectorRef, ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
+    UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES,
+    V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS,
+    V1_SECTOR_SIZE, attach_legacy_packing_bindings, canonical_bytes, coding_challenge,
+    coding_transfer_estimate, decode_canonical, merkle_commit, merkle_zero_commitment,
+    pack_incremental, pack_incremental_authenticated, packing_protected_root,
+    replay_coding_transcript, sector_root, unpack_object_from_sectors,
 };
 #[cfg(test)]
 use mb_core::{ParityRoleV2, encode};
@@ -2948,6 +2949,29 @@ impl P2pClient {
             bail!("peer returned the wrong checkpoint-head response");
         };
         Ok(head)
+    }
+
+    async fn legacy_packing_binding(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        protected_root_id: Uuid,
+        reference: SectorRef,
+    ) -> Result<SignedRecord<LegacyPackingBinding>> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::SignLegacyPackingBinding {
+                    guild_id,
+                    protected_root_id,
+                    reference,
+                },
+            )
+            .await?;
+        let PeerResponse::LegacyPackingBinding(binding) = response else {
+            bail!("peer returned the wrong legacy-packing binding response");
+        };
+        Ok(binding)
     }
 
     pub(crate) async fn sign_checkpoint(
@@ -11825,13 +11849,25 @@ async fn build_production_packing(
     previous: Option<&PackedCatalog>,
 ) -> Result<ProductionPacking> {
     let mut sources = PackingSources::new();
+    let mut legacy_bindings =
+        BTreeMap::<PackingObjectKey, SignedRecord<LegacyPackingBinding>>::new();
+    let prior_legacy_bindings = previous
+        .and_then(|catalog| catalog.legacy_bindings.as_ref())
+        .into_iter()
+        .flatten()
+        .map(|binding| {
+            (
+                (
+                    binding.value.owner,
+                    binding.value.protected_root,
+                    binding.value.object_id,
+                ),
+                binding.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     for revision in revisions {
         let protected_root = packing_protected_root(revision.value.protected_root_id);
-        let commitments = revision
-            .value
-            .sector_commitments
-            .as_ref()
-            .context("retained revision lacks signed source commitments")?;
         for (index, reference) in revision
             .value
             .metadata_sectors
@@ -11839,11 +11875,49 @@ async fn build_production_packing(
             .chain(&revision.value.data_sectors)
             .enumerate()
         {
-            let commitment = commitments
-                .get(index)
-                .context("retained revision source commitment is missing")?
-                .clone();
             let key = (revision.value.owner, protected_root, reference.id);
+            let commitment = if let Some(commitments) = &revision.value.sector_commitments {
+                commitments
+                    .get(index)
+                    .context("retained revision source commitment is missing")?
+                    .clone()
+            } else {
+                let binding = if let Some(binding) = prior_legacy_bindings.get(&key) {
+                    binding.clone()
+                } else if revision.value.owner == local_id {
+                    let reference = reference.clone();
+                    let protected_root_id = revision.value.protected_root_id;
+                    node_blocking(node.clone(), move |node| {
+                        node.sign_legacy_packing_binding(&guild_id, protected_root_id, &reference)
+                    })
+                    .await?
+                } else {
+                    p2p.legacy_packing_binding(
+                        revision.value.owner,
+                        guild_id,
+                        revision.value.protected_root_id,
+                        reference.clone(),
+                    )
+                    .await?
+                };
+                binding.verify(LEGACY_PACKING_BINDING_DOMAIN)?;
+                if binding.signer != revision.value.owner
+                    || binding.value.owner != revision.value.owner
+                    || binding.value.protected_root != protected_root
+                    || binding.value.object_id != reference.id
+                    || binding.value.flat_root != reference.root
+                {
+                    bail!("legacy packing binding conflicts with its signed revision");
+                }
+                let commitment = binding.value.source_commitment.clone();
+                if legacy_bindings
+                    .insert(key, binding)
+                    .is_some_and(|existing| existing.value.source_commitment != commitment)
+                {
+                    bail!("retained revisions disagree about a legacy packing binding");
+                }
+                commitment
+            };
             if sources
                 .insert(key, (reference.clone(), commitment.clone()))
                 .is_some_and(|existing| existing != (reference.clone(), commitment))
@@ -11865,8 +11939,9 @@ async fn build_production_packing(
         .unwrap_or_default();
     let mut inputs = Vec::new();
     for (&(owner, protected_root, object_id), (reference, source_commitment)) in &sources {
-        if previously_authenticated.get(&(owner, protected_root, object_id))
-            == Some(source_commitment)
+        if legacy_bindings.is_empty()
+            && previously_authenticated.get(&(owner, protected_root, object_id))
+                == Some(source_commitment)
         {
             continue;
         }
@@ -11973,7 +12048,7 @@ async fn build_production_packing(
         sector_size: V1_SECTOR_SIZE as u32,
         slot_size: 16 * 1024,
     };
-    if let Some(previous) = previous.filter(|catalog| catalog.format_version == 2) {
+    if let Some(previous) = previous.filter(|catalog| matches!(catalog.format_version, 2 | 3)) {
         let previous = previous.clone();
         let authenticated_sources = sources
             .into_iter()
@@ -12038,7 +12113,22 @@ async fn build_production_packing(
             distributed.insert(descriptor.id, bytes);
         }
     }
-    let result = pack_incremental(profile, previous, inputs)?;
+    let mut result = pack_incremental(profile, previous, inputs)?;
+    if !legacy_bindings.is_empty() {
+        result.catalog = attach_legacy_packing_bindings(
+            result.catalog,
+            legacy_bindings.into_values().collect(),
+        )?;
+        for sector in &mut result.sectors {
+            let descriptor = result
+                .catalog
+                .sectors
+                .get(sector.descriptor.sector_index as usize)
+                .context("legacy catalog lost a packed descriptor")?;
+            sector.descriptor = descriptor.clone();
+        }
+        result.validate()?;
+    }
     let stored = result.clone();
     node_blocking(node, move |node| {
         node.store_packing_result(guild_id, &stored)
@@ -12099,7 +12189,8 @@ async fn load_distributed_packed_sector(
     )
     .await?;
     if bytes.len() != V1_SECTOR_SIZE
-        || sector_root(&bytes) != descriptor.flat_root
+        || descriptor.flat_root != descriptor.commitment.root
+            && sector_root(&bytes) != descriptor.flat_root
         || merkle_commit(&bytes)? != descriptor.commitment
     {
         bail!("distributed packed sector conflicts with its catalog descriptor");
@@ -12120,6 +12211,9 @@ fn advance_unchanged_catalog(
     sources: &PackingSources,
 ) -> Result<Option<PackedCatalog>> {
     catalog.validate()?;
+    if !matches!(catalog.format_version, 3 | 4) {
+        return Ok(None);
+    }
     let authenticated = authenticated_source_objects(catalog)?;
     let expected = sources
         .iter()
@@ -12926,7 +13020,7 @@ mod tests {
                     root: [10; 32],
                     logical_len: V1_SECTOR_SIZE as u32,
                 },
-                commitment,
+                commitment.clone(),
             ),
         )]);
 
@@ -12940,6 +13034,28 @@ mod tests {
             next.source_authentication,
             packed.catalog.source_authentication
         );
+
+        let binding = SignedRecord::sign(
+            LEGACY_PACKING_BINDING_DOMAIN,
+            LegacyPackingBinding {
+                format_version: 1,
+                owner: keys.node_id(),
+                protected_root,
+                object_id,
+                flat_root: [10; 32],
+                source_commitment: commitment.clone(),
+            },
+            &keys,
+        )
+        .unwrap();
+        let migrated =
+            attach_legacy_packing_bindings(packed.catalog.clone(), vec![binding]).unwrap();
+        let migrated_next = advance_unchanged_catalog(&migrated, &sources)
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated_next.format_version, 4);
+        assert_eq!(migrated_next.parent, Some(migrated.id));
+        assert_eq!(migrated_next.legacy_bindings, migrated.legacy_bindings);
 
         sources
             .get_mut(&(keys.node_id(), protected_root, object_id))

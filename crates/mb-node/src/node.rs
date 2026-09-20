@@ -18,11 +18,12 @@ use mb_core::{
     RecoveryBundle, RecoveryLocator, STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN,
     SectorId, SectorRef, Seed, ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt,
     StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision, V1_CATALOG_PAGE_BYTES,
-    V1_MAX_CATALOG_PAGES, V1_MAX_ENDPOINTS_PER_PEER, canonical_bytes, challenged_leaf,
-    coding_challenge_commitment, coding_evidence_hash, decode_canonical, encode_coding_attempt,
-    merkle_commit, merkle_open_range, merkle_open_zero_range, open_recovery_key_envelope,
-    open_recovery_record, replay_coding_transcript, seal_recovery_record, sector_root,
-    sign_guild_event, synthetic_filler_sector,
+    V1_MAX_CATALOG_PAGES, V1_MAX_ENDPOINTS_PER_PEER, V1_SECTOR_SIZE, canonical_bytes,
+    challenged_leaf, coding_challenge_commitment, coding_evidence_hash, decode_canonical,
+    encode_coding_attempt, merkle_commit, merkle_open_range, merkle_open_zero_range,
+    open_recovery_key_envelope, open_recovery_record, packing_protected_root,
+    replay_coding_transcript, seal_recovery_record, sector_root, sign_guild_event,
+    synthetic_filler_sector,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
@@ -260,9 +261,9 @@ fn validate_checkpoint_for_signature(checkpoint: &GuildCheckpoint) -> Result<()>
         && checkpoint
             .packing_catalog
             .as_ref()
-            .is_none_or(|catalog| catalog.format_version != 2)
+            .is_none_or(|catalog| !matches!(catalog.format_version, 3 | 4))
     {
-        anyhow::bail!("new format-seven checkpoints require authenticated packed catalogs");
+        anyhow::bail!("new format-seven checkpoints require root-bound authenticated catalogs");
     }
     Ok(())
 }
@@ -715,6 +716,16 @@ impl NodeReader {
     ) -> Result<Vec<u8>> {
         render_sector(&self.control, &self.keys, sector_id, Some(guild_id))
             .or_else(|_| load_packed_sector(&self.control, guild_id, sector_id))
+    }
+
+    pub(crate) fn sign_legacy_packing_binding(
+        &self,
+        guild_id: &[u8; 32],
+        protected_root_id: Uuid,
+        reference: &SectorRef,
+    ) -> Result<SignedRecord<mb_core::LegacyPackingBinding>> {
+        let bytes = self.sector_for_guild(guild_id, &reference.id)?;
+        sign_legacy_packing_binding(&self.keys, protected_root_id, reference, &bytes)
     }
 
     pub(crate) fn parity_for_guild(
@@ -3554,6 +3565,16 @@ impl Node {
     pub fn sector_for_guild(&self, guild_id: &[u8; 32], sector_id: &SectorId) -> Result<Vec<u8>> {
         render_sector(&self.control, &self.keys, sector_id, Some(guild_id))
             .or_else(|_| load_packed_sector(&self.control, guild_id, sector_id))
+    }
+
+    pub(crate) fn sign_legacy_packing_binding(
+        &self,
+        guild_id: &[u8; 32],
+        protected_root_id: Uuid,
+        reference: &SectorRef,
+    ) -> Result<SignedRecord<mb_core::LegacyPackingBinding>> {
+        let bytes = self.sector_for_guild(guild_id, &reference.id)?;
+        sign_legacy_packing_binding(&self.keys, protected_root_id, reference, &bytes)
     }
 
     pub(crate) fn store_packing_result(
@@ -8818,12 +8839,36 @@ fn packed_record_id(guild_id: &[u8; 32], object_id: &[u8; 32]) -> Vec<u8> {
     record_id
 }
 
+fn sign_legacy_packing_binding(
+    keys: &KeyMaterial,
+    protected_root_id: Uuid,
+    reference: &SectorRef,
+    bytes: &[u8],
+) -> Result<SignedRecord<mb_core::LegacyPackingBinding>> {
+    if bytes.len() != V1_SECTOR_SIZE || sector_root(bytes) != reference.root {
+        anyhow::bail!("legacy packing source conflicts with its signed revision root");
+    }
+    Ok(SignedRecord::sign(
+        mb_core::LEGACY_PACKING_BINDING_DOMAIN,
+        mb_core::LegacyPackingBinding {
+            format_version: 1,
+            owner: keys.node_id(),
+            protected_root: packing_protected_root(protected_root_id),
+            object_id: reference.id,
+            flat_root: reference.root,
+            source_commitment: merkle_commit(bytes)?,
+        },
+        keys,
+    )?)
+}
+
 fn validate_packed_sector(profile: PackingProfile, sector: &PackedSector) -> Result<()> {
     profile.validate()?;
     if sector.descriptor.calculate_id(profile)? != sector.descriptor.id
         || sector.descriptor.commitment.byte_len != profile.sector_size
         || sector.bytes.len() != profile.sector_size as usize
-        || *blake3::hash(&sector.bytes).as_bytes() != sector.descriptor.flat_root
+        || sector.descriptor.flat_root != sector.descriptor.commitment.root
+            && *blake3::hash(&sector.bytes).as_bytes() != sector.descriptor.flat_root
         || merkle_commit(&sector.bytes)? != sector.descriptor.commitment
     {
         anyhow::bail!("packed sector conflicts with its authenticated descriptor");
@@ -8846,7 +8891,8 @@ fn load_packed_sector(
         || record.sector.descriptor.id != *sector_id
         || record.sector.bytes.len()
             != usize::try_from(record.sector.descriptor.commitment.byte_len)?
-        || *blake3::hash(&record.sector.bytes).as_bytes() != record.sector.descriptor.flat_root
+        || record.sector.descriptor.flat_root != record.sector.descriptor.commitment.root
+            && *blake3::hash(&record.sector.bytes).as_bytes() != record.sector.descriptor.flat_root
         || merkle_commit(&record.sector.bytes)? != record.sector.descriptor.commitment
     {
         anyhow::bail!("packed sector record is invalid");
@@ -9568,14 +9614,52 @@ mod tests {
                 },
                 sectors: Vec::new(),
                 source_authentication: None,
+                legacy_bindings: None,
             }),
         };
         assert!(validate_checkpoint_for_signature(&checkpoint).is_err());
 
-        let catalog = checkpoint.packing_catalog.as_mut().unwrap();
-        catalog.format_version = 2;
-        catalog.source_authentication = Some(Vec::new());
+        checkpoint.packing_catalog.as_mut().unwrap().format_version = 3;
+        checkpoint
+            .packing_catalog
+            .as_mut()
+            .unwrap()
+            .source_authentication = Some(Vec::new());
         assert!(validate_checkpoint_for_signature(&checkpoint).is_ok());
+
+        let catalog = checkpoint.packing_catalog.as_mut().unwrap();
+        catalog.format_version = 4;
+        catalog.legacy_bindings = Some(Vec::new());
+        assert!(validate_checkpoint_for_signature(&checkpoint).is_ok());
+    }
+
+    #[test]
+    fn legacy_packing_binding_authenticates_the_signed_flat_root() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([92; 32]));
+        let bytes = vec![17; V1_SECTOR_SIZE];
+        let reference = SectorRef {
+            id: [31; 32],
+            root: sector_root(&bytes),
+            logical_len: V1_SECTOR_SIZE as u32,
+        };
+        let binding =
+            sign_legacy_packing_binding(&keys, Uuid::from_u128(44), &reference, &bytes).unwrap();
+        binding
+            .verify(mb_core::LEGACY_PACKING_BINDING_DOMAIN)
+            .unwrap();
+        assert_eq!(binding.signer, keys.node_id());
+        assert_eq!(binding.value.flat_root, reference.root);
+        assert_eq!(
+            binding.value.source_commitment,
+            merkle_commit(&bytes).unwrap()
+        );
+
+        let mut wrong_reference = reference;
+        wrong_reference.root[0] ^= 1;
+        assert!(
+            sign_legacy_packing_binding(&keys, Uuid::from_u128(44), &wrong_reference, &bytes,)
+                .is_err()
+        );
     }
 
     fn install_empty_recovery_revision(

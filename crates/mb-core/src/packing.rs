@@ -6,11 +6,12 @@ use uuid::Uuid;
 
 use crate::{
     MAX_PROFILE_SHARD_SIZE, MERKLE_LEAF_SIZE, MerkleCommitment, MerkleSubtreeProof, NodeId,
-    canonical_bytes, merkle_commit, merkle_commit_subtrees, merkle_open_subtree,
+    SignedRecord, canonical_bytes, merkle_commit, merkle_commit_subtrees, merkle_open_subtree,
     merkle_verify_subtree,
 };
 
 const MAX_PACKED_CHUNKS: usize = 1_000_000;
+pub const LEGACY_PACKING_BINDING_DOMAIN: &[u8] = b"mutualbackup/legacy-packing-binding/v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PackingProfile {
@@ -120,6 +121,16 @@ pub struct PackedSourceAuthentication {
     pub proof: MerkleSubtreeProof,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyPackingBinding {
+    pub format_version: u16,
+    pub owner: NodeId,
+    pub protected_root: [u8; 32],
+    pub object_id: [u8; 32],
+    pub flat_root: [u8; 32],
+    pub source_commitment: MerkleCommitment,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackedCatalog {
     pub id: [u8; 32],
@@ -131,6 +142,9 @@ pub struct PackedCatalog {
     /// Compact source-to-slot proofs. Version-one catalogs predate source
     /// authentication and retain their original six-field encoding.
     pub source_authentication: Option<Vec<PackedSourceAuthentication>>,
+    /// Owner-signed migration bindings for retained revisions which predate
+    /// source commitments. Present only in version-four catalogs.
+    pub legacy_bindings: Option<Vec<SignedRecord<LegacyPackingBinding>>>,
 }
 
 impl Serialize for PackedCatalog {
@@ -138,9 +152,14 @@ impl Serialize for PackedCatalog {
     where
         S: Serializer,
     {
-        let field_count = match (self.format_version, &self.source_authentication) {
-            (1, None) => 6,
-            (2, Some(_)) => 7,
+        let field_count = match (
+            self.format_version,
+            &self.source_authentication,
+            &self.legacy_bindings,
+        ) {
+            (1, None, None) => 6,
+            (2 | 3, Some(_), None) => 7,
+            (4, Some(_), Some(_)) => 8,
             _ => return Err(serde::ser::Error::custom("invalid packed catalog version")),
         };
         let mut tuple = serializer.serialize_tuple(field_count)?;
@@ -152,6 +171,9 @@ impl Serialize for PackedCatalog {
         tuple.serialize_element(&self.sectors)?;
         if let Some(authentication) = &self.source_authentication {
             tuple.serialize_element(authentication)?;
+        }
+        if let Some(bindings) = &self.legacy_bindings {
+            tuple.serialize_element(bindings)?;
         }
         tuple.end()
     }
@@ -183,10 +205,14 @@ impl<'de> Deserialize<'de> for PackedCatalog {
                 let sectors = next_catalog_field(&mut sequence, "sectors")?;
                 let source_authentication = match format_version {
                     1 => None,
-                    2 => Some(next_catalog_field(&mut sequence, "source authentication")?),
+                    2..=4 => Some(next_catalog_field(&mut sequence, "source authentication")?),
                     _ => {
                         return Err(serde::de::Error::custom("invalid packed catalog version"));
                     }
+                };
+                let legacy_bindings = match format_version {
+                    4 => Some(next_catalog_field(&mut sequence, "legacy bindings")?),
+                    _ => None,
                 };
                 Ok(PackedCatalog {
                     id,
@@ -196,11 +222,12 @@ impl<'de> Deserialize<'de> for PackedCatalog {
                     profile,
                     sectors,
                     source_authentication,
+                    legacy_bindings,
                 })
             }
         }
 
-        deserializer.deserialize_tuple(7, PackedCatalogVisitor)
+        deserializer.deserialize_tuple(8, PackedCatalogVisitor)
     }
 }
 
@@ -223,14 +250,19 @@ impl PackedCatalog {
             self.profile,
             &self.sectors,
             self.source_authentication.as_deref(),
+            self.legacy_bindings.as_deref(),
         )
     }
 
     pub fn validate(&self) -> Result<(), PackingError> {
         self.profile.validate()?;
         if !matches!(
-            (self.format_version, &self.source_authentication),
-            (1, None) | (2, Some(_))
+            (
+                self.format_version,
+                &self.source_authentication,
+                &self.legacy_bindings
+            ),
+            (1, None, None) | (2 | 3, Some(_), None) | (4, Some(_), Some(_))
         ) || self.revision == 0
             || (self.revision == 1) != self.parent.is_none()
             || self.calculate_id()? != self.id
@@ -246,6 +278,7 @@ impl PackedCatalog {
                 || sector.slots.len() != expected_slots
                 || sector.flat_root == [0; 32]
                 || sector.commitment.byte_len != self.profile.sector_size
+                || self.format_version >= 3 && sector.flat_root != sector.commitment.root
                 || sector.calculate_id(self.profile)? != sector.id
             {
                 return Err(PackingError::InvalidCatalog);
@@ -292,8 +325,51 @@ impl PackedCatalog {
                 return Err(PackingError::InvalidCatalog);
             }
         }
-        if self.format_version == 2 {
+        if matches!(self.format_version, 2..=4) {
             self.validate_source_authentication(&source_ids)?;
+        }
+        if self.format_version == 4 {
+            self.validate_legacy_bindings()?;
+        }
+        Ok(())
+    }
+
+    fn validate_legacy_bindings(&self) -> Result<(), PackingError> {
+        let mut seen = std::collections::BTreeSet::new();
+        let bindings = self
+            .legacy_bindings
+            .as_ref()
+            .ok_or(PackingError::InvalidCatalog)?;
+        if bindings.is_empty() {
+            return Err(PackingError::InvalidCatalog);
+        }
+        let authentication = self
+            .source_authentication
+            .as_ref()
+            .ok_or(PackingError::InvalidCatalog)?;
+        for binding in bindings {
+            binding
+                .verify(LEGACY_PACKING_BINDING_DOMAIN)
+                .map_err(|_| PackingError::InvalidCatalog)?;
+            let value = &binding.value;
+            if value.format_version != 1
+                || binding.signer != value.owner
+                || value.owner == NodeId([0; 32])
+                || value.protected_root == [0; 32]
+                || value.object_id == [0; 32]
+                || value.flat_root == [0; 32]
+                || value.source_commitment.byte_len != self.profile.sector_size
+                || value.source_commitment.validate().is_err()
+                || !authentication.iter().any(|entry| {
+                    entry.id.owner == value.owner
+                        && entry.id.protected_root == value.protected_root
+                        && entry.id.object_id == value.object_id
+                        && entry.source_commitment == value.source_commitment
+                })
+                || !seen.insert((value.owner, value.protected_root, value.object_id))
+            {
+                return Err(PackingError::InvalidCatalog);
+            }
         }
         Ok(())
     }
@@ -369,6 +445,27 @@ impl PackedCatalog {
         }
         Ok(())
     }
+}
+
+pub fn attach_legacy_packing_bindings(
+    mut catalog: PackedCatalog,
+    mut bindings: Vec<SignedRecord<LegacyPackingBinding>>,
+) -> Result<PackedCatalog, PackingError> {
+    if catalog.format_version != 3 || bindings.is_empty() {
+        return Err(PackingError::InvalidCatalog);
+    }
+    bindings.sort_by_key(|binding| {
+        (
+            binding.value.owner,
+            binding.value.protected_root,
+            binding.value.object_id,
+        )
+    });
+    catalog.format_version = 4;
+    catalog.legacy_bindings = Some(bindings);
+    catalog.id = catalog.calculate_id()?;
+    catalog.validate()?;
+    Ok(catalog)
 }
 
 impl PackedSectorDescriptor {
@@ -589,7 +686,8 @@ impl PackingResult {
         for (packed, descriptor) in self.sectors.iter().zip(&self.catalog.sectors) {
             if &packed.descriptor != descriptor
                 || packed.bytes.len() != self.catalog.profile.sector_size as usize
-                || *blake3::hash(&packed.bytes).as_bytes() != descriptor.flat_root
+                || self.catalog.format_version < 3
+                    && *blake3::hash(&packed.bytes).as_bytes() != descriptor.flat_root
                 || merkle_commit(&packed.bytes).map_err(|_| PackingError::InvalidCatalog)?
                     != descriptor.commitment
             {
@@ -643,6 +741,11 @@ pub fn pack_incremental(
         }
     }
     let chunks = input_chunks(profile, inputs)?;
+    let authenticated =
+        !chunks.is_empty() && chunks.iter().all(|chunk| chunk.authentication.is_some());
+    if !authenticated && chunks.iter().any(|chunk| chunk.authentication.is_some()) {
+        return Err(PackingError::InvalidInput);
+    }
     let desired = chunks
         .iter()
         .map(|chunk| (chunk.source.id, chunk))
@@ -738,7 +841,11 @@ pub fn pack_incremental(
         let mut descriptor = PackedSectorDescriptor {
             id: [0; 32],
             sector_index: sector_index as u32,
-            flat_root: *blake3::hash(&bytes).as_bytes(),
+            flat_root: if authenticated {
+                commitment.root
+            } else {
+                *blake3::hash(&bytes).as_bytes()
+            },
             commitment,
             slots,
         };
@@ -753,19 +860,17 @@ pub fn pack_incremental(
         .iter()
         .filter_map(|chunk| chunk.authentication.clone())
         .collect::<Vec<_>>();
-    let source_authentication = if authenticated_chunks.is_empty() {
-        None
-    } else if authenticated_chunks.len() == chunks.len() {
+    let source_authentication = if authenticated {
         Some(authenticated_chunks)
     } else {
-        return Err(PackingError::InvalidInput);
+        None
     };
     let revision = previous.map_or(1, |catalog| catalog.revision + 1);
     let parent = previous.map(|catalog| catalog.id);
     let mut catalog = PackedCatalog {
         id: [0; 32],
         format_version: if source_authentication.is_some() {
-            2
+            3
         } else {
             1
         },
@@ -774,6 +879,7 @@ pub fn pack_incremental(
         profile,
         sectors: descriptors,
         source_authentication,
+        legacy_bindings: None,
     };
     catalog.id = catalog.calculate_id()?;
     let changed_sectors = sectors
@@ -820,7 +926,7 @@ where
 {
     profile.validate()?;
     previous.validate()?;
-    if previous.format_version != 2 || previous.profile != profile {
+    if !matches!(previous.format_version, 2 | 3) || previous.profile != profile {
         return Err(PackingError::ProfileChanged);
     }
     let previous_authentication = previous
@@ -988,7 +1094,8 @@ where
             }
             slots.push(slot);
         }
-        if let Some(prior) = previous.sectors.get(sector_index)
+        if previous.format_version == 3
+            && let Some(prior) = previous.sectors.get(sector_index)
             && prior.slots == slots
         {
             descriptors.push(prior.clone());
@@ -998,7 +1105,8 @@ where
         let mut bytes = if let Some(prior) = previous.sectors.get(sector_index) {
             let bytes = load_previous(prior)?;
             if bytes.len() != profile.sector_size as usize
-                || *blake3::hash(&bytes).as_bytes() != prior.flat_root
+                || previous.format_version < 3
+                    && *blake3::hash(&bytes).as_bytes() != prior.flat_root
                 || merkle_commit(&bytes).map_err(|_| PackingError::InvalidCatalog)?
                     != prior.commitment
             {
@@ -1035,7 +1143,7 @@ where
         let mut descriptor = PackedSectorDescriptor {
             id: [0; 32],
             sector_index: sector_index as u32,
-            flat_root: *blake3::hash(&bytes).as_bytes(),
+            flat_root: commitment.root,
             commitment,
             slots,
         };
@@ -1054,7 +1162,7 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let mut catalog = PackedCatalog {
         id: [0; 32],
-        format_version: 2,
+        format_version: 3,
         revision: previous
             .revision
             .checked_add(1)
@@ -1063,6 +1171,7 @@ where
         profile,
         sectors: descriptors,
         source_authentication: Some(source_authentication),
+        legacy_bindings: None,
     };
     catalog.id = catalog.calculate_id()?;
     catalog.validate()?;
@@ -1138,7 +1247,8 @@ pub fn unpack_object_from_sectors(
             .ok_or(PackingError::MissingObject)?;
         if sector.descriptor != *descriptor
             || sector.bytes.len() != catalog.profile.sector_size as usize
-            || *blake3::hash(&sector.bytes).as_bytes() != descriptor.flat_root
+            || catalog.format_version < 3
+                && *blake3::hash(&sector.bytes).as_bytes() != descriptor.flat_root
             || merkle_commit(&sector.bytes).map_err(|_| PackingError::InvalidCatalog)?
                 != descriptor.commitment
         {
@@ -1262,25 +1372,39 @@ fn catalog_id(
     profile: PackingProfile,
     sectors: &[PackedSectorDescriptor],
     source_authentication: Option<&[PackedSourceAuthentication]>,
+    legacy_bindings: Option<&[SignedRecord<LegacyPackingBinding>]>,
 ) -> Result<[u8; 32], PackingError> {
-    let domain = match (format_version, source_authentication) {
-        (1, None) => "mutualbackup packed catalog v1",
-        (2, Some(_)) => "mutualbackup packed catalog v2",
+    let domain = match (format_version, source_authentication, legacy_bindings) {
+        (1, None, None) => "mutualbackup packed catalog v1",
+        (2, Some(_), None) => "mutualbackup packed catalog v2",
+        (3, Some(_), None) => "mutualbackup packed catalog v3",
+        (4, Some(_), Some(_)) => "mutualbackup packed catalog v4",
         _ => return Err(PackingError::InvalidCatalog),
     };
     let mut hasher = blake3::Hasher::new_derive_key(domain);
-    let bytes = if let Some(authentication) = source_authentication {
-        canonical_bytes(&(
-            format_version,
-            revision,
-            parent,
-            profile,
-            sectors,
-            authentication,
-        ))?
-    } else {
-        canonical_bytes(&(format_version, revision, parent, profile, sectors))?
-    };
+    let bytes =
+        if let (Some(authentication), Some(bindings)) = (source_authentication, legacy_bindings) {
+            canonical_bytes(&(
+                format_version,
+                revision,
+                parent,
+                profile,
+                sectors,
+                authentication,
+                bindings,
+            ))?
+        } else if let Some(authentication) = source_authentication {
+            canonical_bytes(&(
+                format_version,
+                revision,
+                parent,
+                profile,
+                sectors,
+                authentication,
+            ))?
+        } else {
+            canonical_bytes(&(format_version, revision, parent, profile, sectors))?
+        };
     hasher.update(&bytes);
     Ok(*hasher.finalize().as_bytes())
 }
@@ -1305,7 +1429,7 @@ pub enum PackingError {
 
 #[cfg(test)]
 mod tests {
-    use crate::{KeyMaterial, Seed, merkle_open_range, merkle_verify_range};
+    use crate::{KeyMaterial, Seed, decode_canonical, merkle_open_range, merkle_verify_range};
 
     use super::*;
 
@@ -1349,7 +1473,7 @@ mod tests {
             }],
         )
         .unwrap();
-        assert_eq!(packed.catalog.format_version, 2);
+        assert_eq!(packed.catalog.format_version, 3);
         packed.validate().unwrap();
 
         packed.sectors[0].bytes[0] ^= 1;
@@ -1364,6 +1488,63 @@ mod tests {
 
         assert!(matches!(
             packed.validate(),
+            Err(PackingError::InvalidCatalog)
+        ));
+    }
+
+    #[test]
+    fn legacy_binding_upgrades_authenticated_catalog_and_rejects_tampering() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([201; 32]));
+        let owner = keys.node_id();
+        let protected_root = [7; 32];
+        let object_id = [8; 32];
+        let bytes = (0..64_u8).rev().collect::<Vec<_>>();
+        let source_commitment = merkle_commit(&bytes).unwrap();
+        let packed = pack_incremental(
+            profile(),
+            None,
+            vec![PackingInput {
+                owner,
+                protected_root,
+                object_id,
+                source_commitment: Some(source_commitment.clone()),
+                bytes: bytes.clone(),
+            }],
+        )
+        .unwrap();
+        let binding = SignedRecord::sign(
+            LEGACY_PACKING_BINDING_DOMAIN,
+            LegacyPackingBinding {
+                format_version: 1,
+                owner,
+                protected_root,
+                object_id,
+                flat_root: *blake3::hash(&bytes).as_bytes(),
+                source_commitment,
+            },
+            &keys,
+        )
+        .unwrap();
+
+        let catalog = attach_legacy_packing_bindings(packed.catalog, vec![binding]).unwrap();
+        assert_eq!(catalog.format_version, 4);
+        assert_eq!(
+            catalog.sectors[0].flat_root,
+            catalog.sectors[0].commitment.root
+        );
+        let encoded = canonical_bytes(&catalog).unwrap();
+        assert_eq!(
+            decode_canonical::<PackedCatalog>(&encoded).unwrap(),
+            catalog
+        );
+
+        let mut tampered = catalog;
+        tampered.legacy_bindings.as_mut().unwrap()[0]
+            .value
+            .flat_root[0] ^= 1;
+        tampered.id = tampered.calculate_id().unwrap();
+        assert!(matches!(
+            tampered.validate(),
             Err(PackingError::InvalidCatalog)
         ));
     }
