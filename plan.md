@@ -1095,8 +1095,8 @@ Milestone 5. Exact source locations and correction gates are in `TODO.md`:
 - **M5-47 (resolved):** A fast empty event tail preserves other requests for
   their bounded logical lifetime, allowing a slower relay or Tor path to
   advance the local event head.
-- **M5-48:** Automatic backup still shares one quiet timestamp and a fixed
-  UUID-first selector across roots, so a noisy root can starve a quiet sibling.
+- **M5-48 (resolved):** Automatic backup persists per-root quiet/attempt state
+  and selects the oldest eligible dirty root, including after restart.
 - **M5-49 and M5-50 (resolved):** Revision format 5 derives stable IDs with a
   separate owner-secret key and protected-root scope. Same-root unchanged data
   retains reuse, cross-root recipes no longer collide, public plaintext guesses

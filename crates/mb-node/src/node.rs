@@ -495,6 +495,8 @@ struct AutomaticBackupState {
     blocked_reason: Option<String>,
     #[serde(default)]
     root_retries: Vec<AutomaticRootRetry>,
+    #[serde(default)]
+    root_schedules: Vec<AutomaticRootSchedule>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -502,6 +504,13 @@ struct AutomaticRootRetry {
     protected_root_id: Uuid,
     retry_at_unix_seconds: u64,
     reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct AutomaticRootSchedule {
+    protected_root_id: Uuid,
+    dirty_since_unix_seconds: u64,
+    last_attempt_unix_seconds: Option<u64>,
 }
 
 pub(crate) enum AutomaticBackupPoll {
@@ -1176,9 +1185,31 @@ impl Node {
             })?,
         )?;
         let mut automation = self.automatic_backup_state(now)?;
-        if changed || automation.dirty_since_unix_seconds.is_none() {
-            automation.dirty_since_unix_seconds = Some(now);
+        let schedule = match automation
+            .root_schedules
+            .binary_search_by_key(&root_id, |schedule| schedule.protected_root_id)
+        {
+            Ok(index) => &mut automation.root_schedules[index],
+            Err(index) => {
+                automation.root_schedules.insert(
+                    index,
+                    AutomaticRootSchedule {
+                        protected_root_id: root_id,
+                        dirty_since_unix_seconds: now,
+                        last_attempt_unix_seconds: None,
+                    },
+                );
+                &mut automation.root_schedules[index]
+            }
+        };
+        if changed {
+            schedule.dirty_since_unix_seconds = now;
         }
+        automation.dirty_since_unix_seconds = automation
+            .root_schedules
+            .iter()
+            .map(|schedule| schedule.dirty_since_unix_seconds)
+            .min();
         self.store_automatic_backup_state(&automation)?;
         Ok(())
     }
@@ -1287,6 +1318,7 @@ impl Node {
                 retry_at_unix_seconds: None,
                 blocked_reason: None,
                 root_retries: Vec::new(),
+                root_schedules: Vec::new(),
             });
         if state.format_version != 1
             || state.in_flight_root_id.is_some() && state.in_flight_revision.is_none()
@@ -1298,6 +1330,14 @@ impl Node {
                 .root_retries
                 .windows(2)
                 .any(|retries| retries[0].protected_root_id >= retries[1].protected_root_id)
+            || state
+                .root_schedules
+                .iter()
+                .any(|schedule| schedule.protected_root_id.is_nil())
+            || state
+                .root_schedules
+                .windows(2)
+                .any(|schedules| schedules[0].protected_root_id >= schedules[1].protected_root_id)
         {
             anyhow::bail!("unsupported automatic-backup state version");
         }
@@ -1363,24 +1403,14 @@ impl Node {
         }
         if !self.root_dirty()? {
             state.root_retries.clear();
+            state.root_schedules.clear();
+            state.dirty_since_unix_seconds = None;
             self.store_automatic_backup_state(&state)?;
             return Ok(AutomaticBackupPoll::Idle);
         }
         if state.retry_at_unix_seconds.is_some_and(|retry| retry > now)
             || state.blocked_reason.is_some() && state.retry_at_unix_seconds.is_none()
         {
-            self.store_automatic_backup_state(&state)?;
-            return Ok(AutomaticBackupPoll::Idle);
-        }
-        let quiet_until = state
-            .dirty_since_unix_seconds
-            .unwrap_or(now)
-            .saturating_add(policy.quiet_period_seconds);
-        let interval_until = state
-            .last_attempt_unix_seconds
-            .unwrap_or(0)
-            .saturating_add(policy.minimum_interval_seconds);
-        if now < quiet_until || now < interval_until {
             self.store_automatic_backup_state(&state)?;
             return Ok(AutomaticBackupPoll::Idle);
         }
@@ -1395,9 +1425,73 @@ impl Node {
             .iter()
             .map(|root| root.root_id)
             .collect::<BTreeSet<_>>();
+        let mut dirty_roots = BTreeSet::new();
+        for root in &roots {
+            if self
+                .root_dirty_state(root.root_id)?
+                .is_none_or(|dirty| dirty.dirty)
+            {
+                dirty_roots.insert(root.root_id);
+            }
+        }
         state
             .root_retries
             .retain(|retry| configured.contains(&retry.protected_root_id));
+        state
+            .root_schedules
+            .retain(|schedule| dirty_roots.contains(&schedule.protected_root_id));
+        for root in &roots {
+            if dirty_roots.contains(&root.root_id)
+                && state
+                    .root_schedules
+                    .binary_search_by_key(&root.root_id, |schedule| schedule.protected_root_id)
+                    .is_err()
+            {
+                let index = state
+                    .root_schedules
+                    .partition_point(|schedule| schedule.protected_root_id < root.root_id);
+                state.root_schedules.insert(
+                    index,
+                    AutomaticRootSchedule {
+                        protected_root_id: root.root_id,
+                        dirty_since_unix_seconds: state.dirty_since_unix_seconds.unwrap_or(now),
+                        last_attempt_unix_seconds: None,
+                    },
+                );
+            }
+        }
+        state.dirty_since_unix_seconds = state
+            .root_schedules
+            .iter()
+            .map(|schedule| schedule.dirty_since_unix_seconds)
+            .min();
+        let schedules = state
+            .root_schedules
+            .iter()
+            .map(|schedule| (schedule.protected_root_id, schedule.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut roots = roots
+            .into_iter()
+            .filter(|root| {
+                let schedule = &schedules[&root.root_id];
+                now >= schedule
+                    .dirty_since_unix_seconds
+                    .saturating_add(policy.quiet_period_seconds)
+                    && now
+                        >= schedule
+                            .last_attempt_unix_seconds
+                            .unwrap_or(0)
+                            .saturating_add(policy.minimum_interval_seconds)
+            })
+            .collect::<Vec<_>>();
+        roots.sort_by_key(|root| {
+            let schedule = &schedules[&root.root_id];
+            (
+                schedule.dirty_since_unix_seconds,
+                schedule.last_attempt_unix_seconds.unwrap_or(0),
+                root.root_id,
+            )
+        });
         let mut selected = None;
         for root in roots {
             if !self
@@ -1462,6 +1556,12 @@ impl Node {
             return Ok(AutomaticBackupPoll::Idle);
         }
         state.last_attempt_unix_seconds = Some(now);
+        let schedule = state
+            .root_schedules
+            .iter_mut()
+            .find(|schedule| schedule.protected_root_id == protected_root_id)
+            .context("selected automatic-backup root has no schedule")?;
+        schedule.last_attempt_unix_seconds = Some(now);
         state.window_backup_count += 1;
         state.window_bytes = state.window_bytes.saturating_add(estimated_bytes);
         state.retry_at_unix_seconds = None;
@@ -6383,11 +6483,25 @@ impl Node {
                 })?,
             )?;
         }
-        if !self.root_dirty()? {
-            let mut automation = self.automatic_backup_state(unix_seconds())?;
-            automation.dirty_since_unix_seconds = None;
-            self.store_automatic_backup_state(&automation)?;
+        let mut automation = self.automatic_backup_state(unix_seconds())?;
+        let mut dirty_roots = BTreeSet::new();
+        for root in self.protected_roots()? {
+            if self
+                .root_dirty_state(root.root_id)?
+                .is_none_or(|state| state.dirty)
+            {
+                dirty_roots.insert(root.root_id);
+            }
         }
+        automation
+            .root_schedules
+            .retain(|schedule| dirty_roots.contains(&schedule.protected_root_id));
+        automation.dirty_since_unix_seconds = automation
+            .root_schedules
+            .iter()
+            .map(|schedule| schedule.dirty_since_unix_seconds)
+            .min();
+        self.store_automatic_backup_state(&automation)?;
         Ok(())
     }
 
@@ -9969,6 +10083,70 @@ mod tests {
         let status = reopened.automatic_backup_status().unwrap();
         assert!(status.blocked_reason.unwrap().contains("capacity"));
         assert!(status.retry_at_unix_seconds.is_none());
+    }
+
+    #[test]
+    fn automatic_backup_noisy_root_cannot_starve_quiet_sibling() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state");
+        let (seed, certificate, peers) = recovery_guild_fixture();
+        let mut node = Node::open(&state_path, seed.clone()).unwrap();
+        node.adopt_recovered_guild(certificate, peers).unwrap();
+        let noisy_id = Uuid::from_bytes([1; 16]);
+        let quiet_id = Uuid::from_bytes([2; 16]);
+        for (root_id, name) in [(noisy_id, "noisy"), (quiet_id, "quiet")] {
+            let path = temp.path().join(name);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("payload"), name.as_bytes()).unwrap();
+            let filesystem = filesystem_identity(&path).unwrap();
+            node.control
+                .put_record(
+                    "protected-root",
+                    root_id.as_bytes(),
+                    &canonical_bytes(&ProtectedRoot {
+                        format_version: 3,
+                        root_id,
+                        root_inode: fs::metadata(&path).unwrap().ino(),
+                        path,
+                        filesystem_id: filesystem.stable_id,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        node.configure_automatic_backup(&AutomaticBackupPolicy {
+            enabled: true,
+            quiet_period_seconds: 10,
+            minimum_interval_seconds: 1,
+            full_reconcile_interval_seconds: 60,
+            daily_backup_limit: 10,
+            daily_byte_limit: 1024,
+        })
+        .unwrap();
+        node.mark_root_dirty_at(noisy_id, "initial noisy change", true, 100)
+            .unwrap();
+        node.mark_root_dirty_at(quiet_id, "quiet change", true, 100)
+            .unwrap();
+        node.mark_root_dirty_at(noisy_id, "more noise", true, 105)
+            .unwrap();
+        node.mark_root_dirty_at(noisy_id, "still noisy", true, 109)
+            .unwrap();
+        drop(node);
+
+        let mut reopened = Node::open(&state_path, seed).unwrap();
+        assert!(matches!(
+            reopened.poll_automatic_backup(110).unwrap(),
+            AutomaticBackupPoll::Start {
+                protected_root_id,
+                ..
+            } if protected_root_id == quiet_id
+        ));
+        let state = reopened.automatic_backup_state(110).unwrap();
+        assert_eq!(state.root_schedules.len(), 2);
+        assert_eq!(state.root_schedules[0].dirty_since_unix_seconds, 109);
+        assert_eq!(state.root_schedules[1].dirty_since_unix_seconds, 100);
     }
 
     #[test]

@@ -1289,7 +1289,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   request lifetime. The selector therefore accepts a later valid advancing
   tail while retaining a hard bound for stalled peers. The scaled slow-path
   regression and strict node Clippy pass locally.
-- [ ] **M5-48 / P1 — Debounce and schedule automatic backups per protected root.**
+- [x] **M5-48 / P1 — Debounce and schedule automatic backups per protected root.**
   Every changed root rewrites one global quiet-period timestamp
   (`crates/mb-node/src/node.rs:1138`, `:1166`), while eligible roots are scanned
   in UUID order and the first is selected (`:1004`, `:1389`). A continuously
@@ -1298,6 +1298,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   root-scoped debounce/attempt state and fair or oldest-eligible selection.
   Gate a noisy lower-UUID root beside a quiet dirty root and prove the quiet
   root commits within a bounded interval while both remain watched.
+  Durable automatic-backup state now records each dirty root's quiet timestamp
+  and last attempt independently. Polling migrates legacy global state, orders
+  eligible roots by oldest dirty time, and removes schedules as roots become
+  clean. A restart regression proves repeated changes to a lower-UUID root do
+  not delay its quiet sibling; all automatic-backup tests and strict node Clippy
+  pass locally.
 - [x] **M5-49 / P1 — Scope stable source identities and recipes to protected roots.**
   Content-derived sector IDs omit the protected-root UUID
   (`crates/mb-core/src/content.rs:55`), but checkpoint validation rejects one ID
