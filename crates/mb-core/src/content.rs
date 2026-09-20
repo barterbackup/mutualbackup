@@ -49,21 +49,27 @@ pub fn make_sector_id(
 }
 
 /// Stable encrypted-sector identity for content-preserving revisions. The
-/// guild scope separates encryption keys, and the logical length prevents two
-/// differently truncated plaintexts with identical zero padding from sharing
-/// a nonce. Equal IDs therefore imply equal plaintext under the same key.
+/// secret identity key prevents peers which observe a signed revision from
+/// testing plaintext guesses. Protected-root scope keeps recipes and anchor
+/// lifetime independent even when two roots contain the same bytes. The
+/// logical length prevents differently truncated plaintexts with identical
+/// zero padding from sharing a nonce.
 pub fn make_content_sector_id(
+    identity_key: &[u8; 32],
     owner: NodeId,
     guild_id: [u8; 32],
+    protected_root_id: Uuid,
     purpose: SectorPurpose,
     plaintext: &[u8],
 ) -> Result<SectorId, ContentError> {
     if plaintext.len() > V1_SECTOR_SIZE {
         return Err(ContentError::TooLarge);
     }
-    let mut hasher = Hasher::new_derive_key("mutualbackup content sector id v1");
+    let mut hasher = Hasher::new_keyed(identity_key);
+    hasher.update(b"mutualbackup content sector id v2");
     hasher.update(&owner.0);
     hasher.update(&guild_id);
+    hasher.update(protected_root_id.as_bytes());
     hasher.update(&[purpose.tag()]);
     hasher.update(&(plaintext.len() as u64).to_be_bytes());
     hasher.update(plaintext);
@@ -144,22 +150,45 @@ mod tests {
     fn content_sector_ids_reuse_nonces_only_for_identical_plaintext() {
         let owner = NodeId([8; 32]);
         let guild = [7; 32];
-        let first = make_content_sector_id(owner, guild, SectorPurpose::Data, b"same").unwrap();
+        let root = Uuid::from_u128(9);
+        let key = [10; 32];
+        let first =
+            make_content_sector_id(&key, owner, guild, root, SectorPurpose::Data, b"same").unwrap();
         assert_eq!(
             first,
-            make_content_sector_id(owner, guild, SectorPurpose::Data, b"same").unwrap()
+            make_content_sector_id(&key, owner, guild, root, SectorPurpose::Data, b"same").unwrap()
         );
         assert_ne!(
             first,
-            make_content_sector_id(owner, guild, SectorPurpose::Data, b"same\0").unwrap()
+            make_content_sector_id(&key, owner, guild, root, SectorPurpose::Data, b"same\0")
+                .unwrap()
         );
         assert_ne!(
             first,
-            make_content_sector_id(owner, guild, SectorPurpose::Metadata, b"same").unwrap()
+            make_content_sector_id(&key, owner, guild, root, SectorPurpose::Metadata, b"same")
+                .unwrap()
         );
         assert_ne!(
             first,
-            make_content_sector_id(owner, [6; 32], SectorPurpose::Data, b"same").unwrap()
+            make_content_sector_id(&key, owner, [6; 32], root, SectorPurpose::Data, b"same")
+                .unwrap()
+        );
+        assert_ne!(
+            first,
+            make_content_sector_id(
+                &key,
+                owner,
+                guild,
+                Uuid::from_u128(10),
+                SectorPurpose::Data,
+                b"same",
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            first,
+            make_content_sector_id(&[11; 32], owner, guild, root, SectorPurpose::Data, b"same")
+                .unwrap()
         );
     }
 }

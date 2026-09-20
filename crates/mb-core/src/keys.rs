@@ -316,6 +316,10 @@ impl KeyMaterial {
         derive_with_context(self.signing.as_bytes(), b"guild/data/v1", guild_id)
     }
 
+    pub fn guild_content_id_key(&self, guild_id: &[u8; 32]) -> [u8; 32] {
+        derive_with_context(self.signing.as_bytes(), b"guild/content-id/v2", guild_id)
+    }
+
     pub fn sign(&self, domain: &'static [u8], bytes: &[u8]) -> [u8; 64] {
         self.signing
             .sign(&signing_payload(domain, bytes))

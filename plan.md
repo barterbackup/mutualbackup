@@ -1096,12 +1096,15 @@ Milestone 5. Exact source locations and correction gates are in `TODO.md`:
   cancels the only advancing request on a legitimate slower relay or Tor path.
 - **M5-48:** Automatic backup still shares one quiet timestamp and a fixed
   UUID-first selector across roots, so a noisy root can starve a quiet sibling.
-- **M5-49 and M5-50:** Stable source IDs omit protected-root scope and use no
-  owner secret. Identical cross-root content both conflicts in checkpoint and
-  recipe state and exposes a public plaintext-confirmation oracle.
-- **M5-51 and M5-52:** Honest signers still accept a newly proposed
-  unauthenticated version-one catalog, including a v2-to-v1 downgrade, while
-  the production packer cannot advance any retained version-three revision.
+- **M5-49 and M5-50 (resolved):** Revision format 5 derives stable IDs with a
+  separate owner-secret key and protected-root scope. Same-root unchanged data
+  retains reuse, cross-root recipes no longer collide, public plaintext guesses
+  do not reproduce IDs, and legacy revision formats remain readable.
+- **M5-51 (resolved):** Current format-7 signing requires an authenticated
+  version-2 catalog. Historical version-1 catalogs remain readable, but a new
+  checkpoint cannot introduce one or downgrade to it.
+- **M5-52:** The production packer cannot yet advance a retained version-three
+  revision without signed source commitments.
 - **M5-53 and M5-54:** Incremental packed reads do not use available any-`k`
   reconstruction, and packed `flat_root` is not cryptographically bound to the
   owner-authenticated Merkle commitment before checkpoint signing.

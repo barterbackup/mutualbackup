@@ -255,6 +255,18 @@ fn same_coding_lane_attempt(left: &CodingAttemptPlan, right: &CodingAttemptPlan)
         && left.information_roots == right.information_roots
 }
 
+fn validate_checkpoint_for_signature(checkpoint: &GuildCheckpoint) -> Result<()> {
+    if checkpoint.format_version == 7
+        && checkpoint
+            .packing_catalog
+            .as_ref()
+            .is_none_or(|catalog| catalog.format_version != 2)
+    {
+        anyhow::bail!("new format-seven checkpoints require authenticated packed catalogs");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct DhtPublicationState {
     format_version: u16,
@@ -5729,6 +5741,7 @@ impl Node {
 
     pub fn sign_checkpoint(&mut self, checkpoint: &GuildCheckpoint) -> Result<MemberSignature> {
         checkpoint.validate()?;
+        validate_checkpoint_for_signature(checkpoint)?;
         self.validate_local_member(checkpoint, true)?;
         self.validate_variable_checkpoint_coverage(checkpoint, false)?;
         let configured: Member = decode_canonical(
@@ -9402,6 +9415,42 @@ fn set_private_directory(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_format_seven_signature_requires_authenticated_packing() {
+        let mut checkpoint = GuildCheckpoint {
+            format_version: 7,
+            guild_id: [1; 32],
+            genesis_hash: [2; 32],
+            generation: 1,
+            parent: None,
+            members: Vec::new(),
+            writer_fences: Vec::new(),
+            revision_tombstones: Vec::new(),
+            revisions: Vec::new(),
+            coding_groups: Vec::new(),
+            authority: None,
+            packing_catalog: Some(PackedCatalog {
+                id: [3; 32],
+                format_version: 1,
+                revision: 1,
+                parent: None,
+                profile: PackingProfile {
+                    format_version: 1,
+                    sector_size: 64,
+                    slot_size: 16,
+                },
+                sectors: Vec::new(),
+                source_authentication: None,
+            }),
+        };
+        assert!(validate_checkpoint_for_signature(&checkpoint).is_err());
+
+        let catalog = checkpoint.packing_catalog.as_mut().unwrap();
+        catalog.format_version = 2;
+        catalog.source_authentication = Some(Vec::new());
+        assert!(validate_checkpoint_for_signature(&checkpoint).is_ok());
+    }
 
     fn install_empty_recovery_revision(
         node: &mut Node,

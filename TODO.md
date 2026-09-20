@@ -1294,7 +1294,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   root-scoped debounce/attempt state and fair or oldest-eligible selection.
   Gate a noisy lower-UUID root beside a quiet dirty root and prove the quiet
   root commits within a bounded interval while both remain watched.
-- [ ] **M5-49 / P1 — Scope stable source identities and recipes to protected roots.**
+- [x] **M5-49 / P1 — Scope stable source identities and recipes to protected roots.**
   Content-derived sector IDs omit the protected-root UUID
   (`crates/mb-core/src/content.rs:55`), but checkpoint validation rejects one ID
   when it appears under two roots (`crates/mb-core/src/model.rs:819`). Identical
@@ -1305,7 +1305,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   anchor. Make identity, recipe ownership, and anchor lifetime root-safe. Gate
   identical content across two roots through repeated backup, independent
   retention/GC, and restore of both roots.
-- [ ] **M5-50 / P1 — Key stable sector IDs against plaintext guessing.**
+  Revision format 5 now includes the protected-root UUID in each stable content
+  ID. Equal bytes in separate roots therefore have separate sector/recipe keys,
+  while equal bytes within one root retain stable reuse. Formats 3 and 4 retain
+  their canonical decoding and restore behavior. Core coverage proves root
+  separation and format-4/format-5 round trips.
+- [x] **M5-50 / P1 — Key stable sector IDs against plaintext guessing.**
   `make_content_sector_id` hashes plaintext with only public owner, guild,
   purpose, length, and constant-domain inputs
   (`crates/mb-core/src/content.rs:55`). IDs are published in replicated signed
@@ -1314,7 +1319,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   owner-secret key material as well as protected-root scope, retain stable
   reuse for identical content in the same root, and version the migration.
   Gate direct dictionary guesses against observed revision IDs.
-- [ ] **M5-51 / P1 — Reject unauthenticated catalogs in newly signed format-7 checkpoints.**
+  `KeyMaterial::guild_content_id_key` derives a separate owner-secret key, and
+  the version-2 content-ID hash uses it before hashing the public scope and
+  plaintext. Tests prove that equal public inputs under another owner secret
+  do not reveal the same ID. The full core suite and strict core/node library
+  Clippy pass locally.
+- [x] **M5-51 / P1 — Reject unauthenticated catalogs in newly signed format-7 checkpoints.**
   Current model validation expressly accepts a version-one packed catalog with
   no source authentication (`crates/mb-core/src/model.rs:916`), and checkpoint
   signing relies on that validation while checking coding only for the supplied
@@ -1326,6 +1336,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   separate from authorization of a new checkpoint and forbid authentication
   downgrade. Gate a commitment-bearing revision with a newly proposed
   unauthenticated catalog and a v2-to-v1 transition.
+  Checkpoint signing now applies a current-format authorization gate after
+  structural validation: every newly signed format-7 body must carry a
+  version-2 authenticated catalog. Historical version-1 catalogs remain
+  decodable and verifiable for recovery, but cannot be signed into another
+  current checkpoint or accepted as a downgrade. The focused node regression,
+  complete core suite, and strict core/node library Clippy pass locally.
 - [ ] **M5-52 / P1 — Migrate retained legacy revisions through authenticated packing.**
   Version-three revisions remain valid and readable without signed source
   commitments, but production packing requires commitments on every retained

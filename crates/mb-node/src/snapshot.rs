@@ -426,7 +426,7 @@ pub(crate) fn prepare_revision(
                 || previous.value.owner != keys.node_id()
                 || previous.value.guild_id != guild_id
                 || previous.value.protected_root_id != protected_root_id
-                || !matches!(previous.value.format_version, 3 | 4)
+                || !matches!(previous.value.format_version, 3..=5)
                 || previous.value.cipher_profile != V1_CIPHER_PROFILE
                 || previous.value.sequence.checked_add(1) != Some(sequence)
             {
@@ -479,6 +479,7 @@ pub(crate) fn prepare_revision(
         }
         validate_capture_sector_budget(&anchor.manifest)?;
         let encryption_key = keys.guild_data_key(&guild_id);
+        let content_id_key = keys.guild_content_id_key(&guild_id);
         let mut data_references = Vec::new();
         let mut sector_commitments = BTreeMap::<SectorId, MerkleCommitment>::new();
         let mut private_entries = Vec::new();
@@ -519,8 +520,10 @@ pub(crate) fn prepare_revision(
                         let mut plaintext = vec![0_u8; logical_len];
                         file.read_exact(&mut plaintext)?;
                         let id = make_content_sector_id(
+                            &content_id_key,
                             keys.node_id(),
                             guild_id,
+                            protected_root_id,
                             SectorPurpose::Data,
                             &plaintext,
                         )?;
@@ -578,6 +581,8 @@ pub(crate) fn prepare_revision(
                         &mut recipe_records,
                         keys,
                         guild_id,
+                        protected_root_id,
+                        &content_id_key,
                         &mut ordinal,
                         &mut sector_commitments,
                         &locator,
@@ -622,8 +627,10 @@ pub(crate) fn prepare_revision(
         let mut metadata_references = Vec::new();
         for plaintext in metadata_bytes.chunks(V1_SECTOR_SIZE) {
             let id = make_content_sector_id(
+                &content_id_key,
                 keys.node_id(),
                 guild_id,
+                protected_root_id,
                 SectorPurpose::Metadata,
                 plaintext,
             )?;
@@ -652,7 +659,7 @@ pub(crate) fn prepare_revision(
             })
             .collect::<Result<Vec<_>>>()?;
         let mut revision = UserRevision {
-            format_version: 4,
+            format_version: 5,
             guild_id,
             protected_root_id,
             cipher_profile: V1_CIPHER_PROFILE,
@@ -724,6 +731,8 @@ fn prepare_sparse_file(
     recipe_records: &mut Vec<RecordWrite>,
     keys: &KeyMaterial,
     guild_id: [u8; 32],
+    protected_root_id: Uuid,
+    content_id_key: &[u8; 32],
     ordinal: &mut u64,
     sector_commitments: &mut BTreeMap<SectorId, MerkleCommitment>,
     locator: &StableAnchorFileLocator,
@@ -748,8 +757,14 @@ fn prepare_sparse_file(
             let logical_len = remaining.min(V1_SECTOR_SIZE as u64) as usize;
             let mut plaintext = vec![0_u8; logical_len];
             file.read_exact(&mut plaintext)?;
-            let id =
-                make_content_sector_id(keys.node_id(), guild_id, SectorPurpose::Data, &plaintext)?;
+            let id = make_content_sector_id(
+                content_id_key,
+                keys.node_id(),
+                guild_id,
+                protected_root_id,
+                SectorPurpose::Data,
+                &plaintext,
+            )?;
             *ordinal = ordinal
                 .checked_add(1)
                 .context("too many sectors in one revision")?;
@@ -1866,7 +1881,7 @@ fn validate_restore_revision(
     if revision.signer != keys.node_id()
         || revision.value.owner != keys.node_id()
         || revision.value.guild_id != guild_id
-        || !matches!(revision.value.format_version, 3 | 4)
+        || !matches!(revision.value.format_version, 3..=5)
         || revision.value.cipher_profile != V1_CIPHER_PROFILE
     {
         bail!("revision does not belong to the recovering seed and guild");
@@ -2107,7 +2122,7 @@ where
     if revision.signer != keys.node_id()
         || revision.value.owner != keys.node_id()
         || revision.value.guild_id != guild_id
-        || !matches!(revision.value.format_version, 3 | 4)
+        || !matches!(revision.value.format_version, 3..=5)
         || revision.value.cipher_profile != V1_CIPHER_PROFILE
     {
         bail!("revision does not belong to the recovering seed and guild");

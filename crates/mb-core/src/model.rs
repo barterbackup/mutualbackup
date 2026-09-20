@@ -769,7 +769,7 @@ impl GuildCheckpoint {
                         revision.value.format_version,
                         &revision.value.sector_commitments
                     ),
-                    (3, None) | (4, Some(_))
+                    (3, None) | (4 | 5, Some(_))
                 )
                 || revision.value.guild_id != self.guild_id
                 || revision.value.protected_root_id.is_nil()
@@ -1252,7 +1252,7 @@ impl Serialize for UserRevision {
     {
         let field_count = match (self.format_version, &self.sector_commitments) {
             (3, None) => 13,
-            (4, Some(_)) => 14,
+            (4 | 5, Some(_)) => 14,
             _ => return Err(serde::ser::Error::custom("invalid user revision version")),
         };
         let mut tuple = serializer.serialize_tuple(field_count)?;
@@ -1311,7 +1311,7 @@ impl<'de> Deserialize<'de> for UserRevision {
                 let data_sectors = next_user_revision_field(&mut sequence, "data sectors")?;
                 let sector_commitments = match format_version {
                     3 => None,
-                    4 => Some(next_user_revision_field(
+                    4 | 5 => Some(next_user_revision_field(
                         &mut sequence,
                         "sector commitments",
                     )?),
@@ -1389,6 +1389,7 @@ impl UserRevision {
         let domain = match self.format_version {
             3 => "mutualbackup user revision body v3",
             4 => "mutualbackup user revision body v4",
+            5 => "mutualbackup user revision body v5",
             _ => return Err(ModelError::InvalidCheckpoint),
         };
         let mut hasher = blake3::Hasher::new_derive_key(domain);
@@ -2007,7 +2008,21 @@ mod tests {
                     .collect(),
             );
             body.sign_writer(&writer).unwrap();
+            let version_four =
+                SignedRecord::sign(USER_REVISION_DOMAIN, body.clone(), &keys[0]).unwrap();
+            let encoded = canonical_bytes(&version_four).unwrap();
+            assert_eq!(
+                decode_canonical::<SignedRecord<UserRevision>>(&encoded).unwrap(),
+                version_four
+            );
+            body.format_version = 5;
+            body.sign_writer(&writer).unwrap();
             *signed = SignedRecord::sign(USER_REVISION_DOMAIN, body, &keys[0]).unwrap();
+            let encoded = canonical_bytes(signed).unwrap();
+            assert_eq!(
+                decode_canonical::<SignedRecord<UserRevision>>(&encoded).unwrap(),
+                *signed
+            );
         }
         let packing_inputs = authenticated_checkpoint
             .revisions
