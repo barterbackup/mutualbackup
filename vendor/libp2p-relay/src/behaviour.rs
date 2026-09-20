@@ -266,7 +266,7 @@ pub struct Behaviour {
     local_peer_id: PeerId,
 
     reservations: HashMap<PeerId, HashSet<ConnectionId>>,
-    pending_new_reservations: HashSet<(PeerId, ConnectionId)>,
+    pending_reservations: HashMap<(PeerId, ConnectionId), bool>,
     circuits: CircuitsTracker,
 
     /// Queue of actions to return when polled.
@@ -281,7 +281,7 @@ impl Behaviour {
             config,
             local_peer_id,
             reservations: Default::default(),
-            pending_new_reservations: Default::default(),
+            pending_reservations: Default::default(),
             circuits: Default::default(),
             queued_actions: Default::default(),
             external_addresses: Default::default(),
@@ -296,8 +296,7 @@ impl Behaviour {
             ..
         }: ConnectionClosed,
     ) {
-        self.pending_new_reservations
-            .remove(&(peer_id, connection_id));
+        self.pending_reservations.remove(&(peer_id, connection_id));
         if let hash_map::Entry::Occupied(mut peer) = self.reservations.entry(peer_id) {
             if peer.get_mut().remove(&connection_id) {
                 self.queued_actions
@@ -327,45 +326,84 @@ impl Behaviour {
         }
     }
 
-    fn reservation_capacity_reached(&self, peer: PeerId, renewed: bool) -> bool {
-        !renewed
-            && (capacity_reached(
-                self.reservations
-                    .get(&peer)
-                    .map(|connections| connections.len())
-                    .unwrap_or(0),
-                self.config.max_reservations_per_peer,
-            ) || self
+    fn reservation_capacity_reached(
+        &self,
+        peer: PeerId,
+        connection: ConnectionId,
+        renewed: bool,
+    ) -> bool {
+        let key = (peer, connection);
+        if self.pending_reservations.contains_key(&key) {
+            return true;
+        }
+        if renewed
+            && self
                 .reservations
-                .values()
+                .get(&peer)
+                .is_some_and(|connections| connections.contains(&connection))
+        {
+            return false;
+        }
+        let pending_new_for_peer = self
+            .pending_reservations
+            .iter()
+            .filter(|((pending_peer, pending_connection), _)| {
+                *pending_peer == peer
+                    && !self
+                        .reservations
+                        .get(pending_peer)
+                        .is_some_and(|connections| connections.contains(pending_connection))
+            })
+            .count();
+        let pending_new_total = self
+            .pending_reservations
+            .keys()
+            .filter(|(pending_peer, pending_connection)| {
+                !self
+                    .reservations
+                    .get(pending_peer)
+                    .is_some_and(|connections| connections.contains(pending_connection))
+            })
+            .count();
+        capacity_reached(
+            self.reservations
+                .get(&peer)
                 .map(|connections| connections.len())
-                .sum::<usize>()
-                >= self.config.max_reservations)
+                .unwrap_or(0)
+                + pending_new_for_peer,
+            self.config.max_reservations_per_peer,
+        ) || self
+            .reservations
+            .values()
+            .map(|connections| connections.len())
+            .sum::<usize>()
+            + pending_new_total
+            >= self.config.max_reservations
     }
 
     fn begin_reservation_accept(&mut self, peer: PeerId, connection: ConnectionId, renewed: bool) {
-        let inserted = self
-            .reservations
-            .entry(peer)
-            .or_default()
-            .insert(connection);
-        if !renewed && inserted {
-            self.pending_new_reservations.insert((peer, connection));
-        }
+        self.pending_reservations
+            .insert((peer, connection), renewed);
     }
 
     fn reservation_accept_succeeded(&mut self, peer: PeerId, connection: ConnectionId) {
-        self.pending_new_reservations.remove(&(peer, connection));
-        self.reservations
-            .entry(peer)
-            .or_default()
-            .insert(connection);
+        if self
+            .pending_reservations
+            .remove(&(peer, connection))
+            .is_some()
+        {
+            self.reservations
+                .entry(peer)
+                .or_default()
+                .insert(connection);
+        }
     }
 
     fn reservation_accept_failed(&mut self, peer: PeerId, connection: ConnectionId) {
-        if !self.pending_new_reservations.remove(&(peer, connection)) {
-            return;
-        }
+        self.pending_reservations.remove(&(peer, connection));
+    }
+
+    fn reservation_timed_out(&mut self, peer: PeerId, connection: ConnectionId) {
         if let hash_map::Entry::Occupied(mut reservations) = self.reservations.entry(peer) {
             reservations.get_mut().remove(&connection);
             if reservations.get().is_empty() {
@@ -464,7 +502,11 @@ impl NetworkBehaviour for Behaviour {
                      denies all inbound substreams."
                 );
 
-                let action = if self.reservation_capacity_reached(event_source, renewed)
+                let action = if self.reservation_capacity_reached(
+                    event_source,
+                    connection,
+                    renewed,
+                )
                     // Deny if it exceeds the allowed rate of reservations.
                     || !self
                         .config
@@ -547,23 +589,7 @@ impl NetworkBehaviour for Behaviour {
                 ));
             }
             handler::Event::ReservationTimedOut {} => {
-                self.pending_new_reservations
-                    .remove(&(event_source, connection));
-                match self.reservations.entry(event_source) {
-                    hash_map::Entry::Occupied(mut peer) => {
-                        peer.get_mut().remove(&connection);
-                        if peer.get().is_empty() {
-                            peer.remove();
-                        }
-                    }
-                    hash_map::Entry::Vacant(_) => {
-                        unreachable!(
-                            "Expect to track timed out reservation with peer {:?} on connection {:?}",
-                            event_source,
-                            connection,
-                        );
-                    }
-                }
+                self.reservation_timed_out(event_source, connection);
 
                 self.queued_actions
                     .push_back(ToSwarm::GenerateEvent(Event::ReservationTimedOut {
@@ -920,18 +946,19 @@ mod tests {
         };
         let mut behaviour = super::Behaviour::new(local, config);
 
-        assert!(!behaviour.reservation_capacity_reached(peer, false));
+        assert!(!behaviour.reservation_capacity_reached(peer, connection, false));
         behaviour.begin_reservation_accept(peer, connection, false);
-        assert!(behaviour.reservation_capacity_reached(peer, false));
+        assert!(behaviour.reservation_capacity_reached(peer, connection, false));
         assert!(behaviour
-            .pending_new_reservations
-            .contains(&(peer, connection)));
+            .pending_reservations
+            .contains_key(&(peer, connection)));
+        assert!(!behaviour.reservations.contains_key(&peer));
 
         behaviour.reservation_accept_failed(peer, connection);
 
-        assert!(!behaviour.reservation_capacity_reached(peer, false));
+        assert!(!behaviour.reservation_capacity_reached(peer, connection, false));
         assert!(!behaviour.reservations.contains_key(&peer));
-        assert!(behaviour.pending_new_reservations.is_empty());
+        assert!(behaviour.pending_reservations.is_empty());
     }
 
     #[test]
@@ -948,8 +975,8 @@ mod tests {
         behaviour.begin_reservation_accept(peer, connection, false);
         behaviour.reservation_accept_succeeded(peer, connection);
 
-        assert!(behaviour.reservation_capacity_reached(peer, false));
-        assert!(!behaviour.reservation_capacity_reached(peer, true));
+        assert!(behaviour.reservation_capacity_reached(peer, connection, false));
+        assert!(!behaviour.reservation_capacity_reached(peer, connection, true));
         behaviour.begin_reservation_accept(peer, connection, true);
         behaviour.reservation_accept_failed(peer, connection);
 
@@ -957,6 +984,64 @@ mod tests {
             .reservations
             .get(&peer)
             .is_some_and(|connections| connections.contains(&connection)));
-        assert!(behaviour.pending_new_reservations.is_empty());
+        assert!(behaviour.pending_reservations.is_empty());
+    }
+
+    #[test]
+    fn overlapping_first_reservation_keeps_original_admission_pending() {
+        let local = PeerId::random();
+        let peer = PeerId::random();
+        let connection = ConnectionId::new_unchecked(1);
+        let mut behaviour = super::Behaviour::new(
+            local,
+            super::Config {
+                max_reservations: 2,
+                max_reservations_per_peer: 1,
+                ..Default::default()
+            },
+        );
+
+        behaviour.begin_reservation_accept(peer, connection, false);
+        assert!(behaviour.reservation_capacity_reached(peer, connection, false));
+        assert!(!behaviour.reservations.contains_key(&peer));
+        behaviour.reservation_accept_succeeded(peer, connection);
+        assert!(behaviour
+            .reservations
+            .get(&peer)
+            .is_some_and(|connections| connections.contains(&connection)));
+    }
+
+    #[test]
+    fn timed_out_renewal_keeps_capacity_reserved_until_acceptance_settles() {
+        let local = PeerId::random();
+        let renewing_peer = PeerId::random();
+        let other_peer = PeerId::random();
+        let renewing_connection = ConnectionId::new_unchecked(1);
+        let other_connection = ConnectionId::new_unchecked(2);
+        let mut behaviour = super::Behaviour::new(
+            local,
+            super::Config {
+                max_reservations: 1,
+                max_reservations_per_peer: 1,
+                ..Default::default()
+            },
+        );
+        behaviour.begin_reservation_accept(renewing_peer, renewing_connection, false);
+        behaviour.reservation_accept_succeeded(renewing_peer, renewing_connection);
+        behaviour.begin_reservation_accept(renewing_peer, renewing_connection, true);
+
+        behaviour.reservation_timed_out(renewing_peer, renewing_connection);
+
+        assert!(!behaviour.reservations.contains_key(&renewing_peer));
+        assert!(behaviour.reservation_capacity_reached(other_peer, other_connection, false));
+        behaviour.reservation_accept_succeeded(renewing_peer, renewing_connection);
+        assert_eq!(
+            behaviour
+                .reservations
+                .values()
+                .map(|connections| connections.len())
+                .sum::<usize>(),
+            1
+        );
     }
 }

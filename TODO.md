@@ -1421,7 +1421,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   holder geometry is now preferred from the preceding lane whenever the
   whole-run capacity plan permits it. Regressions prove stable adjacent holder
   layouts and repeatable geometry; strict node Clippy passes locally.
-- [ ] **M5-57 / P1 — Serialize relay reservation admission, acceptance, and expiry.**
+- [x] **M5-57 / P1 — Serialize relay reservation admission, acceptance, and expiry.**
   A first reservation is inserted before its acceptance settles
   (`vendor/libp2p-relay/src/behaviour.rs:346`). An overlapping request at the
   per-peer cap can replace and drop that acceptance future in the handler, but
@@ -1433,6 +1433,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   Gate overlapping first requests on one connection, circuit traffic before
   acceptance, and timeout-before-renewal-success while another peer fills the
   last slot.
+  The vendored relay now queues reservation response futures per connection and
+  tracks provisional admissions separately from established reservations.
+  Capacity counts both without double-counting renewals; expiry removes circuit
+  eligibility but retains a pending renewal's capacity claim until success or
+  failure. Regressions cover overlapping first requests, provisional visibility,
+  and expiry during renewal. All relay unit tests and strict relay Clippy pass.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

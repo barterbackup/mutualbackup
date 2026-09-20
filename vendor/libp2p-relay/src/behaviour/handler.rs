@@ -355,8 +355,10 @@ pub struct Handler {
     /// The point in time when this connection started idleing.
     idle_at: Option<Instant>,
 
-    /// Future handling inbound reservation request.
-    reservation_request_future: Option<ReservationRequestFuture>,
+    /// Reservation decisions are completed in admission order. Keeping the
+    /// earlier future alive prevents a later overlapping request from silently
+    /// cancelling an acceptance already counted by the behaviour.
+    reservation_request_futures: VecDeque<ReservationRequestFuture>,
     /// Timeout for the currently active reservation.
     active_reservation: Option<Delay>,
 
@@ -402,7 +404,7 @@ impl Handler {
             config,
             queued_events: Default::default(),
             idle_at: None,
-            reservation_request_future: Default::default(),
+            reservation_request_futures: Default::default(),
             circuit_accept_futures: Default::default(),
             circuit_deny_futures: Default::default(),
             circuits: Default::default(),
@@ -511,33 +513,23 @@ impl ConnectionHandler for Handler {
                 inbound_reservation_req,
                 addrs,
             } => {
-                if self
-                    .reservation_request_future
-                    .replace(ReservationRequestFuture::Accepting(
+                self.reservation_request_futures
+                    .push_back(ReservationRequestFuture::Accepting(
                         inbound_reservation_req.accept(addrs).err_into().boxed(),
-                    ))
-                    .is_some()
-                {
-                    tracing::warn!("Dropping existing deny/accept future in favor of new one")
-                }
+                    ));
             }
             In::DenyReservationReq {
                 inbound_reservation_req,
                 status,
             } => {
-                if self
-                    .reservation_request_future
-                    .replace(ReservationRequestFuture::Denying(
+                self.reservation_request_futures
+                    .push_back(ReservationRequestFuture::Denying(
                         inbound_reservation_req
                             .deny(status)
                             .err_into()
                             .map(move |result| (status, result))
                             .boxed(),
-                    ))
-                    .is_some()
-                {
-                    tracing::warn!("Dropping existing deny/accept future in favor of new one")
-                }
+                    ));
             }
             In::NegotiateOutboundConnect {
                 circuit_id,
@@ -828,10 +820,10 @@ impl ConnectionHandler for Handler {
         }
 
         // Progress reservation request.
-        match self.reservation_request_future.as_mut() {
+        match self.reservation_request_futures.front_mut() {
             Some(ReservationRequestFuture::Accepting(fut)) => {
                 if let Poll::Ready(result) = fut.poll_unpin(cx) {
-                    self.reservation_request_future = None;
+                    self.reservation_request_futures.pop_front();
 
                     match result {
                         Ok(()) => {
@@ -853,7 +845,7 @@ impl ConnectionHandler for Handler {
             }
             Some(ReservationRequestFuture::Denying(fut)) => {
                 if let Poll::Ready((status, result)) = fut.poll_unpin(cx) {
-                    self.reservation_request_future = None;
+                    self.reservation_request_futures.pop_front();
 
                     match result {
                         Ok(()) => {

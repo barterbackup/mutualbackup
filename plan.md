@@ -1113,9 +1113,9 @@ Milestone 5. Exact source locations and correction gates are in `TODO.md`:
 - **M5-55 and M5-56 (resolved):** A whole-run domain-capacity planner accepts
   feasible fragmented capacity, rejects infeasible demand, orders lanes by
   adjacent catalog index, and reuses compatible holder geometry across runs.
-- **M5-57:** Relay reservation state still races across overlapping first
-  requests and expiry during renewal, stranding provisional capacity or
-  exceeding the configured cap; provisional entries can also receive circuits.
+- **M5-57 (resolved):** Relay reservation responses are serialized, provisional
+  admissions cannot receive circuits, and pending renewals retain their bounded
+  capacity claim across expiry until acceptance settles.
 
 The M5-42 rejected-connection cleanup was source-reviewed and found to remove
 only the rejected connection while preserving accepted siblings. This review
