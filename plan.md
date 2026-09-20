@@ -86,8 +86,9 @@ candidate-to-lane path ranking are now implemented. The corrected source and
 complete local provisioned gate passed on 2026-09-18. Follow-up source review
 of `8135e0b..da8974a` found the M5-36 through M5-44 blockers in `TODO.md`.
 Those source corrections are implemented, and the complete local M5-45
-correction gate passed on 2026-09-19. Milestones 0 through 5 are closed;
-Milestone 6 is next.
+correction gate passed on 2026-09-19. Follow-up source-only review of
+`56bb57d..f7d0503` on 2026-09-20 found M5-46 through M5-57, so Milestone 5 is
+reopened. Milestone 6 waits for those corrections and a new closure gate.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -494,11 +495,11 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 5 have passed; the M5-36
-through M5-44 corrections and the complete M5-45 correction gate are included
-in that closure. Later wire or durable-state changes require the review and
-gate of the milestone that owns them. Build and run all subsequent validation
-locally; do not use a remote compilation server.
+than a daemon prerequisite. Milestones 0 through 4 have passed. Milestone 5 is
+reopened for M5-46 through M5-57 after its historical M5-45 gate. Later wire or
+durable-state changes require the review and gate of the milestone that owns
+them. Build and run all subsequent validation locally; do not use a remote
+compilation server.
 
 - Use an **asynchronous shell around a synchronous deterministic core**, not
   `async` everywhere. Tokio owns daemon IPC, the libp2p swarm, Kademlia, timers,
@@ -711,9 +712,10 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 5 are passed. The reopened Milestone
-5 source findings M5-36 through M5-44 are resolved and the M5-45 correction
-gate passed locally on 2026-09-19. Milestone 6 is next.
+**Current position:** Milestones 0 through 4 are passed. The M5-36 through
+M5-44 corrections and M5-45 gate remain historical evidence, but source-only
+review of `56bb57d..f7d0503` on 2026-09-20 found M5-46 through M5-57 and
+reopened Milestone 5. Milestone 6 waits for their correction and a new gate.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1082,6 +1084,37 @@ recovery scenario. This closes M5-45 while preserving anti-equivocation,
 seed-only recovery, retained-layout readability, failure-domain separation,
 and storage/transfer bounds. All compilation and execution were local; no
 remote compilation server was used.
+
+Follow-up source-only review of `56bb57d..f7d0503` on 2026-09-20 reopens
+Milestone 5. Exact source locations and correction gates are in `TODO.md`:
+
+- **M5-46:** A checkpoint can finalize on only a policy quorum while its
+  certificate is sent only to signers. That can leave too few independent
+  current publishers for seed recovery, and an active nonsigner has no normal
+  way to install the missed head or sign its successor.
+- **M5-47:** A fast empty event tail starts a five-second cutoff that repeatedly
+  cancels the only advancing request on a legitimate slower relay or Tor path.
+- **M5-48:** Automatic backup still shares one quiet timestamp and a fixed
+  UUID-first selector across roots, so a noisy root can starve a quiet sibling.
+- **M5-49 and M5-50:** Stable source IDs omit protected-root scope and use no
+  owner secret. Identical cross-root content both conflicts in checkpoint and
+  recipe state and exposes a public plaintext-confirmation oracle.
+- **M5-51 and M5-52:** Honest signers still accept a newly proposed
+  unauthenticated version-one catalog, including a v2-to-v1 downgrade, while
+  the production packer cannot advance any retained version-three revision.
+- **M5-53 and M5-54:** Incremental packed reads do not use available any-`k`
+  reconstruction, and packed `flat_root` is not cryptographically bound to the
+  owner-authenticated Merkle commitment before checkpoint signing.
+- **M5-55 and M5-56:** Greedy lane allocation can reject feasible fragmented
+  capacity, and lanes are ordered by content ID rather than adjacent catalog
+  range, so the claimed reusable range geometry is absent.
+- **M5-57:** Relay reservation state still races across overlapping first
+  requests and expiry during renewal, stranding provisional capacity or
+  exceeding the configured cap; provisional entries can also receive circuits.
+
+The M5-42 rejected-connection cleanup was source-reviewed and found to remove
+only the rejected connection while preserving accepted siblings. This review
+ran no builds, tests, daemons, runtime probes, or remote compilation.
 
 Milestone 4 implements quiet-period
 automatic backup with durable limits and full reconciliation, recovered-writer
@@ -1512,12 +1545,15 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (complete)
+### Milestone 5 — efficient and flexible data/guild protocol (reopened)
 
 M5-36 through M5-44 are implemented, and the complete M5-45 correction gate
 passed locally on 2026-09-19. The final committed tree passed formatting,
 locked all-target workspace tests, warning-free locked all-target Clippy, and
-the full provisioned filesystem/network acceptance script.
+the full provisioned filesystem/network acceptance script. A later source-only
+review found M5-46 through M5-57; those unchecked findings supersede the
+closure status. Completion requires their correction, focused regressions, and
+a fresh local source/workspace/provisioned gate before Milestone 6 begins.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and
