@@ -1571,7 +1571,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   reconstruction path and checked against the catalog commitment before the
   source is unpacked. The same loader supplies changed packed sectors to the
   incremental updater.
-- [ ] **M5-65 / P1 — Bound and fairly drain relay reservation responses.**
+- [x] **M5-65 / P1 — Bound and fairly drain relay reservation responses.**
   M5-57 replaced one response future with an unbounded per-connection `VecDeque`
   (`vendor/libp2p-relay/src/behaviour/handler.rs:358`). Every reservation
   decision appends a future that owns its request stream (`:510`), while only
@@ -1583,7 +1583,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   grow daemon memory without bound. Cap outstanding reservation streams, apply
   admission/rate limits to overlaps, fairly poll responses, and time out or
   reset a blocked head. Gate sustained overlapping ingress plus a stalled first
-  response and prove a fixed per-connection bound and continued progress.
+  response and prove a fixed per-connection bound and continued progress. Each
+  relay connection now admits at most ten reservation response futures, polls
+  them independently ahead of new inbound work, and resets any response that
+  has not completed within the stream timeout. Aborted accept responses release
+  provisional reservation capacity. Capacity-rejected overlaps still consume
+  configured peer/address rate-limit admission. Vendored relay regressions pin
+  the queue bound, progress past a stalled response, and overlap rate accounting;
+  all relay library tests and strict Clippy pass locally.
 - [x] **M5-66 / P1 — Make bounded checkpoint-chain catch-up advance.**
   The new walker fetches a head and then requests each parent from the same peer
   (`crates/mb-node/src/network/p2p.rs:7142`), but a peer serves checkpoint pages

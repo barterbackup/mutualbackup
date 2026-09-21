@@ -381,6 +381,22 @@ impl Behaviour {
             >= self.config.max_reservations
     }
 
+    fn reservation_admission_allowed(
+        &mut self,
+        peer: PeerId,
+        connection: ConnectionId,
+        renewed: bool,
+        remote_addr: &Multiaddr,
+        now: Instant,
+    ) -> bool {
+        let rate_allowed = self
+            .config
+            .reservation_rate_limiters
+            .iter_mut()
+            .all(|limiter| limiter.try_next(peer, remote_addr, now));
+        !self.reservation_capacity_reached(peer, connection, renewed) && rate_allowed
+    }
+
     fn begin_reservation_accept(&mut self, peer: PeerId, connection: ConnectionId, renewed: bool) {
         self.pending_reservations
             .insert((peer, connection), renewed);
@@ -502,19 +518,16 @@ impl NetworkBehaviour for Behaviour {
                      denies all inbound substreams."
                 );
 
-                let action = if self.reservation_capacity_reached(
+                // Consume rate-limit admission for every request, including an
+                // overlap that capacity rejects, so overlaps cannot bypass the
+                // peer and address buckets.
+                let action = if !self.reservation_admission_allowed(
                     event_source,
                     connection,
                     renewed,
-                )
-                    // Deny if it exceeds the allowed rate of reservations.
-                    || !self
-                        .config
-                        .reservation_rate_limiters
-                        .iter_mut()
-                        .all(|limiter| {
-                            limiter.try_next(event_source, endpoint.get_remote_address(), now)
-                        }) {
+                    endpoint.get_remote_address(),
+                    now,
+                ) {
                     ToSwarm::NotifyHandler {
                         handler: NotifyHandler::One(connection),
                         peer_id: event_source,
@@ -587,6 +600,11 @@ impl NetworkBehaviour for Behaviour {
                         error,
                     },
                 ));
+            }
+            handler::Event::ReservationReqResponseAborted { accepting } => {
+                if accepting {
+                    self.reservation_accept_failed(event_source, connection);
+                }
             }
             handler::Event::ReservationTimedOut {} => {
                 self.reservation_timed_out(event_source, connection);
@@ -921,10 +939,30 @@ impl From<proto::Status> for StatusCode {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use libp2p_identity::PeerId;
     use libp2p_swarm::ConnectionId;
+
+    struct CountingLimiter(Arc<AtomicUsize>);
+
+    impl super::rate_limiter::RateLimiter for CountingLimiter {
+        fn try_next(
+            &mut self,
+            _peer: PeerId,
+            _addr: &libp2p_core::Multiaddr,
+            _now: web_time::Instant,
+        ) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+    }
 
     #[test]
     fn configured_capacity_is_reached_at_the_exact_limit() {
@@ -1009,6 +1047,32 @@ mod tests {
             .reservations
             .get(&peer)
             .is_some_and(|connections| connections.contains(&connection)));
+    }
+
+    #[test]
+    fn overlapping_reservation_still_consumes_rate_admission() {
+        let local = PeerId::random();
+        let peer = PeerId::random();
+        let connection = ConnectionId::new_unchecked(1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut config = super::Config {
+            max_reservations: 2,
+            max_reservations_per_peer: 1,
+            ..Default::default()
+        };
+        config.reservation_rate_limiters = vec![Box::new(CountingLimiter(calls.clone()))];
+        let mut behaviour = super::Behaviour::new(local, config);
+        behaviour.begin_reservation_accept(peer, connection, false);
+
+        let remote_addr = "/ip4/127.0.0.1/tcp/1".parse().unwrap();
+        assert!(!behaviour.reservation_admission_allowed(
+            peer,
+            connection,
+            false,
+            &remote_addr,
+            web_time::Instant::now(),
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -28,7 +28,7 @@ use std::{
 use bytes::Bytes;
 use either::Either;
 use futures::{
-    future::{BoxFuture, FutureExt, TryFutureExt},
+    future::{self, BoxFuture, FutureExt, TryFutureExt},
     io::AsyncWriteExt,
     stream::{FuturesUnordered, StreamExt},
 };
@@ -51,6 +51,7 @@ use crate::{
 };
 
 const MAX_CONCURRENT_STREAMS_PER_CONNECTION: usize = 10;
+const MAX_PENDING_RESERVATION_RESPONSES: usize = MAX_CONCURRENT_STREAMS_PER_CONNECTION;
 const STREAM_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
@@ -162,6 +163,9 @@ pub enum Event {
     ReservationReqDenied { status: proto::Status },
     /// Denying an inbound reservation request has failed.
     ReservationReqDenyFailed { error: inbound_hop::Error },
+    /// A reservation response was reset before it completed. Accepted
+    /// responses require the behaviour to release provisional admission.
+    ReservationReqResponseAborted { accepting: bool },
     /// An inbound reservation has timed out.
     ReservationTimedOut {},
     /// An inbound circuit request has been received.
@@ -246,6 +250,10 @@ impl fmt::Debug for Event {
             Event::ReservationReqDenyFailed { error } => f
                 .debug_struct("Event::ReservationReqDenyFailed")
                 .field("error", error)
+                .finish(),
+            Event::ReservationReqResponseAborted { accepting } => f
+                .debug_struct("Event::ReservationReqResponseAborted")
+                .field("accepting", accepting)
                 .finish(),
             Event::ReservationTimedOut {} => f.debug_struct("Event::ReservationTimedOut").finish(),
             Event::CircuitReqReceived {
@@ -358,7 +366,7 @@ pub struct Handler {
     /// Reservation decisions are completed in admission order. Keeping the
     /// earlier future alive prevents a later overlapping request from silently
     /// cancelling an acceptance already counted by the behaviour.
-    reservation_request_futures: VecDeque<ReservationRequestFuture>,
+    reservation_request_futures: FuturesUnordered<ReservationRequestFuture>,
     /// Timeout for the currently active reservation.
     active_reservation: Option<Delay>,
 
@@ -486,11 +494,50 @@ impl Handler {
                 },
             ));
     }
+
+    fn poll_reservation_response(&mut self, cx: &mut Context<'_>) -> Option<Event> {
+        match self.reservation_request_futures.poll_next_unpin(cx) {
+            Poll::Ready(Some(ReservationRequestResult::Accepted(Ok(())))) => {
+                let renewed = self
+                    .active_reservation
+                    .replace(Delay::new(self.config.reservation_duration))
+                    .is_some();
+                Some(Event::ReservationReqAccepted { renewed })
+            }
+            Poll::Ready(Some(ReservationRequestResult::Accepted(Err(error)))) => {
+                Some(Event::ReservationReqAcceptFailed { error })
+            }
+            Poll::Ready(Some(ReservationRequestResult::Denied(status, Ok(())))) => {
+                Some(Event::ReservationReqDenied { status })
+            }
+            Poll::Ready(Some(ReservationRequestResult::Denied(_, Err(error)))) => {
+                Some(Event::ReservationReqDenyFailed { error })
+            }
+            Poll::Ready(Some(ReservationRequestResult::TimedOut { accepting })) => {
+                Some(Event::ReservationReqResponseAborted { accepting })
+            }
+            Poll::Ready(None) | Poll::Pending => None,
+        }
+    }
 }
 
-enum ReservationRequestFuture {
-    Accepting(BoxFuture<'static, Result<(), inbound_hop::Error>>),
-    Denying(BoxFuture<'static, (proto::Status, Result<(), inbound_hop::Error>)>),
+enum ReservationRequestResult {
+    Accepted(Result<(), inbound_hop::Error>),
+    Denied(proto::Status, Result<(), inbound_hop::Error>),
+    TimedOut { accepting: bool },
+}
+
+type ReservationRequestFuture = BoxFuture<'static, ReservationRequestResult>;
+
+fn push_reservation_response(
+    responses: &mut FuturesUnordered<ReservationRequestFuture>,
+    response: ReservationRequestFuture,
+) -> bool {
+    if responses.len() >= MAX_PENDING_RESERVATION_RESPONSES {
+        return false;
+    }
+    responses.push(response);
+    true
 }
 
 type Futures<T> = FuturesUnordered<BoxFuture<'static, T>>;
@@ -513,23 +560,46 @@ impl ConnectionHandler for Handler {
                 inbound_reservation_req,
                 addrs,
             } => {
-                self.reservation_request_futures
-                    .push_back(ReservationRequestFuture::Accepting(
-                        inbound_reservation_req.accept(addrs).err_into().boxed(),
-                    ));
+                let response = inbound_reservation_req.accept(addrs).err_into();
+                let future = async move {
+                    let timeout = Delay::new(STREAM_TIMEOUT);
+                    futures::pin_mut!(response, timeout);
+                    match future::select(response, timeout).await {
+                        future::Either::Left((result, _)) => {
+                            ReservationRequestResult::Accepted(result)
+                        }
+                        future::Either::Right(((), _)) => {
+                            ReservationRequestResult::TimedOut { accepting: true }
+                        }
+                    }
+                }
+                .boxed();
+                if !push_reservation_response(&mut self.reservation_request_futures, future) {
+                    self.queued_events
+                        .push_back(ConnectionHandlerEvent::NotifyBehaviour(
+                            Event::ReservationReqResponseAborted { accepting: true },
+                        ));
+                }
             }
             In::DenyReservationReq {
                 inbound_reservation_req,
                 status,
             } => {
-                self.reservation_request_futures
-                    .push_back(ReservationRequestFuture::Denying(
-                        inbound_reservation_req
-                            .deny(status)
-                            .err_into()
-                            .map(move |result| (status, result))
-                            .boxed(),
-                    ));
+                let response = inbound_reservation_req.deny(status).err_into();
+                let future = async move {
+                    let timeout = Delay::new(STREAM_TIMEOUT);
+                    futures::pin_mut!(response, timeout);
+                    match future::select(response, timeout).await {
+                        future::Either::Left((result, _)) => {
+                            ReservationRequestResult::Denied(status, result)
+                        }
+                        future::Either::Right(((), _)) => {
+                            ReservationRequestResult::TimedOut { accepting: false }
+                        }
+                    }
+                }
+                .boxed();
+                push_reservation_response(&mut self.reservation_request_futures, future);
             }
             In::NegotiateOutboundConnect {
                 circuit_id,
@@ -631,6 +701,13 @@ impl ConnectionHandler for Handler {
                     ))
                 }
             }
+        }
+
+        // Complete reservation responses before accepting more inbound work.
+        // Independent polling prevents a blocked response stream from holding
+        // up ready responses behind it.
+        if let Some(event) = self.poll_reservation_response(cx) {
+            return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(event));
         }
 
         // Process inbound protocol workers
@@ -819,51 +896,6 @@ impl ConnectionHandler for Handler {
             ));
         }
 
-        // Progress reservation request.
-        match self.reservation_request_futures.front_mut() {
-            Some(ReservationRequestFuture::Accepting(fut)) => {
-                if let Poll::Ready(result) = fut.poll_unpin(cx) {
-                    self.reservation_request_futures.pop_front();
-
-                    match result {
-                        Ok(()) => {
-                            let renewed = self
-                                .active_reservation
-                                .replace(Delay::new(self.config.reservation_duration))
-                                .is_some();
-                            return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
-                                Event::ReservationReqAccepted { renewed },
-                            ));
-                        }
-                        Err(error) => {
-                            return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
-                                Event::ReservationReqAcceptFailed { error },
-                            ));
-                        }
-                    }
-                }
-            }
-            Some(ReservationRequestFuture::Denying(fut)) => {
-                if let Poll::Ready((status, result)) = fut.poll_unpin(cx) {
-                    self.reservation_request_futures.pop_front();
-
-                    match result {
-                        Ok(()) => {
-                            return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
-                                Event::ReservationReqDenied { status },
-                            ))
-                        }
-                        Err(error) => {
-                            return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
-                                Event::ReservationReqDenyFailed { error },
-                            ));
-                        }
-                    }
-                }
-            }
-            None => {}
-        }
-
         // Check keep alive status.
         if self.active_reservation.is_none() {
             if self.idle_at.is_none() {
@@ -936,5 +968,48 @@ impl PendingConnect {
             max_circuit_duration: config.max_circuit_duration,
             max_circuit_bytes: config.max_circuit_bytes,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::task::{Context, Poll};
+
+    use futures::{future, task::noop_waker_ref, FutureExt, StreamExt};
+
+    use super::{
+        push_reservation_response, ReservationRequestFuture, ReservationRequestResult,
+        MAX_PENDING_RESERVATION_RESPONSES,
+    };
+
+    fn stalled_response() -> ReservationRequestFuture {
+        future::pending().boxed()
+    }
+
+    #[test]
+    fn reservation_responses_are_bounded_and_ready_work_bypasses_a_stall() {
+        let mut bounded = futures::stream::FuturesUnordered::new();
+        for _ in 0..MAX_PENDING_RESERVATION_RESPONSES {
+            assert!(push_reservation_response(&mut bounded, stalled_response()));
+        }
+        assert!(!push_reservation_response(
+            &mut bounded,
+            future::ready(ReservationRequestResult::TimedOut { accepting: false }).boxed(),
+        ));
+        assert_eq!(bounded.len(), MAX_PENDING_RESERVATION_RESPONSES);
+
+        let mut fair = futures::stream::FuturesUnordered::new();
+        assert!(push_reservation_response(&mut fair, stalled_response()));
+        assert!(push_reservation_response(
+            &mut fair,
+            future::ready(ReservationRequestResult::TimedOut { accepting: false }).boxed(),
+        ));
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(matches!(
+            fair.poll_next_unpin(&mut cx),
+            Poll::Ready(Some(ReservationRequestResult::TimedOut {
+                accepting: false
+            }))
+        ));
     }
 }
