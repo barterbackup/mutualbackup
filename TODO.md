@@ -581,9 +581,12 @@ M5-44 blockers below; all are now corrected. The production gate recorded in
 M5-35 remains valid evidence for those scenarios, but predates the corrected
 tree. The complete M5-45 correction gate passed locally on 2026-09-19, so
 it remains historical evidence for that tree. Follow-up source-only review of
-`56bb57d..f7d0503` on 2026-09-20 found M5-46 through M5-57 below. Milestone 5
-is reopened and Milestone 6 must wait for their correction and a new gate.
-The follow-up review ran no builds, tests, daemons, or remote compilation.
+`56bb57d..f7d0503` on 2026-09-20 found M5-46 through M5-57 below. Their
+corrections are recorded under those items, but a fresh source-only review of
+`f7d0503..81ec33b` on 2026-09-21 found M5-58 through M5-66. Milestone 5 remains
+reopened and Milestone 6 must wait for their correction and a new gate. The
+fresh review ran no builds, tests, daemons, runtime probes, or remote
+compilation.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -1464,6 +1467,105 @@ node Clippy gate passed locally. No remote compilation server was used.
   eligibility but retains a pending renewal's capacity claim until success or
   failure. Regressions cover overlapping first requests, provisional visibility,
   and expiry during renewal. All relay unit tests and strict relay Clippy pass.
+
+- [ ] **M5-58 / P1 — Let certified nonsigners adopt and publish checkpoints.**
+  Certificate staging and peer catch-up both finish through `store_checkpoint`,
+  but that path still passes `require_signature_lock = true`
+  (`crates/mb-node/src/node.rs:5840`, `:5848`). The database consequently
+  rejects a valid quorum certificate unless this node signed the exact body
+  (`crates/mb-store/src/database.rs:958`). In a five-member majority, the two
+  reachable nonsigners cannot become durable holders or later publishers, so
+  the M5-46 availability correction does not work. Permit a verified certificate
+  to atomically adopt the matching signature lock while retaining the exact-head
+  and transition checks. Gate policy-quorum finalization to all reachable
+  signers and nonsigners, loss of a signer, seed recovery, and the next
+  checkpoint.
+- [ ] **M5-59 / P1 — Catch checkpoints up across historical authority epochs.**
+  Peer exchange synchronizes guild events before checkpoints
+  (`crates/mb-node/src/network/p2p.rs:7076`), then installs the checkpoint chain
+  oldest first through `store_checkpoint` (`:7175`). That store requires current
+  membership, so an intermediate checkpoint that was valid under a recorded
+  earlier authority is rejected after the event head has advanced
+  (`crates/mb-node/src/node.rs:5842`, `:6239`). Validate each certified link
+  against its historical authority while keeping the final local authority
+  current. Gate a lagging member from an authority-A checkpoint through an
+  A-to-B event and B checkpoint without resetting local state.
+- [ ] **M5-60 / P1 — Keep clean roots out of dirty-root schedule lookup.**
+  Polling retains and creates schedules only for dirty roots
+  (`crates/mb-node/src/node.rs:1446`, `:1458`), but then filters every configured
+  root and indexes the schedule map unconditionally (`:1491`). Once one root is
+  committed and its schedule removed while a sibling remains dirty, the next
+  poll panics on the clean root. Select only roots with a schedule and preserve
+  root-local cleanup. Gate mixed clean/dirty roots after commit and after adding
+  or restoring a clean root beside an existing dirty root.
+- [ ] **M5-61 / P1 — Apply the byte budget without starving eligible roots.**
+  Automatic backup selects the oldest readable root and stops
+  (`crates/mb-node/src/node.rs:1513`), then checks that root against the remaining
+  daily byte budget (`:1566`). An oversized oldest root therefore blocks the
+  whole window every day while smaller dirty siblings that fit are never
+  considered. Include budget eligibility in the fair root selection and retain
+  a root-scoped blocked reason for the skipped root. Gate an oversized oldest
+  root beside smaller eligible siblings across consecutive budget windows.
+- [ ] **M5-62 / P1 — Retire the final legacy binding without losing modern sources.**
+  Once no legacy binding remains, production skips unchanged authenticated
+  inputs (`crates/mb-node/src/network/p2p.rs:11936`), but the complete-corpus
+  authenticated updater accepts only catalog versions 2 and 3 (`:12051`;
+  `crates/mb-core/src/packing.rs:927`). A prior version-4 catalog therefore falls
+  into `pack_incremental`, where the partial inputs are treated as the complete
+  desired corpus (`packing.rs:743`) and retained modern sources disappear. If
+  the source set is unchanged, cloning version 4 instead leaves now-unused
+  bindings. Both paths fail catalog/checkpoint validation when the last legacy
+  revision retires. Make version-4 retirement an authenticated complete-corpus
+  transition that removes exactly obsolete bindings. Gate retention one and
+  larger multi-owner histories through the final legacy retirement and another
+  backup.
+- [ ] **M5-63 / P1 — Make legacy migration durable without every historical owner online.**
+  A missing migration binding is obtained only from the exact source owner
+  (`crates/mb-node/src/network/p2p.rs:11885`), whose signer reads its local sector
+  (`crates/mb-node/src/node.rs:3570`). An offline or removed historical owner can
+  thus block the first upgraded checkpoint even when the certified old layout
+  has enough surviving shards. The acquired bindings are not persisted
+  independently; `store_packing_result` stores only packed-sector records
+  (`node.rs:3580`), so a crash before publication requires the owner again.
+  Define a verifiable offline-owner migration path and durably journal accepted
+  bindings before checkpoint publication. Gate migration with a retained owner
+  offline or removed, any valid `k` old shards, and restart at every publication
+  boundary.
+- [ ] **M5-64 / P1 — Use any-`k` packed recovery throughout the migration window.**
+  While any legacy binding remains, production fetches every retained source
+  (`crates/mb-node/src/network/p2p.rs:11941`). Its failure fallback checks only
+  the coordinator's packed cache or locally assigned information shard
+  (`:11958`), although finalization normally deletes that cache (`:12596`); it
+  never reaches the distributed any-`k` loader at `:12142` because catalog
+  version 4 is excluded from that updater. A changed backup is therefore blocked
+  by any unrelated offline source owner or remote information holder despite
+  enough surviving shards. Route version-4 source recovery through the bounded
+  commitment-checked any-`k` loader. Gate one changed source with another owner
+  offline, the assigned information holder absent, and each valid `k`-shard set.
+- [ ] **M5-65 / P1 — Bound and fairly drain relay reservation responses.**
+  M5-57 replaced one response future with an unbounded per-connection `VecDeque`
+  (`vendor/libp2p-relay/src/behaviour/handler.rs:358`). Every reservation
+  decision appends a future that owns its request stream (`:510`), while only
+  the front is polled and response I/O has no timeout (`:822`). Ready inbound
+  workers are returned first (`:636`), and overlapping requests rejected by a
+  provisional admission bypass both rate limiters through the capacity-check
+  short circuit (`vendor/libp2p-relay/src/behaviour.rs:329`, `:505`). One peer
+  can therefore replenish parsed requests, starve or stall the queue head, and
+  grow daemon memory without bound. Cap outstanding reservation streams, apply
+  admission/rate limits to overlaps, fairly poll responses, and time out or
+  reset a blocked head. Gate sustained overlapping ingress plus a stalled first
+  response and prove a fixed per-connection bound and continued progress.
+- [ ] **M5-66 / P1 — Make bounded checkpoint-chain catch-up advance.**
+  The new walker fetches a head and then requests each parent from the same peer
+  (`crates/mb-node/src/network/p2p.rs:7142`), but a peer serves checkpoint pages
+  only for its current head (`crates/mb-node/src/node.rs:9501`). A member two
+  generations behind therefore cannot fetch the intermediate checkpoint unless
+  another peer happens to retain it as its head. A gap over 1,024 is skipped
+  before any checkpoint is stored (`p2p.rs:7137`), so every later pass repeats
+  the same skip. Serve certified retained ancestors and make bounded passes
+  durably advance instead of requiring the entire gap at once. Gate ordinary
+  rejoin from generation G when all current peers are at G+2 and G+1025, with no
+  intermediate-head peer, then finalize G+n+1 after convergence.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

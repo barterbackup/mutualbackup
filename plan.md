@@ -88,8 +88,9 @@ of `8135e0b..da8974a` found the M5-36 through M5-44 blockers in `TODO.md`.
 Those source corrections are implemented, and the complete local M5-45
 correction gate passed on 2026-09-19. Follow-up source-only review of
 `56bb57d..f7d0503` on 2026-09-20 found M5-46 through M5-57, so Milestone 5 was
-reopened. Those corrections are now implemented; Milestone 6 waits for the new
-closure gate.
+reopened. Those corrections are implemented, but source-only review of
+`f7d0503..81ec33b` on 2026-09-21 found M5-58 through M5-66. Milestone 6 waits
+for those blockers and the new closure gate.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -498,7 +499,8 @@ application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
 than a daemon prerequisite. Milestones 0 through 4 have passed. Milestone 5's
 M5-46 through M5-57 corrections are implemented after its historical M5-45
-gate, and its new closure gate is pending. Later wire or durable-state changes
+gate, but source review found M5-58 through M5-66 and reopened correction work.
+Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
 
@@ -715,9 +717,10 @@ review at every gate before committing the next milestone's detailed scope.
 
 **Current position:** Milestones 0 through 4 are passed. The M5-36 through
 M5-44 corrections and M5-45 gate remain historical evidence. The M5-46 through
-M5-57 findings from the 2026-09-20 source review are implemented, and
-Milestone 5 remains open for its new closure gate. Milestone 6 waits for that
-gate.
+M5-57 findings from the 2026-09-20 source review are implemented. Fresh
+source-only review of that correction series found M5-58 through M5-66, so
+Milestone 5 remains open for correction and a new closure gate. Milestone 6
+waits for that gate.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1128,6 +1131,39 @@ Clippy. The provisioned Btrfs/network acceptance gate has not been rerun after
 M5-46 through M5-57, so the formal milestone closure remains pending that
 runtime evidence. All compilation and execution was local; no remote
 compilation server was used.
+
+Fresh source-only review of `f7d0503..81ec33b` on 2026-09-21 found that the
+correction series does not yet close Milestone 5. Exact source locations,
+failure scenarios, and correction gates are in `TODO.md`:
+
+- **M5-58:** Valid quorum certificates still require the receiving node's exact
+  local signature lock, so nonsigners cannot become the durable checkpoint
+  holders and publishers required by M5-46.
+- **M5-59:** Event-first synchronization advances current authority before the
+  oldest-first checkpoint walk, whose intermediate historical checkpoints are
+  then rejected for not using that current authority.
+- **M5-60 and M5-61:** Per-root scheduling indexes absent schedules for clean
+  roots and panics, while byte-budget checking after selection lets one
+  oversized oldest root starve smaller eligible siblings indefinitely.
+- **M5-62:** The authenticated incremental updater excludes migration catalog
+  version 4, so retiring the final legacy source either drops unchanged modern
+  sources or retains invalid unused bindings.
+- **M5-63 and M5-64:** Initial migration still depends on every exact historical
+  owner and does not journal bindings before publication; changed backups during
+  migration bypass distributed any-`k` recovery and can be frozen by an
+  unrelated unavailable owner or information holder.
+- **M5-65:** Serialized relay reservation responses accumulate in an unbounded
+  stream-owning queue that overlapping requests can starve while bypassing the
+  reservation rate limits.
+- **M5-66:** The checkpoint parent walker requests ancestors that peers refuse
+  to serve, and gaps beyond its fixed limit make no chunked forward progress.
+
+This review found no separate remaining blocker in M5-47 event-tail lifetime,
+M5-49/M5-50 scoped secret content identities, M5-51 catalog authorization,
+M5-53's version-2/3 any-`k` loader, M5-54 root binding, or M5-55/M5-56 placement
+planning. It ran no builds, tests, daemons, runtime probes, or remote
+compilation. The earlier local gate results remain historical evidence for
+their exact trees and do not close these source blockers.
 
 The M5-42 rejected-connection cleanup was source-reviewed and found to remove
 only the rejected connection while preserving accepted siblings. This review
@@ -1562,15 +1598,16 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (closure gate pending)
+### Milestone 5 — efficient and flexible data/guild protocol (reopened)
 
 M5-36 through M5-44 are implemented, and the complete M5-45 correction gate
 passed locally on 2026-09-19. The final committed tree passed formatting,
 locked all-target workspace tests, warning-free locked all-target Clippy, and
 the full provisioned filesystem/network acceptance script. A later source-only
 review found M5-46 through M5-57; their corrections and focused regressions are
-now implemented. Completion requires a fresh local source/workspace/provisioned
-gate before Milestone 6 begins.
+implemented. Fresh source review found M5-58 through M5-66 in that correction
+series. Completion requires those source blockers to be corrected and a fresh
+local source/workspace/provisioned gate before Milestone 6 begins.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and
