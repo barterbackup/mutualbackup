@@ -12007,7 +12007,7 @@ async fn build_production_packing(
         }
     }
     if let Some(catalog) = previous
-        .map(|previous| advance_unchanged_catalog(previous, &sources))
+        .map(|previous| advance_unchanged_catalog(previous, &sources, !legacy_bindings.is_empty()))
         .transpose()?
         .flatten()
     {
@@ -12039,68 +12039,14 @@ async fn build_production_packing(
                 let catalog = previous.cloned().context(
                     "retained source is unavailable and has no previous packing catalog",
                 )?;
-                node_blocking(node.clone(), move |node| {
-                    let state = node
-                        .dynamic_guild_state()?
-                        .context("prior packed recovery requires dynamic guild state")?;
-                    let descriptors = catalog
-                        .sectors
-                        .iter()
-                        .filter(|descriptor| {
-                            descriptor.slots.iter().any(|slot| {
-                                slot.source().is_some_and(|source| {
-                                    (
-                                        source.id.owner,
-                                        source.id.protected_root,
-                                        source.id.object_id,
-                                    ) == (owner, protected_root, object_id)
-                                })
-                            })
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let sectors = descriptors
-                        .into_iter()
-                        .map(|descriptor| {
-                            let bytes = match node.sector_for_guild(&guild_id, &descriptor.id) {
-                                Ok(bytes) => bytes,
-                                Err(_) => {
-                                    let (group_id, shard_index) = state
-                                        .coding_groups
-                                        .iter()
-                                        .find_map(|retained| {
-                                            retained.group.roles.iter().enumerate().find_map(
-                                                |(index, role)| {
-                                                    matches!(role, ShardRoleV2::Information(information)
-                                                        if !information.sector.virtual_zero
-                                                            && information.sector.id == descriptor.id
-                                                            && information.sector.commitment == descriptor.commitment)
-                                                    .then_some((retained.group.id, index as u16))
-                                                },
-                                            )
-                                        })
-                                        .context(
-                                            "prior packed sector has no certified coding group",
-                                        )?;
-                                    node.variable_shard_for_guild(
-                                        &guild_id,
-                                        &group_id,
-                                        shard_index,
-                                    )?
-                                }
-                            };
-                            Ok(PackedSector { descriptor, bytes })
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    unpack_object_from_sectors(
-                        &catalog,
-                        &sectors,
-                        owner,
-                        protected_root,
-                        object_id,
-                    )
-                    .map_err(Into::into)
-                })
+                recover_object_from_previous_packing(
+                    node.clone(),
+                    p2p,
+                    &catalog,
+                    owner,
+                    protected_root,
+                    object_id,
+                )
                 .await
                 .with_context(|| {
                     format!(
@@ -12128,7 +12074,7 @@ async fn build_production_packing(
         sector_size: V1_SECTOR_SIZE as u32,
         slot_size: 16 * 1024,
     };
-    if let Some(previous) = previous.filter(|catalog| matches!(catalog.format_version, 2 | 3)) {
+    if let Some(previous) = previous.filter(|catalog| matches!(catalog.format_version, 2..=4)) {
         let previous = previous.clone();
         let authenticated_sources = sources
             .into_iter()
@@ -12278,6 +12224,57 @@ async fn load_distributed_packed_sector(
     Ok(bytes)
 }
 
+async fn recover_object_from_previous_packing(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    catalog: &PackedCatalog,
+    owner: NodeId,
+    protected_root: [u8; 32],
+    object_id: SectorId,
+) -> Result<Vec<u8>> {
+    let descriptors = catalog
+        .sectors
+        .iter()
+        .filter(|descriptor| {
+            descriptor.slots.iter().any(|slot| {
+                slot.source().is_some_and(|source| {
+                    (
+                        source.id.owner,
+                        source.id.protected_root,
+                        source.id.object_id,
+                    ) == (owner, protected_root, object_id)
+                })
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if descriptors.is_empty() {
+        bail!("prior packing catalog does not contain the retained source");
+    }
+    let guild_id = node_blocking(node.clone(), |node| {
+        Ok(node
+            .dynamic_guild_state()?
+            .context("prior packed recovery requires dynamic guild state")?
+            .guild_id)
+    })
+    .await?;
+    let mut sectors = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        let descriptor_id = descriptor.id;
+        let local = node_blocking(node.clone(), move |node| {
+            node.sector_for_guild(&guild_id, &descriptor_id)
+        })
+        .await;
+        let bytes = match local {
+            Ok(bytes) => bytes,
+            Err(_) => load_distributed_packed_sector(node.clone(), p2p, &descriptor).await?,
+        };
+        sectors.push(PackedSector { descriptor, bytes });
+    }
+    unpack_object_from_sectors(catalog, &sectors, owner, protected_root, object_id)
+        .map_err(Into::into)
+}
+
 struct ProductionPacking {
     catalog: PackedCatalog,
 }
@@ -12289,9 +12286,13 @@ type PackingCommitments = BTreeMap<PackingObjectKey, MerkleCommitment>;
 fn advance_unchanged_catalog(
     catalog: &PackedCatalog,
     sources: &PackingSources,
+    has_legacy_sources: bool,
 ) -> Result<Option<PackedCatalog>> {
     catalog.validate()?;
     if !matches!(catalog.format_version, 3 | 4) {
+        return Ok(None);
+    }
+    if (catalog.format_version == 4) != has_legacy_sources {
         return Ok(None);
     }
     let authenticated = authenticated_source_objects(catalog)?;
@@ -13104,7 +13105,7 @@ mod tests {
             ),
         )]);
 
-        let next = advance_unchanged_catalog(&packed.catalog, &sources)
+        let next = advance_unchanged_catalog(&packed.catalog, &sources, false)
             .unwrap()
             .unwrap();
         assert_eq!(next.parent, Some(packed.catalog.id));
@@ -13130,19 +13131,24 @@ mod tests {
         .unwrap();
         let migrated =
             attach_legacy_packing_bindings(packed.catalog.clone(), vec![binding]).unwrap();
-        let migrated_next = advance_unchanged_catalog(&migrated, &sources)
+        let migrated_next = advance_unchanged_catalog(&migrated, &sources, true)
             .unwrap()
             .unwrap();
         assert_eq!(migrated_next.format_version, 4);
         assert_eq!(migrated_next.parent, Some(migrated.id));
         assert_eq!(migrated_next.legacy_bindings, migrated.legacy_bindings);
+        assert!(
+            advance_unchanged_catalog(&migrated, &sources, false)
+                .unwrap()
+                .is_none()
+        );
 
         sources
             .get_mut(&(keys.node_id(), protected_root, object_id))
             .unwrap()
             .1 = merkle_commit(&vec![6; V1_SECTOR_SIZE]).unwrap();
         assert!(
-            advance_unchanged_catalog(&packed.catalog, &sources)
+            advance_unchanged_catalog(&packed.catalog, &sources, false)
                 .unwrap()
                 .is_none()
         );

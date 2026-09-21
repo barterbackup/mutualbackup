@@ -89,8 +89,8 @@ Those source corrections are implemented, and the complete local M5-45
 correction gate passed on 2026-09-19. Follow-up source-only review of
 `56bb57d..f7d0503` on 2026-09-20 found M5-46 through M5-57, so Milestone 5 was
 reopened. Those corrections are implemented, but source-only review of
-`f7d0503..81ec33b` on 2026-09-21 found M5-58 through M5-66. M5-58 through M5-61
-and M5-66 are corrected; M5-62 through M5-65 remain. Milestone 6 waits for
+`f7d0503..81ec33b` on 2026-09-21 found M5-58 through M5-66. M5-58 through M5-62,
+M5-64, and M5-66 are corrected; M5-63 and M5-65 remain. Milestone 6 waits for
 those blockers and the new closure gate.
 
 The repository connects two real binaries and persistent local control to
@@ -501,8 +501,9 @@ recovery-string file remains an explicit unattended auto-unlock option rather
 than a daemon prerequisite. Milestones 0 through 4 have passed. Milestone 5's
 M5-46 through M5-57 corrections are implemented after its historical M5-45
 gate, but source review found M5-58 through M5-66 and reopened correction work.
-Checkpoint adoption, resumable historical catch-up, and per-root scheduling are
-corrected; M5-62 through M5-65 remain. Later wire or durable-state changes
+Checkpoint adoption, resumable historical catch-up, per-root scheduling, final
+legacy retirement, and migration-window any-`k` recovery are corrected; M5-63
+and M5-65 remain. Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
 
@@ -721,7 +722,7 @@ review at every gate before committing the next milestone's detailed scope.
 M5-44 corrections and M5-45 gate remain historical evidence. The M5-46 through
 M5-57 findings from the 2026-09-20 source review are implemented. Fresh
 source-only review of that correction series found M5-58 through M5-66.
-M5-58 through M5-61 and M5-66 are corrected; M5-62 through M5-65 keep
+M5-58 through M5-62, M5-64, and M5-66 are corrected; M5-63 and M5-65 keep
 Milestone 5 open for correction and a new closure gate. Milestone 6 waits for
 that gate.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
@@ -1149,13 +1150,14 @@ failure scenarios, and correction gates are in `TODO.md`:
   schedules and checks each root's remaining byte-budget fit before choosing
   it. Oversized roots retain a root-local next-window retry while smaller
   eligible siblings proceed.
-- **M5-62:** The authenticated incremental updater excludes migration catalog
-  version 4, so retiring the final legacy source either drops unchanged modern
-  sources or retains invalid unused bindings.
-- **M5-63 and M5-64:** Initial migration still depends on every exact historical
-  owner and does not journal bindings before publication; changed backups during
-  migration bypass distributed any-`k` recovery and can be frozen by an
-  unrelated unavailable owner or information holder.
+- **M5-62 (resolved):** Version-4 catalogs enter the authenticated complete-corpus
+  updater, which emits version 3 after the final legacy source retires without
+  dropping unchanged modern sources or retaining unused bindings.
+- **M5-63:** Initial migration still depends on every exact historical owner and
+  does not journal bindings before publication.
+- **M5-64 (resolved):** Changed backups during migration recover unavailable
+  retained sources and changed packed sectors through the certified-placement
+  any-`k` loader with catalog commitment checks.
 - **M5-65:** Serialized relay reservation responses accumulate in an unbounded
   stream-owning queue that overlapping requests can starve while bypassing the
   reservation rate limits.
@@ -1611,7 +1613,7 @@ locked all-target workspace tests, warning-free locked all-target Clippy, and
 the full provisioned filesystem/network acceptance script. A later source-only
 review found M5-46 through M5-57; their corrections and focused regressions are
 implemented. Fresh source review found M5-58 through M5-66 in that correction
-series. M5-58 through M5-61 and M5-66 are corrected; M5-62 through M5-65
+series. M5-58 through M5-62, M5-64, and M5-66 are corrected; M5-63 and M5-65
 remain. Completion requires those source blockers to be corrected and a fresh
 local source/workspace/provisioned gate before Milestone 6 begins.
 

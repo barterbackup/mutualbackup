@@ -1525,7 +1525,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   root-local retries after a policy change. The regression proves that an
   oversized lower UUID cannot stop a fitting sibling. All seven focused
   automatic-backup tests and strict all-target node Clippy pass locally.
-- [ ] **M5-62 / P1 — Retire the final legacy binding without losing modern sources.**
+- [x] **M5-62 / P1 — Retire the final legacy binding without losing modern sources.**
   Once no legacy binding remains, production skips unchanged authenticated
   inputs (`crates/mb-node/src/network/p2p.rs:11936`), but the complete-corpus
   authenticated updater accepts only catalog versions 2 and 3 (`:12051`;
@@ -1537,7 +1537,11 @@ node Clippy gate passed locally. No remote compilation server was used.
   revision retires. Make version-4 retirement an authenticated complete-corpus
   transition that removes exactly obsolete bindings. Gate retention one and
   larger multi-owner histories through the final legacy retirement and another
-  backup.
+  backup. The authenticated complete-corpus updater now accepts a validated
+  version-4 predecessor and always emits a binding-free version-3 catalog.
+  The unchanged fast path refuses to clone a version-4 catalog after the last
+  legacy source retires, forcing that complete-corpus transition. Core and node
+  regressions cover the version-4-to-version-3 transition and fast-path guard.
 - [ ] **M5-63 / P1 — Make legacy migration durable without every historical owner online.**
   A missing migration binding is obtained only from the exact source owner
   (`crates/mb-node/src/network/p2p.rs:11885`), whose signer reads its local sector
@@ -1550,7 +1554,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   bindings before checkpoint publication. Gate migration with a retained owner
   offline or removed, any valid `k` old shards, and restart at every publication
   boundary.
-- [ ] **M5-64 / P1 — Use any-`k` packed recovery throughout the migration window.**
+- [x] **M5-64 / P1 — Use any-`k` packed recovery throughout the migration window.**
   While any legacy binding remains, production fetches every retained source
   (`crates/mb-node/src/network/p2p.rs:11941`). Its failure fallback checks only
   the coordinator's packed cache or locally assigned information shard
@@ -1561,6 +1565,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   enough surviving shards. Route version-4 source recovery through the bounded
   commitment-checked any-`k` loader. Gate one changed source with another owner
   offline, the assigned information holder absent, and each valid `k`-shard set.
+  Version-4 updates now use the authenticated incremental updater. When a
+  retained source cannot be read from its owner, every packed descriptor that
+  contains it is loaded through the existing certified-placement any-`k`
+  reconstruction path and checked against the catalog commitment before the
+  source is unpacked. The same loader supplies changed packed sectors to the
+  incremental updater.
 - [ ] **M5-65 / P1 — Bound and fairly drain relay reservation responses.**
   M5-57 replaced one response future with an unbounded per-connection `VecDeque`
   (`vendor/libp2p-relay/src/behaviour/handler.rs:358`). Every reservation

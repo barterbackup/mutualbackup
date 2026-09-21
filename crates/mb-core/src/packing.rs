@@ -926,7 +926,7 @@ where
 {
     profile.validate()?;
     previous.validate()?;
-    if !matches!(previous.format_version, 2 | 3) || previous.profile != profile {
+    if !matches!(previous.format_version, 2..=4) || previous.profile != profile {
         return Err(PackingError::ProfileChanged);
     }
     let previous_authentication = previous
@@ -1520,7 +1520,7 @@ mod tests {
                 protected_root,
                 object_id,
                 flat_root: *blake3::hash(&bytes).as_bytes(),
-                source_commitment,
+                source_commitment: source_commitment.clone(),
             },
             &keys,
         )
@@ -1537,6 +1537,39 @@ mod tests {
             decode_canonical::<PackedCatalog>(&encoded).unwrap(),
             catalog
         );
+
+        let prior_bytes = packed
+            .sectors
+            .iter()
+            .map(|sector| (sector.descriptor.id, sector.bytes.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let retired = pack_incremental_authenticated(
+            profile(),
+            &catalog,
+            vec![AuthenticatedPackingSource {
+                owner,
+                protected_root,
+                object_id,
+                source_commitment: source_commitment.clone(),
+            }],
+            vec![PackingInput {
+                owner,
+                protected_root,
+                object_id,
+                source_commitment: Some(source_commitment),
+                bytes,
+            }],
+            |descriptor| {
+                prior_bytes
+                    .get(&descriptor.id)
+                    .cloned()
+                    .ok_or(PackingError::MissingObject)
+            },
+        )
+        .unwrap();
+        assert_eq!(retired.catalog.format_version, 3);
+        assert_eq!(retired.catalog.parent, Some(catalog.id));
+        assert!(retired.catalog.legacy_bindings.is_none());
 
         let mut tampered = catalog;
         tampered.legacy_bindings.as_mut().unwrap()[0]
