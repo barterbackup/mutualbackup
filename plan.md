@@ -89,9 +89,9 @@ Those source corrections are implemented, and the complete local M5-45
 correction gate passed on 2026-09-19. Follow-up source-only review of
 `56bb57d..f7d0503` on 2026-09-20 found M5-46 through M5-57, so Milestone 5 was
 reopened. Those corrections are implemented, but source-only review of
-`f7d0503..81ec33b` on 2026-09-21 found M5-58 through M5-66. M5-58, M5-59, and
-M5-66 are corrected; M5-60 through M5-65 remain. Milestone 6 waits for those
-blockers and the new closure gate.
+`f7d0503..81ec33b` on 2026-09-21 found M5-58 through M5-66. M5-58 through M5-61
+and M5-66 are corrected; M5-62 through M5-65 remain. Milestone 6 waits for
+those blockers and the new closure gate.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -501,8 +501,8 @@ recovery-string file remains an explicit unattended auto-unlock option rather
 than a daemon prerequisite. Milestones 0 through 4 have passed. Milestone 5's
 M5-46 through M5-57 corrections are implemented after its historical M5-45
 gate, but source review found M5-58 through M5-66 and reopened correction work.
-Checkpoint adoption and resumable historical catch-up are corrected; M5-60
-through M5-65 remain. Later wire or durable-state changes
+Checkpoint adoption, resumable historical catch-up, and per-root scheduling are
+corrected; M5-62 through M5-65 remain. Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
 
@@ -721,8 +721,9 @@ review at every gate before committing the next milestone's detailed scope.
 M5-44 corrections and M5-45 gate remain historical evidence. The M5-46 through
 M5-57 findings from the 2026-09-20 source review are implemented. Fresh
 source-only review of that correction series found M5-58 through M5-66.
-M5-58, M5-59, and M5-66 are corrected; M5-60 through M5-65 keep Milestone 5
-open for correction and a new closure gate. Milestone 6 waits for that gate.
+M5-58 through M5-61 and M5-66 are corrected; M5-62 through M5-65 keep
+Milestone 5 open for correction and a new closure gate. Milestone 6 waits for
+that gate.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1144,9 +1145,10 @@ failure scenarios, and correction gates are in `TODO.md`:
 - **M5-59 (resolved):** Intermediate checkpoints validate against the authority
   and complete member history recorded at their epoch even after event-first
   synchronization advances the current authority.
-- **M5-60 and M5-61:** Per-root scheduling indexes absent schedules for clean
-  roots and panics, while byte-budget checking after selection lets one
-  oversized oldest root starve smaller eligible siblings indefinitely.
+- **M5-60 and M5-61 (resolved):** Selection considers only dirty roots with
+  schedules and checks each root's remaining byte-budget fit before choosing
+  it. Oversized roots retain a root-local next-window retry while smaller
+  eligible siblings proceed.
 - **M5-62:** The authenticated incremental updater excludes migration catalog
   version 4, so retiring the final legacy source either drops unchanged modern
   sources or retains invalid unused bindings.
@@ -1609,9 +1611,9 @@ locked all-target workspace tests, warning-free locked all-target Clippy, and
 the full provisioned filesystem/network acceptance script. A later source-only
 review found M5-46 through M5-57; their corrections and focused regressions are
 implemented. Fresh source review found M5-58 through M5-66 in that correction
-series. M5-58, M5-59, and M5-66 are corrected; M5-60 through M5-65 remain.
-Completion requires those source blockers to be corrected and a fresh local
-source/workspace/provisioned gate before Milestone 6 begins.
+series. M5-58 through M5-61 and M5-66 are corrected; M5-62 through M5-65
+remain. Completion requires those source blockers to be corrected and a fresh
+local source/workspace/provisioned gate before Milestone 6 begins.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and

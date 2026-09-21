@@ -1500,7 +1500,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   roster rather than consulting only the newest one. The catch-up regression
   advances events from unanimous to majority authority before installing the
   earlier checkpoint, then reaches the current checkpoint normally.
-- [ ] **M5-60 / P1 — Keep clean roots out of dirty-root schedule lookup.**
+- [x] **M5-60 / P1 — Keep clean roots out of dirty-root schedule lookup.**
   Polling retains and creates schedules only for dirty roots
   (`crates/mb-node/src/node.rs:1446`, `:1458`), but then filters every configured
   root and indexes the schedule map unconditionally (`:1491`). Once one root is
@@ -1508,7 +1508,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   poll panics on the clean root. Select only roots with a schedule and preserve
   root-local cleanup. Gate mixed clean/dirty roots after commit and after adding
   or restoring a clean root beside an existing dirty root.
-- [ ] **M5-61 / P1 — Apply the byte budget without starving eligible roots.**
+  Eligibility now requires a root-scoped schedule before the sort or lookup, so
+  clean configured roots never index the dirty schedule map. A mixed clean/dirty
+  regression selects the dirty sibling and preserves exactly its one schedule.
+- [x] **M5-61 / P1 — Apply the byte budget without starving eligible roots.**
   Automatic backup selects the oldest readable root and stops
   (`crates/mb-node/src/node.rs:1513`), then checks that root against the remaining
   daily byte budget (`:1566`). An oversized oldest root therefore blocks the
@@ -1516,6 +1519,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   considered. Include budget eligibility in the fair root selection and retain
   a root-scoped blocked reason for the skipped root. Gate an oversized oldest
   root beside smaller eligible siblings across consecutive budget windows.
+  Byte-budget eligibility is now evaluated inside the oldest-first root scan.
+  An oversized root receives a retry at the next window with its own reason,
+  while later roots remain eligible; explicit block clearing also clears those
+  root-local retries after a policy change. The regression proves that an
+  oversized lower UUID cannot stop a fitting sibling. All seven focused
+  automatic-backup tests and strict all-target node Clippy pass locally.
 - [ ] **M5-62 / P1 — Retire the final legacy binding without losing modern sources.**
   Once no legacy binding remains, production skips unchanged authenticated
   inputs (`crates/mb-node/src/network/p2p.rs:11936`), but the complete-corpus

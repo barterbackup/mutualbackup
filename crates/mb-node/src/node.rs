@@ -1507,15 +1507,16 @@ impl Node {
         let mut roots = roots
             .into_iter()
             .filter(|root| {
-                let schedule = &schedules[&root.root_id];
-                now >= schedule
-                    .dirty_since_unix_seconds
-                    .saturating_add(policy.quiet_period_seconds)
-                    && now
-                        >= schedule
-                            .last_attempt_unix_seconds
-                            .unwrap_or(0)
-                            .saturating_add(policy.minimum_interval_seconds)
+                schedules.get(&root.root_id).is_some_and(|schedule| {
+                    now >= schedule
+                        .dirty_since_unix_seconds
+                        .saturating_add(policy.quiet_period_seconds)
+                        && now
+                            >= schedule
+                                .last_attempt_unix_seconds
+                                .unwrap_or(0)
+                                .saturating_add(policy.minimum_interval_seconds)
+                })
             })
             .collect::<Vec<_>>();
         roots.sort_by_key(|root| {
@@ -1526,6 +1527,20 @@ impl Node {
                 root.root_id,
             )
         });
+        if state.window_backup_count >= policy.daily_backup_limit {
+            state.blocked_reason = Some("daily automatic-backup count limit reached".into());
+            state.retry_at_unix_seconds = Some(
+                state
+                    .window_started_unix_seconds
+                    .saturating_add(24 * 60 * 60),
+            );
+            self.store_automatic_backup_state(&state)?;
+            return Ok(AutomaticBackupPoll::Idle);
+        }
+        let remaining_bytes = policy.daily_byte_limit.saturating_sub(state.window_bytes);
+        let next_window = state
+            .window_started_unix_seconds
+            .saturating_add(24 * 60 * 60);
         let mut selected = None;
         for root in roots {
             if !self
@@ -1542,6 +1557,20 @@ impl Node {
                     state
                         .root_retries
                         .retain(|retry| retry.protected_root_id != root.root_id);
+                    if estimated_bytes > remaining_bytes {
+                        state.root_retries.push(AutomaticRootRetry {
+                            protected_root_id: root.root_id,
+                            retry_at_unix_seconds: next_window,
+                            reason: format!(
+                                "daily automatic-backup byte limit reached for root {}",
+                                root.root_id
+                            ),
+                        });
+                        state
+                            .root_retries
+                            .sort_by_key(|retry| retry.protected_root_id);
+                        continue;
+                    }
                     selected = Some((root.root_id, estimated_bytes));
                     break;
                 }
@@ -1569,26 +1598,6 @@ impl Node {
             self.store_automatic_backup_state(&state)?;
             return Ok(AutomaticBackupPoll::Idle);
         };
-        if state.window_backup_count >= policy.daily_backup_limit {
-            state.blocked_reason = Some("daily automatic-backup count limit reached".into());
-            state.retry_at_unix_seconds = Some(
-                state
-                    .window_started_unix_seconds
-                    .saturating_add(24 * 60 * 60),
-            );
-            self.store_automatic_backup_state(&state)?;
-            return Ok(AutomaticBackupPoll::Idle);
-        }
-        if estimated_bytes > policy.daily_byte_limit.saturating_sub(state.window_bytes) {
-            state.blocked_reason = Some("daily automatic-backup byte limit reached".into());
-            state.retry_at_unix_seconds = Some(
-                state
-                    .window_started_unix_seconds
-                    .saturating_add(24 * 60 * 60),
-            );
-            self.store_automatic_backup_state(&state)?;
-            return Ok(AutomaticBackupPoll::Idle);
-        }
         state.last_attempt_unix_seconds = Some(now);
         let schedule = state
             .root_schedules
@@ -1686,6 +1695,7 @@ impl Node {
         let mut state = self.automatic_backup_state(unix_seconds())?;
         state.blocked_reason = None;
         state.retry_at_unix_seconds = None;
+        state.root_retries.clear();
         self.store_automatic_backup_state(&state)
     }
 
@@ -10640,6 +10650,127 @@ mod tests {
         assert_eq!(state.root_schedules.len(), 2);
         assert_eq!(state.root_schedules[0].dirty_since_unix_seconds, 109);
         assert_eq!(state.root_schedules[1].dirty_since_unix_seconds, 100);
+    }
+
+    #[test]
+    fn automatic_backup_ignores_clean_roots_without_schedules() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (seed, certificate, peers) = recovery_guild_fixture();
+        let mut node = Node::open(temp.path().join("state"), seed).unwrap();
+        node.adopt_recovered_guild(certificate, peers).unwrap();
+        let clean_id = Uuid::from_bytes([1; 16]);
+        let dirty_id = Uuid::from_bytes([2; 16]);
+        for (root_id, name) in [(clean_id, "clean"), (dirty_id, "dirty")] {
+            let path = temp.path().join(name);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("payload"), name.as_bytes()).unwrap();
+            let filesystem = filesystem_identity(&path).unwrap();
+            node.install_test_protected_root(ProtectedRoot {
+                format_version: 3,
+                root_id,
+                root_inode: fs::metadata(&path).unwrap().ino(),
+                path,
+                filesystem_id: filesystem.stable_id,
+            })
+            .unwrap();
+        }
+        node.configure_automatic_backup(&AutomaticBackupPolicy {
+            enabled: true,
+            quiet_period_seconds: 1,
+            minimum_interval_seconds: 1,
+            full_reconcile_interval_seconds: 60,
+            daily_backup_limit: 10,
+            daily_byte_limit: 1_024,
+        })
+        .unwrap();
+        let mut state = node.automatic_backup_state(100).unwrap();
+        state.last_full_reconcile_unix_seconds = Some(100);
+        node.store_automatic_backup_state(&state).unwrap();
+        node.mark_root_dirty_at(dirty_id, "changed", true, 100)
+            .unwrap();
+
+        assert!(matches!(
+            node.poll_automatic_backup(101).unwrap(),
+            AutomaticBackupPoll::Start {
+                protected_root_id,
+                ..
+            } if protected_root_id == dirty_id
+        ));
+        let state = node.automatic_backup_state(101).unwrap();
+        assert_eq!(state.root_schedules.len(), 1);
+        assert_eq!(state.root_schedules[0].protected_root_id, dirty_id);
+    }
+
+    #[test]
+    fn automatic_backup_byte_budget_skips_oversized_oldest_root() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (seed, certificate, peers) = recovery_guild_fixture();
+        let mut node = Node::open(temp.path().join("state"), seed).unwrap();
+        node.adopt_recovered_guild(certificate, peers).unwrap();
+        let oversized_id = Uuid::from_bytes([1; 16]);
+        let fitting_id = Uuid::from_bytes([2; 16]);
+        for (root_id, name, bytes) in [
+            (oversized_id, "oversized", vec![1; 10]),
+            (fitting_id, "fitting", vec![2; 3]),
+        ] {
+            let path = temp.path().join(name);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("payload"), bytes).unwrap();
+            let filesystem = filesystem_identity(&path).unwrap();
+            node.install_test_protected_root(ProtectedRoot {
+                format_version: 3,
+                root_id,
+                root_inode: fs::metadata(&path).unwrap().ino(),
+                path,
+                filesystem_id: filesystem.stable_id,
+            })
+            .unwrap();
+            node.mark_root_dirty_at(root_id, "changed", true, 100)
+                .unwrap();
+        }
+        node.configure_automatic_backup(&AutomaticBackupPolicy {
+            enabled: true,
+            quiet_period_seconds: 1,
+            minimum_interval_seconds: 1,
+            full_reconcile_interval_seconds: 60,
+            daily_backup_limit: 10,
+            daily_byte_limit: 5,
+        })
+        .unwrap();
+        let mut state = node.automatic_backup_state(100).unwrap();
+        state.last_full_reconcile_unix_seconds = Some(100);
+        node.store_automatic_backup_state(&state).unwrap();
+
+        assert!(matches!(
+            node.poll_automatic_backup(101).unwrap(),
+            AutomaticBackupPoll::Start {
+                protected_root_id,
+                estimated_bytes: 3,
+            } if protected_root_id == fitting_id
+        ));
+        let state = node.automatic_backup_state(101).unwrap();
+        assert_eq!(state.root_retries.len(), 1);
+        assert_eq!(state.root_retries[0].protected_root_id, oversized_id);
+        assert_eq!(state.root_retries[0].retry_at_unix_seconds, 86_500);
+        assert!(state.root_retries[0].reason.contains("byte limit"));
+        assert!(state.blocked_reason.is_none());
+        assert!(state.retry_at_unix_seconds.is_none());
+
+        assert!(matches!(
+            node.poll_automatic_backup(86_500).unwrap(),
+            AutomaticBackupPoll::Start {
+                protected_root_id,
+                estimated_bytes: 3,
+            } if protected_root_id == fitting_id
+        ));
+        let state = node.automatic_backup_state(86_500).unwrap();
+        assert_eq!(state.root_retries.len(), 1);
+        assert_eq!(state.root_retries[0].protected_root_id, oversized_id);
+        assert_eq!(state.root_retries[0].retry_at_unix_seconds, 172_900);
     }
 
     #[test]
