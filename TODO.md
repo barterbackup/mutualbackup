@@ -1468,7 +1468,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   failure. Regressions cover overlapping first requests, provisional visibility,
   and expiry during renewal. All relay unit tests and strict relay Clippy pass.
 
-- [ ] **M5-58 / P1 — Let certified nonsigners adopt and publish checkpoints.**
+- [x] **M5-58 / P1 — Let certified nonsigners adopt and publish checkpoints.**
   Certificate staging and peer catch-up both finish through `store_checkpoint`,
   but that path still passes `require_signature_lock = true`
   (`crates/mb-node/src/node.rs:5840`, `:5848`). The database consequently
@@ -1480,7 +1480,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   and transition checks. Gate policy-quorum finalization to all reachable
   signers and nonsigners, loss of a signer, seed recovery, and the next
   checkpoint.
-- [ ] **M5-59 / P1 — Catch checkpoints up across historical authority epochs.**
+  Verified certificates now enter the same exact-head transition validation
+  without requiring a local signature lock; the database atomically adopts the
+  certified body as the new lock. A regression installs a majority certificate
+  signed only by three remote members and confirms that the nonsigner becomes a
+  durable holder across restart.
+- [x] **M5-59 / P1 — Catch checkpoints up across historical authority epochs.**
   Peer exchange synchronizes guild events before checkpoints
   (`crates/mb-node/src/network/p2p.rs:7076`), then installs the checkpoint chain
   oldest first through `store_checkpoint` (`:7175`). That store requires current
@@ -1490,6 +1495,11 @@ node Clippy gate passed locally. No remote compilation server was used.
   against its historical authority while keeping the final local authority
   current. Gate a lagging member from an authority-A checkpoint through an
   A-to-B event and B checkpoint without resetting local state.
+  Checkpoint storage now accepts an authority found anywhere in the verified
+  durable event history, and historical owner validation accumulates every
+  roster rather than consulting only the newest one. The catch-up regression
+  advances events from unanimous to majority authority before installing the
+  earlier checkpoint, then reaches the current checkpoint normally.
 - [ ] **M5-60 / P1 — Keep clean roots out of dirty-root schedule lookup.**
   Polling retains and creates schedules only for dirty roots
   (`crates/mb-node/src/node.rs:1446`, `:1458`), but then filters every configured
@@ -1555,7 +1565,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   admission/rate limits to overlaps, fairly poll responses, and time out or
   reset a blocked head. Gate sustained overlapping ingress plus a stalled first
   response and prove a fixed per-connection bound and continued progress.
-- [ ] **M5-66 / P1 — Make bounded checkpoint-chain catch-up advance.**
+- [x] **M5-66 / P1 — Make bounded checkpoint-chain catch-up advance.**
   The new walker fetches a head and then requests each parent from the same peer
   (`crates/mb-node/src/network/p2p.rs:7142`), but a peer serves checkpoint pages
   only for its current head (`crates/mb-node/src/node.rs:9501`). A member two
@@ -1566,6 +1576,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   durably advance instead of requiring the entire gap at once. Gate ordinary
   rejoin from generation G when all current peers are at G+2 and G+1025, with no
   intermediate-head peer, then finalize G+n+1 after convergence.
+  Members now serve every retained verified checkpoint by hash. Catch-up stages
+  a hash-linked generation index and cursor transactionally, fetches at most
+  1,024 ancestors per pass, and installs at most 1,024 oldest certificates per
+  pass. Both phases resume after restart. The regression covers a two-generation
+  parent walk, bounded partial installation, restart, retained-ancestor paging, and
+  final convergence without an intermediate-head peer. The complete node
+  library suite (227 passed, 10 provisioned tests ignored) and strict all-target
+  node Clippy pass locally.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

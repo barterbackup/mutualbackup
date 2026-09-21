@@ -89,8 +89,9 @@ Those source corrections are implemented, and the complete local M5-45
 correction gate passed on 2026-09-19. Follow-up source-only review of
 `56bb57d..f7d0503` on 2026-09-20 found M5-46 through M5-57, so Milestone 5 was
 reopened. Those corrections are implemented, but source-only review of
-`f7d0503..81ec33b` on 2026-09-21 found M5-58 through M5-66. Milestone 6 waits
-for those blockers and the new closure gate.
+`f7d0503..81ec33b` on 2026-09-21 found M5-58 through M5-66. M5-58, M5-59, and
+M5-66 are corrected; M5-60 through M5-65 remain. Milestone 6 waits for those
+blockers and the new closure gate.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -500,7 +501,8 @@ recovery-string file remains an explicit unattended auto-unlock option rather
 than a daemon prerequisite. Milestones 0 through 4 have passed. Milestone 5's
 M5-46 through M5-57 corrections are implemented after its historical M5-45
 gate, but source review found M5-58 through M5-66 and reopened correction work.
-Later wire or durable-state changes
+Checkpoint adoption and resumable historical catch-up are corrected; M5-60
+through M5-65 remain. Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
 
@@ -718,9 +720,9 @@ review at every gate before committing the next milestone's detailed scope.
 **Current position:** Milestones 0 through 4 are passed. The M5-36 through
 M5-44 corrections and M5-45 gate remain historical evidence. The M5-46 through
 M5-57 findings from the 2026-09-20 source review are implemented. Fresh
-source-only review of that correction series found M5-58 through M5-66, so
-Milestone 5 remains open for correction and a new closure gate. Milestone 6
-waits for that gate.
+source-only review of that correction series found M5-58 through M5-66.
+M5-58, M5-59, and M5-66 are corrected; M5-60 through M5-65 keep Milestone 5
+open for correction and a new closure gate. Milestone 6 waits for that gate.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1136,12 +1138,12 @@ Fresh source-only review of `f7d0503..81ec33b` on 2026-09-21 found that the
 correction series does not yet close Milestone 5. Exact source locations,
 failure scenarios, and correction gates are in `TODO.md`:
 
-- **M5-58:** Valid quorum certificates still require the receiving node's exact
-  local signature lock, so nonsigners cannot become the durable checkpoint
-  holders and publishers required by M5-46.
-- **M5-59:** Event-first synchronization advances current authority before the
-  oldest-first checkpoint walk, whose intermediate historical checkpoints are
-  then rejected for not using that current authority.
+- **M5-58 (resolved):** Verified quorum certificates can atomically adopt the
+  exact signature lock, so reachable nonsigners become durable holders and
+  publishers without weakening transition checks.
+- **M5-59 (resolved):** Intermediate checkpoints validate against the authority
+  and complete member history recorded at their epoch even after event-first
+  synchronization advances the current authority.
 - **M5-60 and M5-61:** Per-root scheduling indexes absent schedules for clean
   roots and panics, while byte-budget checking after selection lets one
   oversized oldest root starve smaller eligible siblings indefinitely.
@@ -1155,8 +1157,9 @@ failure scenarios, and correction gates are in `TODO.md`:
 - **M5-65:** Serialized relay reservation responses accumulate in an unbounded
   stream-owning queue that overlapping requests can starve while bypassing the
   reservation rate limits.
-- **M5-66:** The checkpoint parent walker requests ancestors that peers refuse
-  to serve, and gaps beyond its fixed limit make no chunked forward progress.
+- **M5-66 (resolved):** Peers serve retained certified ancestors, while a
+  durable cursor and generation index bound both backward fetch and forward
+  installation to 1,024 checkpoints per pass and resume after restart.
 
 This review found no separate remaining blocker in M5-47 event-tail lifetime,
 M5-49/M5-50 scoped secret content identities, M5-51 catalog authorization,
@@ -1606,8 +1609,9 @@ locked all-target workspace tests, warning-free locked all-target Clippy, and
 the full provisioned filesystem/network acceptance script. A later source-only
 review found M5-46 through M5-57; their corrections and focused regressions are
 implemented. Fresh source review found M5-58 through M5-66 in that correction
-series. Completion requires those source blockers to be corrected and a fresh
-local source/workspace/provisioned gate before Milestone 6 begins.
+series. M5-58, M5-59, and M5-66 are corrected; M5-60 through M5-65 remain.
+Completion requires those source blockers to be corrected and a fresh local
+source/workspace/provisioned gate before Milestone 6 begins.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and

@@ -306,6 +306,22 @@ struct DhtObservationState {
     current: DhtObservedRecord,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CheckpointCatchupState {
+    pub format_version: u16,
+    pub guild_id: [u8; 32],
+    pub base_generation: u64,
+    pub base_hash: [u8; 32],
+    pub target_generation: u64,
+    pub target_hash: [u8; 32],
+    pub cursor_generation: u64,
+    pub cursor_hash: [u8; 32],
+    pub ready_to_install: bool,
+}
+
+const CHECKPOINT_CATCHUP_STATE_KIND: &str = "checkpoint-catchup-state";
+const CHECKPOINT_CATCHUP_GENERATION_KIND: &str = "checkpoint-catchup-generation";
+
 struct DhtRecordReconciliation {
     delete_record_ids: Vec<Vec<u8>>,
     replacements: Vec<(Vec<u8>, Vec<u8>)>,
@@ -5839,7 +5855,7 @@ impl Node {
 
     pub fn store_checkpoint(&mut self, checkpoint: &QuorumCheckpoint) -> Result<[u8; 32]> {
         checkpoint.verify()?;
-        self.validate_local_member(&checkpoint.checkpoint, true)?;
+        self.validate_local_member(&checkpoint.checkpoint, false)?;
         self.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, false)?;
         self.validate_checkpoint_transition(&checkpoint.checkpoint)?;
         let hash = checkpoint.hash()?;
@@ -5852,7 +5868,7 @@ impl Node {
             &hash,
             &body,
             &certificate,
-            true,
+            false,
         )?;
         self.clear_root_dirty_if_committed(checkpoint)?;
         for root_id in self.reconcile_local_revision_head(checkpoint)? {
@@ -6195,6 +6211,164 @@ impl Node {
         checkpoint_page(&self.control, guild_id, checkpoint_hash, page_index)
     }
 
+    pub(crate) fn checkpoint_catchup_state(
+        &self,
+        guild_id: &[u8; 32],
+    ) -> Result<Option<CheckpointCatchupState>> {
+        let Some(bytes) = self
+            .control
+            .get_record(CHECKPOINT_CATCHUP_STATE_KIND, guild_id)?
+        else {
+            return Ok(None);
+        };
+        let state: CheckpointCatchupState = decode_canonical(&bytes)?;
+        validate_checkpoint_catchup_state(&state, guild_id)?;
+        Ok(Some(state))
+    }
+
+    pub(crate) fn stage_checkpoint_catchup(
+        &mut self,
+        mut state: CheckpointCatchupState,
+        checkpoint: &QuorumCheckpoint,
+    ) -> Result<CheckpointCatchupState> {
+        validate_checkpoint_catchup_state(&state, &state.guild_id)?;
+        if let Some(stored) = self.checkpoint_catchup_state(&state.guild_id)?
+            && stored != state
+        {
+            anyhow::bail!("checkpoint catch-up state changed while fetching an ancestor");
+        }
+        checkpoint.verify()?;
+        let checkpoint_hash = checkpoint.hash()?;
+        if checkpoint.checkpoint.guild_id != state.guild_id
+            || checkpoint.checkpoint.generation != state.cursor_generation
+            || checkpoint_hash != state.cursor_hash
+        {
+            anyhow::bail!("checkpoint catch-up received an unexpected certified ancestor");
+        }
+        let expected_parent = if state.cursor_generation == 1 {
+            [0; 32]
+        } else {
+            checkpoint
+                .checkpoint
+                .parent
+                .context("non-genesis checkpoint is missing its parent")?
+        };
+        if state.cursor_generation == state.base_generation.saturating_add(1)
+            && expected_parent != state.base_hash
+        {
+            anyhow::bail!("checkpoint catch-up chain does not extend the local head");
+        }
+        let generation_id =
+            checkpoint_catchup_generation_id(&state.guild_id, checkpoint.checkpoint.generation);
+        if let Some(existing) = self
+            .control
+            .get_record(CHECKPOINT_CATCHUP_GENERATION_KIND, &generation_id)?
+            && existing.as_slice() != checkpoint_hash
+        {
+            anyhow::bail!("checkpoint catch-up staged two certificates for one generation");
+        }
+        state.cursor_generation = state
+            .cursor_generation
+            .checked_sub(1)
+            .context("checkpoint catch-up cursor underflow")?;
+        state.cursor_hash = expected_parent;
+        state.ready_to_install = state.cursor_generation == state.base_generation;
+        validate_checkpoint_catchup_state(&state, &state.guild_id)?;
+        self.control.put_records(&[
+            (
+                "guild-checkpoint".to_owned(),
+                checkpoint_hash.to_vec(),
+                canonical_bytes(checkpoint)?,
+            ),
+            (
+                CHECKPOINT_CATCHUP_GENERATION_KIND.to_owned(),
+                generation_id,
+                checkpoint_hash.to_vec(),
+            ),
+            (
+                CHECKPOINT_CATCHUP_STATE_KIND.to_owned(),
+                state.guild_id.to_vec(),
+                canonical_bytes(&state)?,
+            ),
+        ])?;
+        Ok(state)
+    }
+
+    pub(crate) fn install_checkpoint_catchup_batch(
+        &mut self,
+        guild_id: &[u8; 32],
+        limit: usize,
+    ) -> Result<(usize, bool)> {
+        let Some(state) = self.checkpoint_catchup_state(guild_id)? else {
+            return Ok((0, true));
+        };
+        if !state.ready_to_install || limit == 0 {
+            return Ok((0, false));
+        }
+        let mut head = self.checkpoint_head(guild_id)?;
+        if head.is_none() && state.base_generation != 0 {
+            anyhow::bail!("checkpoint catch-up lost its local base head");
+        }
+        if let Some((generation, hash)) = head {
+            if generation < state.base_generation
+                || generation == state.base_generation && hash != state.base_hash
+                || generation > state.target_generation
+            {
+                anyhow::bail!("checkpoint catch-up no longer extends the local head");
+            }
+            if generation == state.target_generation {
+                if hash != state.target_hash {
+                    anyhow::bail!("checkpoint catch-up target conflicts with the local head");
+                }
+                self.clear_checkpoint_catchup(guild_id)?;
+                return Ok((0, true));
+            }
+        }
+        let mut installed = 0;
+        while installed < limit {
+            let generation = head.map_or(1, |(generation, _)| generation.saturating_add(1));
+            if generation > state.target_generation {
+                break;
+            }
+            let generation_id = checkpoint_catchup_generation_id(guild_id, generation);
+            let hash = self
+                .control
+                .get_record(CHECKPOINT_CATCHUP_GENERATION_KIND, &generation_id)?
+                .context("checkpoint catch-up generation index is missing")?;
+            let hash: [u8; 32] = hash
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("checkpoint catch-up generation hash is invalid"))?;
+            let checkpoint = self.checkpoint(&hash)?;
+            let committed = self.store_checkpoint(&checkpoint)?;
+            if committed != hash {
+                anyhow::bail!("checkpoint catch-up installed another certificate");
+            }
+            self.control
+                .delete_record(CHECKPOINT_CATCHUP_GENERATION_KIND, &generation_id)?;
+            head = Some((generation, hash));
+            installed += 1;
+        }
+        let complete = head.is_some_and(|(generation, hash)| {
+            generation == state.target_generation && hash == state.target_hash
+        });
+        if complete {
+            self.clear_checkpoint_catchup(guild_id)?;
+        }
+        Ok((installed, complete))
+    }
+
+    pub(crate) fn clear_checkpoint_catchup(&mut self, guild_id: &[u8; 32]) -> Result<()> {
+        self.control
+            .delete_record(CHECKPOINT_CATCHUP_STATE_KIND, guild_id)?;
+        for (record_id, _) in self.control.records(CHECKPOINT_CATCHUP_GENERATION_KIND)? {
+            if record_id.starts_with(guild_id) {
+                self.control
+                    .delete_record(CHECKPOINT_CATCHUP_GENERATION_KIND, &record_id)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn checkpoint_head(&self, guild_id: &[u8; 32]) -> Result<Option<(u64, [u8; 32])>> {
         Ok(self
             .control
@@ -6224,12 +6398,18 @@ impl Node {
                 let mut replay = initial_dynamic_guild_state(&installed)?;
                 let mut historical_membership =
                     checkpoint_matches_dynamic_authority(checkpoint, &replay);
+                let mut historical = replay
+                    .members
+                    .iter()
+                    .map(|member| member.member.node_id)
+                    .collect::<BTreeSet<_>>();
                 for (record_id, bytes) in self.control.records("guild-event")? {
                     let event: QuorumGuildEvent = decode_canonical(&bytes)?;
                     if record_id != event.event.sequence.to_be_bytes() {
                         anyhow::bail!("guild event history has an invalid record ID");
                     }
                     replay.apply_event(&event)?;
+                    historical.extend(replay.members.iter().map(|member| member.member.node_id));
                     historical_membership |=
                         checkpoint_matches_dynamic_authority(checkpoint, &replay);
                 }
@@ -6241,11 +6421,6 @@ impl Node {
                 {
                     anyhow::bail!("checkpoint does not use the current guild authority");
                 }
-                let historical = durable
-                    .members
-                    .iter()
-                    .map(|member| member.member.node_id)
-                    .collect::<BTreeSet<_>>();
                 if checkpoint
                     .writer_fences
                     .iter()
@@ -9504,13 +9679,49 @@ fn checkpoint_page(
     checkpoint_hash: &[u8; 32],
     page_index: u32,
 ) -> Result<(u32, Vec<u8>)> {
-    let (_, head_hash, _) = control
-        .checkpoint_head(guild_id)?
+    let bytes = control
+        .get_record("guild-checkpoint", checkpoint_hash)?
         .context("guild checkpoint is unavailable")?;
-    if head_hash != *checkpoint_hash {
-        anyhow::bail!("only the current checkpoint is page-readable");
+    let checkpoint: QuorumCheckpoint = decode_canonical(&bytes)?;
+    checkpoint.verify()?;
+    if checkpoint.checkpoint.guild_id != *guild_id || checkpoint.hash()? != *checkpoint_hash {
+        anyhow::bail!("checkpoint page request has the wrong identity");
     }
     Ok(control.protocol_record_page("guild-checkpoint", checkpoint_hash, page_index)?)
+}
+
+fn checkpoint_catchup_generation_id(guild_id: &[u8; 32], generation: u64) -> Vec<u8> {
+    let mut record_id = Vec::with_capacity(40);
+    record_id.extend_from_slice(guild_id);
+    record_id.extend_from_slice(&generation.to_be_bytes());
+    record_id
+}
+
+fn validate_checkpoint_catchup_state(
+    state: &CheckpointCatchupState,
+    guild_id: &[u8; 32],
+) -> Result<()> {
+    let base_hash_valid = if state.base_generation == 0 {
+        state.base_hash == [0; 32]
+    } else {
+        state.base_hash != [0; 32]
+    };
+    if state.format_version != 1
+        || state.guild_id != *guild_id
+        || state.guild_id == [0; 32]
+        || !base_hash_valid
+        || state.target_generation <= state.base_generation
+        || state.target_hash == [0; 32]
+        || state.cursor_generation < state.base_generation
+        || state.cursor_generation > state.target_generation
+        || (state.cursor_generation == state.target_generation
+            && state.cursor_hash != state.target_hash)
+        || state.ready_to_install != (state.cursor_generation == state.base_generation)
+        || state.ready_to_install && state.cursor_hash != state.base_hash
+    {
+        anyhow::bail!("invalid checkpoint catch-up state");
+    }
+    Ok(())
 }
 
 fn parity_proof_id(group_id: &[u8; 32], shard_index: u8) -> [u8; 33] {
@@ -9587,6 +9798,192 @@ fn set_private_directory(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_catchup_is_resumable_across_authority_epochs_and_adopts_certificates() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([226; 32]);
+        let mut source = Node::open(temp.path().join("source"), local_seed.clone()).unwrap();
+        let revision = install_public_restore_fixture(&mut source, &local_seed);
+        let certificate = source.installed_guild_certificate().unwrap().unwrap();
+        let mut first = source
+            .current_checkpoint(revision.value.guild_id)
+            .unwrap()
+            .unwrap();
+        let peers = certificate
+            .genesis
+            .members
+            .iter()
+            .cloned()
+            .map(|member| GuildPeer {
+                member,
+                endpoints: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut signer_keys = std::iter::once(local_seed.clone())
+            .chain((0_u8..4).map(|index| Seed::from_bytes([index + 228; 32])))
+            .map(|seed| KeyMaterial::from_seed(&seed))
+            .collect::<Vec<_>>();
+        signer_keys.sort_by_key(KeyMaterial::node_id);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let guild_id = certificate.genesis.guild_id;
+        drop(source);
+        let node_path = temp.path().join("target");
+        let mut node = Node::open(&node_path, local_seed.clone()).unwrap();
+        node.adopt_recovered_guild(certificate.clone(), peers)
+            .unwrap();
+        let initial = node.dynamic_guild_state().unwrap().unwrap();
+        let writer_fence = first.checkpoint.writer_fences[0].clone();
+        let rotate_writer = GuildEvent {
+            format_version: 1,
+            guild_id,
+            sequence: 1,
+            parent: initial.event_head,
+            kind: mb_core::GuildEventKind::RotateWriterKey {
+                owner: writer_fence.owner,
+                epoch: writer_fence.epoch,
+                public_key: writer_fence.public_key,
+            },
+        };
+        let mut writer_signatures = signer_keys
+            .iter()
+            .map(|keys| sign_guild_event(&rotate_writer, keys).unwrap())
+            .collect::<Vec<_>>();
+        writer_signatures.sort_by_key(|signature| signature.signer);
+        node.install_guild_event(QuorumGuildEvent {
+            event: rotate_writer,
+            signatures: writer_signatures,
+        })
+        .unwrap();
+        let writer_state = node.dynamic_guild_state().unwrap().unwrap();
+        let set_majority = GuildEvent {
+            format_version: 1,
+            guild_id,
+            sequence: 2,
+            parent: writer_state.event_head,
+            kind: mb_core::GuildEventKind::SetQuorum {
+                policy: QuorumPolicy {
+                    format_version: 1,
+                    rule: QuorumRule::Majority,
+                },
+            },
+        };
+        let mut event_signatures = signer_keys
+            .iter()
+            .map(|keys| sign_guild_event(&set_majority, keys).unwrap())
+            .collect::<Vec<_>>();
+        event_signatures.sort_by_key(|signature| signature.signer);
+        node.install_guild_event(QuorumGuildEvent {
+            event: set_majority,
+            signatures: event_signatures,
+        })
+        .unwrap();
+        let current = node.dynamic_guild_state().unwrap().unwrap();
+        assert_eq!(current.quorum.rule, QuorumRule::Majority);
+
+        first.checkpoint.format_version = 4;
+        first.checkpoint.authority = None;
+        first.signatures.clear();
+        for keys in &signer_keys {
+            first.add_signature(keys).unwrap();
+        }
+        first.verify().unwrap();
+
+        let nonsigners = signer_keys
+            .iter()
+            .filter(|keys| keys.node_id() != local_id)
+            .take(
+                current
+                    .quorum
+                    .required(current.active_members().count())
+                    .unwrap(),
+            )
+            .collect::<Vec<_>>();
+        let mut second = QuorumCheckpoint {
+            checkpoint: GuildCheckpoint {
+                format_version: 5,
+                guild_id,
+                genesis_hash: certificate.hash().unwrap(),
+                generation: 2,
+                parent: Some(first.hash().unwrap()),
+                members: current.active_members().cloned().collect(),
+                writer_fences: first.checkpoint.writer_fences.clone(),
+                revision_tombstones: first.checkpoint.revision_tombstones.clone(),
+                revisions: first.checkpoint.revisions.clone(),
+                coding_groups: first.checkpoint.coding_groups.clone(),
+                authority: Some(mb_core::CheckpointAuthority {
+                    format_version: 1,
+                    membership_epoch: current.membership_epoch,
+                    quorum: current.quorum,
+                }),
+                packing_catalog: None,
+            },
+            signatures: Vec::new(),
+        };
+        for keys in &nonsigners {
+            second.add_signature(keys).unwrap();
+        }
+        second.verify().unwrap();
+        let mut third = QuorumCheckpoint {
+            checkpoint: second.checkpoint.clone(),
+            signatures: Vec::new(),
+        };
+        third.checkpoint.generation = 3;
+        third.checkpoint.parent = Some(second.hash().unwrap());
+        for keys in &nonsigners {
+            third.add_signature(keys).unwrap();
+        }
+        third.verify().unwrap();
+
+        let mut state = CheckpointCatchupState {
+            format_version: 1,
+            guild_id,
+            base_generation: 0,
+            base_hash: [0; 32],
+            target_generation: 3,
+            target_hash: third.hash().unwrap(),
+            cursor_generation: 3,
+            cursor_hash: third.hash().unwrap(),
+            ready_to_install: false,
+        };
+        state = node.stage_checkpoint_catchup(state, &third).unwrap();
+        state = node.stage_checkpoint_catchup(state, &second).unwrap();
+        assert_eq!(state.cursor_generation, 1);
+        assert!(node.control.locked_checkpoint(&guild_id).unwrap().is_none());
+        drop(node);
+
+        let mut node = Node::open(&node_path, local_seed.clone()).unwrap();
+        let state = node.checkpoint_catchup_state(&guild_id).unwrap().unwrap();
+        let state = node.stage_checkpoint_catchup(state, &first).unwrap();
+        assert!(state.ready_to_install);
+        assert_eq!(
+            node.install_checkpoint_catchup_batch(&guild_id, 2).unwrap(),
+            (2, false)
+        );
+        assert_eq!(
+            node.checkpoint_head(&guild_id).unwrap(),
+            Some((2, second.hash().unwrap()))
+        );
+        let lock = node.control.locked_checkpoint(&guild_id).unwrap().unwrap();
+        assert_eq!((lock.0, lock.1), (2, second.hash().unwrap()));
+        let (total_pages, first_page) = node
+            .checkpoint_page(&guild_id, &first.hash().unwrap(), 0)
+            .unwrap();
+        assert!(total_pages >= 1);
+        assert!(!first_page.is_empty());
+        drop(node);
+
+        let mut node = Node::open(&node_path, local_seed).unwrap();
+        assert_eq!(
+            node.install_checkpoint_catchup_batch(&guild_id, 2).unwrap(),
+            (1, true)
+        );
+        assert_eq!(
+            node.checkpoint_head(&guild_id).unwrap(),
+            Some((3, third.hash().unwrap()))
+        );
+        assert!(node.checkpoint_catchup_state(&guild_id).unwrap().is_none());
+    }
 
     #[test]
     fn new_format_seven_signature_requires_authenticated_packing() {

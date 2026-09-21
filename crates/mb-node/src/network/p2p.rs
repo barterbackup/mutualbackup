@@ -52,9 +52,10 @@ use mb_store::{ParityObject, VariableParityObject};
 use uuid::Uuid;
 
 use crate::node::{
-    CheckpointRecoveryObservation, CodingRetryJob, DelegatedCodingJob, DelegatedCodingJobState,
-    DhtRecordObservation, GuildPhase, SnapshotInfo, VerifiedCodingTranscript,
-    checkpoint_matches_dynamic_authority, variable_group_protects_checkpoint,
+    CheckpointCatchupState, CheckpointRecoveryObservation, CodingRetryJob, DelegatedCodingJob,
+    DelegatedCodingJobState, DhtRecordObservation, GuildPhase, SnapshotInfo,
+    VerifiedCodingTranscript, checkpoint_matches_dynamic_authority,
+    variable_group_protects_checkpoint,
 };
 
 #[cfg(test)]
@@ -116,6 +117,7 @@ const LOGICAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 // requests alive for their full bounded logical lifetime so a slow relay or
 // Tor path can still supply the advancing tail.
 const EVENT_TAIL_ADVANCE_WAIT: Duration = LOGICAL_REQUEST_TIMEOUT;
+const MAX_CHECKPOINT_CATCHUP_STEPS_PER_PASS: usize = 1_024;
 const REQUEST_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_REQUEST_TRANSPORT_ATTEMPTS: u8 = 6;
 const CLOSED_CONNECTION_PATH_RETENTION: Duration = Duration::from_secs(40);
@@ -7095,7 +7097,7 @@ pub async fn run_peer_exchange(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result
 }
 
 async fn sync_checkpoint_head_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<usize> {
-    let (guild, local_head, local_id) = node_blocking(node.clone(), |node| {
+    let (guild, local_head, local_id, catchup) = node_blocking(node.clone(), |node| {
         let guild = node
             .guild_summary()?
             .context("checkpoint synchronization requires an installed guild")?;
@@ -7103,11 +7105,11 @@ async fn sync_checkpoint_head_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> R
             guild.clone(),
             node.checkpoint_head(&guild.guild_id)?,
             node.keys().node_id(),
+            node.checkpoint_catchup_state(&guild.guild_id)?,
         ))
     })
     .await?;
     let guild_id = guild.guild_id;
-    let mut requests = FuturesUnordered::new();
     for peer in guild
         .peers
         .iter()
@@ -7118,68 +7120,146 @@ async fn sync_checkpoint_head_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> R
                 let _ = p2p.add_peer_address(peer.member.node_id, address).await;
             }
         }
-        let source = peer.member.node_id;
-        requests.push(async move { (source, p2p.checkpoint_head(source, guild_id).await) });
     }
+    let sources = guild
+        .peers
+        .iter()
+        .map(|peer| peer.member.node_id)
+        .filter(|peer| *peer != local_id)
+        .collect::<Vec<_>>();
     let local_generation = local_head.map(|(generation, _)| generation).unwrap_or(0);
-    let local_hash = local_head.map(|(_, hash)| hash);
-    let mut candidates = Vec::new();
-    while let Some((source, result)) = requests.next().await {
-        if let Ok(Some(head)) = result
-            && head.generation > local_generation
-            && head.hash != [0; 32]
+    let local_hash = local_head.map(|(_, hash)| hash).unwrap_or([0; 32]);
+    let mut fetched = 0_usize;
+    let mut state = match catchup {
+        Some(state)
+            if local_generation < state.target_generation
+                && local_generation >= state.base_generation
+                && (local_generation != state.base_generation || local_hash == state.base_hash) =>
         {
-            candidates.push((std::cmp::Reverse(head.generation), source, head.hash));
+            state
         }
-    }
-    candidates.sort();
-    for (std::cmp::Reverse(generation), source, head_hash) in candidates {
-        let distance = generation.saturating_sub(local_generation);
-        if distance > 1_024 {
-            tracing::warn!(%source, generation, local_generation, "checkpoint catch-up chain exceeds the bounded page walk");
-            continue;
+        Some(_) => {
+            node_blocking(node.clone(), move |node| {
+                node.clear_checkpoint_catchup(&guild_id)
+            })
+            .await?;
+            return Ok(0);
         }
-        let mut chain = Vec::with_capacity(distance as usize);
-        let mut expected_generation = generation;
-        let mut cursor = head_hash;
-        let mut complete = false;
-        while expected_generation > local_generation {
-            let checkpoint = match fetch_p2p_checkpoint(p2p, source, guild_id, cursor).await {
-                Ok(checkpoint) => checkpoint,
-                Err(error) => {
-                    tracing::debug!(%source, %error, "checkpoint catch-up source could not serve its certified chain");
-                    break;
+        None => {
+            let mut requests = FuturesUnordered::new();
+            for source in sources.iter().copied() {
+                requests.push(async move { (source, p2p.checkpoint_head(source, guild_id).await) });
+            }
+            let mut candidates = Vec::new();
+            while let Some((source, result)) = requests.next().await {
+                if let Ok(Some(head)) = result
+                    && head.generation > local_generation
+                    && head.hash != [0; 32]
+                {
+                    candidates.push((std::cmp::Reverse(head.generation), source, head.hash));
                 }
-            };
-            if checkpoint.checkpoint.generation != expected_generation
-                || checkpoint.checkpoint.guild_id != guild_id
-                || checkpoint.hash()? != cursor
-            {
+            }
+            candidates.sort();
+            let mut selected = None;
+            for (std::cmp::Reverse(generation), preferred_source, head_hash) in candidates {
+                let mut ordered_sources = Vec::with_capacity(sources.len());
+                ordered_sources.push(preferred_source);
+                ordered_sources.extend(
+                    sources
+                        .iter()
+                        .copied()
+                        .filter(|source| *source != preferred_source),
+                );
+                let checkpoint = match fetch_checkpoint_from_sources(
+                    p2p,
+                    &ordered_sources,
+                    guild_id,
+                    head_hash,
+                )
+                .await
+                {
+                    Ok(checkpoint) if checkpoint.checkpoint.generation == generation => checkpoint,
+                    Ok(_) => continue,
+                    Err(error) => {
+                        tracing::debug!(%preferred_source, %error, "advertised checkpoint head was unavailable");
+                        continue;
+                    }
+                };
+                let initial = CheckpointCatchupState {
+                    format_version: 1,
+                    guild_id,
+                    base_generation: local_generation,
+                    base_hash: local_hash,
+                    target_generation: generation,
+                    target_hash: head_hash,
+                    cursor_generation: generation,
+                    cursor_hash: head_hash,
+                    ready_to_install: false,
+                };
+                let staged = node_blocking(node.clone(), move |node| {
+                    node.stage_checkpoint_catchup(initial, &checkpoint)
+                })
+                .await?;
+                fetched = 1;
+                selected = Some(staged);
                 break;
             }
-            cursor = checkpoint.checkpoint.parent.unwrap_or([0; 32]);
-            chain.push(checkpoint);
-            expected_generation -= 1;
-            complete = if expected_generation == local_generation {
-                match local_hash {
-                    Some(hash) => cursor == hash,
-                    None => cursor == [0; 32],
-                }
-            } else {
-                false
+            let Some(selected) = selected else {
+                return Ok(0);
             };
+            selected
         }
-        if !complete {
-            continue;
-        }
-        chain.reverse();
-        let installed = chain.len();
-        for checkpoint in chain {
-            node_blocking(node.clone(), move |node| node.store_checkpoint(&checkpoint)).await?;
-        }
-        return Ok(installed);
+    };
+    if state.ready_to_install {
+        return node_blocking(node, move |node| {
+            node.install_checkpoint_catchup_batch(&guild_id, MAX_CHECKPOINT_CATCHUP_STEPS_PER_PASS)
+                .map(|(installed, _)| installed)
+        })
+        .await;
     }
-    Ok(0)
+    while !state.ready_to_install && fetched < MAX_CHECKPOINT_CATCHUP_STEPS_PER_PASS {
+        let cursor_hash = state.cursor_hash;
+        let checkpoint = fetch_checkpoint_from_sources(p2p, &sources, guild_id, cursor_hash)
+            .await
+            .with_context(|| {
+                format!(
+                    "checkpoint catch-up could not fetch generation {}",
+                    state.cursor_generation
+                )
+            })?;
+        state = node_blocking(node.clone(), move |node| {
+            node.stage_checkpoint_catchup(state, &checkpoint)
+        })
+        .await?;
+        fetched += 1;
+    }
+    if !state.ready_to_install {
+        return Ok(0);
+    }
+    node_blocking(node, move |node| {
+        node.install_checkpoint_catchup_batch(&guild_id, MAX_CHECKPOINT_CATCHUP_STEPS_PER_PASS)
+            .map(|(installed, _)| installed)
+    })
+    .await
+}
+
+async fn fetch_checkpoint_from_sources(
+    p2p: &P2pClient,
+    sources: &[NodeId],
+    guild_id: [u8; 32],
+    checkpoint_hash: [u8; 32],
+) -> Result<QuorumCheckpoint> {
+    let mut last_error = None;
+    for source in sources.iter().copied() {
+        match fetch_p2p_checkpoint(p2p, source, guild_id, checkpoint_hash).await {
+            Ok(checkpoint) => return Ok(checkpoint),
+            Err(error) => {
+                tracing::debug!(%source, %error, "checkpoint source could not serve a certified ancestor");
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no checkpoint source is available")))
 }
 
 async fn reconcile_recovery_key_epoch_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
