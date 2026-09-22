@@ -261,7 +261,7 @@ fn validate_checkpoint_for_signature(checkpoint: &GuildCheckpoint) -> Result<()>
         && checkpoint
             .packing_catalog
             .as_ref()
-            .is_none_or(|catalog| !matches!(catalog.format_version, 3 | 4))
+            .is_none_or(|catalog| !matches!(catalog.format_version, 3..=5))
     {
         anyhow::bail!("new format-seven checkpoints require root-bound authenticated catalogs");
     }
@@ -3601,6 +3601,84 @@ impl Node {
     ) -> Result<SignedRecord<mb_core::LegacyPackingBinding>> {
         let bytes = self.sector_for_guild(guild_id, &reference.id)?;
         sign_legacy_packing_binding(&self.keys, protected_root_id, reference, &bytes)
+    }
+
+    pub(crate) fn sign_legacy_packing_attestation(
+        &mut self,
+        value: mb_core::LegacyPackingAttestation,
+        bytes: &[u8],
+    ) -> Result<SignedRecord<mb_core::LegacyPackingAttestation>> {
+        let state = self
+            .dynamic_guild_state()?
+            .context("legacy packing attestation requires dynamic guild state")?;
+        if value.format_version != 1
+            || value.guild_id != state.guild_id
+            || value.membership_epoch != state.membership_epoch
+            || !state
+                .active_members()
+                .any(|member| member.node_id == self.keys.node_id())
+            || bytes.len() != V1_SECTOR_SIZE
+            || sector_root(bytes) != value.flat_root
+            || merkle_commit(bytes)? != value.source_commitment
+        {
+            anyhow::bail!("legacy packing attestation conflicts with recovered source bytes");
+        }
+        let attestation = SignedRecord::sign(
+            mb_core::LEGACY_PACKING_ATTESTATION_DOMAIN,
+            value,
+            &self.keys,
+        )?;
+        self.store_legacy_packing_attestation(&attestation)?;
+        Ok(attestation)
+    }
+
+    pub(crate) fn store_legacy_packing_attestation(
+        &mut self,
+        attestation: &SignedRecord<mb_core::LegacyPackingAttestation>,
+    ) -> Result<()> {
+        attestation.verify(mb_core::LEGACY_PACKING_ATTESTATION_DOMAIN)?;
+        let state = self
+            .dynamic_guild_state()?
+            .context("legacy packing attestation requires dynamic guild state")?;
+        if attestation.value.guild_id != state.guild_id
+            || attestation.value.membership_epoch != state.membership_epoch
+            || !state
+                .active_members()
+                .any(|member| member.node_id == attestation.signer)
+        {
+            anyhow::bail!("legacy packing attestation signer is not currently authorized");
+        }
+        let bytes = canonical_bytes(attestation)?;
+        self.control.put_record(
+            "legacy-packing-attestation",
+            blake3::hash(&bytes).as_bytes(),
+            &bytes,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn legacy_packing_attestations(
+        &self,
+        guild_id: [u8; 32],
+        owner: NodeId,
+        protected_root: [u8; 32],
+        object_id: SectorId,
+    ) -> Result<Vec<SignedRecord<mb_core::LegacyPackingAttestation>>> {
+        let mut attestations = Vec::new();
+        for (_, bytes) in self.control.records("legacy-packing-attestation")? {
+            let attestation: SignedRecord<mb_core::LegacyPackingAttestation> =
+                decode_canonical(&bytes)?;
+            attestation.verify(mb_core::LEGACY_PACKING_ATTESTATION_DOMAIN)?;
+            if attestation.value.guild_id == guild_id
+                && attestation.value.owner == owner
+                && attestation.value.protected_root == protected_root
+                && attestation.value.object_id == object_id
+            {
+                attestations.push(attestation);
+            }
+        }
+        attestations.sort_by_key(|attestation| attestation.signer);
+        Ok(attestations)
     }
 
     pub(crate) fn store_packing_result(
@@ -9810,6 +9888,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_packing_attestation_survives_restart_before_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let (seed, certificate, peers) = recovery_guild_fixture();
+        let path = temp.path().join("node");
+        let mut node = Node::open(&path, seed.clone()).unwrap();
+        node.adopt_recovered_guild(certificate.clone(), peers)
+            .unwrap();
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let bytes = vec![37; V1_SECTOR_SIZE];
+        let value = mb_core::LegacyPackingAttestation {
+            format_version: 1,
+            guild_id: state.guild_id,
+            membership_epoch: state.membership_epoch,
+            owner: certificate.genesis.members[1].node_id,
+            protected_root: [41; 32],
+            object_id: [42; 32],
+            flat_root: sector_root(&bytes),
+            source_commitment: merkle_commit(&bytes).unwrap(),
+        };
+        let signed = node
+            .sign_legacy_packing_attestation(value.clone(), &bytes)
+            .unwrap();
+        drop(node);
+
+        let node = Node::open(&path, seed).unwrap();
+        assert_eq!(
+            node.legacy_packing_attestations(
+                value.guild_id,
+                value.owner,
+                value.protected_root,
+                value.object_id,
+            )
+            .unwrap(),
+            vec![signed]
+        );
+    }
+
+    #[test]
     fn checkpoint_catchup_is_resumable_across_authority_epochs_and_adopts_certificates() {
         let temp = tempfile::tempdir().unwrap();
         let local_seed = Seed::from_bytes([226; 32]);
@@ -10022,6 +10138,7 @@ mod tests {
                 sectors: Vec::new(),
                 source_authentication: None,
                 legacy_bindings: None,
+                legacy_attestations: None,
             }),
         };
         assert!(validate_checkpoint_for_signature(&checkpoint).is_err());

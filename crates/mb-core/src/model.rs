@@ -984,6 +984,88 @@ impl GuildCheckpoint {
                         return Err(ModelError::InvalidCheckpoint);
                     }
                 }
+                (5, Some(authentication)) => {
+                    let bindings = catalog
+                        .legacy_bindings
+                        .as_ref()
+                        .ok_or(ModelError::InvalidCheckpoint)?
+                        .iter()
+                        .map(|binding| {
+                            (
+                                (
+                                    binding.value.owner,
+                                    binding.value.protected_root,
+                                    binding.value.object_id,
+                                ),
+                                &binding.value,
+                            )
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    let authority = self.authority.ok_or(ModelError::InvalidCheckpoint)?;
+                    let required = authority
+                        .quorum
+                        .required(self.members.len())
+                        .map_err(|_| ModelError::InvalidCheckpoint)?;
+                    let mut attested = std::collections::BTreeMap::<
+                        _,
+                        (
+                            &crate::LegacyPackingAttestation,
+                            std::collections::BTreeSet<NodeId>,
+                        ),
+                    >::new();
+                    for attestation in catalog
+                        .legacy_attestations
+                        .as_ref()
+                        .ok_or(ModelError::InvalidCheckpoint)?
+                    {
+                        let value = &attestation.value;
+                        let key = (value.owner, value.protected_root, value.object_id);
+                        if value.guild_id != self.guild_id
+                            || value.membership_epoch != authority.membership_epoch
+                            || !member_ids.contains(&attestation.signer)
+                        {
+                            return Err(ModelError::InvalidCheckpoint);
+                        }
+                        let entry = attested
+                            .entry(key)
+                            .or_insert_with(|| (value, std::collections::BTreeSet::new()));
+                        if entry.0 != value || !entry.1.insert(attestation.signer) {
+                            return Err(ModelError::InvalidCheckpoint);
+                        }
+                    }
+                    let mut used_bindings = std::collections::BTreeSet::new();
+                    let mut used_attestations = std::collections::BTreeSet::new();
+                    for entry in authentication {
+                        let key = (entry.id.owner, entry.id.protected_root, entry.id.object_id);
+                        if revision_commitments.get(&key) == Some(&entry.source_commitment) {
+                            continue;
+                        }
+                        if let Some(binding) = bindings.get(&key) {
+                            if binding.source_commitment != entry.source_commitment
+                                || revision_flat_roots.get(&key) != Some(&binding.flat_root)
+                            {
+                                return Err(ModelError::InvalidCheckpoint);
+                            }
+                            used_bindings.insert(key);
+                            continue;
+                        }
+                        let Some((attestation, signers)) = attested.get(&key) else {
+                            return Err(ModelError::InvalidCheckpoint);
+                        };
+                        if attestation.source_commitment != entry.source_commitment
+                            || revision_flat_roots.get(&key) != Some(&attestation.flat_root)
+                            || signers.len() < required
+                        {
+                            return Err(ModelError::InvalidCheckpoint);
+                        }
+                        used_attestations.insert(key);
+                    }
+                    if used_bindings.len() != bindings.len()
+                        || used_attestations.len() != attested.len()
+                    {
+                        return Err(ModelError::InvalidCheckpoint);
+                    }
+                }
                 _ => return Err(ModelError::InvalidCheckpoint),
             }
         }
@@ -2131,11 +2213,83 @@ mod tests {
             legacy_inputs,
         )
         .unwrap();
+        let legacy_catalog = legacy_packing.catalog.clone();
         legacy_packed_checkpoint.format_version = 7;
         legacy_packed_checkpoint.packing_catalog = Some(
             crate::attach_legacy_packing_bindings(legacy_packing.catalog, legacy_bindings).unwrap(),
         );
         legacy_packed_checkpoint.validate().unwrap();
+
+        let authority = legacy_packed_checkpoint.authority.unwrap();
+        let required = authority
+            .quorum
+            .required(legacy_packed_checkpoint.members.len())
+            .unwrap();
+        let member_keys = keys
+            .iter()
+            .filter(|key| {
+                legacy_packed_checkpoint
+                    .members
+                    .iter()
+                    .any(|member| member.node_id == key.node_id())
+            })
+            .take(required)
+            .collect::<Vec<_>>();
+        let legacy_attestations = legacy_packed_checkpoint
+            .revisions
+            .iter()
+            .flat_map(|revision| {
+                revision
+                    .value
+                    .metadata_sectors
+                    .iter()
+                    .chain(&revision.value.data_sectors)
+                    .flat_map(|reference| {
+                        let bytes = vec![reference.id[0]; V1_SECTOR_SIZE];
+                        let value = crate::LegacyPackingAttestation {
+                            format_version: 1,
+                            guild_id: legacy_packed_checkpoint.guild_id,
+                            membership_epoch: authority.membership_epoch,
+                            owner: revision.value.owner,
+                            protected_root: crate::packing_protected_root(
+                                revision.value.protected_root_id,
+                            ),
+                            object_id: reference.id,
+                            flat_root: reference.root,
+                            source_commitment: merkle_commit(&bytes).unwrap(),
+                        };
+                        member_keys.iter().map(move |key| {
+                            SignedRecord::sign(
+                                crate::LEGACY_PACKING_ATTESTATION_DOMAIN,
+                                value.clone(),
+                                key,
+                            )
+                            .unwrap()
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        let mut attested_checkpoint = legacy_packed_checkpoint.clone();
+        attested_checkpoint.packing_catalog = Some(
+            crate::attach_legacy_packing_evidence(legacy_catalog, Vec::new(), legacy_attestations)
+                .unwrap(),
+        );
+        attested_checkpoint.validate().unwrap();
+        let mut insufficient_attestation = attested_checkpoint;
+        insufficient_attestation
+            .packing_catalog
+            .as_mut()
+            .unwrap()
+            .legacy_attestations
+            .as_mut()
+            .unwrap()
+            .retain(|attestation| attestation.signer == member_keys[0].node_id());
+        let catalog = insufficient_attestation.packing_catalog.as_mut().unwrap();
+        catalog.id = catalog.calculate_id().unwrap();
+        assert!(matches!(
+            insufficient_attestation.validate(),
+            Err(ModelError::InvalidCheckpoint)
+        ));
 
         let mut mismatched_binding = legacy_packed_checkpoint.clone();
         let catalog = mismatched_binding.packing_catalog.as_mut().unwrap();

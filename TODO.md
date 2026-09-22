@@ -583,10 +583,13 @@ tree. The complete M5-45 correction gate passed locally on 2026-09-19, so
 it remains historical evidence for that tree. Follow-up source-only review of
 `56bb57d..f7d0503` on 2026-09-20 found M5-46 through M5-57 below. Their
 corrections are recorded under those items, but a fresh source-only review of
-`f7d0503..81ec33b` on 2026-09-21 found M5-58 through M5-66. Milestone 5 remains
-reopened and Milestone 6 must wait for their correction and a new gate. The
-fresh review ran no builds, tests, daemons, runtime probes, or remote
-compilation.
+`f7d0503..81ec33b` on 2026-09-21 found M5-58 through M5-66. Those source
+blockers are now corrected, and the follow-up source-only review finds no
+remaining Milestone 5 blocker. Milestone 5 remains open only for its final
+local closure gate, so Milestone 6 still waits. The original review ran no
+builds, tests, daemons, runtime probes, or remote compilation; the correction
+work used local focused tests, the complete core and node library suites, and
+strict core/node/relay Clippy.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -1542,7 +1545,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   The unchanged fast path refuses to clone a version-4 catalog after the last
   legacy source retires, forcing that complete-corpus transition. Core and node
   regressions cover the version-4-to-version-3 transition and fast-path guard.
-- [ ] **M5-63 / P1 — Make legacy migration durable without every historical owner online.**
+- [x] **M5-63 / P1 — Make legacy migration durable without every historical owner online.**
   A missing migration binding is obtained only from the exact source owner
   (`crates/mb-node/src/network/p2p.rs:11885`), whose signer reads its local sector
   (`crates/mb-node/src/node.rs:3570`). An offline or removed historical owner can
@@ -1553,7 +1556,15 @@ node Clippy gate passed locally. No remote compilation server was used.
   Define a verifiable offline-owner migration path and durably journal accepted
   bindings before checkpoint publication. Gate migration with a retained owner
   offline or removed, any valid `k` old shards, and restart at every publication
-  boundary.
+  boundary. A missing owner binding now falls back to certified any-`k`
+  reconstruction of the historical information shard. Current checkpoint
+  members verify both the signed flat root and reconstructed Merkle commitment,
+  then sign a guild- and membership-epoch-bound attestation. Version-5 catalogs
+  carry a checkpoint-policy quorum of those attestations, and checkpoint
+  validation rejects stale, nonmember, conflicting, insufficient, or unused
+  evidence. Every accepted attestation is journaled before catalog/checkpoint
+  publication and reused after restart. Core quorum/insufficiency, removed-owner
+  quorum, and durable restart regressions pass locally.
 - [x] **M5-64 / P1 — Use any-`k` packed recovery throughout the migration window.**
   While any legacy binding remains, production fetches every retained source
   (`crates/mb-node/src/network/p2p.rs:11941`). Its failure fallback checks only

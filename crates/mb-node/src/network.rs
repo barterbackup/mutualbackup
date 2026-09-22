@@ -896,6 +896,11 @@ fn validate_request_envelope(
     {
         bail!("source path exceeds the protocol limit");
     }
+    if let PeerRequest::AttestLegacyPackingSource { ref bytes, .. } = envelope.request
+        && bytes.len() != mb_core::V1_SECTOR_SIZE
+    {
+        bail!("legacy packing attestation has the wrong source size");
+    }
     Ok(())
 }
 
@@ -1408,6 +1413,11 @@ fn execute_peer_request(
         )),
         PeerRequest::SignLegacyPackingBinding { .. } => {
             bail!("legacy-packing binding read was sent to a mutation worker")
+        }
+        PeerRequest::AttestLegacyPackingSource { attestation, bytes } => {
+            Ok(PeerResponse::LegacyPackingAttestation(
+                node.sign_legacy_packing_attestation(attestation, &bytes)?,
+            ))
         }
         PeerRequest::BackupStatus { .. } => {
             bail!("backup status read was sent to a mutation worker")

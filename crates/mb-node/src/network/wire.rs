@@ -1,10 +1,10 @@
 use mb_core::{
     CodingAttemptPlan, CodingChallengeCommitment, CodingChallengeReveal, CodingFailureReport,
     CodingGroup, CodingRootManifest, CodingShardOpening, CodingVerificationTranscript,
-    EndpointRecord, GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, LegacyPackingBinding,
-    Member, MemberSignature, MerkleCommitment, MerkleRangeProof, NodeId, QuorumGuildEvent,
-    QuorumGuildGenesis, SectorId, SectorRef, SignedRecord, StagedStorageReceipt,
-    StorageAcknowledgement,
+    EndpointRecord, GuildEvent, GuildEventTail, GuildGenesis, GuildInvite,
+    LegacyPackingAttestation, LegacyPackingBinding, Member, MemberSignature, MerkleCommitment,
+    MerkleRangeProof, NodeId, QuorumGuildEvent, QuorumGuildGenesis, SectorId, SectorRef,
+    SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
 };
 use mb_store::{ParityObject, VariableParityObject};
 use serde::{Deserialize, Serialize};
@@ -307,6 +307,10 @@ pub(super) enum PeerRequest {
         guild_id: [u8; 32],
         shard_size: u32,
     },
+    AttestLegacyPackingSource {
+        attestation: LegacyPackingAttestation,
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -405,6 +409,7 @@ impl PeerRequest {
             Self::FinalizeCheckpoint { .. } => Some("finalize-checkpoint"),
             Self::GetCheckpointHead { .. } => Some("get-checkpoint-head"),
             Self::SignLegacyPackingBinding { .. } => Some("sign-legacy-packing-binding"),
+            Self::AttestLegacyPackingSource { .. } => Some("attest-legacy-packing-source"),
             #[cfg(test)]
             Self::BuildRecoveryRecord { .. } => Some("build-recovery-record"),
             #[cfg(test)]
@@ -441,6 +446,7 @@ impl PeerRequest {
             | Self::GetCheckpointHead { guild_id }
             | Self::SignLegacyPackingBinding { guild_id, .. }
             | Self::BackupStatus { guild_id, .. } => Some(*guild_id),
+            Self::AttestLegacyPackingSource { attestation, .. } => Some(attestation.guild_id),
             Self::AbortCodingAttempt { plan } => Some(plan.value.geometry.guild_id),
             Self::ExchangeEndpoints { guild_id } | Self::CodingCapacity { guild_id, .. } => {
                 Some(*guild_id)
@@ -555,6 +561,7 @@ pub(super) enum PeerResponse {
     CodingCapacity {
         available_shards: u64,
     },
+    LegacyPackingAttestation(SignedRecord<LegacyPackingAttestation>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

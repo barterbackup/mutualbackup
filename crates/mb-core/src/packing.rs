@@ -12,6 +12,7 @@ use crate::{
 
 const MAX_PACKED_CHUNKS: usize = 1_000_000;
 pub const LEGACY_PACKING_BINDING_DOMAIN: &[u8] = b"mutualbackup/legacy-packing-binding/v1";
+pub const LEGACY_PACKING_ATTESTATION_DOMAIN: &[u8] = b"mutualbackup/legacy-packing-attestation/v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PackingProfile {
@@ -131,6 +132,18 @@ pub struct LegacyPackingBinding {
     pub source_commitment: MerkleCommitment,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyPackingAttestation {
+    pub format_version: u16,
+    pub guild_id: [u8; 32],
+    pub membership_epoch: u64,
+    pub owner: NodeId,
+    pub protected_root: [u8; 32],
+    pub object_id: [u8; 32],
+    pub flat_root: [u8; 32],
+    pub source_commitment: MerkleCommitment,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackedCatalog {
     pub id: [u8; 32],
@@ -145,6 +158,9 @@ pub struct PackedCatalog {
     /// Owner-signed migration bindings for retained revisions which predate
     /// source commitments. Present only in version-four catalogs.
     pub legacy_bindings: Option<Vec<SignedRecord<LegacyPackingBinding>>>,
+    /// Current-member attestations for legacy sources whose historical owner
+    /// is unavailable. Present only in version-five catalogs.
+    pub legacy_attestations: Option<Vec<SignedRecord<LegacyPackingAttestation>>>,
 }
 
 impl Serialize for PackedCatalog {
@@ -156,10 +172,12 @@ impl Serialize for PackedCatalog {
             self.format_version,
             &self.source_authentication,
             &self.legacy_bindings,
+            &self.legacy_attestations,
         ) {
-            (1, None, None) => 6,
-            (2 | 3, Some(_), None) => 7,
-            (4, Some(_), Some(_)) => 8,
+            (1, None, None, None) => 6,
+            (2 | 3, Some(_), None, None) => 7,
+            (4, Some(_), Some(_), None) => 8,
+            (5, Some(_), Some(_), Some(_)) => 9,
             _ => return Err(serde::ser::Error::custom("invalid packed catalog version")),
         };
         let mut tuple = serializer.serialize_tuple(field_count)?;
@@ -174,6 +192,9 @@ impl Serialize for PackedCatalog {
         }
         if let Some(bindings) = &self.legacy_bindings {
             tuple.serialize_element(bindings)?;
+        }
+        if let Some(attestations) = &self.legacy_attestations {
+            tuple.serialize_element(attestations)?;
         }
         tuple.end()
     }
@@ -205,13 +226,17 @@ impl<'de> Deserialize<'de> for PackedCatalog {
                 let sectors = next_catalog_field(&mut sequence, "sectors")?;
                 let source_authentication = match format_version {
                     1 => None,
-                    2..=4 => Some(next_catalog_field(&mut sequence, "source authentication")?),
+                    2..=5 => Some(next_catalog_field(&mut sequence, "source authentication")?),
                     _ => {
                         return Err(serde::de::Error::custom("invalid packed catalog version"));
                     }
                 };
                 let legacy_bindings = match format_version {
-                    4 => Some(next_catalog_field(&mut sequence, "legacy bindings")?),
+                    4 | 5 => Some(next_catalog_field(&mut sequence, "legacy bindings")?),
+                    _ => None,
+                };
+                let legacy_attestations = match format_version {
+                    5 => Some(next_catalog_field(&mut sequence, "legacy attestations")?),
                     _ => None,
                 };
                 Ok(PackedCatalog {
@@ -223,11 +248,12 @@ impl<'de> Deserialize<'de> for PackedCatalog {
                     sectors,
                     source_authentication,
                     legacy_bindings,
+                    legacy_attestations,
                 })
             }
         }
 
-        deserializer.deserialize_tuple(8, PackedCatalogVisitor)
+        deserializer.deserialize_tuple(9, PackedCatalogVisitor)
     }
 }
 
@@ -251,6 +277,7 @@ impl PackedCatalog {
             &self.sectors,
             self.source_authentication.as_deref(),
             self.legacy_bindings.as_deref(),
+            self.legacy_attestations.as_deref(),
         )
     }
 
@@ -260,9 +287,13 @@ impl PackedCatalog {
             (
                 self.format_version,
                 &self.source_authentication,
-                &self.legacy_bindings
+                &self.legacy_bindings,
+                &self.legacy_attestations
             ),
-            (1, None, None) | (2 | 3, Some(_), None) | (4, Some(_), Some(_))
+            (1, None, None, None)
+                | (2 | 3, Some(_), None, None)
+                | (4, Some(_), Some(_), None)
+                | (5, Some(_), Some(_), Some(_))
         ) || self.revision == 0
             || (self.revision == 1) != self.parent.is_none()
             || self.calculate_id()? != self.id
@@ -325,11 +356,14 @@ impl PackedCatalog {
                 return Err(PackingError::InvalidCatalog);
             }
         }
-        if matches!(self.format_version, 2..=4) {
+        if matches!(self.format_version, 2..=5) {
             self.validate_source_authentication(&source_ids)?;
         }
-        if self.format_version == 4 {
+        if matches!(self.format_version, 4 | 5) {
             self.validate_legacy_bindings()?;
+        }
+        if self.format_version == 5 {
+            self.validate_legacy_attestations()?;
         }
         Ok(())
     }
@@ -340,7 +374,7 @@ impl PackedCatalog {
             .legacy_bindings
             .as_ref()
             .ok_or(PackingError::InvalidCatalog)?;
-        if bindings.is_empty() {
+        if bindings.is_empty() && self.format_version == 4 {
             return Err(PackingError::InvalidCatalog);
         }
         let authentication = self
@@ -367,6 +401,52 @@ impl PackedCatalog {
                         && entry.source_commitment == value.source_commitment
                 })
                 || !seen.insert((value.owner, value.protected_root, value.object_id))
+            {
+                return Err(PackingError::InvalidCatalog);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_legacy_attestations(&self) -> Result<(), PackingError> {
+        let attestations = self
+            .legacy_attestations
+            .as_ref()
+            .ok_or(PackingError::InvalidCatalog)?;
+        if attestations.is_empty() {
+            return Err(PackingError::InvalidCatalog);
+        }
+        let authentication = self
+            .source_authentication
+            .as_ref()
+            .ok_or(PackingError::InvalidCatalog)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for attestation in attestations {
+            attestation
+                .verify(LEGACY_PACKING_ATTESTATION_DOMAIN)
+                .map_err(|_| PackingError::InvalidCatalog)?;
+            let value = &attestation.value;
+            if value.format_version != 1
+                || value.guild_id == [0; 32]
+                || value.membership_epoch == 0
+                || value.owner == NodeId([0; 32])
+                || value.protected_root == [0; 32]
+                || value.object_id == [0; 32]
+                || value.flat_root == [0; 32]
+                || value.source_commitment.byte_len != self.profile.sector_size
+                || value.source_commitment.validate().is_err()
+                || !authentication.iter().any(|entry| {
+                    entry.id.owner == value.owner
+                        && entry.id.protected_root == value.protected_root
+                        && entry.id.object_id == value.object_id
+                        && entry.source_commitment == value.source_commitment
+                })
+                || !seen.insert((
+                    value.owner,
+                    value.protected_root,
+                    value.object_id,
+                    attestation.signer,
+                ))
             {
                 return Err(PackingError::InvalidCatalog);
             }
@@ -463,6 +543,38 @@ pub fn attach_legacy_packing_bindings(
     });
     catalog.format_version = 4;
     catalog.legacy_bindings = Some(bindings);
+    catalog.legacy_attestations = None;
+    catalog.id = catalog.calculate_id()?;
+    catalog.validate()?;
+    Ok(catalog)
+}
+
+pub fn attach_legacy_packing_evidence(
+    mut catalog: PackedCatalog,
+    mut bindings: Vec<SignedRecord<LegacyPackingBinding>>,
+    mut attestations: Vec<SignedRecord<LegacyPackingAttestation>>,
+) -> Result<PackedCatalog, PackingError> {
+    if catalog.format_version != 3 || attestations.is_empty() {
+        return Err(PackingError::InvalidCatalog);
+    }
+    bindings.sort_by_key(|binding| {
+        (
+            binding.value.owner,
+            binding.value.protected_root,
+            binding.value.object_id,
+        )
+    });
+    attestations.sort_by_key(|attestation| {
+        (
+            attestation.value.owner,
+            attestation.value.protected_root,
+            attestation.value.object_id,
+            attestation.signer,
+        )
+    });
+    catalog.format_version = 5;
+    catalog.legacy_bindings = Some(bindings);
+    catalog.legacy_attestations = Some(attestations);
     catalog.id = catalog.calculate_id()?;
     catalog.validate()?;
     Ok(catalog)
@@ -880,6 +992,7 @@ pub fn pack_incremental(
         sectors: descriptors,
         source_authentication,
         legacy_bindings: None,
+        legacy_attestations: None,
     };
     catalog.id = catalog.calculate_id()?;
     let changed_sectors = sectors
@@ -926,7 +1039,7 @@ where
 {
     profile.validate()?;
     previous.validate()?;
-    if !matches!(previous.format_version, 2..=4) || previous.profile != profile {
+    if !matches!(previous.format_version, 2..=5) || previous.profile != profile {
         return Err(PackingError::ProfileChanged);
     }
     let previous_authentication = previous
@@ -1172,6 +1285,7 @@ where
         sectors: descriptors,
         source_authentication: Some(source_authentication),
         legacy_bindings: None,
+        legacy_attestations: None,
     };
     catalog.id = catalog.calculate_id()?;
     catalog.validate()?;
@@ -1365,6 +1479,7 @@ fn input_chunks(
     Ok(chunks)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn catalog_id(
     format_version: u16,
     revision: u64,
@@ -1373,38 +1488,58 @@ fn catalog_id(
     sectors: &[PackedSectorDescriptor],
     source_authentication: Option<&[PackedSourceAuthentication]>,
     legacy_bindings: Option<&[SignedRecord<LegacyPackingBinding>]>,
+    legacy_attestations: Option<&[SignedRecord<LegacyPackingAttestation>]>,
 ) -> Result<[u8; 32], PackingError> {
-    let domain = match (format_version, source_authentication, legacy_bindings) {
-        (1, None, None) => "mutualbackup packed catalog v1",
-        (2, Some(_), None) => "mutualbackup packed catalog v2",
-        (3, Some(_), None) => "mutualbackup packed catalog v3",
-        (4, Some(_), Some(_)) => "mutualbackup packed catalog v4",
+    let domain = match (
+        format_version,
+        source_authentication,
+        legacy_bindings,
+        legacy_attestations,
+    ) {
+        (1, None, None, None) => "mutualbackup packed catalog v1",
+        (2, Some(_), None, None) => "mutualbackup packed catalog v2",
+        (3, Some(_), None, None) => "mutualbackup packed catalog v3",
+        (4, Some(_), Some(_), None) => "mutualbackup packed catalog v4",
+        (5, Some(_), Some(_), Some(_)) => "mutualbackup packed catalog v5",
         _ => return Err(PackingError::InvalidCatalog),
     };
     let mut hasher = blake3::Hasher::new_derive_key(domain);
-    let bytes =
-        if let (Some(authentication), Some(bindings)) = (source_authentication, legacy_bindings) {
-            canonical_bytes(&(
-                format_version,
-                revision,
-                parent,
-                profile,
-                sectors,
-                authentication,
-                bindings,
-            ))?
-        } else if let Some(authentication) = source_authentication {
-            canonical_bytes(&(
-                format_version,
-                revision,
-                parent,
-                profile,
-                sectors,
-                authentication,
-            ))?
-        } else {
-            canonical_bytes(&(format_version, revision, parent, profile, sectors))?
-        };
+    let bytes = if let (Some(authentication), Some(bindings), Some(attestations)) =
+        (source_authentication, legacy_bindings, legacy_attestations)
+    {
+        canonical_bytes(&(
+            format_version,
+            revision,
+            parent,
+            profile,
+            sectors,
+            authentication,
+            bindings,
+            attestations,
+        ))?
+    } else if let (Some(authentication), Some(bindings)) = (source_authentication, legacy_bindings)
+    {
+        canonical_bytes(&(
+            format_version,
+            revision,
+            parent,
+            profile,
+            sectors,
+            authentication,
+            bindings,
+        ))?
+    } else if let Some(authentication) = source_authentication {
+        canonical_bytes(&(
+            format_version,
+            revision,
+            parent,
+            profile,
+            sectors,
+            authentication,
+        ))?
+    } else {
+        canonical_bytes(&(format_version, revision, parent, profile, sectors))?
+    };
     hasher.update(&bytes);
     Ok(*hasher.finalize().as_bytes())
 }

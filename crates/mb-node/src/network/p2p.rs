@@ -33,18 +33,19 @@ use mb_core::{
     CodingGroup, CodingGroupV2, CodingPlanGeometry, CodingProfile, CodingRootManifest,
     CodingShardOpening, CodingVerificationTranscript, DynamicGuildState, GuildCheckpoint,
     GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, InformationRoleV2,
-    LEGACY_PACKING_BINDING_DOMAIN, LegacyPackingBinding, MAX_GUILD_EVENT_TAIL, MERKLE_LEAF_SIZE,
-    Member, MemberSignature, MerkleCommitment, NodeId, PackedCatalog, PackedSector,
-    PackedSectorDescriptor, PackingInput, PackingProfile, ParityPlacementV2, QuorumCheckpoint,
-    QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN,
-    RangeSectorRef, STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId,
-    SectorRef, ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
-    UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES,
-    V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS,
-    V1_SECTOR_SIZE, attach_legacy_packing_bindings, canonical_bytes, coding_challenge,
-    coding_transfer_estimate, decode_canonical, merkle_commit, merkle_zero_commitment,
-    pack_incremental, pack_incremental_authenticated, packing_protected_root,
-    replay_coding_transcript, sector_root, unpack_object_from_sectors,
+    LEGACY_PACKING_ATTESTATION_DOMAIN, LEGACY_PACKING_BINDING_DOMAIN, LegacyPackingAttestation,
+    LegacyPackingBinding, MAX_GUILD_EVENT_TAIL, MERKLE_LEAF_SIZE, Member, MemberSignature,
+    MerkleCommitment, NodeId, PackedCatalog, PackedSector, PackedSectorDescriptor, PackingInput,
+    PackingProfile, ParityPlacementV2, QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis,
+    QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN, RangeSectorRef,
+    STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole,
+    ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement, UserRevision,
+    V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS,
+    V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_SECTOR_SIZE,
+    attach_legacy_packing_bindings, attach_legacy_packing_evidence, canonical_bytes,
+    coding_challenge, coding_transfer_estimate, decode_canonical, merkle_commit,
+    merkle_zero_commitment, pack_incremental, pack_incremental_authenticated,
+    packing_protected_root, replay_coding_transcript, sector_root, unpack_object_from_sectors,
 };
 #[cfg(test)]
 use mb_core::{ParityRoleV2, encode};
@@ -2974,6 +2975,24 @@ impl P2pClient {
             bail!("peer returned the wrong legacy-packing binding response");
         };
         Ok(binding)
+    }
+
+    async fn legacy_packing_attestation(
+        &self,
+        peer: NodeId,
+        attestation: LegacyPackingAttestation,
+        bytes: Vec<u8>,
+    ) -> Result<SignedRecord<LegacyPackingAttestation>> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::AttestLegacyPackingSource { attestation, bytes },
+            )
+            .await?;
+        let PeerResponse::LegacyPackingAttestation(attestation) = response else {
+            bail!("peer returned the wrong legacy-packing attestation response");
+        };
+        Ok(attestation)
     }
 
     pub(crate) async fn sign_checkpoint(
@@ -11920,6 +11939,7 @@ async fn wait_for_variable_coding_groups(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_production_packing(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
@@ -11927,10 +11947,15 @@ async fn build_production_packing(
     guild_id: [u8; 32],
     revisions: &[SignedRecord<UserRevision>],
     previous: Option<&PackedCatalog>,
+    members: &[Member],
+    authority: CheckpointAuthority,
 ) -> Result<ProductionPacking> {
     let mut sources = PackingSources::new();
     let mut legacy_bindings =
         BTreeMap::<PackingObjectKey, SignedRecord<LegacyPackingBinding>>::new();
+    let mut legacy_attestations =
+        BTreeMap::<PackingObjectKey, Vec<SignedRecord<LegacyPackingAttestation>>>::new();
+    let mut legacy_source_bytes = BTreeMap::<PackingObjectKey, Vec<u8>>::new();
     let prior_legacy_bindings = previous
         .and_then(|catalog| catalog.legacy_bindings.as_ref())
         .into_iter()
@@ -11946,6 +11971,22 @@ async fn build_production_packing(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let mut prior_legacy_attestations =
+        BTreeMap::<PackingObjectKey, Vec<SignedRecord<LegacyPackingAttestation>>>::new();
+    for attestation in previous
+        .and_then(|catalog| catalog.legacy_attestations.as_ref())
+        .into_iter()
+        .flatten()
+    {
+        prior_legacy_attestations
+            .entry((
+                attestation.value.owner,
+                attestation.value.protected_root,
+                attestation.value.object_id,
+            ))
+            .or_default()
+            .push(attestation.clone());
+    }
     for revision in revisions {
         let protected_root = packing_protected_root(revision.value.protected_root_id);
         for (index, reference) in revision
@@ -11962,41 +12003,30 @@ async fn build_production_packing(
                     .context("retained revision source commitment is missing")?
                     .clone()
             } else {
-                let binding = if let Some(binding) = prior_legacy_bindings.get(&key) {
-                    binding.clone()
-                } else if revision.value.owner == local_id {
-                    let reference = reference.clone();
-                    let protected_root_id = revision.value.protected_root_id;
-                    node_blocking(node.clone(), move |node| {
-                        node.sign_legacy_packing_binding(&guild_id, protected_root_id, &reference)
-                    })
-                    .await?
-                } else {
-                    p2p.legacy_packing_binding(
-                        revision.value.owner,
-                        guild_id,
-                        revision.value.protected_root_id,
-                        reference.clone(),
-                    )
-                    .await?
-                };
-                binding.verify(LEGACY_PACKING_BINDING_DOMAIN)?;
-                if binding.signer != revision.value.owner
-                    || binding.value.owner != revision.value.owner
-                    || binding.value.protected_root != protected_root
-                    || binding.value.object_id != reference.id
-                    || binding.value.flat_root != reference.root
-                {
-                    bail!("legacy packing binding conflicts with its signed revision");
+                let evidence = legacy_source_evidence(
+                    node.clone(),
+                    p2p,
+                    local_id,
+                    guild_id,
+                    authority,
+                    members,
+                    revision.value.owner,
+                    revision.value.protected_root_id,
+                    reference,
+                    prior_legacy_bindings.get(&key),
+                    prior_legacy_attestations.get(&key).map(Vec::as_slice),
+                )
+                .await?;
+                if let Some(binding) = evidence.binding {
+                    legacy_bindings.insert(key, binding);
                 }
-                let commitment = binding.value.source_commitment.clone();
-                if legacy_bindings
-                    .insert(key, binding)
-                    .is_some_and(|existing| existing.value.source_commitment != commitment)
-                {
-                    bail!("retained revisions disagree about a legacy packing binding");
+                if !evidence.attestations.is_empty() {
+                    legacy_attestations.insert(key, evidence.attestations);
                 }
-                commitment
+                if let Some(bytes) = evidence.bytes {
+                    legacy_source_bytes.insert(key, bytes);
+                }
+                evidence.commitment
             };
             if sources
                 .insert(key, (reference.clone(), commitment.clone()))
@@ -12007,7 +12037,13 @@ async fn build_production_packing(
         }
     }
     if let Some(catalog) = previous
-        .map(|previous| advance_unchanged_catalog(previous, &sources, !legacy_bindings.is_empty()))
+        .map(|previous| {
+            advance_unchanged_catalog(
+                previous,
+                &sources,
+                !legacy_bindings.is_empty() || !legacy_attestations.is_empty(),
+            )
+        })
         .transpose()?
         .flatten()
     {
@@ -12020,19 +12056,23 @@ async fn build_production_packing(
     let mut inputs = Vec::new();
     for (&(owner, protected_root, object_id), (reference, source_commitment)) in &sources {
         if legacy_bindings.is_empty()
+            && legacy_attestations.is_empty()
             && previously_authenticated.get(&(owner, protected_root, object_id))
                 == Some(source_commitment)
         {
             continue;
         }
-        let source = if owner == local_id {
-            node_blocking(node.clone(), move |node| {
-                node.sector_for_guild(&guild_id, &object_id)
-            })
-            .await
-        } else {
-            p2p.sector(owner, guild_id, object_id).await
-        };
+        let source =
+            if let Some(bytes) = legacy_source_bytes.get(&(owner, protected_root, object_id)) {
+                Ok(bytes.clone())
+            } else if owner == local_id {
+                node_blocking(node.clone(), move |node| {
+                    node.sector_for_guild(&guild_id, &object_id)
+                })
+                .await
+            } else {
+                p2p.sector(owner, guild_id, object_id).await
+            };
         let bytes = match source {
             Ok(bytes) => bytes,
             Err(source_error) => {
@@ -12074,8 +12114,14 @@ async fn build_production_packing(
         sector_size: V1_SECTOR_SIZE as u32,
         slot_size: 16 * 1024,
     };
-    if let Some(previous) = previous.filter(|catalog| matches!(catalog.format_version, 2..=4)) {
+    if let Some(previous) = previous.filter(|catalog| matches!(catalog.format_version, 2..=5)) {
         let previous = previous.clone();
+        let update_bindings = legacy_bindings.values().cloned().collect::<Vec<_>>();
+        let update_attestations = legacy_attestations
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
         let authenticated_sources = sources
             .into_iter()
             .map(
@@ -12097,8 +12143,10 @@ async fn build_production_packing(
             let sources_attempt = authenticated_sources.clone();
             let inputs_attempt = inputs.clone();
             let distributed_attempt = distributed.clone();
+            let bindings_attempt = update_bindings.clone();
+            let attestations_attempt = update_attestations.clone();
             let result = node_blocking(node.clone(), move |node| {
-                let update = pack_incremental_authenticated(
+                let mut update = pack_incremental_authenticated(
                     profile,
                     &previous_attempt,
                     sources_attempt,
@@ -12119,6 +12167,13 @@ async fn build_production_packing(
                             })
                     },
                 )?;
+                if !bindings_attempt.is_empty() || !attestations_attempt.is_empty() {
+                    update.catalog = attach_production_legacy_evidence(
+                        update.catalog,
+                        bindings_attempt,
+                        attestations_attempt,
+                    )?;
+                }
                 node.store_packing_update(guild_id, &update)?;
                 Ok(ProductionPacking {
                     catalog: update.catalog,
@@ -12140,11 +12195,13 @@ async fn build_production_packing(
         }
     }
     let mut result = pack_incremental(profile, previous, inputs)?;
-    if !legacy_bindings.is_empty() {
-        result.catalog = attach_legacy_packing_bindings(
-            result.catalog,
-            legacy_bindings.into_values().collect(),
-        )?;
+    if !legacy_bindings.is_empty() || !legacy_attestations.is_empty() {
+        let bindings = legacy_bindings.into_values().collect::<Vec<_>>();
+        let attestations = legacy_attestations
+            .into_values()
+            .flatten()
+            .collect::<Vec<_>>();
+        result.catalog = attach_production_legacy_evidence(result.catalog, bindings, attestations)?;
         for sector in &mut result.sectors {
             let descriptor = result
                 .catalog
@@ -12163,6 +12220,289 @@ async fn build_production_packing(
     Ok(ProductionPacking {
         catalog: result.catalog,
     })
+}
+
+struct LegacySourceEvidence {
+    commitment: MerkleCommitment,
+    binding: Option<SignedRecord<LegacyPackingBinding>>,
+    attestations: Vec<SignedRecord<LegacyPackingAttestation>>,
+    bytes: Option<Vec<u8>>,
+}
+
+fn attach_production_legacy_evidence(
+    catalog: PackedCatalog,
+    bindings: Vec<SignedRecord<LegacyPackingBinding>>,
+    attestations: Vec<SignedRecord<LegacyPackingAttestation>>,
+) -> Result<PackedCatalog> {
+    if attestations.is_empty() {
+        attach_legacy_packing_bindings(catalog, bindings).map_err(Into::into)
+    } else {
+        attach_legacy_packing_evidence(catalog, bindings, attestations).map_err(Into::into)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn legacy_source_evidence(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    local_id: NodeId,
+    guild_id: [u8; 32],
+    authority: CheckpointAuthority,
+    members: &[Member],
+    owner: NodeId,
+    protected_root_id: Uuid,
+    reference: &SectorRef,
+    prior_binding: Option<&SignedRecord<LegacyPackingBinding>>,
+    prior_attestations: Option<&[SignedRecord<LegacyPackingAttestation>]>,
+) -> Result<LegacySourceEvidence> {
+    let protected_root = packing_protected_root(protected_root_id);
+    if let Some(binding) = prior_binding {
+        validate_legacy_packing_binding(binding, owner, protected_root, reference)?;
+        return Ok(LegacySourceEvidence {
+            commitment: binding.value.source_commitment.clone(),
+            binding: Some(binding.clone()),
+            attestations: Vec::new(),
+            bytes: None,
+        });
+    }
+
+    let required = authority.quorum.required(members.len())?;
+    let object_id = reference.id;
+    let member_ids = members
+        .iter()
+        .map(|member| member.node_id)
+        .collect::<BTreeSet<_>>();
+    let mut journaled = node_blocking(node.clone(), move |node| {
+        node.legacy_packing_attestations(guild_id, owner, protected_root, object_id)
+    })
+    .await?;
+    journaled.extend(prior_attestations.into_iter().flatten().cloned());
+    if let Some(attestations) = legacy_attestation_quorum(
+        journaled.clone(),
+        guild_id,
+        authority.membership_epoch,
+        owner,
+        protected_root,
+        reference,
+        &member_ids,
+        required,
+    )? {
+        return Ok(LegacySourceEvidence {
+            commitment: attestations[0].value.source_commitment.clone(),
+            binding: None,
+            attestations,
+            bytes: None,
+        });
+    }
+
+    let owner_binding = if owner == local_id {
+        let reference = reference.clone();
+        node_blocking(node.clone(), move |node| {
+            node.sign_legacy_packing_binding(&guild_id, protected_root_id, &reference)
+        })
+        .await
+    } else {
+        p2p.legacy_packing_binding(owner, guild_id, protected_root_id, reference.clone())
+            .await
+    };
+    if let Ok(binding) = owner_binding {
+        validate_legacy_packing_binding(&binding, owner, protected_root, reference)?;
+        return Ok(LegacySourceEvidence {
+            commitment: binding.value.source_commitment.clone(),
+            binding: Some(binding),
+            attestations: Vec::new(),
+            bytes: None,
+        });
+    }
+
+    let direct = if owner == local_id {
+        node_blocking(node.clone(), move |node| {
+            node.sector_for_guild(&guild_id, &object_id)
+        })
+        .await
+    } else {
+        p2p.sector(owner, guild_id, object_id).await
+    };
+    let bytes = match direct {
+        Ok(bytes) => bytes,
+        Err(_) => recover_legacy_source_from_coding(node.clone(), p2p, owner, reference).await?,
+    };
+    if bytes.len() != V1_SECTOR_SIZE || sector_root(&bytes) != reference.root {
+        bail!("recovered legacy source conflicts with its signed revision root");
+    }
+    let value = LegacyPackingAttestation {
+        format_version: 1,
+        guild_id,
+        membership_epoch: authority.membership_epoch,
+        owner,
+        protected_root,
+        object_id: reference.id,
+        flat_root: reference.root,
+        source_commitment: merkle_commit(&bytes)?,
+    };
+    let mut accepted = journaled
+        .into_iter()
+        .filter(|attestation| {
+            attestation.value == value
+                && member_ids.contains(&attestation.signer)
+                && attestation
+                    .verify(LEGACY_PACKING_ATTESTATION_DOMAIN)
+                    .is_ok()
+        })
+        .map(|attestation| (attestation.signer, attestation))
+        .collect::<BTreeMap<_, _>>();
+    for member in members {
+        if accepted.len() >= required || accepted.contains_key(&member.node_id) {
+            continue;
+        }
+        let signed = if member.node_id == local_id {
+            let value = value.clone();
+            let bytes = bytes.clone();
+            node_blocking(node.clone(), move |node| {
+                node.sign_legacy_packing_attestation(value, &bytes)
+            })
+            .await
+        } else {
+            p2p.legacy_packing_attestation(member.node_id, value.clone(), bytes.clone())
+                .await
+        };
+        let Ok(signed) = signed else {
+            continue;
+        };
+        signed.verify(LEGACY_PACKING_ATTESTATION_DOMAIN)?;
+        if signed.signer != member.node_id || signed.value != value {
+            bail!("member returned conflicting legacy packing attestation");
+        }
+        let stored = signed.clone();
+        node_blocking(node.clone(), move |node| {
+            node.store_legacy_packing_attestation(&stored)
+        })
+        .await?;
+        accepted.insert(signed.signer, signed);
+    }
+    if accepted.len() < required {
+        bail!("legacy packing source did not receive checkpoint-policy attestation quorum");
+    }
+    Ok(LegacySourceEvidence {
+        commitment: value.source_commitment,
+        binding: None,
+        attestations: accepted.into_values().collect(),
+        bytes: Some(bytes),
+    })
+}
+
+fn validate_legacy_packing_binding(
+    binding: &SignedRecord<LegacyPackingBinding>,
+    owner: NodeId,
+    protected_root: [u8; 32],
+    reference: &SectorRef,
+) -> Result<()> {
+    binding.verify(LEGACY_PACKING_BINDING_DOMAIN)?;
+    if binding.signer != owner
+        || binding.value.owner != owner
+        || binding.value.protected_root != protected_root
+        || binding.value.object_id != reference.id
+        || binding.value.flat_root != reference.root
+    {
+        bail!("legacy packing binding conflicts with its signed revision");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn legacy_attestation_quorum(
+    candidates: Vec<SignedRecord<LegacyPackingAttestation>>,
+    guild_id: [u8; 32],
+    membership_epoch: u64,
+    owner: NodeId,
+    protected_root: [u8; 32],
+    reference: &SectorRef,
+    members: &BTreeSet<NodeId>,
+    required: usize,
+) -> Result<Option<Vec<SignedRecord<LegacyPackingAttestation>>>> {
+    let mut groups = Vec::<Vec<SignedRecord<LegacyPackingAttestation>>>::new();
+    for candidate in candidates {
+        candidate.verify(LEGACY_PACKING_ATTESTATION_DOMAIN)?;
+        if candidate.value.guild_id != guild_id
+            || candidate.value.membership_epoch != membership_epoch
+            || candidate.value.owner != owner
+            || candidate.value.protected_root != protected_root
+            || candidate.value.object_id != reference.id
+            || candidate.value.flat_root != reference.root
+            || !members.contains(&candidate.signer)
+        {
+            continue;
+        }
+        let group = groups
+            .iter_mut()
+            .find(|group| group[0].value == candidate.value);
+        if let Some(group) = group {
+            if group
+                .iter()
+                .all(|existing| existing.signer != candidate.signer)
+            {
+                group.push(candidate);
+            }
+        } else {
+            groups.push(vec![candidate]);
+        }
+    }
+    Ok(groups.into_iter().find(|group| group.len() >= required))
+}
+
+async fn recover_legacy_source_from_coding(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    owner: NodeId,
+    reference: &SectorRef,
+) -> Result<Vec<u8>> {
+    let object_id = reference.id;
+    let (group, shard_index, roster) = node_blocking(node.clone(), move |node| {
+        let state = node
+            .dynamic_guild_state()?
+            .context("legacy source recovery requires dynamic guild state")?;
+        let (group, shard_index) = state
+            .coding_groups
+            .iter()
+            .filter(|retained| retained.retired_at_event.is_none())
+            .find_map(|retained| {
+                retained
+                    .group
+                    .roles
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, role)| match role {
+                        ShardRoleV2::Information(information)
+                            if !information.sector.virtual_zero
+                                && information.owner == owner
+                                && information.sector.id == object_id =>
+                        {
+                            Some((retained.group.clone(), index))
+                        }
+                        _ => None,
+                    })
+            })
+            .context("legacy source has no active certified coding placement")?;
+        let roster = node
+            .guild_summary()?
+            .context("legacy source recovery requires an installed guild")?
+            .peers;
+        Ok((group, shard_index, roster))
+    })
+    .await?;
+    let bytes = reconstruct_variable_shard_from_peers(
+        node,
+        p2p,
+        &group,
+        shard_index,
+        &roster,
+        &Mutex::new(BTreeSet::new()),
+    )
+    .await?;
+    if bytes.len() != V1_SECTOR_SIZE || sector_root(&bytes) != reference.root {
+        bail!("certified coding reconstructed the wrong legacy source");
+    }
+    Ok(bytes)
 }
 
 async fn load_distributed_packed_sector(
@@ -12479,6 +12819,8 @@ async fn commit_backup_job(
         guild_id,
         &revisions,
         previous_packing_catalog.as_ref(),
+        &checkpoint_members,
+        checkpoint_authority,
     )
     .await?;
     let checkpoint = GuildCheckpoint {
@@ -13071,6 +13413,61 @@ mod tests {
     }
 
     #[test]
+    fn current_member_quorum_attests_a_removed_legacy_owner() {
+        let member_keys = (0_u8..3)
+            .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([index + 210; 32])))
+            .collect::<Vec<_>>();
+        let removed_owner = KeyMaterial::from_seed(&Seed::from_bytes([220; 32])).node_id();
+        let guild_id = [221; 32];
+        let protected_root = [222; 32];
+        let bytes = vec![17; V1_SECTOR_SIZE];
+        let reference = SectorRef {
+            id: [223; 32],
+            root: sector_root(&bytes),
+            logical_len: V1_SECTOR_SIZE as u32,
+        };
+        let value = LegacyPackingAttestation {
+            format_version: 1,
+            guild_id,
+            membership_epoch: 7,
+            owner: removed_owner,
+            protected_root,
+            object_id: reference.id,
+            flat_root: reference.root,
+            source_commitment: merkle_commit(&bytes).unwrap(),
+        };
+        let attestations = member_keys
+            .iter()
+            .map(|keys| {
+                SignedRecord::sign(LEGACY_PACKING_ATTESTATION_DOMAIN, value.clone(), keys).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let members = member_keys
+            .iter()
+            .map(KeyMaterial::node_id)
+            .collect::<BTreeSet<_>>();
+
+        let quorum = legacy_attestation_quorum(
+            attestations,
+            guild_id,
+            7,
+            removed_owner,
+            protected_root,
+            &reference,
+            &members,
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(quorum.len() >= 2);
+        assert!(
+            quorum
+                .iter()
+                .all(|attestation| attestation.signer != removed_owner)
+        );
+    }
+
+    #[test]
     fn unchanged_authenticated_sources_advance_catalog_without_payloads() {
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([199; 32]));
         let bytes = vec![7; V1_SECTOR_SIZE];
@@ -13130,13 +13527,18 @@ mod tests {
         )
         .unwrap();
         let migrated =
-            attach_legacy_packing_bindings(packed.catalog.clone(), vec![binding]).unwrap();
+            attach_legacy_packing_bindings(packed.catalog.clone(), vec![binding.clone()]).unwrap();
         let migrated_next = advance_unchanged_catalog(&migrated, &sources, true)
             .unwrap()
             .unwrap();
         assert_eq!(migrated_next.format_version, 4);
         assert_eq!(migrated_next.parent, Some(migrated.id));
         assert_eq!(migrated_next.legacy_bindings, migrated.legacy_bindings);
+        let reattached =
+            attach_production_legacy_evidence(packed.catalog.clone(), vec![binding], Vec::new())
+                .unwrap();
+        assert_eq!(reattached.format_version, 4);
+        assert!(reattached.legacy_bindings.is_some());
         assert!(
             advance_unchanged_catalog(&migrated, &sources, false)
                 .unwrap()
