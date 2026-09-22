@@ -1206,8 +1206,9 @@ and correction gates are in `TODO.md`:
 - **M5-75:** Version-5 evidence disables metadata-only advancement and
   per-source/descriptor reuse, turning small migration-window updates into
   full-corpus work.
-- **M5-76:** Replenishable inbound relay work is returned before reservation
-  expiry is polled, allowing an expired reservation to retain capacity.
+- **M5-76 (resolved):** The relay handler polls reservation expiry before every
+  replenishable source of work; the focused priority regression, complete
+  vendored relay crate tests, and warning-free all-target relay Clippy pass.
 
 The review ran no builds, tests, daemons, runtime probes, or remote compilation.
 M5-67 remains evidence only for its exact historical tree and does not close
@@ -1655,9 +1656,10 @@ the full provisioned filesystem/network acceptance script. A later source-only
 review found M5-46 through M5-57; their corrections and focused regressions are
 implemented. Fresh source review found M5-58 through M5-66 in that correction
 series. M5-58 through M5-66 are corrected, and source-only review finds no
-remaining Milestone 5 blocker. The final M5-67 local workspace/provisioned gate
-passed on 2026-09-22. Fresh source-only review then found M5-68 through M5-76;
-Milestone 5 is reopened, and Milestone 6 waits for their correction and a new
+remaining blocker in that correction series. The final M5-67 local
+workspace/provisioned gate passed on 2026-09-22. Fresh source-only review then
+found M5-68 through M5-76. M5-76 is corrected; Milestone 5 remains open on
+M5-68 through M5-75, and Milestone 6 waits for their correction and a new
 closure gate.
 
 - Replace deterministic fillers with cross-user sector packing and fair

@@ -1736,16 +1736,16 @@ node Clippy gate passed locally. No remote compilation server was used.
   one-source change, epoch refresh, and final retirement while asserting actual
   reads, transfers, peak memory, and durable bytes.
 
-- [ ] **M5-76 / P1 — Let relay reservation expiry preempt replenishable inbound work.**
-  The handler returns every ready inbound reservation or circuit request before
-  polling the active reservation timer
-  (`vendor/libp2p-relay/src/behaviour/handler.rs:713`, `:887`). A reservation
-  holder can keep an inbound worker ready on every poll, so an expired timer is
-  never reported and the behaviour never releases reservation capacity
-  (`vendor/libp2p-relay/src/behaviour.rs:609`). Poll expiry ahead of attacker-
-  replenishable work or enforce a fair event budget. Gate sustained parsed
-  ingress across the reservation deadline and prove timely expiry, capacity
-  release, and continued bounded response progress.
+- [x] **M5-76 / P1 — Let relay reservation expiry preempt replenishable inbound work.**
+  The handler now polls the active reservation timer before queued events,
+  response futures, inbound workers, circuits, and outbound work. Once the
+  deadline is ready, it clears the handler reservation and reports
+  `ReservationTimedOut` immediately, allowing the behaviour to release shared
+  capacity even while a peer keeps work ready on every poll. The focused
+  regression places another ready handler event behind an expired reservation
+  and proves expiry wins without discarding the queued work. The complete
+  vendored relay crate tests (19 unit, seven integration, two doc tests) and
+  warning-free all-target relay Clippy pass locally.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

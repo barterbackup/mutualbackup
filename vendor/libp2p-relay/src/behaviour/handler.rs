@@ -672,6 +672,20 @@ impl ConnectionHandler for Handler {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<ConnectionHandlerEvent<Self::OutboundProtocol, (), Self::ToBehaviour>> {
+        // Reservation expiry releases shared relay capacity and must preempt
+        // every replenishable source of handler work. In particular, a peer
+        // can keep inbound protocol workers ready on every poll.
+        if let Some(Poll::Ready(())) = self
+            .active_reservation
+            .as_mut()
+            .map(|fut| fut.poll_unpin(cx))
+        {
+            self.active_reservation = None;
+            return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
+                Event::ReservationTimedOut {},
+            ));
+        }
+
         // Return queued events.
         if let Some(event) = self.queued_events.pop_front() {
             return Poll::Ready(event);
@@ -884,18 +898,6 @@ impl ConnectionHandler for Handler {
             }
         }
 
-        // Check active reservation.
-        if let Some(Poll::Ready(())) = self
-            .active_reservation
-            .as_mut()
-            .map(|fut| fut.poll_unpin(cx))
-        {
-            self.active_reservation = None;
-            return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
-                Event::ReservationTimedOut {},
-            ));
-        }
-
         // Check keep alive status.
         if self.active_reservation.is_none() {
             if self.idle_at.is_none() {
@@ -973,13 +975,20 @@ impl PendingConnect {
 
 #[cfg(test)]
 mod tests {
-    use std::task::{Context, Poll};
+    use std::{
+        task::{Context, Poll},
+        thread,
+        time::Duration,
+    };
 
     use futures::{future, task::noop_waker_ref, FutureExt, StreamExt};
+    use futures_timer::Delay;
+    use libp2p_core::{ConnectedPoint, Multiaddr};
+    use libp2p_swarm::{ConnectionHandler, ConnectionHandlerEvent};
 
     use super::{
-        push_reservation_response, ReservationRequestFuture, ReservationRequestResult,
-        MAX_PENDING_RESERVATION_RESPONSES,
+        push_reservation_response, Config, Event, Handler, ReservationRequestFuture,
+        ReservationRequestResult, MAX_PENDING_RESERVATION_RESPONSES,
     };
 
     fn stalled_response() -> ReservationRequestFuture {
@@ -1011,5 +1020,37 @@ mod tests {
                 accepting: false
             }))
         ));
+    }
+
+    #[test]
+    fn expired_reservation_preempts_replenishable_handler_work() {
+        let mut handler = Handler::new(
+            Config {
+                reservation_duration: Duration::from_secs(60),
+                max_circuit_duration: Duration::from_secs(60),
+                max_circuit_bytes: 1_024,
+            },
+            ConnectedPoint::Listener {
+                local_addr: Multiaddr::empty(),
+                send_back_addr: Multiaddr::empty(),
+            },
+        );
+        handler.active_reservation = Some(Delay::new(Duration::from_millis(1)));
+        handler
+            .queued_events
+            .push_back(ConnectionHandlerEvent::NotifyBehaviour(
+                Event::ReservationReqResponseAborted { accepting: false },
+            ));
+        thread::sleep(Duration::from_millis(5));
+
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(matches!(
+            ConnectionHandler::poll(&mut handler, &mut cx),
+            Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
+                Event::ReservationTimedOut {}
+            ))
+        ));
+        assert_eq!(handler.queued_events.len(), 1);
+        assert!(handler.active_reservation.is_none());
     }
 }
