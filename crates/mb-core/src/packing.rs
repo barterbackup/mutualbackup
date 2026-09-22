@@ -1207,7 +1207,7 @@ where
             }
             slots.push(slot);
         }
-        if previous.format_version == 3
+        if matches!(previous.format_version, 3..=5)
             && let Some(prior) = previous.sectors.get(sector_index)
             && prior.slots == slots
         {
@@ -1678,6 +1678,7 @@ mod tests {
             .iter()
             .map(|sector| (sector.descriptor.id, sector.bytes.clone()))
             .collect::<std::collections::BTreeMap<_, _>>();
+        let mut reads = 0;
         let retired = pack_incremental_authenticated(
             profile(),
             &catalog,
@@ -1691,10 +1692,11 @@ mod tests {
                 owner,
                 protected_root,
                 object_id,
-                source_commitment: Some(source_commitment),
-                bytes,
+                source_commitment: Some(source_commitment.clone()),
+                bytes: bytes.clone(),
             }],
             |descriptor| {
+                reads += 1;
                 prior_bytes
                     .get(&descriptor.id)
                     .cloned()
@@ -1705,6 +1707,47 @@ mod tests {
         assert_eq!(retired.catalog.format_version, 3);
         assert_eq!(retired.catalog.parent, Some(catalog.id));
         assert!(retired.catalog.legacy_bindings.is_none());
+        assert_eq!(reads, 0);
+        assert!(retired.changed_sectors.is_empty());
+
+        let attestation = SignedRecord::sign(
+            LEGACY_PACKING_ATTESTATION_DOMAIN,
+            LegacyPackingAttestation {
+                format_version: 1,
+                guild_id: [9; 32],
+                membership_epoch: 2,
+                owner,
+                protected_root,
+                object_id,
+                flat_root: *blake3::hash(&bytes).as_bytes(),
+                source_commitment: source_commitment.clone(),
+            },
+            &keys,
+        )
+        .unwrap();
+        let attested =
+            attach_legacy_packing_evidence(retired.catalog.clone(), Vec::new(), vec![attestation])
+                .unwrap();
+        let mut attested_reads = 0;
+        let unchanged = pack_incremental_authenticated(
+            profile(),
+            &attested,
+            vec![AuthenticatedPackingSource {
+                owner,
+                protected_root,
+                object_id,
+                source_commitment,
+            }],
+            Vec::new(),
+            |_| {
+                attested_reads += 1;
+                Err(PackingError::MissingObject)
+            },
+        )
+        .unwrap();
+        assert_eq!(attested_reads, 0);
+        assert!(unchanged.changed_sectors.is_empty());
+        assert_eq!(unchanged.catalog.sectors, attested.sectors);
 
         let mut tampered = catalog;
         tampered.legacy_bindings.as_mut().unwrap()[0]

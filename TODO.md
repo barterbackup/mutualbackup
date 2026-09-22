@@ -588,9 +588,10 @@ blockers are now corrected, and the follow-up source-only review finds no
 remaining Milestone 5 blocker. The final M5-67 local workspace/provisioned gate
 passed on 2026-09-22 and remains historical evidence for that exact tree. A
 fresh source-only review of `81ec33b..b65c79a` on 2026-09-22 found M5-68 through
-M5-76 below and reopened Milestone 5. Milestone 6 waits for those corrections
-and a new closure gate. The fresh review ran no builds, tests, daemons, runtime
-probes, or remote compilation.
+M5-76 below and reopened Milestone 5. Those source blockers are corrected. A
+follow-up source-only review found no remaining implementation blocker, but
+Milestone 5 remains open on the new M5-77 closure gate. Milestone 6 waits for
+that gate. The follow-up review used no remote compilation.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -1679,44 +1680,36 @@ node Clippy gate passed locally. No remote compilation server was used.
   regression injects an uncommitted certificate into the old namespace and
   proves finalization refuses to acknowledge it.
 
-- [ ] **M5-73 / P1 — Refresh legacy evidence from the authenticated packed copy.**
-  Version-5 attestations are membership-epoch bound. After the first packed
-  checkpoint, lifecycle uses only packed descriptor IDs as live sectors
-  (`crates/mb-node/src/network/p2p.rs:7397`) and may retire the original source
-  group. A later membership or quorum event changes the epoch, so prior evidence
-  is rejected (`p2p.rs:12269`); refresh then tries the offline owner and an active
-  original-source group only (`:12298`, `:12453`) even though the previous
-  authenticated catalog remains recoverable through `:12567`. Recover and
-  verify the legacy bytes from that packed catalog before requesting current
-  attestations. Gate an offline or removed owner, v5 publication, original-group
-  retirement, epoch change, restart, and successful next checkpoint from any
-  valid packed `k` shards.
+- [x] **M5-73 / P1 — Refresh legacy evidence from the authenticated packed copy.**
+  When direct owner access fails, evidence refresh now recovers the source from
+  the previous authenticated catalog before falling back to an original-source
+  coding placement. Packed descriptors are checked against their commitments,
+  unpacking authenticates the requested source chunks, and the reconstructed
+  sector is checked against both the signed flat root and derived source Merkle
+  commitment before current members attest it. Thus an offline or removed
+  legacy owner and a retired original group do not prevent a later
+  membership-epoch refresh after restart while any valid packed `k` remains.
 
-- [ ] **M5-74 / P1 — Try every certified replacement placement during recovery.**
-  Both original-source and packed-sector recovery select the first matching
-  active coding group with `find_map` and try no alternative
-  (`crates/mb-node/src/network/p2p.rs:12464`, `:12515`). Membership repair
-  intentionally overlaps a stale placement with its replacement before
-  retirement (`p2p.rs:7434`, `:7572`), while group order is hash-derived. If the
-  stale group sorts first and lacks `k` reachable holders, recovery fails even
-  when the replacement has a valid `k`. Iterate bounded matching certified
-  placements, prefer current geometry, and accept the first commitment-valid
-  reconstruction. Gate both legacy-source and packed-sector reads with the
-  unavailable stale group ordered first.
+- [x] **M5-74 / P1 — Try every certified replacement placement during recovery.**
+  Original-source and packed-sector recovery now collect every matching active
+  certified group, sort current-geometry placements ahead of stale overlap,
+  and try the bounded candidates in deterministic group order. A failed or
+  commitment-conflicting reconstruction advances to the next placement; only
+  a source-root-valid or packed-descriptor-valid reconstruction is accepted.
+  Placement coverage verifies that a current replacement is preferred while
+  the stale group remains available as a fallback candidate.
 
-- [ ] **M5-75 / P2 — Preserve incremental packing bounds through v4/v5 migration.**
-  A v5 catalog cannot take the metadata-only unchanged path
-  (`crates/mb-node/src/network/p2p.rs:12626`), any legacy evidence disables the
-  authenticated per-source skip (`p2p.rs:12052`), and core reuses an identical
-  descriptor without loading bytes only for an exact v3 predecessor
-  (`crates/mb-core/src/packing.rs:1210`). Consequently one retained attested
-  source turns unchanged backups, small updates, and final evidence retirement
-  into full-corpus reads, materialization, and writes, violating M5-43/M5-44.
-  Preserve valid v5 evidence on metadata-only advances, skip unchanged
-  authenticated inputs independently per source, and reuse identical v3-v5
-  descriptors. Gate a large mixed modern/legacy corpus with no-change,
-  one-source change, epoch refresh, and final retirement while asserting actual
-  reads, transfers, peak memory, and durable bytes.
+- [x] **M5-75 / P2 — Preserve incremental packing bounds through v4/v5 migration.**
+  Metadata-only advancement now accepts v3-v5 predecessors and carries the
+  exact current bindings or attestations, including refreshed epoch evidence
+  and final evidence retirement. Each unchanged authenticated source is
+  omitted independently from payload inputs, and core reuses identical v3-v5
+  descriptors without loading their packed bytes. Evidence refresh retains a
+  recovered legacy payload only when its authenticated commitment actually
+  needs repacking, keeping unchanged large mixed catalogs bounded to the
+  current source rather than the full corpus. No-change writes no packed
+  sectors; one-source changes and final retirement touch only descriptors whose
+  slot layout changes.
 
 - [x] **M5-76 / P1 — Let relay reservation expiry preempt replenishable inbound work.**
   The handler now polls the active reservation timer before queued events,
@@ -1728,6 +1721,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   and proves expiry wins without discarding the queued work. The complete
   vendored relay crate tests (19 unit, seven integration, two doc tests) and
   warning-free all-target relay Clippy pass locally.
+
+- [ ] **M5-77 / gate — Recheck the corrected tree before closing Milestone 5.**
+  Run formatting, locked all-target workspace tests, warning-free locked
+  all-target workspace Clippy, Docker lab safety, and the complete provisioned
+  `scripts/reflink-acceptance.sh` suite on a fresh disposable Btrfs image. The
+  provisioned gate must cover the five-node recovery and five-daemon
+  namespace/NAT/DHT paths after the M5-68 through M5-76 corrections. Build and
+  run everything locally; no remote compilation server may be used.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
