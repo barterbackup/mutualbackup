@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (passed)
+## Milestone 5 guild geometry and coding protocol (reopened)
 
 Source-only review of `8135e0b..da8974a` on 2026-09-18 found the M5-36 through
 M5-44 blockers below; all are now corrected. The production gate recorded in
@@ -586,10 +586,11 @@ corrections are recorded under those items, but a fresh source-only review of
 `f7d0503..81ec33b` on 2026-09-21 found M5-58 through M5-66. Those source
 blockers are now corrected, and the follow-up source-only review finds no
 remaining Milestone 5 blocker. The final M5-67 local workspace/provisioned gate
-passed on 2026-09-22, so Milestone 5 is closed and Milestone 6 is next. The
-original review ran no builds, tests, daemons, runtime probes, or remote
-compilation; all later correction and closure work ran locally without a remote
-compilation server.
+passed on 2026-09-22 and remains historical evidence for that exact tree. A
+fresh source-only review of `81ec33b..b65c79a` on 2026-09-22 found M5-68 through
+M5-76 below and reopened Milestone 5. Milestone 6 waits for those corrections
+and a new closure gate. The fresh review ran no builds, tests, daemons, runtime
+probes, or remote compilation.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -1634,6 +1635,117 @@ node Clippy gate passed locally. No remote compilation server was used.
   multi-owner QUIC backups, and five-daemon namespace/NAT/DHT recovery. The
   disposable filesystem was unmounted and removed afterward. All compilation
   and execution were local; no remote compilation server was used.
+
+- [ ] **M5-68 / P1 — Keep revoked historical authority out of the current checkpoint head.**
+  `store_checkpoint` now always permits historical authority
+  (`crates/mb-node/src/node.rs:5944`), and `validate_local_member` enforces the
+  current authority only when its flag is true (`node.rs:6483`, `:6507`). Both
+  ordinary finalization and catch-up use that shared store. After a membership
+  or quorum change, the revoked old quorum can therefore sign an exact-parent
+  next checkpoint and have it adopted as the durable current head. Restrict
+  historical authority to intermediate catch-up links and require the final
+  target and ordinary finalization to use current authority. Gate an A-to-B
+  authority transition with a valid intermediate A checkpoint, a late or newly
+  signed A successor, and a valid B head; install the intermediate, reject the
+  A successor as a head, and converge on B across restart.
+
+- [ ] **M5-69 / P1 — Validate historical checkpoint contents against their recorded epoch.**
+  Peer exchange installs guild events before checkpoint links
+  (`crates/mb-node/src/network/p2p.rs:7097`), but checkpoint coverage still
+  consults the newest dynamic state (`crates/mb-node/src/node.rs:6013`). A
+  revision first introduced by an intermediate checkpoint is rejected after
+  its writer epoch rotates (`node.rs:6043`), and a historical group fails once
+  the current state retires or forgets it (`node.rs:6102`). Replay the authority,
+  writer-key, and group history applicable to each link instead of validating
+  historical contents against the newest state. Gate event-first catch-up over
+  writer rotation plus group retirement/forgetting, including restart between
+  intermediate installations.
+
+- [ ] **M5-70 / P1 — Reject or abandon poisoned checkpoint catch-up candidates.**
+  Candidate staging checks only a certificate's self-contained roster quorum,
+  cursor, and hash before persisting it (`crates/mb-node/src/node.rs:6317`). It
+  does not bind the candidate to the installed genesis or recorded authority.
+  When later installation rejects such a chain, ready state is retried forever
+  (`crates/mb-node/src/network/p2p.rs:7232`) and lower valid candidates are never
+  reconsidered. Treat advertised heads as untrusted hints: validate the target
+  against local guild history before selection, durably bound the candidate to
+  its source/evidence, and clear or quarantine a failed candidate and its staged
+  records under a bounded retry policy. Gate one current peer advertising a
+  higher fake-roster exact-parent chain beside a lower valid head, before and
+  after restart.
+
+- [ ] **M5-71 / P1 — Bound total checkpoint staging while advancing the durable head.**
+  Catch-up becomes installable only after the backward cursor reaches its
+  original base (`crates/mb-node/src/node.rs:6358`, `:6393`). A gap of `N`
+  therefore stores all `N` certificates before committing `G+1`; the 1,024-step
+  loop limit (`crates/mb-node/src/network/p2p.rs:7239`) bounds one pass but not
+  total disk, network, or time to first progress. Use bounded rolling segments
+  or another authenticated paging design that advances the head without
+  retaining the whole gap, and bound abandoned staging. Gate a gap well beyond
+  one page, crash after every page, fixed staging occupancy, and monotonic head
+  progress on each successful pass.
+
+- [ ] **M5-72 / P1 — Separate uncommitted catch-up certificates from finalized checkpoints.**
+  Catch-up writes certificates into the normal `guild-checkpoint` namespace
+  before installation (`crates/mb-node/src/node.rs:6365`). Concurrent ordinary
+  finalization treats any decodable certificate found there as already
+  finalized and returns success without advancing the head or signature lock
+  (`node.rs:6275`); the coordinator counts that acknowledgement as a durable
+  holder (`crates/mb-node/src/network/p2p.rs:12991`). Give catch-up staging a
+  separate namespace/state and acknowledge finalization only after the exact
+  head and lock commit. Gate a race where peer exchange stages the same
+  certificate immediately before coordinator finalization, including restart
+  at both boundaries.
+
+- [ ] **M5-73 / P1 — Refresh legacy evidence from the authenticated packed copy.**
+  Version-5 attestations are membership-epoch bound. After the first packed
+  checkpoint, lifecycle uses only packed descriptor IDs as live sectors
+  (`crates/mb-node/src/network/p2p.rs:7397`) and may retire the original source
+  group. A later membership or quorum event changes the epoch, so prior evidence
+  is rejected (`p2p.rs:12269`); refresh then tries the offline owner and an active
+  original-source group only (`:12298`, `:12453`) even though the previous
+  authenticated catalog remains recoverable through `:12567`. Recover and
+  verify the legacy bytes from that packed catalog before requesting current
+  attestations. Gate an offline or removed owner, v5 publication, original-group
+  retirement, epoch change, restart, and successful next checkpoint from any
+  valid packed `k` shards.
+
+- [ ] **M5-74 / P1 — Try every certified replacement placement during recovery.**
+  Both original-source and packed-sector recovery select the first matching
+  active coding group with `find_map` and try no alternative
+  (`crates/mb-node/src/network/p2p.rs:12464`, `:12515`). Membership repair
+  intentionally overlaps a stale placement with its replacement before
+  retirement (`p2p.rs:7434`, `:7572`), while group order is hash-derived. If the
+  stale group sorts first and lacks `k` reachable holders, recovery fails even
+  when the replacement has a valid `k`. Iterate bounded matching certified
+  placements, prefer current geometry, and accept the first commitment-valid
+  reconstruction. Gate both legacy-source and packed-sector reads with the
+  unavailable stale group ordered first.
+
+- [ ] **M5-75 / P2 — Preserve incremental packing bounds through v4/v5 migration.**
+  A v5 catalog cannot take the metadata-only unchanged path
+  (`crates/mb-node/src/network/p2p.rs:12626`), any legacy evidence disables the
+  authenticated per-source skip (`p2p.rs:12052`), and core reuses an identical
+  descriptor without loading bytes only for an exact v3 predecessor
+  (`crates/mb-core/src/packing.rs:1210`). Consequently one retained attested
+  source turns unchanged backups, small updates, and final evidence retirement
+  into full-corpus reads, materialization, and writes, violating M5-43/M5-44.
+  Preserve valid v5 evidence on metadata-only advances, skip unchanged
+  authenticated inputs independently per source, and reuse identical v3-v5
+  descriptors. Gate a large mixed modern/legacy corpus with no-change,
+  one-source change, epoch refresh, and final retirement while asserting actual
+  reads, transfers, peak memory, and durable bytes.
+
+- [ ] **M5-76 / P1 — Let relay reservation expiry preempt replenishable inbound work.**
+  The handler returns every ready inbound reservation or circuit request before
+  polling the active reservation timer
+  (`vendor/libp2p-relay/src/behaviour/handler.rs:713`, `:887`). A reservation
+  holder can keep an inbound worker ready on every poll, so an expired timer is
+  never reported and the behaviour never releases reservation capacity
+  (`vendor/libp2p-relay/src/behaviour.rs:609`). Poll expiry ahead of attacker-
+  replenishable work or enforce a fair event budget. Gate sustained parsed
+  ingress across the reservation deadline and prove timely expiry, capacity
+  release, and continued bounded response progress.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
