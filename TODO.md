@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (reopened)
+## Milestone 5 guild geometry and coding protocol (passed)
 
 Source-only review of `8135e0b..da8974a` on 2026-09-18 found the M5-36 through
 M5-44 blockers below; all are now corrected. The production gate recorded in
@@ -589,9 +589,10 @@ remaining Milestone 5 blocker. The final M5-67 local workspace/provisioned gate
 passed on 2026-09-22 and remains historical evidence for that exact tree. A
 fresh source-only review of `81ec33b..b65c79a` on 2026-09-22 found M5-68 through
 M5-76 below and reopened Milestone 5. Those source blockers are corrected. A
-follow-up source-only review found no remaining implementation blocker, but
-Milestone 5 remains open on the new M5-77 closure gate. Milestone 6 waits for
-that gate. The follow-up review used no remote compilation.
+follow-up source-only review found no remaining implementation blocker. The
+complete M5-77 local workspace/provisioned closure gate passed on 2026-09-22,
+so Milestone 5 is closed and Milestone 6 is next. No remote compilation server
+was used.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -1722,13 +1723,19 @@ node Clippy gate passed locally. No remote compilation server was used.
   vendored relay crate tests (19 unit, seven integration, two doc tests) and
   warning-free all-target relay Clippy pass locally.
 
-- [ ] **M5-77 / gate — Recheck the corrected tree before closing Milestone 5.**
-  Run formatting, locked all-target workspace tests, warning-free locked
-  all-target workspace Clippy, Docker lab safety, and the complete provisioned
-  `scripts/reflink-acceptance.sh` suite on a fresh disposable Btrfs image. The
-  provisioned gate must cover the five-node recovery and five-daemon
-  namespace/NAT/DHT paths after the M5-68 through M5-76 corrections. Build and
-  run everything locally; no remote compilation server may be used.
+- [x] **M5-77 / gate — Recheck the corrected tree before closing Milestone 5.**
+  On 2026-09-22 the corrected tree passed `cargo fmt --all -- --check`,
+  `cargo test --locked --workspace --all-targets`, warning-free
+  `cargo clippy --locked --workspace --all-targets -- -D warnings`, and
+  `scripts/docker-lab-safety-test.sh`. A fresh disposable local 2 GiB Btrfs
+  image mounted with `user_subvol_rm_allowed` passed the complete
+  `scripts/reflink-acceptance.sh` suite: all 12 anchor/reflink cases, all seven
+  node interruption/recovery/headroom cases, five-node seed recovery, signed
+  network commit and recovery, repeated multi-owner QUIC backups, and the real
+  five-daemon namespace/NAT/DHT recovery path. The five-daemon scenario passed
+  in 1,359.10 seconds; the disposable filesystem was unmounted and removed.
+  All compilation and execution were local; no remote compilation server was
+  used. Milestone 5 is closed.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
