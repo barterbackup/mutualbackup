@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (reopened)
+## Milestone 5 guild geometry and coding protocol (passed)
 
 Source-only review of `8135e0b..da8974a` on 2026-09-18 found the M5-36 through
 M5-44 blockers below; all are now corrected. The production gate recorded in
@@ -585,11 +585,11 @@ it remains historical evidence for that tree. Follow-up source-only review of
 corrections are recorded under those items, but a fresh source-only review of
 `f7d0503..81ec33b` on 2026-09-21 found M5-58 through M5-66. Those source
 blockers are now corrected, and the follow-up source-only review finds no
-remaining Milestone 5 blocker. Milestone 5 remains open only for its final
-local closure gate, so Milestone 6 still waits. The original review ran no
-builds, tests, daemons, runtime probes, or remote compilation; the correction
-work used local focused tests, the complete core and node library suites, and
-strict core/node/relay Clippy.
+remaining Milestone 5 blocker. The final M5-67 local workspace/provisioned gate
+passed on 2026-09-22, so Milestone 5 is closed and Milestone 6 is next. The
+original review ran no builds, tests, daemons, runtime probes, or remote
+compilation; all later correction and closure work ran locally without a remote
+compilation server.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -1621,6 +1621,19 @@ node Clippy gate passed locally. No remote compilation server was used.
   final convergence without an intermediate-head peer. The complete node
   library suite (227 passed, 10 provisioned tests ignored) and strict all-target
   node Clippy pass locally.
+
+- [x] **M5-67 / gate — Recheck the final corrected tree before closing Milestone 5.**
+  The final source review found no blocker after M5-58 through M5-66. On
+  2026-09-22 the exact corrected tree passed `cargo fmt --all -- --check`,
+  `cargo test --locked --workspace --all-targets`, warning-free
+  `cargo clippy --locked --workspace --all-targets -- -D warnings`, and
+  `scripts/docker-lab-safety-test.sh`. A fresh disposable local 2 GiB Btrfs
+  image passed the complete `scripts/reflink-acceptance.sh` gate: all 12
+  anchor/reflink cases, all seven node interruption/recovery/headroom cases,
+  five-node seed recovery, signed network commit and recovery, repeated
+  multi-owner QUIC backups, and five-daemon namespace/NAT/DHT recovery. The
+  disposable filesystem was unmounted and removed afterward. All compilation
+  and execution were local; no remote compilation server was used.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

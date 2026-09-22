@@ -90,8 +90,8 @@ correction gate passed on 2026-09-19. Follow-up source-only review of
 `56bb57d..f7d0503` on 2026-09-20 found M5-46 through M5-57, so Milestone 5 was
 reopened. Those corrections are implemented, but source-only review of
 `f7d0503..81ec33b` on 2026-09-21 found M5-58 through M5-66. M5-58 through M5-66
-are corrected. The source correction gate is clear;
-Milestone 6 waits for the requested final closure gate.
+are corrected. The complete local workspace and provisioned closure gate passed
+on 2026-09-22. Milestone 5 is closed, and Milestone 6 is next.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -498,12 +498,11 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 4 have passed. Milestone 5's
-M5-46 through M5-57 corrections are implemented after its historical M5-45
-gate, but source review found M5-58 through M5-66 and reopened correction work.
-Checkpoint adoption, resumable historical catch-up, per-root scheduling, final
-legacy retirement, durable offline-owner migration, migration-window any-`k`
-recovery, and bounded fair relay responses are corrected. Later wire or
+than a daemon prerequisite. Milestones 0 through 5 have passed. Milestone 5's
+final corrections cover checkpoint adoption, resumable historical catch-up,
+per-root scheduling, final legacy retirement, durable offline-owner migration,
+migration-window any-`k` recovery, and bounded fair relay responses. The
+complete local closure gate passed on 2026-09-22. Later wire or
 durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
@@ -719,12 +718,10 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 4 are passed. The M5-36 through
-M5-44 corrections and M5-45 gate remain historical evidence. The M5-46 through
-M5-57 findings from the 2026-09-20 source review are implemented. Fresh
-source-only review of that correction series found M5-58 through M5-66.
-M5-58 through M5-66 are corrected. Source-only review finds no remaining
-Milestone 5 blocker; Milestone 6 waits for the final closure gate.
+**Current position:** Milestones 0 through 5 are passed. The M5-36 through
+M5-66 correction history and M5-45 gate remain historical evidence. Source-only
+review finds no remaining Milestone 5 blocker, and the final complete local
+workspace/provisioned gate passed on 2026-09-22. Milestone 6 is next.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1129,12 +1126,11 @@ Milestone 5. Exact source locations and correction gates are in `TODO.md`:
   admissions cannot receive circuits, and pending renewals retain their bounded
   capacity claim across expiry until acceptance settles.
 
-The fresh local correction tree passes `cargo fmt --all -- --check`, locked
-all-target workspace tests, and warning-free locked all-target workspace
-Clippy. The provisioned Btrfs/network acceptance gate has not been rerun after
-M5-46 through M5-57, so the formal milestone closure remains pending that
-runtime evidence. All compilation and execution was local; no remote
-compilation server was used.
+At that correction stage, the fresh local tree passed `cargo fmt --all --
+--check`, locked all-target workspace tests, and warning-free locked all-target
+workspace Clippy. The provisioned Btrfs/network acceptance gate had not yet
+been rerun after M5-46 through M5-57, so later review and correction continued.
+All compilation and execution was local; no remote compilation server was used.
 
 Fresh source-only review of `f7d0503..81ec33b` on 2026-09-21 found that the
 correction series does not yet close Milestone 5. Exact source locations,
@@ -1173,6 +1169,15 @@ M5-53's version-2/3 any-`k` loader, M5-54 root binding, or M5-55/M5-56 placement
 planning. It ran no builds, tests, daemons, runtime probes, or remote
 compilation. The earlier local gate results remain historical evidence for
 their exact trees and do not close these source blockers.
+
+After correcting M5-58 through M5-66, the final M5-67 gate passed locally on
+2026-09-22: formatting, locked workspace all-target tests, warning-free locked
+workspace all-target Clippy, Docker lab safety, and the complete provisioned
+`scripts/reflink-acceptance.sh` suite on a fresh disposable 2 GiB Btrfs image.
+The provisioned run passed all anchor/reflink and node interruption/headroom
+cases, five-node seed recovery, signed network recovery, repeated multi-owner
+QUIC backup, and five-daemon namespace/NAT/DHT recovery. No remote compilation
+server was used. This closes Milestone 5.
 
 The M5-42 rejected-connection cleanup was source-reviewed and found to remove
 only the rejected connection while preserving accepted siblings. This review
@@ -1607,7 +1612,7 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (reopened)
+### Milestone 5 — efficient and flexible data/guild protocol (passed)
 
 M5-36 through M5-44 are implemented, and the complete M5-45 correction gate
 passed locally on 2026-09-19. The final committed tree passed formatting,
@@ -1616,8 +1621,8 @@ the full provisioned filesystem/network acceptance script. A later source-only
 review found M5-46 through M5-57; their corrections and focused regressions are
 implemented. Fresh source review found M5-58 through M5-66 in that correction
 series. M5-58 through M5-66 are corrected, and source-only review finds no
-remaining Milestone 5 blocker. Formal completion still requires the final local
-workspace/provisioned gate before Milestone 6 begins.
+remaining Milestone 5 blocker. The final M5-67 local workspace/provisioned gate
+passed on 2026-09-22, so Milestone 5 is closed and Milestone 6 is next.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and
