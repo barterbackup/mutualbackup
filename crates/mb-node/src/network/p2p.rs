@@ -53,10 +53,9 @@ use mb_store::{ParityObject, VariableParityObject};
 use uuid::Uuid;
 
 use crate::node::{
-    CheckpointCatchupState, CheckpointRecoveryObservation, CodingRetryJob, DelegatedCodingJob,
-    DelegatedCodingJobState, DhtRecordObservation, GuildPhase, SnapshotInfo,
-    VerifiedCodingTranscript, checkpoint_matches_dynamic_authority,
-    variable_group_protects_checkpoint,
+    CheckpointRecoveryObservation, CodingRetryJob, DelegatedCodingJob, DelegatedCodingJobState,
+    DhtRecordObservation, GuildPhase, SnapshotInfo, VerifiedCodingTranscript,
+    checkpoint_matches_dynamic_authority, variable_group_protects_checkpoint,
 };
 
 #[cfg(test)]
@@ -2952,6 +2951,30 @@ impl P2pClient {
             bail!("peer returned the wrong checkpoint-head response");
         };
         Ok(head)
+    }
+
+    async fn checkpoint_at_generation(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        generation: u64,
+    ) -> Result<Option<crate::network::wire::CheckpointHead>> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::GetCheckpointAtGeneration {
+                    guild_id,
+                    generation,
+                },
+            )
+            .await?;
+        let PeerResponse::CheckpointHead(checkpoint) = response else {
+            bail!("peer returned the wrong checkpoint-generation response");
+        };
+        if checkpoint.is_some_and(|checkpoint| checkpoint.generation != generation) {
+            bail!("peer returned the wrong checkpoint generation");
+        }
+        Ok(checkpoint)
     }
 
     async fn legacy_packing_binding(
@@ -7120,11 +7143,12 @@ async fn sync_checkpoint_head_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> R
         let guild = node
             .guild_summary()?
             .context("checkpoint synchronization requires an installed guild")?;
+        let catchup = node.resume_checkpoint_catchup(&guild.guild_id)?;
         Ok((
             guild.clone(),
             node.checkpoint_head(&guild.guild_id)?,
             node.keys().node_id(),
-            node.checkpoint_catchup_state(&guild.guild_id)?,
+            catchup,
         ))
     })
     .await?;
@@ -7147,23 +7171,13 @@ async fn sync_checkpoint_head_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> R
         .filter(|peer| *peer != local_id)
         .collect::<Vec<_>>();
     let local_generation = local_head.map(|(generation, _)| generation).unwrap_or(0);
-    let local_hash = local_head.map(|(_, hash)| hash).unwrap_or([0; 32]);
-    let mut fetched = 0_usize;
+    let required_remote_endorsements = guild
+        .quorum
+        .context("checkpoint synchronization requires a dynamic quorum")?
+        .required(guild.peers.len())?
+        .saturating_sub(1);
     let mut state = match catchup {
-        Some(state)
-            if local_generation < state.target_generation
-                && local_generation >= state.base_generation
-                && (local_generation != state.base_generation || local_hash == state.base_hash) =>
-        {
-            state
-        }
-        Some(_) => {
-            node_blocking(node.clone(), move |node| {
-                node.clear_checkpoint_catchup(&guild_id)
-            })
-            .await?;
-            return Ok(0);
-        }
+        Some((state, source)) => (state, source),
         None => {
             let mut requests = FuturesUnordered::new();
             for source in sources.iter().copied() {
@@ -7204,24 +7218,19 @@ async fn sync_checkpoint_head_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> R
                         continue;
                     }
                 };
-                let initial = CheckpointCatchupState {
-                    format_version: 1,
-                    guild_id,
-                    base_generation: local_generation,
-                    base_hash: local_hash,
-                    target_generation: generation,
-                    target_hash: head_hash,
-                    cursor_generation: generation,
-                    cursor_hash: head_hash,
-                    ready_to_install: false,
-                };
-                let staged = node_blocking(node.clone(), move |node| {
-                    node.stage_checkpoint_catchup(initial, &checkpoint)
+                match node_blocking(node.clone(), move |node| {
+                    node.begin_checkpoint_catchup(preferred_source, &checkpoint)
                 })
-                .await?;
-                fetched = 1;
-                selected = Some(staged);
-                break;
+                .await
+                {
+                    Ok(staged) => {
+                        selected = Some((staged, preferred_source));
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::debug!(%preferred_source, %error, "advertised checkpoint head is not locally authorized");
+                    }
+                }
             }
             let Some(selected) = selected else {
                 return Ok(0);
@@ -7229,37 +7238,109 @@ async fn sync_checkpoint_head_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> R
             selected
         }
     };
-    if state.ready_to_install {
-        return node_blocking(node, move |node| {
-            node.install_checkpoint_catchup_batch(&guild_id, MAX_CHECKPOINT_CATCHUP_STEPS_PER_PASS)
-                .map(|(installed, _)| installed)
+    let mut installed = 0;
+    while installed < MAX_CHECKPOINT_CATCHUP_STEPS_PER_PASS {
+        let generation = state.0.cursor_generation;
+        let checkpoint_hash = if generation == state.0.target_generation {
+            state.0.target_hash
+        } else {
+            match checkpoint_generation_quorum(
+                p2p,
+                &sources,
+                guild_id,
+                generation,
+                required_remote_endorsements,
+            )
+            .await
+            {
+                Ok(hash) => hash,
+                Err(error) => {
+                    node_blocking(node.clone(), move |node| {
+                        node.clear_checkpoint_catchup(&guild_id)
+                    })
+                    .await?;
+                    return Err(error.context("checkpoint catch-up candidate lacked evidence"));
+                }
+            }
+        };
+        let mut ordered_sources = Vec::with_capacity(sources.len());
+        if sources.contains(&state.1) {
+            ordered_sources.push(state.1);
+        }
+        ordered_sources.extend(sources.iter().copied().filter(|source| *source != state.1));
+        let checkpoint =
+            match fetch_checkpoint_from_sources(p2p, &ordered_sources, guild_id, checkpoint_hash)
+                .await
+            {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => {
+                    node_blocking(node.clone(), move |node| {
+                        node.clear_checkpoint_catchup(&guild_id)
+                    })
+                    .await?;
+                    return Err(error.context("checkpoint catch-up link is unavailable"));
+                }
+            };
+        let next = node_blocking(node.clone(), {
+            let current = state.0.clone();
+            move |node| node.install_checkpoint_catchup_link(current, &checkpoint)
         })
         .await;
+        match next {
+            Ok((next_state, complete)) => {
+                state.0 = next_state;
+                installed += 1;
+                if complete {
+                    return Ok(installed);
+                }
+            }
+            Err(error) => {
+                node_blocking(node.clone(), move |node| {
+                    node.clear_checkpoint_catchup(&guild_id)
+                })
+                .await?;
+                return Err(error.context("checkpoint catch-up candidate was abandoned"));
+            }
+        }
     }
-    while !state.ready_to_install && fetched < MAX_CHECKPOINT_CATCHUP_STEPS_PER_PASS {
-        let cursor_hash = state.cursor_hash;
-        let checkpoint = fetch_checkpoint_from_sources(p2p, &sources, guild_id, cursor_hash)
-            .await
-            .with_context(|| {
-                format!(
-                    "checkpoint catch-up could not fetch generation {}",
-                    state.cursor_generation
-                )
-            })?;
-        state = node_blocking(node.clone(), move |node| {
-            node.stage_checkpoint_catchup(state, &checkpoint)
-        })
-        .await?;
-        fetched += 1;
+    Ok(installed)
+}
+
+async fn checkpoint_generation_quorum(
+    p2p: &P2pClient,
+    sources: &[NodeId],
+    guild_id: [u8; 32],
+    generation: u64,
+    required: usize,
+) -> Result<[u8; 32]> {
+    if required == 0 {
+        anyhow::bail!("checkpoint generation has no remote authority evidence");
     }
-    if !state.ready_to_install {
-        return Ok(0);
+    let mut requests = FuturesUnordered::new();
+    for source in sources.iter().copied() {
+        requests.push(async move {
+            (
+                source,
+                p2p.checkpoint_at_generation(source, guild_id, generation)
+                    .await,
+            )
+        });
     }
-    node_blocking(node, move |node| {
-        node.install_checkpoint_catchup_batch(&guild_id, MAX_CHECKPOINT_CATCHUP_STEPS_PER_PASS)
-            .map(|(installed, _)| installed)
-    })
-    .await
+    let mut endorsements = BTreeMap::<[u8; 32], BTreeSet<NodeId>>::new();
+    while let Some((source, result)) = requests.next().await {
+        if let Ok(Some(checkpoint)) = result {
+            endorsements
+                .entry(checkpoint.hash)
+                .or_default()
+                .insert(source);
+        }
+    }
+    endorsements
+        .into_iter()
+        .filter(|(_, endorsers)| endorsers.len() >= required)
+        .max_by_key(|(hash, endorsers)| (endorsers.len(), *hash))
+        .map(|(hash, _)| hash)
+        .context("checkpoint generation lacks current-authority endorsements")
 }
 
 async fn fetch_checkpoint_from_sources(

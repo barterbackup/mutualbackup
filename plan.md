@@ -1184,20 +1184,20 @@ Fresh source-only review of `81ec33b..b65c79a` on 2026-09-22 reopened that
 closure with M5-68 through M5-76. Exact source locations, failure scenarios,
 and correction gates are in `TODO.md`:
 
-- **M5-68:** Ordinary finalization can adopt a next checkpoint authorized by a
-  revoked historical roster; historical authority must be limited to
-  intermediate catch-up links and the target must use current authority.
-- **M5-69:** Event-first catch-up validates historical writer epochs and coding
-  groups against the newest state, rejecting valid links after rotation or
-  retirement.
-- **M5-70:** A self-consistent but locally unauthorized advertised head is
-  durably staged before local-history validation and can pin every later sync
-  pass instead of yielding to a valid candidate.
-- **M5-71:** The walker stages the complete generation gap before advancing the
-  local head; 1,024 bounds one pass but not total staging or time to progress.
-- **M5-72:** Catch-up staging shares the finalized checkpoint namespace, so
-  concurrent finalization can return success without committing the head or
-  signature lock.
+- **M5-68 (resolved):** Current authority is mandatory for normal and final
+  target commits; replayed historical authority is scoped to nonfinal catch-up
+  links.
+- **M5-69 (resolved):** Historical link validation replays authority, writer,
+  and coding-group state at matching event-history snapshots.
+- **M5-70 (resolved):** Targets are locally authorized before persistence,
+  bound to their advertising source, and abandoned on failed evidence or link
+  installation so another candidate can be selected.
+- **M5-71 (resolved):** Quorum-endorsed forward generation lookup commits each
+  link immediately, bounds each pass to 1,024, and stores no uncommitted
+  certificates.
+- **M5-72 (resolved):** Catch-up metadata has no certificate payload, legacy
+  staging is cleaned on resume, and finalization acknowledges only an exact
+  durable head and signature lock.
 - **M5-73:** After old source groups retire and membership epoch changes,
   current legacy attestations cannot be refreshed from the still-recoverable
   authenticated packed copy.
@@ -1658,9 +1658,9 @@ implemented. Fresh source review found M5-58 through M5-66 in that correction
 series. M5-58 through M5-66 are corrected, and source-only review finds no
 remaining blocker in that correction series. The final M5-67 local
 workspace/provisioned gate passed on 2026-09-22. Fresh source-only review then
-found M5-68 through M5-76. M5-76 is corrected; Milestone 5 remains open on
-M5-68 through M5-75, and Milestone 6 waits for their correction and a new
-closure gate.
+found M5-68 through M5-76. M5-68 through M5-72 and M5-76 are corrected;
+Milestone 5 remains open on packing M5-73 through M5-75, and Milestone 6 waits
+for their correction and a new closure gate.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and

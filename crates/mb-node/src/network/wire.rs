@@ -311,6 +311,10 @@ pub(super) enum PeerRequest {
         attestation: LegacyPackingAttestation,
         bytes: Vec<u8>,
     },
+    GetCheckpointAtGeneration {
+        guild_id: [u8; 32],
+        generation: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -343,6 +347,7 @@ impl PeerRequest {
                 | Self::GetPreparedRevisionPage { .. }
                 | Self::GetCheckpointPage { .. }
                 | Self::GetCheckpointHead { .. }
+                | Self::GetCheckpointAtGeneration { .. }
                 | Self::SignLegacyPackingBinding { .. }
                 | Self::BackupStatus { .. }
                 | Self::GetGuildGenesis { .. }
@@ -365,6 +370,7 @@ impl PeerRequest {
             | Self::GetVariableEmergencyShard { .. }
             | Self::GetPreparedRevisionPage { .. }
             | Self::GetCheckpointPage { .. }
+            | Self::GetCheckpointAtGeneration { .. }
             | Self::BackupStatus { .. }
             | Self::GetGuildGenesis { .. }
             | Self::GetGuildEventTail { .. }
@@ -444,6 +450,7 @@ impl PeerRequest {
             | Self::FinalizeCheckpoint { guild_id, .. }
             | Self::GetCheckpointPage { guild_id, .. }
             | Self::GetCheckpointHead { guild_id }
+            | Self::GetCheckpointAtGeneration { guild_id, .. }
             | Self::SignLegacyPackingBinding { guild_id, .. }
             | Self::BackupStatus { guild_id, .. } => Some(*guild_id),
             Self::AttestLegacyPackingSource { attestation, .. } => Some(attestation.guild_id),

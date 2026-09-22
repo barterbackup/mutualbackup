@@ -176,6 +176,8 @@ peer-request =
   / { "SignCheckpoint": { guild_id: bytes32-array, checkpoint_hash: bytes32-array } }
   / { "FinalizeCheckpoint": { guild_id: bytes32-array, checkpoint_hash: bytes32-array } }
   / { "GetCheckpointPage": { guild_id: bytes32-array, checkpoint_hash: bytes32-array, page_index: uint } }
+  / { "GetCheckpointHead": { guild_id: bytes32-array } }
+  / { "GetCheckpointAtGeneration": { guild_id: bytes32-array, generation: uint } }
   / { "CodingPathObservation": {
         guild_id: bytes32-array,
         targets: [1*256 bytes32-array]
@@ -204,6 +206,7 @@ peer-response =
   / { "GuildEventTail": guild-event-tail }
   / { "EndpointRecords": [* signed-endpoint-record] }
   / { "CheckpointPage": { total_pages: uint, page_hash: bytes32-array, bytes: byte-vector } }
+  / { "CheckpointHead": null / { generation: uint, hash: bytes32-array } }
   / { "CodingPathObservation": coding-path-observation }
   / { "CodingCapacity": { available_shards: uint } }
   / "Ack"

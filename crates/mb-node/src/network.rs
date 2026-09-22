@@ -1022,6 +1022,13 @@ fn execute_read_request(
             node.checkpoint_head(&guild_id)?
                 .map(|(generation, hash)| wire::CheckpointHead { generation, hash }),
         )),
+        PeerRequest::GetCheckpointAtGeneration {
+            guild_id,
+            generation,
+        } => Ok(PeerResponse::CheckpointHead(
+            node.checkpoint_at_generation(&guild_id, generation)?
+                .map(|hash| wire::CheckpointHead { generation, hash }),
+        )),
         PeerRequest::SignLegacyPackingBinding {
             guild_id,
             protected_root_id,
@@ -1410,6 +1417,13 @@ fn execute_peer_request(
         PeerRequest::GetCheckpointHead { guild_id } => Ok(PeerResponse::CheckpointHead(
             node.checkpoint_head(&guild_id)?
                 .map(|(generation, hash)| wire::CheckpointHead { generation, hash }),
+        )),
+        PeerRequest::GetCheckpointAtGeneration {
+            guild_id,
+            generation,
+        } => Ok(PeerResponse::CheckpointHead(
+            node.checkpoint_at_generation(&guild_id, generation)?
+                .map(|hash| wire::CheckpointHead { generation, hash }),
         )),
         PeerRequest::SignLegacyPackingBinding { .. } => {
             bail!("legacy-packing binding read was sent to a mutation worker")

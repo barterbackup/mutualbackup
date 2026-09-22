@@ -1636,66 +1636,48 @@ node Clippy gate passed locally. No remote compilation server was used.
   disposable filesystem was unmounted and removed afterward. All compilation
   and execution were local; no remote compilation server was used.
 
-- [ ] **M5-68 / P1 — Keep revoked historical authority out of the current checkpoint head.**
-  `store_checkpoint` now always permits historical authority
-  (`crates/mb-node/src/node.rs:5944`), and `validate_local_member` enforces the
-  current authority only when its flag is true (`node.rs:6483`, `:6507`). Both
-  ordinary finalization and catch-up use that shared store. After a membership
-  or quorum change, the revoked old quorum can therefore sign an exact-parent
-  next checkpoint and have it adopted as the durable current head. Restrict
-  historical authority to intermediate catch-up links and require the final
-  target and ordinary finalization to use current authority. Gate an A-to-B
-  authority transition with a valid intermediate A checkpoint, a late or newly
-  signed A successor, and a valid B head; install the intermediate, reject the
-  A successor as a head, and converge on B across restart.
+- [x] **M5-68 / P1 — Keep revoked historical authority out of the current checkpoint head.**
+  Ordinary storage, signing, staged finalization, catch-up selection, and the
+  final catch-up target now require current authority. Historical authority is
+  available only inside an active catch-up state for a nonfinal exact-parent
+  link. Legacy format-4 authority is current only in the initial unanimous
+  membership epoch. The regression installs an A-authorized intermediate,
+  rejects a late A successor as a target, and reaches a B-authorized head across
+  restart.
 
-- [ ] **M5-69 / P1 — Validate historical checkpoint contents against their recorded epoch.**
-  Peer exchange installs guild events before checkpoint links
-  (`crates/mb-node/src/network/p2p.rs:7097`), but checkpoint coverage still
-  consults the newest dynamic state (`crates/mb-node/src/node.rs:6013`). A
-  revision first introduced by an intermediate checkpoint is rejected after
-  its writer epoch rotates (`node.rs:6043`), and a historical group fails once
-  the current state retires or forgets it (`node.rs:6102`). Replay the authority,
-  writer-key, and group history applicable to each link instead of validating
-  historical contents against the newest state. Gate event-first catch-up over
-  writer rotation plus group retirement/forgetting, including restart between
-  intermediate installations.
+- [x] **M5-69 / P1 — Validate historical checkpoint contents against their recorded epoch.**
+  Historical coverage now replays every certified guild event from genesis,
+  requires the checkpoint authority to occur in that history, and validates
+  writer keys and coding groups against a matching historical snapshot. Current
+  checkpoints retain current-writer/current-placement rules. Regressions cover
+  writer rotation, quorum transition, coding-group retirement and forgetting,
+  plus restart between intermediate installations.
 
-- [ ] **M5-70 / P1 — Reject or abandon poisoned checkpoint catch-up candidates.**
-  Candidate staging checks only a certificate's self-contained roster quorum,
-  cursor, and hash before persisting it (`crates/mb-node/src/node.rs:6317`). It
-  does not bind the candidate to the installed genesis or recorded authority.
-  When later installation rejects such a chain, ready state is retried forever
-  (`crates/mb-node/src/network/p2p.rs:7232`) and lower valid candidates are never
-  reconsidered. Treat advertised heads as untrusted hints: validate the target
-  against local guild history before selection, durably bound the candidate to
-  its source/evidence, and clear or quarantine a failed candidate and its staged
-  records under a bounded retry policy. Gate one current peer advertising a
-  higher fake-roster exact-parent chain beside a lower valid head, before and
-  after restart.
+- [x] **M5-70 / P1 — Reject or abandon poisoned checkpoint catch-up candidates.**
+  Selection fetches the advertised certificate, verifies its installed genesis
+  and current recorded authority, and persists its source with the target.
+  Invalid higher candidates are skipped in the same pass. Missing quorum
+  evidence, unavailable links, or failed installation clears the durable
+  candidate before returning, while legacy staging state is discarded during
+  resume. A fake or revoked roster cannot pin later synchronization across
+  restart.
 
-- [ ] **M5-71 / P1 — Bound total checkpoint staging while advancing the durable head.**
-  Catch-up becomes installable only after the backward cursor reaches its
-  original base (`crates/mb-node/src/node.rs:6358`, `:6393`). A gap of `N`
-  therefore stores all `N` certificates before committing `G+1`; the 1,024-step
-  loop limit (`crates/mb-node/src/network/p2p.rs:7239`) bounds one pass but not
-  total disk, network, or time to first progress. Use bounded rolling segments
-  or another authenticated paging design that advances the head without
-  retaining the whole gap, and bound abandoned staging. Gate a gap well beyond
-  one page, crash after every page, fixed staging occupancy, and monotonic head
-  progress on each successful pass.
+- [x] **M5-71 / P1 — Bound total checkpoint staging while advancing the durable head.**
+  The peer protocol can request the accepted hash at one generation. Catch-up
+  requires the current quorum minus the local member to endorse each nonfinal
+  generation, fetches its certificate, and commits that exact-parent link
+  immediately. Each pass remains capped at 1,024 links, durable state resumes
+  at the next generation after restart, and persistent uncommitted certificate
+  occupancy is zero. Head progress begins with the first successful link.
 
-- [ ] **M5-72 / P1 — Separate uncommitted catch-up certificates from finalized checkpoints.**
-  Catch-up writes certificates into the normal `guild-checkpoint` namespace
-  before installation (`crates/mb-node/src/node.rs:6365`). Concurrent ordinary
-  finalization treats any decodable certificate found there as already
-  finalized and returns success without advancing the head or signature lock
-  (`node.rs:6275`); the coordinator counts that acknowledgement as a durable
-  holder (`crates/mb-node/src/network/p2p.rs:12991`). Give catch-up staging a
-  separate namespace/state and acknowledge finalization only after the exact
-  head and lock commit. Gate a race where peer exchange stages the same
-  certificate immediately before coordinator finalization, including restart
-  at both boundaries.
+- [x] **M5-72 / P1 — Separate uncommitted catch-up certificates from finalized checkpoints.**
+  Catch-up no longer persists certificate bytes before committing them; its
+  durable namespace contains only cursor, target, and source metadata. Legacy
+  generation staging is removed on resume without deleting accepted history.
+  Staged finalization treats a pre-existing certificate as complete only when
+  the exact certificate is both the durable head and signature lock. The race
+  regression injects an uncommitted certificate into the old namespace and
+  proves finalization refuses to acknowledge it.
 
 - [ ] **M5-73 / P1 — Refresh legacy evidence from the authenticated packed copy.**
   Version-5 attestations are membership-epoch bound. After the first packed
