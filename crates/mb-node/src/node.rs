@@ -3675,21 +3675,23 @@ impl Node {
         guild_id: [u8; 32],
     ) -> Result<LegacyPackingAttestationIndex> {
         let mut attestations = LegacyPackingAttestationIndex::new();
-        for (_, bytes) in self.control.records("legacy-packing-attestation")? {
-            let attestation: SignedRecord<mb_core::LegacyPackingAttestation> =
-                decode_canonical(&bytes)?;
-            attestation.verify(mb_core::LEGACY_PACKING_ATTESTATION_DOMAIN)?;
-            if attestation.value.guild_id == guild_id {
-                attestations
-                    .entry((
-                        attestation.value.owner,
-                        attestation.value.protected_root,
-                        attestation.value.object_id,
-                    ))
-                    .or_default()
-                    .push(attestation);
-            }
-        }
+        self.control
+            .for_each_record_value("legacy-packing-attestation", |bytes| {
+                let attestation: SignedRecord<mb_core::LegacyPackingAttestation> =
+                    decode_canonical(bytes)?;
+                attestation.verify(mb_core::LEGACY_PACKING_ATTESTATION_DOMAIN)?;
+                if attestation.value.guild_id == guild_id {
+                    attestations
+                        .entry((
+                            attestation.value.owner,
+                            attestation.value.protected_root,
+                            attestation.value.object_id,
+                        ))
+                        .or_default()
+                        .push(attestation);
+                }
+                Ok(())
+            })?;
         for entries in attestations.values_mut() {
             entries.sort_by_key(|attestation| attestation.signer);
         }

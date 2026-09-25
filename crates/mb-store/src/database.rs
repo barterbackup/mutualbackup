@@ -353,6 +353,22 @@ impl ControlStore {
             .map_err(DatabaseError::from)
     }
 
+    pub fn for_each_record_value(
+        &self,
+        kind: &str,
+        mut visit: impl FnMut(&[u8]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT bytes FROM protocol_records WHERE kind = ?1 ORDER BY record_id")?;
+        let mut rows = statement.query([kind])?;
+        while let Some(row) = rows.next()? {
+            let bytes: Vec<u8> = row.get(0)?;
+            visit(&bytes)?;
+        }
+        Ok(())
+    }
+
     pub fn finalize_capture_records(
         &mut self,
         capture_id: &[u8; 16],
@@ -3362,6 +3378,38 @@ mod tests {
             Err(DatabaseError::Conflict)
         ));
         assert_eq!(store.get_record("job", b"one").unwrap().unwrap(), b"second");
+    }
+
+    #[test]
+    fn record_value_scan_stops_without_materializing_the_remaining_journal() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([74; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        for index in 0_u8..130 {
+            store
+                .put_record("attestations", &[index], &[index])
+                .unwrap();
+        }
+        let mut visited = 0;
+        let result = store.for_each_record_value("attestations", |bytes| {
+            assert_eq!(bytes, &[visited]);
+            visited += 1;
+            if visited == 5 {
+                anyhow::bail!("invalid attestation");
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(visited, 5);
+
+        let mut visited = 0;
+        store
+            .for_each_record_value("attestations", |_| {
+                visited += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visited, 130);
     }
 
     #[test]
