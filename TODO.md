@@ -613,7 +613,10 @@ correction commits found no new blocker. M5-84 passed locally on 2026-09-25 on
 `e959d92`; that closure record remains evidence for its exact tree. No code
 commits followed `890d88c`, but a new source-only review of the correction
 series found M5-85 through M5-87 below. Milestone 5 is reopened and Milestone 6
-waits. This review ran no builds, tests, daemons, runtime probes, or remote
+waits. Subsequent commits `e9fadb2` and `75d0fd5` correct M5-85 and M5-86;
+source review of `1e8ee2b` found M5-87 still cannot prove a live `k` in a
+multi-live-sector replacement group. M5-88 awaits the final corrected tree.
+This review ran no builds, tests, daemons, runtime probes, or remote
 compilation.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
@@ -1896,7 +1899,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   test; its mount and image were cleaned up. No remote compilation server was
   used.
 
-- [ ] **M5-85 / P1 — Try each advertiser of the same checkpoint head.**
+- [x] **M5-85 / P1 — Try each advertiser of the same checkpoint head.**
   `sync_checkpoint_head_once` de-duplicates candidates by head hash alone
   (`crates/mb-node/src/network/p2p.rs:7212`–`:7216`), but its intermediate
   generation quorum requires the selected advertising source to endorse each
@@ -1908,9 +1911,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   distinct `(head hash, advertising source)` candidates, including after a
   failed resumed attempt. Gate identical advertised heads under a majority
   quorum, with the first source missing an intermediate link and the second
-  source complete.
+  source complete. Corrected in `e9fadb2`; source review confirms the attempted
+  key includes both hash and source for resumed and newly advertised heads.
 
-- [ ] **M5-86 / P1 — Validate legacy checkpoint epochs in historical order.**
+- [x] **M5-86 / P1 — Validate legacy checkpoint epochs in historical order.**
   A format-4 checkpoint has no authority epoch. On a later format-5 transition,
   `latest_checkpoint_member_epoch` assigns it the latest matching roster epoch
   from the entire currently synced guild event history
@@ -1923,7 +1927,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   also matches epoch 3.
   Preserve rollback rejection while bounding legacy epoch inference to the
   checkpoint's historical transition. Gate late catch-up through this complete
-  signed sequence and the existing invalid rollback sequence.
+  signed sequence and the existing invalid rollback sequence. Corrected in
+  `75d0fd5`: an already accepted format-4 epoch is witnessed atomically with
+  its checkpoint, while an unwitnessed historical link is bounded by its
+  explicit successor epoch. Source review found no remaining blocker here.
 
 - [ ] **M5-87 / P1 — Let current replacement coverage satisfy cold recovery without a local role.**
   `variable_recovery_plans` includes a group's covered sectors only when the
@@ -1938,7 +1945,20 @@ node Clippy gate passed locally. No remote compilation server was used.
   recover only shards it still needs. Gate cold recovery in a six-member guild
   where stale-group parity belongs to the recovering node, replacement parity
   belongs elsewhere, the old group is unavailable, and the current replacement
-  has a valid `k`.
+  has a valid `k`. Commit `1e8ee2b` adds coverage-only plans and a parity-only
+  regression, but source review found that its success does not always prove
+  a live `k`: `recover_variable_group_plan` probes one live information shard
+  (`crates/mb-node/src/network/p2p.rs:10530`–`:10559`), while
+  `reconstruct_variable_shard_from_peers` returns immediately when that shard's
+  holder answers (`:10889`–`:10900`). The coverage loop then marks every sector
+  in the group covered (`:10492`). If a group has multiple live information
+  sectors and only the probed holder is reachable, cold recovery can skip the
+  unavailable stale group and accept a checkpoint despite insufficient shards
+  to reconstruct the other sectors. The new regression uses one live sector
+  and virtual-zero roles, so it does not cover this case. Require verified
+  reachability of `k` distinct shards (counting authenticated virtual zeros)
+  before coverage-only success. Add a negative multi-live-sector regression
+  with fewer than `k` reachable shards and a positive one with any valid `k`.
 
 - [ ] **M5-88 / gate — Recheck Milestone 5 after M5-85 through M5-87.**
   After correcting these source blockers, run fresh source review, formatting,
