@@ -10269,21 +10269,53 @@ fn variable_recovery_plans(
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if !targets.is_empty() {
-            let priority = if state
+        if targets.is_empty() {
+            continue;
+        }
+        let current = state
+            .validate_current_group_placement(&retained.group)
+            .is_ok();
+        required_sectors.extend(&covered);
+        plans.push(VariableRecoveryPlan {
+            group: retained.group.clone(),
+            targets,
+            covered,
+            priority: if current { 0 } else { 1 },
+        });
+    }
+    let local_plan_ids = plans
+        .iter()
+        .map(|plan| plan.group.id)
+        .collect::<BTreeSet<_>>();
+    for retained in &state.coding_groups {
+        if retained.retired_at_event.is_some()
+            || local_plan_ids.contains(&retained.group.id)
+            || state
                 .validate_current_group_placement(&retained.group)
-                .is_ok()
-            {
-                0
-            } else {
-                1
-            };
-            required_sectors.extend(&covered);
+                .is_err()
+        {
+            continue;
+        }
+        let needed = retained
+            .group
+            .roles
+            .iter()
+            .filter_map(|role| match role {
+                ShardRoleV2::Information(information)
+                    if !information.sector.virtual_zero
+                        && required_sectors.contains(&information.sector.id) =>
+                {
+                    Some(information.sector.id)
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if !needed.is_empty() {
             plans.push(VariableRecoveryPlan {
                 group: retained.group.clone(),
-                targets,
-                covered,
-                priority,
+                targets: Vec::new(),
+                covered: needed,
+                priority: 0,
             });
         }
     }
@@ -10495,6 +10527,35 @@ async fn recover_variable_group_plan(
         node.recovery_coding_transcript_for_group(checkpoint_hash, group.guild_id, group.id)
     })
     .await?;
+    if plan.targets.is_empty() {
+        // A current replacement can cover stale local parity without assigning
+        // this node a new shard. Prove a live k before skipping the stale group.
+        let probe_index = plan
+            .group
+            .roles
+            .iter()
+            .enumerate()
+            .find_map(|(index, role)| match role {
+                ShardRoleV2::Information(information)
+                    if !information.sector.virtual_zero
+                        && plan.covered.contains(&information.sector.id) =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .context("coverage-only recovery plan has no live information shard")?;
+        reconstruct_variable_shard_from_peers(
+            node,
+            p2p,
+            &plan.group,
+            probe_index,
+            roster,
+            deferred_holders.as_ref(),
+        )
+        .await?;
+        return Ok(());
+    }
     recover_variable_plan(
         node,
         p2p,
@@ -15649,6 +15710,7 @@ mod tests {
         shards: &[Vec<u8>],
         signing_keys: &BTreeMap<NodeId, KeyMaterial>,
         checkpoint_hash: [u8; 32],
+        membership_epoch: u64,
         ordinal: u8,
     ) -> SignedRecord<CodingVerificationTranscript> {
         let members = signing_keys.keys().copied().collect::<Vec<_>>();
@@ -15659,7 +15721,7 @@ mod tests {
             format_version: 2,
             attempt_id,
             checkpoint_hash,
-            membership_epoch: 1,
+            membership_epoch,
             geometry: CodingPlanGeometry {
                 format_version: 1,
                 guild_id: group.guild_id,
@@ -16035,6 +16097,7 @@ mod tests {
                 shards,
                 &signing_keys,
                 next.hash().unwrap(),
+                1,
                 index as u8 + 1,
             );
             crate::node::tests::install_test_recovery_transcript(&mut cold, &transcript);
@@ -16117,6 +16180,316 @@ mod tests {
             assert!(requested.len() > restore_request_count);
             assert!(requested.iter().all(|group_id| !old_ids.contains(group_id)));
         }
+        drop(p2p);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn parity_only_cold_recovery_uses_current_group_without_a_local_shard() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds = (180_u8..186)
+            .map(|value| Seed::from_bytes([value; 32]))
+            .collect::<Vec<_>>();
+        let signing_keys = seeds
+            .iter()
+            .map(KeyMaterial::from_seed)
+            .map(|keys| (keys.node_id(), keys))
+            .collect::<BTreeMap<_, _>>();
+        let owner = KeyMaterial::from_seed(&seeds[0]).node_id();
+        let recovering = KeyMaterial::from_seed(&seeds[1]).node_id();
+        let guild_id = [186; 32];
+        let mut peers = signing_keys
+            .values()
+            .enumerate()
+            .map(|(index, keys)| GuildPeer {
+                member: Member {
+                    node_id: keys.node_id(),
+                    recovery_public_key: keys.recovery_public_key(),
+                    failure_domain: format!("original-domain-{index}"),
+                },
+                endpoints: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        peers.sort_by_key(|peer| peer.member.node_id);
+        let added_member = peers
+            .iter()
+            .rev()
+            .map(|peer| peer.member.node_id)
+            .find(|id| *id != owner && *id != recovering)
+            .unwrap();
+        let old_peers = peers
+            .iter()
+            .filter(|peer| peer.member.node_id != added_member)
+            .cloned()
+            .collect::<Vec<_>>();
+        let genesis = GuildGenesis {
+            format_version: 1,
+            guild_id,
+            coordinator: old_peers[0].member.node_id,
+            members: old_peers.iter().map(|peer| peer.member.clone()).collect(),
+        };
+        let certificate = QuorumGuildGenesis {
+            signatures: signing_keys
+                .values()
+                .filter(|keys| keys.node_id() != added_member)
+                .map(|keys| genesis.member_signature(keys).unwrap())
+                .collect(),
+            genesis,
+        };
+        certificate.verify().unwrap();
+        let old_other_parity = old_peers
+            .iter()
+            .map(|peer| peer.member.node_id)
+            .find(|id| *id != owner && *id != recovering)
+            .unwrap();
+        let mut current_peers = peers.clone();
+        current_peers
+            .iter_mut()
+            .find(|peer| peer.member.node_id == recovering)
+            .unwrap()
+            .member
+            .failure_domain = "relabeled-recovering-domain".to_owned();
+        let replacement_peers = current_peers
+            .iter()
+            .filter(|peer| peer.member.node_id != recovering)
+            .cloned()
+            .collect::<Vec<_>>();
+        let bytes = vec![17; V1_SECTOR_SIZE];
+        let reference = SectorRef {
+            id: [187; 32],
+            root: sector_root(&bytes),
+            logical_len: V1_SECTOR_SIZE as u32,
+        };
+        let commitment = merkle_commit(&bytes).unwrap();
+        let input = [VariableInformationInput {
+            owner,
+            sector: &reference,
+            commitment: &commitment,
+        }];
+        let old_lane = variable_coding_lane_with_capacity(
+            guild_id,
+            Uuid::from_bytes([188; 16]),
+            0,
+            &input,
+            &old_peers,
+            None,
+            Some(&[recovering, old_other_parity]),
+        )
+        .unwrap();
+        let old = materialize_variable_lane(&old_lane, std::slice::from_ref(&bytes));
+        let replacement_lane = variable_coding_lane(
+            guild_id,
+            Uuid::from_bytes([189; 16]),
+            0,
+            &input,
+            &replacement_peers,
+        )
+        .unwrap();
+        let replacement =
+            materialize_variable_lane(&replacement_lane, std::slice::from_ref(&bytes));
+        assert!(old.roles.iter().any(
+            |role| matches!(role, ShardRoleV2::Parity(parity) if parity.holder == recovering)
+        ));
+        assert!(
+            replacement
+                .roles
+                .iter()
+                .all(|role| variable_shard_holder(role) != recovering)
+        );
+        let mut groups = vec![
+            mb_core::RetainedCodingGroup {
+                group: old.clone(),
+                added_at_event: 1,
+                retired_at_event: None,
+                retain_through_event: None,
+            },
+            mb_core::RetainedCodingGroup {
+                group: replacement.clone(),
+                added_at_event: 4,
+                retired_at_event: None,
+                retain_through_event: None,
+            },
+        ];
+        groups.sort_by_key(|retained| retained.group.id);
+        let state = DynamicGuildState {
+            membership_epoch: 3,
+            event_sequence: 4,
+            event_head: [190; 32],
+            coding_groups: groups,
+            ..DynamicGuildState::new(
+                guild_id,
+                certificate.hash().unwrap(),
+                QuorumPolicy {
+                    format_version: 1,
+                    rule: QuorumRule::Unanimous,
+                },
+                current_peers
+                    .iter()
+                    .map(|peer| peer.member.clone())
+                    .collect(),
+            )
+            .unwrap()
+        };
+        assert!(state.validate_current_group_placement(&old).is_err());
+        assert!(state.validate_current_group_placement(&replacement).is_ok());
+        let (plans, required) =
+            variable_recovery_plans(&state, &BTreeSet::from([reference.id]), recovering);
+        assert_eq!(required, BTreeSet::from([reference.id]));
+        assert!(
+            plans
+                .iter()
+                .any(|plan| plan.group.id == old.id && !plan.targets.is_empty())
+        );
+        assert!(plans.iter().any(|plan| {
+            plan.group.id == replacement.id && plan.targets.is_empty() && plan.priority == 0
+        }));
+
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[191; 32]);
+        let mut revision = UserRevision {
+            format_version: 4,
+            guild_id,
+            protected_root_id: Uuid::from_bytes([192; 16]),
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id: Uuid::from_bytes([193; 16]),
+            owner,
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![reference.clone()],
+            data_sectors: Vec::new(),
+            sector_commitments: Some(vec![commitment]),
+        };
+        revision.sign_writer(&writer).unwrap();
+        let revision = SignedRecord::sign(
+            mb_core::USER_REVISION_DOMAIN,
+            revision,
+            signing_keys.get(&owner).unwrap(),
+        )
+        .unwrap();
+        let mut checkpoint = QuorumCheckpoint {
+            checkpoint: GuildCheckpoint {
+                format_version: 5,
+                guild_id,
+                genesis_hash: certificate.hash().unwrap(),
+                generation: 1,
+                parent: None,
+                members: current_peers
+                    .iter()
+                    .map(|peer| peer.member.clone())
+                    .collect(),
+                writer_fences: vec![mb_core::WriterFence {
+                    owner,
+                    epoch: 1,
+                    public_key: writer.verifying_key().to_bytes(),
+                }],
+                revision_tombstones: Vec::new(),
+                revisions: vec![revision],
+                coding_groups: Vec::new(),
+                authority: Some(CheckpointAuthority {
+                    format_version: 1,
+                    membership_epoch: 3,
+                    quorum: state.quorum,
+                }),
+                packing_catalog: None,
+            },
+            signatures: Vec::new(),
+        };
+        for keys in signing_keys.values() {
+            checkpoint.add_signature(keys).unwrap();
+        }
+        checkpoint.verify().unwrap();
+        let information = replacement
+            .roles
+            .iter()
+            .take(usize::from(replacement.profile.data_shards))
+            .map(|role| match role {
+                ShardRoleV2::Information(info) if info.sector.virtual_zero => {
+                    vec![0; replacement.profile.shard_size as usize]
+                }
+                ShardRoleV2::Information(info) if info.sector.id == reference.id => bytes.clone(),
+                _ => panic!("unexpected replacement information role"),
+            })
+            .collect();
+        let shards = encode(replacement.profile, information).unwrap();
+        let transcript = signed_replacement_transcript(
+            &replacement,
+            &shards,
+            &signing_keys,
+            checkpoint.hash().unwrap(),
+            3,
+            1,
+        );
+        let mut cold = Node::open(temp.path().join("cold"), seeds[1].clone()).unwrap();
+        cold.adopt_recovered_guild(certificate, old_peers).unwrap();
+        crate::node::tests::install_test_checkpoint_and_dynamic_state(
+            &mut cold,
+            &checkpoint,
+            &state,
+        );
+        crate::node::tests::install_test_recovery_transcript(&mut cold, &transcript);
+        let cold = Arc::new(Mutex::new(cold));
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let (commands, mut commands_rx) = mpsc::channel(16);
+        let (request_cancellations, _cancellations_rx) = mpsc::unbounded_channel();
+        let (_port_state, port_mapping_listener_state) =
+            watch::channel(PortMappingListenerState::Pending);
+        let p2p = P2pClient {
+            local_peer_id: recovering.libp2p_peer_id().unwrap(),
+            commands,
+            request_cancellations,
+            outbound_permits: Arc::new(Semaphore::new(8)),
+            cold_recovery_permit: Arc::new(Semaphore::new(1)),
+            port_mapping_listener_state,
+        };
+        let replacement_id = replacement.id;
+        let old_id = old.id;
+        let worker = tokio::spawn({
+            let requested = requested.clone();
+            async move {
+                while let Some(command) = commands_rx.recv().await {
+                    let Command::Request {
+                        recipient,
+                        request,
+                        response,
+                        ..
+                    } = command
+                    else {
+                        panic!("unexpected cold recovery command");
+                    };
+                    let reply = match *request {
+                        PeerRequest::GetVariableShard {
+                            guild_id: requested_guild,
+                            group_id,
+                            shard_index,
+                        } if requested_guild == guild_id => {
+                            requested.lock().unwrap().push(group_id);
+                            if group_id == replacement_id
+                                && variable_shard_holder(
+                                    &replacement.roles[usize::from(shard_index)],
+                                ) == recipient
+                            {
+                                Ok(PeerResponse::Bytes(
+                                    shards[usize::from(shard_index)].clone(),
+                                ))
+                            } else {
+                                Err(anyhow::anyhow!("stale group is unavailable"))
+                            }
+                        }
+                        _ => Err(anyhow::anyhow!("unexpected cold recovery request")),
+                    };
+                    let _ = response.send(reply);
+                }
+            }
+        });
+        recover_p2p_variable_shards(cold, &p2p, &checkpoint, &current_peers)
+            .await
+            .unwrap();
+        let requested = requested.lock().unwrap().clone();
+        assert!(!requested.is_empty());
+        assert!(requested.iter().all(|group_id| *group_id == replacement_id));
+        assert!(!requested.contains(&old_id));
         drop(p2p);
         worker.await.unwrap();
     }

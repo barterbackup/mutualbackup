@@ -11481,9 +11481,11 @@ pub(crate) mod tests {
         checkpoint.verify().unwrap();
         state.validate().unwrap();
         let guild_id = checkpoint.checkpoint.guild_id;
-        let parent = node.current_checkpoint(guild_id).unwrap().unwrap();
-        let parent_hash = parent.hash().unwrap();
-        assert_eq!(checkpoint.checkpoint.parent, Some(parent_hash));
+        let parent_hash = node
+            .current_checkpoint(guild_id)
+            .unwrap()
+            .map(|parent| parent.hash().unwrap());
+        assert_eq!(checkpoint.checkpoint.parent, parent_hash);
         node.control
             .put_record(
                 "guild-dynamic-state",
@@ -11496,7 +11498,7 @@ pub(crate) mod tests {
             .commit_checkpoint(
                 &guild_id,
                 checkpoint.checkpoint.generation,
-                Some(&parent_hash),
+                parent_hash.as_ref(),
                 &hash,
                 &canonical_bytes(&checkpoint.checkpoint).unwrap(),
                 &canonical_bytes(checkpoint).unwrap(),
