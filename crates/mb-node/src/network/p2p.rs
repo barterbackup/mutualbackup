@@ -54,8 +54,8 @@ use uuid::Uuid;
 
 use crate::node::{
     CheckpointCatchupState, CheckpointRecoveryObservation, CodingRetryJob, DelegatedCodingJob,
-    DelegatedCodingJobState, DhtRecordObservation, GuildPhase, SnapshotInfo,
-    VerifiedCodingTranscript, checkpoint_matches_dynamic_authority,
+    DelegatedCodingJobState, DhtRecordObservation, GuildPhase, LegacyPackingAttestationIndex,
+    SnapshotInfo, VerifiedCodingTranscript, checkpoint_matches_dynamic_authority,
     variable_group_protects_checkpoint,
 };
 
@@ -12452,9 +12452,7 @@ async fn legacy_source_evidence(
     reference: &SectorRef,
     prior_binding: Option<&SignedRecord<LegacyPackingBinding>>,
     prior_attestations: Option<&[SignedRecord<LegacyPackingAttestation>]>,
-    journaled_by_source: &mut Option<
-        BTreeMap<PackingObjectKey, Vec<SignedRecord<LegacyPackingAttestation>>>,
-    >,
+    journaled_by_source: &mut Option<LegacyPackingAttestationIndex>,
     previous: Option<&PackedCatalog>,
 ) -> Result<LegacySourceEvidence> {
     let protected_root = packing_protected_root(protected_root_id);
@@ -14277,7 +14275,17 @@ mod tests {
                 assert!(journaled_by_source.is_none());
             }
         }
-        assert_eq!(journaled_by_source.unwrap().len(), 130);
+        let index = journaled_by_source.unwrap();
+        assert_eq!(index.len(), 130);
+        assert_eq!(index.scan.rows_read, 138);
+        assert_eq!(index.scan.signatures_verified, 138);
+        assert_eq!(index.scan.retained_records, 138);
+        assert!(index.scan.largest_row_bytes < 1024);
+        assert!(
+            index.scan.peak_journal_payload_bytes
+                <= index.scan.retained_encoded_bytes + index.scan.largest_row_bytes
+        );
+        assert!(index.scan.peak_journal_payload_bytes < 512 * 1024);
     }
 
     #[test]

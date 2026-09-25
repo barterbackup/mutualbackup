@@ -44,8 +44,32 @@ use crate::snapshot::{
 };
 use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open_control_store};
 
-pub(crate) type LegacyPackingAttestationIndex =
+type LegacyPackingAttestationEntries =
     BTreeMap<(NodeId, [u8; 32], SectorId), Vec<SignedRecord<mb_core::LegacyPackingAttestation>>>;
+
+#[derive(Default)]
+pub(crate) struct LegacyPackingAttestationIndex {
+    entries: LegacyPackingAttestationEntries,
+    pub(crate) scan: LegacyPackingAttestationScan,
+}
+
+#[derive(Default)]
+pub(crate) struct LegacyPackingAttestationScan {
+    pub(crate) rows_read: usize,
+    pub(crate) signatures_verified: usize,
+    pub(crate) retained_records: usize,
+    pub(crate) retained_encoded_bytes: usize,
+    pub(crate) largest_row_bytes: usize,
+    pub(crate) peak_journal_payload_bytes: usize,
+}
+
+impl std::ops::Deref for LegacyPackingAttestationIndex {
+    type Target = LegacyPackingAttestationEntries;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 enum RecoveryJobState {
@@ -3674,14 +3698,25 @@ impl Node {
         &self,
         guild_id: [u8; 32],
     ) -> Result<LegacyPackingAttestationIndex> {
-        let mut attestations = LegacyPackingAttestationIndex::new();
+        let mut attestations = LegacyPackingAttestationIndex::default();
         self.control
             .for_each_record_value("legacy-packing-attestation", |bytes| {
+                attestations.scan.rows_read += 1;
+                attestations.scan.largest_row_bytes =
+                    attestations.scan.largest_row_bytes.max(bytes.len());
                 let attestation: SignedRecord<mb_core::LegacyPackingAttestation> =
                     decode_canonical(bytes)?;
                 attestation.verify(mb_core::LEGACY_PACKING_ATTESTATION_DOMAIN)?;
+                attestations.scan.signatures_verified += 1;
                 if attestation.value.guild_id == guild_id {
+                    attestations.scan.retained_records += 1;
+                    attestations.scan.retained_encoded_bytes += bytes.len();
+                    attestations.scan.peak_journal_payload_bytes = attestations
+                        .scan
+                        .peak_journal_payload_bytes
+                        .max(attestations.scan.retained_encoded_bytes + bytes.len());
                     attestations
+                        .entries
                         .entry((
                             attestation.value.owner,
                             attestation.value.protected_root,
@@ -3692,7 +3727,7 @@ impl Node {
                 }
                 Ok(())
             })?;
-        for entries in attestations.values_mut() {
+        for entries in attestations.entries.values_mut() {
             entries.sort_by_key(|attestation| attestation.signer);
         }
         Ok(attestations)
