@@ -12251,7 +12251,13 @@ async fn build_production_packing(
         .transpose()?
         .flatten()
     {
-        return Ok(ProductionPacking { catalog });
+        return Ok(ProductionPacking {
+            catalog,
+            #[cfg(test)]
+            unchanged_legacy_scan: journaled_legacy_attestations
+                .as_ref()
+                .map(|index| index.scan.clone()),
+        });
     }
     let mut inputs = Vec::new();
     for (&(owner, protected_root, object_id), (reference, source_commitment)) in &sources {
@@ -12375,6 +12381,8 @@ async fn build_production_packing(
                 node.store_packing_update(guild_id, &update)?;
                 Ok(ProductionPacking {
                     catalog: update.catalog,
+                    #[cfg(test)]
+                    unchanged_legacy_scan: None,
                 })
             })
             .await;
@@ -12417,6 +12425,8 @@ async fn build_production_packing(
     .await?;
     Ok(ProductionPacking {
         catalog: result.catalog,
+        #[cfg(test)]
+        unchanged_legacy_scan: None,
     })
 }
 
@@ -12965,6 +12975,8 @@ async fn recover_object_from_previous_packing(
 
 struct ProductionPacking {
     catalog: PackedCatalog,
+    #[cfg(test)]
+    unchanged_legacy_scan: Option<crate::node::LegacyPackingAttestationScan>,
 }
 
 type PackingObjectKey = (NodeId, [u8; 32], SectorId);
@@ -14286,6 +14298,81 @@ mod tests {
                 <= index.scan.retained_encoded_bytes + index.scan.largest_row_bytes
         );
         assert!(index.scan.peak_journal_payload_bytes < 512 * 1024);
+
+        let packed = pack_incremental(
+            PackingProfile {
+                format_version: 1,
+                sector_size: V1_SECTOR_SIZE as u32,
+                slot_size: 16 * 1024,
+            },
+            None,
+            corpus
+                .iter()
+                .map(|(reference, _)| PackingInput {
+                    owner: local_id,
+                    protected_root,
+                    object_id: reference.id,
+                    source_commitment: Some(source_commitment.clone()),
+                    bytes: bytes.clone(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        let previous = attach_production_legacy_evidence(
+            packed.catalog,
+            Vec::new(),
+            corpus
+                .iter()
+                .take(128)
+                .flat_map(|(_, attestations)| attestations.clone())
+                .collect(),
+        )
+        .unwrap();
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[232; 32]);
+        let mut revision = UserRevision {
+            format_version: 3,
+            guild_id,
+            protected_root_id,
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id: Uuid::from_bytes([233; 16]),
+            owner: local_id,
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: corpus
+                .iter()
+                .map(|(reference, _)| reference.clone())
+                .collect(),
+            data_sectors: Vec::new(),
+            sector_commitments: None,
+        };
+        revision.sign_writer(&writer).unwrap();
+        let revision = SignedRecord::sign(
+            mb_core::USER_REVISION_DOMAIN,
+            revision,
+            node.lock().unwrap().keys(),
+        )
+        .unwrap();
+        let result = build_production_packing(
+            node,
+            &p2p,
+            local_id,
+            guild_id,
+            &[revision],
+            Some(&previous),
+            &members,
+            authority,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.catalog.parent, Some(previous.id));
+        let scan = result.unchanged_legacy_scan.unwrap();
+        assert_eq!(scan.rows_read, 138);
+        assert_eq!(scan.signatures_verified, 138);
+        assert_eq!(scan.retained_records, 138);
+        assert!(scan.peak_journal_payload_bytes < 512 * 1024);
     }
 
     #[test]

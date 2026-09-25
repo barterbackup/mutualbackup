@@ -53,7 +53,7 @@ pub(crate) struct LegacyPackingAttestationIndex {
     pub(crate) scan: LegacyPackingAttestationScan,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct LegacyPackingAttestationScan {
     pub(crate) rows_read: usize,
     pub(crate) signatures_verified: usize,
