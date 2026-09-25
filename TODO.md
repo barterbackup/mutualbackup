@@ -597,6 +597,14 @@ historical gate evidence for its exact tree; Milestone 6 waits for corrections
 and a new closure gate. The fresh review ran no builds, tests, daemons, runtime
 probes, or remote compilation.
 
+Source-only follow-up review on 2026-09-25 covered `b9d4e07..8434b30` and the
+two local node-source edits. The candidate fallback, generation index, recovery
+placement ordering, lazy legacy-evidence index, and relay overflow response are
+present. M5-83 remains a source blocker for a repeated legacy member roster;
+the specific M5-78, M5-79, M5-80, and M5-82 scenario gates and the complete
+M5-84 gate remain outstanding. This follow-up ran no builds, tests, daemons,
+runtime probes, or remote compilation.
+
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
 relabel exclude old placement from new coverage, invalidates stale audit state,
@@ -1750,6 +1758,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   is never installed. Continue through other candidates in the same bounded pass
   or persist a bounded rejection cooldown; gate a persistent incomplete high
   head alongside a reachable complete lower head across restart.
+  `151a29a` now iterates other advertised candidates after a failed or resumed
+  catch-up, clearing a failed target before retrying. The specified persistent
+  high-head/lower-complete-head network regression across restart is still
+  absent, so this item remains open for its scenario gate.
 
 - [ ] **M5-79 / P2 — Serve checkpoint generation lookups without scanning all history.**
   Each `GetCheckpointAtGeneration` loads every retained `guild-checkpoint`
@@ -1760,6 +1772,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   can also issue repeated absent-generation lookups. Add an atomically maintained
   generation-to-hash index or an equivalently bounded committed-history lookup.
   Gate long-history catch-up and repeated lookups with bounded reads and memory.
+  `151a29a` atomically indexes committed generations, backfills old head
+  ancestry on open, and makes each lookup read one indexed certificate. The
+  1,024-entry store test covers direct indexed reads and conflict rollback;
+  repeated peer requests during long-history catch-up are not yet gated.
 
 - [ ] **M5-80 / P1 — Use healthy replacement groups for restore and cold recovery.**
   M5-74's all-placement fallback covers backup packing, but ordinary packed
@@ -1773,6 +1789,11 @@ node Clippy gate passed locally. No remote compilation server was used.
   try every matching certified placement, and require only enough valid current
   coverage. Gate both restore and seed recovery with the stale group ordered
   first and unavailable.
+  `8434b30` orders current active placements before stale or retired ones,
+  retries matching certified placements during restore, and uses successful
+  active-group coverage for cold recovery. The focused ordering test does not
+  run either network path with an unavailable stale group; both scenario gates
+  remain open.
 
 - [ ] **M5-81 / P2 — Bound legacy attestation lookup per packing pass.**
   For every retained legacy source, production packing calls
@@ -1785,6 +1806,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   or load and index the journal once per packing pass; check valid prior-catalog
   evidence before scanning durable history. Gate a large unchanged mixed corpus
   with bounded row reads, signature checks, and peak memory.
+  `b9d4e07` first checks current prior-catalog quorum and lazily builds one
+  journal index for the remaining pass. A local source edit adds a 130-source
+  mixed-corpus test, but it asserts index reuse rather than row-read, signature,
+  or peak-memory bounds; retain the explicit measurement gate.
 
 - [ ] **M5-82 / P1 — Report relay outbound worker overflow and release its circuit.**
   Guild relay configuration permits 32 circuits in the tested setting
@@ -1798,6 +1823,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   the behaviour on overflow and avoid retaining the rejected request. Gate more
   than ten simultaneous stalled STOP handshakes on one destination connection,
   then prove the rejected circuit and shared capacity are released.
+  `bed5b90` queues a resource-limit failure and skips active-request insertion
+  when `try_push` overflows; the existing denial path removes the circuit. There
+  is still no regression with more than ten stalled STOP handshakes proving the
+  rejected circuit and shared capacity are released.
 
 - [ ] **M5-83 / P1 — Reject checkpoint authority epochs that move backward.**
   A nonfinal catch-up link may use any authority found anywhere in guild event
@@ -1811,6 +1840,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   accepts it as historical. Require authority epochs to be nondecreasing along
   exact-parent links, including the legacy format transition. Gate this chain
   and valid forward A-to-B catch-up across restart.
+  `b9d4e07` rejects explicit epoch decreases and format-5-to-legacy rollback.
+  The local legacy-transition helper in `node.rs` chooses the *earliest* event
+  epoch whose active member roster equals the previous format-4 checkpoint.
+  With event history A -> B -> A, a later A legacy checkpoint can be assigned
+  the first A epoch; a B-authorized successor from the intervening epoch then
+  passes the numeric comparison although authority moved backward. Resolve
+  repeated-roster ambiguity in historical catch-up (or reject ambiguous legacy
+  transitions), and gate that chain plus valid forward catch-up across restart.
 
 - [ ] **M5-84 / gate — Recheck Milestone 5 after M5-78 through M5-83.**
   After correcting these source blockers, run a fresh source review, formatting,

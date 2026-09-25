@@ -731,6 +731,13 @@ complete local M5-77 workspace/provisioned gate passed on 2026-09-22.
 Fresh source-only review of `b95811b..168945a` found M5-78 through M5-83 and
 reopened Milestone 5. Milestone 6 waits for corrections and a new complete local
 gate.
+Source-only follow-up review of `b9d4e07..8434b30` and the local node-source
+edits found implementations for candidate fallback, indexed generation reads,
+placement fallback, bounded legacy-journal loading, and relay overflow cleanup.
+The legacy authority check still accepts an ambiguous A -> B -> A member-roster
+history as the earliest A epoch. M5-78, M5-79, M5-80, M5-81, and M5-82 still
+need their stated scenario or measurement gates; M5-83 needs a source correction
+and regression; M5-84 is not complete. Milestone 5 remains open.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1258,6 +1265,16 @@ This review ran no builds, tests, daemons, runtime probes, or remote
 compilation. M5-77 remains historical evidence; Milestone 5 is reopened and
 requires these corrections plus the new M5-84 local closure gate.
 
+Source-only follow-up on 2026-09-25 found the M5-78 through M5-82 correction
+paths in the current source, but the requested persistent-head, long-history
+peer-lookup, unavailable-stale-group restore/recovery, measured large-corpus,
+and stalled-STOP overflow gates are still missing. M5-83 remains a source
+blocker: the local legacy-transition helper maps a format-4 checkpoint to the
+earliest matching member roster, so A -> B -> A history can conceal an epoch
+rollback to B. The complete M5-84 local gate must follow the final correction.
+This follow-up ran no builds, tests, daemons, runtime probes, or remote
+compilation.
+
 The M5-42 rejected-connection cleanup was source-reviewed and found to remove
 only the rejected connection while preserving accepted siblings. This review
 ran no builds, tests, daemons, runtime probes, or remote compilation.
@@ -1706,7 +1723,10 @@ found M5-68 through M5-76. All nine source blockers are corrected, and a
 follow-up source-only review finds no remaining implementation blocker.
 The complete local M5-77 workspace/provisioned closure gate passed on
 2026-09-22. Fresh source-only review on 2026-09-25 found M5-78 through M5-83;
-Milestone 5 remains open on those corrections and the M5-84 closure gate.
+the correction series addresses M5-78 through M5-82 in source, but their
+specific gates remain outstanding. The repeated-roster legacy epoch rollback
+still blocks M5-83, and the M5-84 closure gate has not run on the final tree.
+Milestone 5 remains open.
 Milestone 6 waits.
 
 - Replace deterministic fillers with cross-user sector packing and fair
