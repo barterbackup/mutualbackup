@@ -10545,7 +10545,7 @@ async fn recover_variable_group_plan(
                 _ => None,
             })
             .context("coverage-only recovery plan has no live information shard")?;
-        reconstruct_variable_shard_from_peers(
+        reconstruct_variable_shard_from_peers_requiring_quorum(
             node,
             p2p,
             &plan.group,
@@ -10865,6 +10865,48 @@ async fn reconstruct_variable_shard_from_peers(
     roster: &[GuildPeer],
     deferred_holders: &Mutex<BTreeSet<NodeId>>,
 ) -> Result<Vec<u8>> {
+    reconstruct_variable_shard_from_peers_with_quorum(
+        node,
+        p2p,
+        group,
+        target_index,
+        roster,
+        deferred_holders,
+        false,
+    )
+    .await
+}
+
+async fn reconstruct_variable_shard_from_peers_requiring_quorum(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    group: &CodingGroupV2,
+    target_index: usize,
+    roster: &[GuildPeer],
+    deferred_holders: &Mutex<BTreeSet<NodeId>>,
+) -> Result<Vec<u8>> {
+    reconstruct_variable_shard_from_peers_with_quorum(
+        node,
+        p2p,
+        group,
+        target_index,
+        roster,
+        deferred_holders,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconstruct_variable_shard_from_peers_with_quorum(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    group: &CodingGroupV2,
+    target_index: usize,
+    roster: &[GuildPeer],
+    deferred_holders: &Mutex<BTreeSet<NodeId>>,
+    require_quorum: bool,
+) -> Result<Vec<u8>> {
     group.validate()?;
     if target_index >= group.roles.len() {
         bail!("target shard index is outside its variable coding group");
@@ -10886,7 +10928,8 @@ async fn reconstruct_variable_shard_from_peers(
         .lock()
         .map_err(|_| anyhow::anyhow!("shard holder health lock is poisoned"))?
         .contains(&target_holder);
-    if target_holder != local_id
+    if !require_quorum
+        && target_holder != local_id
         && target_is_preferred
         && roster
             .iter()
@@ -16490,6 +16533,147 @@ mod tests {
         assert!(!requested.is_empty());
         assert!(requested.iter().all(|group_id| *group_id == replacement_id));
         assert!(!requested.contains(&old_id));
+        drop(p2p);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coverage_only_recovery_requires_a_live_coding_quorum() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let local = Seed::from_bytes([211; 32]);
+        let local_id = KeyMaterial::from_seed(&local).node_id();
+        let guild_id = [212; 32];
+        let mut peers = (213_u8..217)
+            .map(|value| {
+                let keys = KeyMaterial::from_seed(&Seed::from_bytes([value; 32]));
+                GuildPeer {
+                    member: Member {
+                        node_id: keys.node_id(),
+                        recovery_public_key: keys.recovery_public_key(),
+                        failure_domain: format!("coding-domain-{value}"),
+                    },
+                    endpoints: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        peers.sort_by_key(|peer| peer.member.node_id);
+        assert!(peers.iter().all(|peer| peer.member.node_id != local_id));
+        let first_bytes = vec![21; V1_SECTOR_SIZE];
+        let second_bytes = vec![22; V1_SECTOR_SIZE];
+        let first = SectorRef {
+            id: [217; 32],
+            root: sector_root(&first_bytes),
+            logical_len: V1_SECTOR_SIZE as u32,
+        };
+        let second = SectorRef {
+            id: [218; 32],
+            root: sector_root(&second_bytes),
+            logical_len: V1_SECTOR_SIZE as u32,
+        };
+        let first_commitment = merkle_commit(&first_bytes).unwrap();
+        let second_commitment = merkle_commit(&second_bytes).unwrap();
+        let lane = variable_coding_lane(
+            guild_id,
+            Uuid::from_bytes([219; 16]),
+            0,
+            &[
+                VariableInformationInput {
+                    owner: peers[0].member.node_id,
+                    sector: &first,
+                    commitment: &first_commitment,
+                },
+                VariableInformationInput {
+                    owner: peers[1].member.node_id,
+                    sector: &second,
+                    commitment: &second_commitment,
+                },
+            ],
+            &peers,
+        )
+        .unwrap();
+        let group = materialize_variable_lane(&lane, &[first_bytes.clone(), second_bytes.clone()]);
+        assert_eq!(group.profile.data_shards, 2);
+        assert_eq!(group.profile.parity_shards, 2);
+        let shards = encode(group.profile, vec![first_bytes.clone(), second_bytes]).unwrap();
+        let node = Arc::new(Mutex::new(Node::open(temp.path(), local).unwrap()));
+        let (commands, mut commands_rx) = mpsc::channel(16);
+        let (request_cancellations, _cancellations_rx) = mpsc::unbounded_channel();
+        let (_port_state, port_mapping_listener_state) =
+            watch::channel(PortMappingListenerState::Pending);
+        let p2p = P2pClient {
+            local_peer_id: local_id.libp2p_peer_id().unwrap(),
+            commands,
+            request_cancellations,
+            outbound_permits: Arc::new(Semaphore::new(8)),
+            cold_recovery_permit: Arc::new(Semaphore::new(1)),
+            port_mapping_listener_state,
+        };
+        let second_holder_available = Arc::new(AtomicBool::new(false));
+        let worker = tokio::spawn({
+            let group = group.clone();
+            let second_holder_available = second_holder_available.clone();
+            async move {
+                while let Some(command) = commands_rx.recv().await {
+                    let Command::Request {
+                        recipient,
+                        request,
+                        response,
+                        ..
+                    } = command
+                    else {
+                        panic!("unexpected coverage probe command");
+                    };
+                    let reply = match *request {
+                        PeerRequest::GetVariableShard {
+                            guild_id: requested_guild,
+                            group_id,
+                            shard_index,
+                        } if requested_guild == guild_id && group_id == group.id => {
+                            let index = usize::from(shard_index);
+                            if variable_shard_holder(&group.roles[index]) == recipient
+                                && (index == 0
+                                    || (index == 1
+                                        && second_holder_available.load(Ordering::SeqCst)))
+                            {
+                                Ok(PeerResponse::Bytes(shards[index].clone()))
+                            } else {
+                                Err(anyhow::anyhow!("shard holder is unavailable"))
+                            }
+                        }
+                        _ => Err(anyhow::anyhow!("unexpected coverage probe request")),
+                    };
+                    let _ = response.send(reply);
+                }
+            }
+        });
+        assert!(
+            reconstruct_variable_shard_from_peers_requiring_quorum(
+                node.clone(),
+                &p2p,
+                &group,
+                0,
+                &peers,
+                &Mutex::new(BTreeSet::new()),
+            )
+            .await
+            .is_err()
+        );
+        second_holder_available.store(true, Ordering::SeqCst);
+        assert_eq!(
+            reconstruct_variable_shard_from_peers_requiring_quorum(
+                node,
+                &p2p,
+                &group,
+                0,
+                &peers,
+                &Mutex::new(BTreeSet::new()),
+            )
+            .await
+            .unwrap(),
+            first_bytes
+        );
         drop(p2p);
         worker.await.unwrap();
     }
