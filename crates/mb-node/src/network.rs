@@ -3028,6 +3028,61 @@ mod tests {
     }
 
     #[test]
+    fn peer_checkpoint_generation_reads_long_committed_history_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("node");
+        let seed = Seed::from_bytes([226; 32]);
+        let mut node = Node::open(&path, seed.clone()).unwrap();
+        let (guild_id, hashes) =
+            crate::node::tests::install_long_committed_checkpoint_history(&mut node, &seed);
+        drop(node);
+
+        let node = Arc::new(Mutex::new(Node::open(&path, seed).unwrap()));
+        let (local_id, reader_config) = {
+            let guard = node.lock().unwrap();
+            (guard.keys().node_id(), guard.reader_config())
+        };
+        let service = Arc::new(NodeService {
+            reader_config,
+            writer: node,
+            readers: Mutex::new(Vec::new()),
+            max_readers: 2,
+            active_readers: AtomicUsize::new(0),
+            coding_paths: RwLock::new(BTreeMap::new()),
+        });
+        let caller = KeyMaterial::from_seed(&Seed::from_bytes([228; 32]));
+        let config = NodeServerConfig {
+            listen: free_address(),
+            public_endpoint: "tcp://127.0.0.1:1".to_owned(),
+            failure_domain: "checkpoint-history-peer".to_owned(),
+            trusted_coordinator: caller.node_id(),
+            max_connections: 2,
+        };
+        let lookup = |generation| {
+            let request = make_peer_request(
+                &caller,
+                Some(local_id),
+                PeerRequest::GetCheckpointAtGeneration {
+                    guild_id,
+                    generation,
+                },
+            )
+            .unwrap();
+            let response = process_peer_request(service.clone(), &config, request).unwrap();
+            match response.value.result.unwrap() {
+                PeerResponse::CheckpointHead(head) => head.map(|head| head.hash),
+                other => panic!("unexpected checkpoint generation response: {other:?}"),
+            }
+        };
+        for (index, hash) in hashes.into_iter().enumerate() {
+            assert_eq!(lookup(index as u64 + 1), Some(hash));
+        }
+        for _ in 0..128 {
+            assert_eq!(lookup(1_025), None);
+        }
+    }
+
+    #[test]
     fn reader_pool_enforces_its_active_limit_and_recovers() {
         let temp = tempfile::tempdir().unwrap();
         let node = Arc::new(Mutex::new(

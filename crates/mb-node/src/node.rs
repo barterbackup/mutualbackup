@@ -10541,13 +10541,11 @@ pub(crate) mod tests {
         assert!(node.checkpoint_catchup_state(&guild_id).unwrap().is_none());
     }
 
-    #[test]
-    fn committed_checkpoint_generation_lookup_serves_long_history_after_restart() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("node");
-        let seed = Seed::from_bytes([226; 32]);
-        let mut node = Node::open(&path, seed.clone()).unwrap();
-        let revision = install_public_restore_fixture(&mut node, &seed);
+    pub(crate) fn install_long_committed_checkpoint_history(
+        node: &mut Node,
+        seed: &Seed,
+    ) -> ([u8; 32], Vec<[u8; 32]>) {
+        let revision = install_public_restore_fixture(node, seed);
         let guild_id = revision.value.guild_id;
         let mut previous = node.current_checkpoint(guild_id).unwrap().unwrap();
         let signer_keys = std::iter::once(seed.clone())
@@ -10579,22 +10577,7 @@ pub(crate) mod tests {
             hashes.push(hash);
             previous = next;
         }
-        drop(node);
-
-        let node = Node::open(&path, seed).unwrap();
-        for (index, hash) in hashes.into_iter().enumerate() {
-            assert_eq!(
-                node.checkpoint_at_generation(&guild_id, index as u64 + 1)
-                    .unwrap(),
-                Some(hash)
-            );
-        }
-        for _ in 0..128 {
-            assert_eq!(
-                node.checkpoint_at_generation(&guild_id, 1_025).unwrap(),
-                None
-            );
-        }
+        (guild_id, hashes)
     }
 
     #[test]
