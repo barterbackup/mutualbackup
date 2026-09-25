@@ -15533,6 +15533,262 @@ mod tests {
         worker.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn packed_snapshot_restore_uses_replacement_when_older_group_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([226; 32]);
+        let node_path = temp.path().join("node");
+        let mut local = Node::open(&node_path, seed.clone()).unwrap();
+        let revision = crate::node::tests::install_public_restore_fixture(&mut local, &seed);
+        let guild_id = revision.value.guild_id;
+        let certificate = local.installed_guild_certificate().unwrap().unwrap();
+        let peers = certificate
+            .genesis
+            .members
+            .iter()
+            .cloned()
+            .map(|member| GuildPeer {
+                member,
+                endpoints: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        local
+            .adopt_recovered_guild(certificate.clone(), peers.clone())
+            .unwrap();
+        let reference = revision.value.metadata_sectors[0].clone();
+        let source_bytes = local.sector_for_guild(&guild_id, &reference.id).unwrap();
+        let packed = pack_incremental(
+            PackingProfile {
+                format_version: 1,
+                sector_size: V1_SECTOR_SIZE as u32,
+                slot_size: 16 * 1024,
+            },
+            None,
+            vec![PackingInput {
+                owner: revision.value.owner,
+                protected_root: packing_protected_root(revision.value.protected_root_id),
+                object_id: reference.id,
+                source_commitment: Some(merkle_commit(&source_bytes).unwrap()),
+                bytes: source_bytes,
+            }],
+        )
+        .unwrap();
+        assert!(packed.sectors.len() >= 2);
+        let packed_references = packed
+            .sectors
+            .iter()
+            .map(|sector| SectorRef {
+                id: sector.descriptor.id,
+                root: sector_root(&sector.bytes),
+                logical_len: sector.bytes.len() as u32,
+            })
+            .collect::<Vec<_>>();
+        let mut replacement_peers = peers.clone();
+        for (index, peer) in replacement_peers.iter_mut().enumerate() {
+            peer.member.failure_domain = format!("replacement-domain-{index}");
+        }
+        let mut old_groups = Vec::new();
+        let mut replacement_groups = Vec::new();
+        for (index, (sector, packed_reference)) in
+            packed.sectors.iter().zip(&packed_references).enumerate()
+        {
+            let input = [VariableInformationInput {
+                owner: revision.value.owner,
+                sector: packed_reference,
+                commitment: &sector.descriptor.commitment,
+            }];
+            let old_lane = variable_coding_lane(
+                guild_id,
+                Uuid::from_bytes([241; 16]),
+                index as u64,
+                &input,
+                &peers,
+            )
+            .unwrap();
+            old_groups.push(materialize_variable_lane(
+                &old_lane,
+                std::slice::from_ref(&sector.bytes),
+            ));
+            let replacement_lane = variable_coding_lane(
+                guild_id,
+                Uuid::from_bytes([242; 16]),
+                index as u64,
+                &input,
+                &replacement_peers,
+            )
+            .unwrap();
+            replacement_groups.push(materialize_variable_lane(
+                &replacement_lane,
+                std::slice::from_ref(&sector.bytes),
+            ));
+        }
+        let mut coding_groups = old_groups
+            .iter()
+            .chain(&replacement_groups)
+            .enumerate()
+            .map(|(index, group)| mb_core::RetainedCodingGroup {
+                group: group.clone(),
+                added_at_event: index as u64 + 1,
+                retired_at_event: None,
+                retain_through_event: None,
+            })
+            .collect::<Vec<_>>();
+        coding_groups.sort_by_key(|retained| retained.group.id);
+        let state = DynamicGuildState {
+            event_sequence: coding_groups.len() as u64,
+            event_head: [243; 32],
+            coding_groups,
+            ..DynamicGuildState::new(
+                guild_id,
+                certificate.hash().unwrap(),
+                QuorumPolicy {
+                    format_version: 1,
+                    rule: QuorumRule::Unanimous,
+                },
+                replacement_peers
+                    .iter()
+                    .map(|peer| peer.member.clone())
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let first = local.current_checkpoint(guild_id).unwrap().unwrap();
+        let mut next = first.clone();
+        next.checkpoint.format_version = 7;
+        next.checkpoint.generation = 2;
+        next.checkpoint.parent = Some(first.hash().unwrap());
+        next.checkpoint.coding_groups.clear();
+        next.checkpoint.authority = Some(CheckpointAuthority {
+            format_version: 1,
+            membership_epoch: state.membership_epoch,
+            quorum: state.quorum,
+        });
+        next.checkpoint.packing_catalog = Some(packed.catalog.clone());
+        let mut upgraded_revision = revision.value.clone();
+        upgraded_revision.format_version = 4;
+        upgraded_revision.sector_commitments = Some(vec![
+            packed.catalog.source_authentication.as_ref().unwrap()[0]
+                .source_commitment
+                .clone(),
+        ]);
+        upgraded_revision.writer_signature.clear();
+        upgraded_revision
+            .sign_writer(&ed25519_dalek::SigningKey::from_bytes(&[71; 32]))
+            .unwrap();
+        next.checkpoint.revisions = vec![
+            SignedRecord::sign(
+                mb_core::USER_REVISION_DOMAIN,
+                upgraded_revision,
+                local.keys(),
+            )
+            .unwrap(),
+        ];
+        next.signatures.clear();
+        for signer_seed in std::iter::once(seed.clone())
+            .chain((0_u8..4).map(|index| Seed::from_bytes([index + 228; 32])))
+        {
+            next.add_signature(&KeyMaterial::from_seed(&signer_seed))
+                .unwrap();
+        }
+        crate::node::tests::install_test_checkpoint_and_dynamic_state(&mut local, &next, &state);
+        local.forget_local_sector(&reference.id).unwrap();
+        drop(local);
+
+        let replacement_shards = replacement_groups
+            .into_iter()
+            .map(|group| {
+                let information = group
+                    .roles
+                    .iter()
+                    .take(usize::from(group.profile.data_shards))
+                    .map(|role| match role {
+                        ShardRoleV2::Information(info) if info.sector.virtual_zero => {
+                            vec![0; group.profile.shard_size as usize]
+                        }
+                        ShardRoleV2::Information(info) => packed
+                            .sectors
+                            .iter()
+                            .find(|sector| sector.descriptor.id == info.sector.id)
+                            .unwrap()
+                            .bytes
+                            .clone(),
+                        _ => panic!("unexpected replacement information role"),
+                    })
+                    .collect();
+                let shards = encode(group.profile, information).unwrap();
+                (group.id, (group, shards))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let old_ids = old_groups
+            .iter()
+            .map(|group| group.id)
+            .collect::<BTreeSet<_>>();
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let (commands, mut commands_rx) = mpsc::channel(16);
+        let (request_cancellations, _cancellations_rx) = mpsc::unbounded_channel();
+        let (_port_state, port_mapping_listener_state) =
+            watch::channel(PortMappingListenerState::Pending);
+        let local_id = KeyMaterial::from_seed(&seed).node_id();
+        let p2p = P2pClient {
+            local_peer_id: local_id.libp2p_peer_id().unwrap(),
+            commands,
+            request_cancellations,
+            outbound_permits: Arc::new(Semaphore::new(8)),
+            cold_recovery_permit: Arc::new(Semaphore::new(1)),
+            port_mapping_listener_state,
+        };
+        let worker = tokio::spawn({
+            let requested = requested.clone();
+            async move {
+                while let Some(command) = commands_rx.recv().await {
+                    let Command::Request {
+                        recipient,
+                        request,
+                        response,
+                        ..
+                    } = command
+                    else {
+                        panic!("unexpected restore command");
+                    };
+                    let reply = match *request {
+                        PeerRequest::GetVariableShard {
+                            guild_id: requested_guild,
+                            group_id,
+                            shard_index,
+                        } if requested_guild == guild_id => {
+                            requested.lock().unwrap().push(group_id);
+                            if let Some((group, shards)) = replacement_shards.get(&group_id)
+                                && variable_shard_holder(&group.roles[usize::from(shard_index)])
+                                    == recipient
+                            {
+                                Ok(PeerResponse::Bytes(
+                                    shards[usize::from(shard_index)].clone(),
+                                ))
+                            } else {
+                                Err(anyhow::anyhow!("old placement is unavailable"))
+                            }
+                        }
+                        _ => Err(anyhow::anyhow!("unexpected restore request")),
+                    };
+                    let _ = response.send(reply);
+                }
+            }
+        });
+        let node = Arc::new(Mutex::new(Node::open(&node_path, seed).unwrap()));
+        let restored = temp.path().join("restored");
+        restore_snapshot_with_p2p(node, &p2p, None, &restored)
+            .await
+            .unwrap();
+        assert!(restored.is_dir());
+        {
+            let requested = requested.lock().unwrap();
+            assert!(!requested.is_empty());
+            assert!(requested.iter().all(|group_id| !old_ids.contains(group_id)));
+        }
+        drop(p2p);
+        worker.await.unwrap();
+    }
+
     #[test]
     fn production_variable_lane_tracks_dynamic_roster_geometry() {
         let peers = (0_u8..6)

@@ -11242,6 +11242,38 @@ pub(crate) mod tests {
         revision
     }
 
+    pub(crate) fn install_test_checkpoint_and_dynamic_state(
+        node: &mut Node,
+        checkpoint: &QuorumCheckpoint,
+        state: &DynamicGuildState,
+    ) {
+        checkpoint.verify().unwrap();
+        state.validate().unwrap();
+        let guild_id = checkpoint.checkpoint.guild_id;
+        let parent = node.current_checkpoint(guild_id).unwrap().unwrap();
+        let parent_hash = parent.hash().unwrap();
+        assert_eq!(checkpoint.checkpoint.parent, Some(parent_hash));
+        node.control
+            .put_record(
+                "guild-dynamic-state",
+                b"primary",
+                &canonical_bytes(state).unwrap(),
+            )
+            .unwrap();
+        let hash = checkpoint.hash().unwrap();
+        node.control
+            .commit_checkpoint(
+                &guild_id,
+                checkpoint.checkpoint.generation,
+                Some(&parent_hash),
+                &hash,
+                &canonical_bytes(&checkpoint.checkpoint).unwrap(),
+                &canonical_bytes(checkpoint).unwrap(),
+                false,
+            )
+            .unwrap();
+    }
+
     #[test]
     fn data_directory_has_one_live_owner() {
         let temp = tempfile::tempdir().unwrap();
