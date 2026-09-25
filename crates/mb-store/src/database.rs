@@ -15,6 +15,7 @@ use crate::SCHEMA_VERSION;
 
 const CONTROL_DATABASE_ID: &[u8] = b"control.db";
 const CHECKPOINT_GENERATION_KIND: &str = "guild-checkpoint-generation";
+const CHECKPOINT_LEGACY_EPOCH_KIND: &str = "guild-checkpoint-legacy-epoch";
 pub type CheckpointRow = (u64, [u8; 32], Vec<u8>);
 pub type ProtocolRecordRow = (Vec<u8>, Vec<u8>);
 
@@ -994,7 +995,34 @@ impl ControlStore {
         checkpoint_certificate_bytes: &[u8],
         require_signature_lock: bool,
     ) -> Result<(), DatabaseError> {
+        self.commit_checkpoint_with_legacy_epoch(
+            guild_id,
+            generation,
+            parent,
+            checkpoint_hash,
+            checkpoint_body_bytes,
+            checkpoint_certificate_bytes,
+            require_signature_lock,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_checkpoint_with_legacy_epoch(
+        &mut self,
+        guild_id: &[u8; 32],
+        generation: u64,
+        parent: Option<&[u8; 32]>,
+        checkpoint_hash: &[u8; 32],
+        checkpoint_body_bytes: &[u8],
+        checkpoint_certificate_bytes: &[u8],
+        require_signature_lock: bool,
+        legacy_epoch: Option<u64>,
+    ) -> Result<(), DatabaseError> {
         let generation_i64 = i64::try_from(generation).map_err(|_| DatabaseError::Integrity)?;
+        if legacy_epoch == Some(0) {
+            return Err(DatabaseError::Integrity);
+        }
         let transaction = self.connection.transaction()?;
         if require_signature_lock {
             let locked = checkpoint_row(&transaction, "checkpoint_signature_locks", guild_id)?;
@@ -1025,6 +1053,9 @@ impl ControlStore {
                     )?;
                 }
                 insert_checkpoint_generation(&transaction, guild_id, generation, checkpoint_hash)?;
+                if let Some(epoch) = legacy_epoch {
+                    insert_checkpoint_legacy_epoch(&transaction, checkpoint_hash, epoch)?;
+                }
                 transaction.commit()?;
                 return Ok(());
             }
@@ -1058,6 +1089,9 @@ impl ControlStore {
             ],
         )?;
         insert_checkpoint_generation(&transaction, guild_id, generation, checkpoint_hash)?;
+        if let Some(epoch) = legacy_epoch {
+            insert_checkpoint_legacy_epoch(&transaction, checkpoint_hash, epoch)?;
+        }
         if !require_signature_lock {
             upsert_checkpoint_signature_lock(
                 &transaction,
@@ -1217,6 +1251,27 @@ fn insert_checkpoint_generation(
             CHECKPOINT_GENERATION_KIND,
             record_id.as_slice(),
             checkpoint_hash.as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(DatabaseError::Conflict);
+    }
+    Ok(())
+}
+
+fn insert_checkpoint_legacy_epoch(
+    transaction: &rusqlite::Transaction<'_>,
+    checkpoint_hash: &[u8; 32],
+    epoch: u64,
+) -> Result<(), DatabaseError> {
+    let changed = transaction.execute(
+        "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+         ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes
+         WHERE protocol_records.bytes = excluded.bytes",
+        params![
+            CHECKPOINT_LEGACY_EPOCH_KIND,
+            checkpoint_hash.as_slice(),
+            epoch.to_be_bytes().as_slice(),
         ],
     )?;
     if changed != 1 {
@@ -3994,6 +4049,65 @@ mod tests {
         store
             .lock_checkpoint_signature(&guild_id, 2, Some(&first_hash), &second_hash, b"body-2")
             .unwrap();
+    }
+
+    #[test]
+    fn legacy_checkpoint_epoch_witness_commits_atomically() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([70; 32]));
+        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let guild_id = [71; 32];
+        let first_hash = [72; 32];
+        let second_hash = [73; 32];
+        store
+            .commit_checkpoint_with_legacy_epoch(
+                &guild_id,
+                1,
+                None,
+                &first_hash,
+                b"first-body",
+                b"first-certificate",
+                false,
+                Some(1),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get_record(CHECKPOINT_LEGACY_EPOCH_KIND, &first_hash)
+                .unwrap(),
+            Some(1_u64.to_be_bytes().to_vec())
+        );
+        store
+            .put_record(
+                CHECKPOINT_LEGACY_EPOCH_KIND,
+                &second_hash,
+                &3_u64.to_be_bytes(),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.commit_checkpoint_with_legacy_epoch(
+                &guild_id,
+                2,
+                Some(&first_hash),
+                &second_hash,
+                b"second-body",
+                b"second-certificate",
+                false,
+                Some(2),
+            ),
+            Err(DatabaseError::Conflict)
+        ));
+        assert_eq!(
+            store.checkpoint_head(&guild_id).unwrap().map(|row| row.1),
+            Some(first_hash)
+        );
+        assert_eq!(store.checkpoint_at_generation(&guild_id, 2).unwrap(), None);
+        assert!(
+            store
+                .get_record("guild-checkpoint", &second_hash)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
