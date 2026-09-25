@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (passed)
+## Milestone 5 guild geometry and coding protocol (reopened)
 
 Source-only review of `8135e0b..da8974a` on 2026-09-18 found the M5-36 through
 M5-44 blockers below; all are now corrected. The production gate recorded in
@@ -591,8 +591,11 @@ fresh source-only review of `81ec33b..b65c79a` on 2026-09-22 found M5-68 through
 M5-76 below and reopened Milestone 5. Those source blockers are corrected. A
 follow-up source-only review found no remaining implementation blocker. The
 complete M5-77 local workspace/provisioned closure gate passed on 2026-09-22,
-so Milestone 5 is closed and Milestone 6 is next. No remote compilation server
-was used.
+but source-only review of `b95811b..168945a` on 2026-09-25 found the remaining
+M5-78 through M5-83 blockers below and reopened Milestone 5. M5-77 remains
+historical gate evidence for its exact tree; Milestone 6 waits for corrections
+and a new closure gate. The fresh review ran no builds, tests, daemons, runtime
+probes, or remote compilation.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -1735,7 +1738,86 @@ node Clippy gate passed locally. No remote compilation server was used.
   five-daemon namespace/NAT/DHT recovery path. The five-daemon scenario passed
   in 1,359.10 seconds; the disposable filesystem was unmounted and removed.
   All compilation and execution were local; no remote compilation server was
-  used. Milestone 5 is closed.
+  used. Later source review reopened Milestone 5.
+
+- [ ] **M5-78 / P1 — Try a lower complete checkpoint candidate after a higher one fails.**
+  `sync_checkpoint_head_once` selects the highest currently authorized advertised
+  certificate (`crates/mb-node/src/network/p2p.rs:7191`) but clears catch-up and
+  returns on missing generation quorum, unavailable link, or failed installation
+  (`:7250`–`:7302`). A recovered peer may legitimately advertise a high certified
+  head without intermediate certificate records, while another peer has a lower
+  complete chain. Each pass reselects the same high candidate, so the lower head
+  is never installed. Continue through other candidates in the same bounded pass
+  or persist a bounded rejection cooldown; gate a persistent incomplete high
+  head alongside a reachable complete lower head across restart.
+
+- [ ] **M5-79 / P2 — Serve checkpoint generation lookups without scanning all history.**
+  Each `GetCheckpointAtGeneration` loads every retained `guild-checkpoint`
+  certificate into memory, decodes it, and verifies its signatures
+  (`crates/mb-node/src/node.rs:9928`; `crates/mb-store/src/database.rs:346`).
+  A 1,024-link catch-up repeats that full-history scan at every current peer for
+  every link, so CPU work is quadratic in a long history; one authorized peer
+  can also issue repeated absent-generation lookups. Add an atomically maintained
+  generation-to-hash index or an equivalently bounded committed-history lookup.
+  Gate long-history catch-up and repeated lookups with bounded reads and memory.
+
+- [ ] **M5-80 / P1 — Use healthy replacement groups for restore and cold recovery.**
+  M5-74's all-placement fallback covers backup packing, but ordinary packed
+  snapshot restore still selects the first matching group from all retained
+  groups, including retired ones (`crates/mb-node/src/network/p2p.rs:10897`).
+  Cold guild recovery first requires every matching retained group to reconstruct
+  (`:10218`–`:10267`) and then chooses the first group for each packed cache
+  descriptor (`:10293`–`:10316`). During stale/replacement overlap, an old group
+  with fewer than `k` reachable shards can fail restore or recovery despite a
+  current certified replacement with a valid `k`. Prefer current active geometry,
+  try every matching certified placement, and require only enough valid current
+  coverage. Gate both restore and seed recovery with the stale group ordered
+  first and unavailable.
+
+- [ ] **M5-81 / P2 — Bound legacy attestation lookup per packing pass.**
+  For every retained legacy source, production packing calls
+  `legacy_source_evidence` (`crates/mb-node/src/network/p2p.rs:12075`), which
+  loads, decodes, and signature-verifies the entire durable attestation journal
+  before checking the prior catalog's current-epoch evidence (`:12359`;
+  `crates/mb-node/src/node.rs:3669`). With `N` attested legacy sources and a
+  journal proportional to `N`, an unchanged backup does quadratic full-journal
+  work despite metadata-only packed advancement. Index attestations by source,
+  or load and index the journal once per packing pass; check valid prior-catalog
+  evidence before scanning durable history. Gate a large unchanged mixed corpus
+  with bounded row reads, signature checks, and peak memory.
+
+- [ ] **M5-82 / P1 — Report relay outbound worker overflow and release its circuit.**
+  Guild relay configuration permits 32 circuits in the tested setting
+  (`crates/mb-node/src/network/p2p.rs:697`), while a destination handler has
+  only ten concurrent outbound STOP workers
+  (`vendor/libp2p-relay/src/behaviour/handler.rs:55`). If the eleventh stream
+  arrives while ten handshakes stall, `try_push` rejects it but the handler still
+  inserts its request into `active_connect_requests` (`handler.rs:446`–`:463`).
+  No worker can emit a result, leaving the source request and an `Accepting`
+  circuit slot occupied until a connection closes. Send an explicit failure to
+  the behaviour on overflow and avoid retaining the rejected request. Gate more
+  than ten simultaneous stalled STOP handshakes on one destination connection,
+  then prove the rejected circuit and shared capacity are released.
+
+- [ ] **M5-83 / P1 — Reject checkpoint authority epochs that move backward.**
+  A nonfinal catch-up link may use any authority found anywhere in guild event
+  history (`crates/mb-node/src/node.rs:6032`–`:6069`, `:6615`–`:6643`), while
+  `validate_checkpoint_transition` checks its parent and state but never
+  compares consecutive authority epochs (`:6678`–`:6825`). A certificate chain
+  with A at generation 1, B after membership rotation at generation 2, revoked
+  A at generation 3, and current B at generation 4 passes these local checks if
+  signed certificates and peer responses are supplied. The third checkpoint
+  cannot be an honestly signed pre-revocation successor of B, yet catch-up
+  accepts it as historical. Require authority epochs to be nondecreasing along
+  exact-parent links, including the legacy format transition. Gate this chain
+  and valid forward A-to-B catch-up across restart.
+
+- [ ] **M5-84 / gate — Recheck Milestone 5 after M5-78 through M5-83.**
+  After correcting these source blockers, run a fresh source review, formatting,
+  locked all-target workspace tests, warning-free locked all-target workspace
+  Clippy, Docker lab safety, and the complete provisioned Btrfs/network
+  acceptance script on a fresh disposable local filesystem. No remote
+  compilation server may be used.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
