@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (reopened)
+## Milestone 5 guild geometry and coding protocol (closed 2026-09-25)
 
 Source-only review of `8135e0b..da8974a` on 2026-09-18 found the M5-36 through
 M5-44 blockers below; all are now corrected. The production gate recorded in
@@ -622,6 +622,9 @@ M5-88 closure gate passed on 2026-09-25 for its source tree. A further
 source-only review found M5-89 and M5-90 below, reopening Milestone 5; Milestone
 6 waits. These source-only reviews ran no builds, tests, daemons, runtime
 probes, or remote compilation.
+Commits `e63d538` and `09e9379` correct M5-89 and M5-90, and the complete
+M5-91 local gate passed on the latter source tree. Milestone 5 is closed;
+Milestone 6 is next.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -2035,13 +2038,22 @@ node Clippy gate passed locally. No remote compilation server was used.
   the eight-group in-flight bound, and network recovery that requests shards
   only from its healthy replacement.
 
-- [ ] **M5-91 / gate — Recheck Milestone 5 after M5-89 and M5-90.**
+- [x] **M5-91 / gate — Recheck Milestone 5 after M5-89 and M5-90.**
   After correcting both source blockers, run fresh source review, formatting,
   locked all-target workspace tests, warning-free locked all-target workspace
   Clippy, Docker lab safety, and the complete provisioned Btrfs/network
   acceptance script on a fresh disposable local filesystem. Build and run
   locally; do not use a remote compilation server. M5-88 remains historical
   evidence for its exact source tree.
+  Fresh source review found no remaining blocker. On source commit `09e9379`,
+  `cargo fmt --all -- --check`, `cargo test --locked --workspace --all-targets`,
+  `cargo clippy --locked --workspace --all-targets -- -D warnings`, and
+  `scripts/docker-lab-safety-test.sh` passed locally. The complete
+  `scripts/reflink-acceptance.sh` passed on a fresh disposable 8 GiB local
+  Btrfs image, including its provisioned filesystem tests, repeated multi-owner
+  QUIC backups, and five-daemon seed/DHT recovery smoke test. The mount, loop
+  device, image, and smoke-test namespaces were removed. No remote compilation
+  server was used.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
