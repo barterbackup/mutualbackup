@@ -7174,7 +7174,7 @@ async fn sync_checkpoint_head_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> R
     let mut attempted = BTreeSet::new();
     let mut last_error = None;
     if let Some((state, source)) = catchup {
-        attempted.insert(state.target_hash);
+        attempted.insert((state.target_hash, source));
         match advance_checkpoint_catchup(
             node.clone(),
             p2p,
@@ -7211,7 +7211,7 @@ async fn sync_checkpoint_head_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> R
     }
     candidates.sort();
     for (std::cmp::Reverse(generation), preferred_source, head_hash) in candidates {
-        if !attempted.insert(head_hash) {
+        if !attempted.insert((head_hash, preferred_source)) {
             continue;
         }
         let mut ordered_sources = Vec::with_capacity(sources.len());
@@ -13943,8 +13943,7 @@ mod tests {
         worker.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn incomplete_high_checkpoint_head_yields_to_complete_lower_head_across_restart() {
+    async fn checkpoint_head_fallback_case(same_head: bool, resume_first: bool) {
         let temp = tempfile::tempdir().unwrap();
         let seed = Seed::from_bytes([226; 32]);
         let mut source = Node::open(temp.path().join("source"), seed.clone()).unwrap();
@@ -14038,7 +14037,7 @@ mod tests {
             .map(KeyMaterial::node_id)
             .filter(|node_id| *node_id != target.keys().node_id())
             .collect::<Vec<_>>();
-        let high_source = source_ids[0];
+        let high_source = *source_ids.iter().min().unwrap();
         let pages = BTreeMap::from([
             (first_hash, canonical_bytes(&first).unwrap()),
             (lower_hash, canonical_bytes(&lower).unwrap()),
@@ -14071,7 +14070,7 @@ mod tests {
                     PeerRequest::GetCheckpointHead {
                         guild_id: requested,
                     } if requested == guild_id => {
-                        let (generation, hash) = if recipient == high_source {
+                        let (generation, hash) = if recipient == high_source && !same_head {
                             (3, higher_hash)
                         } else {
                             (2, lower_hash)
@@ -14108,6 +14107,15 @@ mod tests {
                 let _ = response.send(reply);
             }
         });
+        if resume_first {
+            assert_eq!(
+                target
+                    .begin_checkpoint_catchup(high_source, &lower)
+                    .unwrap()
+                    .target_hash,
+                lower_hash
+            );
+        }
         let target = Arc::new(Mutex::new(target));
         assert_eq!(
             sync_checkpoint_head_once(target.clone(), &p2p)
@@ -14129,11 +14137,12 @@ mod tests {
         );
         drop(target);
         let reopened = Arc::new(Mutex::new(Node::open(&target_path, seed).unwrap()));
-        assert!(
-            sync_checkpoint_head_once(reopened.clone(), &p2p)
-                .await
-                .is_err()
-        );
+        let repeated = sync_checkpoint_head_once(reopened.clone(), &p2p).await;
+        if same_head {
+            assert_eq!(repeated.unwrap(), 0);
+        } else {
+            assert!(repeated.is_err());
+        }
         assert_eq!(
             reopened.lock().unwrap().checkpoint_head(&guild_id).unwrap(),
             Some((2, lower_hash))
@@ -14149,6 +14158,21 @@ mod tests {
         drop(reopened);
         drop(p2p);
         worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_high_checkpoint_head_yields_to_complete_lower_head_across_restart() {
+        checkpoint_head_fallback_case(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn identical_head_retries_advertiser_with_complete_history() {
+        checkpoint_head_fallback_case(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn failed_resumed_head_retries_another_advertiser() {
+        checkpoint_head_fallback_case(true, true).await;
     }
 
     #[tokio::test]
