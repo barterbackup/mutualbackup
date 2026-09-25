@@ -7291,6 +7291,7 @@ async fn advance_checkpoint_catchup(
                 guild_id,
                 generation,
                 required_remote_endorsements,
+                state.1,
             )
             .await
             {
@@ -7353,6 +7354,7 @@ async fn checkpoint_generation_quorum(
     guild_id: [u8; 32],
     generation: u64,
     required: usize,
+    preferred_source: NodeId,
 ) -> Result<[u8; 32]> {
     if required == 0 {
         anyhow::bail!("checkpoint generation has no remote authority evidence");
@@ -7378,7 +7380,9 @@ async fn checkpoint_generation_quorum(
     }
     endorsements
         .into_iter()
-        .filter(|(_, endorsers)| endorsers.len() >= required)
+        .filter(|(_, endorsers)| {
+            endorsers.len() >= required && endorsers.contains(&preferred_source)
+        })
         .max_by_key(|(hash, endorsers)| (endorsers.len(), *hash))
         .map(|(hash, _)| hash)
         .context("checkpoint generation lacks current-authority endorsements")
@@ -13833,6 +13837,303 @@ mod tests {
                 .iter()
                 .all(|attestation| attestation.signer != removed_owner)
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_generation_quorum_stays_on_candidate_history() {
+        let sources = (0_u8..4)
+            .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([210 + index; 32])).node_id())
+            .collect::<Vec<_>>();
+        let first = [11; 32];
+        let second = [22; 32];
+        let replies = Arc::new(Mutex::new(BTreeMap::from([
+            (sources[0], Some(first)),
+            (sources[1], Some(first)),
+            (sources[2], Some(second)),
+            (sources[3], Some(second)),
+        ])));
+        let (commands, mut commands_rx) = mpsc::channel(8);
+        let (request_cancellations, _cancellations_rx) = mpsc::unbounded_channel();
+        let (_port_state, port_mapping_listener_state) =
+            watch::channel(PortMappingListenerState::Pending);
+        let local_id = KeyMaterial::from_seed(&Seed::from_bytes([209; 32])).node_id();
+        let p2p = P2pClient {
+            local_peer_id: local_id.libp2p_peer_id().unwrap(),
+            commands,
+            request_cancellations,
+            outbound_permits: Arc::new(Semaphore::new(4)),
+            cold_recovery_permit: Arc::new(Semaphore::new(1)),
+            port_mapping_listener_state,
+        };
+        let guild_id = [23; 32];
+        let worker = tokio::spawn({
+            let replies = replies.clone();
+            async move {
+                while let Some(command) = commands_rx.recv().await {
+                    let Command::Request {
+                        recipient,
+                        request,
+                        response,
+                        ..
+                    } = command
+                    else {
+                        panic!("unexpected peer command");
+                    };
+                    assert!(matches!(
+                        *request,
+                        PeerRequest::GetCheckpointAtGeneration {
+                            guild_id: requested,
+                            generation: 7,
+                        } if requested == guild_id
+                    ));
+                    let checkpoint = replies
+                        .lock()
+                        .unwrap()
+                        .get(&recipient)
+                        .copied()
+                        .flatten()
+                        .map(|hash| crate::network::wire::CheckpointHead {
+                            generation: 7,
+                            hash,
+                        });
+                    let _ = response.send(Ok(PeerResponse::CheckpointHead(checkpoint)));
+                }
+            }
+        });
+        assert_eq!(
+            checkpoint_generation_quorum(&p2p, &sources, guild_id, 7, 2, sources[0])
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            checkpoint_generation_quorum(&p2p, &sources, guild_id, 7, 2, sources[2])
+                .await
+                .unwrap(),
+            second
+        );
+        replies.lock().unwrap().insert(sources[0], None);
+        assert!(
+            checkpoint_generation_quorum(&p2p, &sources, guild_id, 7, 2, sources[0])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            checkpoint_generation_quorum(&p2p, &sources, guild_id, 7, 2, sources[2])
+                .await
+                .unwrap(),
+            second
+        );
+        drop(p2p);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_high_checkpoint_head_yields_to_complete_lower_head_across_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([226; 32]);
+        let mut source = Node::open(temp.path().join("source"), seed.clone()).unwrap();
+        let revision = crate::node::tests::install_public_restore_fixture(&mut source, &seed);
+        let guild_id = revision.value.guild_id;
+        let first = source.current_checkpoint(guild_id).unwrap().unwrap();
+        let certificate = source.installed_guild_certificate().unwrap().unwrap();
+        let peers = certificate
+            .genesis
+            .members
+            .iter()
+            .cloned()
+            .map(|member| GuildPeer {
+                member,
+                endpoints: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        drop(source);
+        let signer_keys = std::iter::once(seed.clone())
+            .chain((0_u8..4).map(|index| Seed::from_bytes([index + 228; 32])))
+            .map(|seed| KeyMaterial::from_seed(&seed))
+            .collect::<Vec<_>>();
+        let target_path = temp.path().join("target");
+        let mut target = Node::open(&target_path, seed.clone()).unwrap();
+        target.adopt_recovered_guild(certificate, peers).unwrap();
+        let install_event = |target: &mut Node, kind: mb_core::GuildEventKind| {
+            let state = target.dynamic_guild_state().unwrap().unwrap();
+            let event = GuildEvent {
+                format_version: 1,
+                guild_id,
+                sequence: state.event_sequence + 1,
+                parent: state.event_head,
+                kind,
+            };
+            let mut signatures = signer_keys
+                .iter()
+                .map(|keys| mb_core::sign_guild_event(&event, keys).unwrap())
+                .collect::<Vec<_>>();
+            signatures.sort_by_key(|signature| signature.signer);
+            target
+                .install_guild_event(QuorumGuildEvent { event, signatures })
+                .unwrap();
+        };
+        let writer = &first.checkpoint.writer_fences[0];
+        install_event(
+            &mut target,
+            mb_core::GuildEventKind::RotateWriterKey {
+                owner: writer.owner,
+                epoch: writer.epoch,
+                public_key: writer.public_key,
+            },
+        );
+        install_event(
+            &mut target,
+            mb_core::GuildEventKind::SetQuorum {
+                policy: QuorumPolicy {
+                    format_version: 1,
+                    rule: QuorumRule::Majority,
+                },
+            },
+        );
+        let current = target.dynamic_guild_state().unwrap().unwrap();
+        assert_eq!(current.membership_epoch, 2);
+        let mut lower = first.clone();
+        lower.checkpoint.format_version = 5;
+        lower.checkpoint.generation = 2;
+        lower.checkpoint.parent = Some(first.hash().unwrap());
+        lower.checkpoint.authority = Some(CheckpointAuthority {
+            format_version: 1,
+            membership_epoch: current.membership_epoch,
+            quorum: current.quorum,
+        });
+        lower.signatures.clear();
+        for keys in &signer_keys {
+            lower.add_signature(keys).unwrap();
+        }
+        lower.verify().unwrap();
+        let mut higher = lower.clone();
+        higher.checkpoint.generation = 3;
+        higher.checkpoint.parent = Some([99; 32]);
+        higher.signatures.clear();
+        for keys in &signer_keys {
+            higher.add_signature(keys).unwrap();
+        }
+        higher.verify().unwrap();
+        let first_hash = first.hash().unwrap();
+        let lower_hash = lower.hash().unwrap();
+        let higher_hash = higher.hash().unwrap();
+        let source_ids = signer_keys
+            .iter()
+            .map(KeyMaterial::node_id)
+            .filter(|node_id| *node_id != target.keys().node_id())
+            .collect::<Vec<_>>();
+        let high_source = source_ids[0];
+        let pages = BTreeMap::from([
+            (first_hash, canonical_bytes(&first).unwrap()),
+            (lower_hash, canonical_bytes(&lower).unwrap()),
+            (higher_hash, canonical_bytes(&higher).unwrap()),
+        ]);
+        let (commands, mut commands_rx) = mpsc::channel(16);
+        let (request_cancellations, _cancellations_rx) = mpsc::unbounded_channel();
+        let (_port_state, port_mapping_listener_state) =
+            watch::channel(PortMappingListenerState::Pending);
+        let p2p = P2pClient {
+            local_peer_id: target.keys().node_id().libp2p_peer_id().unwrap(),
+            commands,
+            request_cancellations,
+            outbound_permits: Arc::new(Semaphore::new(4)),
+            cold_recovery_permit: Arc::new(Semaphore::new(1)),
+            port_mapping_listener_state,
+        };
+        let worker = tokio::spawn(async move {
+            while let Some(command) = commands_rx.recv().await {
+                let Command::Request {
+                    recipient,
+                    request,
+                    response,
+                    ..
+                } = command
+                else {
+                    panic!("unexpected checkpoint synchronization command");
+                };
+                let reply = match *request {
+                    PeerRequest::GetCheckpointHead {
+                        guild_id: requested,
+                    } if requested == guild_id => {
+                        let (generation, hash) = if recipient == high_source {
+                            (3, higher_hash)
+                        } else {
+                            (2, lower_hash)
+                        };
+                        Ok(PeerResponse::CheckpointHead(Some(
+                            crate::network::wire::CheckpointHead { generation, hash },
+                        )))
+                    }
+                    PeerRequest::GetCheckpointAtGeneration {
+                        guild_id: requested,
+                        generation: 1,
+                    } if requested == guild_id => Ok(PeerResponse::CheckpointHead(
+                        (recipient != high_source).then_some(
+                            crate::network::wire::CheckpointHead {
+                                generation: 1,
+                                hash: first_hash,
+                            },
+                        ),
+                    )),
+                    PeerRequest::GetCheckpointPage {
+                        guild_id: requested,
+                        checkpoint_hash,
+                        page_index: 0,
+                    } if requested == guild_id => pages
+                        .get(&checkpoint_hash)
+                        .map(|bytes| PeerResponse::CheckpointPage {
+                            total_pages: 1,
+                            page_hash: *blake3::hash(bytes).as_bytes(),
+                            bytes: bytes.clone(),
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("checkpoint page is unavailable")),
+                    _ => Err(anyhow::anyhow!("unexpected checkpoint request")),
+                };
+                let _ = response.send(reply);
+            }
+        });
+        let target = Arc::new(Mutex::new(target));
+        assert_eq!(
+            sync_checkpoint_head_once(target.clone(), &p2p)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            target.lock().unwrap().checkpoint_head(&guild_id).unwrap(),
+            Some((2, lower_hash))
+        );
+        assert!(
+            target
+                .lock()
+                .unwrap()
+                .checkpoint_catchup_state(&guild_id)
+                .unwrap()
+                .is_none()
+        );
+        drop(target);
+        let reopened = Arc::new(Mutex::new(Node::open(&target_path, seed).unwrap()));
+        assert!(
+            sync_checkpoint_head_once(reopened.clone(), &p2p)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            reopened.lock().unwrap().checkpoint_head(&guild_id).unwrap(),
+            Some((2, lower_hash))
+        );
+        assert!(
+            reopened
+                .lock()
+                .unwrap()
+                .checkpoint_catchup_state(&guild_id)
+                .unwrap()
+                .is_none()
+        );
+        drop(reopened);
+        drop(p2p);
+        worker.await.unwrap();
     }
 
     #[tokio::test]

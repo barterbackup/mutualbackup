@@ -10148,7 +10148,7 @@ fn set_private_directory(_path: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -11032,7 +11032,7 @@ mod tests {
         (identities[2].1.clone(), certificate, peers)
     }
 
-    fn install_public_restore_fixture(
+    pub(crate) fn install_public_restore_fixture(
         node: &mut Node,
         local_seed: &Seed,
     ) -> SignedRecord<UserRevision> {
