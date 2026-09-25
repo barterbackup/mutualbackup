@@ -736,9 +736,12 @@ node-source edits found a repeated-roster legacy rollback and missing gates.
 Subsequent local correction commits `7ee8397`, `bb0d333`, `5076e8e`, and
 `d1c94cc` fix that rollback, gate persistent high-head/lower-head fallback
 across restart, exercise lazy legacy-evidence indexing, and release a failed
-relay circuit before source denial completes. M5-78 and M5-83 are corrected;
-M5-79 through M5-82 and M5-84 remain open on their stated gates. Milestone 5
-remains open.
+relay circuit before source denial completes. Later commits through `484e4ec`
+add indexed long-history lookups, a streaming legacy journal, replacement
+network-shard coverage, and a twelve-request stalled-STOP relay regression.
+M5-78, M5-82, and M5-83 are corrected; M5-79 through M5-81 retain their exact
+scenario or measurement gates, and M5-84 has not run on the final tree.
+Milestone 5 remains open.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1282,9 +1285,22 @@ prove fallback, while the latest matching legacy member epoch rejects an
 ambiguous A -> B -> A rollback after restart. Relay outbound failure now
 releases circuit capacity immediately, independent of source-denial progress.
 Focused node and relay tests and strict all-target Clippy passed locally for
-these changes. M5-79 long-history peer lookups, M5-80 unavailable-stale-group
-restore/recovery, M5-81 measured corpus bounds, M5-82 stalled-STOP overflow,
-and the complete M5-84 gate remain outstanding.
+these changes. At that point M5-79 long-history peer lookups, M5-80
+unavailable-stale-group restore/recovery, M5-81 measured corpus bounds, M5-82
+stalled-STOP overflow, and the complete M5-84 gate remained outstanding.
+
+Source-only review of `ae9e6c3..484e4ec` on 2026-09-25 finds the M5-82
+stalled-STOP overflow regression covers twelve requests on one destination
+connection and observes shared circuit capacity released after each overflow.
+M5-79 now has 1,024 committed signed generations read after restart and
+repeated absent lookups, but no long-history peer catch-up resource gate.
+M5-80 exercises network reconstruction and the production coverage helper
+with an unavailable stale group, but not full restore and cold seed recovery
+under that condition. M5-81 streams the journal and reuses its verified index
+across 130 mixed sources, but lacks measured row-read, signature-check, and
+peak-memory bounds for a full packing pass. The complete M5-84 local gate
+remains outstanding. This review ran no builds, tests, daemons, runtime
+probes, or remote compilation.
 
 The M5-42 rejected-connection cleanup was source-reviewed and found to remove
 only the rejected connection while preserving accepted siblings. This review
@@ -1735,10 +1751,11 @@ follow-up source-only review finds no remaining implementation blocker.
 The complete local M5-77 workspace/provisioned closure gate passed on
 2026-09-22. Fresh source-only review on 2026-09-25 found M5-78 through M5-83.
 M5-78's persistent fallback regression and M5-83's repeated-roster rollback
-regression now pass locally. M5-79 through M5-82 need their remaining
-long-history, unavailable-placement, measured-corpus, and stalled-relay gates;
-the complete M5-84 closure gate has not run on the final tree. Milestone 5
-remains open.
+regression now pass locally. Source-only review of the later correction series
+finds M5-82's stalled-relay gate covered. M5-79 through M5-81 still need the
+long-history peer catch-up, full unavailable-placement restore/recovery, and
+measured large-corpus gates; the complete M5-84 closure gate has not run on the
+final tree. Milestone 5 remains open.
 Milestone 6 waits.
 
 - Replace deterministic fillers with cross-user sector packing and fair
