@@ -748,6 +748,7 @@ impl NetworkBehaviour for Behaviour {
                 status,
                 error,
             } => {
+                self.circuits.remove(circuit_id);
                 self.queued_actions.push_back(ToSwarm::NotifyHandler {
                     handler: NotifyHandler::One(src_connection_id),
                     peer_id: src_peer_id,
