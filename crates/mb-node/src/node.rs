@@ -1023,6 +1023,7 @@ impl Node {
             volumes,
             volume_readers,
         };
+        node.backfill_checkpoint_generation_index()?;
         node.reconcile_certified_writer_head()?;
         node.reconcile_garbage_collection()?;
         Ok(node)
@@ -5959,6 +5960,50 @@ impl Node {
         self.store_checkpoint_with_authority(checkpoint, true, false)
     }
 
+    fn backfill_checkpoint_generation_index(&mut self) -> Result<()> {
+        for head_bytes in self.control.checkpoint_head_certificates()? {
+            let mut checkpoint: QuorumCheckpoint = decode_canonical(&head_bytes)?;
+            checkpoint.verify()?;
+            let guild_id = checkpoint.checkpoint.guild_id;
+            let mut history = Vec::new();
+            loop {
+                let generation = checkpoint.checkpoint.generation;
+                let hash = checkpoint.hash()?;
+                if let Some(indexed) = self
+                    .control
+                    .checkpoint_at_generation(&guild_id, generation)?
+                {
+                    if indexed != hash {
+                        anyhow::bail!(
+                            "committed checkpoint generation index conflicts with its certificate"
+                        );
+                    }
+                    break;
+                }
+                history.push((generation, hash));
+                let Some(parent) = checkpoint.checkpoint.parent else {
+                    break;
+                };
+                let Some(bytes) = self.control.get_record("guild-checkpoint", &parent)? else {
+                    break;
+                };
+                let ancestor: QuorumCheckpoint = decode_canonical(&bytes)?;
+                ancestor.verify()?;
+                if ancestor.hash()? != parent
+                    || ancestor.checkpoint.guild_id != guild_id
+                    || ancestor.checkpoint.generation.checked_add(1) != Some(generation)
+                {
+                    anyhow::bail!("committed checkpoint ancestry is invalid");
+                }
+                checkpoint = ancestor;
+            }
+            history.reverse();
+            self.control
+                .backfill_checkpoint_generations(&guild_id, &history)?;
+        }
+        Ok(())
+    }
+
     fn store_checkpoint_with_authority(
         &mut self,
         checkpoint: &QuorumCheckpoint,
@@ -9949,24 +9994,21 @@ fn checkpoint_at_generation(
     if generation == 0 {
         anyhow::bail!("checkpoint generation must be positive");
     }
-    let mut found = None;
-    for (record_id, bytes) in control.records("guild-checkpoint")? {
-        let checkpoint: QuorumCheckpoint = decode_canonical(&bytes)?;
-        checkpoint.verify()?;
-        let hash = checkpoint.hash()?;
-        if record_id.as_slice() != hash {
-            anyhow::bail!("checkpoint record has the wrong identity");
-        }
-        if checkpoint.checkpoint.guild_id != *guild_id
-            || checkpoint.checkpoint.generation != generation
-        {
-            continue;
-        }
-        if found.replace(hash).is_some_and(|existing| existing != hash) {
-            anyhow::bail!("checkpoint history contains a generation fork");
-        }
+    let Some(hash) = control.checkpoint_at_generation(guild_id, generation)? else {
+        return Ok(None);
+    };
+    let bytes = control
+        .get_record("guild-checkpoint", &hash)?
+        .context("committed checkpoint generation has no certificate")?;
+    let checkpoint: QuorumCheckpoint = decode_canonical(&bytes)?;
+    checkpoint.verify()?;
+    if checkpoint.hash()? != hash
+        || checkpoint.checkpoint.guild_id != *guild_id
+        || checkpoint.checkpoint.generation != generation
+    {
+        anyhow::bail!("committed checkpoint generation has an invalid certificate");
     }
-    Ok(found)
+    Ok(Some(hash))
 }
 
 fn validate_checkpoint_catchup_state(
@@ -10348,9 +10390,19 @@ mod tests {
             node.checkpoint_at_generation(&guild_id, 1).unwrap(),
             Some(first.hash().unwrap())
         );
+        let generation_key = [guild_id.as_slice(), &1_u64.to_be_bytes()].concat();
+        assert!(
+            node.control
+                .delete_record("guild-checkpoint-generation", &generation_key)
+                .unwrap()
+        );
         drop(node);
 
         let mut node = Node::open(&node_path, local_seed.clone()).unwrap();
+        assert_eq!(
+            node.checkpoint_at_generation(&guild_id, 1).unwrap(),
+            Some(first.hash().unwrap())
+        );
         let (state, resumed_source) = node.resume_checkpoint_catchup(&guild_id).unwrap().unwrap();
         assert_eq!(resumed_source, source_id);
         let (state, complete) = node

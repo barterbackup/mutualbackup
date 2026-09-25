@@ -14,6 +14,7 @@ use thiserror::Error;
 use crate::SCHEMA_VERSION;
 
 const CONTROL_DATABASE_ID: &[u8] = b"control.db";
+const CHECKPOINT_GENERATION_KIND: &str = "guild-checkpoint-generation";
 pub type CheckpointRow = (u64, [u8; 32], Vec<u8>);
 pub type ProtocolRecordRow = (Vec<u8>, Vec<u8>);
 
@@ -509,6 +510,30 @@ impl ControlStore {
         checkpoint_row(&self.connection, "checkpoint_heads", guild_id)
     }
 
+    pub fn checkpoint_at_generation(
+        &self,
+        guild_id: &[u8; 32],
+        generation: u64,
+    ) -> Result<Option<[u8; 32]>, DatabaseError> {
+        let record_id = checkpoint_generation_record_id(guild_id, generation)?;
+        self.get_record(CHECKPOINT_GENERATION_KIND, &record_id)?
+            .map(|bytes| bytes.try_into().map_err(|_| DatabaseError::Integrity))
+            .transpose()
+    }
+
+    pub fn backfill_checkpoint_generations(
+        &mut self,
+        guild_id: &[u8; 32],
+        generations: &[(u64, [u8; 32])],
+    ) -> Result<(), DatabaseError> {
+        let transaction = self.connection.transaction()?;
+        for (generation, hash) in generations {
+            insert_checkpoint_generation(&transaction, guild_id, *generation, hash)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn checkpoint_head_certificates(&self) -> Result<Vec<Vec<u8>>, DatabaseError> {
         let mut statement = self
             .connection
@@ -983,6 +1008,7 @@ impl ControlStore {
                         checkpoint_body_bytes,
                     )?;
                 }
+                insert_checkpoint_generation(&transaction, guild_id, generation, checkpoint_hash)?;
                 transaction.commit()?;
                 return Ok(());
             }
@@ -1015,6 +1041,7 @@ impl ControlStore {
                 checkpoint_certificate_bytes,
             ],
         )?;
+        insert_checkpoint_generation(&transaction, guild_id, generation, checkpoint_hash)?;
         if !require_signature_lock {
             upsert_checkpoint_signature_lock(
                 &transaction,
@@ -1076,6 +1103,7 @@ impl ControlStore {
                 checkpoint_certificate_bytes,
             ],
         )?;
+        insert_checkpoint_generation(&transaction, guild_id, generation, checkpoint_hash)?;
         upsert_checkpoint_signature_lock(
             &transaction,
             guild_id,
@@ -1142,6 +1170,42 @@ fn upsert_checkpoint_signature_lock(
             checkpoint_body_bytes,
         ],
     )?;
+    Ok(())
+}
+
+fn checkpoint_generation_record_id(
+    guild_id: &[u8; 32],
+    generation: u64,
+) -> Result<[u8; 40], DatabaseError> {
+    if generation == 0 || i64::try_from(generation).is_err() {
+        return Err(DatabaseError::Integrity);
+    }
+    let mut id = [0; 40];
+    id[..32].copy_from_slice(guild_id);
+    id[32..].copy_from_slice(&generation.to_be_bytes());
+    Ok(id)
+}
+
+fn insert_checkpoint_generation(
+    transaction: &rusqlite::Transaction<'_>,
+    guild_id: &[u8; 32],
+    generation: u64,
+    checkpoint_hash: &[u8; 32],
+) -> Result<(), DatabaseError> {
+    let record_id = checkpoint_generation_record_id(guild_id, generation)?;
+    let changed = transaction.execute(
+        "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+         ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes
+         WHERE protocol_records.bytes = excluded.bytes",
+        params![
+            CHECKPOINT_GENERATION_KIND,
+            record_id.as_slice(),
+            checkpoint_hash.as_slice(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(DatabaseError::Conflict);
+    }
     Ok(())
 }
 
@@ -3874,9 +3938,53 @@ mod tests {
                 true,
             )
             .unwrap();
+        assert_eq!(
+            store.checkpoint_at_generation(&guild_id, 1).unwrap(),
+            Some(first_hash)
+        );
+        assert_eq!(store.checkpoint_at_generation(&guild_id, 2).unwrap(), None);
         store
             .lock_checkpoint_signature(&guild_id, 2, Some(&first_hash), &second_hash, b"body-2")
             .unwrap();
+    }
+
+    #[test]
+    fn checkpoint_generation_history_has_bounded_key_lookups() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([29; 32]));
+        let mut store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let guild_id = [30; 32];
+        let history = (1..=1_024_u64)
+            .map(|generation| {
+                (
+                    generation,
+                    *blake3::hash(&generation.to_be_bytes()).as_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        store
+            .backfill_checkpoint_generations(&guild_id, &history)
+            .unwrap();
+        assert_eq!(
+            store.checkpoint_at_generation(&guild_id, 1).unwrap(),
+            Some(history[0].1)
+        );
+        assert_eq!(
+            store.checkpoint_at_generation(&guild_id, 1_024).unwrap(),
+            Some(history[1_023].1)
+        );
+        assert_eq!(
+            store.checkpoint_at_generation(&guild_id, 1_025).unwrap(),
+            None
+        );
+        assert!(matches!(
+            store.backfill_checkpoint_generations(&guild_id, &[(1, [31; 32])]),
+            Err(DatabaseError::Conflict)
+        ));
+        assert_eq!(
+            store.checkpoint_at_generation(&guild_id, 1).unwrap(),
+            Some(history[0].1)
+        );
     }
 
     #[test]
