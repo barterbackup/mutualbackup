@@ -618,9 +618,10 @@ Subsequent commits `e9fadb2` and `75d0fd5` correct M5-85 and M5-86;
 source review of `1e8ee2b` found M5-87 still could not prove a live `k` in a
 multi-live-sector replacement group. Commit `dd5c7e8` corrects that path and
 adds positive and negative multi-live-sector coverage. The complete local
-M5-88 closure gate passed on 2026-09-25; Milestone 5 is closed and Milestone 6
-is next. That source-only review ran no builds, tests, daemons, runtime probes,
-or remote compilation.
+M5-88 closure gate passed on 2026-09-25 for its source tree. A further
+source-only review found M5-89 and M5-90 below, reopening Milestone 5; Milestone
+6 waits. These source-only reviews ran no builds, tests, daemons, runtime
+probes, or remote compilation.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -1984,6 +1985,53 @@ node Clippy gate passed locally. No remote compilation server was used.
   QUIC backups, and five-daemon seed/DHT recovery network smoke test. The
   mount, loop device, image, and smoke-test namespaces were removed. No remote
   compilation server was used.
+
+- [ ] **M5-89 / P1 — Bind cold replacement coverage to the checkpoint's authenticated sector.**
+  `variable_recovery_plans` collects checkpoint sectors as IDs and its new
+  coverage-only pass treats a current group's information role as a match on
+  ID alone (`crates/mb-node/src/network/p2p.rs:10227`–`:10319`). A separately
+  certified `AddCodingGroup` may reuse a legacy sector ID with different
+  committed bytes or a different information owner; guild event validation
+  checks the group's placement and transcript, but does not bind that new
+  group to an older checkpoint (`crates/mb-core/src/guild.rs:490`–`:510`,
+  `crates/mb-node/src/node.rs:2844`–`:2860`). A format-5 checkpoint can remain
+  valid through a stale group with the correct owner and root, while a current
+  group without a recovering parity holder's role has the same ID and different
+  authenticated content. The current group can provide `k` shards of the wrong
+  bytes, be marked as covering the checkpoint sector, and make cold recovery
+  skip the unavailable stale group. The historical checkpoint validator still
+  accepts the stale certified placement
+  (`crates/mb-node/src/node.rs:6121`–`:6165`), so the
+  checkpoint can be installed without recoverable protection for that sector.
+  Match exact checkpoint authentication before counting coverage: owner,
+  logical length, and transcript information root for legacy references;
+  catalog commitment and flat root for packed sectors. Gate a same-ID,
+  different-root current group against an unavailable correct stale group.
+
+- [ ] **M5-90 / P2 — Stop cold recovery work after sufficient current coverage.**
+  The coverage-only second pass adds every current group overlapping a required
+  sector, even when one healthy replacement covers it
+  (`crates/mb-node/src/network/p2p.rs:10287`–`:10319`).
+  `recover_variable_plan_coverage` awaits all current plans before checking
+  whether the required sectors are covered (`:10467`–`:10513`), and
+  `collect_bounded_recovery_requests` drains the entire iterator (`:9084`–`:9100`).
+  Dynamic guild state accepts multiple distinct overlapping coding groups with
+  no group-count or overlap bound (`crates/mb-core/src/guild.rs:263`–`:280`,
+  `:490`–`:510`). One healthy current replacement plus stalled or unavailable
+  redundant groups therefore forces unnecessary `k`-shard fetches and waits;
+  repeated certified groups make the transfer and delay grow with history.
+  Keep concurrency bounded and stop or cancel redundant probes once exact
+  required coverage succeeds, while still trying another placement when the
+  first fails. Gate healthy-first with stalled redundant groups and failed-first
+  fallback, including a bound on issued shard requests.
+
+- [ ] **M5-91 / gate — Recheck Milestone 5 after M5-89 and M5-90.**
+  After correcting both source blockers, run fresh source review, formatting,
+  locked all-target workspace tests, warning-free locked all-target workspace
+  Clippy, Docker lab safety, and the complete provisioned Btrfs/network
+  acceptance script on a fresh disposable local filesystem. Build and run
+  locally; do not use a remote compilation server. M5-88 remains historical
+  evidence for its exact source tree.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
