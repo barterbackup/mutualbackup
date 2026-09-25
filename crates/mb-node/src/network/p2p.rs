@@ -10337,44 +10337,8 @@ async fn recover_p2p_variable_shards(
     })
     .await?;
     let deferred_holders = Arc::new(Mutex::new(BTreeSet::new()));
-    let (current, fallback): (Vec<_>, Vec<_>) =
-        plans.into_iter().partition(|plan| plan.priority == 0);
-    let requests = current.into_iter().map(|plan| {
-        let node = node.clone();
-        let deferred_holders = deferred_holders.clone();
-        async move {
-            let covered = plan.covered.clone();
-            let result = recover_variable_group_plan(
-                node,
-                p2p,
-                checkpoint_hash,
-                plan,
-                roster,
-                deferred_holders,
-            )
-            .await;
-            Ok((covered, result))
-        }
-    });
-    let mut covered = BTreeSet::new();
-    let mut last_error = None;
-    for (sectors, result) in
-        collect_bounded_recovery_requests(requests, RECOVERY_VARIABLE_GROUP_CONCURRENCY).await?
-    {
-        match result {
-            Ok(()) => covered.extend(sectors),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    for plan in fallback {
-        if required_sectors.is_subset(&covered) {
-            break;
-        }
-        if plan.covered.is_subset(&covered) {
-            continue;
-        }
-        let sectors = plan.covered.clone();
-        match recover_variable_group_plan(
+    recover_variable_plan_coverage(plans, required_sectors, |plan| {
+        recover_variable_group_plan(
             node.clone(),
             p2p,
             checkpoint_hash,
@@ -10382,17 +10346,8 @@ async fn recover_p2p_variable_shards(
             roster,
             deferred_holders.clone(),
         )
-        .await
-        {
-            Ok(()) => covered.extend(sectors),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    if !required_sectors.is_subset(&covered) {
-        return Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!("live variable sectors lack recoverable certified placement")
-        }));
-    }
+    })
+    .await?;
     if let Some(catalog) = &checkpoint.checkpoint.packing_catalog {
         let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
         let recovered_catalog = catalog.clone();
@@ -10473,6 +10428,56 @@ async fn recover_p2p_variable_shards(
             })
             .await?;
         }
+    }
+    Ok(())
+}
+
+async fn recover_variable_plan_coverage<F, Fut>(
+    plans: Vec<VariableRecoveryPlan>,
+    required_sectors: BTreeSet<SectorId>,
+    recover: F,
+) -> Result<()>
+where
+    F: Fn(VariableRecoveryPlan) -> Fut + Clone + Send + Sync,
+    Fut: Future<Output = Result<()>> + Send,
+{
+    let (current, fallback): (Vec<_>, Vec<_>) =
+        plans.into_iter().partition(|plan| plan.priority == 0);
+    let requests = current.into_iter().map(|plan| {
+        let recover = recover.clone();
+        async move {
+            let covered = plan.covered.clone();
+            let result = recover(plan).await;
+            Ok((covered, result))
+        }
+    });
+    let mut covered = BTreeSet::new();
+    let mut last_error = None;
+    for (sectors, result) in
+        collect_bounded_recovery_requests(requests, RECOVERY_VARIABLE_GROUP_CONCURRENCY).await?
+    {
+        match result {
+            Ok(()) => covered.extend(sectors),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    for plan in fallback {
+        if required_sectors.is_subset(&covered) {
+            break;
+        }
+        if plan.covered.is_subset(&covered) {
+            continue;
+        }
+        let sectors = plan.covered.clone();
+        match recover(plan).await {
+            Ok(()) => covered.extend(sectors),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if !required_sectors.is_subset(&covered) {
+        return Err(last_error.unwrap_or_else(|| {
+            anyhow::anyhow!("live variable sectors lack recoverable certified placement")
+        }));
     }
     Ok(())
 }
@@ -15473,16 +15478,46 @@ mod tests {
         let node = Arc::new(Mutex::new(
             Node::open(temp.path().join("restoring"), Seed::from_bytes([70; 32])).unwrap(),
         ));
+        let deferred = Mutex::new(BTreeSet::new());
         let reconstructed = reconstruct_variable_from_placements(
-            node,
+            node.clone(),
             &p2p,
             &placements,
             &replacement_peers,
-            &Mutex::new(BTreeSet::new()),
+            &deferred,
         )
         .await
         .unwrap();
         assert_eq!(reconstructed, first_bytes);
+        let (plans, required) =
+            variable_recovery_plans(&state, &BTreeSet::from([first.id]), local_id);
+        let attempted = Arc::new(Mutex::new(Vec::new()));
+        let recovery_deferred = Mutex::new(BTreeSet::new());
+        recover_variable_plan_coverage(plans, required, |plan| {
+            let node = node.clone();
+            let attempted = attempted.clone();
+            let expected = &first_bytes;
+            let recovery_deferred = &recovery_deferred;
+            let p2p = &p2p;
+            let roster = &replacement_peers;
+            async move {
+                attempted.lock().unwrap().push(plan.group.id);
+                let bytes = reconstruct_variable_shard_from_peers(
+                    node,
+                    p2p,
+                    &plan.group,
+                    plan.targets[0],
+                    roster,
+                    recovery_deferred,
+                )
+                .await?;
+                assert_eq!(bytes, *expected);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*attempted.lock().unwrap(), vec![replacement_id]);
         let requested = requested.lock().unwrap().clone();
         assert!(!requested.is_empty());
         assert!(requested.iter().all(|group_id| *group_id != old_id));
