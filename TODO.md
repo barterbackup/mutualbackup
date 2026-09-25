@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (closed 2026-09-25)
+## Milestone 5 guild geometry and coding protocol (reopened 2026-09-25)
 
 Source-only review of `8135e0b..da8974a` on 2026-09-18 found the M5-36 through
 M5-44 blockers below; all are now corrected. The production gate recorded in
@@ -623,8 +623,11 @@ source-only review found M5-89 and M5-90 below, reopening Milestone 5; Milestone
 6 waits. These source-only reviews ran no builds, tests, daemons, runtime
 probes, or remote compilation.
 Commits `e63d538` and `09e9379` correct M5-89 and M5-90, and the complete
-M5-91 local gate passed on the latter source tree. Milestone 5 is closed;
-Milestone 6 is next.
+M5-91 local gate passed on the latter source tree. A further source-only review
+of `6bc66bd..543fb9b` found M5-92 through M5-96 below. M5-91 remains
+historical evidence for source commit `09e9379`; Milestone 5 is reopened and
+Milestone 6 waits for corrections and M5-97. This review ran no builds, tests,
+daemons, runtime probes, or remote compilation.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -2054,6 +2057,84 @@ node Clippy gate passed locally. No remote compilation server was used.
   QUIC backups, and five-daemon seed/DHT recovery smoke test. The mount, loop
   device, image, and smoke-test namespaces were removed. No remote compilation
   server was used.
+
+- [ ] **M5-92 / P1 — Bind claimed legacy information roots to committed bytes.**
+  Cold recovery accepts a format-2 transcript's claimed information root as
+  checkpoint proof without reconstructing its shard
+  (`crates/mb-node/src/network/p2p.rs:10306`–`:10336`). A signed plan can
+  claim the expected legacy flat root while the group's Merkle commitment and
+  actual information bytes differ: `CodingAttemptPlan::validate` does not bind
+  them, and `replay_coding_transcript` checks signed sampled openings and the
+  sampled codeword, not the claimed full-content root
+  (`crates/mb-core/src/attempt.rs:232`–`:258`, `:590`–`:712`). Honest
+  `encode_coding_attempt` checks its inputs, but replay of externally supplied
+  certified evidence does not enforce that check. Such a group can receive
+  credit for live `k` of wrong bytes and suppress a correct stale fallback.
+  Make every accepted claimed root a verified binding to the committed full
+  information shard, including checkpoint-signing and cold-recovery paths.
+  Gate a replay-valid, false-root transcript against wrong committed bytes and
+  an unavailable correct stale placement.
+
+- [ ] **M5-93 / P1 — Require live `k` when current local targets are READY.**
+  `recover_variable_group_plan` proves a live quorum for coverage-only plans,
+  but sends current plans with local targets to `recover_variable_plan`
+  (`crates/mb-node/src/network/p2p.rs:10649`–`:10705`). That function skips
+  network reconstruction for each target already READY and can activate the
+  transcript without fetching any peer shard (`:10707`–`:10755`). A retry
+  retaining only its local current parity shard can mark replacement coverage
+  complete with fewer than `k` live shards and skip a stale fallback. Prove a
+  live decoding quorum before crediting the current group even when every
+  local target is READY. Gate interrupted recovery with one READY local shard,
+  fewer than `k` live shards, and an available correct fallback.
+
+- [ ] **M5-94 / P1 — Continue ordinary restore after a wrong-root placement.**
+  Legacy restore selects certified variable placements by sector ID, prefers
+  a current placement, and takes the first reconstruction that matches that
+  group's commitment (`crates/mb-node/src/network/p2p.rs:11345`–`:11399`,
+  `:13074`–`:13163`). It checks the signed revision root only after placement
+  fallback has ended. A reachable same-ID current group with different bytes
+  therefore aborts restore even when a correct stale group is available.
+  Match authenticated owner, length, and root before accepting a placement, or
+  treat a revision-root mismatch as a per-placement failure and continue.
+  Gate wrong-root current placement followed by a recoverable correct stale
+  placement.
+
+- [ ] **M5-95 / P2 — Credit valid sectors within mixed recovery groups.**
+  `variable_recovery_plans` collects all matching checkpoint IDs into a
+  group's `covered` set (`crates/mb-node/src/network/p2p.rs:10339`–`:10430`).
+  Coverage scheduling can select that group for one still-needed sector, but
+  `recovery_plan_missing_roots` rejects it when any other planned sector has
+  a mismatched checkpoint root (`:10306`–`:10336`, `:10568`–`:10620`). Thus a
+  live group with valid A and old/wrong-root B cannot cover A after another
+  group already covered B; recovery can fail despite both sectors being
+  recoverable. Authenticate and credit only the still-needed matching sectors
+  without losing valid coverage from the group. Gate mixed correct/wrong-root
+  groups with independent coverage for the conflicting sector.
+
+- [ ] **M5-96 / P1 — Authenticate retained-revision coverage and audit.**
+  For a revision retained from the preceding checkpoint, checkpoint validation
+  passes `allow_legacy_root` to variable coverage
+  (`crates/mb-node/src/node.rs:6187`–`:6249`). That accepts a rootless format-1
+  transcript matching owner, sector ID, and length without proving its bytes
+  match the signed revision root (`:6348`–`:6395`). A newly certified
+  wrong-byte format-1 group is still accepted by attempt-authority replay
+  (`crates/mb-core/src/guild.rs:584`–`:618`) and can replace the correct
+  placement while the next checkpoint signs the retained revision as protected.
+  The checkpoint audit also matches legacy groups by owner, ID, and length alone
+  (`:9716`–`:9744`;
+  `crates/mb-node/src/network/p2p.rs:9518`–`:9540`), and can report the wrong
+  group healthy. Require exact signed-root protection for replacement groups
+  even when a revision is retained, and make audit use the same authenticated
+  coverage. Gate a retained revision with a wrong-byte format-1 replacement
+  through checkpoint signing and audit.
+
+- [ ] **M5-97 / gate — Close Milestone 5 after M5-92 through M5-96.**
+  After correcting the source blockers, run fresh source review, formatting,
+  locked all-target workspace tests, warning-free locked all-target workspace
+  Clippy, Docker lab safety, and the complete provisioned Btrfs/network
+  acceptance script on a fresh disposable local filesystem. Build and run
+  locally; do not use a remote compilation server. M5-91 remains historical
+  evidence for its exact source tree.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

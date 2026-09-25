@@ -103,8 +103,11 @@ M5-87 are corrected, and the complete M5-88 local closure gate passed on
 2026-09-25. Further source-only review found M5-89 and M5-90 in coverage-only
 cold recovery: it matches sector IDs without checkpoint content authentication
 and probes every overlapping current group. Those corrections and the complete
-M5-91 local workspace/provisioned gate passed on 2026-09-25. Milestone 5 is
-closed; Milestone 6 is next.
+M5-91 local workspace/provisioned gate passed on 2026-09-25. A later source-only
+review found M5-92 through M5-96: unbound claimed legacy roots, READY-target
+quorum bypass, restore fallback on wrong-root placements, mixed-group coverage
+loss, and retained-revision/audit root bypass. Milestone 5 is reopened;
+Milestone 6 waits for corrections and M5-97.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -520,8 +523,10 @@ expiry are corrected. The complete local M5-77 closure gate passed on
 Further source-only review found M5-85 through M5-87 and reopened Milestone 5;
 M5-85 through M5-87 are corrected, and M5-88 passed locally on 2026-09-25.
 Another source-only review found M5-89 and M5-90. Their corrections and the
-complete M5-91 local gate passed on 2026-09-25; Milestone 5 is closed and
-Milestone 6 is next.
+complete M5-91 local gate passed on 2026-09-25. A further source-only review
+found M5-92 through M5-96, so Milestone 5 is reopened and Milestone 6 waits
+for the correction and closure gate. M5-91 remains evidence for its exact
+source tree.
 Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
@@ -762,8 +767,8 @@ are corrected in `e9fadb2` and `75d0fd5`; `1e8ee2b` and `dd5c7e8` correct
 M5-87. The complete M5-88 gate passed locally on 2026-09-25, closing
 Milestone 5 for that source tree. Later source-only review found M5-89 and
 M5-90. Both are corrected in `e63d538` and `09e9379`; the complete M5-91
-local gate passed on the latter source tree. Milestone 5 is closed and
-Milestone 6 is next.
+local gate passed on the latter source tree. Further source-only review found
+M5-92 through M5-96; Milestone 5 is reopened and Milestone 6 waits for M5-97.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1397,7 +1402,21 @@ Docker lab safety, and the full provisioned acceptance script on a fresh
 disposable 8 GiB Btrfs image. Repeated multi-owner QUIC backup and five-daemon
 seed/DHT recovery smoke tests passed. The mount, loop device, image, and smoke
 namespaces were removed. No remote compilation server was used. Milestone 5
-is closed; Milestone 6 is next.
+was closed for that source tree at that point.
+
+Further source-only review of `6bc66bd..543fb9b` on 2026-09-25 found five
+remaining blockers. A format-2 transcript's claimed legacy root can be
+accepted without binding it to committed information bytes; a current recovery
+plan with all local targets READY can receive coverage without proving live
+`k`. Ordinary restore stops at a reachable same-ID wrong-root group instead
+of trying a correct older placement. A mixed group can be rejected for an
+already-covered wrong-root sector even though another sector in the group is
+valid and needed. Finally, retained-revision checkpoint validation can count
+a wrong-byte rootless format-1 replacement as protection, and audit can report
+it healthy. The exact source paths and correction gates are M5-92 through
+M5-97 in `TODO.md`. The review ran no builds, tests, daemons, runtime probes,
+or remote compilation. M5-91 remains historical evidence for source commit
+`09e9379`; Milestone 5 is reopened and Milestone 6 waits.
 
 The M5-42 rejected-connection cleanup was source-reviewed and found to remove
 only the rejected connection while preserving accepted siblings. This review
@@ -1832,7 +1851,7 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (passed)
+### Milestone 5 — efficient and flexible data/guild protocol (reopened)
 
 M5-36 through M5-44 are implemented, and the complete M5-45 correction gate
 passed locally on 2026-09-19. The final committed tree passed formatting,
@@ -1869,7 +1888,9 @@ recovery path. Their corrections now bind replacement coverage to exact
 checkpoint authentication and stop bounded current-group work after sufficient
 coverage. The complete M5-91 local workspace/provisioned acceptance gate passed
 on source commit `09e9379` on 2026-09-25. M5-88 remains historical evidence
-for its earlier tree; Milestone 5 is closed and Milestone 6 is next.
+for its earlier tree. Later source-only review found M5-92 through M5-96 in
+legacy-root authentication, live-quorum recovery, and restore fallback. The
+source corrections and M5-97 local closure gate remain open; Milestone 6 waits.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and
