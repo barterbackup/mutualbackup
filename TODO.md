@@ -610,15 +610,17 @@ found M5-82's stalled-STOP gate covered. Subsequent commits `40d83ec`,
 scenario and resource gates below. That source-only review ran no builds, tests,
 daemons, runtime probes, or remote compilation. Fresh source review of the final
 correction commits found no new blocker. M5-84 passed locally on 2026-09-25 on
-`e959d92`; that closure record remains evidence for its exact tree. No code
-commits followed `890d88c`, but a new source-only review of the correction
-series found M5-85 through M5-87 below. Milestone 5 is reopened and Milestone 6
-waits. Subsequent commits `e9fadb2` and `75d0fd5` correct M5-85 and M5-86;
+`e959d92`; that closure record remains evidence for its exact tree. At that
+point, no code commits had followed `890d88c`, but a new source-only review of
+the correction series found M5-85 through M5-87 below, reopening Milestone 5
+at that time.
+Subsequent commits `e9fadb2` and `75d0fd5` correct M5-85 and M5-86;
 source review of `1e8ee2b` found M5-87 still could not prove a live `k` in a
 multi-live-sector replacement group. Commit `dd5c7e8` corrects that path and
-adds positive and negative multi-live-sector coverage. M5-88 remains pending.
-This review ran no builds, tests, daemons, runtime probes, or remote
-compilation.
+adds positive and negative multi-live-sector coverage. The complete local
+M5-88 closure gate passed on 2026-09-25; Milestone 5 is closed and Milestone 6
+is next. That source-only review ran no builds, tests, daemons, runtime probes,
+or remote compilation.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -1966,12 +1968,22 @@ node Clippy gate passed locally. No remote compilation server was used.
   one reachable shard and accepts two; the six-member parity-only cold recovery
   regression still passes locally.
 
-- [ ] **M5-88 / gate — Recheck Milestone 5 after M5-85 through M5-87.**
+- [x] **M5-88 / gate — Recheck Milestone 5 after M5-85 through M5-87.**
   After correcting these source blockers, run fresh source review, formatting,
   locked all-target workspace tests, warning-free locked all-target workspace
   Clippy, Docker lab safety, and the complete provisioned Btrfs/network
   acceptance script on a fresh disposable local filesystem. Build and run
-  locally; do not use a remote compilation server.
+  locally; do not use a remote compilation server. Fresh source review of the
+  final correction tree through `dd5c7e8` found no further blocker. On
+  2026-09-25, `cargo fmt --all -- --check`,
+  `cargo test --locked --workspace --all-targets`,
+  `cargo clippy --locked --workspace --all-targets -- -D warnings`, and
+  `scripts/docker-lab-safety-test.sh` passed locally. The complete
+  `scripts/reflink-acceptance.sh` passed on a fresh disposable 8 GiB local
+  Btrfs image, including its provisioned filesystem tests, repeated multi-owner
+  QUIC backups, and five-daemon seed/DHT recovery network smoke test. The
+  mount, loop device, image, and smoke-test namespaces were removed. No remote
+  compilation server was used.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
