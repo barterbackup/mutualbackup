@@ -10542,6 +10542,62 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn committed_checkpoint_generation_lookup_serves_long_history_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("node");
+        let seed = Seed::from_bytes([226; 32]);
+        let mut node = Node::open(&path, seed.clone()).unwrap();
+        let revision = install_public_restore_fixture(&mut node, &seed);
+        let guild_id = revision.value.guild_id;
+        let mut previous = node.current_checkpoint(guild_id).unwrap().unwrap();
+        let signer_keys = std::iter::once(seed.clone())
+            .chain((0_u8..4).map(|index| Seed::from_bytes([index + 228; 32])))
+            .map(|seed| KeyMaterial::from_seed(&seed))
+            .collect::<Vec<_>>();
+        let mut hashes = vec![previous.hash().unwrap()];
+        for generation in 2..=1_024 {
+            let parent = previous.hash().unwrap();
+            let mut next = previous.clone();
+            next.checkpoint.generation = generation;
+            next.checkpoint.parent = Some(parent);
+            next.signatures.clear();
+            for keys in &signer_keys {
+                next.add_signature(keys).unwrap();
+            }
+            let hash = next.hash().unwrap();
+            node.control
+                .commit_checkpoint(
+                    &guild_id,
+                    generation,
+                    Some(&parent),
+                    &hash,
+                    &canonical_bytes(&next.checkpoint).unwrap(),
+                    &canonical_bytes(&next).unwrap(),
+                    false,
+                )
+                .unwrap();
+            hashes.push(hash);
+            previous = next;
+        }
+        drop(node);
+
+        let node = Node::open(&path, seed).unwrap();
+        for (index, hash) in hashes.into_iter().enumerate() {
+            assert_eq!(
+                node.checkpoint_at_generation(&guild_id, index as u64 + 1)
+                    .unwrap(),
+                Some(hash)
+            );
+        }
+        for _ in 0..128 {
+            assert_eq!(
+                node.checkpoint_at_generation(&guild_id, 1_025).unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn legacy_checkpoint_transition_uses_latest_matching_membership_epoch() {
         let temp = tempfile::tempdir().unwrap();
         let (seed, certificate, peers) = recovery_guild_fixture();
