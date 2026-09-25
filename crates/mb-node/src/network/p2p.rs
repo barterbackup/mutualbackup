@@ -15533,8 +15533,186 @@ mod tests {
         worker.await.unwrap();
     }
 
+    fn signed_replacement_transcript(
+        group: &CodingGroupV2,
+        shards: &[Vec<u8>],
+        signing_keys: &BTreeMap<NodeId, KeyMaterial>,
+        checkpoint_hash: [u8; 32],
+        ordinal: u8,
+    ) -> SignedRecord<CodingVerificationTranscript> {
+        let members = signing_keys.keys().copied().collect::<Vec<_>>();
+        let coordinator = members[1];
+        let verifier = members[2];
+        let attempt_id = [ordinal; 16];
+        let plan = CodingAttemptPlan {
+            format_version: 2,
+            attempt_id,
+            checkpoint_hash,
+            membership_epoch: 1,
+            geometry: CodingPlanGeometry {
+                format_version: 1,
+                guild_id: group.guild_id,
+                profile: group.profile,
+                information: group.roles[..usize::from(group.profile.data_shards)]
+                    .iter()
+                    .map(|role| match role {
+                        ShardRoleV2::Information(information) => information.clone(),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+                parity: group.roles[usize::from(group.profile.data_shards)..]
+                    .iter()
+                    .map(|role| match role {
+                        ShardRoleV2::Parity(parity) => ParityPlacementV2 {
+                            holder: parity.holder,
+                            failure_domain: parity.failure_domain.clone(),
+                            row: parity.row,
+                        },
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+            },
+            delegator: members[0],
+            coding_coordinator: coordinator,
+            verification_coordinator: verifier,
+            expires_at_unix_seconds: u64::MAX,
+            information_roots: Some(
+                group.roles[..usize::from(group.profile.data_shards)]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, role)| match role {
+                        ShardRoleV2::Information(information)
+                            if information.sector.virtual_zero =>
+                        {
+                            [0; 32]
+                        }
+                        ShardRoleV2::Information(_) => sector_root(&shards[index]),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+            ),
+        };
+        let plan_hash = plan.hash().unwrap();
+        let plan = SignedRecord::sign(
+            mb_core::CODING_ATTEMPT_PLAN_DOMAIN,
+            plan,
+            signing_keys.get(&members[0]).unwrap(),
+        )
+        .unwrap();
+        let manifest = SignedRecord::sign(
+            mb_core::CODING_ROOT_MANIFEST_DOMAIN,
+            CodingRootManifest {
+                format_version: 1,
+                attempt_id,
+                plan_hash,
+                group: group.clone(),
+            },
+            signing_keys.get(&coordinator).unwrap(),
+        )
+        .unwrap();
+        let receipts = group.roles[usize::from(group.profile.data_shards)..]
+            .iter()
+            .enumerate()
+            .map(|(offset, role)| {
+                let index = usize::from(group.profile.data_shards) + offset;
+                let ShardRoleV2::Parity(parity) = role else {
+                    unreachable!()
+                };
+                SignedRecord::sign(
+                    STAGED_STORAGE_RECEIPT_DOMAIN,
+                    StagedStorageReceipt {
+                        format_version: 1,
+                        attempt_id,
+                        plan_hash,
+                        guild_id: group.guild_id,
+                        group_id: group.id,
+                        shard_index: index as u16,
+                        holder: parity.holder,
+                        commitment: parity.commitment.clone(),
+                    },
+                    signing_keys.get(&parity.holder).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let nonce = [ordinal.wrapping_add(1); 32];
+        let commitment = SignedRecord::sign(
+            CODING_CHALLENGE_COMMITMENT_DOMAIN,
+            CodingChallengeCommitment {
+                format_version: 1,
+                attempt_id,
+                plan_hash,
+                commitment: mb_core::coding_challenge_commitment(plan_hash, nonce),
+            },
+            signing_keys.get(&verifier).unwrap(),
+        )
+        .unwrap();
+        let evidence_hash = mb_core::coding_evidence_hash(&manifest, &receipts).unwrap();
+        let reveal = SignedRecord::sign(
+            CODING_CHALLENGE_REVEAL_DOMAIN,
+            CodingChallengeReveal {
+                format_version: 1,
+                attempt_id,
+                plan_hash,
+                nonce,
+                evidence_hash,
+            },
+            signing_keys.get(&verifier).unwrap(),
+        )
+        .unwrap();
+        let challenge = coding_challenge(plan_hash, nonce, evidence_hash);
+        let openings = group
+            .roles
+            .iter()
+            .enumerate()
+            .map(|(index, role)| {
+                let commitment = match role {
+                    ShardRoleV2::Information(information) => &information.sector.commitment,
+                    ShardRoleV2::Parity(parity) => &parity.commitment,
+                };
+                let leaf = mb_core::challenged_leaf(&challenge, commitment).unwrap();
+                let holder = variable_shard_holder(role);
+                SignedRecord::sign(
+                    CODING_SHARD_OPENING_DOMAIN,
+                    CodingShardOpening {
+                        format_version: 1,
+                        attempt_id,
+                        plan_hash,
+                        verifier,
+                        challenge,
+                        shard_index: index as u16,
+                        commitment: commitment.clone(),
+                        proof: mb_core::merkle_open_range(&shards[index], leaf, 1).unwrap(),
+                    },
+                    signing_keys.get(&holder).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let transcript = SignedRecord::sign(
+            mb_core::CODING_TRANSCRIPT_DOMAIN,
+            CodingVerificationTranscript {
+                format_version: 1,
+                verified_at_unix_seconds: 1,
+                plan,
+                manifest,
+                challenge_commitment: commitment,
+                staged_receipts: receipts,
+                challenge_reveal: reveal,
+                openings,
+            },
+            signing_keys.get(&verifier).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            replay_coding_transcript(&transcript).unwrap(),
+            mb_core::CodingReplayFinding::Verified
+        );
+        transcript
+    }
+
     #[tokio::test]
-    async fn packed_snapshot_restore_uses_replacement_when_older_group_is_unavailable() {
+    async fn packed_snapshot_restore_and_cold_recovery_use_available_replacements() {
         let temp = tempfile::tempdir().unwrap();
         let seed = Seed::from_bytes([226; 32]);
         let node_path = temp.path().join("node");
@@ -15723,6 +15901,35 @@ mod tests {
             .iter()
             .map(|group| group.id)
             .collect::<BTreeSet<_>>();
+        let signing_keys = std::iter::once(seed.clone())
+            .chain((0_u8..4).map(|index| Seed::from_bytes([index + 228; 32])))
+            .map(|seed| {
+                let keys = KeyMaterial::from_seed(&seed);
+                (keys.node_id(), keys)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let cold_path = temp.path().join("cold-seed");
+        let mut cold = Node::open(&cold_path, seed.clone()).unwrap();
+        let cold_revision = crate::node::tests::install_public_restore_fixture(&mut cold, &seed);
+        assert_eq!(cold_revision.value.metadata_sectors[0], reference);
+        cold.adopt_recovered_guild(certificate, peers).unwrap();
+        crate::node::tests::install_test_checkpoint_and_dynamic_state(&mut cold, &next, &state);
+        let cold_volume = temp.path().join("cold-volume");
+        std::fs::create_dir_all(&cold_volume).unwrap();
+        cold.configure_storage_volumes(&[cold_volume], 16 * 1024 * 1024, 0)
+            .unwrap();
+        for (index, (group, shards)) in replacement_shards.values().enumerate() {
+            let transcript = signed_replacement_transcript(
+                group,
+                shards,
+                &signing_keys,
+                next.hash().unwrap(),
+                index as u8 + 1,
+            );
+            crate::node::tests::install_test_recovery_transcript(&mut cold, &transcript);
+        }
+        cold.forget_local_sector(&reference.id).unwrap();
+        drop(cold);
         let requested = Arc::new(Mutex::new(Vec::new()));
         let (commands, mut commands_rx) = mpsc::channel(16);
         let (request_cancellations, _cancellations_rx) = mpsc::unbounded_channel();
@@ -15774,15 +15981,29 @@ mod tests {
                 }
             }
         });
-        let node = Arc::new(Mutex::new(Node::open(&node_path, seed).unwrap()));
+        let node = Arc::new(Mutex::new(Node::open(&node_path, seed.clone()).unwrap()));
         let restored = temp.path().join("restored");
         restore_snapshot_with_p2p(node, &p2p, None, &restored)
             .await
             .unwrap();
         assert!(restored.is_dir());
+        let restore_request_count = requested.lock().unwrap().len();
+        assert!(restore_request_count > 0);
+        let cold = Arc::new(Mutex::new(Node::open(&cold_path, seed).unwrap()));
+        recover_p2p_variable_shards(cold.clone(), &p2p, &next, &replacement_peers)
+            .await
+            .unwrap();
+        assert_eq!(
+            cold.lock()
+                .unwrap()
+                .sector_for_guild(&guild_id, &reference.id)
+                .map(|bytes| sector_root(&bytes))
+                .unwrap(),
+            reference.root
+        );
         {
             let requested = requested.lock().unwrap();
-            assert!(!requested.is_empty());
+            assert!(requested.len() > restore_request_count);
             assert!(requested.iter().all(|group_id| !old_ids.contains(group_id)));
         }
         drop(p2p);

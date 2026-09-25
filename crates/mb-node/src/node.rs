@@ -11274,6 +11274,31 @@ pub(crate) mod tests {
             .unwrap();
     }
 
+    pub(crate) fn install_test_recovery_transcript(
+        node: &mut Node,
+        transcript: &SignedRecord<CodingVerificationTranscript>,
+    ) {
+        assert_eq!(
+            replay_coding_transcript(transcript).unwrap(),
+            CodingReplayFinding::Verified
+        );
+        let bytes = canonical_bytes(transcript).unwrap();
+        node.control
+            .put_records(&[
+                (
+                    "coding-transcript".to_owned(),
+                    transcript.value.plan.value.attempt_id.to_vec(),
+                    bytes.clone(),
+                ),
+                (
+                    "coding-group-transcript".to_owned(),
+                    transcript.value.manifest.value.group.id.to_vec(),
+                    bytes,
+                ),
+            ])
+            .unwrap();
+    }
+
     #[test]
     fn data_directory_has_one_live_owner() {
         let temp = tempfile::tempdir().unwrap();
