@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (closed)
+## Milestone 5 guild geometry and coding protocol (reopened)
 
 Source-only review of `8135e0b..da8974a` on 2026-09-18 found the M5-36 through
 M5-44 blockers below; all are now corrected. The production gate recorded in
@@ -610,7 +610,11 @@ found M5-82's stalled-STOP gate covered. Subsequent commits `40d83ec`,
 scenario and resource gates below. That source-only review ran no builds, tests,
 daemons, runtime probes, or remote compilation. Fresh source review of the final
 correction commits found no new blocker. M5-84 passed locally on 2026-09-25 on
-`e959d92`; Milestone 5 is closed and Milestone 6 is next.
+`e959d92`; that closure record remains evidence for its exact tree. No code
+commits followed `890d88c`, but a new source-only review of the correction
+series found M5-85 through M5-87 below. Milestone 5 is reopened and Milestone 6
+waits. This review ran no builds, tests, daemons, runtime probes, or remote
+compilation.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -1891,6 +1895,57 @@ node Clippy gate passed locally. No remote compilation server was used.
   filesystem, including provisioned tests and the five-daemon network smoke
   test; its mount and image were cleaned up. No remote compilation server was
   used.
+
+- [ ] **M5-85 / P1 — Try each advertiser of the same checkpoint head.**
+  `sync_checkpoint_head_once` de-duplicates candidates by head hash alone
+  (`crates/mb-node/src/network/p2p.rs:7212`–`:7216`), but its intermediate
+  generation quorum requires the selected advertising source to endorse each
+  link (`:7288`–`:7295`, `:7377`–`:7385`). A seed-recovered peer can advertise a
+  certified high head while having only that generation indexed
+  (`crates/mb-store/src/database.rs:1075`–`:1122`). If it sorts before a peer
+  advertising the same hash with the complete chain, its catch-up fails and
+  the complete peer is skipped on every pass, including after restart. Try
+  distinct `(head hash, advertising source)` candidates, including after a
+  failed resumed attempt. Gate identical advertised heads under a majority
+  quorum, with the first source missing an intermediate link and the second
+  source complete.
+
+- [ ] **M5-86 / P1 — Validate legacy checkpoint epochs in historical order.**
+  A format-4 checkpoint has no authority epoch. On a later format-5 transition,
+  `latest_checkpoint_member_epoch` assigns it the latest matching roster epoch
+  from the entire currently synced guild event history
+  (`crates/mb-node/src/node.rs:6937`–`:6960`), then rejects a smaller explicit
+  successor epoch (`:6794`–`:6808`). Peer exchange syncs events before
+  checkpoints (`crates/mb-node/src/network/p2p.rs:7121`–`:7127`). Thus a valid
+  format-4 checkpoint at unanimous epoch 1, format-5 successor at majority
+  epoch 2, and later return to unanimous epoch 3 with a new format-5 head make
+  a lagging peer reject that historical epoch-2 link forever: the old roster
+  also matches epoch 3.
+  Preserve rollback rejection while bounding legacy epoch inference to the
+  checkpoint's historical transition. Gate late catch-up through this complete
+  signed sequence and the existing invalid rollback sequence.
+
+- [ ] **M5-87 / P1 — Let current replacement coverage satisfy cold recovery without a local role.**
+  `variable_recovery_plans` includes a group's covered sectors only when the
+  recovering node owns an information or parity shard in that group
+  (`crates/mb-node/src/network/p2p.rs:10255`–`:10286`). During the normal
+  overlap before a separate `RetireCodingGroup` event, a node can hold parity
+  in the stale group but have no role in a healthy current replacement. The
+  replacement is omitted from its plans, so recovery requires the unavailable
+  stale group and aborts before installing the recovered checkpoint
+  (`:10464`–`:10480`, `:8876`–`:8880`). Determine live-sector coverage from
+  current certified groups independently of the node's local shard targets;
+  recover only shards it still needs. Gate cold recovery in a six-member guild
+  where stale-group parity belongs to the recovering node, replacement parity
+  belongs elsewhere, the old group is unavailable, and the current replacement
+  has a valid `k`.
+
+- [ ] **M5-88 / gate — Recheck Milestone 5 after M5-85 through M5-87.**
+  After correcting these source blockers, run fresh source review, formatting,
+  locked all-target workspace tests, warning-free locked all-target workspace
+  Clippy, Docker lab safety, and the complete provisioned Btrfs/network
+  acceptance script on a fresh disposable local filesystem. Build and run
+  locally; do not use a remote compilation server.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
