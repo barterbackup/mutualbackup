@@ -6756,10 +6756,13 @@ impl Node {
         } else {
             decode_canonical::<QuorumCheckpoint>(&bytes)?.checkpoint
         };
-        let previous_epoch = previous
-            .authority
-            .map(|authority| authority.membership_epoch)
-            .unwrap_or(0);
+        let previous_epoch = match previous.authority {
+            Some(authority) => authority.membership_epoch,
+            None if checkpoint.authority.is_some() => {
+                self.latest_checkpoint_member_epoch(&previous)?
+            }
+            None => 0,
+        };
         let next_epoch = checkpoint
             .authority
             .map(|authority| authority.membership_epoch)
@@ -6892,6 +6895,30 @@ impl Node {
             anyhow::bail!("checkpoint transition drops or changes active state");
         }
         Ok(())
+    }
+
+    // Format-4 checkpoints do not record their epoch. Use the latest possible
+    // matching epoch so a repeated member roster cannot conceal a rollback.
+    fn latest_checkpoint_member_epoch(&self, checkpoint: &GuildCheckpoint) -> Result<u64> {
+        let installed = self
+            .installed_guild()?
+            .context("legacy checkpoint transition requires an installed guild")?;
+        let mut replay = initial_dynamic_guild_state(&installed)?;
+        let mut latest = replay
+            .active_members()
+            .eq(checkpoint.members.iter())
+            .then_some(replay.membership_epoch);
+        for (record_id, bytes) in self.control.records("guild-event")? {
+            let event: QuorumGuildEvent = decode_canonical(&bytes)?;
+            if record_id != event.event.sequence.to_be_bytes() {
+                anyhow::bail!("guild event history has an invalid record ID");
+            }
+            replay.apply_event(&event)?;
+            if replay.active_members().eq(checkpoint.members.iter()) {
+                latest = Some(replay.membership_epoch);
+            }
+        }
+        latest.context("legacy checkpoint membership is absent from guild event history")
     }
 
     fn validate_local_roles(&self, checkpoint: &GuildCheckpoint) -> Result<()> {
@@ -10510,6 +10537,218 @@ mod tests {
             Some((3, third.hash().unwrap()))
         );
         assert!(node.checkpoint_catchup_state(&guild_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_checkpoint_transition_uses_latest_matching_membership_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let (seed, certificate, peers) = recovery_guild_fixture();
+        let guild_id = certificate.genesis.guild_id;
+        let genesis_hash = certificate.hash().unwrap();
+        let path = temp.path().join("node");
+        let mut node = Node::open(&path, seed.clone()).unwrap();
+        node.adopt_recovered_guild(certificate, peers).unwrap();
+        let initial = node.dynamic_guild_state().unwrap().unwrap();
+        let mut checkpoint = GuildCheckpoint {
+            format_version: 4,
+            guild_id,
+            genesis_hash,
+            generation: 1,
+            parent: None,
+            members: initial.active_members().cloned().collect(),
+            writer_fences: Vec::new(),
+            revision_tombstones: Vec::new(),
+            revisions: Vec::new(),
+            coding_groups: Vec::new(),
+            authority: None,
+            packing_catalog: None,
+        };
+        assert_eq!(node.latest_checkpoint_member_epoch(&checkpoint).unwrap(), 1);
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id,
+            sequence: 1,
+            parent: initial.event_head,
+            kind: mb_core::GuildEventKind::RelabelMember {
+                node_id: initial.members[0].member.node_id,
+                failure_domain: "new-distinct-domain".into(),
+            },
+        };
+        let mut signatures = (120_u8..125)
+            .map(|index| {
+                sign_guild_event(
+                    &event,
+                    &KeyMaterial::from_seed(&Seed::from_bytes([index; 32])),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        node.install_guild_event(QuorumGuildEvent { event, signatures })
+            .unwrap();
+        let relabeled = node.dynamic_guild_state().unwrap().unwrap();
+        assert_eq!(relabeled.membership_epoch, 2);
+        checkpoint.members = relabeled.active_members().cloned().collect();
+        assert_eq!(node.latest_checkpoint_member_epoch(&checkpoint).unwrap(), 2);
+        let restore = GuildEvent {
+            format_version: 1,
+            guild_id,
+            sequence: 2,
+            parent: relabeled.event_head,
+            kind: mb_core::GuildEventKind::RelabelMember {
+                node_id: initial.members[0].member.node_id,
+                failure_domain: initial.members[0].member.failure_domain.clone(),
+            },
+        };
+        let mut signatures = (120_u8..125)
+            .map(|index| {
+                sign_guild_event(
+                    &restore,
+                    &KeyMaterial::from_seed(&Seed::from_bytes([index; 32])),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        node.install_guild_event(QuorumGuildEvent {
+            event: restore,
+            signatures,
+        })
+        .unwrap();
+        checkpoint.members = initial.active_members().cloned().collect();
+        assert_eq!(node.latest_checkpoint_member_epoch(&checkpoint).unwrap(), 3);
+        drop(node);
+
+        let node = Node::open(&path, seed).unwrap();
+        assert_eq!(node.latest_checkpoint_member_epoch(&checkpoint).unwrap(), 3);
+    }
+
+    #[test]
+    fn repeated_legacy_roster_cannot_hide_checkpoint_epoch_rollback() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([226; 32]);
+        let mut source = Node::open(temp.path().join("source"), seed.clone()).unwrap();
+        let revision = install_public_restore_fixture(&mut source, &seed);
+        let guild_id = revision.value.guild_id;
+        let first = source.current_checkpoint(guild_id).unwrap().unwrap();
+        let certificate = source.installed_guild_certificate().unwrap().unwrap();
+        let peers = certificate
+            .genesis
+            .members
+            .iter()
+            .cloned()
+            .map(|member| GuildPeer {
+                member,
+                endpoints: Vec::new(),
+            })
+            .collect();
+        drop(source);
+        let target_path = temp.path().join("target");
+        let mut node = Node::open(&target_path, seed.clone()).unwrap();
+        node.adopt_recovered_guild(certificate, peers).unwrap();
+        let initial = node.dynamic_guild_state().unwrap().unwrap();
+        node.store_checkpoint_with_authority(&first, false, true)
+            .unwrap();
+        let signer_keys = std::iter::once(seed.clone())
+            .chain((0_u8..4).map(|index| Seed::from_bytes([index + 228; 32])))
+            .map(|seed| KeyMaterial::from_seed(&seed))
+            .collect::<Vec<_>>();
+        let writer_fence = &first.checkpoint.writer_fences[0];
+        let rotate_writer = GuildEvent {
+            format_version: 1,
+            guild_id,
+            sequence: 1,
+            parent: initial.event_head,
+            kind: mb_core::GuildEventKind::RotateWriterKey {
+                owner: writer_fence.owner,
+                epoch: writer_fence.epoch,
+                public_key: writer_fence.public_key,
+            },
+        };
+        let mut signatures = signer_keys
+            .iter()
+            .map(|keys| sign_guild_event(&rotate_writer, keys).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        node.install_guild_event(QuorumGuildEvent {
+            event: rotate_writer,
+            signatures,
+        })
+        .unwrap();
+        let original = initial.members[0].member.clone();
+        let mut historical_middle = None;
+        for (sequence, domain) in [
+            (2, "repeated-roster-middle".to_owned()),
+            (3, original.failure_domain.clone()),
+        ] {
+            let state = node.dynamic_guild_state().unwrap().unwrap();
+            let event = GuildEvent {
+                format_version: 1,
+                guild_id,
+                sequence,
+                parent: state.event_head,
+                kind: mb_core::GuildEventKind::RelabelMember {
+                    node_id: original.node_id,
+                    failure_domain: domain,
+                },
+            };
+            let mut signatures = signer_keys
+                .iter()
+                .map(|keys| sign_guild_event(&event, keys).unwrap())
+                .collect::<Vec<_>>();
+            signatures.sort_by_key(|signature| signature.signer);
+            node.install_guild_event(QuorumGuildEvent { event, signatures })
+                .unwrap();
+            if sequence == 2 {
+                historical_middle = node.dynamic_guild_state().unwrap();
+            }
+        }
+        let middle = historical_middle.unwrap();
+        assert_eq!(middle.membership_epoch, 2);
+        assert_eq!(
+            node.dynamic_guild_state()
+                .unwrap()
+                .unwrap()
+                .membership_epoch,
+            3
+        );
+
+        let mut legacy = first.clone();
+        legacy.checkpoint.format_version = 4;
+        legacy.checkpoint.generation = 2;
+        legacy.checkpoint.parent = Some(first.hash().unwrap());
+        legacy.signatures.clear();
+        for keys in &signer_keys {
+            legacy.add_signature(keys).unwrap();
+        }
+        legacy.verify().unwrap();
+        node.store_checkpoint_with_authority(&legacy, false, true)
+            .unwrap();
+        drop(node);
+        let node = Node::open(&target_path, seed).unwrap();
+        assert_eq!(
+            node.latest_checkpoint_member_epoch(&legacy.checkpoint)
+                .unwrap(),
+            3
+        );
+
+        let mut backward = legacy.checkpoint.clone();
+        backward.format_version = 5;
+        backward.generation = 3;
+        backward.parent = Some(legacy.hash().unwrap());
+        backward.members = middle.active_members().cloned().collect();
+        backward.authority = Some(mb_core::CheckpointAuthority {
+            format_version: 1,
+            membership_epoch: middle.membership_epoch,
+            quorum: middle.quorum,
+        });
+        backward.validate().unwrap();
+        assert!(
+            node.validate_checkpoint_transition(&backward)
+                .unwrap_err()
+                .to_string()
+                .contains("epoch moves backward")
+        );
     }
 
     #[test]
