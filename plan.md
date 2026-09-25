@@ -1384,6 +1384,12 @@ builds, tests, daemons, runtime probes, or remote compilation. M5-88 remains
 historical gate evidence for its exact tree; Milestone 5 is reopened and
 Milestone 6 waits.
 
+The M5-89 and M5-90 corrections now bind cold replacement coverage to exact
+checkpoint sector authentication and schedule only bounded, useful current
+groups. Focused local regressions and strict `mb-node` Clippy pass. The complete
+M5-91 local gate still has to run on the corrected source tree before closing
+Milestone 5.
+
 The M5-42 rejected-connection cleanup was source-reviewed and found to remove
 only the rejected connection while preserving accepted siblings. This review
 ran no builds, tests, daemons, runtime probes, or remote compilation.
@@ -1850,8 +1856,11 @@ and any-`k` two-live-sector cases.
 The complete M5-88 gate passed locally on 2026-09-25 on source commit
 `dd5c7e8`, including the full provisioned Btrfs/network acceptance script.
 Further source-only review found M5-89 and M5-90 in the coverage-only cold
-recovery path. M5-88 remains evidence for its exact source tree; Milestone 5
-is reopened until those corrections and M5-91 pass. Milestone 6 waits.
+recovery path. Their corrections now bind replacement coverage to exact
+checkpoint authentication and stop bounded current-group work after sufficient
+coverage. Focused local tests and strict `mb-node` Clippy pass. M5-88 remains
+historical evidence; Milestone 5 awaits the complete M5-91 local gate, and
+Milestone 6 waits.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and

@@ -1986,7 +1986,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   mount, loop device, image, and smoke-test namespaces were removed. No remote
   compilation server was used.
 
-- [ ] **M5-89 / P1 — Bind cold replacement coverage to the checkpoint's authenticated sector.**
+- [x] **M5-89 / P1 — Bind cold replacement coverage to the checkpoint's authenticated sector.**
   `variable_recovery_plans` collects checkpoint sectors as IDs and its new
   coverage-only pass treats a current group's information role as a match on
   ID alone (`crates/mb-node/src/network/p2p.rs:10227`–`:10319`). A separately
@@ -2007,8 +2007,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   logical length, and transcript information root for legacy references;
   catalog commitment and flat root for packed sectors. Gate a same-ID,
   different-root current group against an unavailable correct stale group.
+  The correction checks each claimed information role against the checkpoint's
+  owner and length or packed commitment, then checks the transcript root.
+  Legacy transcripts without roots reconstruct and compare sector bytes.
+  Focused local regressions reject a same-ID wrong-root current group with an
+  unavailable correct stale group, and packed commitment/root mismatches.
 
-- [ ] **M5-90 / P2 — Stop cold recovery work after sufficient current coverage.**
+- [x] **M5-90 / P2 — Stop cold recovery work after sufficient current coverage.**
   The coverage-only second pass adds every current group overlapping a required
   sector, even when one healthy replacement covers it
   (`crates/mb-node/src/network/p2p.rs:10287`–`:10319`).
@@ -2024,6 +2029,11 @@ node Clippy gate passed locally. No remote compilation server was used.
   required coverage succeeds, while still trying another placement when the
   first fails. Gate healthy-first with stalled redundant groups and failed-first
   fallback, including a bound on issued shard requests.
+  Current groups now run in bounded batches with disjoint needed sectors;
+  successful coverage stops redundant probes and failures allow alternatives.
+  Focused local tests cover stalled redundant groups, failed-first fallback,
+  the eight-group in-flight bound, and network recovery that requests shards
+  only from its healthy replacement.
 
 - [ ] **M5-91 / gate — Recheck Milestone 5 after M5-89 and M5-90.**
   After correcting both source blockers, run fresh source review, formatting,

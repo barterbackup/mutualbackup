@@ -10224,6 +10224,107 @@ struct VariableRecoveryPlan {
     priority: u8,
 }
 
+#[derive(Clone)]
+enum RecoverySectorAuthentication {
+    Legacy { owner: NodeId, reference: SectorRef },
+    Packed(PackedSectorDescriptor),
+}
+
+impl RecoverySectorAuthentication {
+    fn root(&self) -> [u8; 32] {
+        match self {
+            Self::Legacy { reference, .. } => reference.root,
+            Self::Packed(descriptor) => descriptor.flat_root,
+        }
+    }
+
+    fn matches_role(&self, information: &InformationRoleV2) -> bool {
+        match self {
+            Self::Legacy { owner, reference } => {
+                information.owner == *owner
+                    && information.sector.id == reference.id
+                    && information.sector.logical_len == reference.logical_len
+            }
+            Self::Packed(descriptor) => {
+                information.sector.id == descriptor.id
+                    && information.sector.logical_len == descriptor.commitment.byte_len
+                    && information.sector.commitment == descriptor.commitment
+            }
+        }
+    }
+}
+
+fn checkpoint_recovery_authentication(
+    checkpoint: &GuildCheckpoint,
+) -> BTreeMap<SectorId, RecoverySectorAuthentication> {
+    if let Some(catalog) = &checkpoint.packing_catalog {
+        catalog
+            .sectors
+            .iter()
+            .map(|descriptor| {
+                (
+                    descriptor.id,
+                    RecoverySectorAuthentication::Packed(descriptor.clone()),
+                )
+            })
+            .collect()
+    } else {
+        checkpoint
+            .revisions
+            .iter()
+            .flat_map(|revision| {
+                revision
+                    .value
+                    .metadata_sectors
+                    .iter()
+                    .chain(&revision.value.data_sectors)
+                    .map(|reference| {
+                        (
+                            reference.id,
+                            RecoverySectorAuthentication::Legacy {
+                                owner: revision.value.owner,
+                                reference: reference.clone(),
+                            },
+                        )
+                    })
+            })
+            .collect()
+    }
+}
+
+fn recovery_plan_missing_roots(
+    plan: &VariableRecoveryPlan,
+    transcript: &SignedRecord<CodingVerificationTranscript>,
+    authentication: &BTreeMap<SectorId, RecoverySectorAuthentication>,
+) -> Result<Vec<(usize, [u8; 32])>> {
+    let mut matched = BTreeSet::new();
+    let mut missing_roots = Vec::new();
+    for (index, role) in plan.group.roles.iter().enumerate() {
+        let ShardRoleV2::Information(information) = role else {
+            continue;
+        };
+        if !plan.covered.contains(&information.sector.id) {
+            continue;
+        }
+        let expected = authentication
+            .get(&information.sector.id)
+            .context("recovery sector is absent from the checkpoint")?;
+        if !expected.matches_role(information) {
+            bail!("recovery group information differs from the checkpoint sector");
+        }
+        match transcript.value.plan.value.information_root(index) {
+            Some(root) if root == expected.root() => {}
+            Some(_) => bail!("recovery group information root differs from the checkpoint"),
+            None => missing_roots.push((index, expected.root())),
+        }
+        matched.insert(information.sector.id);
+    }
+    if matched != plan.covered {
+        bail!("recovery group does not cover its planned checkpoint sectors");
+    }
+    Ok(missing_roots)
+}
+
 fn variable_recovery_plans(
     state: &DynamicGuildState,
     sectors: &BTreeSet<SectorId>,
@@ -10333,38 +10434,13 @@ async fn recover_p2p_variable_shards(
         return Ok(());
     }
     let checkpoint_hash = checkpoint.hash()?;
-    let checkpoint_for_plan = checkpoint.clone();
+    let authentication = Arc::new(checkpoint_recovery_authentication(&checkpoint.checkpoint));
+    let sectors = authentication.keys().copied().collect::<BTreeSet<_>>();
     let (plans, required_sectors) = node_blocking(node.clone(), move |node| {
         let local_id = node.keys().node_id();
         let state = node
             .dynamic_guild_state()?
             .context("variable recovery requires dynamic guild state")?;
-        let sectors = checkpoint_for_plan
-            .checkpoint
-            .packing_catalog
-            .as_ref()
-            .map(|catalog| {
-                catalog
-                    .sectors
-                    .iter()
-                    .map(|sector| sector.id)
-                    .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_else(|| {
-                checkpoint_for_plan
-                    .checkpoint
-                    .revisions
-                    .iter()
-                    .flat_map(|revision| {
-                        revision
-                            .value
-                            .metadata_sectors
-                            .iter()
-                            .chain(&revision.value.data_sectors)
-                    })
-                    .map(|reference| reference.id)
-                    .collect()
-            });
         Ok(variable_recovery_plans(&state, &sectors, local_id))
     })
     .await?;
@@ -10375,6 +10451,7 @@ async fn recover_p2p_variable_shards(
             p2p,
             checkpoint_hash,
             plan,
+            authentication.clone(),
             roster,
             deferred_holders.clone(),
         )
@@ -10473,24 +10550,54 @@ where
     F: Fn(VariableRecoveryPlan) -> Fut + Clone + Send + Sync,
     Fut: Future<Output = Result<()>> + Send,
 {
-    let (current, fallback): (Vec<_>, Vec<_>) =
+    let (mut current, fallback): (Vec<_>, Vec<_>) =
         plans.into_iter().partition(|plan| plan.priority == 0);
-    let requests = current.into_iter().map(|plan| {
-        let recover = recover.clone();
-        async move {
-            let covered = plan.covered.clone();
-            let result = recover(plan).await;
-            Ok((covered, result))
-        }
-    });
     let mut covered = BTreeSet::new();
     let mut last_error = None;
-    for (sectors, result) in
-        collect_bounded_recovery_requests(requests, RECOVERY_VARIABLE_GROUP_CONCURRENCY).await?
-    {
-        match result {
-            Ok(()) => covered.extend(sectors),
-            Err(error) => last_error = Some(error),
+    while !required_sectors.is_subset(&covered) && !current.is_empty() {
+        let needed = required_sectors
+            .difference(&covered)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut reserved = BTreeSet::new();
+        let mut selected = Vec::new();
+        let mut next = Vec::new();
+        for plan in current {
+            let useful = plan
+                .covered
+                .intersection(&needed)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if useful.is_empty()
+                || !useful.is_disjoint(&reserved)
+                || selected.len() == RECOVERY_VARIABLE_GROUP_CONCURRENCY
+            {
+                next.push(plan);
+            } else {
+                reserved.extend(useful);
+                selected.push(plan);
+            }
+        }
+        if selected.is_empty() {
+            break;
+        }
+        current = next;
+        let mut requests = FuturesUnordered::new();
+        for plan in selected {
+            let recover = recover.clone();
+            requests.push(async move {
+                let sectors = plan.covered.clone();
+                (sectors, recover(plan).await)
+            });
+        }
+        while let Some((sectors, result)) = requests.next().await {
+            match result {
+                Ok(()) => covered.extend(sectors),
+                Err(error) => last_error = Some(error),
+            }
+            if required_sectors.is_subset(&covered) {
+                break;
+            }
         }
     }
     for plan in fallback {
@@ -10519,6 +10626,7 @@ async fn recover_variable_group_plan(
     p2p: &P2pClient,
     checkpoint_hash: [u8; 32],
     plan: VariableRecoveryPlan,
+    authentication: Arc<BTreeMap<SectorId, RecoverySectorAuthentication>>,
     roster: &[GuildPeer],
     deferred_holders: Arc<Mutex<BTreeSet<NodeId>>>,
 ) -> Result<()> {
@@ -10527,6 +10635,21 @@ async fn recover_variable_group_plan(
         node.recovery_coding_transcript_for_group(checkpoint_hash, group.guild_id, group.id)
     })
     .await?;
+    let missing_roots = recovery_plan_missing_roots(&plan, &transcript, &authentication)?;
+    for (index, expected_root) in &missing_roots {
+        let bytes = reconstruct_variable_shard_from_peers_requiring_quorum(
+            node.clone(),
+            p2p,
+            &plan.group,
+            *index,
+            roster,
+            deferred_holders.as_ref(),
+        )
+        .await?;
+        if sector_root(&bytes) != *expected_root {
+            bail!("reconstructed recovery sector root differs from the checkpoint");
+        }
+    }
     if plan.targets.is_empty() {
         // A current replacement can cover stale local parity without assigning
         // this node a new shard. Prove a live k before skipping the stale group.
@@ -10545,15 +10668,17 @@ async fn recover_variable_group_plan(
                 _ => None,
             })
             .context("coverage-only recovery plan has no live information shard")?;
-        reconstruct_variable_shard_from_peers_requiring_quorum(
-            node,
-            p2p,
-            &plan.group,
-            probe_index,
-            roster,
-            deferred_holders.as_ref(),
-        )
-        .await?;
+        if missing_roots.is_empty() {
+            reconstruct_variable_shard_from_peers_requiring_quorum(
+                node,
+                p2p,
+                &plan.group,
+                probe_index,
+                roster,
+                deferred_holders.as_ref(),
+            )
+            .await?;
+        }
         return Ok(());
     }
     recover_variable_plan(
@@ -13885,6 +14010,98 @@ mod tests {
     use request_response::Codec as _;
     use std::io;
 
+    fn coverage_test_plan(group_id: u8, sector_id: SectorId) -> VariableRecoveryPlan {
+        VariableRecoveryPlan {
+            group: CodingGroupV2 {
+                id: [group_id; 32],
+                format_version: 1,
+                guild_id: [1; 32],
+                profile: CodingProfile::new(1, 1, 1),
+                roles: Vec::new(),
+            },
+            targets: Vec::new(),
+            covered: BTreeSet::from([sector_id]),
+            priority: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn current_recovery_stops_before_redundant_stalled_group() {
+        let sector = [2; 32];
+        let issued = Arc::new(Mutex::new(Vec::new()));
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            recover_variable_plan_coverage(
+                vec![coverage_test_plan(1, sector), coverage_test_plan(2, sector)],
+                BTreeSet::from([sector]),
+                |plan| {
+                    let issued = issued.clone();
+                    async move {
+                        issued.lock().unwrap().push(plan.group.id);
+                        if plan.group.id == [2; 32] {
+                            std::future::pending::<Result<()>>().await
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+            ),
+        )
+        .await;
+        assert!(result.unwrap().is_ok());
+        assert_eq!(*issued.lock().unwrap(), vec![[1; 32]]);
+    }
+
+    #[tokio::test]
+    async fn current_recovery_tries_another_placement_after_failure() {
+        let sector = [3; 32];
+        let issued = Arc::new(Mutex::new(Vec::new()));
+        recover_variable_plan_coverage(
+            vec![coverage_test_plan(1, sector), coverage_test_plan(2, sector)],
+            BTreeSet::from([sector]),
+            |plan| {
+                let issued = issued.clone();
+                async move {
+                    issued.lock().unwrap().push(plan.group.id);
+                    if plan.group.id == [1; 32] {
+                        bail!("first placement is unavailable");
+                    }
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*issued.lock().unwrap(), vec![[1; 32], [2; 32]]);
+    }
+
+    #[tokio::test]
+    async fn current_recovery_limits_parallel_group_requests() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let plans = (1_u8..=24)
+            .map(|index| coverage_test_plan(index, [index; 32]))
+            .collect();
+        let required = (1_u8..=24).map(|index| [index; 32]).collect();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        recover_variable_plan_coverage(plans, required, |_plan| {
+            let active = active.clone();
+            let peak = peak.clone();
+            async move {
+                let in_flight = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(in_flight, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        assert!(peak.load(Ordering::SeqCst) > 1);
+        assert!(peak.load(Ordering::SeqCst) <= RECOVERY_VARIABLE_GROUP_CONCURRENCY);
+    }
+
     fn config(node_id: NodeId) -> P2pConfig {
         P2pConfig {
             listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
@@ -16330,6 +16547,20 @@ mod tests {
         .unwrap();
         let replacement =
             materialize_variable_lane(&replacement_lane, std::slice::from_ref(&bytes));
+        let redundant = (195_u8..=255)
+            .find_map(|ordinal| {
+                let lane = variable_coding_lane(
+                    guild_id,
+                    Uuid::from_bytes([ordinal; 16]),
+                    0,
+                    &input,
+                    &replacement_peers,
+                )
+                .ok()?;
+                let group = materialize_variable_lane(&lane, std::slice::from_ref(&bytes));
+                (group.id > replacement.id).then_some(group)
+            })
+            .expect("a distinct later-sorted current group");
         assert!(old.roles.iter().any(
             |role| matches!(role, ShardRoleV2::Parity(parity) if parity.holder == recovering)
         ));
@@ -16352,11 +16583,17 @@ mod tests {
                 retired_at_event: None,
                 retain_through_event: None,
             },
+            mb_core::RetainedCodingGroup {
+                group: redundant.clone(),
+                added_at_event: 5,
+                retired_at_event: None,
+                retain_through_event: None,
+            },
         ];
         groups.sort_by_key(|retained| retained.group.id);
         let state = DynamicGuildState {
             membership_epoch: 3,
-            event_sequence: 4,
+            event_sequence: 5,
             event_head: [190; 32],
             coding_groups: groups,
             ..DynamicGuildState::new(
@@ -16375,6 +16612,7 @@ mod tests {
         };
         assert!(state.validate_current_group_placement(&old).is_err());
         assert!(state.validate_current_group_placement(&replacement).is_ok());
+        assert!(state.validate_current_group_placement(&redundant).is_ok());
         let (plans, required) =
             variable_recovery_plans(&state, &BTreeSet::from([reference.id]), recovering);
         assert_eq!(required, BTreeSet::from([reference.id]));
@@ -16464,6 +16702,172 @@ mod tests {
             3,
             1,
         );
+        let redundant_information = redundant
+            .roles
+            .iter()
+            .take(usize::from(redundant.profile.data_shards))
+            .map(|role| match role {
+                ShardRoleV2::Information(information) if information.sector.virtual_zero => {
+                    vec![0; redundant.profile.shard_size as usize]
+                }
+                ShardRoleV2::Information(_) => bytes.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let redundant_shards = encode(redundant.profile, redundant_information).unwrap();
+        let redundant_transcript = signed_replacement_transcript(
+            &redundant,
+            &redundant_shards,
+            &signing_keys,
+            checkpoint.hash().unwrap(),
+            3,
+            3,
+        );
+        let wrong_bytes = vec![18; V1_SECTOR_SIZE];
+        let wrong_reference = SectorRef {
+            id: reference.id,
+            root: sector_root(&wrong_bytes),
+            logical_len: reference.logical_len,
+        };
+        let wrong_commitment = merkle_commit(&wrong_bytes).unwrap();
+        let wrong_lane = variable_coding_lane(
+            guild_id,
+            Uuid::from_bytes([194; 16]),
+            0,
+            &[VariableInformationInput {
+                owner,
+                sector: &wrong_reference,
+                commitment: &wrong_commitment,
+            }],
+            &replacement_peers,
+        )
+        .unwrap();
+        let wrong = materialize_variable_lane(&wrong_lane, std::slice::from_ref(&wrong_bytes));
+        let wrong_information = wrong
+            .roles
+            .iter()
+            .take(usize::from(wrong.profile.data_shards))
+            .map(|role| match role {
+                ShardRoleV2::Information(information) if information.sector.virtual_zero => {
+                    vec![0; wrong.profile.shard_size as usize]
+                }
+                ShardRoleV2::Information(_) => wrong_bytes.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let wrong_shards = encode(wrong.profile, wrong_information).unwrap();
+        let wrong_transcript = signed_replacement_transcript(
+            &wrong,
+            &wrong_shards,
+            &signing_keys,
+            checkpoint.hash().unwrap(),
+            3,
+            2,
+        );
+        assert_eq!(
+            replay_coding_transcript(&wrong_transcript).unwrap(),
+            mb_core::CodingReplayFinding::Verified
+        );
+        assert!(state.validate_current_group_placement(&wrong).is_ok());
+        let authentication = checkpoint_recovery_authentication(&checkpoint.checkpoint);
+        let wrong_plan = VariableRecoveryPlan {
+            group: wrong,
+            targets: Vec::new(),
+            covered: BTreeSet::from([reference.id]),
+            priority: 0,
+        };
+        assert!(
+            recovery_plan_missing_roots(&wrong_plan, &wrong_transcript, &authentication).is_err(),
+            "a certified same-ID group with a different root cannot replace checkpoint coverage"
+        );
+        let wrong_id = wrong_plan.group.id;
+        let old_id = old.id;
+        let attempted = Arc::new(Mutex::new(Vec::new()));
+        assert!(
+            recover_variable_plan_coverage(
+                vec![
+                    wrong_plan,
+                    VariableRecoveryPlan {
+                        group: old.clone(),
+                        targets: vec![0],
+                        covered: BTreeSet::from([reference.id]),
+                        priority: 1,
+                    },
+                ],
+                BTreeSet::from([reference.id]),
+                |plan| {
+                    let attempted = attempted.clone();
+                    let wrong_transcript = &wrong_transcript;
+                    let authentication = &authentication;
+                    async move {
+                        attempted.lock().unwrap().push(plan.group.id);
+                        if plan.group.id == wrong_id {
+                            recovery_plan_missing_roots(&plan, wrong_transcript, authentication)?;
+                            Ok(())
+                        } else {
+                            bail!("the correct stale group is unavailable")
+                        }
+                    }
+                },
+            )
+            .await
+            .is_err(),
+            "wrong current bytes and unavailable correct stale bytes cannot cover the checkpoint"
+        );
+        assert_eq!(*attempted.lock().unwrap(), vec![wrong_id, old_id]);
+        let valid_plan = VariableRecoveryPlan {
+            group: replacement.clone(),
+            targets: Vec::new(),
+            covered: BTreeSet::from([reference.id]),
+            priority: 0,
+        };
+        assert!(
+            recovery_plan_missing_roots(&valid_plan, &transcript, &authentication)
+                .unwrap()
+                .is_empty()
+        );
+        let packed = PackedSectorDescriptor {
+            id: reference.id,
+            sector_index: 0,
+            flat_root: reference.root,
+            commitment: merkle_commit(&bytes).unwrap(),
+            slots: Vec::new(),
+        };
+        let packed_authentication = BTreeMap::from([(
+            reference.id,
+            RecoverySectorAuthentication::Packed(packed.clone()),
+        )]);
+        assert!(
+            recovery_plan_missing_roots(&valid_plan, &transcript, &packed_authentication)
+                .unwrap()
+                .is_empty()
+        );
+        let mut wrong_packed_commitment = packed.clone();
+        wrong_packed_commitment.commitment = wrong_commitment;
+        assert!(
+            recovery_plan_missing_roots(
+                &valid_plan,
+                &transcript,
+                &BTreeMap::from([(
+                    reference.id,
+                    RecoverySectorAuthentication::Packed(wrong_packed_commitment),
+                )]),
+            )
+            .is_err()
+        );
+        let mut wrong_packed_root = packed;
+        wrong_packed_root.flat_root = wrong_reference.root;
+        assert!(
+            recovery_plan_missing_roots(
+                &valid_plan,
+                &transcript,
+                &BTreeMap::from([(
+                    reference.id,
+                    RecoverySectorAuthentication::Packed(wrong_packed_root),
+                )]),
+            )
+            .is_err()
+        );
         let mut cold = Node::open(temp.path().join("cold"), seeds[1].clone()).unwrap();
         cold.adopt_recovered_guild(certificate, old_peers).unwrap();
         crate::node::tests::install_test_checkpoint_and_dynamic_state(
@@ -16472,6 +16876,7 @@ mod tests {
             &state,
         );
         crate::node::tests::install_test_recovery_transcript(&mut cold, &transcript);
+        crate::node::tests::install_test_recovery_transcript(&mut cold, &redundant_transcript);
         let cold = Arc::new(Mutex::new(cold));
         let requested = Arc::new(Mutex::new(Vec::new()));
         let (commands, mut commands_rx) = mpsc::channel(16);
