@@ -12072,6 +12072,7 @@ async fn build_production_packing(
             .or_default()
             .push(attestation.clone());
     }
+    let mut journaled_legacy_attestations = None;
     for revision in revisions {
         let protected_root = packing_protected_root(revision.value.protected_root_id);
         for (index, reference) in revision
@@ -12100,6 +12101,7 @@ async fn build_production_packing(
                     reference,
                     prior_legacy_bindings.get(&key),
                     prior_legacy_attestations.get(&key).map(Vec::as_slice),
+                    &mut journaled_legacy_attestations,
                     previous,
                 )
                 .await?;
@@ -12337,6 +12339,9 @@ async fn legacy_source_evidence(
     reference: &SectorRef,
     prior_binding: Option<&SignedRecord<LegacyPackingBinding>>,
     prior_attestations: Option<&[SignedRecord<LegacyPackingAttestation>]>,
+    journaled_by_source: &mut Option<
+        BTreeMap<PackingObjectKey, Vec<SignedRecord<LegacyPackingAttestation>>>,
+    >,
     previous: Option<&PackedCatalog>,
 ) -> Result<LegacySourceEvidence> {
     let protected_root = packing_protected_root(protected_root_id);
@@ -12356,10 +12361,36 @@ async fn legacy_source_evidence(
         .iter()
         .map(|member| member.node_id)
         .collect::<BTreeSet<_>>();
-    let mut journaled = node_blocking(node.clone(), move |node| {
-        node.legacy_packing_attestations(guild_id, owner, protected_root, object_id)
-    })
-    .await?;
+    if let Some(attestations) = legacy_attestation_quorum(
+        prior_attestations.unwrap_or_default().to_vec(),
+        guild_id,
+        authority.membership_epoch,
+        owner,
+        protected_root,
+        reference,
+        &member_ids,
+        required,
+    )? {
+        return Ok(LegacySourceEvidence {
+            commitment: attestations[0].value.source_commitment.clone(),
+            binding: None,
+            attestations,
+            bytes: None,
+        });
+    }
+    if journaled_by_source.is_none() {
+        *journaled_by_source = Some(
+            node_blocking(node.clone(), move |node| {
+                node.legacy_packing_attestation_index(guild_id)
+            })
+            .await?,
+        );
+    }
+    let mut journaled = journaled_by_source
+        .as_ref()
+        .and_then(|index| index.get(&(owner, protected_root, object_id)))
+        .cloned()
+        .unwrap_or_default();
     journaled.extend(prior_attestations.into_iter().flatten().cloned());
     if let Some(attestations) = legacy_attestation_quorum(
         journaled.clone(),

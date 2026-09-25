@@ -44,6 +44,9 @@ use crate::snapshot::{
 };
 use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open_control_store};
 
+pub(crate) type LegacyPackingAttestationIndex =
+    BTreeMap<(NodeId, [u8; 32], SectorId), Vec<SignedRecord<mb_core::LegacyPackingAttestation>>>;
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 enum RecoveryJobState {
     Building,
@@ -3666,27 +3669,29 @@ impl Node {
         Ok(())
     }
 
-    pub(crate) fn legacy_packing_attestations(
+    pub(crate) fn legacy_packing_attestation_index(
         &self,
         guild_id: [u8; 32],
-        owner: NodeId,
-        protected_root: [u8; 32],
-        object_id: SectorId,
-    ) -> Result<Vec<SignedRecord<mb_core::LegacyPackingAttestation>>> {
-        let mut attestations = Vec::new();
+    ) -> Result<LegacyPackingAttestationIndex> {
+        let mut attestations = LegacyPackingAttestationIndex::new();
         for (_, bytes) in self.control.records("legacy-packing-attestation")? {
             let attestation: SignedRecord<mb_core::LegacyPackingAttestation> =
                 decode_canonical(&bytes)?;
             attestation.verify(mb_core::LEGACY_PACKING_ATTESTATION_DOMAIN)?;
-            if attestation.value.guild_id == guild_id
-                && attestation.value.owner == owner
-                && attestation.value.protected_root == protected_root
-                && attestation.value.object_id == object_id
-            {
-                attestations.push(attestation);
+            if attestation.value.guild_id == guild_id {
+                attestations
+                    .entry((
+                        attestation.value.owner,
+                        attestation.value.protected_root,
+                        attestation.value.object_id,
+                    ))
+                    .or_default()
+                    .push(attestation);
             }
         }
-        attestations.sort_by_key(|attestation| attestation.signer);
+        for entries in attestations.values_mut() {
+            entries.sort_by_key(|attestation| attestation.signer);
+        }
         Ok(attestations)
     }
 
@@ -6706,6 +6711,17 @@ impl Node {
         } else {
             decode_canonical::<QuorumCheckpoint>(&bytes)?.checkpoint
         };
+        let previous_epoch = previous
+            .authority
+            .map(|authority| authority.membership_epoch)
+            .unwrap_or(0);
+        let next_epoch = checkpoint
+            .authority
+            .map(|authority| authority.membership_epoch)
+            .unwrap_or(0);
+        if next_epoch < previous_epoch {
+            anyhow::bail!("checkpoint authority epoch moves backward");
+        }
         match (
             previous.packing_catalog.as_ref(),
             checkpoint.packing_catalog.as_ref(),
@@ -10089,18 +10105,27 @@ mod tests {
         let signed = node
             .sign_legacy_packing_attestation(value.clone(), &bytes)
             .unwrap();
+        for index in 0..128_u8 {
+            let mut other = value.clone();
+            other.object_id = [index + 100; 32];
+            let attestation = SignedRecord::sign(
+                mb_core::LEGACY_PACKING_ATTESTATION_DOMAIN,
+                other,
+                &node.keys,
+            )
+            .unwrap();
+            node.store_legacy_packing_attestation(&attestation).unwrap();
+        }
         drop(node);
 
         let node = Node::open(&path, seed).unwrap();
+        let index = node
+            .legacy_packing_attestation_index(value.guild_id)
+            .unwrap();
+        assert_eq!(index.len(), 129);
         assert_eq!(
-            node.legacy_packing_attestations(
-                value.guild_id,
-                value.owner,
-                value.protected_root,
-                value.object_id,
-            )
-            .unwrap(),
-            vec![signed]
+            index.get(&(value.owner, value.protected_root, value.object_id)),
+            Some(&vec![signed.clone()])
         );
     }
 
@@ -10135,7 +10160,7 @@ mod tests {
         drop(source);
         let node_path = temp.path().join("target");
         let mut node = Node::open(&node_path, local_seed.clone()).unwrap();
-        node.adopt_recovered_guild(certificate.clone(), peers)
+        node.adopt_recovered_guild(certificate.clone(), peers.clone())
             .unwrap();
         let initial = node.dynamic_guild_state().unwrap().unwrap();
         let writer_fence = first.checkpoint.writer_fences[0].clone();
@@ -10334,6 +10359,80 @@ mod tests {
         assert!(!complete);
         assert_eq!(
             node.checkpoint_head(&guild_id).unwrap(),
+            Some((2, second.hash().unwrap()))
+        );
+        let mut regressed = second.clone();
+        regressed.checkpoint.generation = 3;
+        regressed.checkpoint.parent = Some(second.hash().unwrap());
+        regressed.checkpoint.authority = Some(mb_core::CheckpointAuthority {
+            format_version: 1,
+            membership_epoch: initial.membership_epoch,
+            quorum: initial.quorum,
+        });
+        regressed.signatures.clear();
+        for keys in &signer_keys {
+            regressed.add_signature(keys).unwrap();
+        }
+        regressed.verify().unwrap();
+        assert!(
+            node.validate_checkpoint_transition(&regressed.checkpoint)
+                .is_err()
+        );
+
+        let mut legacy_regression = regressed.clone();
+        legacy_regression.checkpoint.format_version = 4;
+        legacy_regression.checkpoint.authority = None;
+        legacy_regression.signatures.clear();
+        for keys in &signer_keys {
+            legacy_regression.add_signature(keys).unwrap();
+        }
+        legacy_regression.verify().unwrap();
+        assert!(
+            node.validate_checkpoint_transition(&legacy_regression.checkpoint)
+                .is_err()
+        );
+        let mut fourth = second.clone();
+        fourth.checkpoint.generation = 4;
+        fourth.checkpoint.parent = Some(regressed.hash().unwrap());
+        fourth.signatures.clear();
+        for keys in &nonsigners {
+            fourth.add_signature(keys).unwrap();
+        }
+        fourth.verify().unwrap();
+        let rollback_path = temp.path().join("rollback-target");
+        let mut rollback = Node::open(&rollback_path, local_seed.clone()).unwrap();
+        rollback
+            .adopt_recovered_guild(certificate.clone(), peers)
+            .unwrap();
+        for (_, bytes) in node.control.records("guild-event").unwrap() {
+            rollback
+                .install_guild_event(decode_canonical(&bytes).unwrap())
+                .unwrap();
+        }
+        let rollback_state = rollback
+            .begin_checkpoint_catchup(source_id, &fourth)
+            .unwrap();
+        let (rollback_state, complete) = rollback
+            .install_checkpoint_catchup_link(rollback_state, &first)
+            .unwrap();
+        assert!(!complete);
+        let (_, complete) = rollback
+            .install_checkpoint_catchup_link(rollback_state, &second)
+            .unwrap();
+        assert!(!complete);
+        drop(rollback);
+        let mut rollback = Node::open(&rollback_path, local_seed.clone()).unwrap();
+        let (rollback_state, _) = rollback
+            .resume_checkpoint_catchup(&guild_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            rollback
+                .install_checkpoint_catchup_link(rollback_state, &regressed)
+                .is_err()
+        );
+        assert_eq!(
+            rollback.checkpoint_head(&guild_id).unwrap(),
             Some((2, second.hash().unwrap()))
         );
         let lock = node.control.locked_checkpoint(&guild_id).unwrap().unwrap();
