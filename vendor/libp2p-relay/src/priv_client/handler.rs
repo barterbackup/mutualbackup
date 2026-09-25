@@ -145,6 +145,9 @@ pub struct Handler {
     inflight_inbound_circuit_requests:
         futures_bounded::FuturesSet<Result<inbound_stop::Circuit, inbound_stop::Error>>,
 
+    #[cfg(test)]
+    stalled_stop_streams: Vec<Stream>,
+
     inflight_outbound_circuit_deny_requests:
         futures_bounded::FuturesSet<Result<(), inbound_stop::Error>>,
 
@@ -173,6 +176,8 @@ impl Handler {
                 STREAM_TIMEOUT,
                 MAX_CONCURRENT_STREAMS_PER_CONNECTION,
             ),
+            #[cfg(test)]
+            stalled_stop_streams: Vec::new(),
             inflight_outbound_connect_requests: futures_bounded::FuturesTupleSet::new(
                 STREAM_TIMEOUT,
                 MAX_CONCURRENT_STREAMS_PER_CONNECTION,
@@ -497,6 +502,18 @@ impl ConnectionHandler for Handler {
                 protocol: stream,
                 ..
             }) => {
+                #[cfg(test)]
+                if crate::priv_client::STALL_STOP_FOR_TEST
+                    .lock()
+                    .expect("STOP test lock is poisoned")
+                    .as_ref()
+                    == Some(&self.local_peer_id)
+                {
+                    crate::priv_client::STALLED_STOP_COUNT
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    self.stalled_stop_streams.push(stream);
+                    return;
+                }
                 if self
                     .inflight_inbound_circuit_requests
                     .try_push(inbound_stop::handle_open_circuit(stream))

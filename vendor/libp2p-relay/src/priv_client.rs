@@ -21,6 +21,13 @@
 //! [`NetworkBehaviour`] to act as a circuit relay v2 **client**.
 
 pub(crate) mod handler;
+
+#[cfg(test)]
+pub(crate) static STALL_STOP_FOR_TEST: std::sync::Mutex<Option<PeerId>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(crate) static STALLED_STOP_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 pub(crate) mod transport;
 
 use std::{

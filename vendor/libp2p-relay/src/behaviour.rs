@@ -948,8 +948,91 @@ mod tests {
         time::Duration,
     };
 
-    use libp2p_identity::PeerId;
-    use libp2p_swarm::ConnectionId;
+    use futures::{
+        io::{AsyncRead, AsyncWrite},
+        StreamExt,
+    };
+    use libp2p_core::{
+        multiaddr::{Multiaddr, Protocol},
+        muxing::StreamMuxerBox,
+        transport::{choice::OrTransport, Boxed, MemoryTransport, Transport},
+        upgrade,
+    };
+    use libp2p_identity::{self as identity, PeerId};
+    use libp2p_swarm::{Config as SwarmConfig, ConnectionId, NetworkBehaviour, Swarm, SwarmEvent};
+
+    #[derive(NetworkBehaviour)]
+    #[behaviour(prelude = "libp2p_swarm::derive_prelude")]
+    struct RelayNetwork {
+        relay: super::Behaviour,
+    }
+
+    #[derive(NetworkBehaviour)]
+    #[behaviour(prelude = "libp2p_swarm::derive_prelude")]
+    struct ClientNetwork {
+        relay: crate::client::Behaviour,
+    }
+
+    fn test_transport<StreamSink>(
+        transport: Boxed<StreamSink>,
+        identity: &identity::Keypair,
+    ) -> Boxed<(PeerId, StreamMuxerBox)>
+    where
+        StreamSink: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        transport
+            .upgrade(upgrade::Version::V1)
+            .authenticate(libp2p_plaintext::Config::new(identity))
+            .multiplex(libp2p_yamux::Config::default())
+            .boxed()
+    }
+
+    fn test_relay(config: super::Config) -> Swarm<RelayNetwork> {
+        let identity = identity::Keypair::generate_ed25519();
+        let local_peer_id = identity.public().to_peer_id();
+        Swarm::new(
+            test_transport(MemoryTransport::default().boxed(), &identity),
+            RelayNetwork {
+                relay: super::Behaviour::new(local_peer_id, config),
+            },
+            local_peer_id,
+            SwarmConfig::with_tokio_executor(),
+        )
+    }
+
+    fn test_client() -> Swarm<ClientNetwork> {
+        let identity = identity::Keypair::generate_ed25519();
+        let local_peer_id = identity.public().to_peer_id();
+        let (relay_transport, behaviour) = crate::client::new(local_peer_id);
+        Swarm::new(
+            test_transport(
+                OrTransport::new(relay_transport, MemoryTransport::default()).boxed(),
+                &identity,
+            ),
+            ClientNetwork { relay: behaviour },
+            local_peer_id,
+            SwarmConfig::with_tokio_executor(),
+        )
+    }
+
+    fn launch_stalled_source(address: Multiaddr) -> tokio::task::JoinHandle<()> {
+        let mut source = test_client();
+        source.dial(address).unwrap();
+        tokio::spawn(async move { while source.next().await.is_some() {} })
+    }
+
+    struct StopStallGuard(PeerId);
+
+    impl Drop for StopStallGuard {
+        fn drop(&mut self) {
+            let mut stalled = crate::priv_client::STALL_STOP_FOR_TEST
+                .lock()
+                .expect("STOP test lock is poisoned");
+            if stalled.as_ref() == Some(&self.0) {
+                *stalled = None;
+            }
+        }
+    }
 
     struct CountingLimiter(Arc<AtomicUsize>);
 
@@ -1108,5 +1191,103 @@ mod tests {
                 .sum::<usize>(),
             1
         );
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn outbound_stop_worker_overflow_releases_shared_circuit_capacity() {
+        let relay_address = Multiaddr::empty().with(Protocol::Memory(rand::random::<u64>()));
+        let mut relay = test_relay(super::Config {
+            max_circuits: 11,
+            max_circuits_per_peer: 32,
+            ..Default::default()
+        });
+        let relay_peer_id = *relay.local_peer_id();
+        relay.listen_on(relay_address.clone()).unwrap();
+        relay.add_external_address(relay_address.clone());
+        let (failures, mut failure_events) = tokio::sync::mpsc::unbounded_channel();
+        let relay_task = tokio::spawn(async move {
+            while let Some(event) = relay.next().await {
+                if matches!(
+                    event,
+                    SwarmEvent::Behaviour(RelayNetworkEvent::Relay(
+                        super::Event::CircuitReqOutboundConnectFailed { .. }
+                    ))
+                ) {
+                    let _ = failures.send(relay.behaviour().relay.circuits.len());
+                }
+            }
+        });
+
+        let mut destination = test_client();
+        let destination_peer_id = *destination.local_peer_id();
+        crate::priv_client::STALLED_STOP_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        *crate::priv_client::STALL_STOP_FOR_TEST
+            .lock()
+            .expect("STOP test lock is poisoned") = Some(destination_peer_id);
+        let _stall_guard = StopStallGuard(destination_peer_id);
+        let destination_address = relay_address
+            .with(Protocol::P2p(relay_peer_id))
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p(destination_peer_id));
+        destination.listen_on(destination_address.clone()).unwrap();
+        let (reserved, reservation_ready) = tokio::sync::oneshot::channel();
+        let destination_task = tokio::spawn(async move {
+            let mut reserved = Some(reserved);
+            while let Some(event) = destination.next().await {
+                if matches!(
+                    event,
+                    SwarmEvent::Behaviour(ClientNetworkEvent::Relay(
+                        crate::client::Event::ReservationReqAccepted { .. }
+                    ))
+                ) {
+                    if let Some(reserved) = reserved.take() {
+                        let _ = reserved.send(());
+                    }
+                }
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), reservation_ready)
+            .await
+            .expect("destination did not reserve the relay")
+            .unwrap();
+
+        let mut sources = (0..10)
+            .map(|_| launch_stalled_source(destination_address.clone()))
+            .collect::<Vec<_>>();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while crate::priv_client::STALLED_STOP_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+                < 10
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ten STOP handshakes did not stall");
+
+        sources.push(launch_stalled_source(destination_address.clone()));
+        let active_after_overflow =
+            tokio::time::timeout(Duration::from_secs(10), failure_events.recv())
+                .await
+                .expect("eleventh STOP handshake did not overflow")
+                .unwrap();
+        assert_eq!(active_after_overflow, 10);
+
+        sources.push(launch_stalled_source(destination_address));
+        let active_after_retry =
+            tokio::time::timeout(Duration::from_secs(10), failure_events.recv())
+                .await
+                .expect("twelfth STOP handshake did not reach worker overflow")
+                .unwrap();
+        assert_eq!(active_after_retry, 10);
+        assert!(
+            crate::priv_client::STALLED_STOP_COUNT.load(std::sync::atomic::Ordering::SeqCst) >= 12
+        );
+
+        for source in sources {
+            source.abort();
+        }
+        destination_task.abort();
+        relay_task.abort();
     }
 }
