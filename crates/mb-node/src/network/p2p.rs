@@ -10252,6 +10252,17 @@ impl RecoverySectorAuthentication {
             }
         }
     }
+
+    fn matches_bytes(&self, bytes: &[u8]) -> Result<bool> {
+        Ok(match self {
+            Self::Legacy { reference, .. } => sector_root(bytes) == reference.root,
+            Self::Packed(descriptor) => {
+                merkle_commit(bytes)? == descriptor.commitment
+                    && (descriptor.flat_root == descriptor.commitment.root
+                        || sector_root(bytes) == descriptor.flat_root)
+            }
+        })
+    }
 }
 
 fn checkpoint_recovery_authentication(
@@ -10296,7 +10307,7 @@ fn recovery_plan_missing_roots(
     plan: &VariableRecoveryPlan,
     transcript: &SignedRecord<CodingVerificationTranscript>,
     authentication: &BTreeMap<SectorId, RecoverySectorAuthentication>,
-) -> Result<Vec<(usize, [u8; 32])>> {
+) -> Result<Vec<(usize, RecoverySectorAuthentication)>> {
     let mut matched = BTreeSet::new();
     let mut missing_roots = Vec::new();
     for (index, role) in plan.group.roles.iter().enumerate() {
@@ -10315,7 +10326,7 @@ fn recovery_plan_missing_roots(
         match transcript.value.plan.value.information_root(index) {
             Some(root) if root == expected.root() => {}
             Some(_) => bail!("recovery group information root differs from the checkpoint"),
-            None => missing_roots.push((index, expected.root())),
+            None => missing_roots.push((index, expected.clone())),
         }
         matched.insert(information.sector.id);
     }
@@ -10636,7 +10647,7 @@ async fn recover_variable_group_plan(
     })
     .await?;
     let missing_roots = recovery_plan_missing_roots(&plan, &transcript, &authentication)?;
-    for (index, expected_root) in &missing_roots {
+    for (index, expected) in &missing_roots {
         let bytes = reconstruct_variable_shard_from_peers_requiring_quorum(
             node.clone(),
             p2p,
@@ -10646,7 +10657,7 @@ async fn recover_variable_group_plan(
             deferred_holders.as_ref(),
         )
         .await?;
-        if sector_root(&bytes) != *expected_root {
+        if !expected.matches_bytes(&bytes)? {
             bail!("reconstructed recovery sector root differs from the checkpoint");
         }
     }
@@ -15972,6 +15983,7 @@ mod tests {
         checkpoint_hash: [u8; 32],
         membership_epoch: u64,
         ordinal: u8,
+        information_roots: Option<&BTreeMap<SectorId, [u8; 32]>>,
     ) -> SignedRecord<CodingVerificationTranscript> {
         let members = signing_keys.keys().copied().collect::<Vec<_>>();
         let coordinator = members[1];
@@ -16019,7 +16031,10 @@ mod tests {
                         {
                             [0; 32]
                         }
-                        ShardRoleV2::Information(_) => sector_root(&shards[index]),
+                        ShardRoleV2::Information(information) => information_roots
+                            .and_then(|roots| roots.get(&information.sector.id))
+                            .copied()
+                            .unwrap_or_else(|| sector_root(&shards[index])),
                         _ => unreachable!(),
                     })
                     .collect(),
@@ -16190,7 +16205,7 @@ mod tests {
             .iter()
             .map(|sector| SectorRef {
                 id: sector.descriptor.id,
-                root: sector_root(&sector.bytes),
+                root: sector.descriptor.flat_root,
                 logical_len: sector.bytes.len() as u32,
             })
             .collect::<Vec<_>>();
@@ -16341,6 +16356,12 @@ mod tests {
                 (keys.node_id(), keys)
             })
             .collect::<BTreeMap<_, _>>();
+        let packed_roots = packed
+            .catalog
+            .sectors
+            .iter()
+            .map(|descriptor| (descriptor.id, descriptor.flat_root))
+            .collect::<BTreeMap<_, _>>();
         let cold_path = temp.path().join("cold-seed");
         let mut cold = Node::open(&cold_path, seed.clone()).unwrap();
         let cold_revision = crate::node::tests::install_public_restore_fixture(&mut cold, &seed);
@@ -16359,6 +16380,7 @@ mod tests {
                 next.hash().unwrap(),
                 1,
                 index as u8 + 1,
+                Some(&packed_roots),
             );
             crate::node::tests::install_test_recovery_transcript(&mut cold, &transcript);
         }
@@ -16701,6 +16723,7 @@ mod tests {
             checkpoint.hash().unwrap(),
             3,
             1,
+            None,
         );
         let redundant_information = redundant
             .roles
@@ -16722,6 +16745,7 @@ mod tests {
             checkpoint.hash().unwrap(),
             3,
             3,
+            None,
         );
         let wrong_bytes = vec![18; V1_SECTOR_SIZE];
         let wrong_reference = SectorRef {
@@ -16763,6 +16787,7 @@ mod tests {
             checkpoint.hash().unwrap(),
             3,
             2,
+            None,
         );
         assert_eq!(
             replay_coding_transcript(&wrong_transcript).unwrap(),
