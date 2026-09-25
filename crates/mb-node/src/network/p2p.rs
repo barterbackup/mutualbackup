@@ -13835,6 +13835,145 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn large_unchanged_legacy_corpus_reads_its_journal_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut keys = (200_u8..205)
+            .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([index; 32])))
+            .collect::<Vec<_>>();
+        keys.sort_by_key(KeyMaterial::node_id);
+        let members = keys
+            .iter()
+            .enumerate()
+            .map(|(index, keys)| Member {
+                node_id: keys.node_id(),
+                recovery_public_key: keys.recovery_public_key(),
+                failure_domain: format!("legacy-domain-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let guild_id = [230; 32];
+        let genesis = GuildGenesis {
+            format_version: 1,
+            guild_id,
+            coordinator: members[0].node_id,
+            members: members.clone(),
+        };
+        let certificate = QuorumGuildGenesis {
+            signatures: keys
+                .iter()
+                .map(|keys| genesis.member_signature(keys).unwrap())
+                .collect(),
+            genesis,
+        };
+        let local_seed = Seed::from_bytes([200; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let mut local = Node::open(temp.path().join("node"), local_seed).unwrap();
+        local
+            .adopt_recovered_guild(
+                certificate,
+                members
+                    .iter()
+                    .cloned()
+                    .map(|member| GuildPeer {
+                        member,
+                        endpoints: Vec::new(),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        let node = Arc::new(Mutex::new(local));
+        let (commands, _commands_rx) = mpsc::channel(1);
+        let (request_cancellations, _cancellations_rx) = mpsc::unbounded_channel();
+        let (_port_state, port_mapping_listener_state) =
+            watch::channel(PortMappingListenerState::Pending);
+        let p2p = P2pClient {
+            local_peer_id: local_id.libp2p_peer_id().unwrap(),
+            commands,
+            request_cancellations,
+            outbound_permits: Arc::new(Semaphore::new(1)),
+            cold_recovery_permit: Arc::new(Semaphore::new(1)),
+            port_mapping_listener_state,
+        };
+        let bytes = vec![17; V1_SECTOR_SIZE];
+        let flat_root = sector_root(&bytes);
+        let source_commitment = merkle_commit(&bytes).unwrap();
+        let protected_root_id = Uuid::from_bytes([231; 16]);
+        let protected_root = packing_protected_root(protected_root_id);
+        let authority = CheckpointAuthority {
+            format_version: 1,
+            membership_epoch: 1,
+            quorum: QuorumPolicy {
+                format_version: 1,
+                rule: QuorumRule::Unanimous,
+            },
+        };
+        let mut corpus = Vec::new();
+        for index in 1_u8..=130 {
+            let reference = SectorRef {
+                id: [index; 32],
+                root: flat_root,
+                logical_len: V1_SECTOR_SIZE as u32,
+            };
+            let value = LegacyPackingAttestation {
+                format_version: 1,
+                guild_id,
+                membership_epoch: authority.membership_epoch,
+                owner: local_id,
+                protected_root,
+                object_id: reference.id,
+                flat_root,
+                source_commitment: source_commitment.clone(),
+            };
+            let attestations = keys
+                .iter()
+                .map(|keys| {
+                    SignedRecord::sign(LEGACY_PACKING_ATTESTATION_DOMAIN, value.clone(), keys)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let durable = if index <= 128 {
+                &attestations[..1]
+            } else {
+                &attestations[..]
+            };
+            for attestation in durable {
+                node.lock()
+                    .unwrap()
+                    .store_legacy_packing_attestation(attestation)
+                    .unwrap();
+            }
+            corpus.push((reference, attestations));
+        }
+        let mut journaled_by_source = None;
+        for (offset, (reference, attestations)) in corpus.iter().enumerate() {
+            let index = offset + 1;
+            let prior = (index <= 128).then_some(attestations.as_slice());
+            let evidence = legacy_source_evidence(
+                node.clone(),
+                &p2p,
+                local_id,
+                guild_id,
+                authority,
+                &members,
+                local_id,
+                protected_root_id,
+                reference,
+                None,
+                prior,
+                &mut journaled_by_source,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(evidence.commitment, source_commitment);
+            assert!(evidence.bytes.is_none());
+            if index <= 128 {
+                assert!(journaled_by_source.is_none());
+            }
+        }
+        assert_eq!(journaled_by_source.unwrap().len(), 130);
+    }
+
     #[test]
     fn unchanged_authenticated_sources_advance_catalog_without_payloads() {
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([199; 32]));
