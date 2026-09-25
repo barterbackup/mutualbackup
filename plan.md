@@ -99,8 +99,8 @@ M5-78 through M5-83. Those corrections and the complete M5-84 local closure
 gate passed on 2026-09-25. A further source-only review of the same code found
 M5-85 through M5-87: same-head advertiser deduplication, historical legacy
 authority inference, and parity-only cold recovery coverage. Milestone 5 is
-reopened. M5-85 and M5-86 are corrected; M5-87's coverage-only recovery still
-needs to prove a live `k`, and M5-88 remains ungated. Milestone 6 waits.
+reopened. M5-85 through M5-87 are corrected, and M5-88's local closure gate
+remains pending. Milestone 6 waits.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -514,8 +514,8 @@ expiry are corrected. The complete local M5-77 closure gate passed on
 2026-09-22, but source review found M5-78 through M5-83 and reopened Milestone
 5. Those corrections and the complete M5-84 local gate passed on 2026-09-25.
 Further source-only review found M5-85 through M5-87 and reopened Milestone 5;
-M5-85 and M5-86 are corrected, but M5-87 and M5-88 remain open. Milestone 6
-waits. Later wire or durable-state changes
+M5-85 through M5-87 are corrected, but M5-88 remains open. Milestone 6 waits.
+Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
 
@@ -751,9 +751,9 @@ M5-78, M5-82, and M5-83 are corrected. Later commits `40d83ec` through
 gates. Fresh source review and the complete M5-84 local gate passed on
 2026-09-25. A further source-only review found M5-85 through M5-87 in that
 source tree. The earlier gate is historical evidence; Milestone 5 is reopened
-until M5-87 proves a live `k` in coverage-only cold recovery and the M5-88
-local closure gate passes. M5-85 and M5-86 are corrected in `e9fadb2` and
-`75d0fd5`; `1e8ee2b` only partly addresses M5-87. Milestone 6 waits.
+until the M5-88 local closure gate passes. M5-85 and M5-86 are corrected in
+`e9fadb2` and `75d0fd5`; `1e8ee2b` and `dd5c7e8` correct M5-87. Milestone 6
+waits.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1352,6 +1352,13 @@ case. M5-87 remains an implementation blocker; M5-88's full local gate must
 run on the corrected source tree. This review ran no builds, tests, daemons,
 runtime probes, or remote compilation.
 
+Commit `dd5c7e8` makes coverage-only cold recovery skip the direct-shard
+shortcut and wait for `k` distinct verified shards, including authenticated
+virtual-zero roles. A two-live-sector regression rejects one reachable shard
+and accepts two; the six-member parity-only cold recovery regression still
+passes locally. Fresh source review found no further blocker in M5-85 through
+M5-87. The M5-88 local closure gate is pending.
+
 The M5-42 rejected-connection cleanup was source-reviewed and found to remove
 only the rejected connection while preserving accepted siblings. This review
 ran no builds, tests, daemons, runtime probes, or remote compilation.
@@ -1812,7 +1819,8 @@ full fresh disposable Btrfs/network acceptance script. A further source-only
 review of the same tree found M5-85 through M5-87. Milestone 5 is reopened;
 M5-85 and M5-86 are corrected. Source review of `1e8ee2b` found that M5-87's
 coverage-only probe can mark a replacement group covered without proving a
-live `k`. Milestone 6 waits for that correction and the M5-88 local gate.
+live `k`. Commit `dd5c7e8` corrects that gap and covers both fewer-than-`k`
+and any-`k` two-live-sector cases. Milestone 6 waits for the M5-88 local gate.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and

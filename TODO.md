@@ -614,8 +614,9 @@ correction commits found no new blocker. M5-84 passed locally on 2026-09-25 on
 commits followed `890d88c`, but a new source-only review of the correction
 series found M5-85 through M5-87 below. Milestone 5 is reopened and Milestone 6
 waits. Subsequent commits `e9fadb2` and `75d0fd5` correct M5-85 and M5-86;
-source review of `1e8ee2b` found M5-87 still cannot prove a live `k` in a
-multi-live-sector replacement group. M5-88 awaits the final corrected tree.
+source review of `1e8ee2b` found M5-87 still could not prove a live `k` in a
+multi-live-sector replacement group. Commit `dd5c7e8` corrects that path and
+adds positive and negative multi-live-sector coverage. M5-88 remains pending.
 This review ran no builds, tests, daemons, runtime probes, or remote
 compilation.
 
@@ -1932,7 +1933,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   its checkpoint, while an unwitnessed historical link is bounded by its
   explicit successor epoch. Source review found no remaining blocker here.
 
-- [ ] **M5-87 / P1 — Let current replacement coverage satisfy cold recovery without a local role.**
+- [x] **M5-87 / P1 — Let current replacement coverage satisfy cold recovery without a local role.**
   `variable_recovery_plans` includes a group's covered sectors only when the
   recovering node owns an information or parity shard in that group
   (`crates/mb-node/src/network/p2p.rs:10255`–`:10286`). During the normal
@@ -1959,6 +1960,11 @@ node Clippy gate passed locally. No remote compilation server was used.
   reachability of `k` distinct shards (counting authenticated virtual zeros)
   before coverage-only success. Add a negative multi-live-sector regression
   with fewer than `k` reachable shards and a positive one with any valid `k`.
+  Corrected in `dd5c7e8`: coverage-only recovery now skips the direct-shard
+  shortcut and requires `k` distinct commitment-verified shards, counting
+  authenticated virtual-zero roles. The new two-live-sector regression rejects
+  one reachable shard and accepts two; the six-member parity-only cold recovery
+  regression still passes locally.
 
 - [ ] **M5-88 / gate — Recheck Milestone 5 after M5-85 through M5-87.**
   After correcting these source blockers, run fresh source review, formatting,
