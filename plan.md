@@ -731,13 +731,14 @@ complete local M5-77 workspace/provisioned gate passed on 2026-09-22.
 Fresh source-only review of `b95811b..168945a` found M5-78 through M5-83 and
 reopened Milestone 5. Milestone 6 waits for corrections and a new complete local
 gate.
-Source-only follow-up review of `b9d4e07..8434b30` and the local node-source
-edits found implementations for candidate fallback, indexed generation reads,
-placement fallback, bounded legacy-journal loading, and relay overflow cleanup.
-The legacy authority check still accepts an ambiguous A -> B -> A member-roster
-history as the earliest A epoch. M5-78, M5-79, M5-80, M5-81, and M5-82 still
-need their stated scenario or measurement gates; M5-83 needs a source correction
-and regression; M5-84 is not complete. Milestone 5 remains open.
+Source-only follow-up review of `b9d4e07..8434b30` and the then-local
+node-source edits found a repeated-roster legacy rollback and missing gates.
+Subsequent local correction commits `7ee8397`, `bb0d333`, `5076e8e`, and
+`d1c94cc` fix that rollback, gate persistent high-head/lower-head fallback
+across restart, exercise lazy legacy-evidence indexing, and release a failed
+relay circuit before source denial completes. M5-78 and M5-83 are corrected;
+M5-79 through M5-82 and M5-84 remain open on their stated gates. Milestone 5
+remains open.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1275,6 +1276,16 @@ rollback to B. The complete M5-84 local gate must follow the final correction.
 This follow-up ran no builds, tests, daemons, runtime probes, or remote
 compilation.
 
+The next local correction series closes M5-78 and M5-83: candidate-specific
+generation endorsement and a signed high-head/lower-head restart regression
+prove fallback, while the latest matching legacy member epoch rejects an
+ambiguous A -> B -> A rollback after restart. Relay outbound failure now
+releases circuit capacity immediately, independent of source-denial progress.
+Focused node and relay tests and strict all-target Clippy passed locally for
+these changes. M5-79 long-history peer lookups, M5-80 unavailable-stale-group
+restore/recovery, M5-81 measured corpus bounds, M5-82 stalled-STOP overflow,
+and the complete M5-84 gate remain outstanding.
+
 The M5-42 rejected-connection cleanup was source-reviewed and found to remove
 only the rejected connection while preserving accepted siblings. This review
 ran no builds, tests, daemons, runtime probes, or remote compilation.
@@ -1722,11 +1733,12 @@ workspace/provisioned gate passed on 2026-09-22. Fresh source-only review then
 found M5-68 through M5-76. All nine source blockers are corrected, and a
 follow-up source-only review finds no remaining implementation blocker.
 The complete local M5-77 workspace/provisioned closure gate passed on
-2026-09-22. Fresh source-only review on 2026-09-25 found M5-78 through M5-83;
-the correction series addresses M5-78 through M5-82 in source, but their
-specific gates remain outstanding. The repeated-roster legacy epoch rollback
-still blocks M5-83, and the M5-84 closure gate has not run on the final tree.
-Milestone 5 remains open.
+2026-09-22. Fresh source-only review on 2026-09-25 found M5-78 through M5-83.
+M5-78's persistent fallback regression and M5-83's repeated-roster rollback
+regression now pass locally. M5-79 through M5-82 need their remaining
+long-history, unavailable-placement, measured-corpus, and stalled-relay gates;
+the complete M5-84 closure gate has not run on the final tree. Milestone 5
+remains open.
 Milestone 6 waits.
 
 - Replace deterministic fillers with cross-user sector packing and fair

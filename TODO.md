@@ -598,12 +598,13 @@ and a new closure gate. The fresh review ran no builds, tests, daemons, runtime
 probes, or remote compilation.
 
 Source-only follow-up review on 2026-09-25 covered `b9d4e07..8434b30` and the
-two local node-source edits. The candidate fallback, generation index, recovery
-placement ordering, lazy legacy-evidence index, and relay overflow response are
-present. M5-83 remains a source blocker for a repeated legacy member roster;
-the specific M5-78, M5-79, M5-80, and M5-82 scenario gates and the complete
-M5-84 gate remain outstanding. This follow-up ran no builds, tests, daemons,
-runtime probes, or remote compilation.
+two then-local node-source edits. It found a repeated-roster legacy authority
+rollback and missing scenario gates; that review ran no builds, tests, daemons,
+runtime probes, or remote compilation. Subsequent local correction commits
+`7ee8397`, `bb0d333`, `5076e8e`, and `d1c94cc` address that rollback, exercise
+the mixed legacy corpus and persistent checkpoint-head fallback, and release
+failed relay circuits immediately. M5-79 through M5-82 and M5-84 remain open
+on the gates recorded below.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -1748,7 +1749,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   All compilation and execution were local; no remote compilation server was
   used. Later source review reopened Milestone 5.
 
-- [ ] **M5-78 / P1 — Try a lower complete checkpoint candidate after a higher one fails.**
+- [x] **M5-78 / P1 — Try a lower complete checkpoint candidate after a higher one fails.**
   `sync_checkpoint_head_once` selects the highest currently authorized advertised
   certificate (`crates/mb-node/src/network/p2p.rs:7191`) but clears catch-up and
   returns on missing generation quorum, unavailable link, or failed installation
@@ -1758,10 +1759,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   is never installed. Continue through other candidates in the same bounded pass
   or persist a bounded rejection cooldown; gate a persistent incomplete high
   head alongside a reachable complete lower head across restart.
-  `151a29a` now iterates other advertised candidates after a failed or resumed
-  catch-up, clearing a failed target before retrying. The specified persistent
-  high-head/lower-complete-head network regression across restart is still
-  absent, so this item remains open for its scenario gate.
+  `151a29a` iterates other advertised candidates after a failed or resumed
+  catch-up, clearing a failed target before retrying. `5076e8e` binds each
+  intermediate quorum hash to the candidate's advertising source, so a
+  different certified history cannot be chosen for that candidate. Its focused
+  regression uses signed certificates and peer responses: a persistent higher
+  head has no first-link evidence from its source, a lower head has a complete
+  chain, and the lower head installs and remains durable across restart.
 
 - [ ] **M5-79 / P2 — Serve checkpoint generation lookups without scanning all history.**
   Each `GetCheckpointAtGeneration` loads every retained `guild-checkpoint`
@@ -1824,11 +1828,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   than ten simultaneous stalled STOP handshakes on one destination connection,
   then prove the rejected circuit and shared capacity are released.
   `bed5b90` queues a resource-limit failure and skips active-request insertion
-  when `try_push` overflows; the existing denial path removes the circuit. There
-  is still no regression with more than ten stalled STOP handshakes proving the
+  when `try_push` overflows. `d1c94cc` removes the circuit as soon as the
+  failure reaches the behaviour, even when source denial is stalled. There is
+  still no regression with more than ten stalled STOP handshakes proving the
   rejected circuit and shared capacity are released.
 
-- [ ] **M5-83 / P1 — Reject checkpoint authority epochs that move backward.**
+- [x] **M5-83 / P1 — Reject checkpoint authority epochs that move backward.**
   A nonfinal catch-up link may use any authority found anywhere in guild event
   history (`crates/mb-node/src/node.rs:6032`–`:6069`, `:6615`–`:6643`), while
   `validate_checkpoint_transition` checks its parent and state but never
@@ -1841,13 +1846,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   exact-parent links, including the legacy format transition. Gate this chain
   and valid forward A-to-B catch-up across restart.
   `b9d4e07` rejects explicit epoch decreases and format-5-to-legacy rollback.
-  The local legacy-transition helper in `node.rs` chooses the *earliest* event
-  epoch whose active member roster equals the previous format-4 checkpoint.
-  With event history A -> B -> A, a later A legacy checkpoint can be assigned
-  the first A epoch; a B-authorized successor from the intervening epoch then
-  passes the numeric comparison although authority moved backward. Resolve
-  repeated-roster ambiguity in historical catch-up (or reject ambiguous legacy
-  transitions), and gate that chain plus valid forward catch-up across restart.
+  `7ee8397` uses the latest possible matching epoch for a format-4 predecessor;
+  an ambiguous A -> B -> A member roster can no longer hide a rollback to B.
+  The focused regression commits the legacy checkpoint, restarts, and rejects
+  its B-epoch successor. The existing catch-up regression accepts a valid
+  forward legacy-to-authority transition across restart. Ambiguous historical
+  transitions are conservatively rejected when their epoch cannot be proven.
 
 - [ ] **M5-84 / gate — Recheck Milestone 5 after M5-78 through M5-83.**
   After correcting these source blockers, run a fresh source review, formatting,
