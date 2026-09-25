@@ -93,9 +93,10 @@ reopened. Those corrections are implemented, but source-only review of
 are corrected. The complete local workspace and provisioned closure gate passed
 on 2026-09-22. Fresh source-only review of `81ec33b..b65c79a` then found M5-68
 through M5-76. Those source blockers are corrected, and the complete local
-M5-77 workspace/provisioned closure gate passed on 2026-09-22. Milestone 5 is
+M5-77 workspace/provisioned closure gate passed on 2026-09-22. Milestone 5 was
 reopened by source-only review of `b95811b..168945a` on 2026-09-25, which found
-M5-78 through M5-83. Milestone 6 waits for those corrections and a new gate.
+M5-78 through M5-83. Those corrections and the complete M5-84 local closure
+gate passed on 2026-09-25. Milestone 5 is closed; Milestone 6 is next.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -507,8 +508,8 @@ historical M5-67 gate passed, and the later M5-68 through M5-76 source blockers
 in checkpoint catch-up, legacy migration, incremental packing, and relay
 expiry are corrected. The complete local M5-77 closure gate passed on
 2026-09-22, but source review found M5-78 through M5-83 and reopened Milestone
-5. Later wire or
-durable-state changes
+5. Those corrections and the complete M5-84 local gate passed on 2026-09-25;
+Milestone 6 is next. Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
 
@@ -729,8 +730,8 @@ Fresh source-only review of `81ec33b..b65c79a` found M5-68 through M5-76 and
 reopened Milestone 5. Those implementation blockers are corrected, and the
 complete local M5-77 workspace/provisioned gate passed on 2026-09-22.
 Fresh source-only review of `b95811b..168945a` found M5-78 through M5-83 and
-reopened Milestone 5. Milestone 6 waits for corrections and a new complete local
-gate.
+reopened Milestone 5. Those corrections and the complete local M5-84 gate
+passed on 2026-09-25.
 Source-only follow-up review of `b9d4e07..8434b30` and the then-local
 node-source edits found a repeated-roster legacy rollback and missing gates.
 Subsequent local correction commits `7ee8397`, `bb0d333`, `5076e8e`, and
@@ -739,9 +740,10 @@ across restart, exercise lazy legacy-evidence indexing, and release a failed
 relay circuit before source denial completes. Later commits through `484e4ec`
 add indexed long-history lookups, a streaming legacy journal, replacement
 network-shard coverage, and a twelve-request stalled-STOP relay regression.
-M5-78, M5-82, and M5-83 are corrected; M5-79 through M5-81 retain their exact
-scenario or measurement gates, and M5-84 has not run on the final tree.
-Milestone 5 remains open.
+M5-78, M5-82, and M5-83 are corrected. Later commits `40d83ec` through
+`e959d92` cover M5-79 through M5-81's peer, recovery, and packing resource
+gates. Fresh source review and the complete M5-84 local gate passed on
+2026-09-25. Milestone 5 is closed; Milestone 6 is next.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1302,6 +1304,21 @@ peak-memory bounds for a full packing pass. The complete M5-84 local gate
 remains outstanding. This review ran no builds, tests, daemons, runtime
 probes, or remote compilation.
 
+Subsequent local correction commits close M5-79 through M5-81. Signed peer
+requests read every generation of a 1,024-link committed history after restart
+and repeat an absent lookup 128 times; the request path reads one indexed hash
+and one certificate. A packed snapshot with stale groups ordered first restores
+through current replacement shards, and the same fixture runs production cold
+shard recovery with replay-verified replacement transcripts. The complete
+unchanged-catalog packing pass over 130 mixed legacy sources makes one
+138-row/138-signature journal scan and keeps its peak encoded journal payload
+under 512 KiB, with one transient row beyond the retained index. Focused tests
+and strict node Clippy passed locally. Fresh source review of the final
+correction commits found no new blocker. Formatting, locked all-target workspace
+tests, strict locked all-target workspace Clippy, Docker lab safety, and the
+complete fresh disposable local Btrfs/network acceptance script passed on
+2026-09-25. No remote compilation server was used. M5-84 closes Milestone 5.
+
 The M5-42 rejected-connection cleanup was source-reviewed and found to remove
 only the rejected connection while preserving accepted siblings. This review
 ran no builds, tests, daemons, runtime probes, or remote compilation.
@@ -1735,7 +1752,7 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (reopened)
+### Milestone 5 — efficient and flexible data/guild protocol (closed)
 
 M5-36 through M5-44 are implemented, and the complete M5-45 correction gate
 passed locally on 2026-09-19. The final committed tree passed formatting,
@@ -1752,11 +1769,14 @@ The complete local M5-77 workspace/provisioned closure gate passed on
 2026-09-22. Fresh source-only review on 2026-09-25 found M5-78 through M5-83.
 M5-78's persistent fallback regression and M5-83's repeated-roster rollback
 regression now pass locally. Source-only review of the later correction series
-finds M5-82's stalled-relay gate covered. M5-79 through M5-81 still need the
-long-history peer catch-up, full unavailable-placement restore/recovery, and
-measured large-corpus gates; the complete M5-84 closure gate has not run on the
-final tree. Milestone 5 remains open.
-Milestone 6 waits.
+finds M5-82's stalled-relay gate covered. Later local regressions cover
+M5-79's long-history peer requests, M5-80's packed restore and cold shard
+recovery with unavailable stale groups, and M5-81's bounded full packing pass.
+Fresh source review found no new blocker in the final correction commits. The
+complete M5-84 local closure gate passed on `e959d92` on 2026-09-25: formatting,
+locked all-target workspace tests and strict Clippy, Docker lab safety, and the
+full fresh disposable Btrfs/network acceptance script. Milestone 5 is closed;
+Milestone 6 is next.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and

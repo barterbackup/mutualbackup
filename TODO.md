@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (reopened)
+## Milestone 5 guild geometry and coding protocol (closed)
 
 Source-only review of `8135e0b..da8974a` on 2026-09-18 found the M5-36 through
 M5-44 blockers below; all are now corrected. The production gate recorded in
@@ -605,9 +605,12 @@ through `484e4ec` address that rollback, exercise mixed legacy evidence and
 persistent checkpoint-head fallback, index committed generations, stream the
 attestation journal, prefer replacement shards, and release failed relay
 circuits immediately. Source-only review of `ae9e6c3..484e4ec` on 2026-09-25
-finds M5-82's stalled-STOP gate covered. M5-79 through M5-81 retain the exact
-scenario or measurement gates below; M5-84 has not run on this final tree.
-This review ran no builds, tests, daemons, runtime probes, or remote compilation.
+found M5-82's stalled-STOP gate covered. Subsequent commits `40d83ec`,
+`7287a4a`, `f58d64e`, `df014c1`, and `e959d92` cover the M5-79 through M5-81
+scenario and resource gates below. That source-only review ran no builds, tests,
+daemons, runtime probes, or remote compilation. Fresh source review of the final
+correction commits found no new blocker. M5-84 passed locally on 2026-09-25 on
+`e959d92`; Milestone 5 is closed and Milestone 6 is next.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -1770,7 +1773,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   head has no first-link evidence from its source, a lower head has a complete
   chain, and the lower head installs and remains durable across restart.
 
-- [ ] **M5-79 / P2 — Serve checkpoint generation lookups without scanning all history.**
+- [x] **M5-79 / P2 — Serve checkpoint generation lookups without scanning all history.**
   Each `GetCheckpointAtGeneration` loads every retained `guild-checkpoint`
   certificate into memory, decodes it, and verifies its signatures
   (`crates/mb-node/src/node.rs:9928`; `crates/mb-store/src/database.rs:346`).
@@ -1783,10 +1786,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   ancestry on open, and makes each lookup read one indexed certificate.
   `f155406` adds 1,024 committed, signed generations, reopens the node, reads
   every generation, and repeats an absent lookup 128 times. The peer request
-  handler calls this indexed node lookup directly. The explicit long-history
-  peer catch-up and bounded resource measurement gate is still absent.
+  handler calls this indexed node lookup directly. `40d83ec` sends signed peer
+  requests for every generation of that committed history after restart and
+  repeats the absent lookup 128 times. Each request loads one indexed hash and
+  one certificate, so read work and retained certificate memory do not grow
+  with history length.
 
-- [ ] **M5-80 / P1 — Use healthy replacement groups for restore and cold recovery.**
+- [x] **M5-80 / P1 — Use healthy replacement groups for restore and cold recovery.**
   M5-74's all-placement fallback covers backup packing, but ordinary packed
   snapshot restore still selects the first matching group from all retained
   groups, including retired ones (`crates/mb-node/src/network/p2p.rs:10897`).
@@ -1803,10 +1809,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   active-group coverage for cold recovery. `01cfd39` reconstructs from a
   current replacement over mocked shard responses while the old group is
   unavailable. `484e4ec` exercises the production coverage helper with those
-  network shards. Neither test invokes full snapshot restore or cold seed
-  recovery with this overlap; both end-to-end scenario gates remain open.
+  network shards. `f58d64e` runs full packed snapshot restore with old groups
+  listed first and unavailable. `df014c1` uses the same fixture to run the
+  production cold shard-recovery step with replay-verified replacement coding
+  transcripts. Both paths fetch the current groups and recover the signed
+  revision sector without requesting an old group.
 
-- [ ] **M5-81 / P2 — Bound legacy attestation lookup per packing pass.**
+- [x] **M5-81 / P2 — Bound legacy attestation lookup per packing pass.**
   For every retained legacy source, production packing calls
   `legacy_source_evidence` (`crates/mb-node/src/network/p2p.rs:12075`), which
   loads, decodes, and signature-verifies the entire durable attestation journal
@@ -1820,9 +1829,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   `b9d4e07` first checks current prior-catalog quorum and lazily builds one
   journal index for the remaining pass. `bb0d333` tests a 130-source mixed
   corpus and asserts index reuse. `ae9e6c3` streams journal rows into that
-  single verified index, avoiding a second full journal allocation. These
-  tests do not measure row reads, signature checks, or peak memory for a full
-  packing pass; retain the explicit measurement gate.
+  single verified index, avoiding a second full journal allocation.
+  `7287a4a` counts rows, signature checks, retained records, and peak encoded
+  journal payload. `e959d92` runs the complete unchanged-catalog packing pass
+  over 130 mixed sources: 128 use prior-catalog evidence, while the remaining
+  two trigger one 138-row/138-signature journal scan. The retained index has
+  138 records and its peak journal payload stays under 512 KiB; the streaming
+  cursor holds only one additional row at a time.
 
 - [x] **M5-82 / P1 — Report relay outbound worker overflow and release its circuit.**
   Guild relay configuration permits 32 circuits in the tested setting
@@ -1864,12 +1877,20 @@ node Clippy gate passed locally. No remote compilation server was used.
   forward legacy-to-authority transition across restart. Ambiguous historical
   transitions are conservatively rejected when their epoch cannot be proven.
 
-- [ ] **M5-84 / gate — Recheck Milestone 5 after M5-78 through M5-83.**
+- [x] **M5-84 / gate — Recheck Milestone 5 after M5-78 through M5-83.**
   After correcting these source blockers, run a fresh source review, formatting,
   locked all-target workspace tests, warning-free locked all-target workspace
   Clippy, Docker lab safety, and the complete provisioned Btrfs/network
   acceptance script on a fresh disposable local filesystem. No remote
-  compilation server may be used.
+  compilation server may be used. Fresh source review of `9e3e194..e959d92`
+  found no new blocker. On 2026-09-25, `cargo fmt --all -- --check`,
+  `cargo test --locked --workspace --all-targets`,
+  `cargo clippy --locked --workspace --all-targets -- -D warnings`, and
+  `scripts/docker-lab-safety-test.sh` passed locally. The complete
+  `scripts/reflink-acceptance.sh` passed on a fresh disposable local Btrfs
+  filesystem, including provisioned tests and the five-daemon network smoke
+  test; its mount and image were cleaned up. No remote compilation server was
+  used.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
