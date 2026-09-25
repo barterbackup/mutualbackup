@@ -10213,6 +10213,80 @@ async fn recover_p2p_local_shards(
     .await
 }
 
+struct VariableRecoveryPlan {
+    group: CodingGroupV2,
+    targets: Vec<usize>,
+    covered: BTreeSet<SectorId>,
+    priority: u8,
+}
+
+fn variable_recovery_plans(
+    state: &DynamicGuildState,
+    sectors: &BTreeSet<SectorId>,
+    local_id: NodeId,
+) -> (Vec<VariableRecoveryPlan>, BTreeSet<SectorId>) {
+    let mut plans = Vec::new();
+    let mut required_sectors = BTreeSet::new();
+    for retained in &state.coding_groups {
+        if retained.retired_at_event.is_some() {
+            continue;
+        }
+        let covered = retained
+            .group
+            .roles
+            .iter()
+            .filter_map(|role| match role {
+                ShardRoleV2::Information(information)
+                    if !information.sector.virtual_zero
+                        && sectors.contains(&information.sector.id) =>
+                {
+                    Some(information.sector.id)
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if covered.is_empty() {
+            continue;
+        }
+        let targets = retained
+            .group
+            .roles
+            .iter()
+            .enumerate()
+            .filter_map(|(index, role)| match role {
+                ShardRoleV2::Information(information)
+                    if information.owner == local_id
+                        && !information.sector.virtual_zero
+                        && sectors.contains(&information.sector.id) =>
+                {
+                    Some(index)
+                }
+                ShardRoleV2::Parity(parity) if parity.holder == local_id => Some(index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !targets.is_empty() {
+            let priority = if state
+                .validate_current_group_placement(&retained.group)
+                .is_ok()
+            {
+                0
+            } else {
+                1
+            };
+            required_sectors.extend(&covered);
+            plans.push(VariableRecoveryPlan {
+                group: retained.group.clone(),
+                targets,
+                covered,
+                priority,
+            });
+        }
+    }
+    plans.sort_by_key(|plan| (plan.priority, plan.group.id));
+    (plans, required_sectors)
+}
+
 async fn recover_p2p_variable_shards(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
@@ -10224,7 +10298,7 @@ async fn recover_p2p_variable_shards(
     }
     let checkpoint_hash = checkpoint.hash()?;
     let checkpoint_for_plan = checkpoint.clone();
-    let plans = node_blocking(node.clone(), move |node| {
+    let (plans, required_sectors) = node_blocking(node.clone(), move |node| {
         let local_id = node.keys().node_id();
         let state = node
             .dynamic_guild_state()?
@@ -10255,70 +10329,66 @@ async fn recover_p2p_variable_shards(
                     .map(|reference| reference.id)
                     .collect()
             });
-        let mut plans = Vec::new();
-        for retained in state.coding_groups {
-            if !retained.group.roles.iter().any(|role| {
-                matches!(role, ShardRoleV2::Information(information)
-                    if !information.sector.virtual_zero
-                        && sectors.contains(&information.sector.id))
-            }) {
-                continue;
-            }
-            let targets = retained
-                .group
-                .roles
-                .iter()
-                .enumerate()
-                .filter_map(|(index, role)| match role {
-                    ShardRoleV2::Information(information)
-                        if information.owner == local_id && !information.sector.virtual_zero =>
-                    {
-                        Some(index)
-                    }
-                    ShardRoleV2::Parity(parity) if parity.holder == local_id => Some(index),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            if !targets.is_empty() {
-                plans.push((
-                    node.recovery_coding_transcript_for_group(
-                        checkpoint_hash,
-                        retained.group.guild_id,
-                        retained.group.id,
-                    )?,
-                    targets,
-                ));
-            }
-        }
-        Ok(plans)
+        Ok(variable_recovery_plans(&state, &sectors, local_id))
     })
     .await?;
     let deferred_holders = Arc::new(Mutex::new(BTreeSet::new()));
-    let mut plans = plans.into_iter();
-    if let Some((transcript, targets)) = plans.next() {
-        recover_variable_plan(
-            node.clone(),
-            p2p,
-            checkpoint_hash,
-            transcript,
-            targets,
-            roster,
-            deferred_holders.clone(),
-        )
-        .await?;
-    }
-    let requests = plans.map(|(transcript, targets)| {
-        recover_variable_plan(
-            node.clone(),
-            p2p,
-            checkpoint_hash,
-            transcript,
-            targets,
-            roster,
-            deferred_holders.clone(),
-        )
+    let (current, fallback): (Vec<_>, Vec<_>) =
+        plans.into_iter().partition(|plan| plan.priority == 0);
+    let requests = current.into_iter().map(|plan| {
+        let node = node.clone();
+        let deferred_holders = deferred_holders.clone();
+        async move {
+            let covered = plan.covered.clone();
+            let result = recover_variable_group_plan(
+                node,
+                p2p,
+                checkpoint_hash,
+                plan,
+                roster,
+                deferred_holders,
+            )
+            .await;
+            Ok((covered, result))
+        }
     });
-    collect_bounded_recovery_requests(requests, RECOVERY_VARIABLE_GROUP_CONCURRENCY).await?;
+    let mut covered = BTreeSet::new();
+    let mut last_error = None;
+    for (sectors, result) in
+        collect_bounded_recovery_requests(requests, RECOVERY_VARIABLE_GROUP_CONCURRENCY).await?
+    {
+        match result {
+            Ok(()) => covered.extend(sectors),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    for plan in fallback {
+        if required_sectors.is_subset(&covered) {
+            break;
+        }
+        if plan.covered.is_subset(&covered) {
+            continue;
+        }
+        let sectors = plan.covered.clone();
+        match recover_variable_group_plan(
+            node.clone(),
+            p2p,
+            checkpoint_hash,
+            plan,
+            roster,
+            deferred_holders.clone(),
+        )
+        .await
+        {
+            Ok(()) => covered.extend(sectors),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if !required_sectors.is_subset(&covered) {
+        return Err(last_error.unwrap_or_else(|| {
+            anyhow::anyhow!("live variable sectors lack recoverable certified placement")
+        }));
+    }
     if let Some(catalog) = &checkpoint.checkpoint.packing_catalog {
         let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
         let recovered_catalog = catalog.clone();
@@ -10331,25 +10401,21 @@ async fn recover_p2p_variable_shards(
                 .sectors
                 .iter()
                 .filter_map(|descriptor| {
-                    state.coding_groups.iter().find_map(|retained| {
-                        retained
-                            .group
-                            .roles
-                            .iter()
-                            .enumerate()
-                            .find_map(|(index, role)| {
-                                matches!(role, ShardRoleV2::Information(information)
-                                    if information.owner == local_id
-                                        && !information.sector.virtual_zero
-                                        && information.sector.id == descriptor.id
-                                        && information.sector.commitment == descriptor.commitment)
-                                .then_some((descriptor.clone(), retained.group.id, index as u16))
-                            })
+                    ordered_certified_variable_placements(&state, |information| {
+                        information.owner == local_id
+                            && !information.sector.virtual_zero
+                            && information.sector.id == descriptor.id
+                            && information.sector.commitment == descriptor.commitment
+                    })
+                    .into_iter()
+                    .find_map(|(group, index)| {
+                        node.variable_shard_for_guild(&guild_id, &group.id, index as u16)
+                            .ok()
+                            .map(|bytes| (descriptor.clone(), bytes))
                     })
                 })
                 .collect::<Vec<_>>();
-            for (descriptor, group_id, shard_index) in assignments {
-                let bytes = node.variable_shard_for_guild(&guild_id, &group_id, shard_index)?;
+            for (descriptor, bytes) in assignments {
                 node.store_packed_sector(
                     guild_id,
                     recovered_catalog.profile,
@@ -10359,11 +10425,9 @@ async fn recover_p2p_variable_shards(
             Ok(())
         })
         .await?;
-        let variable_groups = node_blocking(node.clone(), |node| {
-            Ok(node
-                .dynamic_guild_state()?
-                .context("packed recovery requires dynamic guild state")?
-                .coding_groups)
+        let state = node_blocking(node.clone(), |node| {
+            node.dynamic_guild_state()?
+                .context("packed recovery requires dynamic guild state")
         })
         .await?;
         let mut references = BTreeMap::new();
@@ -10394,7 +10458,7 @@ async fn recover_p2p_variable_shards(
                 local_id,
                 protected_root_id,
                 &reference,
-                &variable_groups,
+                &state,
                 roster,
                 &deferred_holders,
             )
@@ -10407,6 +10471,31 @@ async fn recover_p2p_variable_shards(
         }
     }
     Ok(())
+}
+
+async fn recover_variable_group_plan(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    checkpoint_hash: [u8; 32],
+    plan: VariableRecoveryPlan,
+    roster: &[GuildPeer],
+    deferred_holders: Arc<Mutex<BTreeSet<NodeId>>>,
+) -> Result<()> {
+    let group = plan.group.clone();
+    let transcript = node_blocking(node.clone(), move |node| {
+        node.recovery_coding_transcript_for_group(checkpoint_hash, group.guild_id, group.id)
+    })
+    .await?;
+    recover_variable_plan(
+        node,
+        p2p,
+        checkpoint_hash,
+        transcript,
+        plan.targets,
+        roster,
+        deferred_holders,
+    )
+    .await
 }
 
 async fn recover_variable_plan(
@@ -10901,7 +10990,7 @@ async fn reconstruct_packed_object(
     owner: NodeId,
     protected_root_id: Uuid,
     reference: &SectorRef,
-    variable_groups: &[mb_core::RetainedCodingGroup],
+    state: &DynamicGuildState,
     roster: &[GuildPeer],
     deferred_holders: &Mutex<BTreeSet<NodeId>>,
 ) -> Result<Vec<u8>> {
@@ -10935,28 +11024,15 @@ async fn reconstruct_packed_object(
         let bytes = match local {
             Ok(bytes) => bytes,
             Err(_) => {
-                let (group, target_index) = variable_groups
-                    .iter()
-                    .find_map(|retained| {
-                        retained
-                            .group
-                            .roles
-                            .iter()
-                            .enumerate()
-                            .find(|(_, role)| {
-                                matches!(role, ShardRoleV2::Information(information)
-                                    if !information.sector.virtual_zero
-                                        && information.sector.id == descriptor.id
-                                        && information.sector.commitment == descriptor.commitment)
-                            })
-                            .map(|(index, _)| (&retained.group, index))
-                    })
-                    .context("packed sector is absent from certified variable coding")?;
-                reconstruct_variable_shard_from_peers(
+                let placements = ordered_certified_variable_placements(state, |information| {
+                    !information.sector.virtual_zero
+                        && information.sector.id == descriptor.id
+                        && information.sector.commitment == descriptor.commitment
+                });
+                reconstruct_variable_from_placements(
                     node.clone(),
                     p2p,
-                    group,
-                    target_index,
+                    &placements,
                     roster,
                     deferred_holders,
                 )
@@ -10983,16 +11059,14 @@ pub(crate) async fn restore_snapshot_with_p2p(
     {
         return Ok(restored);
     }
-    let (checkpoint, revision, roster, variable_groups) =
-        node_blocking(node.clone(), move |node| {
-            let (checkpoint, revision, roster) = node.snapshot_repair_plan(revision_id)?;
-            let groups = node
-                .dynamic_guild_state()?
-                .context("snapshot recovery requires dynamic guild state")?
-                .coding_groups;
-            Ok((checkpoint, revision, roster, groups))
-        })
-        .await?;
+    let (checkpoint, revision, roster, state) = node_blocking(node.clone(), move |node| {
+        let (checkpoint, revision, roster) = node.snapshot_repair_plan(revision_id)?;
+        let state = node
+            .dynamic_guild_state()?
+            .context("snapshot recovery requires dynamic guild state")?;
+        Ok((checkpoint, revision, roster, state))
+    })
+    .await?;
     let guild_id = checkpoint.checkpoint.guild_id;
     let packing_catalog = checkpoint.checkpoint.packing_catalog.clone();
     let revision_owner = revision.value.owner;
@@ -11019,18 +11093,8 @@ pub(crate) async fn restore_snapshot_with_p2p(
         if local_is_valid {
             continue;
         }
-        let variable = variable_groups.iter().find_map(|retained| {
-            retained
-                .group
-                .roles
-                .iter()
-                .enumerate()
-                .find(|(_, role)| {
-                    matches!(role, ShardRoleV2::Information(information)
-                        if !information.sector.virtual_zero
-                            && information.sector.id == reference.id)
-                })
-                .map(|(index, _)| (&retained.group, index))
+        let variable = ordered_certified_variable_placements(&state, |information| {
+            !information.sector.virtual_zero && information.sector.id == reference.id
         });
         let bytes = if let Some(catalog) = &packing_catalog {
             reconstruct_packed_object(
@@ -11041,17 +11105,16 @@ pub(crate) async fn restore_snapshot_with_p2p(
                 revision_owner,
                 protected_root_id,
                 &reference,
-                &variable_groups,
+                &state,
                 &roster,
                 &deferred_holders,
             )
             .await?
-        } else if let Some((group, target_index)) = variable {
-            reconstruct_variable_shard_from_peers(
+        } else if !variable.is_empty() {
+            reconstruct_variable_from_placements(
                 node.clone(),
                 p2p,
-                group,
-                target_index,
+                &variable,
                 &roster,
                 &deferred_holders,
             )
@@ -12746,12 +12809,27 @@ async fn load_distributed_packed_sector(
 
 fn ordered_active_variable_placements(
     state: &DynamicGuildState,
+    matches: impl FnMut(&InformationRoleV2) -> bool,
+) -> Vec<(CodingGroupV2, usize)> {
+    ordered_variable_placements(state, false, matches)
+}
+
+fn ordered_certified_variable_placements(
+    state: &DynamicGuildState,
+    matches: impl FnMut(&InformationRoleV2) -> bool,
+) -> Vec<(CodingGroupV2, usize)> {
+    ordered_variable_placements(state, true, matches)
+}
+
+fn ordered_variable_placements(
+    state: &DynamicGuildState,
+    include_retired: bool,
     mut matches: impl FnMut(&InformationRoleV2) -> bool,
 ) -> Vec<(CodingGroupV2, usize)> {
     let mut placements = state
         .coding_groups
         .iter()
-        .filter(|retained| retained.retired_at_event.is_none())
+        .filter(|retained| include_retired || retained.retired_at_event.is_none())
         .filter_map(|retained| {
             retained
                 .group
@@ -12764,6 +12842,7 @@ fn ordered_active_variable_placements(
                 })
                 .map(|index| {
                     (
+                        retained.retired_at_event.is_some(),
                         state
                             .validate_current_group_placement(&retained.group)
                             .is_ok(),
@@ -12773,11 +12852,57 @@ fn ordered_active_variable_placements(
                 })
         })
         .collect::<Vec<_>>();
-    placements.sort_by_key(|(current, group, index)| (!*current, group.id, *index));
+    placements
+        .sort_by_key(|(retired, current, group, index)| (*retired, !*current, group.id, *index));
     placements
         .into_iter()
-        .map(|(_, group, index)| (group, index))
+        .map(|(_, _, group, index)| (group, index))
         .collect()
+}
+
+async fn reconstruct_variable_from_placements(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    placements: &[(CodingGroupV2, usize)],
+    roster: &[GuildPeer],
+    deferred_holders: &Mutex<BTreeSet<NodeId>>,
+) -> Result<Vec<u8>> {
+    first_reconstructable_variable_placement(placements, |group, target_index| {
+        let node = node.clone();
+        async move {
+            reconstruct_variable_shard_from_peers(
+                node,
+                p2p,
+                &group,
+                target_index,
+                roster,
+                deferred_holders,
+            )
+            .await
+        }
+    })
+    .await
+}
+
+async fn first_reconstructable_variable_placement<F, Fut>(
+    placements: &[(CodingGroupV2, usize)],
+    mut reconstruct: F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(CodingGroupV2, usize) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>>>,
+{
+    let mut last_error = None;
+    for (group, target_index) in placements {
+        match reconstruct(group.clone(), *target_index).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => {
+                tracing::debug!(group = %hex::encode(group.id), %error, "certified variable placement is unavailable");
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("sector has no certified coding placement")))
 }
 
 async fn recover_object_from_previous_packing(
@@ -14567,8 +14692,8 @@ mod tests {
         assert!(plan_packed_lane_placements([141; 32], &[3, 3], &peers, &infeasible, 2).is_err());
     }
 
-    #[test]
-    fn redundant_variable_groups_retire_only_after_replacement_coverage() {
+    #[tokio::test]
+    async fn redundant_variable_groups_retire_only_after_replacement_coverage() {
         let peers = (0_u8..5)
             .map(|index| {
                 let keys = KeyMaterial::from_seed(&Seed::from_bytes([index + 70; 32]));
@@ -14674,6 +14799,11 @@ mod tests {
         assert_eq!(placements[0].0.id, replacement_id);
         assert_eq!(placements[1].0.id, old_id);
         let live = BTreeSet::from([first.id, second.id]);
+        let (plans, required) = variable_recovery_plans(&state, &live, peers[0].member.node_id);
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].group.id, replacement_id);
+        assert_eq!(plans[1].group.id, old_id);
+        assert_eq!(required, live);
         assert!(matches!(
             variable_group_lifecycle_kind(&state, &live, 3),
             Some(mb_core::GuildEventKind::RetireCodingGroup { group_id, .. })
@@ -14691,6 +14821,31 @@ mod tests {
             .unwrap();
         old.retired_at_event = Some(3);
         old.retain_through_event = Some(3);
+        let (plans, required) = variable_recovery_plans(&state, &live, peers[0].member.node_id);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].group.id, replacement_id);
+        assert_eq!(required, live);
+        let certified = ordered_certified_variable_placements(&state, |information| {
+            information.owner == peers[0].member.node_id && information.sector.id == first.id
+        });
+        assert_eq!(certified.len(), 2);
+        assert_eq!(certified[0].0.id, replacement_id);
+        assert_eq!(certified[1].0.id, old_id);
+        let attempted = Arc::new(Mutex::new(Vec::new()));
+        let bytes = first_reconstructable_variable_placement(&certified, |group, _| {
+            let attempted = attempted.clone();
+            async move {
+                attempted.lock().unwrap().push(group.id);
+                if group.id == replacement_id {
+                    anyhow::bail!("current placement is unavailable");
+                }
+                Ok(vec![9])
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(bytes, vec![9]);
+        assert_eq!(*attempted.lock().unwrap(), vec![replacement_id, old_id]);
         assert!(matches!(
             variable_group_lifecycle_kind(&state, &live, 4),
             Some(mb_core::GuildEventKind::ForgetCodingGroup { group_id })
