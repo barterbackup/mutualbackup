@@ -112,7 +112,9 @@ Milestone 6 waits for corrections and M5-97. The follow-up commits through
 coverage, and audit. Source-only review found that checkpoint signing can still
 accept an inconsistent revision-signed flat root and Merkle commitment through
 a format-2 plan's root claim. M5-92, M5-96, and the local M5-97 gate remain
-open.
+open on `308b156`. Commit `c7cc6fd` requires a replay-verified full-byte
+binding for new legacy checkpoint coverage, including retained revisions.
+M5-92 through M5-96 are corrected; the complete M5-97 gate is pending.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -780,6 +782,13 @@ mixed-coverage paths and tighten legacy root checks. Source-only review of
 flat-root claim when its role commitment matches a separately signed revision
 commitment. The model does not establish that the two revision roots describe
 the same bytes. M5-92 and M5-96 remain open, and M5-97 has not run on this tree.
+Commit `c7cc6fd` introduces a version-three coding plan and a version-two
+manifest carrying complete encrypted information bytes only when flat-root
+binding is needed. Replay checks both roots against those bytes. New legacy
+variable and old flat-root packed checkpoint coverage requires this proof;
+compact production packed coding remains unchanged. Focused local regressions
+pass for forged claims and retained revisions. M5-92 and M5-96 are corrected,
+and M5-97 is the remaining closure gate.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1904,7 +1913,11 @@ legacy-root authentication, live-quorum recovery, and restore fallback. The
 M5-93 through M5-95 corrections are committed. M5-92 and M5-96 still need a
 checkpoint-signing proof that the signed flat root matches the group's full
 information bytes even if the revision carries a Merkle commitment. M5-97's
-local closure gate remains open; Milestone 6 waits.
+local closure gate remains open; Milestone 6 waits. Commit `c7cc6fd` supplies
+that proof in a signed full-byte legacy manifest, and new checkpoint signing
+requires its successful replay. Correct legacy revisions without separately
+signed Merkle commitments can still use the proof. All M5-92 through M5-96
+corrections are implemented; M5-97 has not yet passed on this tree.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and

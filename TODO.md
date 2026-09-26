@@ -634,6 +634,13 @@ Source-only review of `308b156` found the remaining checkpoint-signing gap
 under M5-92 and M5-96: matching two independently signed root claims does not
 prove they describe the same bytes. M5-97 also remains open. This review ran
 no builds, tests, daemons, runtime probes, or remote compilation.
+Commit `c7cc6fd` adds a version-three legacy coding plan whose signed manifest
+carries complete encrypted information bytes. Transcript replay recomputes the
+group's Merkle commitment and plan flat root from those same bytes. New legacy
+checkpoint coverage requires that proof; format-1/2 transcripts remain valid
+for historical checkpoints but cannot protect a new one. Focused local tests
+pass for forged claims, retained revisions, and a correct old revision without
+a signed Merkle commitment. M5-92 and M5-96 are corrected; M5-97 remains open.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -2064,7 +2071,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   device, image, and smoke-test namespaces were removed. No remote compilation
   server was used.
 
-- [ ] **M5-92 / P1 — Bind claimed legacy information roots to committed bytes.**
+- [x] **M5-92 / P1 — Bind claimed legacy information roots to committed bytes.**
   Cold recovery accepts a format-2 transcript's claimed information root as
   checkpoint proof without reconstructing its shard
   (`crates/mb-node/src/network/p2p.rs:10306`–`:10336`). A signed plan can
@@ -2096,7 +2103,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   also passes the commitment-matching branch. Bind the roots through full
   authenticated bytes or an equivalent verifiable proof. Add checkpoint
   signing regressions with this inconsistent signed root/commitment pair for
-  both transcript formats.
+  both transcript formats. Commit `c7cc6fd` adds that proof to version-three
+  legacy coding manifests and requires it before signing new legacy variable
+  or old flat-root packed coverage. The coordinator computes both roots from
+  complete encrypted information bytes; replay independently recomputes them.
+  Focused local regressions reject replay-valid format-1/2 false claims, a
+  forged version-three manifest, and inconsistent signed revision roots while
+  accepting a correct version-three group. Compact production packed groups
+  retain format two because their descriptor root equals the Merkle root.
 
 - [x] **M5-93 / P1 — Require live `k` when current local targets are READY.**
   `recover_variable_group_plan` proves a live quorum for coverage-only plans,
@@ -2145,7 +2159,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   mismatched roles. Focused local regressions cover a live mixed group that
   credits valid A despite conflicting B and then credits B from another group.
 
-- [ ] **M5-96 / P1 — Authenticate retained-revision coverage and audit.**
+- [x] **M5-96 / P1 — Authenticate retained-revision coverage and audit.**
   For a revision retained from the preceding checkpoint, checkpoint validation
   passes `allow_legacy_root` to variable coverage
   (`crates/mb-node/src/node.rs:6187`–`:6249`). That accepts a rootless format-1
@@ -2165,7 +2179,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   focused regression passed locally before this source-only review. The
   checkpoint signer still accepts a retained signed revision whose flat root
   and signed Merkle commitment are inconsistent, through the M5-92 path above.
-  Gate that retained-revision case as well before closing this item.
+  Gate that retained-revision case as well before closing this item. Commit
+  `c7cc6fd` requires a replay-verified full-byte root binding for every new
+  legacy checkpoint, including retained revisions. A focused local regression
+  rejects both a format-2 false-root claim and a rootless format-1 group for
+  an inconsistent retained revision; audit continues to check reconstructed
+  bytes against the committed checkpoint.
 
 - [ ] **M5-97 / gate — Close Milestone 5 after M5-92 through M5-96.**
   After correcting the source blockers, run fresh source review, formatting,
@@ -2173,8 +2192,8 @@ node Clippy gate passed locally. No remote compilation server was used.
   Clippy, Docker lab safety, and the complete provisioned Btrfs/network
   acceptance script on a fresh disposable local filesystem. Build and run
   locally; do not use a remote compilation server. M5-91 remains historical
-  evidence for its exact source tree. The source-only review of `308b156` did
-  not run this gate; M5-92 and M5-96 remain open.
+  evidence for its exact source tree. M5-92 and M5-96 are corrected in
+  `c7cc6fd`; the complete gate has not yet run on that source tree.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
