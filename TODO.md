@@ -587,7 +587,10 @@ Source-only review through `c4e97f8` finds M5-105 and M5-106 in retry lane
 coalescing and its production staging caller. Both corrections are now
 implemented with passing restart/replanning regressions. Milestone 5 remains
 open; the M5-107 membership-transition follow-up also passes its focused
-checks. Milestone 6 waits for the complete new M5-104 gate.
+checks. Source-only review of `c4e97f8..1f3141e` found M5-108 and M5-109:
+expired durable launches cannot renew, and blocked staging launches hide
+later runnable launches. Milestone 6 waits for those corrections and the
+complete new M5-104 gate.
 M5-97 and earlier gate records remain evidence for their exact trees. This
 review ran no builds, tests, daemons, runtime probes, or remote compilation.
 
@@ -2424,8 +2427,8 @@ node Clippy gate passed locally. No remote compilation server was used.
   gate is required on the final corrected source.
 
 - [ ] **M5-104 / gate — Recheck Milestone 5 after durable retry scheduling is corrected.**
-  Correct M5-105 through M5-107, then review the complete M5-103 follow-up and its
-  production-worker restart/replanning regressions.
+  Correct M5-108 and M5-109 after M5-105 through M5-107, then review the complete
+  M5-103 follow-up and its production-worker restart/replanning regressions.
   Then run formatting, locked all-target workspace tests, strict locked
   all-target workspace Clippy, Docker lab safety, and the complete fresh
   disposable local Btrfs/network acceptance script. Record exact source
@@ -2537,6 +2540,56 @@ node Clippy gate passed locally. No remote compilation server was used.
   capacity assertions that inspected an offline default volume. They now sum
   all volumes, matching the production fixture's actual storage layout. No
   remote compilation server is used.
+
+- [ ] **M5-108 / P1 — Renew expired durable launches after safe input cleanup.**
+  Source-only review of `c4e97f8..1f3141e` on 2026-09-26 finds no same-epoch
+  expiry transition for the new durable staging path. Production launches
+  expire after 24 hours (`crates/mb-node/src/network/p2p.rs:12471`–`:12473`).
+  If an input volume/holder is unavailable until after that deadline, launch
+  claim still selects the original plan using authority-only validation
+  (`crates/mb-node/src/node.rs:4155`–`:4180`). Dispatch cleans up only on an
+  epoch change (`network/p2p.rs:6296`–`:6315`); otherwise it retries staging
+  under that expired plan and persists another deferral (`:6318`–`:6339`).
+  Input reserve/write/finalize check the current deadline through
+  `validate_local_coding_information` (`node.rs:4840`–`:4845`, `:5796`–`:5806`;
+  `crates/mb-core/src/guild.rs:569`–`:578`), so restoring every disk and peer
+  cannot unblock it. Completed staging followed by unsuccessful delegation
+  until expiry has the same problem: delegated enqueue rejects the plan
+  (`node.rs:4289`–`:4294`), and
+  no coordinator job exists to report failure and create a retry. The launch
+  remains pending (`node.rs:4183`–`:4191`), suppressing lifecycle replanning.
+  Direct re-enqueue with the deterministic initial ID also retains the old
+  signed plan (`node.rs:4072`–`:4083`). Partial reservations or finalized staged
+  inputs remain stranded and checkpoint coverage cannot finish.
+  Add durable fencing and resumable expiry cleanup, then renew with a fresh
+  identity and current authority without modifying historical signed bytes
+  or discarding accepted verifier evidence. Gate partial and finalized input
+  staging plus completed-staging/failed-delegation cases across same-epoch
+  reopen after expiry. Drive the actual worker to verification, activation,
+  checkpoint coverage, zero reservations/staged receipts, and exact expected
+  capacity on all holders, including two further reopens. The existing staging
+  restart fixture restores its volume before launch expiry. This review ran
+  no builds, tests, or runtime probes.
+
+- [ ] **M5-109 / P1 — Give deferred launches bounded scheduling turns.**
+  Source-only review of `c4e97f8..1f3141e` on 2026-09-26 finds launch claims
+  always return the first undispatched current-epoch record
+  (`crates/mb-node/src/node.rs:4155`–`:4180`). Records are ordered by attempt ID
+  (`crates/mb-store/src/database.rs:348`–`:355`). Staging deferral leaves that
+  record undispatched and only updates its error (`node.rs:4255`–`:4280`;
+  `crates/mb-node/src/network/p2p.rs:6323`–`:6339`). Every worker cycle invokes
+  the same cursorless launch claim (`network/p2p.rs:6023`–`:6043`, `:6283`–`:6285`).
+  A lower-ID launch awaiting an offline volume or information holder therefore
+  hides later launches whose holders, capacity, and coordinators are available.
+  Retry rotation and activation queue turns do not dispatch those other lanes.
+  Add fair launch selection/backoff so deferred staging, delegation, and cleanup
+  cannot monopolize launch dispatch. Preserve durable intents and immutable
+  plans, with explicit blocked status. Gate two independent current-epoch
+  launches in adverse ID order through the production worker: keep the first
+  staging destination unavailable while the second verifies, activates, and
+  reaches checkpoint coverage, then restore and finish the first. Cover
+  repeated reopen and all holders' reservations, staged receipts, and used
+  capacity. This review ran no builds, tests, or runtime probes.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

@@ -600,7 +600,9 @@ retry scheduling. Its correction and focused restart regressions now pass.
 Follow-up source review through `c4e97f8` finds M5-105 and M5-106 in retry
 coalescing and staging. Those corrections and focused restart/replanning
 regressions now pass. Milestone 5 remains open and Milestone 6 waits for
-the complete M5-104 gate. The preceding
+the complete M5-104 gate. Source-only review through `1f3141e` also requires
+M5-108/M5-109: safely renew expired durable launches and give deferred launches
+bounded scheduling turns. The preceding
 records are closure history.
 Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
@@ -822,8 +824,10 @@ correction and focused regressions pass; source review through `c4e97f8` finds
 M5-105 and M5-106 in lane coalescing and production staging. Both corrections
 and focused production regressions now pass. Milestone 5 remains open for the
 complete M5-104 gate, including M5-107's verified-placement/epoch-identity
-follow-up whose focused checks pass. Milestone 6
-waits. The complete M5-97 local gate passed on source `c7033fa`
+follow-up whose focused checks pass. Source-only review of `c4e97f8..1f3141e`
+also finds M5-108 (expired launches cannot renew) and M5-109 (blocked staging
+launches hide later runnable launches). Correct both before the final gate.
+Milestone 6 waits. The complete M5-97 local gate passed on source `c7033fa`
 on 2026-09-26; provisioned acceptance ran at documentation-only successor
 `4170dce`. That gate remains historical evidence for its tested scenarios.
 The following records retain the correction and closure history. The M5-36
@@ -1966,6 +1970,23 @@ source locations, failure cases, and recorded gate evidence.
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
 ### Milestone 5 — efficient and flexible data/guild protocol (reopened)
+
+Current source-only review of `c4e97f8..1f3141e` on 2026-09-26 finds two remaining
+production-worker blockers after M5-105 through M5-107. M5-108: a durable launch
+that outlives its 24-hour deadline is still claimed, but input staging and
+delegation reject its immutable expired plan. Same-epoch restart and restored
+peers/disks cannot recover it; its pending record also suppresses replanning.
+Fence and clean partial/finalized inputs durably, then renew with fresh identity
+and current authority while retaining signed history and accepted verifier
+evidence. M5-109: launch selection always returns the first undispatched ID,
+and staging deferral leaves it eligible, so one offline input destination hides
+later runnable launches. Give deferred launches bounded turns, including
+delegation and cleanup failures. Required expiry/reopen, two-launch fairness,
+activation/checkpoint, and all-holder capacity/receipt regressions are recorded
+in `TODO.md`. Milestone 5 remains open; correct both before M5-104's complete
+local gate and Milestone 6. This review ran no builds, tests, daemons, runtime
+probes, or remote compilation. The following paragraphs retain earlier review
+and validation history.
 
 Previously closed on 2026-09-26 after the complete M5-97 gate on corrected source
 `c7033fa`. Formatting, locked all-target workspace tests, strict locked
