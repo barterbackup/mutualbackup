@@ -574,7 +574,21 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (reopened 2026-09-26)
+## Milestone 5 guild geometry and coding protocol (closed 2026-09-26)
+
+M5-103 and M5-105 through M5-110 are implemented. The complete final M5-104
+gate passed locally on exact source `f8e47d34d62a073db6953260571441525dc5e2ac`:
+locked all-target workspace tests, strict locked all-target Clippy, formatting,
+Docker lab safety, and all 23 fresh disposable Btrfs/network acceptance
+invocations. The acknowledged-launch, accepted-result, ownership, fairness,
+staging and membership-transition regressions pass in the full workspace run.
+Owner/storage-only seed recovery and direct, DCUtR and forced-relay bulk
+transfers pass in the final daemon scenario. Disposable filesystem, loop device,
+namespaces, network rules/interfaces and test processes were independently
+confirmed removed. All compilation and execution were local. Milestone 5 is
+closed; Milestone 6 is next. Exact outcomes are recorded under M5-104 below.
+
+The following paragraphs retain earlier review and correction history.
 
 The final corrected source `c7033fa` passed the complete M5-97 local gate on
 2026-09-26. Provisioned acceptance ran at `4170dce`, which changes only these
@@ -2431,7 +2445,34 @@ node Clippy gate passed locally. No remote compilation server was used.
   filesystem, image, loop device, and namespaces were removed. A new complete
   gate is required on the final corrected source.
 
-- [ ] **M5-104 / gate — Recheck Milestone 5 after durable retry scheduling is corrected.**
+- [x] **M5-104 / gate — Recheck Milestone 5 after durable retry scheduling is corrected.**
+  Completed on 2026-09-26 against exact committed source
+  `f8e47d34d62a073db6953260571441525dc5e2ac`, with a clean worktree throughout
+  the final workspace and provisioned gates. `cargo clippy --locked --workspace
+  --all-targets -- -D warnings` passed in 34.17 seconds. `cargo test --locked
+  --workspace --all-targets` passed every suite: 48 core, 270 node (10 ignored)
+  and 50 store (14 ignored), plus all CLI/application and vendored workspace
+  targets. The node suite finished in 472.87 seconds and includes all recent
+  launch-expiry, ownership, staging, fairness, membership and relay/DCUtR
+  regressions. `cargo fmt --all -- --check` and
+  `bash scripts/docker-lab-safety-test.sh` passed.
+
+  All 23 invocations in `scripts/reflink-acceptance.sh` passed on a fresh local
+  8 GiB Btrfs image. Repeated multi-owner QUIC finished in 1391.14 seconds;
+  `five_daemons_recover_latest_snapshot_from_seed_and_dht` finished in
+  3583.56 seconds, covering owner/storage-only seed recovery and direct,
+  DCUtR and forced-relay bulk transfers. The runner exited zero and reported
+  cleanup `result=0`. Independent checks confirmed that
+  `/tmp/mutualbackup-m5-104.wFKFzL` (including mount/image) was absent,
+  `/dev/loop0` was detached, all four `b5340b9` namespaces and their veth and
+  firewall/NAT rules were gone, and no test daemon/harness processes remained.
+  Workspace evidence is in `/tmp/mutualbackup-m5-104-owner-final-2-*.log`;
+  provisioned evidence is in
+  `/tmp/mutualbackup-m5-104-owner-final-provisioned.log`. No remote compilation
+  server was used. Milestone 5 is closed and Milestone 6 is next.
+
+  Earlier review and gate history:
+
   Latest source-only review on 2026-09-26 covers `16c28a5..77c2090` and the
   existing uncommitted relay/DCUtR fixture change. No new source blocker was
   found in expired acknowledged-launch selection, acknowledgement-preserving

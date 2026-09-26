@@ -56,7 +56,14 @@ them as ADRs and test vectors before promising wire compatibility.
   checkpoints. Leave a compatible authorization interface for later quorum
   policies and FROST once membership and recovery policy are stable.
 
-### Implemented baseline — efficient and flexible guild protocol beta reopened
+### Implemented baseline — efficient and flexible guild protocol beta passed
+
+Milestones 0 through 5 have passed. The complete final M5-104 local gate on
+2026-09-26 passed against `f8e47d34d62a073db6953260571441525dc5e2ac`, including
+strict locked workspace Clippy, all-target workspace tests, formatting, Docker
+lab safety and all 23 fresh disposable Btrfs/network acceptance invocations.
+Cleanup was independently verified. Milestone 6's source-backend and platform
+work is next. The following paragraphs retain the prior closure/review history.
 
 The first usable architectural prototype and the Milestone 2
 operator-configuration and identity-state slice have passed their review gates.
@@ -578,8 +585,12 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 4 have passed. Milestone 5's
-historical M5-67 gate passed, and the later M5-68 through M5-76 source blockers
+than a daemon prerequisite. Milestones 0 through 5 have passed. The final
+M5-104 workspace and fresh provisioned gate passed on `f8e47d3`, with all
+disposable resources removed and independently checked. Milestone 6 is next.
+
+Earlier correction history: Milestone 5's historical M5-67 gate passed, and
+the later M5-68 through M5-76 source blockers
 in checkpoint catch-up, legacy migration, incremental packing, and relay
 expiry are corrected. The complete local M5-77 closure gate passed on
 2026-09-22, but source review found M5-78 through M5-83 and reopened Milestone
@@ -824,21 +835,14 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 4 are passed. M5-103's durable retry
-correction and focused regressions pass; source review through `c4e97f8` finds
-M5-105 and M5-106 in lane coalescing and production staging. Both corrections
-and focused production regressions now pass. Milestone 5 remains open for the
-complete M5-104 gate, including M5-107's verified-placement/epoch-identity
-follow-up whose focused checks pass. Source-only review of `c4e97f8..1f3141e`
-also finds M5-108 (expired launches cannot renew) and M5-109 (blocked staging
-launches hide later runnable launches). Both corrections and all 21 focused
-tests pass. Source-only review through `16c28a5` finds M5-110: current-epoch
-dispatched launches never reach expiry recovery after coordinator loss.
-M5-110 is now implemented with passing coordinator-loss, accepted-result, and
-lineage regressions. Pass the complete new local gate before closure.
-Milestone 6 waits. The complete M5-97 local gate passed on source `c7033fa`
-on 2026-09-26; provisioned acceptance ran at documentation-only successor
-`4170dce`. That gate remains historical evidence for its tested scenarios.
+**Current position:** Milestones 0 through 5 are passed. M5-103 and M5-105
+through M5-110's retry, staging, membership, expiry, fairness and ownership
+corrections pass the complete M5-104 local gate on exact source `f8e47d3`.
+All 23 fresh provisioned acceptance invocations passed, and disposable-resource
+cleanup was independently verified on 2026-09-26. Milestone 6 is next:
+guarded link-freeze capture, followed by additional native platforms and
+capture hooks. M5-97 and earlier gates remain historical evidence for their
+exact source trees.
 The following records retain the correction and closure history. The M5-36
 through M5-66 correction history and M5-45/M5-67 gates remain historical evidence.
 Fresh source-only review of `81ec33b..b65c79a` found M5-68 through M5-76 and
@@ -1978,7 +1982,29 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (reopened)
+### Milestone 5 — efficient and flexible data/guild protocol (passed)
+
+The complete final M5-104 gate passed locally on 2026-09-26 against exact
+source `f8e47d34d62a073db6953260571441525dc5e2ac`. Strict locked all-target
+workspace Clippy passed in 34.17 seconds. Locked all-target workspace tests
+passed every suite, including 48 core, 270 node (10 ignored) and 50 store
+(14 ignored), plus all CLI/application and vendored targets. The node suite
+finished in 472.87 seconds, covering all recent retry/launch, acknowledged
+coordinator-loss, accepted-result expiry, ownership, staging, fairness,
+membership and relay/DCUtR regressions. Formatting and Docker lab safety passed.
+
+All 23 fresh local Btrfs/network acceptance invocations passed on the same
+unchanged committed source. Repeated multi-owner QUIC finished in 1391.14
+seconds; the final five-daemon recovery/transport scenario finished in 3583.56
+seconds. Owner and storage-only seed recovery, direct and DCUtR bulk traffic,
+and forced-relay bulk fallback passed. The runner exited zero and reported
+successful cleanup. Independent checks confirmed the owned mount/image/directory,
+loop device, four namespaces, veth interfaces, firewall/NAT rules and test
+processes were gone. Exact resources and log locations are recorded in TODO.md
+under M5-104. All builds and runs were local; no remote compilation server was
+used. Milestone 5 is closed; Milestone 6 is next.
+
+Earlier source-review and correction history follows.
 
 Latest source-only review on 2026-09-26 covers `16c28a5..77c2090` and the
 existing uncommitted relay/DCUtR fixture change. No new source blocker was
