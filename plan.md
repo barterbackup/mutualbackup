@@ -120,6 +120,11 @@ attempt identities, unchanged group identities prevent replacing compact
 evidence with full-byte proof, and raw witness bounds do not ensure CBOR
 messages fit the peer frame. Those corrections and the complete M5-97 gate
 remain pending; Milestone 6 waits.
+The follow-up implements distinct attempt/group identities, authenticated READY
+input reuse, compact version-three manifests, and encoded peer-message budgets.
+Focused migration, checkpoint-signing, lifecycle, and transport regressions pass
+locally. M5-98 through M5-100 are corrected; the complete M5-97 gate remains
+pending, so Milestone 5 stays open.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -1947,6 +1952,11 @@ existing certified group identities reject stronger transcripts, and the raw
 witness bound does not guarantee transportable CBOR frames. Implement and
 review those corrections before running the complete M5-97 local gate.
 Milestone 5 remains open and Milestone 6 waits.
+Those corrections are now implemented. The regression preserves old durable
+launch/retry/activation records and both certified groups across restart,
+checks historical coverage, and signs a new checkpoint with the stronger proof.
+Worst-case witness messages round-trip through the bounded CBOR codec and the
+Postcard serializer. M5-97's final local workspace/provisioned gate is pending.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and
@@ -1971,6 +1981,12 @@ Milestone 5 remains open and Milestone 6 waits.
   that the two root representations describe the same bytes. That compatibility
   payload is bounded to 512 KiB per manifest and reported separately as
   `root_binding_bytes`; current production packed plans carry no such payload.
+  New full-byte manifests use CBOR byte strings. Before staging, nodes also
+  budget both encoded transports, including proofs, event certificates, and
+  signed envelopes; untransportable new attempts are rejected. Parity range
+  size adapts to the remaining frame space, and event tails return a prefix
+  bounded by encoded bytes. Historical transcript replay retains its original
+  validation independently of current peer-frame budgets.
 - Add versioned variable `k/m` and sector profiles, dynamic membership and event
   tails, quorum policy, writer/key epochs, recovery-key envelopes, rotation and
   revocation. Keep old committed layouts decodable until their retention ends.

@@ -4537,6 +4537,9 @@ impl Node {
         if role.sector.virtual_zero {
             anyhow::bail!("virtual-zero information requires no storage reservation");
         }
+        if self.ready_coding_information(plan, shard_index)?.is_some() {
+            return Ok(role.sector.commitment.byte_len);
+        }
         self.volumes.reserve_attempt(
             &self.control,
             &plan.value.attempt_id,
@@ -4581,6 +4584,9 @@ impl Node {
         if role.sector.virtual_zero {
             anyhow::bail!("virtual-zero information requires no payload upload");
         }
+        if self.ready_coding_information(plan, shard_index)?.is_some() {
+            return Ok(());
+        }
         self.volumes.finish_attempt_upload(
             &self.control,
             &plan.value.attempt_id,
@@ -4612,6 +4618,9 @@ impl Node {
             }
             return Ok(merkle_open_range(&bytes, start_leaf, leaf_count)?);
         }
+        if let Some(bytes) = self.ready_coding_information(plan, shard_index)? {
+            return Ok(merkle_open_range(&bytes, start_leaf, leaf_count)?);
+        }
         self.volumes.open_attempt_range(
             &self.control,
             &plan.value.attempt_id,
@@ -4620,6 +4629,25 @@ impl Node {
             start_leaf,
             leaf_count,
         )
+    }
+
+    /// Reuse an authenticated READY input without taking ownership of its old
+    /// attempt record. Upgrading evidence must not rewrite historical storage.
+    fn ready_coding_information(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+        shard_index: u16,
+    ) -> Result<Option<Vec<u8>>> {
+        let role = self.validate_local_coding_information(plan, shard_index)?;
+        Ok(self
+            .volumes
+            .load_ready_variable(&self.control, &role.sector.id, shard_index)
+            .ok()
+            .filter(|object| {
+                object.guild_id == plan.value.geometry.guild_id
+                    && object.commitment == role.sector.commitment
+            })
+            .map(|object| object.bytes))
     }
 
     fn validate_local_coding_information<'a>(
@@ -4769,29 +4797,8 @@ impl Node {
         }
         let leaf = challenged_leaf(&challenge, commitment)?;
         let proof = match role {
-            ShardRoleV2::Information(information) => {
-                if information.sector.virtual_zero {
-                    merkle_open_zero_range(information.sector.commitment.byte_len, leaf, 1)?
-                } else {
-                    match self.sector_for_guild(&group.guild_id, &information.sector.id) {
-                        Ok(bytes) => {
-                            if merkle_commit(&bytes)? != *commitment {
-                                anyhow::bail!(
-                                    "local information bytes conflict with the coding plan"
-                                );
-                            }
-                            merkle_open_range(&bytes, leaf, 1)?
-                        }
-                        Err(_) => self.volumes.open_attempt_range(
-                            &self.control,
-                            &plan.value.attempt_id,
-                            &information.sector.id,
-                            shard_index,
-                            leaf,
-                            1,
-                        )?,
-                    }
-                }
+            ShardRoleV2::Information(_) => {
+                self.coding_information_range(plan, shard_index, leaf, 1)?
             }
             ShardRoleV2::Parity(_) => self.volumes.open_attempt_range(
                 &self.control,
@@ -5174,18 +5181,13 @@ impl Node {
                     if information.sector.virtual_zero {
                         continue;
                     }
-                    if group_committed
-                        && self
-                            .volumes
-                            .load_ready_variable(
-                                &self.control,
-                                &information.sector.id,
-                                index as u16,
-                            )
-                            .is_ok_and(|object| {
-                                object.guild_id == group.guild_id
-                                    && object.commitment == information.sector.commitment
-                            })
+                    if self
+                        .volumes
+                        .load_ready_variable(&self.control, &information.sector.id, index as u16)
+                        .is_ok_and(|object| {
+                            object.guild_id == group.guild_id
+                                && object.commitment == information.sector.commitment
+                        })
                     {
                         continue;
                     }
@@ -5373,6 +5375,10 @@ impl Node {
         let state = self
             .dynamic_guild_state()?
             .context("node has no dynamic guild state")?;
+        crate::network::validate_root_binding_frame_budget(
+            &plan.value,
+            state.active_members().count(),
+        )?;
         state.validate_attempt(&plan.value, unix_seconds())?;
         Ok(())
     }
@@ -13681,6 +13687,437 @@ pub(crate) mod tests {
         assert!(!source_path.exists());
     }
 
+    pub(crate) fn test_coding_transcript(
+        plan: SignedRecord<CodingAttemptPlan>,
+        shards: &[Vec<u8>],
+        keys: &[KeyMaterial],
+    ) -> SignedRecord<CodingVerificationTranscript> {
+        let key = |id| keys.iter().find(|key| key.node_id() == id).unwrap();
+        let value = &plan.value;
+        let attempt_id = value.attempt_id;
+        let plan_hash = value.hash().unwrap();
+        let verifier = value.verification_coordinator;
+        let (manifest, _) = mb_core::encode_coding_attempt(
+            &plan,
+            shards[..usize::from(value.geometry.profile.data_shards)]
+                .iter()
+                .cloned()
+                .map(Some)
+                .collect(),
+            key(value.coding_coordinator),
+        )
+        .unwrap();
+        let receipts = manifest
+            .value
+            .group
+            .roles
+            .iter()
+            .enumerate()
+            .filter_map(|(index, role)| {
+                let ShardRoleV2::Parity(parity) = role else {
+                    return None;
+                };
+                Some(
+                    SignedRecord::sign(
+                        STAGED_STORAGE_RECEIPT_DOMAIN,
+                        StagedStorageReceipt {
+                            format_version: 1,
+                            attempt_id,
+                            plan_hash,
+                            guild_id: manifest.value.group.guild_id,
+                            group_id: manifest.value.group.id,
+                            shard_index: index as u16,
+                            holder: parity.holder,
+                            commitment: parity.commitment.clone(),
+                        },
+                        key(parity.holder),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let nonce = [42; 32];
+        let challenge_commitment = SignedRecord::sign(
+            CODING_CHALLENGE_COMMITMENT_DOMAIN,
+            CodingChallengeCommitment {
+                format_version: 1,
+                attempt_id,
+                plan_hash,
+                commitment: mb_core::coding_challenge_commitment(plan_hash, nonce),
+            },
+            key(verifier),
+        )
+        .unwrap();
+        let evidence_hash = mb_core::coding_evidence_hash(&manifest, &receipts).unwrap();
+        let challenge_reveal = SignedRecord::sign(
+            CODING_CHALLENGE_REVEAL_DOMAIN,
+            CodingChallengeReveal {
+                format_version: 1,
+                attempt_id,
+                plan_hash,
+                nonce,
+                evidence_hash,
+            },
+            key(verifier),
+        )
+        .unwrap();
+        let challenge = mb_core::coding_challenge(plan_hash, nonce, evidence_hash);
+        let openings = manifest
+            .value
+            .group
+            .roles
+            .iter()
+            .enumerate()
+            .map(|(index, role)| {
+                let (holder, commitment) = match role {
+                    ShardRoleV2::Information(info) => (info.owner, &info.sector.commitment),
+                    ShardRoleV2::Parity(parity) => (parity.holder, &parity.commitment),
+                };
+                let leaf = challenged_leaf(&challenge, commitment).unwrap();
+                SignedRecord::sign(
+                    CODING_SHARD_OPENING_DOMAIN,
+                    CodingShardOpening {
+                        format_version: 1,
+                        attempt_id,
+                        plan_hash,
+                        verifier,
+                        challenge,
+                        shard_index: index as u16,
+                        commitment: commitment.clone(),
+                        proof: merkle_open_range(&shards[index], leaf, 1).unwrap(),
+                    },
+                    key(holder),
+                )
+                .unwrap()
+            })
+            .collect();
+        let transcript = SignedRecord::sign(
+            mb_core::CODING_TRANSCRIPT_DOMAIN,
+            CodingVerificationTranscript {
+                format_version: 1,
+                verified_at_unix_seconds: unix_seconds(),
+                plan,
+                manifest,
+                challenge_commitment,
+                staged_receipts: receipts,
+                challenge_reveal,
+                openings,
+            },
+            key(verifier),
+        )
+        .unwrap();
+        assert_eq!(
+            replay_coding_transcript(&transcript).unwrap(),
+            CodingReplayFinding::Verified
+        );
+        transcript
+    }
+
+    #[test]
+    fn legacy_proof_upgrade_preserves_durable_jobs_and_certified_groups() {
+        let temp = tempfile::tempdir().unwrap();
+        let (seed, certificate, peers) = recovery_guild_fixture();
+        let keys = (0_u8..5)
+            .map(|i| KeyMaterial::from_seed(&Seed::from_bytes([120 + i; 32])))
+            .collect::<Vec<_>>();
+        let local_id = KeyMaterial::from_seed(&seed).node_id();
+        let remotes = keys
+            .iter()
+            .filter(|key| key.node_id() != local_id)
+            .collect::<Vec<_>>();
+        let member = |id| {
+            peers
+                .iter()
+                .find(|peer| peer.member.node_id == id)
+                .unwrap()
+                .member
+                .clone()
+        };
+        let profile = mb_core::CodingProfile::new(1, 1, 64);
+        let shards = mb_core::encode(profile, vec![vec![67; 64]]).unwrap();
+        let geometry = mb_core::CodingPlanGeometry {
+            format_version: 1,
+            guild_id: certificate.genesis.guild_id,
+            profile,
+            information: vec![mb_core::InformationRoleV2 {
+                owner: local_id,
+                failure_domain: member(local_id).failure_domain,
+                sector: mb_core::RangeSectorRef {
+                    id: [71; 32],
+                    commitment: merkle_commit(&shards[0]).unwrap(),
+                    logical_len: 64,
+                    virtual_zero: false,
+                },
+            }],
+            parity: vec![mb_core::ParityPlacementV2 {
+                holder: remotes[0].node_id(),
+                failure_domain: member(remotes[0].node_id()).failure_domain,
+                row: 0,
+            }],
+        };
+        let roots = vec![sector_root(&shards[0])];
+        let old = CodingAttemptPlan {
+            format_version: 2,
+            attempt_id: CodingAttemptPlan::initial_attempt_id(2, [72; 32], &geometry, &roots)
+                .unwrap(),
+            checkpoint_hash: [72; 32],
+            membership_epoch: 1,
+            geometry,
+            delegator: local_id,
+            coding_coordinator: remotes[1].node_id(),
+            verification_coordinator: remotes[2].node_id(),
+            expires_at_unix_seconds: unix_seconds() + 600,
+            information_roots: Some(roots),
+        };
+        let mut new = old.clone();
+        new.format_version = 3;
+        new.attempt_id = CodingAttemptPlan::initial_attempt_id(
+            3,
+            new.checkpoint_hash,
+            &new.geometry,
+            new.information_roots.as_ref().unwrap(),
+        )
+        .unwrap();
+        let signer = keys.iter().find(|key| key.node_id() == local_id).unwrap();
+        let old = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, old, signer).unwrap();
+        let new = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, new, signer).unwrap();
+        let old_transcript = test_coding_transcript(old.clone(), &shards, &keys);
+        let new_transcript = test_coding_transcript(new.clone(), &shards, &keys);
+        assert_ne!(old.value.attempt_id, new.value.attempt_id);
+        assert_ne!(
+            old_transcript.value.manifest.value.group.id,
+            new_transcript.value.manifest.value.group.id
+        );
+        let failure = SignedRecord::sign(
+            CODING_FAILURE_REPORT_DOMAIN,
+            CodingFailureReport {
+                format_version: 1,
+                failed_at_unix_seconds: unix_seconds(),
+                plan: old.clone(),
+                error_hash: [73; 32],
+            },
+            remotes[1],
+        )
+        .unwrap();
+        for (kind, bytes) in [
+            (
+                "coding-launch-job",
+                canonical_bytes(&CodingLaunchJob {
+                    format_version: 1,
+                    plan: old.clone(),
+                    dispatched: true,
+                    error: None,
+                })
+                .unwrap(),
+            ),
+            (
+                "coding-retry-job",
+                canonical_bytes(&CodingRetryJob {
+                    format_version: 1,
+                    failure: failure.clone(),
+                    retry_plan: None,
+                    complete: false,
+                    error: None,
+                })
+                .unwrap(),
+            ),
+            (
+                "coding-activation-job",
+                canonical_bytes(&CodingActivationJob {
+                    format_version: 1,
+                    transcript: old_transcript.clone(),
+                    complete: false,
+                    error: None,
+                })
+                .unwrap(),
+            ),
+        ] {
+            let dir = temp.path().join(kind);
+            let mut node = Node::open(&dir, seed.clone()).unwrap();
+            node.adopt_recovered_guild(certificate.clone(), peers.clone())
+                .unwrap();
+            node.control
+                .put_record(kind, &old.value.attempt_id, &bytes)
+                .unwrap();
+            drop(node);
+            let node = Node::open(&dir, seed.clone()).unwrap();
+            assert_eq!(node.enqueue_coding_launch(new.clone()).unwrap(), new);
+            assert_eq!(
+                node.control
+                    .get_record(kind, &old.value.attempt_id)
+                    .unwrap()
+                    .unwrap(),
+                bytes
+            );
+            assert_eq!(node.claim_coding_launch().unwrap().unwrap().plan, new);
+        }
+        let dir = temp.path().join("groups");
+        let volume = temp.path().join("volume");
+        std::fs::create_dir(&volume).unwrap();
+        let mut node = Node::open(&dir, seed.clone()).unwrap();
+        node.adopt_recovered_guild(certificate.clone(), peers.clone())
+            .unwrap();
+        node.configure_storage_volumes(std::slice::from_ref(&volume), 1024 * 1024, 0)
+            .unwrap();
+        node.configure_failure_domain(&member(local_id).failure_domain)
+            .unwrap();
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[74; 32]);
+        let mut revision = UserRevision {
+            format_version: 3,
+            guild_id: certificate.genesis.guild_id,
+            protected_root_id: Uuid::from_bytes([75; 16]),
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id: Uuid::from_bytes([76; 16]),
+            owner: local_id,
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![SectorRef {
+                id: [71; 32],
+                root: sector_root(&shards[0]),
+                logical_len: 64,
+            }],
+            data_sectors: Vec::new(),
+            sector_commitments: None,
+        };
+        revision.sign_writer(&writer).unwrap();
+        let checkpoint = GuildCheckpoint {
+            format_version: 4,
+            guild_id: certificate.genesis.guild_id,
+            genesis_hash: certificate.hash().unwrap(),
+            generation: 1,
+            parent: None,
+            members: peers.iter().map(|peer| peer.member.clone()).collect(),
+            writer_fences: vec![mb_core::WriterFence {
+                owner: local_id,
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            }],
+            revision_tombstones: Vec::new(),
+            revisions: vec![SignedRecord::sign(USER_REVISION_DOMAIN, revision, signer).unwrap()],
+            coding_groups: Vec::new(),
+            authority: None,
+            packing_catalog: None,
+        };
+        checkpoint.validate().unwrap();
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RotateWriterKey {
+                owner: local_id,
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            },
+        };
+        let mut signatures = keys
+            .iter()
+            .map(|key| sign_guild_event(&event, key).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        node.install_guild_event(QuorumGuildEvent { event, signatures })
+            .unwrap();
+        for transcript in [&old_transcript, &new_transcript] {
+            let plan = &transcript.value.plan;
+            if node.reserve_coding_information(plan, 0).unwrap() == 0 {
+                node.write_coding_information_range(plan, 0, 0, &shards[0])
+                    .unwrap();
+            }
+            node.finish_coding_information_upload(plan, 0).unwrap();
+            assert_eq!(
+                node.coding_information_range(plan, 0, 0, 1).unwrap(),
+                merkle_open_range(&shards[0], 0, 1).unwrap()
+            );
+            node.activate_coding_attempt(transcript).unwrap();
+            let state = node.dynamic_guild_state().unwrap().unwrap();
+            let event = GuildEvent {
+                format_version: 1,
+                guild_id: state.guild_id,
+                sequence: state.event_sequence + 1,
+                parent: state.event_head,
+                kind: mb_core::GuildEventKind::AddCodingGroup {
+                    group: transcript.value.manifest.value.group.clone(),
+                },
+            };
+            node.sign_coding_group_event_proposal(&event, transcript)
+                .unwrap();
+            let mut signatures = keys
+                .iter()
+                .map(|key| sign_guild_event(&event, key).unwrap())
+                .collect::<Vec<_>>();
+            signatures.sort_by_key(|signature| signature.signer);
+            node.install_coding_group_event(
+                QuorumGuildEvent { event, signatures },
+                transcript.clone(),
+            )
+            .unwrap();
+            if transcript.value.plan.value.format_version == 2 {
+                assert!(
+                    node.validate_variable_checkpoint_coverage(&checkpoint, false)
+                        .is_err()
+                );
+                node.validate_variable_checkpoint_coverage(&checkpoint, true)
+                    .unwrap();
+            } else {
+                node.validate_variable_checkpoint_coverage(&checkpoint, false)
+                    .unwrap();
+            }
+        }
+        drop(node);
+        let mut node = Node::open(&dir, seed).unwrap();
+        node.configure_storage_volumes(&[volume], 1024 * 1024, 0)
+            .unwrap();
+        assert_eq!(
+            node.dynamic_guild_state()
+                .unwrap()
+                .unwrap()
+                .coding_groups
+                .len(),
+            2
+        );
+        for transcript in [&old_transcript, &new_transcript] {
+            assert_eq!(
+                node.coding_transcript_for_group(
+                    certificate.genesis.guild_id,
+                    transcript.value.manifest.value.group.id
+                )
+                .unwrap(),
+                *transcript
+            );
+            assert_eq!(
+                node.variable_shard_for_guild(
+                    &certificate.genesis.guild_id,
+                    &transcript.value.manifest.value.group.id,
+                    0
+                )
+                .unwrap(),
+                shards[0]
+            );
+        }
+        assert!(
+            node.verified_variable_sector_coverage(
+                &node.dynamic_guild_state().unwrap().unwrap(),
+                local_id,
+                &SectorRef {
+                    id: [71; 32],
+                    root: sector_root(&shards[0]),
+                    logical_len: 64
+                },
+                None,
+                false,
+                true
+            )
+            .unwrap()
+        );
+        node.validate_variable_checkpoint_coverage(&checkpoint, false)
+            .unwrap();
+        node.sign_checkpoint(&checkpoint).unwrap();
+    }
+
     #[test]
     fn variable_coding_attempt_stages_opens_and_activates_after_replay() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -13772,7 +14209,7 @@ pub(crate) mod tests {
         }));
         let mut group = mb_core::CodingGroupV2 {
             id: [0; 32],
-            format_version: 2,
+            format_version: 3,
             guild_id: [181; 32],
             profile,
             roles,

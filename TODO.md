@@ -647,6 +647,10 @@ attempt/group evidence, and its raw-byte bound does not ensure it fits the
 CBOR peer transport. Milestone 5 remains open; Milestone 6 waits for these
 corrections and M5-97. This review ran no builds, tests, daemons, or runtime
 probes and used no remote compilation.
+The follow-up corrects M5-98 through M5-100 with distinct durable identities,
+authenticated READY input reuse, compact full-byte manifests, and encoded
+peer-frame budgets. Focused local migration, checkpoint, lifecycle, and
+transport regressions pass. M5-97 remains the final closure gate.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -2202,8 +2206,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   `c7cc6fd`; the complete gate has not yet passed on the final corrected tree.
   Source review of `e64f76e` found M5-98 through M5-100 below; correct these
   before running and recording the complete local closure gate.
+  M5-98 through M5-100 are now implemented and focused regressions pass; the
+  complete final workspace/provisioned acceptance gate remains pending.
 
-- [ ] **M5-98 / P1 — Give upgraded legacy attempts a distinct durable identity.**
+- [x] **M5-98 / P1 — Give upgraded legacy attempts a distinct durable identity.**
   `queue_variable_coding_lanes` now emits format-3 legacy plans but derives
   `attempt_id` from the same checkpoint, geometry, and information roots as
   the former format-2 plan, without including the plan version
@@ -2217,8 +2223,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   decoding behavior. Gate an installed format-2 launch, retry, and activation
   record against scheduling the same lane with format 3 after reopening the
   node; the stronger attempt must make progress without deleting old evidence.
+  Format-3 plans now use a separate deterministic hash context while compact
+  format-2 IDs remain byte-exact. A focused local restart regression installs
+  each old durable job kind, queues and claims the stronger attempt, and checks
+  that the original record is unchanged.
 
-- [ ] **M5-99 / P1 — Permit stronger evidence for an already certified legacy group.**
+- [x] **M5-99 / P1 — Permit stronger evidence for an already certified legacy group.**
   Even with a fresh attempt ID, `encode_coding_attempt` always emits a
   format-2 group with the same roles and commitments
   (`crates/mb-core/src/attempt.rs:715`–`:723`). The group's ID excludes the
@@ -2235,8 +2245,15 @@ node Clippy gate passed locally. No remote compilation server was used.
   evidence rejected. Gate a durable certified format-2 group, then a correct
   full-byte proof for the same bytes/placement through activation, event
   persistence, restart, successor checkpoint signing, and historical recovery.
+  New full-byte encoding emits group format 3, whose version participates in
+  its ID; compact plans remain restricted to group format 2. Historical full
+  proofs for format-2 groups still replay. READY information with matching
+  authenticated guild/commitment is reused without rewriting its old attempt
+  record. The focused local migration regression certifies both layouts,
+  reopens storage, reads both transcripts and inputs, validates historical
+  compact coverage, and signs a new checkpoint with the stronger proof.
 
-- [ ] **M5-100 / P2 — Bound full-byte manifests by encoded peer-frame size.**
+- [x] **M5-100 / P2 — Bound full-byte manifests by encoded peer-frame size.**
   Format-3 validation permits `k * shard_size` up to 512 KiB
   (`crates/mb-core/src/attempt.rs:250`–`:253`), claiming this fits a 600 KiB
   frame. The payload is ordinary nested `Vec<u8>` (`:293`), serialized by
@@ -2253,6 +2270,16 @@ node Clippy gate passed locally. No remote compilation server was used.
   at the largest accepted geometry through actual encoded staging, challenge,
   transcript, and event-tail envelopes on both peer transports; keep legacy
   manifest serialization compatible.
+  New manifest format 3 uses CBOR byte strings; formats 1–2 retain their
+  original layouts and remain readable. New attempt validation budgets
+  worst-case signed control envelopes, proofs, and certificates against both
+  encodings before staging. Parity range size uses the actual remaining frame
+  budget; full-byte staging uses these ranges. Event-tail responses return
+  the largest fitting prefix. The focused local transport regression uses
+  512 KiB of worst-case ciphertext and maximum-length domain claims, checks
+  staging/challenge/transcript/certification envelopes with the CBOR codec and
+  Postcard, verifies historical layout compatibility, and rejects a dense
+  raw-size-valid plan whose control evidence cannot fit its containing frames.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

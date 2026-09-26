@@ -70,6 +70,7 @@ pub use tor::{
     onion_address_matches_node, onion_address_matches_peer, onion_listener_address,
     wait_for_onion_service_shutdown,
 };
+pub(crate) use wire::validate_root_binding_frame_budget;
 use wire::*;
 
 pub(super) const MAX_PEER_FRAME_BYTES: usize = 600 * 1024;
@@ -1050,7 +1051,7 @@ fn execute_read_request(
             base_sequence,
             base_head,
         } => Ok(PeerResponse::GuildEventTail(Box::new(
-            node.guild_event_tail(base_sequence, base_head)?,
+            bound_peer_event_tail(node.guild_event_tail(base_sequence, base_head)?)?,
         ))),
         PeerRequest::GetCodingTranscript { guild_id, group_id } => {
             Ok(PeerResponse::CodingVerificationTranscript(Box::new(

@@ -580,6 +580,302 @@ pub(super) struct PeerResponseEnvelope {
     pub(super) result: Result<PeerResponse, WireError>,
 }
 
+fn budget_signed<T>(value: T) -> SignedRecord<T> {
+    SignedRecord {
+        signer: NodeId([255; 32]),
+        value,
+        signature: vec![255; 64],
+    }
+}
+
+fn budget_request(request: PeerRequest) -> SignedRecord<PeerRequestEnvelope> {
+    budget_signed(PeerRequestEnvelope {
+        format_version: PEER_WIRE_FORMAT_VERSION,
+        request_id: [255; 16],
+        caller: NodeId([255; 32]),
+        recipient: Some(NodeId([255; 32])),
+        guild_scope: Some([255; 32]),
+        issued_at_unix_seconds: u64::MAX,
+        expires_at_unix_seconds: u64::MAX,
+        request,
+    })
+}
+
+fn budget_response(response: PeerResponse) -> SignedRecord<PeerResponseEnvelope> {
+    budget_signed(PeerResponseEnvelope {
+        format_version: PEER_WIRE_FORMAT_VERSION,
+        request_id: [255; 16],
+        recipient: NodeId([255; 32]),
+        request_hash: [255; 32],
+        result: Ok(response),
+    })
+}
+
+fn frame_sizes<T: Serialize>(value: &T) -> anyhow::Result<(usize, usize)> {
+    Ok((
+        mb_core::canonical_bytes(value)?.len(),
+        cbor4ii::serde::to_vec(Vec::new(), value)
+            .map_err(|error| anyhow::anyhow!("CBOR frame accounting failed: {error}"))?
+            .len(),
+    ))
+}
+
+/// A u8 sequence uses at most two CBOR bytes per element. Include the largest
+/// signed envelope and reserve length-prefix growth before choosing a range.
+pub(super) fn coding_parity_range_bytes(
+    plan: &SignedRecord<CodingAttemptPlan>,
+    manifest: &SignedRecord<CodingRootManifest>,
+) -> anyhow::Result<usize> {
+    let (tcp, cbor) = frame_sizes(&budget_request(PeerRequest::UploadCodingParityRange {
+        plan: Box::new(plan.clone()),
+        manifest: Box::new(manifest.clone()),
+        shard_index: u16::MAX,
+        offset: u32::MAX,
+        bytes: Vec::new(),
+    }))?;
+    let limit = super::MAX_PEER_FRAME_BYTES;
+    let bytes = limit
+        .saturating_sub(tcp.saturating_add(8))
+        .min(limit.saturating_sub(cbor.saturating_add(8)) / 2)
+        .min(256 * 1024);
+    if bytes < mb_core::MERKLE_LEAF_SIZE {
+        anyhow::bail!("coding evidence leaves no peer-frame space for a parity range");
+    }
+    Ok(bytes)
+}
+
+/// Verify the worst serialized control evidence before accepting new flat-root
+/// work. Empty byte strings stand in for the witness: add its known byte count
+/// and conservative length-prefix growth without allocating ciphertext here.
+pub(crate) fn validate_root_binding_frame_budget(
+    plan: &CodingAttemptPlan,
+    member_count: usize,
+) -> anyhow::Result<()> {
+    if plan.format_version != 3 {
+        return Ok(());
+    }
+    use mb_core::{CodingGroupV2, MERKLE_LEAF_SIZE, ParityRoleV2, ShardRoleV2};
+    let profile = plan.geometry.profile;
+    let mut plan = plan.clone();
+    plan.attempt_id = [255; 16];
+    plan.checkpoint_hash = [255; 32];
+    plan.membership_epoch = u64::MAX;
+    plan.expires_at_unix_seconds = u64::MAX;
+    plan.delegator = NodeId([255; 32]);
+    plan.coding_coordinator = NodeId([255; 32]);
+    plan.verification_coordinator = NodeId([255; 32]);
+    for info in &mut plan.geometry.information {
+        info.owner = NodeId([255; 32]);
+        info.sector.id = [255; 32];
+        info.sector.commitment.root = [255; 32];
+    }
+    for parity in &mut plan.geometry.parity {
+        parity.holder = NodeId([255; 32]);
+    }
+    plan.information_roots = Some(vec![[255; 32]; usize::from(profile.data_shards)]);
+    let mut roles = plan
+        .geometry
+        .information
+        .iter()
+        .cloned()
+        .map(ShardRoleV2::Information)
+        .collect::<Vec<_>>();
+    let commitment = MerkleCommitment {
+        format_version: 1,
+        leaf_size: MERKLE_LEAF_SIZE as u16,
+        byte_len: profile.shard_size,
+        root: [255; 32],
+    };
+    roles.extend(plan.geometry.parity.iter().map(|parity| {
+        ShardRoleV2::Parity(ParityRoleV2 {
+            holder: parity.holder,
+            failure_domain: parity.failure_domain.clone(),
+            row: parity.row,
+            commitment: commitment.clone(),
+        })
+    }));
+    let group = CodingGroupV2 {
+        id: [255; 32],
+        format_version: 3,
+        guild_id: [255; 32],
+        profile,
+        roles,
+    };
+    let information_bytes = plan
+        .geometry
+        .information
+        .iter()
+        .map(|info| (!info.sector.virtual_zero).then(Vec::new))
+        .collect::<Vec<_>>();
+    let witness = information_bytes
+        .iter()
+        .filter(|bytes| bytes.is_some())
+        .count()
+        * (profile.shard_size as usize + 8);
+    let manifest = budget_signed(CodingRootManifest {
+        format_version: 3,
+        attempt_id: [255; 16],
+        plan_hash: [255; 32],
+        group,
+        information_bytes: Some(information_bytes),
+    });
+    let plan = budget_signed(plan);
+    let receipts = manifest
+        .value
+        .group
+        .roles
+        .iter()
+        .enumerate()
+        .filter_map(|(index, role)| {
+            let ShardRoleV2::Parity(parity) = role else {
+                return None;
+            };
+            Some(budget_signed(StagedStorageReceipt {
+                format_version: 1,
+                attempt_id: [255; 16],
+                plan_hash: [255; 32],
+                guild_id: [255; 32],
+                group_id: [255; 32],
+                shard_index: index as u16,
+                holder: parity.holder,
+                commitment: parity.commitment.clone(),
+            }))
+        })
+        .collect::<Vec<_>>();
+    let openings = manifest
+        .value
+        .group
+        .roles
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            budget_signed(CodingShardOpening {
+                format_version: 1,
+                attempt_id: [255; 16],
+                plan_hash: [255; 32],
+                verifier: NodeId([255; 32]),
+                challenge: [255; 32],
+                shard_index: index as u16,
+                commitment: commitment.clone(),
+                proof: MerkleRangeProof {
+                    format_version: 1,
+                    start_leaf: u32::MAX,
+                    leaves: vec![[255; MERKLE_LEAF_SIZE]],
+                    siblings: vec![
+                        [255; 32];
+                        (profile.shard_size as usize / MERKLE_LEAF_SIZE).ilog2() as usize
+                    ],
+                },
+            })
+        })
+        .collect();
+    let transcript = budget_signed(CodingVerificationTranscript {
+        format_version: 1,
+        verified_at_unix_seconds: u64::MAX,
+        plan: plan.clone(),
+        manifest: manifest.clone(),
+        challenge_commitment: budget_signed(CodingChallengeCommitment {
+            format_version: 1,
+            attempt_id: [255; 16],
+            plan_hash: [255; 32],
+            commitment: [255; 32],
+        }),
+        staged_receipts: receipts.clone(),
+        challenge_reveal: budget_signed(CodingChallengeReveal {
+            format_version: 1,
+            attempt_id: [255; 16],
+            plan_hash: [255; 32],
+            nonce: [255; 32],
+            evidence_hash: [255; 32],
+        }),
+        openings,
+    });
+    let event = GuildEvent {
+        format_version: 1,
+        guild_id: [255; 32],
+        sequence: u64::MAX,
+        parent: [255; 32],
+        kind: mb_core::GuildEventKind::AddCodingGroup {
+            group: manifest.value.group.clone(),
+        },
+    };
+    for request in [
+        PeerRequest::UploadCodingParityRange {
+            plan: Box::new(plan.clone()),
+            manifest: Box::new(manifest.clone()),
+            shard_index: u16::MAX,
+            offset: u32::MAX,
+            bytes: vec![255; MERKLE_LEAF_SIZE],
+        },
+        PeerRequest::RevealCodingChallenge {
+            plan: Box::new(plan.clone()),
+            manifest: Box::new(manifest.clone()),
+            receipts,
+        },
+        PeerRequest::SubmitCodingTranscript {
+            transcript: Box::new(transcript.clone()),
+        },
+        PeerRequest::ActivateCodingParity {
+            transcript: Box::new(transcript.clone()),
+        },
+        PeerRequest::FinalizeCodingVerification {
+            transcript: Box::new(transcript.value.clone()),
+        },
+        PeerRequest::SignCodingGroupEvent {
+            event: Box::new(event.clone()),
+            transcript: Box::new(transcript.clone()),
+        },
+        PeerRequest::InstallCodingGroupEvent {
+            certified: Box::new(QuorumGuildEvent {
+                event,
+                signatures: vec![
+                    MemberSignature {
+                        signer: NodeId([255; 32]),
+                        signature: vec![255; 64]
+                    };
+                    member_count
+                ],
+            }),
+            transcript: Box::new(transcript.clone()),
+        },
+    ] {
+        let (tcp, cbor) = frame_sizes(&budget_request(request))?;
+        if tcp.max(cbor).saturating_add(witness) > super::MAX_PEER_FRAME_BYTES {
+            anyhow::bail!("full-byte coding evidence exceeds a containing peer frame");
+        }
+    }
+    let (tcp, cbor) = frame_sizes(&budget_response(
+        PeerResponse::CodingVerificationTranscript(Box::new(transcript)),
+    ))?;
+    if tcp.max(cbor).saturating_add(witness) > super::MAX_PEER_FRAME_BYTES {
+        anyhow::bail!("full-byte coding transcript exceeds the peer response frame");
+    }
+    Ok(())
+}
+
+pub(super) fn bound_peer_event_tail(mut tail: GuildEventTail) -> anyhow::Result<GuildEventTail> {
+    let mut low = 0;
+    let mut high = tail.events.len();
+    while low < high {
+        let count = low + (high - low).div_ceil(2);
+        let mut prefix = tail.clone();
+        prefix.events.truncate(count);
+        let (tcp, cbor) = frame_sizes(&budget_response(PeerResponse::GuildEventTail(Box::new(
+            prefix,
+        ))))?;
+        if tcp.max(cbor) <= super::MAX_PEER_FRAME_BYTES {
+            low = count;
+        } else {
+            high = count - 1;
+        }
+    }
+    if low == 0 && !tail.events.is_empty() {
+        anyhow::bail!("one guild event exceeds a peer response frame");
+    }
+    tail.events.truncate(low);
+    Ok(tail)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct CachedOperation {
     pub(super) request_hash: [u8; 32],
@@ -607,6 +903,249 @@ mod tests {
         include_str!("../../../../protocol/vectors/storage-acknowledgement.postcard.hex");
     const RECOVERY_LOCATOR: &str =
         include_str!("../../../../protocol/vectors/recovery-locator.postcard.hex");
+
+    #[tokio::test]
+    async fn full_byte_proof_frames_fit_both_transports_and_keep_old_layouts() {
+        use libp2p::request_response::Codec;
+        use mb_core::{
+            CODING_ATTEMPT_PLAN_DOMAIN, CodingPlanGeometry, CodingProfile, InformationRoleV2,
+            ParityPlacementV2, RangeSectorRef,
+        };
+        let keys = (0_u8..6)
+            .map(|i| KeyMaterial::from_seed(&Seed::from_bytes([90 + i; 32])))
+            .collect::<Vec<_>>();
+        let profile = CodingProfile::new(4, 2, 128 * 1024);
+        let shards = mb_core::encode(profile, vec![vec![255; 128 * 1024]; 4]).unwrap();
+        let domain = |i| format!("{i:03}{}", "x".repeat(253));
+        let plan = CodingAttemptPlan {
+            format_version: 3,
+            attempt_id: [1; 16],
+            checkpoint_hash: [2; 32],
+            membership_epoch: 1,
+            geometry: CodingPlanGeometry {
+                format_version: 1,
+                guild_id: [3; 32],
+                profile,
+                information: (0..4)
+                    .map(|i| InformationRoleV2 {
+                        owner: keys[i].node_id(),
+                        failure_domain: domain(i),
+                        sector: RangeSectorRef {
+                            id: [i as u8 + 1; 32],
+                            commitment: mb_core::merkle_commit(&shards[i]).unwrap(),
+                            logical_len: profile.shard_size,
+                            virtual_zero: false,
+                        },
+                    })
+                    .collect(),
+                parity: (0..2)
+                    .map(|i| ParityPlacementV2 {
+                        holder: keys[4 + i].node_id(),
+                        failure_domain: domain(4 + i),
+                        row: i as u16,
+                    })
+                    .collect(),
+            },
+            delegator: keys[0].node_id(),
+            coding_coordinator: keys[1].node_id(),
+            verification_coordinator: keys[2].node_id(),
+            expires_at_unix_seconds: u64::MAX,
+            information_roots: Some(
+                shards[..4]
+                    .iter()
+                    .map(|bytes| mb_core::sector_root(bytes))
+                    .collect(),
+            ),
+        };
+        plan.validate().unwrap();
+        validate_root_binding_frame_budget(&plan, 256).unwrap();
+        let signed_plan =
+            SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan.clone(), &keys[0]).unwrap();
+        let transcript =
+            crate::node::tests::test_coding_transcript(signed_plan.clone(), &shards, &keys);
+        let manifest = transcript.value.manifest.clone();
+        let mut legacy = manifest.value.clone();
+        legacy.format_version = 2;
+        #[derive(Serialize)]
+        struct LegacyFullManifest<'a> {
+            format_version: u16,
+            attempt_id: [u8; 16],
+            plan_hash: [u8; 32],
+            group: &'a mb_core::CodingGroupV2,
+            information_bytes: &'a Vec<Option<Vec<u8>>>,
+        }
+        let layout = LegacyFullManifest {
+            format_version: 2,
+            attempt_id: legacy.attempt_id,
+            plan_hash: legacy.plan_hash,
+            group: &legacy.group,
+            information_bytes: legacy.information_bytes.as_ref().unwrap(),
+        };
+        let legacy_cbor = cbor4ii::serde::to_vec(Vec::new(), &layout).unwrap();
+        assert!(legacy_cbor.len() > super::super::MAX_PEER_FRAME_BYTES);
+        assert_eq!(
+            mb_core::canonical_bytes(&layout).unwrap(),
+            mb_core::canonical_bytes(&legacy).unwrap()
+        );
+        assert_eq!(
+            cbor4ii::serde::to_vec(Vec::new(), &legacy).unwrap(),
+            legacy_cbor
+        );
+        assert_eq!(
+            cbor4ii::serde::from_slice::<CodingRootManifest>(&legacy_cbor).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            mb_core::decode_canonical::<CodingRootManifest>(
+                &mb_core::canonical_bytes(&legacy).unwrap()
+            )
+            .unwrap(),
+            legacy
+        );
+        let range_bytes = coding_parity_range_bytes(&signed_plan, &manifest).unwrap();
+        assert!(range_bytes < profile.shard_size as usize);
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: plan.geometry.guild_id,
+            sequence: 1,
+            parent: [4; 32],
+            kind: mb_core::GuildEventKind::AddCodingGroup {
+                group: manifest.value.group.clone(),
+            },
+        };
+        let certified = QuorumGuildEvent {
+            event: event.clone(),
+            signatures: keys
+                .iter()
+                .map(|key| mb_core::sign_guild_event(&event, key).unwrap())
+                .collect(),
+        };
+        let requests = vec![
+            PeerRequest::UploadCodingParityRange {
+                plan: Box::new(signed_plan.clone()),
+                manifest: Box::new(manifest.clone()),
+                shard_index: 4,
+                offset: u32::MAX,
+                bytes: vec![255; range_bytes],
+            },
+            PeerRequest::FinalizeCodingParity {
+                plan: Box::new(signed_plan.clone()),
+                manifest: Box::new(manifest.clone()),
+                shard_index: 4,
+            },
+            PeerRequest::RevealCodingChallenge {
+                plan: Box::new(signed_plan.clone()),
+                manifest: Box::new(manifest.clone()),
+                receipts: transcript.value.staged_receipts.clone(),
+            },
+            PeerRequest::GetCodingOpening {
+                plan: Box::new(signed_plan.clone()),
+                manifest: Box::new(manifest.clone()),
+                challenge: [255; 32],
+                shard_index: 4,
+            },
+            PeerRequest::FinalizeCodingVerification {
+                transcript: Box::new(transcript.value.clone()),
+            },
+            PeerRequest::SubmitCodingTranscript {
+                transcript: Box::new(transcript.clone()),
+            },
+            PeerRequest::ActivateCodingParity {
+                transcript: Box::new(transcript.clone()),
+            },
+            PeerRequest::SignCodingGroupEvent {
+                event: Box::new(event.clone()),
+                transcript: Box::new(transcript.clone()),
+            },
+            PeerRequest::InstallCodingGroupEvent {
+                certified: Box::new(certified.clone()),
+                transcript: Box::new(transcript.clone()),
+            },
+        ];
+        let mut codec = libp2p::request_response::cbor::codec::Codec::<
+            SignedRecord<PeerRequestEnvelope>,
+            SignedRecord<PeerResponseEnvelope>,
+        >::default()
+        .set_request_size_maximum(super::super::MAX_PEER_FRAME_BYTES as u64)
+        .set_response_size_maximum(super::super::MAX_PEER_FRAME_BYTES as u64);
+        let protocol = libp2p::StreamProtocol::new("/mutualbackup/peer/2");
+        for request in requests {
+            let request = budget_request(request);
+            let (tcp, cbor) = frame_sizes(&request).unwrap();
+            assert!(tcp.max(cbor) <= super::super::MAX_PEER_FRAME_BYTES);
+            let canonical = mb_core::canonical_bytes(&request).unwrap();
+            mb_core::decode_canonical::<SignedRecord<PeerRequestEnvelope>>(&canonical).unwrap();
+            let mut cursor = futures::io::Cursor::new(Vec::new());
+            codec
+                .write_request(&protocol, &mut cursor, request)
+                .await
+                .unwrap();
+            cursor.set_position(0);
+            let decoded = codec.read_request(&protocol, &mut cursor).await.unwrap();
+            if let PeerRequest::SubmitCodingTranscript {
+                transcript: decoded,
+            } = decoded.value.request
+            {
+                assert_eq!(*decoded, transcript);
+                assert_eq!(
+                    mb_core::replay_coding_transcript(&decoded).unwrap(),
+                    mb_core::CodingReplayFinding::Verified
+                );
+            }
+        }
+        let tail = GuildEventTail {
+            format_version: 1,
+            base_sequence: 0,
+            base_head: [4; 32],
+            events: vec![certified; 512],
+        };
+        let bounded = bound_peer_event_tail(tail.clone()).unwrap();
+        assert!(!bounded.events.is_empty() && bounded.events.len() < tail.events.len());
+        assert_eq!(bounded.events, tail.events[..bounded.events.len()]);
+        for response in [
+            PeerResponse::CodingVerificationTranscript(Box::new(transcript)),
+            PeerResponse::GuildEventTail(Box::new(bounded)),
+        ] {
+            let response = budget_response(response);
+            let (tcp, cbor) = frame_sizes(&response).unwrap();
+            assert!(tcp.max(cbor) <= super::super::MAX_PEER_FRAME_BYTES);
+            mb_core::decode_canonical::<SignedRecord<PeerResponseEnvelope>>(
+                &mb_core::canonical_bytes(&response).unwrap(),
+            )
+            .unwrap();
+            let mut cursor = futures::io::Cursor::new(Vec::new());
+            codec
+                .write_response(&protocol, &mut cursor, response)
+                .await
+                .unwrap();
+            cursor.set_position(0);
+            codec.read_response(&protocol, &mut cursor).await.unwrap();
+        }
+        // Raw size alone fits, but dense roles/proofs and a large certificate
+        // do not. Reject new work before staging, while core replay stays able
+        // to decode historical evidence independent of current transport limits.
+        let mut dense = plan;
+        dense.geometry.profile = CodingProfile::new(32, 32, 16 * 1024);
+        dense.geometry.information = (0..32)
+            .map(|i| {
+                let mut info = dense.geometry.information[0].clone();
+                info.sector.commitment.byte_len = 16 * 1024;
+                info.sector.logical_len = 16 * 1024;
+                info.failure_domain = domain(i);
+                info
+            })
+            .collect();
+        dense.geometry.parity = (0..32)
+            .map(|i| ParityPlacementV2 {
+                holder: keys[4].node_id(),
+                failure_domain: domain(32 + i),
+                row: i as u16,
+            })
+            .collect();
+        dense.information_roots = Some(vec![[1; 32]; 32]);
+        dense.validate().unwrap();
+        assert!(validate_root_binding_frame_budget(&dense, 256).is_err());
+    }
 
     fn profile_request(format_version: u16) -> SignedRecord<PeerRequestEnvelope> {
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([7; 32]));

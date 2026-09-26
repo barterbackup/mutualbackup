@@ -272,6 +272,8 @@ pub enum ShardRoleV2 {
 
 /// An explicit variable-geometry layout. The descriptor records every coding
 /// parameter and placement-domain claim needed to decode it in the future.
+/// Version three reserves a distinct identity for newly encoded full-byte
+/// flat-root proofs; version two retains historical and compact packed groups.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CodingGroupV2 {
     pub id: CodingGroupId,
@@ -293,7 +295,7 @@ impl CodingGroupV2 {
 
     pub fn validate(&self) -> Result<(), ModelError> {
         self.profile.validate()?;
-        if self.format_version != 2
+        if !matches!(self.format_version, 2 | 3)
             || self.guild_id == [0; 32]
             || self.roles.len() != self.profile.total_shards()?
             || self.calculate_id()? != self.id

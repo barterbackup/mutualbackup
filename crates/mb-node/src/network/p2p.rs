@@ -34,18 +34,18 @@ use mb_core::{
     CodingShardOpening, CodingVerificationTranscript, DynamicGuildState, GuildCheckpoint,
     GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, InformationRoleV2,
     LEGACY_PACKING_ATTESTATION_DOMAIN, LEGACY_PACKING_BINDING_DOMAIN, LegacyPackingAttestation,
-    LegacyPackingBinding, MAX_GUILD_EVENT_TAIL, MERKLE_LEAF_SIZE, Member, MemberSignature,
-    MerkleCommitment, NodeId, PackedCatalog, PackedSector, PackedSectorDescriptor, PackingInput,
-    PackingProfile, ParityPlacementV2, QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis,
-    QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN, RangeSectorRef,
-    STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole,
-    ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement, UserRevision,
-    V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS,
-    V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_SECTOR_SIZE,
-    attach_legacy_packing_bindings, attach_legacy_packing_evidence, canonical_bytes,
-    coding_challenge, coding_transfer_estimate, decode_canonical, merkle_commit,
-    merkle_zero_commitment, pack_incremental, pack_incremental_authenticated,
-    packing_protected_root, replay_coding_transcript, sector_root, unpack_object_from_sectors,
+    LegacyPackingBinding, MERKLE_LEAF_SIZE, Member, MemberSignature, MerkleCommitment, NodeId,
+    PackedCatalog, PackedSector, PackedSectorDescriptor, PackingInput, PackingProfile,
+    ParityPlacementV2, QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy,
+    QuorumRule, RECOVERY_LOCATOR_DOMAIN, RangeSectorRef, STAGED_STORAGE_RECEIPT_DOMAIN,
+    STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole, ShardRoleV2, SignedRecord,
+    StagedStorageReceipt, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
+    V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES,
+    V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_SECTOR_SIZE, attach_legacy_packing_bindings,
+    attach_legacy_packing_evidence, canonical_bytes, coding_challenge, coding_transfer_estimate,
+    decode_canonical, merkle_commit, merkle_zero_commitment, pack_incremental,
+    pack_incremental_authenticated, packing_protected_root, replay_coding_transcript, sector_root,
+    unpack_object_from_sectors,
 };
 #[cfg(test)]
 use mb_core::{ParityRoleV2, encode};
@@ -66,8 +66,8 @@ use super::{
     BackupDescriptor, BackupJob, CheckpointObjectKind, CodingPathClass, CodingPathObservation,
     DhtSequenceFloors, GuildPeer, MAX_PEER_FRAME_BYTES, Node, NodeServerConfig, NodeService,
     PEER_RESPONSE_DOMAIN, PeerRequest, PeerRequestEnvelope, PeerResponse, PeerResponseEnvelope,
-    checked_catalog_page_count, make_peer_request, peer_error_response, process_peer_request,
-    storage_operation_id, validate_coding_path_targets,
+    checked_catalog_page_count, coding_parity_range_bytes, make_peer_request, peer_error_response,
+    process_peer_request, storage_operation_id, validate_coding_path_targets,
 };
 use super::{
     TorMode, TorTransport, is_onion_address, onion_address_matches_node, onion_address_matches_peer,
@@ -2447,6 +2447,46 @@ impl P2pClient {
         let expected_group = manifest.value.group.id;
         let expected_index = object.shard_index;
         let expected_commitment = object.commitment.clone();
+        // Full-byte manifests already carry substantial control evidence.
+        // Send parity through the existing resumable range protocol so no
+        // request also has to carry a complete parity shard.
+        if plan.value.format_version == 3 {
+            manifest.value.validate_for_plan(&plan.value)?;
+            let Some(ShardRoleV2::Parity(parity)) =
+                manifest.value.group.roles.get(usize::from(expected_index))
+            else {
+                bail!("parity staging object is not assigned to a parity role");
+            };
+            if object.format_version != 2
+                || object.group_id != expected_group
+                || object.guild_id != manifest.value.group.guild_id
+                || parity.holder != peer
+                || parity.commitment != expected_commitment
+                || merkle_commit(&object.bytes)? != expected_commitment
+            {
+                bail!("parity staging object conflicts with its full-byte manifest");
+            }
+            let range_bytes = coding_parity_range_bytes(&plan, &manifest)?;
+            let mut offset = self
+                .reserve_coding_parity(peer, plan.clone(), expected_index)
+                .await? as usize;
+            while offset < object.bytes.len() {
+                let end = offset.saturating_add(range_bytes).min(object.bytes.len());
+                offset = self
+                    .upload_coding_parity_range(
+                        peer,
+                        plan.clone(),
+                        manifest.clone(),
+                        expected_index,
+                        offset as u32,
+                        object.bytes[offset..end].to_vec(),
+                    )
+                    .await? as usize;
+            }
+            return self
+                .finalize_coding_parity(peer, plan, manifest, expected_index)
+                .await;
+        }
         let response = self
             .call(
                 peer,
@@ -6648,6 +6688,7 @@ async fn execute_delegated_coding(
     })
     .await?;
 
+    let parity_range_bytes = coding_parity_range_bytes(&plan, &manifest)?;
     let mut receipts = Vec::with_capacity(parity.len());
     for (offset, bytes) in parity.into_iter().enumerate() {
         let index = parity_start + offset;
@@ -6657,7 +6698,7 @@ async fn execute_delegated_coding(
         let mut written_until = output_progress[offset] as usize;
         while written_until < bytes.len() {
             let end = written_until
-                .saturating_add(CODING_INPUT_RANGE_BYTES)
+                .saturating_add(parity_range_bytes)
                 .min(bytes.len());
             let chunk = bytes[written_until..end].to_vec();
             let next = if role.holder == local_id {
@@ -9166,7 +9207,9 @@ async fn fetch_recovery_guild_history(
         if events.len() > 1_000_000 {
             bail!("guild event history exceeds the recovery bound");
         }
-        if count < MAX_GUILD_EVENT_TAIL {
+        // A byte-bounded page can contain fewer than the event-count limit
+        // without reaching the durable head. Only an empty page ends history.
+        if count == 0 {
             break;
         }
     }
@@ -10839,6 +10882,7 @@ async fn recover_variable_group_plan(
     Ok(proven.authenticated)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn recover_variable_plan(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
@@ -12355,25 +12399,20 @@ async fn queue_variable_coding_lanes(
                 &verifier_path_ranks,
             )?
         };
-        let mut hasher = blake3::Hasher::new_derive_key("mutualbackup initial coding attempt v1");
-        hasher.update(&checkpoint_hash);
-        hasher.update(&canonical_bytes(&(
+        let format_version = if !is_packed_lane || requires_flat_binding {
+            3
+        } else {
+            2
+        };
+        let attempt_id = CodingAttemptPlan::initial_attempt_id(
+            format_version,
+            checkpoint_hash,
             &lane.geometry,
             &lane.information_roots,
-        ))?);
-        let mut attempt_id: [u8; 16] = hasher.finalize().as_bytes()[..16]
-            .try_into()
-            .expect("fixed digest prefix");
-        if attempt_id == [0; 16] {
-            attempt_id[0] = 1;
-        }
+        )?;
         let plan = node_blocking(node.clone(), move |node| {
             node.sign_coding_attempt_plan(CodingAttemptPlan {
-                format_version: if !is_packed_lane || requires_flat_binding {
-                    3
-                } else {
-                    2
-                },
+                format_version,
                 attempt_id,
                 checkpoint_hash,
                 membership_epoch,
@@ -15058,6 +15097,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_history_continues_after_short_byte_bounded_pages() {
+        let keys = (0_u8..5)
+            .map(|i| KeyMaterial::from_seed(&Seed::from_bytes([31 + i; 32])))
+            .collect::<Vec<_>>();
+        let mut members = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| Member {
+                node_id: key.node_id(),
+                recovery_public_key: key.recovery_public_key(),
+                failure_domain: format!("history-{i}"),
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| member.node_id);
+        let genesis = GuildGenesis {
+            format_version: 1,
+            guild_id: [33; 32],
+            coordinator: members[0].node_id,
+            members,
+        };
+        let mut signatures = keys
+            .iter()
+            .map(|key| genesis.member_signature(key).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        let genesis = QuorumGuildGenesis {
+            genesis,
+            signatures,
+        };
+        let mut state = DynamicGuildState::new(
+            genesis.genesis.guild_id,
+            genesis.hash().unwrap(),
+            QuorumPolicy {
+                format_version: 1,
+                rule: QuorumRule::Unanimous,
+            },
+            genesis.genesis.members.clone(),
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        let mut heads = vec![state.event_head];
+        for epoch in 1..=3 {
+            let event = GuildEvent {
+                format_version: 1,
+                guild_id: state.guild_id,
+                sequence: state.event_sequence + 1,
+                parent: state.event_head,
+                kind: mb_core::GuildEventKind::RotateWriterKey {
+                    owner: keys[0].node_id(),
+                    epoch,
+                    public_key: ed25519_dalek::SigningKey::from_bytes(&[epoch as u8; 32])
+                        .verifying_key()
+                        .to_bytes(),
+                },
+            };
+            let mut signatures = keys
+                .iter()
+                .map(|key| mb_core::sign_guild_event(&event, key).unwrap())
+                .collect::<Vec<_>>();
+            signatures.sort_by_key(|signature| signature.signer);
+            let certified = QuorumGuildEvent { event, signatures };
+            state.apply_event(&certified).unwrap();
+            heads.push(state.event_head);
+            events.push(certified);
+        }
+        let expected = events.clone();
+        let (commands, mut rx) = mpsc::channel(4);
+        let (request_cancellations, _cancel_rx) = mpsc::unbounded_channel();
+        let (_port, port_mapping_listener_state) =
+            watch::channel(PortMappingListenerState::Pending);
+        let p2p = P2pClient {
+            local_peer_id: keys[0].node_id().libp2p_peer_id().unwrap(),
+            commands,
+            request_cancellations,
+            outbound_permits: Arc::new(Semaphore::new(4)),
+            cold_recovery_permit: Arc::new(Semaphore::new(1)),
+            port_mapping_listener_state,
+        };
+        let worker = tokio::spawn(async move {
+            let mut requests = 0;
+            while let Some(Command::Request {
+                request, response, ..
+            }) = rx.recv().await
+            {
+                let PeerRequest::GetGuildEventTail {
+                    base_sequence,
+                    base_head,
+                    ..
+                } = *request
+                else {
+                    panic!("unexpected history request")
+                };
+                assert_eq!(base_head, heads[base_sequence as usize]);
+                let page = events
+                    .get(base_sequence as usize)
+                    .cloned()
+                    .into_iter()
+                    .collect();
+                response
+                    .send(Ok(PeerResponse::GuildEventTail(Box::new(GuildEventTail {
+                        format_version: 1,
+                        base_sequence,
+                        base_head,
+                        events: page,
+                    }))))
+                    .unwrap();
+                requests += 1;
+            }
+            requests
+        });
+        let (recovered, history) = fetch_recovery_guild_history(&p2p, keys[1].node_id(), &genesis)
+            .await
+            .unwrap();
+        assert_eq!(recovered, state);
+        assert_eq!(history, expected);
+        drop(p2p);
+        assert_eq!(worker.await.unwrap(), 4);
+    }
+
+    #[tokio::test]
     async fn event_tail_selection_keeps_slow_advancing_requests_bounded() {
         type TailRequest =
             Pin<Box<dyn Future<Output = (NodeId, Result<GuildEventTail>)> + Send + 'static>>;
@@ -17540,7 +17699,10 @@ mod tests {
             .collect::<Vec<_>>();
         let lane = variable_coding_lane(guild_id, Uuid::from_bytes([238; 16]), 0, &sources, &peers)
             .unwrap();
-        let group = materialize_variable_lane(&lane, &bytes);
+        let legacy_group = materialize_variable_lane(&lane, &bytes);
+        let mut group = legacy_group.clone();
+        group.format_version = 3;
+        group.id = group.calculate_id().unwrap();
         assert_eq!(group.profile.data_shards, 2);
         let shards = encode(group.profile, bytes.to_vec()).unwrap();
         let local_target = group
@@ -17566,12 +17728,15 @@ mod tests {
                 activated_at_event: 1,
                 revoked_at_event: None,
             }],
-            coding_groups: vec![mb_core::RetainedCodingGroup {
-                group: group.clone(),
-                added_at_event: 1,
-                retired_at_event: None,
-                retain_through_event: None,
-            }],
+            coding_groups: [group.clone(), legacy_group.clone()]
+                .into_iter()
+                .map(|group| mb_core::RetainedCodingGroup {
+                    group,
+                    added_at_event: 1,
+                    retired_at_event: None,
+                    retain_through_event: None,
+                })
+                .collect(),
             ..DynamicGuildState::new(
                 guild_id,
                 genesis_hash,
@@ -17749,7 +17914,7 @@ mod tests {
         );
         for (ordinal, rootless) in [(2, false), (3, true)] {
             let claimed = signed_replacement_transcript(
-                &group,
+                &legacy_group,
                 &shards,
                 &signing_keys,
                 checkpoint_hash,
@@ -17793,7 +17958,7 @@ mod tests {
         );
         for (ordinal, rootless) in [(5, false), (6, true)] {
             let claimed = signed_replacement_transcript(
-                &group,
+                &legacy_group,
                 &shards,
                 &signing_keys,
                 retained_hash,
