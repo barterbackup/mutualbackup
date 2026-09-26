@@ -315,6 +315,12 @@ pub(super) enum PeerRequest {
         guild_id: [u8; 32],
         generation: u64,
     },
+    RetireCodingAttempt {
+        plan: Box<SignedRecord<CodingAttemptPlan>>,
+    },
+    GetCodingAttemptRetirement {
+        plan: Box<SignedRecord<CodingAttemptPlan>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -333,6 +339,10 @@ impl CheckpointObjectKind {
 }
 
 impl PeerRequest {
+    pub(super) fn is_writer_read(&self) -> bool {
+        matches!(self, Self::GetCodingAttemptRetirement { .. })
+    }
+
     pub(super) fn is_read_only(&self) -> bool {
         matches!(
             self,
@@ -360,7 +370,8 @@ impl PeerRequest {
 
     pub(super) fn mutation_kind(&self) -> Option<&'static str> {
         match self {
-            Self::Profile
+            Self::GetCodingAttemptRetirement { .. }
+            | Self::Profile
             | Self::CodingPathObservation { .. }
             | Self::GetSector { .. }
             | Self::GetSectorRange { .. }
@@ -408,6 +419,7 @@ impl PeerRequest {
             Self::SubmitCodingFailure { .. } => Some("submit-coding-failure"),
             Self::ActivateCodingParity { .. } => Some("activate-coding-parity"),
             Self::AbortCodingAttempt { .. } => Some("abort-coding-attempt"),
+            Self::RetireCodingAttempt { .. } => Some("retire-coding-attempt"),
             Self::StoreRepairShard { .. } => Some("store-repair-shard"),
             Self::StoreVariableRepairShard { .. } => Some("store-variable-repair-shard"),
             Self::PutCheckpointPage { .. } => Some("put-checkpoint-page"),
@@ -454,7 +466,9 @@ impl PeerRequest {
             | Self::SignLegacyPackingBinding { guild_id, .. }
             | Self::BackupStatus { guild_id, .. } => Some(*guild_id),
             Self::AttestLegacyPackingSource { attestation, .. } => Some(attestation.guild_id),
-            Self::AbortCodingAttempt { plan } => Some(plan.value.geometry.guild_id),
+            Self::AbortCodingAttempt { plan }
+            | Self::RetireCodingAttempt { plan }
+            | Self::GetCodingAttemptRetirement { plan } => Some(plan.value.geometry.guild_id),
             Self::ExchangeEndpoints { guild_id } | Self::CodingCapacity { guild_id, .. } => {
                 Some(*guild_id)
             }
@@ -569,6 +583,9 @@ pub(super) enum PeerResponse {
         available_shards: u64,
     },
     LegacyPackingAttestation(SignedRecord<LegacyPackingAttestation>),
+    CodingAttemptRetired {
+        retired: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1113,6 +1130,12 @@ mod tests {
                 .collect(),
         };
         let requests = vec![
+            PeerRequest::GetCodingAttemptRetirement {
+                plan: Box::new(signed_plan.clone()),
+            },
+            PeerRequest::RetireCodingAttempt {
+                plan: Box::new(signed_plan.clone()),
+            },
             PeerRequest::UploadCodingParityRange {
                 plan: Box::new(signed_plan.clone()),
                 manifest: Box::new(manifest.clone()),
@@ -1163,6 +1186,14 @@ mod tests {
         let protocol = libp2p::StreamProtocol::new("/mutualbackup/peer/2");
         for request in requests {
             let request = budget_request(request);
+            if matches!(
+                request.value.request,
+                PeerRequest::RetireCodingAttempt { .. }
+                    | PeerRequest::GetCodingAttemptRetirement { .. }
+            ) {
+                let bytes = cbor4ii::serde::to_vec(Vec::new(), &request).unwrap();
+                cddl_cat::validate_cbor_bytes("signed-peer-request", SCHEMA, &bytes).unwrap();
+            }
             let (tcp, cbor) = frame_sizes(&request).unwrap();
             assert!(tcp.max(cbor) <= super::super::MAX_PEER_FRAME_BYTES);
             let canonical = mb_core::canonical_bytes(&request).unwrap();
@@ -1195,10 +1226,19 @@ mod tests {
         assert!(!bounded.events.is_empty() && bounded.events.len() < tail.events.len());
         assert_eq!(bounded.events, tail.events[..bounded.events.len()]);
         for response in [
+            PeerResponse::CodingAttemptRetired { retired: false },
+            PeerResponse::CodingAttemptRetired { retired: true },
             PeerResponse::CodingVerificationTranscript(Box::new(transcript)),
             PeerResponse::GuildEventTail(Box::new(bounded)),
         ] {
             let response = budget_response(response);
+            if matches!(
+                response.value.result,
+                Ok(PeerResponse::CodingAttemptRetired { .. })
+            ) {
+                let bytes = cbor4ii::serde::to_vec(Vec::new(), &response).unwrap();
+                cddl_cat::validate_cbor_bytes("signed-peer-response", SCHEMA, &bytes).unwrap();
+            }
             let (tcp, cbor) = frame_sizes(&response).unwrap();
             assert!(tcp.max(cbor) <= super::super::MAX_PEER_FRAME_BYTES);
             mb_core::decode_canonical::<SignedRecord<PeerResponseEnvelope>>(

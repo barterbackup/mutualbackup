@@ -2802,7 +2802,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   and error before renewal. It passes locally in 16.36 seconds. The complete
   final gate must cover this ownership correction too.
 
-- [ ] **M5-111 / P1 — Fence stale cleanup against concurrent verifier acceptance.**
+- [x] **M5-111 / P1 — Fence stale cleanup against concurrent verifier acceptance.**
   `dispatch_next_coding_launch_after` checks accepted evidence once
   (`crates/mb-node/src/network/p2p.rs:6305`), then reads membership separately
   and invokes stale cleanup without retiring the signed attempt (`:6319`–`:6336`).
@@ -2830,7 +2830,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   activation/checkpoint coverage, late-result rejection, all holders' exact
   capacity/receipt cleanup, and repeated reopen. This finding is source-only.
 
-- [ ] **M5-112 / P1 — Handle failure ownership transfer during expired-launch recovery.**
+- [x] **M5-112 / P1 — Handle failure ownership transfer during expired-launch recovery.**
   An expired acknowledged launch can be claimed (`network/p2p.rs:6295`) just
   before its coder's signed failure arrives. Historical failure acceptance
   creates a durable retry, then removes the launch and its input descriptors
@@ -2891,7 +2891,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   staged receipts/reservations through repeated reopen. This finding is
   source-only.
 
-- [ ] **M5-115 / P1 — Finish retired delegated submissions without starving stale cleanup.**
+- [x] **M5-115 / P1 — Finish retired delegated submissions without starving stale cleanup.**
   Source-only review on 2026-09-26 covers `d3fd117` plus the pending cleanup
   ownership changes. The new stale-job branch deliberately excludes
   `Submitting` (`crates/mb-node/src/network/p2p.rs:6067`–`:6071`), allowing a
@@ -2923,7 +2923,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   `Submitting` job, so it does not cover this production path. No builds or
   runtime validation were run in this review.
 
-  Follow-up status: the pending source adds delegator-owned retirement for
+  Status at that source-only review: the pending source adds delegator-owned retirement for
   M5-111 and recognizes retry/activation ownership transfer for M5-112,
   including focused regression sources. These corrections are uncommitted
   and not closed by this review; M5-115 remains in the delegated submission
@@ -2934,6 +2934,44 @@ node Clippy gate passed locally. No remote compilation server was used.
   assertion that unrelated coding work progresses alongside the failure race;
   its new failure branch exercises replacement coverage but creates no such
   unrelated lane. M5-114 still requires the complete final committed-tree gate.
+
+  Implementation update (2026-09-26): M5-111, M5-112 and M5-115 now have
+  focused local corrections. Stale launch cleanup and stale delegated cleanup
+  arbitrate retirement at the delegator before touching holders. Verified
+  activation wins that arbitration; retirement persists the exact signed plan
+  before interrupted cleanup, and later results cannot claim discarded data.
+  Expired claimed launches yield to authenticated retry/activation ownership,
+  including late acknowledgement/deferral and a crash leaving a redundant
+  launch beside its durable retry. The redundant launch is removed without
+  removing input intent owned by that retry. Missing owners without evidence
+  remain errors rather than being silently recreated.
+
+  Durable historical Submitting jobs still deliver valid results. On failed
+  delivery they query an existing matching retirement fence, without creating
+  one or caching a negative answer. A confirmed fence permits resumed cleanup
+  and completion; a transport error or an unfenced answer keeps delivery
+  retryable. The new peer variants are appended to preserve existing Postcard
+  discriminants, with matching CDDL and both transport frame checks. Signed
+  record fields and persisted job encodings remain unchanged.
+
+  Five stale regressions pass locally (44.74 seconds), covering result arrival
+  after the launch guard, accepted durable delegated submission, retirement
+  before submission, a second stale cleanup job, an offline volume, reopen,
+  production verification/activation/checkpoint coverage and all holders'
+  capacity/receipt/reservation cleanup. The failure-after-expired-claim test
+  passes (151.47 seconds), with actual signed failure delivery, unrelated
+  coding progress, live workers, fresh successor roles, late-result rejection
+  and two further reopens. The lineage ownership test passes (7.40 seconds),
+  including both failure/retirement orderings and redundant-owner recovery;
+  legacy durable-history migration passes (15.74 seconds), including exact
+  fence queries and rejected conflicting plans; both transport/CDDL frame and
+  old-layout checks pass (6.22 seconds). Strict locked mb-node all-target
+  Clippy and formatting pass. Failed development runs exposed and corrected
+  fixture capacity/configuration assumptions and cached status reads; these
+  are not passing evidence. Logs use `/tmp/mutualbackup-m5-cleanup-*`,
+  `/tmp/mutualbackup-m5-115-stale-v6.log`, and
+  `/tmp/mutualbackup-m5-112-failure-unrelated-v2.log`. M5-113 and the complete
+  exact-commit M5-114 gate remain open. All builds and runs are local.
 
 - [ ] **M5-114 / gate — Recheck Milestone 5 after cleanup ownership and packed retries.**
   Correct M5-111 through M5-113 and M5-115, then source-review the final

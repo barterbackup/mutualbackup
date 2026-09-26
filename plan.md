@@ -58,17 +58,14 @@ them as ADRs and test vectors before promising wire compatibility.
 
 ### Implemented baseline — efficient and flexible guild protocol beta reopened
 
-Milestones 0 through 4 have passed. Milestone 5 is reopened by source-only
-review of `16c28a5..88898a6` on 2026-09-26: M5-111 through M5-113 expose
-concurrent verifier acceptance during stale cleanup, signed-failure ownership
-transfer during expiry recovery, and missing packed-input restaging after
-failure. Correct these and pass the new M5-114 local gate before Milestone 6.
-Follow-up source-only review of `d3fd117` plus pending changes finds M5-115:
-a retired stale `Submitting` job retries rejected delivery forever and blocks
-later stale cleanup. The pending M5-111/M5-112 fixes are not yet committed or
-closed; M5-113's packed-input restaging is still absent. Correct M5-115 too,
-complete the requested regression coverage, and pass M5-114 on the final tree.
-No builds or runtime validation were run in this review.
+Milestones 0 through 4 have passed. Milestone 5 remains open for M5-113's
+packed-input retry restaging and the complete M5-114 final local gate.
+M5-111/M5-112/M5-115 now arbitrate cleanup at the delegator, yield expired
+launches to durable submission owners, and finish retired historical
+submissions without blocking later stale cleanup. Focused local regressions,
+strict locked mb-node all-target Clippy and formatting pass; full workspace
+and fresh provisioned validation on the corrected final commit are pending.
+Milestone 6 waits. Earlier source-only review records remain historical.
 
 The previous complete final M5-104 local gate on
 2026-09-26 passed against `f8e47d34d62a073db6953260571441525dc5e2ac`, including
@@ -600,8 +597,10 @@ machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
 than a daemon prerequisite. Milestones 0 through 4 have passed. Milestone 5
-is reopened for M5-111 through M5-113, M5-115 and the new M5-114 gate; Milestone 6
-waits. This source-only review ran no builds, tests, daemons or runtime probes.
+remains open for M5-113 and the new M5-114 gate; Milestone 6 waits.
+M5-111/M5-112/M5-115 corrections pass focused local validation. Complete locked
+workspace and fresh Btrfs/network gates on the final corrected commit remain
+required. All compilation and execution take place locally.
 The previous final M5-104 workspace and fresh provisioned gate passed on
 `f8e47d3`, with all
 disposable resources removed and independently checked. This remains
@@ -853,17 +852,14 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 4 are passed. Milestone 5 is
-reopened by source-only review of `16c28a5..88898a6` on 2026-09-26. Correct
-M5-111's stale cleanup/verifier race, M5-112's failure/expiry ownership race
-that can stop the daemon, and M5-113's packed-input retry restaging gap.
-Pending source changes address M5-111/M5-112, but follow-up source review finds
-M5-115: retired stale submissions never finish and block later stale cleanup.
-M5-113 remains unchanged. Finish authenticated submission reconciliation,
-packed-input restaging, and the requested regression coverage before closure.
-Pass M5-114's complete local gate on the corrected committed source before
-Milestone 6's guarded link-freeze capture, native platforms and capture hooks.
-No builds, tests, daemons or runtime probes ran in this review. The earlier
+**Current position:** Milestones 0 through 4 are passed. Milestone 5 remains
+open for packed-input successor restaging (M5-113) and the complete final
+committed-source gate (M5-114). Cleanup/verifier arbitration, expired-launch
+failure ownership, and retired durable submission reconciliation
+(M5-111/M5-112/M5-115) are implemented with passing focused local regressions.
+Finish input-intent transfer and resumable successor uploads, then run the full
+workspace and fresh local Btrfs/network acceptance gate and verify disposable
+resource cleanup before Milestone 6. The earlier
 M5-104 gate on `f8e47d3`, including all 23 provisioned invocations and verified
 cleanup, remains passing historical evidence; it does not establish coverage
 of these newly found paths. M5-97 and earlier gates retain their exact-tree
@@ -2008,6 +2004,24 @@ source locations, failure cases, and recorded gate evidence.
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
 ### Milestone 5 — efficient and flexible data/guild protocol (reopened)
+
+Implementation update (2026-09-26): M5-111/M5-112/M5-115 corrections now
+preserve accepted activation or durably fence cleanup, recognize authenticated
+launch-to-retry ownership including redundant owners after crash, and reconcile
+retired durable submissions through an uncached authenticated status query.
+Existing signed plans, job encodings and peer message discriminants remain
+unchanged. Five stale regressions pass, including both arrival orderings,
+a second stale job, interrupted/offline cleanup and reopen. The expired
+acknowledged failure-arrival regression passes with unrelated coding progress,
+live workers, fresh activation/checkpoint coverage, late-result rejection and
+repeated reopen. Ownership/history and both transport/CDDL frame regressions,
+strict locked mb-node all-target Clippy and formatting pass locally. Detailed
+outcomes are in TODO.md. M5-113 still needs durable packed-input intent transfer
+and resumable staging before successor delegation; M5-114 still needs the
+complete final committed-tree workspace and fresh Btrfs/network acceptance
+proof. Milestone 5 remains open and Milestone 6 waits.
+
+Earlier source-review record:
 
 Follow-up source-only review on 2026-09-26 covers `d3fd117` plus the pending
 source/protocol changes. Delegator-owned retirement now arbitrates stale launch

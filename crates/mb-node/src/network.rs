@@ -757,6 +757,10 @@ fn process_peer_request(
             PeerRequest::AbortCodingAttempt { plan } => {
                 caller == plan.value.coding_coordinator || caller == plan.value.delegator
             }
+            PeerRequest::RetireCodingAttempt { plan }
+            | PeerRequest::GetCodingAttemptRetirement { plan } => {
+                caller == plan.value.coding_coordinator
+            }
             _ => false,
         };
         if mutation_kind.is_some()
@@ -811,6 +815,10 @@ fn process_peer_request(
                 &canonical_bytes(&cached)?,
             )?;
             Ok(response)
+        } else if request.is_writer_read() {
+            // This status read must observe the current writer-owned fence.
+            // Never journal/cache a negative answer across later retirement.
+            execute_peer_request(&mut node_guard, config, request_id, caller, request)
         } else {
             bail!("request was not classified as a read or mutation")
         }
@@ -1307,6 +1315,14 @@ fn execute_peer_request(
             }
             Ok(PeerResponse::Ack)
         }
+        PeerRequest::GetCodingAttemptRetirement { plan } => {
+            Ok(PeerResponse::CodingAttemptRetired {
+                retired: node.coding_attempt_is_retired(caller, &plan)?,
+            })
+        }
+        PeerRequest::RetireCodingAttempt { plan } => Ok(PeerResponse::CodingAttemptRetired {
+            retired: node.retire_delegated_coding_attempt(caller, &plan)?,
+        }),
         PeerRequest::StoreRepairShard {
             repair_id,
             guild_id: _,

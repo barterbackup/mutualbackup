@@ -135,6 +135,8 @@ peer-request =
   / { "SubmitCodingFailure": { failure: signed-coding-failure-report } }
   / { "ActivateCodingParity": { transcript: signed-coding-transcript } }
   / { "AbortCodingAttempt": { plan: signed-coding-attempt-plan } }
+  / { "RetireCodingAttempt": { plan: signed-coding-attempt-plan } }
+  / { "GetCodingAttemptRetirement": { plan: signed-coding-attempt-plan } }
   / { "GetParity": { guild_id: bytes32-array, group_id: bytes32-array, shard_index: uint8 } }
   / { "GetVariableShard": {
         guild_id: bytes32-array,
@@ -209,6 +211,7 @@ peer-response =
   / { "CheckpointHead": null / { generation: uint, hash: bytes32-array } }
   / { "CodingPathObservation": coding-path-observation }
   / { "CodingCapacity": { available_shards: uint } }
+  / { "CodingAttemptRetired": { retired: bool } }
   / "Ack"
 
 peer-profile = { member: member, endpoint: tstr }

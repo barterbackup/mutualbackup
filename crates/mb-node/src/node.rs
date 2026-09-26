@@ -4247,6 +4247,65 @@ impl Node {
         Ok(replay_coding_transcript(&activation.transcript)? == CodingReplayFinding::Verified)
     }
 
+    fn coding_launch_submission_plan(
+        &self,
+        attempt_id: [u8; 16],
+    ) -> Result<Option<SignedRecord<CodingAttemptPlan>>> {
+        let plan = if let Some(bytes) = self
+            .control
+            .get_record("coding-activation-job", &attempt_id)?
+        {
+            let job: CodingActivationJob = decode_canonical(&bytes)?;
+            if job.format_version != 1 {
+                anyhow::bail!("coding activation owner has an invalid format");
+            }
+            replay_coding_transcript(&job.transcript)?;
+            job.transcript.value.plan
+        } else if let Some(bytes) = self.control.get_record("coding-retry-job", &attempt_id)? {
+            let job: CodingRetryJob = decode_canonical(&bytes)?;
+            job.failure.verify(CODING_FAILURE_REPORT_DOMAIN)?;
+            job.failure.value.validate()?;
+            if job.format_version != 1
+                || job.failure.signer != job.failure.value.plan.value.coding_coordinator
+            {
+                anyhow::bail!("coding retry owner has an invalid failure report");
+            }
+            job.failure.value.plan
+        } else {
+            return Ok(None);
+        };
+        self.validate_coding_attempt_authority(&plan)?;
+        if plan.value.attempt_id != attempt_id || plan.value.delegator != self.keys.node_id() {
+            anyhow::bail!("coding submission owner conflicts with its launch ID");
+        }
+        Ok(Some(plan))
+    }
+
+    pub(crate) fn retire_coding_launch_for_cleanup(&self, job: &CodingLaunchJob) -> Result<bool> {
+        let plan = &job.plan;
+        self.validate_coding_attempt_authority(plan)?;
+        if let Some(submitted) = self.coding_launch_submission_plan(plan.value.attempt_id)? {
+            if submitted != *plan {
+                anyhow::bail!("coding launch conflicts with its submitted owner");
+            }
+            // Recover a crash after durable submission ownership was written
+            // but before its redundant launch was removed. Keep retry inputs.
+            self.abandon_coding_launch(plan.value.attempt_id)?;
+            return Ok(false);
+        }
+        if self
+            .control
+            .get_record("coding-launch-job", &plan.value.attempt_id)?
+            != Some(canonical_bytes(job)?)
+        {
+            anyhow::bail!("coding launch changed before cleanup retirement");
+        }
+        // Failure acceptance and retirement share the writer lock. A failure
+        // accepted first owns a retry; one arriving later is archived without
+        // deleting the launch that still owns cleanup and renewal.
+        self.retire_coding_retry_plan(plan)
+    }
+
     fn coding_launch_renewal_candidate(
         &self,
         prior: &SignedRecord<CodingAttemptPlan>,
@@ -4485,7 +4544,16 @@ impl Node {
     }
 
     pub(crate) fn abandon_coding_launch(&self, attempt_id: [u8; 16]) -> Result<()> {
-        self.complete_coding_launch_information(attempt_id)?;
+        if self
+            .control
+            .get_record("coding-retry-job", &attempt_id)?
+            .is_some()
+        {
+            self.control
+                .delete_record("coding-launch-staged", &attempt_id)?;
+        } else {
+            self.complete_coding_launch_information(attempt_id)?;
+        }
         self.control
             .delete_record("coding-launch-job", &attempt_id)?;
         Ok(())
@@ -4494,10 +4562,11 @@ impl Node {
     pub(crate) fn defer_coding_launch(&self, attempt_id: [u8; 16], error: &str) -> Result<()> {
         let mut error = error.to_owned();
         truncate_utf8(&mut error, 4096);
-        let bytes = self
-            .control
-            .get_record("coding-launch-job", &attempt_id)?
-            .context("coding launch job is unavailable")?;
+        let bytes = self.control.get_record("coding-launch-job", &attempt_id)?;
+        if bytes.is_none() && self.coding_launch_submission_plan(attempt_id)?.is_some() {
+            return Ok(());
+        }
+        let bytes = bytes.context("coding launch job is unavailable")?;
         let job: CodingLaunchJob = decode_canonical(&bytes)?;
         // Expiry cleanup can defer an acknowledged launch. Retain that state
         // so a later renewal still avoids its silent coordinator pair.
@@ -4510,10 +4579,11 @@ impl Node {
         dispatched: bool,
         error: Option<String>,
     ) -> Result<()> {
-        let bytes = self
-            .control
-            .get_record("coding-launch-job", &attempt_id)?
-            .context("coding launch job is unavailable")?;
+        let bytes = self.control.get_record("coding-launch-job", &attempt_id)?;
+        if bytes.is_none() && self.coding_launch_submission_plan(attempt_id)?.is_some() {
+            return Ok(());
+        }
+        let bytes = bytes.context("coding launch job is unavailable")?;
         let mut job: CodingLaunchJob = decode_canonical(&bytes)?;
         if job.format_version != 1 || job.plan.value.attempt_id != attempt_id {
             anyhow::bail!("durable coding launch job is invalid");
@@ -5567,6 +5637,38 @@ impl Node {
         Ok(false)
     }
 
+    pub(crate) fn coding_attempt_is_retired(
+        &self,
+        caller: NodeId,
+        plan: &SignedRecord<CodingAttemptPlan>,
+    ) -> Result<bool> {
+        self.validate_coding_attempt_authority(plan)?;
+        if caller != plan.value.coding_coordinator || plan.value.delegator != self.keys.node_id() {
+            anyhow::bail!("only the assigned coder may query its delegator's retirement");
+        }
+        let Some(bytes) = self
+            .control
+            .get_record("coding-retired-attempt", &plan.value.attempt_id)?
+        else {
+            return Ok(false);
+        };
+        if decode_canonical::<SignedRecord<CodingAttemptPlan>>(&bytes)? != *plan {
+            anyhow::bail!("retired attempt conflicts with its signed plan");
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn retire_delegated_coding_attempt(
+        &self,
+        caller: NodeId,
+        plan: &SignedRecord<CodingAttemptPlan>,
+    ) -> Result<bool> {
+        if caller != plan.value.coding_coordinator {
+            anyhow::bail!("only the assigned coder may request attempt retirement");
+        }
+        self.retire_coding_retry_plan(plan)
+    }
+
     // Fence late submissions before remote cleanup. Keep this signed plan even
     // if cleanup or the process is interrupted; a retry never mutates its bytes.
     pub(crate) fn retire_coding_retry_plan(
@@ -5577,11 +5679,7 @@ impl Node {
         if plan.value.delegator != self.keys.node_id() {
             anyhow::bail!("only the delegator may retire a coding retry");
         }
-        if self
-            .control
-            .get_record("coding-activation-job", &plan.value.attempt_id)?
-            .is_some()
-        {
+        if self.coding_launch_has_verified_result(plan)? {
             return Ok(false);
         }
         let bytes = canonical_bytes(plan)?;
@@ -5657,6 +5755,33 @@ impl Node {
                 .context("missing retry")?,
         )
         .map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coding_launch_jobs_for_test(&self) -> Result<Vec<CodingLaunchJob>> {
+        self.control
+            .records("coding-launch-job")?
+            .into_iter()
+            .map(|(_, bytes)| decode_canonical(&bytes).map_err(Into::into))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delegated_coding_jobs_for_test(&self) -> Result<Vec<DelegatedCodingJob>> {
+        self.control
+            .records("delegated-coding-job")?
+            .into_iter()
+            .map(|(_, bytes)| decode_canonical(&bytes).map_err(Into::into))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coding_activation_jobs_for_test(&self) -> Result<Vec<CodingActivationJob>> {
+        self.control
+            .records("coding-activation-job")?
+            .into_iter()
+            .map(|(_, bytes)| decode_canonical(&bytes).map_err(Into::into))
+            .collect()
     }
 
     #[cfg(test)]
@@ -14813,6 +14938,95 @@ pub(crate) mod tests {
                 .unwrap(),
             Some(expired)
         );
+
+        // A signed failure can arrive after an acknowledged expired claim but
+        // before the writer lock is reacquired for retirement. Its retry owns
+        // all subsequent work, including delayed acknowledgement/deferral.
+        for (id, retire_first) in [(250, false), (251, true)] {
+            let mut plan = initial.value.clone();
+            plan.coding_coordinator = remotes[1].node_id();
+            plan.verification_coordinator = remotes[2].node_id();
+            plan.attempt_id = [id; 16];
+            plan.checkpoint_hash = [76; 32];
+            plan.expires_at_unix_seconds = unix_seconds() - 1;
+            let plan = SignedRecord::sign(
+                CODING_ATTEMPT_PLAN_DOMAIN,
+                plan,
+                keys.iter().find(|key| key.node_id() == owner).unwrap(),
+            )
+            .unwrap();
+            let claimed = CodingLaunchJob {
+                format_version: 1,
+                plan: plan.clone(),
+                dispatched: true,
+                error: None,
+            };
+            node.put_coding_launch_job(&claimed).unwrap();
+            if retire_first {
+                assert!(node.retire_coding_launch_for_cleanup(&claimed).unwrap());
+            }
+            let report = failure(plan.clone());
+            node.accept_coding_failure(report.signer, report.clone())
+                .unwrap();
+            if retire_first {
+                assert_eq!(
+                    node.control
+                        .get_record("coding-launch-job", &plan.value.attempt_id)
+                        .unwrap(),
+                    Some(canonical_bytes(&claimed).unwrap())
+                );
+                assert_eq!(
+                    node.control
+                        .get_record("coding-retired-failure", &plan.value.attempt_id)
+                        .unwrap(),
+                    Some(canonical_bytes(&report).unwrap())
+                );
+                assert!(
+                    node.control
+                        .get_record("coding-retry-job", &plan.value.attempt_id)
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                for reopen in 0..2 {
+                    if reopen == 0 {
+                        // A crash can leave this redundant launch beside its
+                        // already durable retry owner. Reconcile it as well.
+                        node.put_coding_launch_job(&claimed).unwrap();
+                    }
+                    assert!(!node.retire_coding_launch_for_cleanup(&claimed).unwrap());
+                    node.defer_coding_launch(
+                        plan.value.attempt_id,
+                        "selection completed after failure",
+                    )
+                    .unwrap();
+                    node.complete_coding_launch(plan.value.attempt_id).unwrap();
+                    assert!(
+                        node.control
+                            .get_record("coding-launch-job", &plan.value.attempt_id)
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert!(
+                        node.retired_coding_plan_for_test(plan.value.attempt_id)
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(
+                        node.coding_retry_evidence_for_test(plan.value.attempt_id)
+                            .unwrap()
+                            .failure,
+                        report
+                    );
+                    drop(node);
+                    node = Node::open(temp.path(), seed.clone()).unwrap();
+                }
+            }
+        }
+        assert!(
+            node.defer_coding_launch([249; 16], "unexpected missing owner")
+                .is_err()
+        );
     }
 
     #[test]
@@ -15032,7 +15246,35 @@ pub(crate) mod tests {
                 let prepared =
                     SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, prepared, signer).unwrap();
                 let late_result = test_coding_transcript(prepared.clone(), &shards, &keys);
-                assert!(node.retire_coding_retry_plan(&prepared).unwrap());
+                assert!(node.coding_attempt_is_retired(local_id, &prepared).is_err());
+                assert!(
+                    !node
+                        .coding_attempt_is_retired(prepared.value.coding_coordinator, &prepared)
+                        .unwrap()
+                );
+                assert!(
+                    node.retire_delegated_coding_attempt(local_id, &prepared)
+                        .is_err()
+                );
+                assert!(
+                    node.retire_delegated_coding_attempt(
+                        prepared.value.coding_coordinator,
+                        &prepared
+                    )
+                    .unwrap()
+                );
+                assert!(
+                    node.coding_attempt_is_retired(prepared.value.coding_coordinator, &prepared)
+                        .unwrap()
+                );
+                let mut conflicting = prepared.value.clone();
+                conflicting.expires_at_unix_seconds += 1;
+                let conflicting =
+                    SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, conflicting, signer).unwrap();
+                assert!(
+                    node.coding_attempt_is_retired(prepared.value.coding_coordinator, &conflicting)
+                        .is_err()
+                );
                 assert!(
                     node.accept_coding_transcript(prepared.value.coding_coordinator, late_result)
                         .is_err()
@@ -15079,12 +15321,29 @@ pub(crate) mod tests {
                 node.accept_coding_transcript(verified.value.coding_coordinator, result.clone())
                     .unwrap();
                 assert!(!node.retire_coding_retry_plan(&verified).unwrap());
+                assert!(
+                    !node
+                        .retire_delegated_coding_attempt(
+                            verified.value.coding_coordinator,
+                            &verified
+                        )
+                        .unwrap()
+                );
                 assert_eq!(
                     node.claim_coding_activation().unwrap().unwrap().transcript,
                     result
                 );
                 drop(node);
                 let node = Node::open(&dir, seed.clone()).unwrap();
+                assert!(
+                    node.coding_attempt_is_retired(prepared.value.coding_coordinator, &prepared)
+                        .unwrap()
+                );
+                assert!(
+                    !node
+                        .coding_attempt_is_retired(verified.value.coding_coordinator, &verified)
+                        .unwrap()
+                );
                 assert_eq!(
                     node.control
                         .get_record("coding-retired-attempt", &prepared.value.attempt_id)

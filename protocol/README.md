@@ -26,3 +26,21 @@ format version, nonzero/correlated request IDs, signer/transport identity,
 recipient and guild scope, request hash, freshness, authorization, frame and
 queue limits, and object-specific semantic bounds. Errors are capped at 4096
 UTF-8 bytes and carry a stable code plus a retryable flag.
+
+`RetireCodingAttempt` is a mutation addressed to the signed plan's delegator
+by its assigned coding coordinator. The delegator checks historical plan
+authority and arbitrates against accepted verifier evidence under its writer
+lock. `CodingAttemptRetired { retired: true }` acknowledges a durable fence for
+that immutable plan; later verifier submissions are rejected and holder cleanup
+may proceed. A false response leaves accepted evidence in charge of activation,
+so the coordinator must not discard the attempt's shards. Request failure or
+timeout never authorizes cleanup. Stale launch recovery makes the same decision
+locally at its delegator. This adds draft peer message variants without changing
+any existing signed-record fields or persisted job encodings.
+
+`GetCodingAttemptRetirement` lets the assigned coder query its delegator about
+that exact historical signed plan without creating a fence. Its authenticated
+`CodingAttemptRetired` response is true only for an existing matching durable
+retirement. A false response leaves delivery retryable. Following rejected
+result delivery, a true response allows the coder to resume holder cleanup and
+finish its durable submission job; transport errors never authorize deletion.
