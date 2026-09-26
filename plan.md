@@ -168,7 +168,8 @@ The complete final M5-104 gate remains pending, so Milestone 5 stays open.
 Source-only review through `c4e97f8` finds M5-105 and M5-106: format-3 lane
 coalescing can suppress a launch using failed/retired historical retry plans,
 and its production caller stages inputs under an ID that coalescing never
-dispatches. Correct both before the final M5-104 gate. Milestone 6 waits.
+dispatches. Both corrections are now implemented with passing production
+restart/replanning regressions. The final M5-104 gate is pending; Milestone 6 waits.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -595,8 +596,9 @@ local workspace and fresh disposable Btrfs/network gate. Milestones 0 through
 4 are passed. Subsequent source-only review found M5-103 in same-epoch durable
 retry scheduling. Its correction and focused restart regressions now pass.
 Follow-up source review through `c4e97f8` finds M5-105 and M5-106 in retry
-coalescing and staging. Milestone 5 remains open and Milestone 6 waits for
-those corrections and M5-104. The preceding
+coalescing and staging. Those corrections and focused restart/replanning
+regressions now pass. Milestone 5 remains open and Milestone 6 waits for
+the complete M5-104 gate. The preceding
 records are closure history.
 Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
@@ -815,8 +817,9 @@ review at every gate before committing the next milestone's detailed scope.
 
 **Current position:** Milestones 0 through 4 are passed. M5-103's durable retry
 correction and focused regressions pass; source review through `c4e97f8` finds
-M5-105 and M5-106 in lane coalescing and production staging. Milestone 5
-remains open for those corrections and the complete M5-104 gate. Milestone 6
+M5-105 and M5-106 in lane coalescing and production staging. Both corrections
+and focused production regressions now pass. Milestone 5 remains open for the
+complete M5-104 gate. Milestone 6
 waits. The complete M5-97 local gate passed on source `c7033fa`
 on 2026-09-26; provisioned acceptance ran at documentation-only successor
 `4170dce`. That gate remains historical evidence for its tested scenarios.
@@ -2028,6 +2031,22 @@ objects/receipts and used capacity rather than reservation counts alone.
 Exact source paths and correction gates are in `TODO.md`. Milestone 5 remains
 open; correct M5-105/M5-106 before M5-104 and Milestone 6. This review ran no
 builds, tests, daemons, or runtime probes.
+
+The M5-105/M5-106 correction now chooses verified protection or a live retry
+successor while skipping failed/retired/expired historical children. New
+same-format work safely supersedes blocked retries and retains fresh
+coordinator exclusions; preparation rechecks supersession. Production queues
+atomically persist a new launch and its separate input-staging intent before
+allocating storage. The worker resumes partial staging under the selected
+signed ID, records deferrals, and dispatches only after placement succeeds.
+Existing positional CBOR launch records and signed history stay unchanged.
+Three additional real QUIC regressions cover live-retry replanning, a failed
+retry chain with a retired descendant, and an offline partial upload resumed
+after reopen. They pass verification, activation, checkpoint signing, staged
+receipt/reservation cleanup, exact used-capacity checks on every holder, and
+two further reopens. The node regression also checks adverse ordering and
+rejected coordinator reuse. All 16 focused `retry` tests pass locally; the
+complete final M5-104 workspace/provisioned gate remains pending.
 
 M5-36 through M5-44 are implemented, and the complete M5-45 correction gate
 passed locally on 2026-09-19. The final committed tree passed formatting,

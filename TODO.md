@@ -584,8 +584,9 @@ a preserved incomplete retry can indefinitely prevent the background worker
 from dispatching a stronger replacement or finishing unrelated activations.
 M5-103 is now implemented with passing production-worker restart regressions.
 Source-only review through `c4e97f8` finds M5-105 and M5-106 in retry lane
-coalescing and its production staging caller. Milestone 5 remains open;
-Milestone 6 waits for those corrections and the complete new M5-104 gate.
+coalescing and its production staging caller. Both corrections are now
+implemented with passing restart/replanning regressions. Milestone 5 remains
+open; Milestone 6 waits for the complete new M5-104 gate.
 M5-97 and earlier gate records remain evidence for their exact trees. This
 review ran no builds, tests, daemons, runtime probes, or remote compilation.
 
@@ -2431,7 +2432,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   passed historical gate; it does not cover the missing retry schedule.
   All compilation and execution must remain local, with no remote server.
 
-- [ ] **M5-105 / P1 — Coalesce only with live retry work or completed protection.**
+- [x] **M5-105 / P1 — Coalesce only with live retry work or completed protection.**
   The new format-3 scan in `enqueue_coding_launch`
   (`crates/mb-node/src/node.rs:3947`–`:3956`) returns the first same-lane
   `retry_plan` using historical authority validation only. It does not check
@@ -2453,8 +2454,22 @@ node Clippy gate passed locally. No remote compilation server was used.
   descendants, insufficient fresh roles, and repeated reopen. Exercise actual
   background dispatch through activation/checkpoint coverage, and preserve
   all original signed records. This finding is source-only; no tests were run.
+  Coalescing now prefers replay-verified activation evidence and current
+  retained protection, then a valid live retry child. Failed, retired, expired,
+  and terminal children are skipped while signed history stays intact. A
+  same-format replacement supersedes the blocked retry after safe cleanup;
+  preparation rechecks supersession before signing another child. Replanning
+  and enqueue enforce fresh roles relative to the latest failed/expired/retired
+  attempt, preserving the fresh-coordinator invariant. A node regression
+  covers adverse record ordering, multi-generation failure, expired/retired
+  plans, live successors, rejected role reuse, verified activation, and reopen.
+  A real QUIC regression drives a failed format-3 child with a retired prepared
+  descendant through production replanning, cleanup, activation, checkpoint
+  signing, and two further reopens, preserving original signed evidence.
+  The focused `retry` run passed all 16 selected tests locally. M5-104 remains
+  pending on the final committed source.
 
-- [ ] **M5-106 / P1 — Resolve the selected attempt before staging coding inputs.**
+- [x] **M5-106 / P1 — Resolve the selected attempt before staging coding inputs.**
   `queue_variable_coding_lanes` stages information under its newly signed
   deterministic plan (`crates/mb-node/src/network/p2p.rs:12508`–`:12529`), then
   calls `enqueue_coding_launch` and ignores the returned plan. The new
@@ -2479,6 +2494,20 @@ node Clippy gate passed locally. No remote compilation server was used.
   verify staged receipts/objects and used capacity as well as reservations
   after activation, failures, and repeated reopen. Preserve signed history.
   This finding is source-only; no tests were run.
+  Production queuing now selects the durable attempt before any input upload.
+  A new launch and its input-staging intent are written atomically; a coalesced
+  retry gets no unused upload. The worker resumes staging under that launch's
+  signed ID and clears its intent only after successful placement, before
+  delegation. Failures retain the resumable launch, partial upload, and error;
+  stale-authority cleanup removes its intent after discarding staged data.
+  Staging intent uses a separate record, preserving the positional CBOR launch
+  format and every preexisting signed record. Two real QUIC regressions cover
+  production replanning around a live retry and a partial input upload whose
+  volume goes offline before staging, then recovers after node reopen. All
+  holders finish with zero staged receipts/reservations and exactly the expected
+  used capacity, including two further reopens. Verification, activation, and
+  checkpoint signing pass. The focused `retry` run passed all 16 selected tests
+  locally; the full M5-104 gate is still required.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
