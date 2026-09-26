@@ -4212,7 +4212,8 @@ impl Node {
             }
             self.validate_coding_attempt_authority(&job.plan)?;
             let current = job.plan.value.membership_epoch == current_membership_epoch;
-            if current && job.dispatched {
+            if current && job.dispatched && job.plan.value.expires_at_unix_seconds >= unix_seconds()
+            {
                 continue;
             }
             if let Some(cursor) = after {
@@ -4246,9 +4247,46 @@ impl Node {
         Ok(replay_coding_transcript(&activation.transcript)? == CodingReplayFinding::Verified)
     }
 
+    fn coding_launch_renewal_candidate(
+        &self,
+        prior: &SignedRecord<CodingAttemptPlan>,
+    ) -> Result<Option<CodingLaunchJob>> {
+        for (_, bytes) in self.control.records("coding-launch-job")? {
+            let existing: CodingLaunchJob = decode_canonical(&bytes)?;
+            let candidate = &existing.plan;
+            if candidate.value.attempt_id != prior.value.attempt_id
+                && same_coding_lane(&candidate.value, &prior.value)
+                && self.validate_coding_attempt_plan(candidate).is_ok()
+                && self
+                    .control
+                    .get_record("coding-retired-attempt", &candidate.value.attempt_id)?
+                    .is_none()
+                && self
+                    .control
+                    .get_record("coding-retry-job", &candidate.value.attempt_id)?
+                    .is_none()
+            {
+                return Ok(Some(existing));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn coding_launch_has_renewal(
+        &self,
+        prior: &SignedRecord<CodingAttemptPlan>,
+    ) -> Result<bool> {
+        Ok(self
+            .control
+            .get_record("coding-launch-successor", &prior.value.attempt_id)?
+            .is_some()
+            || self.coding_launch_renewal_candidate(prior)?.is_some())
+    }
+
     pub(crate) fn renew_coding_launch_after_cleanup(
         &mut self,
         job: &CodingLaunchJob,
+        coordinators: Option<(NodeId, NodeId)>,
     ) -> Result<SignedRecord<CodingAttemptPlan>> {
         let prior = &job.plan;
         let id = prior.value.attempt_id;
@@ -4266,31 +4304,16 @@ impl Node {
             if let Some(bytes) = self.control.get_record("coding-launch-successor", &id)? {
                 decode_canonical(&bytes)?
             } else {
-                let mut replacement = None;
-                for (_, bytes) in self.control.records("coding-launch-job")? {
-                    let existing: CodingLaunchJob = decode_canonical(&bytes)?;
-                    let candidate = &existing.plan;
-                    if candidate.value.attempt_id != id
-                        && same_coding_lane(&candidate.value, &prior.value)
-                        && self.validate_coding_attempt_plan(candidate).is_ok()
-                        && self
-                            .control
-                            .get_record("coding-retired-attempt", &candidate.value.attempt_id)?
-                            .is_none()
-                        && self
-                            .control
-                            .get_record("coding-retry-job", &candidate.value.attempt_id)?
-                            .is_none()
-                    {
-                        replacement = Some(existing);
-                        break;
-                    }
-                }
+                let replacement = self.coding_launch_renewal_candidate(prior)?;
                 let new_launch = replacement.is_none();
                 let launch = match replacement {
                     Some(existing) => existing,
                     None => {
+                        let (coding_coordinator, verification_coordinator) = coordinators
+                            .context("coding launch renewal requires reachable coordinators")?;
                         let mut value = prior.value.clone();
+                        value.coding_coordinator = coding_coordinator;
+                        value.verification_coordinator = verification_coordinator;
                         loop {
                             rand::rngs::OsRng.fill_bytes(&mut value.attempt_id);
                             if value.attempt_id != [0; 16] && value.attempt_id != id {
@@ -4471,7 +4494,14 @@ impl Node {
     pub(crate) fn defer_coding_launch(&self, attempt_id: [u8; 16], error: &str) -> Result<()> {
         let mut error = error.to_owned();
         truncate_utf8(&mut error, 4096);
-        self.update_coding_launch(attempt_id, false, Some(error))
+        let bytes = self
+            .control
+            .get_record("coding-launch-job", &attempt_id)?
+            .context("coding launch job is unavailable")?;
+        let job: CodingLaunchJob = decode_canonical(&bytes)?;
+        // Expiry cleanup can defer an acknowledged launch. Retain that state
+        // so a later renewal still avoids its silent coordinator pair.
+        self.update_coding_launch(attempt_id, job.dispatched, Some(error))
     }
 
     fn update_coding_launch(
@@ -14496,7 +14526,7 @@ pub(crate) mod tests {
             mb_core::CODING_TRANSCRIPT_DOMAIN,
             CodingVerificationTranscript {
                 format_version: 1,
-                verified_at_unix_seconds: unix_seconds(),
+                verified_at_unix_seconds: unix_seconds().min(plan.value.expires_at_unix_seconds),
                 plan,
                 manifest,
                 challenge_commitment,
@@ -14684,10 +14714,16 @@ pub(crate) mod tests {
         let job = CodingLaunchJob {
             format_version: 1,
             plan: expired.clone(),
-            dispatched: false,
+            dispatched: true,
             error: None,
         };
         node.put_coding_launch_job(&job).unwrap();
+        assert_eq!(node.claim_coding_launch().unwrap(), Some(job.clone()));
+        node.defer_coding_launch(expired.value.attempt_id, "cleanup destination offline")
+            .unwrap();
+        let job = node.claim_coding_launch().unwrap().unwrap();
+        assert!(job.dispatched);
+        assert!(job.error.is_some());
         node.control
             .put_record(
                 "coding-launch-information",
@@ -14696,14 +14732,27 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(node.retire_coding_retry_plan(&expired).unwrap());
-        let successor = node.renew_coding_launch_after_cleanup(&job).unwrap();
+        let late_result = test_coding_transcript(expired.clone(), &shards, &keys);
+        assert!(
+            node.accept_coding_transcript(expired.value.coding_coordinator, late_result)
+                .is_err()
+        );
+        let successor = node
+            .renew_coding_launch_after_cleanup(
+                &job,
+                Some((
+                    expired.value.coding_coordinator,
+                    expired.value.verification_coordinator,
+                )),
+            )
+            .unwrap();
         assert_ne!(successor.value.attempt_id, expired.value.attempt_id);
         assert!(successor.value.expires_at_unix_seconds > unix_seconds());
         node.put_coding_launch_job(&job).unwrap();
         drop(node);
         node = Node::open(temp.path(), seed.clone()).unwrap();
         assert_eq!(
-            node.renew_coding_launch_after_cleanup(&job).unwrap(),
+            node.renew_coding_launch_after_cleanup(&job, None).unwrap(),
             successor
         );
         assert_eq!(node.control.records("coding-launch-job").unwrap().len(), 1);

@@ -6346,8 +6346,19 @@ async fn dispatch_next_coding_launch_after(
     if job.plan.value.expires_at_unix_seconds < unix_seconds() {
         let result = async {
             if cleanup_coding_retry_plan(node.clone(), p2p, &job.plan).await? {
+                let prior = job.plan.clone();
+                let existing = node_blocking(node.clone(), move |node| {
+                    node.coding_launch_has_renewal(&prior)
+                })
+                .await?;
+                let coordinators = if existing {
+                    None
+                } else {
+                    Some(choose_coding_launch_renewal_coordinators(node.clone(), p2p, &job).await?)
+                };
                 node_blocking(node.clone(), move |node| {
-                    node.renew_coding_launch_after_cleanup(&job).map(|_| ())
+                    node.renew_coding_launch_after_cleanup(&job, coordinators)
+                        .map(|_| ())
                 })
                 .await?;
             } else {
@@ -6432,6 +6443,75 @@ async fn dispatch_next_coding_launch_after(
         }
     }
     Ok(dispatched)
+}
+
+async fn choose_coding_launch_renewal_coordinators(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    job: &crate::node::CodingLaunchJob,
+) -> Result<(NodeId, NodeId)> {
+    let (guild, local_id) = node_blocking(node, |node| {
+        Ok((
+            node.guild_summary()?
+                .context("coding launch renewal requires a guild")?,
+            node.keys().node_id(),
+        ))
+    })
+    .await?;
+    let prior = &job.plan.value;
+    let participants = prior
+        .geometry
+        .information
+        .iter()
+        .filter(|role| !role.sector.virtual_zero)
+        .map(|role| role.owner)
+        .chain(prior.geometry.parity.iter().map(|role| role.holder))
+        .collect::<BTreeSet<_>>();
+    // An acknowledged attempt that never reported a result needs fresh roles.
+    // Silence is an availability failure, not evidence of misconduct.
+    let peers = guild
+        .peers
+        .into_iter()
+        .filter(|peer| {
+            !job.dispatched
+                || (peer.member.node_id != prior.coding_coordinator
+                    && peer.member.node_id != prior.verification_coordinator)
+        })
+        .collect::<Vec<_>>();
+    let reachable = reachable_coding_peers(p2p, local_id, &peers)
+        .await
+        .into_iter()
+        .map(|peer| peer.member.node_id)
+        .collect::<Vec<_>>();
+    if reachable.len() < 2 {
+        bail!("coding launch renewal has fewer than two fresh reachable coordinators");
+    }
+    let targets = participants.iter().copied().collect::<Vec<_>>();
+    let observations =
+        collect_coding_path_observations(p2p, guild.guild_id, &reachable, &targets).await;
+    let status = p2p.status().await?;
+    let verifier_path_ranks = reachable
+        .iter()
+        .map(|candidate| {
+            (
+                *candidate,
+                coding_candidate_path_rank(*candidate, local_id, &status),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let lane_scores = reachable
+        .iter()
+        .filter_map(|candidate| {
+            coding_candidate_lane_score(*candidate, &participants, &observations)
+                .map(|score| (*candidate, score))
+        })
+        .collect::<BTreeMap<_, _>>();
+    choose_coding_coordinators(
+        &reachable,
+        &participants,
+        &lane_scores,
+        &verifier_path_ranks,
+    )
 }
 
 async fn submit_delegated_coding_failure(
@@ -22249,6 +22329,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verified_dispatched_launch_survives_expiry_after_reopen() {
+        coding_retry_restart_fixture(false, false, false, RetryReplanningCase::VerifiedExpiry)
+            .await;
+    }
+
+    #[tokio::test]
     async fn expired_launch_partial_staging_renews_after_reopen() {
         coding_retry_restart_fixture(true, false, false, RetryReplanningCase::ExpiredPartial).await;
     }
@@ -22266,6 +22352,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_dispatched_launch_recovers_with_coordinator_offline_after_reopen() {
+        coding_retry_restart_fixture(true, false, false, RetryReplanningCase::ExpiredDispatched)
+            .await;
+    }
+
+    #[tokio::test]
     async fn blocked_launch_staging_yields_to_healthy_launch_after_reopen() {
         coding_retry_restart_fixture(true, false, false, RetryReplanningCase::LaunchFairness).await;
     }
@@ -22279,8 +22371,10 @@ mod tests {
         ExpiredPartial,
         ExpiredFinalized,
         ExpiredCompleted,
+        ExpiredDispatched,
         LaunchFairness,
         VerifiedEpochChange,
+        VerifiedExpiry,
     }
 
     fn install_coding_test_event(nodes: &[Arc<Mutex<Node>>], kind: mb_core::GuildEventKind) {
@@ -22377,6 +22471,17 @@ mod tests {
                     mb_core::GuildEventKind::RemoveMember { node_id: removed },
                 );
             }
+        }
+        if replanning == RetryReplanningCase::ExpiredDispatched {
+            install_coding_test_event(
+                &nodes,
+                mb_core::GuildEventKind::SetQuorum {
+                    policy: QuorumPolicy {
+                        format_version: 1,
+                        rule: QuorumRule::Majority,
+                    },
+                },
+            );
         }
         let owner = nodes[0].lock().unwrap().keys().node_id();
         let writer = ed25519_dalek::SigningKey::from_bytes(&[211; 32]);
@@ -22482,13 +22587,16 @@ mod tests {
                 RetryReplanningCase::Live
                     | RetryReplanningCase::FailedChain
                     | RetryReplanningCase::VerifiedEpochChange
+                    | RetryReplanningCase::VerifiedExpiry
             ) {
                 plan.format_version = 3;
             }
             plan.coding_coordinator = member(3).node_id;
             plan.verification_coordinator = member(4).node_id;
             plan.expires_at_unix_seconds = unix_seconds()
-                + if stale_epoch
+                + if replanning == RetryReplanningCase::VerifiedExpiry {
+                    15
+                } else if stale_epoch
                     || replanning == RetryReplanningCase::Live
                     || replanning == RetryReplanningCase::FailedChain
                     || replanning == RetryReplanningCase::VerifiedEpochChange
@@ -22514,9 +22622,11 @@ mod tests {
                 RetryReplanningCase::Live
                     | RetryReplanningCase::FailedChain
                     | RetryReplanningCase::VerifiedEpochChange
+                    | RetryReplanningCase::VerifiedExpiry
                     | RetryReplanningCase::ExpiredPartial
                     | RetryReplanningCase::ExpiredFinalized
                     | RetryReplanningCase::ExpiredCompleted
+                    | RetryReplanningCase::ExpiredDispatched
             ),
             error: None,
         };
@@ -22572,6 +22682,7 @@ mod tests {
                 RetryReplanningCase::ExpiredPartial
                     | RetryReplanningCase::ExpiredFinalized
                     | RetryReplanningCase::ExpiredCompleted
+                    | RetryReplanningCase::ExpiredDispatched
             )
         }) {
             // A partial durable upload must be cleaned before renewal or supersession.
@@ -22609,7 +22720,10 @@ mod tests {
                 .unwrap();
         }
         let mut accepted_evidence = None;
-        if replanning == RetryReplanningCase::VerifiedEpochChange {
+        if matches!(
+            replanning,
+            RetryReplanningCase::VerifiedEpochChange | RetryReplanningCase::VerifiedExpiry
+        ) {
             nodes[0]
                 .lock()
                 .unwrap()
@@ -22645,14 +22759,22 @@ mod tests {
             submit_delegated_coding_result(nodes[3].clone(), &clients[3], transcript)
                 .await
                 .unwrap();
-            install_coding_test_event(
-                &nodes,
-                mb_core::GuildEventKind::RelabelMember {
-                    node_id: member(2).node_id,
-                    failure_domain: "unrelated-verified-placement-change".to_owned(),
-                },
-            );
-            replacement.membership_epoch += 1;
+            if replanning == RetryReplanningCase::VerifiedEpochChange {
+                install_coding_test_event(
+                    &nodes,
+                    mb_core::GuildEventKind::RelabelMember {
+                        node_id: member(2).node_id,
+                        failure_domain: "unrelated-verified-placement-change".to_owned(),
+                    },
+                );
+                replacement.membership_epoch += 1;
+            } else {
+                let deadline = expired_plan.as_ref().unwrap().value.expires_at_unix_seconds;
+                tokio::time::sleep(Duration::from_secs(
+                    deadline.saturating_sub(unix_seconds()) + 1,
+                ))
+                .await;
+            }
         }
         if let Some(job) = &child_job {
             assert!(
@@ -22819,6 +22941,7 @@ mod tests {
                 | RetryReplanningCase::ExpiredPartial
                 | RetryReplanningCase::ExpiredFinalized
                 | RetryReplanningCase::ExpiredCompleted
+                | RetryReplanningCase::ExpiredDispatched
         ) {
             let peers = nodes[0]
                 .lock()
@@ -22848,7 +22971,10 @@ mod tests {
                 let node = nodes[0].lock().unwrap();
                 let mut value = pending.plan.value.clone();
                 value.expires_at_unix_seconds = unix_seconds() + 3;
-                if replanning == RetryReplanningCase::ExpiredCompleted {
+                if matches!(
+                    replanning,
+                    RetryReplanningCase::ExpiredCompleted | RetryReplanningCase::ExpiredDispatched
+                ) {
                     value.coding_coordinator = member(3).node_id;
                     value.verification_coordinator = member(4).node_id;
                 }
@@ -22887,22 +23013,90 @@ mod tests {
                         .unwrap();
                     assert_eq!(node.coding_staged_receipt_count_for_test().unwrap(), 1);
                 }
-                if replanning != RetryReplanningCase::ExpiredCompleted {
+                if !matches!(
+                    replanning,
+                    RetryReplanningCase::ExpiredCompleted | RetryReplanningCase::ExpiredDispatched
+                ) {
                     let volume = temp.path().join("volume-0");
                     std::fs::rename(&volume, temp.path().join("offline-volume-0")).unwrap();
                     node.configure_storage_volumes(&[volume], 4 * 1024 * 1024, 0)
                         .unwrap();
                 }
             }
-            if replanning == RetryReplanningCase::ExpiredCompleted {
+            if replanning == RetryReplanningCase::ExpiredDispatched {
+                assert!(
+                    dispatch_next_coding_launch(nodes[0].clone(), &clients[0])
+                        .await
+                        .unwrap()
+                );
+                assert!(
+                    nodes[0]
+                        .lock()
+                        .unwrap()
+                        .claim_coding_launch()
+                        .unwrap()
+                        .is_none()
+                );
+                nodes[1]
+                    .lock()
+                    .unwrap()
+                    .reserve_coding_parity(&pending.plan, 1)
+                    .unwrap();
+                let (manifest, parity) = nodes[3]
+                    .lock()
+                    .unwrap()
+                    .encode_delegated_coding(&pending.plan, vec![Some(bytes.clone())])
+                    .unwrap();
+                nodes[1]
+                    .lock()
+                    .unwrap()
+                    .write_coding_parity_range(
+                        &pending.plan,
+                        &manifest,
+                        1,
+                        0,
+                        &parity[0][..MERKLE_LEAF_SIZE],
+                    )
+                    .unwrap();
+                // The remote queue has acknowledged the plan; no coding worker
+                // has run there, so no result or failure can already exist.
+                assert!(
+                    nodes[3]
+                        .lock()
+                        .unwrap()
+                        .claim_delegated_coding()
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            if matches!(
+                replanning,
+                RetryReplanningCase::ExpiredCompleted | RetryReplanningCase::ExpiredDispatched
+            ) {
                 clients[3].shutdown().await.unwrap();
                 network_tasks.remove(3).await.unwrap().unwrap();
             }
-            assert!(
-                !dispatch_next_coding_launch(nodes[0].clone(), &clients[0])
-                    .await
+            if replanning != RetryReplanningCase::ExpiredDispatched {
+                assert!(
+                    !dispatch_next_coding_launch(nodes[0].clone(), &clients[0])
+                        .await
+                        .unwrap()
+                );
+            } else {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                let volume = temp.path().join("volume-0");
+                std::fs::rename(&volume, temp.path().join("offline-volume-0")).unwrap();
+                nodes[0]
+                    .lock()
                     .unwrap()
-            );
+                    .configure_storage_volumes(&[volume], 4 * 1024 * 1024, 0)
+                    .unwrap();
+                assert!(
+                    !dispatch_next_coding_launch(nodes[0].clone(), &clients[0])
+                        .await
+                        .unwrap()
+                );
+            }
             let deferred = nodes[0]
                 .lock()
                 .unwrap()
@@ -22918,8 +23112,32 @@ mod tests {
                     .unwrap()
                     .is_some()
             );
-            if replanning == RetryReplanningCase::ExpiredCompleted {
+            if matches!(
+                replanning,
+                RetryReplanningCase::ExpiredCompleted | RetryReplanningCase::ExpiredDispatched
+            ) {
+                assert_eq!(
+                    deferred.dispatched,
+                    replanning == RetryReplanningCase::ExpiredDispatched
+                );
                 assert!(deferred.error.is_some());
+                if replanning == RetryReplanningCase::ExpiredDispatched {
+                    assert!(
+                        deferred
+                            .error
+                            .as_ref()
+                            .unwrap()
+                            .contains("expired launch cleanup deferred")
+                    );
+                    assert_eq!(
+                        nodes[0]
+                            .lock()
+                            .unwrap()
+                            .retired_coding_plan_for_test(pending.plan.value.attempt_id)
+                            .unwrap(),
+                        Some(pending.plan.clone())
+                    );
+                }
                 assert_eq!(
                     nodes[0]
                         .lock()
@@ -22970,7 +23188,11 @@ mod tests {
             }
         }
         for (index, client) in clients.iter().enumerate() {
-            if replanning != RetryReplanningCase::ExpiredCompleted || index != 3 {
+            if !matches!(
+                replanning,
+                RetryReplanningCase::ExpiredCompleted | RetryReplanningCase::ExpiredDispatched
+            ) || index != 3
+            {
                 client.shutdown().await.unwrap();
             }
         }
@@ -22984,6 +23206,7 @@ mod tests {
             RetryReplanningCase::StagingRestart
                 | RetryReplanningCase::ExpiredPartial
                 | RetryReplanningCase::ExpiredFinalized
+                | RetryReplanningCase::ExpiredDispatched
         ) {
             std::fs::rename(
                 temp.path().join("offline-volume-0"),
@@ -22995,7 +23218,9 @@ mod tests {
             && !stale_epoch
             && !matches!(
                 replanning,
-                RetryReplanningCase::Live | RetryReplanningCase::VerifiedEpochChange
+                RetryReplanningCase::Live
+                    | RetryReplanningCase::VerifiedEpochChange
+                    | RetryReplanningCase::VerifiedExpiry
             )
         {
             tokio::time::sleep(Duration::from_secs(4)).await;
@@ -23007,6 +23232,7 @@ mod tests {
                 | RetryReplanningCase::ExpiredPartial
                 | RetryReplanningCase::ExpiredFinalized
                 | RetryReplanningCase::ExpiredCompleted
+                | RetryReplanningCase::ExpiredDispatched
         ) {
             let mut node = nodes[0].lock().unwrap();
             node.configure_storage_volumes(&[temp.path().join("volume-0")], 4 * 1024 * 1024, 0)
@@ -23021,7 +23247,9 @@ mod tests {
                 node.coding_reservation_count_for_test().unwrap(),
                 if matches!(
                     replanning,
-                    RetryReplanningCase::ExpiredFinalized | RetryReplanningCase::ExpiredCompleted
+                    RetryReplanningCase::ExpiredFinalized
+                        | RetryReplanningCase::ExpiredCompleted
+                        | RetryReplanningCase::ExpiredDispatched
                 ) {
                     0
                 } else {
@@ -23073,8 +23301,17 @@ mod tests {
                 .install_guild_genesis(certificate.clone(), reopened_peers.clone())
                 .unwrap();
         }
+        if replanning == RetryReplanningCase::ExpiredDispatched {
+            clients[3].shutdown().await.unwrap();
+        }
         for (index, client) in clients.iter().enumerate().take(active_count) {
+            if replanning == RetryReplanningCase::ExpiredDispatched && index == 3 {
+                continue;
+            }
             for (remote, node) in nodes.iter().enumerate().take(active_count) {
+                if replanning == RetryReplanningCase::ExpiredDispatched && remote == 3 {
+                    continue;
+                }
                 if remote != index {
                     let id = node.lock().unwrap().keys().node_id();
                     client
@@ -23085,7 +23322,10 @@ mod tests {
                 }
             }
         }
-        if replanning != RetryReplanningCase::None {
+        if !matches!(
+            replanning,
+            RetryReplanningCase::None | RetryReplanningCase::ExpiredDispatched
+        ) {
             let peers = nodes[0]
                 .lock()
                 .unwrap()
@@ -23106,10 +23346,15 @@ mod tests {
             .unwrap();
             if matches!(
                 replanning,
-                RetryReplanningCase::Live | RetryReplanningCase::VerifiedEpochChange
+                RetryReplanningCase::Live
+                    | RetryReplanningCase::VerifiedEpochChange
+                    | RetryReplanningCase::VerifiedExpiry
             ) {
                 let node = nodes[0].lock().unwrap();
-                if replanning == RetryReplanningCase::VerifiedEpochChange {
+                if matches!(
+                    replanning,
+                    RetryReplanningCase::VerifiedEpochChange | RetryReplanningCase::VerifiedExpiry
+                ) {
                     let pending = node.claim_coding_launch().unwrap().unwrap();
                     assert!(pending.dispatched);
                     assert_eq!(pending.plan, accepted_evidence.as_ref().unwrap().value.plan);
@@ -23120,7 +23365,7 @@ mod tests {
                 assert_eq!(node.coding_reservation_count_for_test().unwrap(), 0);
                 assert_eq!(node.coding_used_bytes_for_test().unwrap(), 0);
             }
-        } else if queue_replacement {
+        } else if queue_replacement && replanning != RetryReplanningCase::ExpiredDispatched {
             let replacement = nodes[0]
                 .lock()
                 .unwrap()
@@ -23133,12 +23378,22 @@ mod tests {
                 .unwrap();
         }
         for (index, node) in nodes.iter().enumerate().take(active_count) {
+            if replanning == RetryReplanningCase::ExpiredDispatched && index == 3 {
+                continue;
+            }
             coding_tasks.push(tokio::spawn(run_delegated_coding_jobs(
                 node.clone(),
                 clients[index].clone(),
             )));
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        // Quorum collection and event dissemination each wait through a
+        // logical request deadline for the intentionally offline member.
+        let timeout = if replanning == RetryReplanningCase::ExpiredDispatched {
+            240
+        } else {
+            60
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
         loop {
             let complete = {
                 let node = nodes[0].lock().unwrap();
@@ -23227,6 +23482,15 @@ mod tests {
                     .unwrap();
                 assert_ne!(successor.value.attempt_id, expired.value.attempt_id);
                 assert!(successor.value.expires_at_unix_seconds > unix_seconds());
+                if replanning == RetryReplanningCase::ExpiredDispatched {
+                    for candidate in [
+                        successor.value.coding_coordinator,
+                        successor.value.verification_coordinator,
+                    ] {
+                        assert_ne!(candidate, expired.value.coding_coordinator);
+                        assert_ne!(candidate, expired.value.verification_coordinator);
+                    }
+                }
                 let current = node.dynamic_guild_state().unwrap().unwrap();
                 let retained = current
                     .coding_groups
@@ -23282,6 +23546,7 @@ mod tests {
                             | RetryReplanningCase::ExpiredPartial
                             | RetryReplanningCase::ExpiredFinalized
                             | RetryReplanningCase::ExpiredCompleted
+                            | RetryReplanningCase::ExpiredDispatched
                             | RetryReplanningCase::LaunchFairness
                     ) {
                         assert_eq!(evidence.retry_plan, old_job.retry_plan);
@@ -23351,6 +23616,7 @@ mod tests {
                                 replanning,
                                 RetryReplanningCase::Live
                                     | RetryReplanningCase::VerifiedEpochChange
+                                    | RetryReplanningCase::VerifiedExpiry
                             )
                     {
                         V1_SECTOR_SIZE as u64
@@ -23364,8 +23630,10 @@ mod tests {
             task.abort();
             let _ = task.await;
         }
-        for client in &clients {
-            client.shutdown().await.unwrap();
+        for (index, client) in clients.iter().enumerate() {
+            if replanning != RetryReplanningCase::ExpiredDispatched || index != 3 {
+                client.shutdown().await.unwrap();
+            }
         }
         for task in network_tasks {
             task.await.unwrap().unwrap();
@@ -23459,6 +23727,7 @@ mod tests {
                                     replanning,
                                     RetryReplanningCase::Live
                                         | RetryReplanningCase::VerifiedEpochChange
+                                        | RetryReplanningCase::VerifiedExpiry
                                 )
                         {
                             V1_SECTOR_SIZE as u64

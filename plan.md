@@ -605,7 +605,9 @@ M5-108/M5-109: safely renew expired durable launches and give deferred launches
 bounded scheduling turns. Both corrections and all 21 focused tests pass.
 Source-only review through `16c28a5` finds M5-110: acknowledged launches
 are skipped after expiry if their coordinator disappears. Correct this
-delegator recovery gap before the complete new local gate. The preceding
+delegator recovery gap before the complete new local gate. M5-110 is now
+implemented and its coordinator-loss, accepted-result, and lineage regressions
+pass locally; the complete M5-104 gate remains pending. The preceding
 records are closure history.
 Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
@@ -832,7 +834,8 @@ also finds M5-108 (expired launches cannot renew) and M5-109 (blocked staging
 launches hide later runnable launches). Both corrections and all 21 focused
 tests pass. Source-only review through `16c28a5` finds M5-110: current-epoch
 dispatched launches never reach expiry recovery after coordinator loss.
-Correct M5-110 and pass the complete new local gate before closure.
+M5-110 is now implemented with passing coordinator-loss, accepted-result, and
+lineage regressions. Pass the complete new local gate before closure.
 Milestone 6 waits. The complete M5-97 local gate passed on source `c7033fa`
 on 2026-09-26; provisioned acceptance ran at documentation-only successor
 `4170dce`. That gate remains historical evidence for its tested scenarios.
@@ -1987,11 +1990,27 @@ Allow the delegator to fence and clean expired dispatched work, preserving
 accepted verifier evidence, and choose reachable replacement coordinators.
 Keep signed history immutable and treat silence only as unavailability. Add an
 acknowledged-delegation/coordinator-loss regression through same-epoch expiry
-and reopen, fresh activation/checkpoint coverage, late-result rejection, all
+and reopen with a configured majority quorum, fresh activation/checkpoint
+coverage, late-result rejection, all
 holders' capacity/receipt cleanup, and repeated reopen. Exact source evidence
 and the correction gate are in `TODO.md`. Milestone 5 remains open for M5-110
 and the complete M5-104 local gate; Milestone 6 waits. This review ran no builds,
 tests, daemons, runtime probes, or remote compilation.
+
+M5-110's correction now lets expired dispatched launches reach durable cleanup
+and renewal. Deferral preserves acknowledgement, and fresh-role selection ranks
+reachable authenticated peers while excluding both silent-attempt coordinators.
+Existing successors and live replacements retain their immutable identity without
+another selection round. Accepted verifier evidence still precedes retirement.
+The real QUIC coordinator-loss case passes in 88.95 seconds, covering acknowledged
+delegation, partial parity upload, interrupted offline-volume cleanup, same-epoch
+reopen under an explicitly configured majority quorum, and fresh activation and
+checkpoint coverage with the old coordinator kept offline. Exact signed lineage,
+all holders' capacity/receipt cleanup, and two further reopens are checked. The
+accepted-result expiry/reopen case also passes. The node lineage case passes in
+16.43 seconds, including acknowledgement retention, valid late-result rejection,
+and idempotent successor reuse after a crash. The complete final M5-104 local
+workspace/provisioned gate remains required; Milestone 6 waits.
 
 Earlier source-only review of `c4e97f8..1f3141e` on 2026-09-26 found two
 production-worker blockers after M5-105 through M5-107. M5-108: a durable launch

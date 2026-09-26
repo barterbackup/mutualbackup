@@ -593,7 +593,9 @@ later runnable launches. Both corrections and all 21 focused tests now pass;
 the complete new M5-104 gate remains required. Source-only review of
 `1f3141e..16c28a5` finds M5-110: successfully dispatched current-epoch
 launches are skipped even after expiry, leaving coordinator-loss recovery
-unreachable. Correct M5-110 before the final gate. Milestone 6 waits.
+unreachable. M5-110 is now implemented with passing coordinator-loss,
+accepted-result, and lineage regressions. The complete final M5-104 gate remains
+required. Milestone 6 waits.
 M5-97 and earlier gate records remain evidence for their exact trees. This
 review ran no builds, tests, daemons, runtime probes, or remote compilation.
 
@@ -2640,7 +2642,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   validation passes: all four `launch_` tests in 69.49 seconds and all 17 `retry`
   tests in 35.46 seconds. The complete final M5-104 gate remains required.
 
-- [ ] **M5-110 / P1 — Recover expired launches after successful delegation.**
+- [x] **M5-110 / P1 — Recover expired launches after successful delegation.**
   Source-only review of `1f3141e..16c28a5` on 2026-09-26 finds that the new
   launch expiry transition cannot handle a coordinator disappearing after
   acknowledging delegation. Successful dispatch calls `complete_coding_launch`
@@ -2652,7 +2654,8 @@ node Clippy gate passed locally. No remote compilation server was used.
   (`network/p2p.rs:6346`–`:6352`), even after the delegator reopens in the same
   epoch. A concrete case is an acknowledged remote coordinator that stops
   before submitting either verifier evidence or a signed failure, while all
-  information/parity holders and alternative coordinators remain available.
+  information/parity holders, alternative coordinators, and enough members
+  to satisfy the configured quorum remain available.
   Only that remote coordinator can submit the normal failure report
   (`node.rs:5320`–`:5332`); its absence does not create a retry. The retained
   launch continues to count as pending (`node.rs:4369`–`:4376`), suppressing
@@ -2666,7 +2669,8 @@ node Clippy gate passed locally. No remote compilation server was used.
   Simply selecting the expired job is insufficient if renewal repeatedly
   copies the unavailable coordinator. Gate actual successful remote delegation
   followed by coordinator shutdown before result/failure submission, expiry,
-  and same-epoch delegator reopen. Keep the old coordinator unavailable while
+  and same-epoch delegator reopen under an explicitly configured majority
+  quorum. Keep the old coordinator unavailable while
   the production worker reaches fresh verification, activation, and checkpoint
   coverage. Assert immutable retired evidence, rejection of late old results,
   zero reservations/staged receipts, exact capacity on every holder, and two
@@ -2675,6 +2679,26 @@ node Clippy gate passed locally. No remote compilation server was used.
   their launch undispatched (`network/p2p.rs:22901`–`:22913`); they do not cover
   this acknowledged-delegation window. This review ran no builds, tests,
   daemons, runtime probes, or remote compilation.
+
+  The correction selects expired dispatched launches for delegator-owned
+  cleanup and renewal. Cleanup deferral retains the acknowledgement flag;
+  fresh-role selection excludes the silent attempt's coordinator pair and
+  ranks reachable authenticated peers. Persisted successors and existing live
+  replacements are reused without repeating selection. Accepted verifier
+  evidence retains priority over retirement. The real QUIC coordinator-loss
+  regression passes in 88.95 seconds: delegation is acknowledged, a partial
+  parity upload exists, the coordinator stops before reporting, and expiry
+  cleanup is interrupted by an offline input volume. Same-epoch reopen under
+  a previously configured majority quorum then reaches fresh verification,
+  activation, and checkpoint coverage while that coordinator remains offline.
+  Both replacement roles differ from both old roles. All holders have exact
+  expected used capacity and no staged receipts/reservations after two more
+  reopens. The accepted-result expiry/reopen regression also passes. The node
+  lineage regression passes in 16.43 seconds, including retained acknowledgement
+  across deferral, valid late-result rejection, and successor reuse after the
+  persistence/parent-removal crash window. Its transcript helper records a
+  verification time within the historical plan deadline. The complete final
+  M5-104 workspace/provisioned gate remains required. All validation is local.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
