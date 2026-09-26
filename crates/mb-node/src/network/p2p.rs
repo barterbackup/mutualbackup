@@ -7624,9 +7624,10 @@ async fn reconcile_variable_group_lifecycle_once(
                     .chain(&revision.value.data_sectors)
                     .cloned()
                     .collect::<Vec<_>>();
+                let commitments = revision.value.sector_commitments.clone();
                 let owner = revision.value.owner;
                 let uncovered = node_blocking(node.clone(), move |node| {
-                    node.uncovered_variable_sectors(owner, &sectors)
+                    node.uncovered_variable_sectors(owner, &sectors, commitments.as_deref())
                 })
                 .await?;
                 if !uncovered.is_empty() {
@@ -9513,31 +9514,46 @@ pub async fn audit_guild(
     p2p: &P2pClient,
     repair: bool,
 ) -> Result<crate::GuildAuditReport> {
-    let (checkpoint, roster, local_id, variable_groups) = node_blocking(node.clone(), |node| {
-        let guild = node
-            .guild_summary()?
-            .context("guild audit requires an installed guild")?;
-        let checkpoint = node
-            .current_checkpoint(guild.guild_id)?
-            .context("guild audit requires a committed checkpoint")?;
-        let variable_groups = node
-            .dynamic_guild_state()?
-            .context("guild audit requires dynamic guild state")?
-            .coding_groups
-            .into_iter()
-            .filter(|retained| {
-                variable_group_protects_checkpoint(&checkpoint.checkpoint, &retained.group)
-            })
-            .map(|retained| retained.group)
-            .collect::<Vec<_>>();
-        Ok((
-            checkpoint,
-            guild.peers,
-            node.keys().node_id(),
-            variable_groups,
-        ))
-    })
-    .await?;
+    let (checkpoint, roster, local_id, variable_groups, required_variable_sectors) =
+        node_blocking(node.clone(), |node| {
+            let guild = node
+                .guild_summary()?
+                .context("guild audit requires an installed guild")?;
+            let checkpoint = node
+                .current_checkpoint(guild.guild_id)?
+                .context("guild audit requires a committed checkpoint")?;
+            let variable_groups = node
+                .dynamic_guild_state()?
+                .context("guild audit requires dynamic guild state")?
+                .coding_groups
+                .into_iter()
+                .filter(|retained| {
+                    variable_group_protects_checkpoint(&checkpoint.checkpoint, &retained.group)
+                })
+                .map(|retained| retained.group)
+                .collect::<Vec<_>>();
+            let mut required_variable_sectors =
+                if matches!(checkpoint.checkpoint.format_version, 4..=7) {
+                    checkpoint_recovery_authentication(&checkpoint.checkpoint)
+                } else {
+                    BTreeMap::new()
+                };
+            for group in &checkpoint.checkpoint.coding_groups {
+                for role in &group.roles {
+                    if let ShardRole::Information(information) = role {
+                        required_variable_sectors.remove(&information.sector.id);
+                    }
+                }
+            }
+            Ok((
+                checkpoint,
+                guild.peers,
+                node.keys().node_id(),
+                variable_groups,
+                required_variable_sectors,
+            ))
+        })
+        .await?;
     checkpoint.verify()?;
     let checkpoint_hash = checkpoint.hash()?;
     for peer in &roster {
@@ -9783,18 +9799,34 @@ pub async fn audit_guild(
         };
         report.state = worse_protection_state(report.state, group_state);
     }
+    let mut authenticated_variable_sectors = BTreeSet::new();
     for group in variable_groups {
-        audit_variable_group(
-            node.clone(),
-            p2p,
-            &roster,
-            local_id,
-            checkpoint_hash,
-            &group,
-            repair,
-            &mut report,
-        )
-        .await?;
+        authenticated_variable_sectors.extend(
+            audit_variable_group(
+                node.clone(),
+                p2p,
+                &roster,
+                local_id,
+                checkpoint_hash,
+                &group,
+                &required_variable_sectors,
+                repair,
+                &mut report,
+            )
+            .await?,
+        );
+    }
+    for sector_id in required_variable_sectors
+        .keys()
+        .filter(|sector_id| !authenticated_variable_sectors.contains(*sector_id))
+    {
+        report.state = worse_protection_state(report.state, crate::ProtectionState::Unrecoverable);
+        if report.issues.len() < 256 {
+            report.issues.push(format!(
+                "checkpoint sector {} has no authenticated recoverable variable placement",
+                hex::encode(sector_id)
+            ));
+        }
     }
     let durable_report = report.clone();
     node_blocking(node, move |node| node.record_guild_audit(&durable_report)).await?;
@@ -9809,9 +9841,10 @@ async fn audit_variable_group(
     local_id: NodeId,
     checkpoint_hash: [u8; 32],
     group: &CodingGroupV2,
+    expected_sectors: &BTreeMap<SectorId, RecoverySectorAuthentication>,
     repair: bool,
     report: &mut crate::GuildAuditReport,
-) -> Result<()> {
+) -> Result<BTreeSet<SectorId>> {
     group.validate()?;
     report.checked_groups += 1;
     let mut shards = group
@@ -10047,7 +10080,29 @@ async fn audit_variable_group(
         ));
     }
     report.state = worse_protection_state(report.state, group_state);
-    Ok(())
+    let mut authenticated = BTreeSet::new();
+    if available >= required {
+        let mut reconstructed = shards;
+        if mb_core::reconstruct(group.profile, &mut reconstructed).is_ok() {
+            for (index, role) in group.roles.iter().enumerate() {
+                let ShardRoleV2::Information(information) = role else {
+                    continue;
+                };
+                let Some(expected) = expected_sectors.get(&information.sector.id) else {
+                    continue;
+                };
+                if !information.sector.virtual_zero
+                    && expected.matches_role(information)
+                    && reconstructed[index]
+                        .as_ref()
+                        .is_some_and(|bytes| expected.matches_bytes(bytes).unwrap_or(false))
+                {
+                    authenticated.insert(information.sector.id);
+                }
+            }
+        }
+    }
+    Ok(authenticated)
 }
 
 fn variable_shard_holder(role: &ShardRoleV2) -> NodeId {
@@ -10226,7 +10281,11 @@ struct VariableRecoveryPlan {
 
 #[derive(Clone)]
 enum RecoverySectorAuthentication {
-    Legacy { owner: NodeId, reference: SectorRef },
+    Legacy {
+        owner: NodeId,
+        reference: SectorRef,
+        commitment: Option<mb_core::MerkleCommitment>,
+    },
     Packed(PackedSectorDescriptor),
 }
 
@@ -10240,10 +10299,17 @@ impl RecoverySectorAuthentication {
 
     fn matches_role(&self, information: &InformationRoleV2) -> bool {
         match self {
-            Self::Legacy { owner, reference } => {
+            Self::Legacy {
+                owner,
+                reference,
+                commitment,
+            } => {
                 information.owner == *owner
                     && information.sector.id == reference.id
                     && information.sector.logical_len == reference.logical_len
+                    && commitment
+                        .as_ref()
+                        .is_none_or(|expected| information.sector.commitment == *expected)
             }
             Self::Packed(descriptor) => {
                 information.sector.id == descriptor.id
@@ -10255,7 +10321,16 @@ impl RecoverySectorAuthentication {
 
     fn matches_bytes(&self, bytes: &[u8]) -> Result<bool> {
         Ok(match self {
-            Self::Legacy { reference, .. } => sector_root(bytes) == reference.root,
+            Self::Legacy {
+                reference,
+                commitment,
+                ..
+            } => {
+                sector_root(bytes) == reference.root
+                    && commitment
+                        .as_ref()
+                        .is_none_or(|expected| merkle_commit(bytes).ok().as_ref() == Some(expected))
+            }
             Self::Packed(descriptor) => {
                 merkle_commit(bytes)? == descriptor.commitment
                     && (descriptor.flat_root == descriptor.commitment.root
@@ -10289,12 +10364,19 @@ fn checkpoint_recovery_authentication(
                     .metadata_sectors
                     .iter()
                     .chain(&revision.value.data_sectors)
-                    .map(|reference| {
+                    .enumerate()
+                    .map(|(index, reference)| {
                         (
                             reference.id,
                             RecoverySectorAuthentication::Legacy {
                                 owner: revision.value.owner,
                                 reference: reference.clone(),
+                                commitment: revision
+                                    .value
+                                    .sector_commitments
+                                    .as_ref()
+                                    .and_then(|commitments| commitments.get(index))
+                                    .cloned(),
                             },
                         )
                     })
@@ -16171,13 +16253,14 @@ mod tests {
         membership_epoch: u64,
         ordinal: u8,
         information_roots: Option<&BTreeMap<SectorId, [u8; 32]>>,
+        rootless: bool,
     ) -> SignedRecord<CodingVerificationTranscript> {
         let members = signing_keys.keys().copied().collect::<Vec<_>>();
         let coordinator = members[1];
         let verifier = members[2];
         let attempt_id = [ordinal; 16];
         let plan = CodingAttemptPlan {
-            format_version: 2,
+            format_version: if rootless { 1 } else { 2 },
             attempt_id,
             checkpoint_hash,
             membership_epoch,
@@ -16208,7 +16291,7 @@ mod tests {
             coding_coordinator: coordinator,
             verification_coordinator: verifier,
             expires_at_unix_seconds: u64::MAX,
-            information_roots: Some(
+            information_roots: (!rootless).then(|| {
                 group.roles[..usize::from(group.profile.data_shards)]
                     .iter()
                     .enumerate()
@@ -16224,8 +16307,8 @@ mod tests {
                             .unwrap_or_else(|| sector_root(&shards[index])),
                         _ => unreachable!(),
                     })
-                    .collect(),
-            ),
+                    .collect()
+            }),
         };
         let plan_hash = plan.hash().unwrap();
         let plan = SignedRecord::sign(
@@ -16568,6 +16651,7 @@ mod tests {
                 1,
                 index as u8 + 1,
                 Some(&packed_roots),
+                false,
             );
             crate::node::tests::install_test_recovery_transcript(&mut cold, &transcript);
         }
@@ -16836,7 +16920,7 @@ mod tests {
 
         let writer = ed25519_dalek::SigningKey::from_bytes(&[191; 32]);
         let mut revision = UserRevision {
-            format_version: 4,
+            format_version: 3,
             guild_id,
             protected_root_id: Uuid::from_bytes([192; 16]),
             cipher_profile: mb_core::V1_CIPHER_PROFILE,
@@ -16849,7 +16933,7 @@ mod tests {
             parent: None,
             metadata_sectors: vec![reference.clone()],
             data_sectors: Vec::new(),
-            sector_commitments: Some(vec![commitment]),
+            sector_commitments: None,
         };
         revision.sign_writer(&writer).unwrap();
         let revision = SignedRecord::sign(
@@ -16911,6 +16995,7 @@ mod tests {
             3,
             1,
             None,
+            false,
         );
         let redundant_information = redundant
             .roles
@@ -16933,6 +17018,7 @@ mod tests {
             3,
             3,
             None,
+            false,
         );
         let wrong_bytes = vec![18; V1_SECTOR_SIZE];
         let wrong_reference = SectorRef {
@@ -16975,6 +17061,7 @@ mod tests {
             3,
             2,
             None,
+            false,
         );
         let false_root_transcript = signed_replacement_transcript(
             &wrong,
@@ -16984,6 +17071,7 @@ mod tests {
             3,
             4,
             Some(&BTreeMap::from([(reference.id, reference.root)])),
+            false,
         );
         assert_eq!(
             replay_coding_transcript(&wrong_transcript).unwrap(),
@@ -17432,9 +17520,17 @@ mod tests {
             rule: QuorumRule::Majority,
         };
         let genesis_hash = [239; 32];
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[241; 32]);
         let state = DynamicGuildState {
             event_sequence: 1,
             event_head: [240; 32],
+            writer_keys: vec![mb_core::WriterKeyEpoch {
+                owner: owners[0],
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+                activated_at_event: 1,
+                revoked_at_event: None,
+            }],
             coding_groups: vec![mb_core::RetainedCodingGroup {
                 group: group.clone(),
                 added_at_event: 1,
@@ -17449,7 +17545,6 @@ mod tests {
             )
             .unwrap()
         };
-        let writer = ed25519_dalek::SigningKey::from_bytes(&[241; 32]);
         let mut revision = UserRevision {
             format_version: 4,
             guild_id,
@@ -17510,6 +17605,7 @@ mod tests {
             state.membership_epoch,
             1,
             None,
+            false,
         );
         let mut local = Node::open(temp.path().join("node"), local_seed).unwrap();
         crate::node::tests::install_test_checkpoint_and_dynamic_state(
@@ -17518,6 +17614,51 @@ mod tests {
             &state,
         );
         crate::node::tests::install_test_recovery_transcript(&mut local, &transcript);
+        assert!(
+            local
+                .uncovered_variable_sectors(
+                    owners[0],
+                    std::slice::from_ref(&references[0]),
+                    Some(std::slice::from_ref(&commitments[0])),
+                )
+                .unwrap()
+                .is_empty()
+        );
+        let false_commitment = merkle_commit(&vec![99; V1_SECTOR_SIZE]).unwrap();
+        assert_eq!(
+            local
+                .uncovered_variable_sectors(
+                    owners[0],
+                    std::slice::from_ref(&references[0]),
+                    Some(std::slice::from_ref(&false_commitment)),
+                )
+                .unwrap(),
+            vec![references[0].clone()],
+        );
+        let mut successor = checkpoint.checkpoint.clone();
+        successor.generation = 2;
+        successor.parent = Some(checkpoint_hash);
+        local
+            .validate_variable_checkpoint_coverage(&successor, false)
+            .unwrap();
+        let mut false_binding = successor.clone();
+        let mut changed_revision = false_binding.revisions[0].value.clone();
+        changed_revision.sector_commitments = Some(vec![false_commitment]);
+        changed_revision.sign_writer(&writer).unwrap();
+        false_binding.revisions = vec![
+            SignedRecord::sign(
+                mb_core::USER_REVISION_DOMAIN,
+                changed_revision,
+                signing_keys.get(&owners[0]).unwrap(),
+            )
+            .unwrap(),
+        ];
+        assert!(
+            local
+                .validate_variable_checkpoint_coverage(&false_binding, false)
+                .is_err(),
+            "a plan root claim cannot certify a different revision-signed commitment"
+        );
         let volume = temp.path().join("volume");
         std::fs::create_dir_all(&volume).unwrap();
         local
@@ -17600,6 +17741,7 @@ mod tests {
             RecoverySectorAuthentication::Legacy {
                 owner: owners[0],
                 reference: references[0].clone(),
+                commitment: Some(commitments[0].clone()),
             },
         )]));
         assert!(
@@ -17635,6 +17777,7 @@ mod tests {
                 RecoverySectorAuthentication::Legacy {
                     owner: owners[0],
                     reference: references[0].clone(),
+                    commitment: Some(commitments[0].clone()),
                 },
             ),
             (
@@ -17642,6 +17785,7 @@ mod tests {
                 RecoverySectorAuthentication::Legacy {
                     owner: owners[1],
                     reference: conflicting_second,
+                    commitment: None,
                 },
             ),
         ]));
@@ -17660,6 +17804,278 @@ mod tests {
             .await
             .unwrap(),
             BTreeSet::from([references[0].id]),
+        );
+        drop(p2p);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_legacy_revision_rejects_rootless_replacement_and_audit_exposes_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([245; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let signing_keys = (245_u8..250)
+            .map(|value| KeyMaterial::from_seed(&Seed::from_bytes([value; 32])))
+            .map(|keys| (keys.node_id(), keys))
+            .collect::<BTreeMap<_, _>>();
+        let peers = signing_keys
+            .values()
+            .enumerate()
+            .map(|(index, keys)| GuildPeer {
+                member: Member {
+                    node_id: keys.node_id(),
+                    recovery_public_key: keys.recovery_public_key(),
+                    failure_domain: format!("rootless-domain-{index}"),
+                },
+                endpoints: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let owner = peers
+            .iter()
+            .map(|peer| peer.member.node_id)
+            .find(|id| *id != local_id)
+            .unwrap();
+        let other_parity = peers
+            .iter()
+            .map(|peer| peer.member.node_id)
+            .find(|id| *id != local_id && *id != owner)
+            .unwrap();
+        let guild_id = [249; 32];
+        let expected_bytes = vec![41; V1_SECTOR_SIZE];
+        let wrong_bytes = vec![42; V1_SECTOR_SIZE];
+        let reference = SectorRef {
+            id: [250; 32],
+            root: sector_root(&expected_bytes),
+            logical_len: V1_SECTOR_SIZE as u32,
+        };
+        let wrong_reference = SectorRef {
+            root: sector_root(&wrong_bytes),
+            ..reference.clone()
+        };
+        let wrong_commitment = merkle_commit(&wrong_bytes).unwrap();
+        let lane = variable_coding_lane_with_capacity(
+            guild_id,
+            Uuid::from_bytes([251; 16]),
+            0,
+            &[VariableInformationInput {
+                owner,
+                sector: &wrong_reference,
+                commitment: &wrong_commitment,
+            }],
+            &peers,
+            None,
+            Some(&[local_id, other_parity]),
+        )
+        .unwrap();
+        let group = materialize_variable_lane(&lane, std::slice::from_ref(&wrong_bytes));
+        let information = group
+            .roles
+            .iter()
+            .take(usize::from(group.profile.data_shards))
+            .map(|role| match role {
+                ShardRoleV2::Information(info) if info.sector.virtual_zero => {
+                    vec![0; group.profile.shard_size as usize]
+                }
+                ShardRoleV2::Information(_) => wrong_bytes.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let shards = encode(group.profile, information).unwrap();
+        let local_target = group
+            .roles
+            .iter()
+            .position(
+                |role| matches!(role, ShardRoleV2::Parity(parity) if parity.holder == local_id),
+            )
+            .unwrap();
+        let quorum = QuorumPolicy {
+            format_version: 1,
+            rule: QuorumRule::Majority,
+        };
+        let genesis = GuildGenesis {
+            format_version: 1,
+            guild_id,
+            coordinator: peers[0].member.node_id,
+            members: peers.iter().map(|peer| peer.member.clone()).collect(),
+        };
+        let certificate = QuorumGuildGenesis {
+            signatures: signing_keys
+                .values()
+                .map(|keys| genesis.member_signature(keys).unwrap())
+                .collect(),
+            genesis,
+        };
+        certificate.verify().unwrap();
+        let state = DynamicGuildState {
+            event_sequence: 1,
+            event_head: [252; 32],
+            coding_groups: vec![mb_core::RetainedCodingGroup {
+                group: group.clone(),
+                added_at_event: 1,
+                retired_at_event: None,
+                retain_through_event: None,
+            }],
+            ..DynamicGuildState::new(
+                guild_id,
+                certificate.hash().unwrap(),
+                quorum,
+                peers.iter().map(|peer| peer.member.clone()).collect(),
+            )
+            .unwrap()
+        };
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[253; 32]);
+        let mut revision = UserRevision {
+            format_version: 3,
+            guild_id,
+            protected_root_id: Uuid::from_bytes([254; 16]),
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id: Uuid::from_bytes([255; 16]),
+            owner,
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![reference.clone()],
+            data_sectors: Vec::new(),
+            sector_commitments: None,
+        };
+        revision.sign_writer(&writer).unwrap();
+        let revision = SignedRecord::sign(
+            mb_core::USER_REVISION_DOMAIN,
+            revision,
+            signing_keys.get(&owner).unwrap(),
+        )
+        .unwrap();
+        let mut checkpoint = QuorumCheckpoint {
+            checkpoint: GuildCheckpoint {
+                format_version: 5,
+                guild_id,
+                genesis_hash: certificate.hash().unwrap(),
+                generation: 1,
+                parent: None,
+                members: peers.iter().map(|peer| peer.member.clone()).collect(),
+                writer_fences: vec![mb_core::WriterFence {
+                    owner,
+                    epoch: 1,
+                    public_key: writer.verifying_key().to_bytes(),
+                }],
+                revision_tombstones: Vec::new(),
+                revisions: vec![revision],
+                coding_groups: Vec::new(),
+                authority: Some(CheckpointAuthority {
+                    format_version: 1,
+                    membership_epoch: state.membership_epoch,
+                    quorum,
+                }),
+                packing_catalog: None,
+            },
+            signatures: Vec::new(),
+        };
+        for keys in signing_keys.values() {
+            checkpoint.add_signature(keys).unwrap();
+        }
+        let checkpoint_hash = checkpoint.hash().unwrap();
+        let transcript = signed_replacement_transcript(
+            &group,
+            &shards,
+            &signing_keys,
+            checkpoint_hash,
+            state.membership_epoch,
+            1,
+            None,
+            true,
+        );
+        let mut local = Node::open(temp.path().join("node"), local_seed).unwrap();
+        local
+            .adopt_recovered_guild(certificate, peers.clone())
+            .unwrap();
+        crate::node::tests::install_test_checkpoint_and_dynamic_state(
+            &mut local,
+            &checkpoint,
+            &state,
+        );
+        crate::node::tests::install_test_recovery_transcript(&mut local, &transcript);
+        let volume = temp.path().join("volume");
+        std::fs::create_dir_all(&volume).unwrap();
+        local
+            .configure_storage_volumes(&[volume], 16 * 1024 * 1024, 0)
+            .unwrap();
+        local
+            .stage_recovered_variable_shard(
+                &checkpoint_hash,
+                &transcript,
+                local_target as u16,
+                &shards[local_target],
+            )
+            .unwrap();
+        local
+            .activate_recovered_coding_attempt(checkpoint_hash, &transcript)
+            .unwrap();
+        let mut successor = checkpoint.checkpoint.clone();
+        successor.generation = 2;
+        successor.parent = Some(checkpoint_hash);
+        successor.validate().unwrap();
+        assert!(
+            local
+                .validate_variable_checkpoint_coverage(&successor, false)
+                .is_err(),
+            "a retained legacy revision cannot be signed against a new wrong-byte rootless group"
+        );
+        let node = Arc::new(Mutex::new(local));
+        let (commands, mut commands_rx) = mpsc::channel(16);
+        let (request_cancellations, _cancellations_rx) = mpsc::unbounded_channel();
+        let (_port_state, port_mapping_listener_state) =
+            watch::channel(PortMappingListenerState::Pending);
+        let p2p = P2pClient {
+            local_peer_id: local_id.libp2p_peer_id().unwrap(),
+            commands,
+            request_cancellations,
+            outbound_permits: Arc::new(Semaphore::new(8)),
+            cold_recovery_permit: Arc::new(Semaphore::new(1)),
+            port_mapping_listener_state,
+        };
+        let worker = tokio::spawn({
+            let group = group.clone();
+            async move {
+                while let Some(command) = commands_rx.recv().await {
+                    let Command::Request {
+                        recipient,
+                        request,
+                        response,
+                        ..
+                    } = command
+                    else {
+                        panic!("unexpected rootless audit command");
+                    };
+                    let reply = match *request {
+                        PeerRequest::GetVariableShard {
+                            guild_id: requested_guild,
+                            group_id,
+                            shard_index,
+                        } if requested_guild == guild_id && group_id == group.id => {
+                            let index = usize::from(shard_index);
+                            if variable_shard_holder(&group.roles[index]) == recipient {
+                                Ok(PeerResponse::Bytes(shards[index].clone()))
+                            } else {
+                                Err(anyhow::anyhow!("wrong audit shard holder"))
+                            }
+                        }
+                        _ => Err(anyhow::anyhow!("unexpected rootless audit request")),
+                    };
+                    let _ = response.send(reply);
+                }
+            }
+        });
+        let report = audit_guild(node, &p2p, false).await.unwrap();
+        assert_eq!(report.checked_groups, 1);
+        assert_eq!(report.assigned_shards_unavailable, 0);
+        assert_eq!(report.state, crate::ProtectionState::Unrecoverable);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.contains("no authenticated"))
         );
         drop(p2p);
         worker.await.unwrap();

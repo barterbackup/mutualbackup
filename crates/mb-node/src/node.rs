@@ -6184,7 +6184,7 @@ impl Node {
             anyhow::bail!("checkpoint and dynamic guild state differ");
         }
         let checkpoint_hash = checkpoint.hash()?;
-        let previous_revisions = if historical {
+        let previous_checkpoint = if historical {
             None
         } else {
             self.control
@@ -6194,10 +6194,17 @@ impl Node {
                         || (generation.checked_add(1) == Some(checkpoint.generation)
                             && checkpoint.parent == Some(*hash))
                 })
-                .map(|(_, _, bytes)| decode_canonical::<QuorumCheckpoint>(&bytes))
-                .transpose()?
-                .map(|previous| previous.checkpoint.revisions)
         };
+        let exact_committed_head =
+            previous_checkpoint
+                .as_ref()
+                .is_some_and(|(generation, hash, _)| {
+                    *generation == checkpoint.generation && *hash == checkpoint_hash
+                });
+        let previous_revisions = previous_checkpoint
+            .map(|(_, _, bytes)| decode_canonical::<QuorumCheckpoint>(&bytes))
+            .transpose()?
+            .map(|previous| previous.checkpoint.revisions);
         let legacy_coverage = checkpoint
             .coding_groups
             .iter()
@@ -6226,11 +6233,12 @@ impl Node {
             {
                 anyhow::bail!("checkpoint revision was signed by a superseded writer epoch");
             }
-            for reference in revision
+            for (index, reference) in revision
                 .value
                 .metadata_sectors
                 .iter()
                 .chain(&revision.value.data_sectors)
+                .enumerate()
             {
                 if checkpoint.format_version == 7 {
                     continue;
@@ -6242,7 +6250,13 @@ impl Node {
                     state,
                     revision.value.owner,
                     reference,
-                    historical || retained_revision,
+                    revision
+                        .value
+                        .sector_commitments
+                        .as_ref()
+                        .and_then(|commitments| commitments.get(index)),
+                    historical || exact_committed_head,
+                    !historical && !exact_committed_head,
                 )? {
                     anyhow::bail!(
                         "checkpoint sector has no verified variable coding group bound to its revision"
@@ -6313,13 +6327,25 @@ impl Node {
         &self,
         owner: NodeId,
         sectors: &[SectorRef],
+        commitments: Option<&[mb_core::MerkleCommitment]>,
     ) -> Result<Vec<SectorRef>> {
+        if commitments.is_some_and(|commitments| commitments.len() != sectors.len()) {
+            anyhow::bail!("revision sector commitments do not align with its sectors");
+        }
         let state = self
             .dynamic_guild_state()?
             .context("variable coverage requires dynamic guild state")?;
         let mut uncovered = Vec::new();
-        for sector in sectors {
-            if !self.verified_variable_sector_coverage(&state, owner, sector, false)? {
+        for (index, sector) in sectors.iter().enumerate() {
+            let expected_commitment = commitments.and_then(|commitments| commitments.get(index));
+            if !self.verified_variable_sector_coverage(
+                &state,
+                owner,
+                sector,
+                expected_commitment,
+                false,
+                expected_commitment.is_some(),
+            )? {
                 uncovered.push(sector.clone());
             }
         }
@@ -6350,7 +6376,9 @@ impl Node {
         state: &DynamicGuildState,
         owner: NodeId,
         reference: &SectorRef,
+        expected_commitment: Option<&mb_core::MerkleCommitment>,
         allow_legacy_root: bool,
+        require_signed_commitment: bool,
     ) -> Result<bool> {
         for retained in state
             .coding_groups
@@ -6373,6 +6401,15 @@ impl Node {
             }) else {
                 continue;
             };
+            let ShardRoleV2::Information(information) = &retained.group.roles[information_index]
+            else {
+                unreachable!("selected coding role must be information");
+            };
+            let commitment_matches = expected_commitment
+                .is_some_and(|expected| information.sector.commitment == *expected);
+            if require_signed_commitment && !commitment_matches {
+                continue;
+            }
             let Some(bytes) = self
                 .control
                 .get_record("coding-group-transcript", &retained.group.id)?
@@ -6388,7 +6425,8 @@ impl Node {
                     .value
                     .information_root(information_index)
                     == Some(reference.root)
-                    || allow_legacy_root && transcript.value.plan.value.format_version == 1)
+                    || transcript.value.plan.value.format_version == 1
+                        && (allow_legacy_root || commitment_matches))
             {
                 return Ok(true);
             }
@@ -9738,8 +9776,12 @@ pub(crate) fn variable_group_protects_checkpoint(
                             && information.owner == revision.value.owner
                             && revision.value.metadata_sectors.iter()
                                 .chain(&revision.value.data_sectors)
-                                .any(|reference| reference.id == information.sector.id
-                                    && reference.logical_len == information.sector.logical_len))
+                                .enumerate()
+                                .any(|(index, reference)| reference.id == information.sector.id
+                                    && reference.logical_len == information.sector.logical_len
+                                    && revision.value.sector_commitments.as_ref()
+                                        .and_then(|commitments| commitments.get(index))
+                                        .is_none_or(|commitment| *commitment == information.sector.commitment)))
                 })
             })
         })
@@ -14124,19 +14166,26 @@ pub(crate) mod tests {
             .install_guild_event(certified_writer_event)
             .unwrap();
         assert!(
-            node.uncovered_variable_sectors(members[2].node_id, std::slice::from_ref(&target))
-                .unwrap()
-                .is_empty()
+            node.uncovered_variable_sectors(
+                members[2].node_id,
+                std::slice::from_ref(&target),
+                None
+            )
+            .unwrap()
+            .is_empty()
         );
         let mut changed = target.clone();
         changed.root[0] ^= 1;
         assert_eq!(
-            node.uncovered_variable_sectors(members[2].node_id, &[changed.clone()])
+            node.uncovered_variable_sectors(members[2].node_id, &[changed.clone()], None)
                 .unwrap(),
             vec![changed]
         );
-        node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, false)
-            .unwrap();
+        assert!(
+            node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, false)
+                .is_err(),
+            "a new legacy checkpoint needs a revision-signed full-content commitment"
+        );
         node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, true)
             .unwrap();
         let checkpoint_hash = checkpoint.hash().unwrap();
@@ -14263,8 +14312,12 @@ pub(crate) mod tests {
             .unwrap();
         assert!(node.last_guild_audit().unwrap().is_none());
         assert_eq!(
-            node.uncovered_variable_sectors(members[2].node_id, std::slice::from_ref(&target))
-                .unwrap(),
+            node.uncovered_variable_sectors(
+                members[2].node_id,
+                std::slice::from_ref(&target),
+                None
+            )
+            .unwrap(),
             vec![target.clone()]
         );
         // A retained checkpoint remains valid while replacement work is
