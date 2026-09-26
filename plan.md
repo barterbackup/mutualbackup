@@ -1995,6 +1995,17 @@ M5-104 on the exact committed tree and record disposable-resource cleanup.
 Milestone 6 waits. This review ran no builds, tests, daemons, runtime probes,
 or remote compilation; earlier validation remains historical evidence.
 
+The subsequent local gate on `77c2090` passed strict Clippy and 48 core tests;
+the node suite had 269 passes and one relay/DCUtR fixture failure. Discovery
+had established a plain direct session before the intended relay circuit.
+The fixture now disables background DHT maintenance for its three initial
+nodes and starts a tracked policy dial over the actual circuit before running
+the first event loop. This uses the existing transport implementation and
+retains the hole-punch, relay-retirement, traffic-accounting and fallback
+assertions. The corrected targeted test passes locally in 20.30 seconds.
+M5-104 still requires the complete workspace and fresh provisioned gate on
+the final committed source; Milestone 6 waits.
+
 Source-only review of `1f3141e..16c28a5` on 2026-09-26 finds M5-110 after
 reviewing the launch renewal, staging metadata, fair selection, and restart
 regressions. A successful delegation leaves a durable launch marked dispatched.

@@ -2449,6 +2449,20 @@ node Clippy gate passed locally. No remote compilation server was used.
   remains open for this gate; previous validation records do not establish
   completion of the final tree.
 
+  The subsequent local workspace gate on `77c2090` passed strict Clippy and
+  48 core tests, but finished with 269 node passes and one relay/DCUtR fixture
+  failure: discovery established a plain direct session before the intended
+  relay circuit, so the test never exercised hole punching. The fixture now
+  disables background DHT maintenance for its initial three nodes, retains the
+  actual circuit address, and starts a tracked policy dial before the first
+  event loop runs. A raw swarm-dial intermediate failed its first request and
+  was replaced by that existing policy-dial path. Production transport is
+  unchanged; all hole-punch, relay-retirement, application-byte and fallback
+  assertions remain. The corrected targeted regression passes in 20.30 seconds
+  (`cargo test --locked --workspace --all-targets
+  relay_circuit_supports_application_requests_and_dcutr_upgrade -- --nocapture`).
+  The complete workspace and fresh provisioned gate remain required.
+
   Correct M5-110 after the M5-108/M5-109 follow-up, then review the complete
   M5-103 follow-up and its production-worker restart/replanning regressions.
   Then run formatting, locked all-target workspace tests, strict locked

@@ -24200,6 +24200,7 @@ mod tests {
             .parse()
             .unwrap();
         let mut relay_config = config(relay_id);
+        relay_config.enable_dht_maintenance = false;
         relay_config.listen_addresses = vec![relay_transport.clone()];
         relay_config.external_addresses = vec![relay_transport];
         let (relay_client, relay_loop) =
@@ -24226,6 +24227,7 @@ mod tests {
         first_config.listen_addresses = vec![first_transport.clone()];
         first_config.external_addresses = vec![first_transport];
         first_config.enable_relay_server = false;
+        first_config.enable_dht_maintenance = false;
         first_config.relay_reservation_addresses = vec![relay_address.clone()];
         let mut second_config = config(second_id);
         let second_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -24239,19 +24241,29 @@ mod tests {
         second_config.listen_addresses = vec![second_transport.clone()];
         second_config.external_addresses = vec![second_transport];
         second_config.enable_relay_server = false;
+        second_config.enable_dht_maintenance = false;
         second_config.relay_reservation_addresses = vec![relay_address.clone()];
-        let (first_client, first_loop) =
+        let (first_client, mut first_loop) =
             build_p2p(Arc::new(Mutex::new(first_node)), first_config).unwrap();
         let (second_client, second_loop) =
             build_p2p(Arc::new(Mutex::new(second_node)), second_config).unwrap();
-        let first_task = tokio::spawn(first_loop.run());
         let second_task = tokio::spawn(second_loop.run());
 
         let second_relayed = relayed_address(&second_client).await;
-        first_client
-            .add_peer_address(second_id, second_relayed)
-            .await
+        // Discovery may otherwise find a plain direct path before the first
+        // application request. Start the intended relay circuit explicitly so
+        // this case actually exercises DCUtR rather than ordinary dialing.
+        let second_peer = second_id.libp2p_peer_id().unwrap();
+        first_loop
+            .add_learned_address(second_peer, second_relayed.clone())
             .unwrap();
+        assert!(first_loop.start_policy_dial(
+            second_peer,
+            first_loop.selected_transport_tier(second_peer),
+            vec![second_relayed],
+            PolicyDialKind::Selected,
+        ));
+        let first_task = tokio::spawn(first_loop.run());
         let profile = first_client.profile(second_id).await.unwrap();
         assert_eq!(profile.member.node_id, second_id);
         let dcutr_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
