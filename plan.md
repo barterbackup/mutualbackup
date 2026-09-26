@@ -114,7 +114,12 @@ accept an inconsistent revision-signed flat root and Merkle commitment through
 a format-2 plan's root claim. M5-92, M5-96, and the local M5-97 gate remain
 open on `308b156`. Commit `c7cc6fd` requires a replay-verified full-byte
 binding for new legacy checkpoint coverage, including retained revisions.
-M5-92 through M5-96 are corrected; the complete M5-97 gate is pending.
+M5-92 through M5-96 are corrected. Source-only review of `e64f76e` on
+2026-09-26 finds M5-98 through M5-100: upgraded plans collide with durable old
+attempt identities, unchanged group identities prevent replacing compact
+evidence with full-byte proof, and raw witness bounds do not ensure CBOR
+messages fit the peer frame. Those corrections and the complete M5-97 gate
+remain pending; Milestone 6 waits.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -533,7 +538,9 @@ Another source-only review found M5-89 and M5-90. Their corrections and the
 complete M5-91 local gate passed on 2026-09-25. A further source-only review
 found M5-92 through M5-96, so Milestone 5 is reopened and Milestone 6 waits
 for the correction and closure gate. M5-91 remains evidence for its exact
-source tree.
+source tree. Source-only review of `e64f76e` on 2026-09-26 finds M5-98 through
+M5-100 in the stronger legacy proof's migration and encoded-frame handling;
+these also require correction before M5-97 and Milestone 6.
 Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
@@ -788,7 +795,11 @@ binding is needed. Replay checks both roots against those bytes. New legacy
 variable and old flat-root packed checkpoint coverage requires this proof;
 compact production packed coding remains unchanged. Focused local regressions
 pass for forged claims and retained revisions. M5-92 and M5-96 are corrected,
-and M5-97 is the remaining closure gate.
+and M5-97 remains the closure gate. Source-only review of the follow-up through
+`e64f76e` finds migration and encoded-frame blockers M5-98 through M5-100.
+Stronger legacy proofs must have a usable durable attempt/group upgrade path,
+preserve historical recovery, and fit every containing peer message before
+the complete local gate can close Milestone 5.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1438,6 +1449,19 @@ M5-97 in `TODO.md`. The review ran no builds, tests, daemons, runtime probes,
 or remote compilation. M5-91 remains historical evidence for source commit
 `09e9379`; Milestone 5 is reopened and Milestone 6 waits.
 
+Source-only review of the full-byte legacy-proof follow-up through `e64f76e`
+on 2026-09-26 finds three further blockers. Format-3 plans reuse format-2
+attempt IDs, conflicting with durable interrupted jobs. Identical bytes and
+placement also reuse the certified group's ID, whose immutable transcript
+record rejects the stronger evidence. Finally, the 512 KiB raw witness limit
+does not account for CBOR integer-array expansion or containing peer-message
+overhead, so accepted profiles can exceed the 600 KiB transport frame.
+M5-98 through M5-100 in `TODO.md` specify the correction and regression gates.
+M5-92 through M5-96's authentication corrections remain implemented, but
+Milestone 5 is unfinished until migration and transport work and M5-97 pass.
+This review ran no builds, tests, daemons, or runtime probes and used no remote
+compilation.
+
 The M5-42 rejected-connection cleanup was source-reviewed and found to remove
 only the rejected connection while preserving accepted siblings. This review
 ran no builds, tests, daemons, runtime probes, or remote compilation.
@@ -1917,7 +1941,12 @@ local closure gate remains open; Milestone 6 waits. Commit `c7cc6fd` supplies
 that proof in a signed full-byte legacy manifest, and new checkpoint signing
 requires its successful replay. Correct legacy revisions without separately
 signed Merkle commitments can still use the proof. All M5-92 through M5-96
-corrections are implemented; M5-97 has not yet passed on this tree.
+corrections are implemented. Source-only review of `e64f76e` found M5-98
+through M5-100: old durable attempt identities collide with upgraded plans,
+existing certified group identities reject stronger transcripts, and the raw
+witness bound does not guarantee transportable CBOR frames. Implement and
+review those corrections before running the complete M5-97 local gate.
+Milestone 5 remains open and Milestone 6 waits.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and

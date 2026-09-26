@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (reopened 2026-09-25)
+## Milestone 5 guild geometry and coding protocol (reopened 2026-09-26)
 
 Source-only review of `8135e0b..da8974a` on 2026-09-18 found the M5-36 through
 M5-44 blockers below; all are now corrected. The production gate recorded in
@@ -641,6 +641,12 @@ checkpoint coverage requires that proof; format-1/2 transcripts remain valid
 for historical checkpoints but cannot protect a new one. Focused local tests
 pass for forged claims, retained revisions, and a correct old revision without
 a signed Merkle commitment. M5-92 and M5-96 are corrected; M5-97 remains open.
+Source-only review of `c7cc6fd..e64f76e` on 2026-09-26 finds M5-98 through
+M5-100 below: the stronger legacy proof cannot reliably replace durable old
+attempt/group evidence, and its raw-byte bound does not ensure it fits the
+CBOR peer transport. Milestone 5 remains open; Milestone 6 waits for these
+corrections and M5-97. This review ran no builds, tests, daemons, or runtime
+probes and used no remote compilation.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -2186,14 +2192,67 @@ node Clippy gate passed locally. No remote compilation server was used.
   an inconsistent retained revision; audit continues to check reconstructed
   bytes against the committed checkpoint.
 
-- [ ] **M5-97 / gate — Close Milestone 5 after M5-92 through M5-96.**
+- [ ] **M5-97 / gate — Close Milestone 5 after the root-binding and migration corrections.**
   After correcting the source blockers, run fresh source review, formatting,
   locked all-target workspace tests, warning-free locked all-target workspace
   Clippy, Docker lab safety, and the complete provisioned Btrfs/network
   acceptance script on a fresh disposable local filesystem. Build and run
   locally; do not use a remote compilation server. M5-91 remains historical
   evidence for its exact source tree. M5-92 and M5-96 are corrected in
-  `c7cc6fd`; the complete gate has not yet run on that source tree.
+  `c7cc6fd`; the complete gate has not yet passed on the final corrected tree.
+  Source review of `e64f76e` found M5-98 through M5-100 below; correct these
+  before running and recording the complete local closure gate.
+
+- [ ] **M5-98 / P1 — Give upgraded legacy attempts a distinct durable identity.**
+  `queue_variable_coding_lanes` now emits format-3 legacy plans but derives
+  `attempt_id` from the same checkpoint, geometry, and information roots as
+  the former format-2 plan, without including the plan version
+  (`crates/mb-node/src/network/p2p.rs:12358`–`:12380`).
+  `same_coding_lane_attempt` requires matching format versions, and
+  `enqueue_coding_launch` rejects collisions with durable launch, retry, or
+  activation records (`crates/mb-node/src/node.rs:276`–`:284`,
+  `:3941`–`:3973`). Restarting interrupted legacy coding after upgrading
+  therefore repeatedly rejects the stronger plan instead of scheduling it.
+  Separate upgraded attempt identities while preserving historical retry and
+  decoding behavior. Gate an installed format-2 launch, retry, and activation
+  record against scheduling the same lane with format 3 after reopening the
+  node; the stronger attempt must make progress without deleting old evidence.
+
+- [ ] **M5-99 / P1 — Permit stronger evidence for an already certified legacy group.**
+  Even with a fresh attempt ID, `encode_coding_attempt` always emits a
+  format-2 group with the same roles and commitments
+  (`crates/mb-core/src/attempt.rs:715`–`:723`). The group's ID excludes the
+  plan version and root-binding evidence (`crates/mb-core/src/model.rs:285`–
+  `:292`), so recoding identical bytes and placements reproduces its old ID.
+  `validate_coding_transcript_storage_conflicts` rejects any different
+  transcript stored under that group ID (`crates/mb-node/src/node.rs:2861`–
+  `:2885`), and `commit_verified_coding_group` returns immediately when the
+  descriptor already exists (`crates/mb-node/src/network/p2p.rs:6942`–`:6947`).
+  New legacy checkpoint coverage now requires format-3 evidence, so a
+  certified old group cannot acquire the proof required to protect a successor.
+  Define an authenticated evidence upgrade or a distinct group identity for
+  stronger proofs, keeping old checkpoints recoverable and conflicting
+  evidence rejected. Gate a durable certified format-2 group, then a correct
+  full-byte proof for the same bytes/placement through activation, event
+  persistence, restart, successor checkpoint signing, and historical recovery.
+
+- [ ] **M5-100 / P2 — Bound full-byte manifests by encoded peer-frame size.**
+  Format-3 validation permits `k * shard_size` up to 512 KiB
+  (`crates/mb-core/src/attempt.rs:250`–`:253`), claiming this fits a 600 KiB
+  frame. The payload is ordinary nested `Vec<u8>` (`:293`), serialized by
+  Serde as integer sequences rather than CBOR byte strings. Values at least
+  24 require two CBOR bytes. A valid `4+2` profile with 128 KiB information
+  shards can therefore produce a manifest exceeding 600 KiB before envelope
+  overhead; parity staging also carries a complete parity object
+  (`crates/mb-node/src/network/wire.rs:143`–`:147`). The QUIC codec enforces
+  that frame limit (`crates/mb-node/src/network/p2p.rs:712`–`:718`;
+  `crates/mb-node/src/network.rs:75`). Such accepted plans cannot complete
+  remote staging or transcript exchange. Use a version-compatible compact
+  byte representation and budget every containing request/response, or split
+  the authenticated witness into bounded messages. Gate worst-case payloads
+  at the largest accepted geometry through actual encoded staging, challenge,
+  transcript, and event-tail envelopes on both peer transports; keep legacy
+  manifest serialization compatible.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
