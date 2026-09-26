@@ -58,9 +58,10 @@ them as ADRs and test vectors before promising wire compatibility.
 
 ### Implemented baseline — efficient and flexible guild protocol beta reopened
 
-Milestones 0 through 4 have passed. Milestone 5 remains open for M5-116's
-acknowledged retry successor recovery, M5-117's cleanup-completion correction,
-and the complete M5-114 final local gate.
+Milestones 0 through 4 have passed. Milestone 5 remains open for the complete
+M5-114 final local gate after acknowledged retry recovery and confirmed cleanup
+completion (M5-116/M5-117). Those corrections now distinguish delegation
+acknowledgement from terminal cleanup and retain accepted child ownership.
 M5-113 now transfers packed input intent atomically and resumes successor
 uploads before delegation; its production partial-upload/offline/reopen,
 checkpoint, capacity and cache/GC regressions pass locally.
@@ -70,10 +71,10 @@ submissions without blocking later stale cleanup. Focused local regressions,
 strict locked mb-node all-target Clippy and formatting pass; full workspace
 and fresh provisioned validation on the corrected final commit are pending.
 Milestone 6 waits. Earlier source-only review records remain historical.
-The M5-113 ownership audit also found M5-116: acknowledged retry successors
-have completed parents that the worker never reclaims for expiry or stale
-cleanup. Correct that selection gap and gate packed successor silence before
-closing M5-114; retained input intent must have a reachable recovery owner.
+The M5-113 ownership audit found M5-116's unreachable acknowledged-successor
+recovery; the correction now gives retained input intent a reachable recovery
+owner. M5-117 also requires confirmed cleanup rather than treating a retirement
+fence as completion. Both paths remain part of the final M5-114 gate.
 
 The previous complete final M5-104 local gate on
 2026-09-26 passed against `f8e47d34d62a073db6953260571441525dc5e2ac`, including
@@ -605,7 +606,7 @@ machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
 than a daemon prerequisite. Milestones 0 through 4 have passed. Milestone 5
-remains open for M5-116/M5-117 and the new M5-114 gate; Milestone 6 waits.
+remains open for the final M5-114 gate; Milestone 6 waits.
 M5-111/M5-112/M5-113/M5-115 corrections pass focused local validation. Complete locked
 workspace and fresh Btrfs/network gates on the final corrected commit remain
 required. All compilation and execution take place locally.
@@ -861,15 +862,15 @@ integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
 **Current position:** Milestones 0 through 4 are passed. Milestone 5 remains
-open for acknowledged retry successor recovery (M5-116), confirmed cleanup
-completion (M5-117), and the complete final committed-source gate (M5-114).
+open for the complete final committed-source gate (M5-114). Acknowledged retry
+successor recovery (M5-116) and confirmed cleanup completion (M5-117) are
+implemented; a fence or delayed acknowledgement cannot replace holder cleanup.
 Packed-input restaging (M5-113), cleanup/verifier
 arbitration, expired-launch
 failure ownership, and retired durable submission reconciliation
 (M5-111/M5-112/M5-115) are implemented with passing focused local regressions.
-Make acknowledged retry expiry and stale cleanup reachable without treating
-a fence and missing descriptors as completed holder cleanup, then run the full
-workspace and fresh local Btrfs/network acceptance gate and verify disposable
+Run the full workspace and fresh local Btrfs/network acceptance gate on the
+corrected final commit and verify disposable
 resource cleanup before Milestone 6. The earlier
 M5-104 gate on `f8e47d3`, including all 23 provisioned invocations and verified
 cleanup, remains passing historical evidence; it does not establish coverage
@@ -2015,6 +2016,30 @@ source locations, failure cases, and recorded gate evidence.
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
 ### Milestone 5 — efficient and flexible data/guild protocol (reopened)
+
+M5-116/M5-117 implementation update (2026-09-26): durable claims reclaim an
+acknowledged child after expiry, staleness or retirement unless terminal cleanup
+or accepted submission ownership exists. Live unfenced acknowledgement remains
+quiescent. Successor retirement atomically yields to accepted child results or
+failures. Cleanup success is distinct from dispatch acknowledgement; neither
+missing packed descriptors nor a fence appearing during a delayed acknowledgement
+can release cleanup ownership. Exact signed-child terminal metadata prevents
+completed histories from reopening, while late parent completion preserves
+child-owned retry inputs. Existing signed records and job encodings stay intact.
+The remotely placed packed successor regression exercises actual signed expiry,
+silent coder/reopen, fresh roles, verifier/activation/checkpoint coverage and
+exact holder cleanup. A separate descriptor-less QUIC regression covers a
+retirement request followed by coder shutdown before deletion, delayed parent
+acknowledgement, an offline volume, delegator-only cleanup after reopen, and
+exact zero holder bytes/receipts/reservations through repeated reopen. Controlled
+ownership coverage includes accepted child activation/failure and live fenced
+acknowledgement. All 17 focused retry tests pass together in 382.28 seconds;
+strict locked mb-node/mb-store all-target Clippy, formatting and whitespace
+checks pass. Final source inspection finds no remaining implementation blocker
+in these corrections. M5-114's full final committed-source local gate remains required;
+Milestone 6 waits. Detailed validation outcomes are recorded in TODO.md.
+
+Earlier source-review record:
 
 Latest source-only review (2026-09-26) covers `88898a6..687e207` plus the
 pending M5-116 source changes. Acknowledged successor recovery is now present

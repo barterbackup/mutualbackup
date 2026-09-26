@@ -576,6 +576,23 @@ implementation; Milestone 4 was reopened until they were resolved.
 
 ## Milestone 5 guild geometry and coding protocol (reopened 2026-09-26)
 
+M5-116/M5-117 implementation update (2026-09-26): acknowledged retry parents
+now remain quiescent only while their successor is live and unfenced, or after
+explicit terminal cleanup/submission ownership. Expired, stale or retired
+successors without accepted evidence are reclaimed durably. A fence never
+proves holder deletion, regardless of descriptor presence or a delayed
+delegation acknowledgement. Retry execution reports successful cleanup
+separately from acknowledgement. Only confirmed cleanup or authenticated
+submission ownership can release input intent and publish terminal metadata.
+Accepted child result/failure
+owners win successor retirement arbitration under the writer lock; late parent
+completion preserves child-owned input intent. Terminal metadata binds the
+exact signed child without changing persisted job encodings or signed records.
+Milestone 5 remains open for the complete final M5-114 gate; Milestone 6 waits.
+All compilation and execution are local.
+
+Earlier source-review record:
+
 Latest source-only review covers `88898a6..687e207` and the pending M5-116
 changes in `crates/mb-node/src/node.rs` and `network/p2p.rs`. The committed
 M5-111/M5-112/M5-113/M5-115 corrections preserve cleanup/submission ownership
@@ -3026,7 +3043,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   `/tmp/mutualbackup-m5-112-failure-unrelated-v2.log`. M5-113 and the complete
   exact-commit M5-114 gate remain open. All builds and runs are local.
 
-- [ ] **M5-116 / P1 — Recover acknowledged retry successors after silence or epoch change.**
+- [x] **M5-116 / P1 — Recover acknowledged retry successors after silence or epoch change.**
   The input-intent audit during M5-113 implementation found a separate owner
   gap. `process_coding_retry_job` completes the parent when successor delegation
   returns an acknowledgement (`crates/mb-node/src/network/p2p.rs:6252`;
@@ -3065,7 +3082,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   test installs `Some(BTreeMap::new())` and does not exercise absent intent or
   interrupted remote cleanup after an independently established fence.
 
-- [ ] **M5-117 / P2 — Do not infer completed retry cleanup from absent input intent.**
+- [x] **M5-117 / P2 — Do not infer completed retry cleanup from absent input intent.**
   In the pending M5-116 source, `coding_retry_needs_recovery` treats an exact
   child retirement fence plus absent parent/child `coding-launch-information`
   records as terminal cleanup (`crates/mb-node/src/node.rs:5606`–`:5629`). It
@@ -3104,6 +3121,48 @@ node Clippy gate passed locally. No remote compilation server was used.
   converges, every holder's exact capacity and zero staged receipts/reservations,
   and terminal history remains complete through repeated reopen. This finding
   is source-only and applies to the uncommitted M5-116 correction.
+
+  Implementation update (2026-09-26): recovery no longer interprets absent
+  descriptors as cleanup confirmation. A signed fence makes acknowledged work
+  eligible immediately, even before its deadline. The worker distinguishes
+  delegation acknowledgement from successful holder cleanup; delayed
+  acknowledgement cannot delete input intent or publish a terminal marker just
+  because another actor retired the child. Explicit cleanup completion checks
+  the exact fence and publishes terminal history atomically with metadata
+  release. Already accepted child result/failure ownership takes priority and
+  preserves the child's own retry inputs. Existing descriptor-less histories
+  without terminal evidence are reconciled once rather than silently skipped.
+
+  The new real QUIC fixture acknowledges a descriptor-less successor, finishes
+  one parity row and partially uploads another on different holders, advances
+  an unrelated member's epoch, and retires the successor through the actual
+  coder-to-delegator request. The coder's network then stops before deletion.
+  A delayed parent acknowledgement leaves cleanup reachable. An offline holder
+  defers the delegator's production cleanup; reopen retains that exact job.
+  Restoring the volume and starting only the delegator's worker clears all
+  holder bytes, receipts and reservations with the coder still offline. Two
+  further reopens retain exact signed failure/successor/fence history and leave
+  terminal cleanup unclaimed. The controlled ownership regression also covers
+  expiry, stale acknowledgement, accepted child activation/failure, absent
+  descriptors, and retirement before a late acknowledgement with retained
+  packed intent. Both result/failure ownership and terminal cleanup survive
+  repeated reopen.
+
+  Final focused validation for M5-116/M5-117 passes locally: all 17 `retry_`
+  tests pass together in 382.28 seconds, including actual signed packed-child
+  expiry, silent coder/reopen, fresh roles, verifier acceptance, activation and
+  checkpoint coverage, all-holder exact capacity and repeated cleanup checks.
+  The suite also covers the new descriptor-less coder-shutdown schedule, all
+  six controlled ownership cases, existing staging/fairness/history cases and
+  packed cache lifetime. Strict locked mb-node/mb-store all-target Clippy passes
+  in 38.80 seconds; formatting and whitespace checks pass. Logs are
+  `/tmp/mutualbackup-m5-116-117-retries-v2.log` and
+  `/tmp/mutualbackup-m5-116-117-clippy-v4.log`. Earlier development runs predate
+  the separate acknowledgement/cleanup correction and are not final evidence;
+  failed Clippy runs identified corrected style issues. Final source inspection
+  finds no remaining blocker in these ownership/cleanup corrections. The full
+  exact-commit M5-114 workspace and fresh provisioned acceptance gate remain
+  required. All builds and runs were local.
 
 - [ ] **M5-114 / gate — Recheck Milestone 5 after cleanup ownership and packed retries.**
   Correct M5-111 through M5-113 and M5-115 through M5-117, then source-review

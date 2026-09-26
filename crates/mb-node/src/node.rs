@@ -5489,13 +5489,14 @@ impl Node {
         // Keep input intent under this failed ID until a successor has taken
         // durable ownership. Parent receipts are gone, so every successor must
         // stage its own information before delegation.
-        let mut deletions = self.coding_retry_parent_input_deletions(plan)?;
+        let mut records = Vec::new();
+        let mut deletions = self.coding_retry_parent_input_deletions(plan, &mut records)?;
         deletions.extend([
             ("coding-launch-job".to_owned(), attempt_id.to_vec()),
             ("coding-launch-staged".to_owned(), attempt_id.to_vec()),
         ]);
         let input = self.coding_retry_information(plan)?;
-        let mut records = vec![(
+        records.push((
             "coding-retry-job".to_owned(),
             attempt_id.to_vec(),
             canonical_bytes(&CodingRetryJob {
@@ -5505,7 +5506,7 @@ impl Node {
                 complete: false,
                 error: None,
             })?,
-        )];
+        ));
         if let Some(input) = input {
             records.push((
                 "coding-launch-information".to_owned(),
@@ -5521,9 +5522,17 @@ impl Node {
         &self,
         after: Option<[u8; 16]>,
     ) -> Result<Option<CodingRetryJob>> {
+        self.claim_coding_retry_at(after, unix_seconds())
+    }
+
+    fn claim_coding_retry_at(
+        &self,
+        after: Option<[u8; 16]>,
+        now: u64,
+    ) -> Result<Option<CodingRetryJob>> {
         let mut first = None;
         for (_, bytes) in self.control.records("coding-retry-job")? {
-            let job: CodingRetryJob = decode_canonical(&bytes)?;
+            let mut job: CodingRetryJob = decode_canonical(&bytes)?;
             if job.format_version != 1 {
                 anyhow::bail!("durable coding retry job is invalid");
             }
@@ -5534,6 +5543,13 @@ impl Node {
             {
                 anyhow::bail!("durable coding retry job belongs to another delegator");
             }
+            if job.complete && self.coding_retry_needs_recovery(&job, now)? {
+                // Acknowledgement is quiescent ownership, not terminal evidence.
+                // Reclaim expired, stale or retired successors lacking submission.
+                job.complete = false;
+                job.error = None;
+                self.put_coding_retry_job(&job)?;
+            }
             if !job.complete {
                 if after.is_none_or(|cursor| job.failure.value.plan.value.attempt_id > cursor) {
                     return Ok(Some(job));
@@ -5542,6 +5558,64 @@ impl Node {
             }
         }
         Ok(first)
+    }
+
+    fn coding_retry_needs_recovery(&self, job: &CodingRetryJob, now: u64) -> Result<bool> {
+        let Some(child) = &job.retry_plan else {
+            return Ok(false);
+        };
+        let terminal_hash = *blake3::hash(&canonical_bytes(child)?).as_bytes();
+        if let Some(bytes) = self.control.get_record(
+            "coding-retry-terminal",
+            &job.failure.value.plan.value.attempt_id,
+        )? {
+            if decode_canonical::<[u8; 32]>(&bytes)? != terminal_hash {
+                anyhow::bail!("terminal retry history conflicts with its signed child");
+            }
+            return Ok(false);
+        }
+        let epoch = self
+            .dynamic_guild_state()?
+            .context("coding retry requires dynamic guild state")?
+            .membership_epoch;
+        let retired = self
+            .control
+            .get_record("coding-retired-attempt", &child.value.attempt_id)?;
+        if job.failure.value.plan.value.membership_epoch == epoch
+            && child.value.expires_at_unix_seconds >= now
+            && retired.is_none()
+        {
+            return Ok(false);
+        }
+        self.validate_coding_attempt_authority(child)?;
+        let parent = &job.failure.value.plan.value;
+        if child.value.checkpoint_hash != parent.checkpoint_hash
+            || child.value.geometry != parent.geometry
+            || child.value.delegator != parent.delegator
+            || child.value.information_roots != parent.information_roots
+        {
+            anyhow::bail!("retry successor conflicts with its failed lane");
+        }
+        if let Some(owner) = self.coding_launch_submission_plan(child.value.attempt_id)? {
+            if owner != *child {
+                anyhow::bail!("retry successor conflicts with its submitted owner");
+            }
+            self.control.put_record(
+                "coding-retry-terminal",
+                &job.failure.value.plan.value.attempt_id,
+                &canonical_bytes(&terminal_hash)?,
+            )?;
+            return Ok(false);
+        }
+        let signed = canonical_bytes(child)?;
+        if retired.as_ref().is_some_and(|bytes| bytes != &signed) {
+            anyhow::bail!("retry successor conflicts with its retirement fence");
+        }
+        // Retirement authorizes deletion; it never proves deletion finished.
+        // Descriptor-less jobs can still own remote staged parity/reservations.
+        // Only explicit terminal metadata or a submitted owner makes this
+        // parent quiescent after its child becomes stale or expires.
+        Ok(true)
     }
 
     pub(crate) fn prepare_coding_retry(
@@ -5683,11 +5757,17 @@ impl Node {
     fn coding_retry_parent_input_deletions(
         &self,
         child: &SignedRecord<CodingAttemptPlan>,
+        records: &mut Vec<ControlRecord>,
     ) -> Result<Vec<(String, Vec<u8>)>> {
         let mut deletions = Vec::new();
         for (id, bytes) in self.control.records("coding-retry-job")? {
             let parent: CodingRetryJob = decode_canonical(&bytes)?;
             if parent.retry_plan.as_ref() == Some(child) {
+                records.push((
+                    "coding-retry-terminal".to_owned(),
+                    id.clone(),
+                    canonical_bytes(blake3::hash(&canonical_bytes(child)?).as_bytes())?,
+                ));
                 deletions.extend([
                     ("coding-launch-information".to_owned(), id.clone()),
                     ("coding-launch-staged".to_owned(), id),
@@ -5820,26 +5900,38 @@ impl Node {
         Ok(true)
     }
 
+    pub(crate) fn retire_coding_retry_successor(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+    ) -> Result<bool> {
+        if let Some(owner) = self.coding_launch_submission_plan(plan.value.attempt_id)? {
+            if owner != *plan {
+                anyhow::bail!("retry successor conflicts with its submitted owner");
+            }
+            return Ok(false);
+        }
+        self.retire_coding_retry_plan(plan)
+    }
+
     pub(crate) fn renew_coding_retry_after_cleanup(&mut self, job: &CodingRetryJob) -> Result<()> {
         let plan = job
             .retry_plan
             .as_ref()
-            .context("coding retry has no expired plan")?;
-        if plan.value.expires_at_unix_seconds >= unix_seconds()
-            || job.complete
+            .context("coding retry has no successor plan")?;
+        if job.complete
             || self
                 .control
                 .get_record("coding-retry-job", &job.failure.value.plan.value.attempt_id)?
                 != Some(canonical_bytes(job)?)
         {
-            anyhow::bail!("coding retry changed or has not expired before renewal");
+            anyhow::bail!("coding retry changed before renewal");
         }
         if self
             .control
             .get_record("coding-retired-attempt", &plan.value.attempt_id)?
             != Some(canonical_bytes(plan)?)
         {
-            anyhow::bail!("expired coding retry was not fenced before cleanup");
+            anyhow::bail!("coding retry successor was not fenced before cleanup");
         }
         let mut updated = job.clone();
         updated.retry_plan = None;
@@ -5941,18 +6033,41 @@ impl Node {
     }
 
     pub(crate) fn complete_coding_retry(&self, failed_attempt_id: [u8; 16]) -> Result<()> {
+        self.finish_coding_retry(failed_attempt_id, false)
+    }
+
+    pub(crate) fn complete_coding_retry_after_cleanup(
+        &self,
+        failed_attempt_id: [u8; 16],
+    ) -> Result<()> {
+        self.finish_coding_retry(failed_attempt_id, true)
+    }
+
+    fn finish_coding_retry(&self, failed_attempt_id: [u8; 16], cleaned: bool) -> Result<()> {
         let bytes = self
             .control
             .get_record("coding-retry-job", &failed_attempt_id)?
             .context("coding retry job is unavailable")?;
         let mut job: CodingRetryJob = decode_canonical(&bytes)?;
-        let terminal = match &job.retry_plan {
-            None => true,
-            Some(plan) => self
-                .control
-                .get_record("coding-retired-attempt", &plan.value.attempt_id)?
-                .is_some(),
+        let child_owner = match &job.retry_plan {
+            None => false,
+            Some(child) => match self.coding_launch_submission_plan(child.value.attempt_id)? {
+                None => false,
+                Some(owner) if owner == *child => true,
+                Some(_) => anyhow::bail!("retry completion conflicts with its child owner"),
+            },
         };
+        if cleaned
+            && !child_owner
+            && let Some(child) = &job.retry_plan
+            && self
+                .control
+                .get_record("coding-retired-attempt", &child.value.attempt_id)?
+                != Some(canonical_bytes(child)?)
+        {
+            anyhow::bail!("cleaned retry successor has no matching retirement fence");
+        }
+        let terminal = job.retry_plan.is_none() || child_owner || cleaned;
         // Dispatch acknowledgement is not terminal activation. Retain input
         // intent while the successor can still need restaging after expiry.
         let mut deletions = Vec::new();
@@ -5967,7 +6082,7 @@ impl Node {
                     failed_attempt_id.to_vec(),
                 ),
             ]);
-            if let Some(plan) = &job.retry_plan {
+            if !child_owner && let Some(plan) = &job.retry_plan {
                 deletions.extend([
                     (
                         "coding-launch-information".to_owned(),
@@ -5982,14 +6097,19 @@ impl Node {
         }
         job.complete = true;
         job.error = None;
-        self.control.put_records_and_delete(
-            &[(
-                "coding-retry-job".to_owned(),
+        let mut records = vec![(
+            "coding-retry-job".to_owned(),
+            failed_attempt_id.to_vec(),
+            canonical_bytes(&job)?,
+        )];
+        if terminal && let Some(child) = &job.retry_plan {
+            records.push((
+                "coding-retry-terminal".to_owned(),
                 failed_attempt_id.to_vec(),
-                canonical_bytes(&job)?,
-            )],
-            &deletions,
-        )?;
+                canonical_bytes(blake3::hash(&canonical_bytes(child)?).as_bytes())?,
+            ));
+        }
+        self.control.put_records_and_delete(&records, &deletions)?;
         Ok(())
     }
 
@@ -6093,7 +6213,9 @@ impl Node {
             .get_record("coding-activation-job", &attempt_id)?
             .context("coding activation job is unavailable")?;
         let mut job: CodingActivationJob = decode_canonical(&bytes)?;
-        let mut deletions = self.coding_retry_parent_input_deletions(&job.transcript.value.plan)?;
+        let mut records = Vec::new();
+        let mut deletions =
+            self.coding_retry_parent_input_deletions(&job.transcript.value.plan, &mut records)?;
         deletions.extend([
             ("coding-launch-job".to_owned(), attempt_id.to_vec()),
             ("coding-launch-information".to_owned(), attempt_id.to_vec()),
@@ -6101,14 +6223,12 @@ impl Node {
         ]);
         job.complete = true;
         job.error = None;
-        self.control.put_records_and_delete(
-            &[(
-                "coding-activation-job".to_owned(),
-                attempt_id.to_vec(),
-                canonical_bytes(&job)?,
-            )],
-            &deletions,
-        )?;
+        records.push((
+            "coding-activation-job".to_owned(),
+            attempt_id.to_vec(),
+            canonical_bytes(&job)?,
+        ));
+        self.control.put_records_and_delete(&records, &deletions)?;
         Ok(())
     }
 
@@ -13552,7 +13672,7 @@ pub(crate) mod tests {
             sector.bytes
         );
         assert!(node.retire_coding_retry_plan(&successor).unwrap());
-        node.complete_coding_retry(initial.value.attempt_id)
+        node.complete_coding_retry_after_cleanup(initial.value.attempt_id)
             .unwrap();
         node.reconcile_garbage_collection().unwrap();
         head = advance(&mut node, &head);
@@ -15428,6 +15548,228 @@ pub(crate) mod tests {
             node.defer_coding_launch([249; 16], "unexpected missing owner")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn acknowledged_retry_reclaims_expiry_and_stale_cleanup_but_preserves_accepted_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let (seed, certificate, peers) = recovery_guild_fixture();
+        let keys = (0_u8..5)
+            .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([index + 120; 32])))
+            .collect::<Vec<_>>();
+        let local_id = KeyMaterial::from_seed(&seed).node_id();
+        let remotes = keys
+            .iter()
+            .filter(|key| key.node_id() != local_id)
+            .collect::<Vec<_>>();
+        let member = |id| {
+            peers
+                .iter()
+                .find(|peer| peer.member.node_id == id)
+                .unwrap()
+                .member
+                .clone()
+        };
+        let profile = mb_core::CodingProfile::new(1, 1, V1_SECTOR_SIZE as u32);
+        let shards = mb_core::encode(profile, vec![vec![96; V1_SECTOR_SIZE]]).unwrap();
+        for case in 0..6 {
+            let dir = temp.path().join(format!("case-{case}"));
+            let mut node = Node::open(&dir, seed.clone()).unwrap();
+            node.adopt_recovered_guild(certificate.clone(), peers.clone())
+                .unwrap();
+            let initial = node
+                .sign_coding_attempt_plan(CodingAttemptPlan {
+                    format_version: 2,
+                    attempt_id: [97; 16],
+                    checkpoint_hash: [98; 32],
+                    membership_epoch: 1,
+                    geometry: mb_core::CodingPlanGeometry {
+                        format_version: 1,
+                        guild_id: certificate.genesis.guild_id,
+                        profile,
+                        information: vec![mb_core::InformationRoleV2 {
+                            owner: local_id,
+                            failure_domain: member(local_id).failure_domain,
+                            sector: mb_core::RangeSectorRef {
+                                id: [99; 32],
+                                commitment: merkle_commit(&shards[0]).unwrap(),
+                                logical_len: V1_SECTOR_SIZE as u32,
+                                virtual_zero: false,
+                            },
+                        }],
+                        parity: vec![mb_core::ParityPlacementV2 {
+                            holder: remotes[0].node_id(),
+                            failure_domain: member(remotes[0].node_id()).failure_domain,
+                            row: 0,
+                        }],
+                    },
+                    delegator: local_id,
+                    coding_coordinator: remotes[1].node_id(),
+                    verification_coordinator: remotes[2].node_id(),
+                    expires_at_unix_seconds: unix_seconds() + 600,
+                    information_roots: Some(vec![sector_root(&shards[0])]),
+                })
+                .unwrap();
+            node.enqueue_coding_launch_with_information(
+                initial.clone(),
+                (case != 4).then(BTreeMap::new),
+            )
+            .unwrap();
+            let failure = SignedRecord::sign(
+                CODING_FAILURE_REPORT_DOMAIN,
+                CodingFailureReport {
+                    format_version: 1,
+                    failed_at_unix_seconds: unix_seconds(),
+                    plan: initial.clone(),
+                    error_hash: [100; 32],
+                },
+                remotes[1],
+            )
+            .unwrap();
+            node.accept_coding_failure(failure.signer, failure.clone())
+                .unwrap();
+            let child = node
+                .prepare_coding_retry(
+                    initial.value.attempt_id,
+                    remotes[0].node_id(),
+                    remotes[3].node_id(),
+                    unix_seconds() + 600,
+                )
+                .unwrap();
+            assert_eq!(child.value.format_version, 3);
+            node.complete_coding_retry(initial.value.attempt_id)
+                .unwrap();
+            assert!(node.claim_coding_retry(None).unwrap().is_none());
+            if case == 2 {
+                let result = test_coding_transcript(child.clone(), &shards, &keys);
+                node.accept_coding_transcript(child.value.coding_coordinator, result)
+                    .unwrap();
+            }
+            let child_failure = if case == 3 {
+                let failure = SignedRecord::sign(
+                    CODING_FAILURE_REPORT_DOMAIN,
+                    CodingFailureReport {
+                        format_version: 1,
+                        failed_at_unix_seconds: unix_seconds(),
+                        plan: child.clone(),
+                        error_hash: [101; 32],
+                    },
+                    remotes[0],
+                )
+                .unwrap();
+                node.accept_coding_failure(failure.signer, failure.clone())
+                    .unwrap();
+                assert!(!node.retire_coding_retry_successor(&child).unwrap());
+                assert!(node.retire_coding_retry_plan(&child).unwrap());
+                // A late parent acknowledgement meets a child failure owner
+                // and a retirement fence. The child's retry still needs input.
+                node.complete_coding_retry(initial.value.attempt_id)
+                    .unwrap();
+                assert_eq!(
+                    node.coding_launch_information_to_stage(child.value.attempt_id)
+                        .unwrap(),
+                    Some(BTreeMap::new())
+                );
+                Some(failure)
+            } else {
+                None
+            };
+            if case >= 4 {
+                assert!(
+                    node.retire_delegated_coding_attempt(child.value.coding_coordinator, &child)
+                        .unwrap()
+                );
+                node.complete_coding_retry(initial.value.attempt_id)
+                    .unwrap();
+                for id in [initial.value.attempt_id, child.value.attempt_id] {
+                    assert_eq!(
+                        node.coding_launch_information_to_stage(id).unwrap(),
+                        (case != 4).then(BTreeMap::new),
+                    );
+                }
+            }
+            if case == 1 || case == 4 {
+                let state = node.dynamic_guild_state().unwrap().unwrap();
+                let event = GuildEvent {
+                    format_version: 1,
+                    guild_id: state.guild_id,
+                    sequence: state.event_sequence + 1,
+                    parent: state.event_head,
+                    kind: mb_core::GuildEventKind::RelabelMember {
+                        node_id: remotes[2].node_id(),
+                        failure_domain: "acknowledged-retry-unrelated-change".to_owned(),
+                    },
+                };
+                let mut signatures = keys
+                    .iter()
+                    .map(|key| sign_guild_event(&event, key).unwrap())
+                    .collect::<Vec<_>>();
+                signatures.sort_by_key(|signature| signature.signer);
+                node.install_guild_event(QuorumGuildEvent { event, signatures })
+                    .unwrap();
+            }
+            drop(node);
+            node = Node::open(&dir, seed.clone()).unwrap();
+            let now = if case == 1 || case >= 4 {
+                unix_seconds()
+            } else {
+                child.value.expires_at_unix_seconds + 1
+            };
+            let claimed = node.claim_coding_retry_at(None, now).unwrap();
+            if case == 3 {
+                assert_eq!(claimed.unwrap().failure, *child_failure.as_ref().unwrap());
+            } else if case == 2 {
+                assert!(claimed.is_none());
+                assert!(
+                    node.retired_coding_plan_for_test(child.value.attempt_id)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(!node.retire_coding_retry_successor(&child).unwrap());
+            } else {
+                let claimed = claimed.unwrap();
+                assert!(!claimed.complete);
+                assert_eq!(claimed.failure, failure);
+                assert_eq!(claimed.retry_plan, Some(child.clone()));
+                // The controlled gate has no holder staging. Only explicit
+                // completion after cleanup makes this exact fence terminal.
+                assert!(node.retire_coding_retry_plan(&child).unwrap());
+                node.complete_coding_retry_after_cleanup(initial.value.attempt_id)
+                    .unwrap();
+            }
+            for _ in 0..2 {
+                drop(node);
+                node = Node::open(&dir, seed.clone()).unwrap();
+                let claimed = node.claim_coding_retry_at(None, now).unwrap();
+                if case == 3 {
+                    assert_eq!(claimed.unwrap().failure, *child_failure.as_ref().unwrap());
+                    assert_eq!(
+                        node.coding_launch_information_to_stage(child.value.attempt_id)
+                            .unwrap(),
+                        Some(BTreeMap::new())
+                    );
+                } else {
+                    assert!(claimed.is_none());
+                }
+                let retained = node
+                    .coding_retry_evidence_for_test(initial.value.attempt_id)
+                    .unwrap();
+                assert!(retained.complete);
+                assert_eq!(retained.failure, failure);
+                assert_eq!(retained.retry_plan, Some(child.clone()));
+                if case == 2 {
+                    assert!(!node.retire_coding_retry_plan(&child).unwrap());
+                } else if case != 3 {
+                    for id in [initial.value.attempt_id, child.value.attempt_id] {
+                        assert!(
+                            node.coding_launch_information_to_stage(id)
+                                .unwrap()
+                                .is_none()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

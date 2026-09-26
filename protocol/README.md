@@ -55,3 +55,13 @@ receives that intent durably and stages its own information before delegation;
 discarded parent receipts do not establish successor availability. Input intent
 pins the delegator's packed cache until terminal activation, cleanup, or durable
 handoff to another failure owner.
+
+Successor delegation acknowledgement leaves the failed parent's retry history
+quiescent while that immutable successor remains live. If it expires or becomes
+stale without accepted result/failure ownership, the delegator reclaims cleanup
+and renewal, including after reopen. A retirement fence permits holder cleanup
+but does not confirm deletion; this also applies to descriptor-less retries.
+Explicit terminal metadata binds the signed successor only after required
+cleanup succeeds or authenticated submission ownership takes over. Accepted
+child failure retains its own input intent when a delayed parent acknowledgement
+finishes the redundant parent.
