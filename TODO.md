@@ -574,7 +574,21 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (closed 2026-09-26)
+## Milestone 5 guild geometry and coding protocol (reopened 2026-09-26)
+
+Source-only review of `16c28a5..88898a6` on 2026-09-26 finds three outstanding
+P1 blockers in the production cleanup/retry paths: stale membership cleanup
+can discard concurrently accepted verifier evidence (M5-111); a signed failure
+arriving during expired-launch recovery can terminate the daemon (M5-112);
+and failed packed-input attempts retry without restaging their deleted inputs
+(M5-113). Correct these and complete the new M5-114 local gate before closure.
+Milestones 0 through 4 remain passed; Milestone 6 waits. This review ran no
+builds, tests, daemons, runtime probes, or remote compilation. The earlier
+M5-104 passing results below remain historical evidence for their exact source;
+their regressions do not cover these report/cleanup interleavings or packed
+inputs available only through the original attempt's placement.
+
+Previous closure record:
 
 M5-103 and M5-105 through M5-110 are implemented. The complete final M5-104
 gate passed locally on exact source `f8e47d34d62a073db6953260571441525dc5e2ac`:
@@ -585,8 +599,8 @@ staging and membership-transition regressions pass in the full workspace run.
 Owner/storage-only seed recovery and direct, DCUtR and forced-relay bulk
 transfers pass in the final daemon scenario. Disposable filesystem, loop device,
 namespaces, network rules/interfaces and test processes were independently
-confirmed removed. All compilation and execution were local. Milestone 5 is
-closed; Milestone 6 is next. Exact outcomes are recorded under M5-104 below.
+confirmed removed. All compilation and execution were local. Milestone 5 was
+closed at that point. Exact outcomes are recorded under M5-104 below.
 
 The following paragraphs retain earlier review and correction history.
 
@@ -2469,11 +2483,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   Workspace evidence is in `/tmp/mutualbackup-m5-104-owner-final-2-*.log`;
   provisioned evidence is in
   `/tmp/mutualbackup-m5-104-owner-final-provisioned.log`. No remote compilation
-  server was used. Milestone 5 is closed and Milestone 6 is next.
+  server was used. Milestone 5 was closed at that point. The later M5-111
+  through M5-113 source review reopens it; M5-114 is the new closure gate.
 
   Earlier review and gate history:
 
-  Latest source-only review on 2026-09-26 covers `16c28a5..77c2090` and the
+  Earlier source-only review on 2026-09-26 covers `16c28a5..77c2090` and the
   existing uncommitted relay/DCUtR fixture change. No new source blocker was
   found in expired acknowledged-launch selection, acknowledgement-preserving
   deferral/replanning, retirement before cleanup, accepted-result priority,
@@ -2786,6 +2801,109 @@ node Clippy gate passed locally. No remote compilation server was used.
   before fencing, reopens, and checks the exact original plan, acknowledgement,
   and error before renewal. It passes locally in 16.36 seconds. The complete
   final gate must cover this ownership correction too.
+
+- [ ] **M5-111 / P1 — Fence stale cleanup against concurrent verifier acceptance.**
+  `dispatch_next_coding_launch_after` checks accepted evidence once
+  (`crates/mb-node/src/network/p2p.rs:6305`), then reads membership separately
+  and invokes stale cleanup without retiring the signed attempt (`:6319`–`:6336`).
+  After the initial check, the assigned coder can submit a valid historical
+  transcript: `accept_coding_transcript` validates historical authority and
+  persists an incomplete activation while no retirement/retry fence exists
+  (`crates/mb-node/src/node.rs:5314`–`:5346`, `:6063`). With an unrelated member
+  relabel, all information/parity placements can still be valid. Cleanup then
+  discards their staged objects (`network/p2p.rs:7179`–`:7204`). The holder guard
+  protects only a persisted transcript for an already committed group, not the
+  pending activation (`node.rs:5938`–`:5952`; `volume.rs:1139`). Activation still
+  requires the removed parity (`node.rs:5918`), defers indefinitely, and remains
+  pending across reopen, suppressing checkpoint replanning (`node.rs:4392`;
+  `network/p2p.rs:6189`–`:6238`). The existing verified-membership fixture accepts
+  its transcript before cleanup starts, so it bypasses this arrival window.
+
+  Arbitrate accepted-evidence ownership and retirement atomically before any
+  holder cleanup. Preserve activation when it wins; otherwise durably fence
+  the exact signed attempt so subsequent submissions cannot be accepted for
+  deleted data. Apply the same ownership rule to stale delegated cleanup
+  (`network/p2p.rs:6048`), preserving immutable signed history and valid current
+  placements. Gate controlled transcript arrival after the initial evidence
+  check, with both acceptance-before-retirement and retirement-before-acceptance
+  orderings, an unrelated relabel, interrupted cleanup, reopen, production
+  activation/checkpoint coverage, late-result rejection, all holders' exact
+  capacity/receipt cleanup, and repeated reopen. This finding is source-only.
+
+- [ ] **M5-112 / P1 — Handle failure ownership transfer during expired-launch recovery.**
+  An expired acknowledged launch can be claimed (`network/p2p.rs:6295`) just
+  before its coder's signed failure arrives. Historical failure acceptance
+  creates a durable retry, then removes the launch and its input descriptors
+  (`node.rs:5354`–`:5408`); a report signed before expiry may arrive afterward.
+  Retirement checks activation but not this launch-to-retry transfer
+  (`node.rs:5572`–`:5597`), so expiry cleanup continues with the claimed snapshot.
+  Renewal rejects the missing launch (`node.rs:4297`–`:4299`). The error handler
+  then tries to defer that deleted launch (`network/p2p.rs:6374`–`:6379`), and
+  `defer_coding_launch` returns "coding launch job is unavailable"
+  (`node.rs:4494`–`:4500`). The error propagates out of the shared worker
+  (`network/p2p.rs:6029`), completes the daemon's main select, and shuts down its
+  network/control service (`cmd/mutualbackup/src/bin/mutualbackupd.rs:140`–`:192`).
+  The coordinator-loss regression keeps the coder offline before recovery;
+  it does not deliver a failure between claim and retirement.
+
+  Reconcile the claimed launch with its current durable owner when fencing,
+  renewing, and deferring. Treat an authenticated transition to retry/activation
+  as normal progress, preserving its evidence and cleanup responsibility;
+  never recreate the deleted owner or turn this routine race into daemon exit.
+  Gate signed failure arrival after expired acknowledged claim and before
+  retirement, including cleanup/selection deferral and same-epoch reopen.
+  Assert that the worker/daemon remain alive, unrelated work progresses, the
+  retry reaches fresh verification/activation/checkpoint coverage, historical
+  plans stay immutable, and all holders finish without leaked staged objects,
+  receipts or reservations after repeated reopen. This finding is source-only.
+
+- [ ] **M5-113 / P1 — Restage packed information for signed-failure retry successors.**
+  Packed lanes can place information on a holder other than the delegator
+  (`network/p2p.rs:12368`–`:12385`), while their initial coder is the delegator
+  (`:6866`–`:6889`, `:12666`). Initial launch staging uploads those packed bytes
+  under attempt A (`:6393`, `:12713`). If coding fails before verification,
+  ordinary failure cleanup deletes A's information and parity objects
+  (`:6136`, `:7179`–`:7204`; `volume.rs:1139`;
+  `crates/mb-store/src/database.rs:2263`–`:2274`). Failure acceptance also deletes
+  the durable packed-input descriptors (`node.rs:5406`, `:4451`–`:4456`).
+  `execute_coding_retry` selects fresh roles excluding A's coder/verifier and
+  delegates B without calling the information-staging helper
+  (`network/p2p.rs:6534`–`:6665`). B fetches from its local source/cache or the
+  named information holder, never from the delegator's surviving packed cache
+  (`:7079`–`:7126`). A remotely placed new packed sector has no local source
+  recipe or READY copy on that holder; `coding_information_range` therefore
+  opens B's staged object, which was never uploaded (`node.rs:5039`–`:5070`).
+  Healthy peers/disks do not resolve this missing-input retry. Coalescing a
+  live successor also creates no launch/staging intent (`node.rs:4015`–`:4039`).
+  The current retry fixture installs legacy source bytes on the information
+  owner (`network/p2p.rs:22512`), masking this packed-only placement case.
+
+  Retain recoverable packed-input intent across signed failure, transfer it
+  durably to the selected successor, and repeat/resume all required information
+  uploads under its new ID before delegation. READY inputs may be reused when
+  independently authenticated and durable; never depend on discarded parent
+  receipts. Gate a real production packed lane with a nonzero information
+  sector on a holder that has no source/cache/READY copy, inject failure after
+  initial staging, and keep the original coder out of the first replacement
+  pair. Cover partial successor upload, an offline input volume, coalesced
+  replanning, same-epoch reopen, fresh verification/activation/checkpoint
+  coverage, immutable signed history, exact capacity on every holder, and zero
+  staged receipts/reservations through repeated reopen. This finding is
+  source-only.
+
+- [ ] **M5-114 / gate — Recheck Milestone 5 after cleanup ownership and packed retries.**
+  Correct M5-111 through M5-113, then source-review the final committed tree
+  and run their controlled production-worker regressions locally. On that
+  exact source, pass strict locked all-target workspace Clippy, locked
+  all-target workspace tests, formatting, Docker lab safety, and the complete
+  fresh disposable Btrfs/network acceptance script. Retain acknowledged expiry,
+  accepted-result expiry/membership, staging, fairness, checkpoint, migration,
+  relay/DCUtR, owner/storage-only recovery and bulk fallback coverage. Record
+  exact commits and outcomes, and independently verify removal of all owned
+  images/mounts, loop devices, namespaces, interfaces/rules and processes.
+  Earlier M5-104 results remain historical; only this new gate can close the
+  follow-up corrections. Build and run everything locally; never use a remote
+  compilation server. This source-only review did not execute the gate.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

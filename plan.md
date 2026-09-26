@@ -56,14 +56,23 @@ them as ADRs and test vectors before promising wire compatibility.
   checkpoints. Leave a compatible authorization interface for later quorum
   policies and FROST once membership and recovery policy are stable.
 
-### Implemented baseline — efficient and flexible guild protocol beta passed
+### Implemented baseline — efficient and flexible guild protocol beta reopened
 
-Milestones 0 through 5 have passed. The complete final M5-104 local gate on
+Milestones 0 through 4 have passed. Milestone 5 is reopened by source-only
+review of `16c28a5..88898a6` on 2026-09-26: M5-111 through M5-113 expose
+concurrent verifier acceptance during stale cleanup, signed-failure ownership
+transfer during expiry recovery, and missing packed-input restaging after
+failure. Correct these and pass the new M5-114 local gate before Milestone 6.
+No builds or runtime validation were run in this review.
+
+The previous complete final M5-104 local gate on
 2026-09-26 passed against `f8e47d34d62a073db6953260571441525dc5e2ac`, including
 strict locked workspace Clippy, all-target workspace tests, formatting, Docker
 lab safety and all 23 fresh disposable Btrfs/network acceptance invocations.
-Cleanup was independently verified. Milestone 6's source-backend and platform
-work is next. The following paragraphs retain the prior closure/review history.
+Cleanup was independently verified. Those outcomes remain historical evidence
+for their exact source; the passing regressions do not cover the newly found
+interleavings and packed-only retry inputs. The following paragraphs retain
+the prior closure/review history.
 
 The first usable architectural prototype and the Milestone 2
 operator-configuration and identity-state slice have passed their review gates.
@@ -585,9 +594,13 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 5 have passed. The final
-M5-104 workspace and fresh provisioned gate passed on `f8e47d3`, with all
-disposable resources removed and independently checked. Milestone 6 is next.
+than a daemon prerequisite. Milestones 0 through 4 have passed. Milestone 5
+is reopened for M5-111 through M5-113 and the new M5-114 gate; Milestone 6
+waits. This source-only review ran no builds, tests, daemons or runtime probes.
+The previous final M5-104 workspace and fresh provisioned gate passed on
+`f8e47d3`, with all
+disposable resources removed and independently checked. This remains
+historical evidence for that source tree.
 
 Earlier correction history: Milestone 5's historical M5-67 gate passed, and
 the later M5-68 through M5-76 source blockers
@@ -835,14 +848,17 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 5 are passed. M5-103 and M5-105
-through M5-110's retry, staging, membership, expiry, fairness and ownership
-corrections pass the complete M5-104 local gate on exact source `f8e47d3`.
-All 23 fresh provisioned acceptance invocations passed, and disposable-resource
-cleanup was independently verified on 2026-09-26. Milestone 6 is next:
-guarded link-freeze capture, followed by additional native platforms and
-capture hooks. M5-97 and earlier gates remain historical evidence for their
-exact source trees.
+**Current position:** Milestones 0 through 4 are passed. Milestone 5 is
+reopened by source-only review of `16c28a5..88898a6` on 2026-09-26. Correct
+M5-111's stale cleanup/verifier race, M5-112's failure/expiry ownership race
+that can stop the daemon, and M5-113's packed-input retry restaging gap.
+Pass M5-114's complete local gate on the corrected committed source before
+Milestone 6's guarded link-freeze capture, native platforms and capture hooks.
+No builds, tests, daemons or runtime probes ran in this review. The earlier
+M5-104 gate on `f8e47d3`, including all 23 provisioned invocations and verified
+cleanup, remains passing historical evidence; it does not establish coverage
+of these newly found paths. M5-97 and earlier gates retain their exact-tree
+results too.
 The following records retain the correction and closure history. The M5-36
 through M5-66 correction history and M5-45/M5-67 gates remain historical evidence.
 Fresh source-only review of `81ec33b..b65c79a` found M5-68 through M5-76 and
@@ -1982,7 +1998,43 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (passed)
+### Milestone 5 — efficient and flexible data/guild protocol (reopened)
+
+Source-only review of `16c28a5..88898a6` on 2026-09-26 finds three production
+P1 blockers. The recent acknowledged-launch ownership, renewal and relay
+fixture corrections do not resolve these adjacent cleanup/retry paths:
+
+- **M5-111:** Stale membership cleanup checks verifier evidence before a
+  separate awaited epoch read, then discards holders' data without a durable
+  retirement fence. A valid historical transcript accepted in between owns
+  activation but loses its staged parity, even after an unrelated relabel
+  leaves placement valid. Activation and checkpoint coverage remain pending
+  through reopen. Arbitrate accepted evidence and retirement before cleanup;
+  cover both orderings of result arrival and retirement in launch and delegated
+  cleanup, interrupted cleanup, activation/checkpoint completion and reopen.
+- **M5-112:** A signed failure arriving after an expired acknowledged claim
+  transfers ownership to a durable retry and deletes the launch. Expiry recovery
+  still attempts renewal and then deferral against the missing launch. The
+  resulting error exits the shared worker and the daemon's main select.
+  Reconcile current ownership during fencing/renewal/deferral and gate this
+  failure-arrival window while preserving daemon and unrelated-work progress.
+- **M5-113:** Signed-failure cleanup removes remotely placed packed inputs and
+  acceptance deletes their descriptors. The fresh retry delegates another ID
+  without restaging, so a holder without its own source/cache/READY copy cannot
+  serve the required input. Retain and transfer input intent, stage the selected
+  successor before delegation, and gate a real packed-only remote placement
+  through failure, interrupted upload, replanning, activation and reopen.
+
+Exact source evidence and correction requirements are in `TODO.md`. After
+these corrections, M5-114 requires source review, focused regressions, the
+complete locked workspace and fresh local Btrfs/network acceptance gate on
+the final committed tree, and independently verified disposable-resource
+cleanup. Milestone 6 waits. This review ran no builds, tests, daemons, runtime
+probes, or remote compilation. The earlier passing M5-104 record below remains
+historical evidence for its exact source; its fixtures do not inject these
+arrival windows or missing packed-input copies.
+
+Previous closure record:
 
 The complete final M5-104 gate passed locally on 2026-09-26 against exact
 source `f8e47d34d62a073db6953260571441525dc5e2ac`. Strict locked all-target
@@ -2002,11 +2054,11 @@ successful cleanup. Independent checks confirmed the owned mount/image/directory
 loop device, four namespaces, veth interfaces, firewall/NAT rules and test
 processes were gone. Exact resources and log locations are recorded in TODO.md
 under M5-104. All builds and runs were local; no remote compilation server was
-used. Milestone 5 is closed; Milestone 6 is next.
+used. Milestone 5 was closed at that point.
 
 Earlier source-review and correction history follows.
 
-Latest source-only review on 2026-09-26 covers `16c28a5..77c2090` and the
+Earlier source-only review on 2026-09-26 covers `16c28a5..77c2090` and the
 existing uncommitted relay/DCUtR fixture change. No new source blocker was
 found in the acknowledged-launch recovery and ownership corrections. Expired
 acknowledged work reaches retirement and cleanup; accepted verifier evidence
