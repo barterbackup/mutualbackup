@@ -2010,7 +2010,12 @@ all holders' capacity/receipt cleanup, and two further reopens are checked. The
 accepted-result expiry/reopen case also passes. The node lineage case passes in
 16.43 seconds, including acknowledgement retention, valid late-result rejection,
 and idempotent successor reuse after a crash. The complete final M5-104 local
-workspace/provisioned gate remains required; Milestone 6 waits.
+workspace/provisioned gate remains required; Milestone 6 waits. The first full
+workspace run on `4039bd6` passed strict Clippy and 268 node tests, but both new
+expiry fixtures outlived their short deadlines during initial dispatch or
+verification under suite load. They now allow 120 seconds for setup and then
+wait for their unchanged signed deadline before exercising expiry. Production
+behavior is unchanged. Rerun the complete gate on the final committed source.
 
 Earlier source-only review of `c4e97f8..1f3141e` on 2026-09-26 found two
 production-worker blockers after M5-105 through M5-107. M5-108: a durable launch

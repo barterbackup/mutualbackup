@@ -2699,6 +2699,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   persistence/parent-removal crash window. Its transcript helper records a
   verification time within the historical plan deadline. The complete final
   M5-104 workspace/provisioned gate remains required. All validation is local.
+  The first complete workspace run on `4039bd6` passed strict Clippy, 48 core
+  tests, and 268 node tests, but the two new expiry fixtures failed because
+  their three-/fifteen-second deadlines elapsed during acknowledged dispatch
+  or verification under concurrent suite load. Their initial immutable plans
+  now allow 120 seconds for successful setup, then wait through the actual
+  signed deadline before exercising expiry. Production deadlines and recovery
+  behavior are unchanged. A new complete committed-source gate is required.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

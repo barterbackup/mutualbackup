@@ -22595,7 +22595,9 @@ mod tests {
             plan.verification_coordinator = member(4).node_id;
             plan.expires_at_unix_seconds = unix_seconds()
                 + if replanning == RetryReplanningCase::VerifiedExpiry {
-                    15
+                    // Initial verification must finish before real expiry even
+                    // when the full workspace suite competes for CPU and I/O.
+                    120
                 } else if stale_epoch
                     || replanning == RetryReplanningCase::Live
                     || replanning == RetryReplanningCase::FailedChain
@@ -22970,7 +22972,12 @@ mod tests {
             if replanning != RetryReplanningCase::StagingRestart {
                 let node = nodes[0].lock().unwrap();
                 let mut value = pending.plan.value.clone();
-                value.expires_at_unix_seconds = unix_seconds() + 3;
+                value.expires_at_unix_seconds = unix_seconds()
+                    + if replanning == RetryReplanningCase::ExpiredDispatched {
+                        120
+                    } else {
+                        3
+                    };
                 if matches!(
                     replanning,
                     RetryReplanningCase::ExpiredCompleted | RetryReplanningCase::ExpiredDispatched
@@ -23083,7 +23090,11 @@ mod tests {
                         .unwrap()
                 );
             } else {
-                tokio::time::sleep(Duration::from_secs(4)).await;
+                let deadline = pending.plan.value.expires_at_unix_seconds;
+                tokio::time::sleep(Duration::from_secs(
+                    deadline.saturating_sub(unix_seconds()) + 1,
+                ))
+                .await;
                 let volume = temp.path().join("volume-0");
                 std::fs::rename(&volume, temp.path().join("offline-volume-0")).unwrap();
                 nodes[0]
