@@ -2087,7 +2087,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   local target is READY. Gate interrupted recovery with one READY local shard,
   fewer than `k` live shards, and an available correct fallback.
 
-- [ ] **M5-94 / P1 — Continue ordinary restore after a wrong-root placement.**
+- [x] **M5-94 / P1 — Continue ordinary restore after a wrong-root placement.**
   Legacy restore selects certified variable placements by sector ID, prefers
   a current placement, and takes the first reconstruction that matches that
   group's commitment (`crates/mb-node/src/network/p2p.rs:11345`–`:11399`,
@@ -2097,7 +2097,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   Match authenticated owner, length, and root before accepting a placement, or
   treat a revision-root mismatch as a per-placement failure and continue.
   Gate wrong-root current placement followed by a recoverable correct stale
-  placement.
+  placement. The restore path now filters owner and logical length and checks
+  each reconstructed candidate against the signed revision root before
+  accepting it. A focused local network regression passed with reachable
+  wrong-root bytes followed by a correct placement.
 
 - [ ] **M5-95 / P2 — Credit valid sectors within mixed recovery groups.**
   `variable_recovery_plans` collects all matching checkpoint IDs into a

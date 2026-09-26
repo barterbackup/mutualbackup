@@ -11282,6 +11282,7 @@ async fn reconstruct_packed_object(
                     node.clone(),
                     p2p,
                     &placements,
+                    None,
                     roster,
                     deferred_holders,
                 )
@@ -11343,7 +11344,10 @@ pub(crate) async fn restore_snapshot_with_p2p(
             continue;
         }
         let variable = ordered_certified_variable_placements(&state, |information| {
-            !information.sector.virtual_zero && information.sector.id == reference.id
+            !information.sector.virtual_zero
+                && information.owner == revision_owner
+                && information.sector.id == reference.id
+                && information.sector.logical_len == reference.logical_len
         });
         let bytes = if let Some(catalog) = &packing_catalog {
             reconstruct_packed_object(
@@ -11364,6 +11368,7 @@ pub(crate) async fn restore_snapshot_with_p2p(
                 node.clone(),
                 p2p,
                 &variable,
+                Some(expected_root),
                 &roster,
                 &deferred_holders,
             )
@@ -13121,13 +13126,14 @@ async fn reconstruct_variable_from_placements(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
     placements: &[(CodingGroupV2, usize)],
+    expected_legacy_root: Option<[u8; 32]>,
     roster: &[GuildPeer],
     deferred_holders: &Mutex<BTreeSet<NodeId>>,
 ) -> Result<Vec<u8>> {
     first_reconstructable_variable_placement(placements, |group, target_index| {
         let node = node.clone();
         async move {
-            reconstruct_variable_shard_from_peers(
+            let bytes = reconstruct_variable_shard_from_peers(
                 node,
                 p2p,
                 &group,
@@ -13135,7 +13141,13 @@ async fn reconstruct_variable_from_placements(
                 roster,
                 deferred_holders,
             )
-            .await
+            .await?;
+            if let Some(expected_root) = expected_legacy_root
+                && (bytes.len() != V1_SECTOR_SIZE || sector_root(&bytes) != expected_root)
+            {
+                bail!("reconstructed placement conflicts with the signed revision root");
+            }
+            Ok(bytes)
         }
     })
     .await
@@ -15871,8 +15883,55 @@ mod tests {
             })
             .collect();
         let shards = encode(replacement.profile, information).unwrap();
+        let old_information = old
+            .roles
+            .iter()
+            .take(usize::from(old.profile.data_shards))
+            .map(|role| match role {
+                ShardRoleV2::Information(info) if info.sector.virtual_zero => {
+                    vec![0; old.profile.shard_size as usize]
+                }
+                ShardRoleV2::Information(_) => first_bytes.clone(),
+                _ => panic!("unexpected old-placement information role"),
+            })
+            .collect();
+        let old_shards = encode(old.profile, old_information).unwrap();
+        let wrong_bytes = vec![79; V1_SECTOR_SIZE];
+        let wrong_reference = SectorRef {
+            id: first.id,
+            root: sector_root(&wrong_bytes),
+            logical_len: first.logical_len,
+        };
+        let wrong_commitment = merkle_commit(&wrong_bytes).unwrap();
+        let wrong_lane = variable_coding_lane(
+            guild_id,
+            Uuid::from_bytes([79; 16]),
+            0,
+            &[VariableInformationInput {
+                owner: peers[0].member.node_id,
+                sector: &wrong_reference,
+                commitment: &wrong_commitment,
+            }],
+            &replacement_peers,
+        )
+        .unwrap();
+        let wrong = materialize_variable_lane(&wrong_lane, std::slice::from_ref(&wrong_bytes));
+        let wrong_information = wrong
+            .roles
+            .iter()
+            .take(usize::from(wrong.profile.data_shards))
+            .map(|role| match role {
+                ShardRoleV2::Information(info) if info.sector.virtual_zero => {
+                    vec![0; wrong.profile.shard_size as usize]
+                }
+                ShardRoleV2::Information(_) => wrong_bytes.clone(),
+                _ => panic!("unexpected wrong-placement information role"),
+            })
+            .collect();
+        let wrong_shards = encode(wrong.profile, wrong_information).unwrap();
         let old_id = old.id;
         let replacement_id = replacement.id;
+        let wrong_id = wrong.id;
         let requested = Arc::new(Mutex::new(Vec::new()));
         let (commands, mut commands_rx) = mpsc::channel(16);
         let (request_cancellations, _cancellations_rx) = mpsc::unbounded_channel();
@@ -15890,6 +15949,8 @@ mod tests {
         let worker = tokio::spawn({
             let requested = requested.clone();
             let replacement = replacement.clone();
+            let old = old.clone();
+            let wrong = wrong.clone();
             async move {
                 while let Some(command) = commands_rx.recv().await {
                     let Command::Request {
@@ -15916,6 +15977,20 @@ mod tests {
                                 Ok(PeerResponse::Bytes(
                                     shards[usize::from(shard_index)].clone(),
                                 ))
+                            } else if group_id == wrong_id
+                                && variable_shard_holder(&wrong.roles[usize::from(shard_index)])
+                                    == recipient
+                            {
+                                Ok(PeerResponse::Bytes(
+                                    wrong_shards[usize::from(shard_index)].clone(),
+                                ))
+                            } else if group_id == old_id
+                                && variable_shard_holder(&old.roles[usize::from(shard_index)])
+                                    == recipient
+                            {
+                                Ok(PeerResponse::Bytes(
+                                    old_shards[usize::from(shard_index)].clone(),
+                                ))
                             } else {
                                 Err(anyhow::anyhow!("stale shard is unavailable"))
                             }
@@ -15934,12 +16009,40 @@ mod tests {
             node.clone(),
             &p2p,
             &placements,
+            Some(first.root),
             &replacement_peers,
             &deferred,
         )
         .await
         .unwrap();
         assert_eq!(reconstructed, first_bytes);
+        assert!(
+            requested
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|group_id| *group_id != old_id)
+        );
+        let wrong_target = wrong
+            .roles
+            .iter()
+            .position(
+                |role| matches!(role, ShardRoleV2::Information(info) if info.sector.id == first.id),
+            )
+            .unwrap();
+        let recovered_after_wrong = reconstruct_variable_from_placements(
+            node.clone(),
+            &p2p,
+            &[(wrong, wrong_target), placements[1].clone()],
+            Some(first.root),
+            &replacement_peers,
+            &Mutex::new(BTreeSet::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered_after_wrong, first_bytes);
+        assert!(requested.lock().unwrap().contains(&wrong_id));
+        assert!(requested.lock().unwrap().contains(&old_id));
         let (plans, required) =
             variable_recovery_plans(&state, &BTreeSet::from([first.id]), local_id);
         let attempted = Arc::new(Mutex::new(Vec::new()));
@@ -15971,7 +16074,6 @@ mod tests {
         assert_eq!(*attempted.lock().unwrap(), vec![replacement_id]);
         let requested = requested.lock().unwrap().clone();
         assert!(!requested.is_empty());
-        assert!(requested.iter().all(|group_id| *group_id != old_id));
         drop(p2p);
         worker.await.unwrap();
     }
