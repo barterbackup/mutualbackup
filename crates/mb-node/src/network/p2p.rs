@@ -10303,13 +10303,18 @@ fn checkpoint_recovery_authentication(
     }
 }
 
-fn recovery_plan_missing_roots(
+struct RecoveryPlanAuthentication {
+    authenticated: BTreeSet<SectorId>,
+    requires_bytes: Vec<(usize, SectorId, RecoverySectorAuthentication)>,
+}
+
+fn recovery_plan_authentication(
     plan: &VariableRecoveryPlan,
     transcript: &SignedRecord<CodingVerificationTranscript>,
     authentication: &BTreeMap<SectorId, RecoverySectorAuthentication>,
-) -> Result<Vec<(usize, RecoverySectorAuthentication)>> {
-    let mut matched = BTreeSet::new();
-    let mut missing_roots = Vec::new();
+) -> Result<RecoveryPlanAuthentication> {
+    let mut authenticated = BTreeSet::new();
+    let mut requires_bytes = Vec::new();
     for (index, role) in plan.group.roles.iter().enumerate() {
         let ShardRoleV2::Information(information) = role else {
             continue;
@@ -10317,23 +10322,35 @@ fn recovery_plan_missing_roots(
         if !plan.covered.contains(&information.sector.id) {
             continue;
         }
-        let expected = authentication
-            .get(&information.sector.id)
-            .context("recovery sector is absent from the checkpoint")?;
+        let Some(expected) = authentication.get(&information.sector.id) else {
+            continue;
+        };
         if !expected.matches_role(information) {
-            bail!("recovery group information differs from the checkpoint sector");
+            continue;
         }
         match transcript.value.plan.value.information_root(index) {
-            Some(root) if root == expected.root() => {}
-            Some(_) => bail!("recovery group information root differs from the checkpoint"),
-            None => missing_roots.push((index, expected.clone())),
+            Some(root) if root != expected.root() => continue,
+            _ => {}
         }
-        matched.insert(information.sector.id);
+        // A plan root is only a signed assertion. For a legacy flat root, or
+        // a packed flat root distinct from its authenticated Merkle root, the
+        // full reconstructed bytes must establish the content binding.
+        match expected {
+            RecoverySectorAuthentication::Packed(descriptor)
+                if descriptor.flat_root == descriptor.commitment.root =>
+            {
+                authenticated.insert(information.sector.id);
+            }
+            _ => requires_bytes.push((index, information.sector.id, expected.clone())),
+        }
     }
-    if matched != plan.covered {
-        bail!("recovery group does not cover its planned checkpoint sectors");
+    if authenticated.is_empty() && requires_bytes.is_empty() {
+        bail!("recovery group has no information matching the checkpoint");
     }
-    Ok(missing_roots)
+    Ok(RecoveryPlanAuthentication {
+        authenticated,
+        requires_bytes,
+    })
 }
 
 fn variable_recovery_plans(
@@ -10559,7 +10576,7 @@ async fn recover_variable_plan_coverage<F, Fut>(
 ) -> Result<()>
 where
     F: Fn(VariableRecoveryPlan) -> Fut + Clone + Send + Sync,
-    Fut: Future<Output = Result<()>> + Send,
+    Fut: Future<Output = Result<BTreeSet<SectorId>>> + Send,
 {
     let (mut current, fallback): (Vec<_>, Vec<_>) =
         plans.into_iter().partition(|plan| plan.priority == 0);
@@ -10603,7 +10620,7 @@ where
         }
         while let Some((sectors, result)) = requests.next().await {
             match result {
-                Ok(()) => covered.extend(sectors),
+                Ok(recovered) => covered.extend(recovered.intersection(&sectors).copied()),
                 Err(error) => last_error = Some(error),
             }
             if required_sectors.is_subset(&covered) {
@@ -10620,7 +10637,7 @@ where
         }
         let sectors = plan.covered.clone();
         match recover(plan).await {
-            Ok(()) => covered.extend(sectors),
+            Ok(recovered) => covered.extend(recovered.intersection(&sectors).copied()),
             Err(error) => last_error = Some(error),
         }
     }
@@ -10640,16 +10657,16 @@ async fn recover_variable_group_plan(
     authentication: Arc<BTreeMap<SectorId, RecoverySectorAuthentication>>,
     roster: &[GuildPeer],
     deferred_holders: Arc<Mutex<BTreeSet<NodeId>>>,
-) -> Result<()> {
+) -> Result<BTreeSet<SectorId>> {
     let group = plan.group.clone();
     let transcript = node_blocking(node.clone(), move |node| {
         node.recovery_coding_transcript_for_group(checkpoint_hash, group.guild_id, group.id)
     })
     .await?;
-    let missing_roots = recovery_plan_missing_roots(&plan, &transcript, &authentication)?;
+    let mut proven = recovery_plan_authentication(&plan, &transcript, &authentication)?;
     let mut quorum_shards = BTreeMap::new();
-    for (index, expected) in &missing_roots {
-        let bytes = reconstruct_variable_shard_from_peers_requiring_quorum(
+    for (index, sector_id, expected) in &proven.requires_bytes {
+        let bytes = match reconstruct_variable_shard_from_peers_requiring_quorum(
             node.clone(),
             p2p,
             &plan.group,
@@ -10657,18 +10674,42 @@ async fn recover_variable_group_plan(
             roster,
             deferred_holders.as_ref(),
         )
-        .await?;
-        if !expected.matches_bytes(&bytes)? {
-            bail!("reconstructed recovery sector root differs from the checkpoint");
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::debug!(
+                    group = %hex::encode(plan.group.id),
+                    sector = %hex::encode(sector_id),
+                    %error,
+                    "recovery group could not prove a planned sector"
+                );
+                continue;
+            }
+        };
+        if expected.matches_bytes(&bytes)? {
+            proven.authenticated.insert(*sector_id);
         }
         quorum_shards.insert(*index, bytes);
     }
+    if proven.authenticated.is_empty() {
+        bail!("reconstructed recovery sectors differ from the checkpoint");
+    }
+    let targets = plan
+        .targets
+        .into_iter()
+        .filter(|index| match &plan.group.roles[*index] {
+            ShardRoleV2::Information(information) => {
+                proven.authenticated.contains(&information.sector.id)
+            }
+            ShardRoleV2::Parity(_) => true,
+        })
+        .collect::<Vec<_>>();
     // A locally READY target does not establish that the certified group still
     // has a live decoding quorum. The same proof also covers a plan without a
     // local target; reuse a reconstructed root shard when there is one.
     if quorum_shards.is_empty() {
-        let probe_index = plan
-            .targets
+        let probe_index = targets
             .first()
             .copied()
             .or_else(|| {
@@ -10679,7 +10720,7 @@ async fn recover_variable_group_plan(
                     .find_map(|(index, role)| match role {
                         ShardRoleV2::Information(information)
                             if !information.sector.virtual_zero
-                                && plan.covered.contains(&information.sector.id) =>
+                                && proven.authenticated.contains(&information.sector.id) =>
                         {
                             Some(index)
                         }
@@ -10698,20 +10739,21 @@ async fn recover_variable_group_plan(
         .await?;
         quorum_shards.insert(probe_index, bytes);
     }
-    if plan.targets.is_empty() {
-        return Ok(());
+    if targets.is_empty() {
+        return Ok(proven.authenticated);
     }
     recover_variable_plan(
         node,
         p2p,
         checkpoint_hash,
         transcript,
-        plan.targets,
+        targets,
         quorum_shards,
         roster,
         deferred_holders,
     )
-    .await
+    .await?;
+    Ok(proven.authenticated)
 }
 
 async fn recover_variable_plan(
@@ -14077,9 +14119,9 @@ mod tests {
                     async move {
                         issued.lock().unwrap().push(plan.group.id);
                         if plan.group.id == [2; 32] {
-                            std::future::pending::<Result<()>>().await
+                            std::future::pending::<Result<BTreeSet<SectorId>>>().await
                         } else {
-                            Ok(())
+                            Ok(plan.covered)
                         }
                     }
                 },
@@ -14104,13 +14146,41 @@ mod tests {
                     if plan.group.id == [1; 32] {
                         bail!("first placement is unavailable");
                     }
-                    Ok(())
+                    Ok(plan.covered)
                 }
             },
         )
         .await
         .unwrap();
         assert_eq!(*issued.lock().unwrap(), vec![[1; 32], [2; 32]]);
+    }
+
+    #[tokio::test]
+    async fn current_recovery_credits_only_authenticated_sectors() {
+        let first = [4; 32];
+        let second = [5; 32];
+        let mut mixed = coverage_test_plan(1, first);
+        mixed.covered.insert(second);
+        let fallback = coverage_test_plan(2, second);
+        let attempted = Arc::new(Mutex::new(Vec::new()));
+        recover_variable_plan_coverage(
+            vec![mixed, fallback],
+            BTreeSet::from([first, second]),
+            |plan| {
+                let attempted = attempted.clone();
+                async move {
+                    attempted.lock().unwrap().push(plan.group.id);
+                    if plan.group.id == [1; 32] {
+                        Ok(BTreeSet::from([first]))
+                    } else {
+                        Ok(BTreeSet::from([second]))
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*attempted.lock().unwrap(), vec![[1; 32], [2; 32]]);
     }
 
     #[tokio::test]
@@ -14123,7 +14193,7 @@ mod tests {
         let required = (1_u8..=24).map(|index| [index; 32]).collect();
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
-        recover_variable_plan_coverage(plans, required, |_plan| {
+        recover_variable_plan_coverage(plans, required, |plan| {
             let active = active.clone();
             let peak = peak.clone();
             async move {
@@ -14131,7 +14201,7 @@ mod tests {
                 peak.fetch_max(in_flight, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 active.fetch_sub(1, Ordering::SeqCst);
-                Ok(())
+                Ok(plan.covered)
             }
         })
         .await
@@ -16081,7 +16151,7 @@ mod tests {
                 )
                 .await?;
                 assert_eq!(bytes, *expected);
-                Ok(())
+                Ok(plan.covered)
             }
         })
         .await
@@ -16906,21 +16976,42 @@ mod tests {
             2,
             None,
         );
+        let false_root_transcript = signed_replacement_transcript(
+            &wrong,
+            &wrong_shards,
+            &signing_keys,
+            checkpoint.hash().unwrap(),
+            3,
+            4,
+            Some(&BTreeMap::from([(reference.id, reference.root)])),
+        );
         assert_eq!(
             replay_coding_transcript(&wrong_transcript).unwrap(),
+            mb_core::CodingReplayFinding::Verified
+        );
+        assert_eq!(
+            replay_coding_transcript(&false_root_transcript).unwrap(),
             mb_core::CodingReplayFinding::Verified
         );
         assert!(state.validate_current_group_placement(&wrong).is_ok());
         let authentication = checkpoint_recovery_authentication(&checkpoint.checkpoint);
         let wrong_plan = VariableRecoveryPlan {
-            group: wrong,
+            group: wrong.clone(),
             targets: Vec::new(),
             covered: BTreeSet::from([reference.id]),
             priority: 0,
         };
         assert!(
-            recovery_plan_missing_roots(&wrong_plan, &wrong_transcript, &authentication).is_err(),
+            recovery_plan_authentication(&wrong_plan, &wrong_transcript, &authentication).is_err(),
             "a certified same-ID group with a different root cannot replace checkpoint coverage"
+        );
+        assert_eq!(
+            recovery_plan_authentication(&wrong_plan, &false_root_transcript, &authentication)
+                .unwrap()
+                .requires_bytes
+                .len(),
+            1,
+            "a matching claimed root still needs proof from committed bytes"
         );
         let wrong_id = wrong_plan.group.id;
         let old_id = old.id;
@@ -16944,8 +17035,8 @@ mod tests {
                     async move {
                         attempted.lock().unwrap().push(plan.group.id);
                         if plan.group.id == wrong_id {
-                            recovery_plan_missing_roots(&plan, wrong_transcript, authentication)?;
-                            Ok(())
+                            recovery_plan_authentication(&plan, wrong_transcript, authentication)?;
+                            Ok(plan.covered)
                         } else {
                             bail!("the correct stale group is unavailable")
                         }
@@ -16964,9 +17055,11 @@ mod tests {
             priority: 0,
         };
         assert!(
-            recovery_plan_missing_roots(&valid_plan, &transcript, &authentication)
+            recovery_plan_authentication(&valid_plan, &transcript, &authentication)
                 .unwrap()
-                .is_empty()
+                .requires_bytes
+                .len()
+                == 1
         );
         let packed = PackedSectorDescriptor {
             id: reference.id,
@@ -16980,14 +17073,16 @@ mod tests {
             RecoverySectorAuthentication::Packed(packed.clone()),
         )]);
         assert!(
-            recovery_plan_missing_roots(&valid_plan, &transcript, &packed_authentication)
+            recovery_plan_authentication(&valid_plan, &transcript, &packed_authentication)
                 .unwrap()
-                .is_empty()
+                .requires_bytes
+                .len()
+                == 1
         );
         let mut wrong_packed_commitment = packed.clone();
         wrong_packed_commitment.commitment = wrong_commitment;
         assert!(
-            recovery_plan_missing_roots(
+            recovery_plan_authentication(
                 &valid_plan,
                 &transcript,
                 &BTreeMap::from([(
@@ -17000,7 +17095,7 @@ mod tests {
         let mut wrong_packed_root = packed;
         wrong_packed_root.flat_root = wrong_reference.root;
         assert!(
-            recovery_plan_missing_roots(
+            recovery_plan_authentication(
                 &valid_plan,
                 &transcript,
                 &BTreeMap::from([(
@@ -17010,15 +17105,28 @@ mod tests {
             )
             .is_err()
         );
+        let mut cold_state = state.clone();
+        cold_state.event_sequence = 6;
+        cold_state.event_head = [196; 32];
+        cold_state.coding_groups.push(mb_core::RetainedCodingGroup {
+            group: wrong.clone(),
+            added_at_event: 6,
+            retired_at_event: None,
+            retain_through_event: None,
+        });
+        cold_state
+            .coding_groups
+            .sort_by_key(|retained| retained.group.id);
         let mut cold = Node::open(temp.path().join("cold"), seeds[1].clone()).unwrap();
         cold.adopt_recovered_guild(certificate, old_peers).unwrap();
         crate::node::tests::install_test_checkpoint_and_dynamic_state(
             &mut cold,
             &checkpoint,
-            &state,
+            &cold_state,
         );
         crate::node::tests::install_test_recovery_transcript(&mut cold, &transcript);
         crate::node::tests::install_test_recovery_transcript(&mut cold, &redundant_transcript);
+        crate::node::tests::install_test_recovery_transcript(&mut cold, &false_root_transcript);
         let cold = Arc::new(Mutex::new(cold));
         let requested = Arc::new(Mutex::new(Vec::new()));
         let (commands, mut commands_rx) = mpsc::channel(16);
@@ -17037,6 +17145,7 @@ mod tests {
         let old_id = old.id;
         let worker = tokio::spawn({
             let requested = requested.clone();
+            let wrong = wrong.clone();
             async move {
                 while let Some(command) = commands_rx.recv().await {
                     let Command::Request {
@@ -17063,6 +17172,13 @@ mod tests {
                                 Ok(PeerResponse::Bytes(
                                     shards[usize::from(shard_index)].clone(),
                                 ))
+                            } else if group_id == wrong_id
+                                && variable_shard_holder(&wrong.roles[usize::from(shard_index)])
+                                    == recipient
+                            {
+                                Ok(PeerResponse::Bytes(
+                                    wrong_shards[usize::from(shard_index)].clone(),
+                                ))
                             } else {
                                 Err(anyhow::anyhow!("stale group is unavailable"))
                             }
@@ -17073,12 +17189,35 @@ mod tests {
                 }
             }
         });
+        assert!(
+            recover_variable_group_plan(
+                cold.clone(),
+                &p2p,
+                checkpoint.hash().unwrap(),
+                VariableRecoveryPlan {
+                    group: wrong,
+                    targets: Vec::new(),
+                    covered: BTreeSet::from([reference.id]),
+                    priority: 0,
+                },
+                Arc::new(authentication),
+                &current_peers,
+                Arc::new(Mutex::new(BTreeSet::new())),
+            )
+            .await
+            .is_err()
+        );
         recover_p2p_variable_shards(cold, &p2p, &checkpoint, &current_peers)
             .await
             .unwrap();
         let requested = requested.lock().unwrap().clone();
         assert!(!requested.is_empty());
-        assert!(requested.iter().all(|group_id| *group_id == replacement_id));
+        assert!(
+            requested
+                .iter()
+                .all(|group_id| *group_id == replacement_id || *group_id == wrong_id)
+        );
+        assert!(requested.contains(&wrong_id));
         assert!(!requested.contains(&old_id));
         drop(p2p);
         worker.await.unwrap();
@@ -17478,7 +17617,7 @@ mod tests {
         );
         remote_available.store(true, Ordering::SeqCst);
         recover_variable_group_plan(
-            node,
+            node.clone(),
             &p2p,
             checkpoint_hash,
             plan(),
@@ -17488,6 +17627,40 @@ mod tests {
         )
         .await
         .unwrap();
+        let mut conflicting_second = references[1].clone();
+        conflicting_second.root = sector_root(&vec![33; V1_SECTOR_SIZE]);
+        let mixed_authentication = Arc::new(BTreeMap::from([
+            (
+                references[0].id,
+                RecoverySectorAuthentication::Legacy {
+                    owner: owners[0],
+                    reference: references[0].clone(),
+                },
+            ),
+            (
+                references[1].id,
+                RecoverySectorAuthentication::Legacy {
+                    owner: owners[1],
+                    reference: conflicting_second,
+                },
+            ),
+        ]));
+        let mut mixed_plan = plan();
+        mixed_plan.covered.insert(references[1].id);
+        assert_eq!(
+            recover_variable_group_plan(
+                node,
+                &p2p,
+                checkpoint_hash,
+                mixed_plan,
+                mixed_authentication,
+                &peers,
+                Arc::new(Mutex::new(BTreeSet::new())),
+            )
+            .await
+            .unwrap(),
+            BTreeSet::from([references[0].id]),
+        );
         drop(p2p);
         worker.await.unwrap();
     }

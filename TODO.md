@@ -2073,7 +2073,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   Make every accepted claimed root a verified binding to the committed full
   information shard, including checkpoint-signing and cold-recovery paths.
   Gate a replay-valid, false-root transcript against wrong committed bytes and
-  an unavailable correct stale placement.
+  an unavailable correct stale placement. Cold recovery now reconstructs and
+  checks legacy flat-root bytes even when the transcript claims the expected
+  root; a focused local regression rejects a replay-valid false-root group.
+  Checkpoint-signing coverage still needs the same binding.
 
 - [x] **M5-93 / P1 — Require live `k` when current local targets are READY.**
   `recover_variable_group_plan` proves a live quorum for coverage-only plans,
@@ -2107,7 +2110,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   accepting it. A focused local network regression passed with reachable
   wrong-root bytes followed by a correct placement.
 
-- [ ] **M5-95 / P2 — Credit valid sectors within mixed recovery groups.**
+- [x] **M5-95 / P2 — Credit valid sectors within mixed recovery groups.**
   `variable_recovery_plans` collects all matching checkpoint IDs into a
   group's `covered` set (`crates/mb-node/src/network/p2p.rs:10339`–`:10430`).
   Coverage scheduling can select that group for one still-needed sector, but
@@ -2117,7 +2120,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   group already covered B; recovery can fail despite both sectors being
   recoverable. Authenticate and credit only the still-needed matching sectors
   without losing valid coverage from the group. Gate mixed correct/wrong-root
-  groups with independent coverage for the conflicting sector.
+  groups with independent coverage for the conflicting sector. Recovery now
+  returns only sectors authenticated against the checkpoint and skips unrelated
+  mismatched roles. Focused local regressions cover a live mixed group that
+  credits valid A despite conflicting B and then credits B from another group.
 
 - [ ] **M5-96 / P1 — Authenticate retained-revision coverage and audit.**
   For a revision retained from the preceding checkpoint, checkpoint validation
