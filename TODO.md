@@ -2432,6 +2432,23 @@ node Clippy gate passed locally. No remote compilation server was used.
   gate is required on the final corrected source.
 
 - [ ] **M5-104 / gate — Recheck Milestone 5 after durable retry scheduling is corrected.**
+  Latest source-only review on 2026-09-26 covers `16c28a5..77c2090` and the
+  existing uncommitted relay/DCUtR fixture change. No new source blocker was
+  found in expired acknowledged-launch selection, acknowledgement-preserving
+  deferral/replanning, retirement before cleanup, accepted-result priority,
+  reachable replacement selection, or atomic successor/staging-intent reuse.
+  The added regressions cover coordinator shutdown, expiry and same-epoch
+  reopen with explicit majority quorum, accepted evidence across expiry, and
+  ownership preservation when the same attempt is proposed again.
+  The relay fixture explicitly dials its circuit before starting the first
+  event loop and disables background DHT maintenance for its three initial
+  nodes; hole-punch, relay retirement, application-byte and fallback assertions
+  remain present. This source edit is still uncommitted. Finalize that change
+  before recording the complete gate against an exact committed source tree.
+  This review ran no builds, tests, daemons, or runtime probes. Milestone 5
+  remains open for this gate; previous validation records do not establish
+  completion of the final tree.
+
   Correct M5-110 after the M5-108/M5-109 follow-up, then review the complete
   M5-103 follow-up and its production-worker restart/replanning regressions.
   Then run formatting, locked all-target workspace tests, strict locked

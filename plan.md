@@ -1980,6 +1980,21 @@ source locations, failure cases, and recorded gate evidence.
 
 ### Milestone 5 — efficient and flexible data/guild protocol (reopened)
 
+Latest source-only review on 2026-09-26 covers `16c28a5..77c2090` and the
+existing uncommitted relay/DCUtR fixture change. No new source blocker was
+found in the acknowledged-launch recovery and ownership corrections. Expired
+acknowledged work reaches retirement and cleanup; accepted verifier evidence
+keeps priority; deferral and same-ID replanning preserve acknowledgement; new
+successors use reachable replacement roles while persisted successors retain
+their identity and staging intent. The regression sources cover coordinator
+loss, expiry/reopen, explicit majority quorum, accepted evidence, and preserved
+ownership. The pending relay fixture change explicitly initiates its circuit
+and retains the hole-punch, relay-retirement, traffic and fallback assertions.
+Milestone 5 is still unfinished: finalize that source change, then complete
+M5-104 on the exact committed tree and record disposable-resource cleanup.
+Milestone 6 waits. This review ran no builds, tests, daemons, runtime probes,
+or remote compilation; earlier validation remains historical evidence.
+
 Source-only review of `1f3141e..16c28a5` on 2026-09-26 finds M5-110 after
 reviewing the launch renewal, staging metadata, fair selection, and restart
 regressions. A successful delegation leaves a durable launch marked dispatched.
