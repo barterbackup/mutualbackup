@@ -107,7 +107,12 @@ M5-91 local workspace/provisioned gate passed on 2026-09-25. A later source-only
 review found M5-92 through M5-96: unbound claimed legacy roots, READY-target
 quorum bypass, restore fallback on wrong-root placements, mixed-group coverage
 loss, and retained-revision/audit root bypass. Milestone 5 is reopened;
-Milestone 6 waits for corrections and M5-97.
+Milestone 6 waits for corrections and M5-97. The follow-up commits through
+`308b156` correct M5-93 through M5-95 and harden cold recovery, checkpoint
+coverage, and audit. Source-only review found that checkpoint signing can still
+accept an inconsistent revision-signed flat root and Merkle commitment through
+a format-2 plan's root claim. M5-92, M5-96, and the local M5-97 gate remain
+open.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -769,6 +774,12 @@ Milestone 5 for that source tree. Later source-only review found M5-89 and
 M5-90. Both are corrected in `e63d538` and `09e9379`; the complete M5-91
 local gate passed on the latter source tree. Further source-only review found
 M5-92 through M5-96; Milestone 5 is reopened and Milestone 6 waits for M5-97.
+Commits `1998700` through `308b156` correct the live-quorum, restore, and
+mixed-coverage paths and tighten legacy root checks. Source-only review of
+`308b156` found that new legacy checkpoint signing still trusts a format-2
+flat-root claim when its role commitment matches a separately signed revision
+commitment. The model does not establish that the two revision roots describe
+the same bytes. M5-92 and M5-96 remain open, and M5-97 has not run on this tree.
 Milestone 5 replaces filler-based protection with fair incremental cross-user
 variable-profile coding. It adds authenticated resumable Merkle ranges and
 virtual zero extents, delegated coding with separate sampled verification and
@@ -1890,7 +1901,10 @@ coverage. The complete M5-91 local workspace/provisioned acceptance gate passed
 on source commit `09e9379` on 2026-09-25. M5-88 remains historical evidence
 for its earlier tree. Later source-only review found M5-92 through M5-96 in
 legacy-root authentication, live-quorum recovery, and restore fallback. The
-source corrections and M5-97 local closure gate remain open; Milestone 6 waits.
+M5-93 through M5-95 corrections are committed. M5-92 and M5-96 still need a
+checkpoint-signing proof that the signed flat root matches the group's full
+information bytes even if the revision carries a Merkle commitment. M5-97's
+local closure gate remains open; Milestone 6 waits.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and

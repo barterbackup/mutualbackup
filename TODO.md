@@ -628,6 +628,12 @@ of `6bc66bd..543fb9b` found M5-92 through M5-96 below. M5-91 remains
 historical evidence for source commit `09e9379`; Milestone 5 is reopened and
 Milestone 6 waits for corrections and M5-97. This review ran no builds, tests,
 daemons, runtime probes, or remote compilation.
+Commits `1998700`, `ce3a96e`, `5b2b1a8`, and `308b156` address the restore,
+live-quorum, mixed-coverage, cold-root, and retained-revision/audit paths.
+Source-only review of `308b156` found the remaining checkpoint-signing gap
+under M5-92 and M5-96: matching two independently signed root claims does not
+prove they describe the same bytes. M5-97 also remains open. This review ran
+no builds, tests, daemons, runtime probes, or remote compilation.
 
 The first closure record at `8135e0b` was premature. A follow-up source audit
 found the remaining production gaps below. Commit `eeffd45` makes removal or
@@ -2076,7 +2082,21 @@ node Clippy gate passed locally. No remote compilation server was used.
   an unavailable correct stale placement. Cold recovery now reconstructs and
   checks legacy flat-root bytes even when the transcript claims the expected
   root; a focused local regression rejects a replay-valid false-root group.
-  Checkpoint-signing coverage still needs the same binding.
+  Checkpoint-signing coverage still needs the same binding. Commit `308b156`
+  requires a revision-signed Merkle commitment for a new legacy checkpoint,
+  but `verified_variable_sector_coverage` accepts a group when that commitment
+  matches the role and a format-2 plan merely *claims* the revision's flat root
+  (`crates/mb-node/src/node.rs:6408`–`:6431`). Neither
+  `GuildCheckpoint::validate` nor `CodingAttemptPlan::validate` proves that
+  the revision's flat root and Merkle commitment describe the same bytes
+  (`crates/mb-core/src/model.rs:790`–`:797`;
+  `crates/mb-core/src/attempt.rs:249`–`:258`). A signed revision with flat
+  root A and commitment for B, plus a replay-valid group for B claiming A,
+  can therefore still be signed as protected. A rootless format-1 group for B
+  also passes the commitment-matching branch. Bind the roots through full
+  authenticated bytes or an equivalent verifiable proof. Add checkpoint
+  signing regressions with this inconsistent signed root/commitment pair for
+  both transcript formats.
 
 - [x] **M5-93 / P1 — Require live `k` when current local targets are READY.**
   `recover_variable_group_plan` proves a live quorum for coverage-only plans,
@@ -2140,7 +2160,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   group healthy. Require exact signed-root protection for replacement groups
   even when a revision is retained, and make audit use the same authenticated
   coverage. Gate a retained revision with a wrong-byte format-1 replacement
-  through checkpoint signing and audit.
+  through checkpoint signing and audit. Commit `308b156` rejects that rootless
+  successor and makes audit reconstruct and check the checkpoint bytes; its
+  focused regression passed locally before this source-only review. The
+  checkpoint signer still accepts a retained signed revision whose flat root
+  and signed Merkle commitment are inconsistent, through the M5-92 path above.
+  Gate that retained-revision case as well before closing this item.
 
 - [ ] **M5-97 / gate — Close Milestone 5 after M5-92 through M5-96.**
   After correcting the source blockers, run fresh source review, formatting,
@@ -2148,7 +2173,8 @@ node Clippy gate passed locally. No remote compilation server was used.
   Clippy, Docker lab safety, and the complete provisioned Btrfs/network
   acceptance script on a fresh disposable local filesystem. Build and run
   locally; do not use a remote compilation server. M5-91 remains historical
-  evidence for its exact source tree.
+  evidence for its exact source tree. The source-only review of `308b156` did
+  not run this gate; M5-92 and M5-96 remain open.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
