@@ -165,6 +165,10 @@ The M5-103 follow-up is now implemented. Four real QUIC restart regressions
 pass through verification, activation, checkpoint signing, staged cleanup,
 and repeated reopen; retry rotation and late-evidence fences are also covered.
 The complete final M5-104 gate remains pending, so Milestone 5 stays open.
+Source-only review through `c4e97f8` finds M5-105 and M5-106: format-3 lane
+coalescing can suppress a launch using failed/retired historical retry plans,
+and its production caller stages inputs under an ID that coalescing never
+dispatches. Correct both before the final M5-104 gate. Milestone 6 waits.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -589,8 +593,10 @@ these also require correction before M5-97 and Milestone 6.
 The final correction series through `c7033fa` now passes the complete M5-97
 local workspace and fresh disposable Btrfs/network gate. Milestones 0 through
 4 are passed. Subsequent source-only review found M5-103 in same-epoch durable
-retry scheduling. Its correction and focused restart regressions now pass;
-Milestone 5 remains open and Milestone 6 waits for M5-104. The preceding
+retry scheduling. Its correction and focused restart regressions now pass.
+Follow-up source review through `c4e97f8` finds M5-105 and M5-106 in retry
+coalescing and staging. Milestone 5 remains open and Milestone 6 waits for
+those corrections and M5-104. The preceding
 records are closure history.
 Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
@@ -808,8 +814,10 @@ integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
 **Current position:** Milestones 0 through 4 are passed. M5-103's durable retry
-correction and focused regressions pass; Milestone 5 remains open for the
-complete M5-104 gate. Milestone 6 waits. The complete M5-97 local gate passed on source `c7033fa`
+correction and focused regressions pass; source review through `c4e97f8` finds
+M5-105 and M5-106 in lane coalescing and production staging. Milestone 5
+remains open for those corrections and the complete M5-104 gate. Milestone 6
+waits. The complete M5-97 local gate passed on source `c7033fa`
 on 2026-09-26; provisioned acceptance ran at documentation-only successor
 `4170dce`. That gate remains historical evidence for its tested scenarios.
 The following records retain the correction and closure history. The M5-36
@@ -2004,6 +2012,22 @@ its capacity, and leaves both terminal records unclaimed. The initial
 acceptance run on `b9aadcc` passed 21 checks before deliberate interruption
 for this correction, with all disposable resources removed. M5-104 still
 requires a complete gate on the final source.
+
+Source-only review of `515260c..c4e97f8` finds two further blockers. M5-105:
+the format-3 coalescing scan treats a same-lane historical retry child as live
+work, even after its parent is complete and the child has failed or been
+retired. A later valid launch can be suppressed indefinitely by this stale
+record. Resolve the live successor or verified coverage while preserving
+historical signed evidence. M5-106: production lane queuing uploads inputs
+before coalescing selects a different attempt ID, then ignores that returned
+plan. The unused ID has no launch or cleanup job; finalized STAGED objects and
+receipts can retain capacity across reopen. Resolve the durable attempt before
+staging or durably clean unused uploads. Required regressions must exercise
+multi-generation retries and the actual production queue, including staged
+objects/receipts and used capacity rather than reservation counts alone.
+Exact source paths and correction gates are in `TODO.md`. Milestone 5 remains
+open; correct M5-105/M5-106 before M5-104 and Milestone 6. This review ran no
+builds, tests, daemons, or runtime probes.
 
 M5-36 through M5-44 are implemented, and the complete M5-45 correction gate
 passed locally on 2026-09-19. The final committed tree passed formatting,

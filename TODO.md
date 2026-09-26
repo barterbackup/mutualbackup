@@ -583,7 +583,9 @@ remain implemented, but source-only review through `515260c` found M5-103:
 a preserved incomplete retry can indefinitely prevent the background worker
 from dispatching a stronger replacement or finishing unrelated activations.
 M5-103 is now implemented with passing production-worker restart regressions.
-Milestone 5 remains open; Milestone 6 waits for the complete new M5-104 gate.
+Source-only review through `c4e97f8` finds M5-105 and M5-106 in retry lane
+coalescing and its production staging caller. Milestone 5 remains open;
+Milestone 6 waits for those corrections and the complete new M5-104 gate.
 M5-97 and earlier gate records remain evidence for their exact trees. This
 review ran no builds, tests, daemons, runtime probes, or remote compilation.
 
@@ -2420,13 +2422,63 @@ node Clippy gate passed locally. No remote compilation server was used.
   gate is required on the final corrected source.
 
 - [ ] **M5-104 / gate — Recheck Milestone 5 after durable retry scheduling is corrected.**
-  Review the M5-103 correction and its production-worker restart regressions.
+  Correct M5-105 and M5-106, then review the complete M5-103 follow-up and its
+  production-worker restart/replanning regressions.
   Then run formatting, locked all-target workspace tests, strict locked
   all-target workspace Clippy, Docker lab safety, and the complete fresh
   disposable local Btrfs/network acceptance script. Record exact source
   commits and outcomes, and remove disposable resources. M5-97 remains a
   passed historical gate; it does not cover the missing retry schedule.
   All compilation and execution must remain local, with no remote server.
+
+- [ ] **M5-105 / P1 — Coalesce only with live retry work or completed protection.**
+  The new format-3 scan in `enqueue_coding_launch`
+  (`crates/mb-node/src/node.rs:3947`–`:3956`) returns the first same-lane
+  `retry_plan` using historical authority validation only. It does not check
+  expiry, retirement, a subsequent failure, or whether a completed retry has
+  any remaining launch/activation/coverage. Successful delegation marks the
+  parent retry complete immediately (`network/p2p.rs:6169`–`:6174`), preserving
+  that signed child forever. A concrete chain is A -> B (format 3), then B
+  fails and creates its own retry job. The completed A record still names B.
+  If B's prepared child expires and is retired/renewed, scanning A can still
+  return failed B instead of the live successor. If B cannot find two fresh
+  coordinators, a fresh same-lane launch is suppressed by B although it has
+  neither activation evidence nor runnable work. `claim_coding_retry` skips
+  completed A (`node.rs:5009`), so it cannot repair that stale pointer.
+  Historical authority validation explicitly omits current time/liveness
+  (`node.rs:5613`–`:5620`). Retain immutable evidence, but resolve the live
+  successor or verified retained coverage before suppressing a launch. Do not
+  treat a failed, retired, expired, or abandoned historical child as work.
+  Gate multi-generation retries with adverse record ordering, expired/retired
+  descendants, insufficient fresh roles, and repeated reopen. Exercise actual
+  background dispatch through activation/checkpoint coverage, and preserve
+  all original signed records. This finding is source-only; no tests were run.
+
+- [ ] **M5-106 / P1 — Resolve the selected attempt before staging coding inputs.**
+  `queue_variable_coding_lanes` stages information under its newly signed
+  deterministic plan (`crates/mb-node/src/network/p2p.rs:12508`–`:12529`), then
+  calls `enqueue_coding_launch` and ignores the returned plan. The new
+  coalescing branch can instead return an existing random-ID format-3 retry
+  without creating a launch for the staged deterministic ID. This is reachable
+  while a delegated retry is running: its parent is already complete and
+  `coding_checkpoint_has_pending` ignores completed retry records
+  (`node.rs:4057`–`:4066`), allowing the lifecycle replacement planner to queue
+  the still-uncovered lane (`network/p2p.rs:7681`–`:7686`, `:7787`). Legacy
+  information available through `sector_for_guild` is still uploaded by the
+  staging helper; only an existing READY variable object skips reservation
+  (`node.rs:4551`–`:4569`, `:4656`–`:4670`). Upload completion leaves a durable
+  STAGED object and `volume-attempt-receipt` for the unused ID
+  (`volume.rs:936`–`:961`). Activation and abort act on the selected plan's ID,
+  so they do not consume or discard these objects. The new regression invokes
+  enqueue directly after coverage (`network/p2p.rs:22584`–`:22585`), bypassing
+  production staging; zero reservations also cannot detect finalized STAGED
+  receipts. Select/reuse the durable attempt before allocating inputs, or
+  durably arrange cleanup of every unused staged attempt, including failure
+  and restart windows. Gate the real queue path while a format-3 retry is
+  pending, with locally available legacy bytes and no READY variable copy;
+  verify staged receipts/objects and used capacity as well as reservations
+  after activation, failures, and repeated reopen. Preserve signed history.
+  This finding is source-only; no tests were run.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
