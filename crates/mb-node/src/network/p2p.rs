@@ -6013,6 +6013,7 @@ const CODING_INPUT_RANGE_BYTES: usize = 256 * 1024;
 
 pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {
     let mut retry_cursor = None;
+    let mut launch_cursor = None;
     loop {
         // Every queue gets a turn, including when a retry or cleanup is blocked.
         // The retry cursor also prevents one failed retry from hiding later retries.
@@ -6025,7 +6026,7 @@ pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -
             retry_cursor = Some(job.failure.value.plan.value.attempt_id);
             process_coding_retry_job(node.clone(), &p2p, &job).await?;
         }
-        dispatch_next_coding_launch(node.clone(), &p2p).await?;
+        dispatch_next_coding_launch_after(node.clone(), &p2p, &mut launch_cursor).await?;
         process_coding_activation_job(node.clone(), &p2p).await?;
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -6280,11 +6281,40 @@ async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
     Ok(())
 }
 
+#[cfg(test)]
 async fn dispatch_next_coding_launch(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<bool> {
-    let Some(job) = node_blocking(node.clone(), |node| node.claim_coding_launch()).await? else {
+    dispatch_next_coding_launch_after(node, p2p, &mut None).await
+}
+
+async fn dispatch_next_coding_launch_after(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    cursor: &mut Option<[u8; 16]>,
+) -> Result<bool> {
+    let after = *cursor;
+    let Some(job) = node_blocking(node.clone(), move |node| {
+        node.claim_coding_launch_after(after)
+    })
+    .await?
+    else {
         return Ok(false);
     };
     let attempt_id = job.plan.value.attempt_id;
+    *cursor = Some(attempt_id);
+    let activation_plan = job.plan.clone();
+    if node_blocking(node.clone(), move |node| {
+        node.coding_launch_has_verified_result(&activation_plan)
+    })
+    .await?
+    {
+        // Activation owns these shards now, including after expiry or an epoch
+        // change. Drop only the redundant launch and its staging metadata.
+        node_blocking(node.clone(), move |node| {
+            node.abandon_coding_launch(attempt_id)
+        })
+        .await?;
+        return Ok(true);
+    }
     let attempt_membership_epoch = job.plan.value.membership_epoch;
     let current_membership_epoch = node_blocking(node.clone(), |node| {
         Ok(node
@@ -6313,10 +6343,39 @@ async fn dispatch_next_coding_launch(node: Arc<Mutex<Node>>, p2p: &P2pClient) ->
             }
         };
     }
+    if job.plan.value.expires_at_unix_seconds < unix_seconds() {
+        let result = async {
+            if cleanup_coding_retry_plan(node.clone(), p2p, &job.plan).await? {
+                node_blocking(node.clone(), move |node| {
+                    node.renew_coding_launch_after_cleanup(&job).map(|_| ())
+                })
+                .await?;
+            } else {
+                // Accepted verifier evidence remains activatable after expiry.
+                node_blocking(node.clone(), move |node| {
+                    node.complete_coding_launch(attempt_id)
+                })
+                .await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            let message = format!("expired launch cleanup deferred: {error:#}");
+            node_blocking(node.clone(), move |node| {
+                node.defer_coding_launch(attempt_id, &message)
+            })
+            .await?;
+            tracing::warn!(?attempt_id, %error, "expired coding launch deferred");
+            return Ok(false);
+        }
+        return Ok(true);
+    }
     let coordinator = job.plan.value.coding_coordinator;
     let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
+    let staging_plan = job.plan.clone();
     if let Some(information) = node_blocking(node.clone(), move |node| {
-        node.coding_launch_information_to_stage(attempt_id)
+        node.pending_coding_launch_information(&staging_plan)
     })
     .await?
     {
@@ -6338,8 +6397,12 @@ async fn dispatch_next_coding_launch(node: Arc<Mutex<Node>>, p2p: &P2pClient) ->
             tokio::time::sleep(Duration::from_secs(2)).await;
             return Ok(false);
         }
+        // Keep the input descriptors until terminal activation or failure.
+        // Delegation can remain unavailable past expiry after staging finishes;
+        // a renewed ID must be able to stage the same inputs after cleanup.
+        let staged_plan = job.plan.clone();
         node_blocking(node.clone(), move |node| {
-            node.complete_coding_launch_information(attempt_id)
+            node.mark_coding_launch_staged(&staged_plan)
         })
         .await?;
     }
@@ -22185,12 +22248,38 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn expired_launch_partial_staging_renews_after_reopen() {
+        coding_retry_restart_fixture(true, false, false, RetryReplanningCase::ExpiredPartial).await;
+    }
+
+    #[tokio::test]
+    async fn expired_launch_finalized_staging_renews_after_reopen() {
+        coding_retry_restart_fixture(true, false, false, RetryReplanningCase::ExpiredFinalized)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn expired_launch_completed_staging_renews_after_reopen() {
+        coding_retry_restart_fixture(true, false, false, RetryReplanningCase::ExpiredCompleted)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn blocked_launch_staging_yields_to_healthy_launch_after_reopen() {
+        coding_retry_restart_fixture(true, false, false, RetryReplanningCase::LaunchFairness).await;
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum RetryReplanningCase {
         None,
         Live,
         FailedChain,
         StagingRestart,
+        ExpiredPartial,
+        ExpiredFinalized,
+        ExpiredCompleted,
+        LaunchFairness,
         VerifiedEpochChange,
     }
 
@@ -22425,6 +22514,9 @@ mod tests {
                 RetryReplanningCase::Live
                     | RetryReplanningCase::FailedChain
                     | RetryReplanningCase::VerifiedEpochChange
+                    | RetryReplanningCase::ExpiredPartial
+                    | RetryReplanningCase::ExpiredFinalized
+                    | RetryReplanningCase::ExpiredCompleted
             ),
             error: None,
         };
@@ -22474,7 +22566,14 @@ mod tests {
             .as_ref()
             .and_then(|job| job.retry_plan.as_ref())
             .or(expired_plan.as_ref());
-        if let Some(plan) = partial_plan {
+        if let Some(plan) = partial_plan.filter(|_| {
+            !matches!(
+                replanning,
+                RetryReplanningCase::ExpiredPartial
+                    | RetryReplanningCase::ExpiredFinalized
+                    | RetryReplanningCase::ExpiredCompleted
+            )
+        }) {
             // A partial durable upload must be cleaned before renewal or supersession.
             nodes[1]
                 .lock()
@@ -22511,6 +22610,16 @@ mod tests {
         }
         let mut accepted_evidence = None;
         if replanning == RetryReplanningCase::VerifiedEpochChange {
+            nodes[0]
+                .lock()
+                .unwrap()
+                .install_coding_launch_for_test(&crate::node::CodingLaunchJob {
+                    format_version: 1,
+                    plan: expired_plan.as_ref().unwrap().clone(),
+                    dispatched: true,
+                    error: None,
+                })
+                .unwrap();
             for (remote, remote_node) in nodes.iter().enumerate() {
                 if remote != 3 {
                     let id = remote_node.lock().unwrap().keys().node_id();
@@ -22615,7 +22724,100 @@ mod tests {
             information_roots: replacement.information_roots.clone().unwrap(),
             packed_information: BTreeMap::new(),
         };
-        if replanning == RetryReplanningCase::StagingRestart {
+        let mut expired_launch = None;
+        let mut blocked_launch = None;
+        if replanning == RetryReplanningCase::LaunchFairness {
+            let blocked_owner = member(2).node_id;
+            let blocked_sector = mb_core::make_sector_id(
+                blocked_owner,
+                Uuid::from_bytes([222; 16]),
+                mb_core::SectorPurpose::Metadata,
+                0,
+            );
+            let (_, blocked_bytes) = mb_core::encrypted_sector(
+                &nodes[2].lock().unwrap().keys().guild_data_key(&guild_id),
+                blocked_sector,
+                &[43],
+            )
+            .unwrap();
+            let profile = mb_core::PackingProfile {
+                format_version: 1,
+                sector_size: V1_SECTOR_SIZE as u32,
+                slot_size: MERKLE_LEAF_SIZE as u32,
+            };
+            let packed = mb_core::pack_incremental(
+                profile,
+                None,
+                vec![mb_core::PackingInput {
+                    owner: blocked_owner,
+                    protected_root: [224; 32],
+                    object_id: blocked_sector,
+                    source_commitment: Some(merkle_commit(&blocked_bytes).unwrap()),
+                    bytes: blocked_bytes,
+                }],
+            )
+            .unwrap();
+            let packed_sector = packed.sectors[0].clone();
+            let blocked_bytes = packed_sector.bytes.clone();
+            let mut value = replacement.clone();
+            value.format_version = 2;
+            value.attempt_id = [0; 16];
+            value.attempt_id[15] = 1;
+            value.checkpoint_hash = [223; 32];
+            value.geometry.information[0].owner = blocked_owner;
+            value.geometry.information[0].failure_domain = member(2).failure_domain.clone();
+            value.geometry.information[0].sector.id = packed_sector.descriptor.id;
+            value.geometry.information[0].sector.logical_len = V1_SECTOR_SIZE as u32;
+            value.geometry.information[0].sector.commitment =
+                merkle_commit(&blocked_bytes).unwrap();
+            value.geometry.parity[0].holder = member(4).node_id;
+            value.geometry.parity[0].failure_domain = member(4).failure_domain.clone();
+            value.information_roots = Some(vec![packed_sector.descriptor.flat_root]);
+            value.coding_coordinator = member(3).node_id;
+            value.verification_coordinator = member(4).node_id;
+            let mut node = nodes[0].lock().unwrap();
+            node.store_packed_sector(guild_id, profile, packed_sector)
+                .unwrap();
+            assert_eq!(
+                node.sector_for_guild(&guild_id, &value.geometry.information[0].sector.id)
+                    .unwrap(),
+                blocked_bytes
+            );
+            let plan = node.sign_coding_attempt_plan(value).unwrap();
+            node.enqueue_coding_launch_with_information(plan.clone(), Some(BTreeMap::new()))
+                .unwrap();
+            nodes[2]
+                .lock()
+                .unwrap()
+                .reserve_coding_information(&plan, 0)
+                .unwrap();
+            nodes[2]
+                .lock()
+                .unwrap()
+                .write_coding_information_range(&plan, 0, 0, &blocked_bytes[..MERKLE_LEAF_SIZE])
+                .unwrap();
+            blocked_launch = Some(plan);
+            drop(node);
+            let volume = temp.path().join("volume-2");
+            std::fs::rename(&volume, temp.path().join("offline-volume-2")).unwrap();
+            nodes[2]
+                .lock()
+                .unwrap()
+                .configure_storage_volumes(&[volume], 4 * 1024 * 1024, 0)
+                .unwrap();
+            assert!(
+                !dispatch_next_coding_launch(nodes[0].clone(), &clients[0])
+                    .await
+                    .unwrap()
+            );
+        }
+        if matches!(
+            replanning,
+            RetryReplanningCase::StagingRestart
+                | RetryReplanningCase::ExpiredPartial
+                | RetryReplanningCase::ExpiredFinalized
+                | RetryReplanningCase::ExpiredCompleted
+        ) {
             let peers = nodes[0]
                 .lock()
                 .unwrap()
@@ -22634,12 +22836,24 @@ mod tests {
             )
             .await
             .unwrap();
-            let pending = nodes[0]
+            let mut pending = nodes[0]
                 .lock()
                 .unwrap()
                 .claim_coding_launch()
                 .unwrap()
                 .unwrap();
+            if replanning != RetryReplanningCase::StagingRestart {
+                let node = nodes[0].lock().unwrap();
+                let mut value = pending.plan.value.clone();
+                value.expires_at_unix_seconds = unix_seconds() + 3;
+                if replanning == RetryReplanningCase::ExpiredCompleted {
+                    value.coding_coordinator = member(3).node_id;
+                    value.verification_coordinator = member(4).node_id;
+                }
+                pending.plan = node.sign_coding_attempt_plan(value).unwrap();
+                node.install_coding_launch_for_test(&pending).unwrap();
+                expired_launch = Some(pending.plan.clone());
+            }
             assert!(
                 nodes[0]
                     .lock()
@@ -22659,10 +22873,28 @@ mod tests {
                     &bytes[..MERKLE_LEAF_SIZE],
                 )
                 .unwrap();
-                let volume = temp.path().join("volume-0");
-                std::fs::rename(&volume, temp.path().join("offline-volume-0")).unwrap();
-                node.configure_storage_volumes(&[volume], 4 * 1024 * 1024, 0)
+                if replanning == RetryReplanningCase::ExpiredFinalized {
+                    node.write_coding_information_range(
+                        &pending.plan,
+                        0,
+                        MERKLE_LEAF_SIZE as u32,
+                        &bytes[MERKLE_LEAF_SIZE..],
+                    )
                     .unwrap();
+                    node.finish_coding_information_upload(&pending.plan, 0)
+                        .unwrap();
+                    assert_eq!(node.coding_staged_receipt_count_for_test().unwrap(), 1);
+                }
+                if replanning != RetryReplanningCase::ExpiredCompleted {
+                    let volume = temp.path().join("volume-0");
+                    std::fs::rename(&volume, temp.path().join("offline-volume-0")).unwrap();
+                    node.configure_storage_volumes(&[volume], 4 * 1024 * 1024, 0)
+                        .unwrap();
+                }
+            }
+            if replanning == RetryReplanningCase::ExpiredCompleted {
+                clients[3].shutdown().await.unwrap();
+                network_tasks.remove(3).await.unwrap().unwrap();
             }
             assert!(
                 !dispatch_next_coding_launch(nodes[0].clone(), &clients[0])
@@ -22684,22 +22916,73 @@ mod tests {
                     .unwrap()
                     .is_some()
             );
-            assert!(
-                deferred
-                    .error
-                    .unwrap()
-                    .contains("information placement deferred")
-            );
+            if replanning == RetryReplanningCase::ExpiredCompleted {
+                assert!(deferred.error.is_some());
+                assert_eq!(
+                    nodes[0]
+                        .lock()
+                        .unwrap()
+                        .coding_staged_receipt_count_for_test()
+                        .unwrap(),
+                    1
+                );
+            } else {
+                assert!(
+                    deferred
+                        .error
+                        .unwrap()
+                        .contains("information placement deferred")
+                );
+            }
+            if matches!(
+                replanning,
+                RetryReplanningCase::ExpiredPartial | RetryReplanningCase::ExpiredFinalized
+            ) {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                // Cleanup is interrupted by the same offline volume. Its fence
+                // and staging intent must survive until the later reopen.
+                assert!(
+                    !dispatch_next_coding_launch(nodes[0].clone(), &clients[0])
+                        .await
+                        .unwrap()
+                );
+                let node = nodes[0].lock().unwrap();
+                assert_eq!(
+                    node.retired_coding_plan_for_test(pending.plan.value.attempt_id)
+                        .unwrap(),
+                    Some(pending.plan.clone())
+                );
+                assert!(
+                    node.claim_coding_launch()
+                        .unwrap()
+                        .unwrap()
+                        .error
+                        .unwrap()
+                        .contains("expired launch cleanup deferred")
+                );
+                assert!(
+                    node.coding_launch_information_to_stage(pending.plan.value.attempt_id)
+                        .unwrap()
+                        .is_some()
+                );
+            }
         }
-        for client in &clients {
-            client.shutdown().await.unwrap();
+        for (index, client) in clients.iter().enumerate() {
+            if replanning != RetryReplanningCase::ExpiredCompleted || index != 3 {
+                client.shutdown().await.unwrap();
+            }
         }
         for task in network_tasks.drain(..) {
             task.await.unwrap().unwrap();
         }
         clients.clear();
         drop(nodes);
-        if replanning == RetryReplanningCase::StagingRestart {
+        if matches!(
+            replanning,
+            RetryReplanningCase::StagingRestart
+                | RetryReplanningCase::ExpiredPartial
+                | RetryReplanningCase::ExpiredFinalized
+        ) {
             std::fs::rename(
                 temp.path().join("offline-volume-0"),
                 temp.path().join("volume-0"),
@@ -22716,7 +22999,13 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(4)).await;
         }
         nodes = open_nodes();
-        if replanning == RetryReplanningCase::StagingRestart {
+        if matches!(
+            replanning,
+            RetryReplanningCase::StagingRestart
+                | RetryReplanningCase::ExpiredPartial
+                | RetryReplanningCase::ExpiredFinalized
+                | RetryReplanningCase::ExpiredCompleted
+        ) {
             let mut node = nodes[0].lock().unwrap();
             node.configure_storage_volumes(&[temp.path().join("volume-0")], 4 * 1024 * 1024, 0)
                 .unwrap();
@@ -22726,7 +23015,17 @@ mod tests {
                     .unwrap()
                     .is_some()
             );
-            assert_eq!(node.coding_reservation_count_for_test().unwrap(), 1);
+            assert_eq!(
+                node.coding_reservation_count_for_test().unwrap(),
+                if matches!(
+                    replanning,
+                    RetryReplanningCase::ExpiredFinalized | RetryReplanningCase::ExpiredCompleted
+                ) {
+                    0
+                } else {
+                    1
+                }
+            );
         }
         assert_eq!(
             nodes[0]
@@ -22808,7 +23107,13 @@ mod tests {
                 RetryReplanningCase::Live | RetryReplanningCase::VerifiedEpochChange
             ) {
                 let node = nodes[0].lock().unwrap();
-                assert!(node.claim_coding_launch().unwrap().is_none());
+                if replanning == RetryReplanningCase::VerifiedEpochChange {
+                    let pending = node.claim_coding_launch().unwrap().unwrap();
+                    assert!(pending.dispatched);
+                    assert_eq!(pending.plan, accepted_evidence.as_ref().unwrap().value.plan);
+                } else {
+                    assert!(node.claim_coding_launch().unwrap().is_none());
+                }
                 assert_eq!(node.coding_staged_receipt_count_for_test().unwrap(), 0);
                 assert_eq!(node.coding_reservation_count_for_test().unwrap(), 0);
                 assert_eq!(node.coding_used_bytes_for_test().unwrap(), 0);
@@ -22853,6 +23158,49 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        if let Some(blocked) = &blocked_launch {
+            {
+                let mut node = nodes[0].lock().unwrap();
+                node.sign_checkpoint(&checkpoint).unwrap();
+                let pending = node.claim_coding_launch().unwrap().unwrap();
+                assert_eq!(pending.plan, *blocked);
+                assert!(
+                    pending
+                        .error
+                        .unwrap()
+                        .contains("information placement deferred")
+                );
+                assert!(
+                    node.coding_launch_information_to_stage(blocked.value.attempt_id)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            let volume = temp.path().join("volume-2");
+            std::fs::rename(temp.path().join("offline-volume-2"), &volume).unwrap();
+            nodes[2]
+                .lock()
+                .unwrap()
+                .configure_storage_volumes(&[volume], 4 * 1024 * 1024, 0)
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let complete = {
+                    let node = nodes[0].lock().unwrap();
+                    node.claim_coding_launch().unwrap().is_none() && node.claim_coding_activation().unwrap().is_none()
+                        && node.dynamic_guild_state().unwrap().unwrap().coding_groups.iter().any(|retained|
+                            retained.group.roles.iter().any(|role| matches!(role, ShardRoleV2::Information(info) if info.owner == blocked.value.geometry.information[0].owner)))
+                };
+                if complete {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "restored blocked launch did not activate"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
         {
             let mut node = nodes[0].lock().unwrap();
             if state.membership_epoch != 1 {
@@ -22865,6 +23213,42 @@ mod tests {
                 });
             }
             node.sign_checkpoint(&checkpoint).unwrap();
+            if let Some(expired) = &expired_launch {
+                assert_eq!(
+                    node.retired_coding_plan_for_test(expired.value.attempt_id)
+                        .unwrap(),
+                    Some(expired.clone())
+                );
+                let successor = node
+                    .coding_launch_successor_for_test(expired.value.attempt_id)
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(successor.value.attempt_id, expired.value.attempt_id);
+                assert!(successor.value.expires_at_unix_seconds > unix_seconds());
+                let current = node.dynamic_guild_state().unwrap().unwrap();
+                let retained = current
+                    .coding_groups
+                    .iter()
+                    .find(|retained| retained.retired_at_event.is_none())
+                    .unwrap();
+                assert_eq!(
+                    node.coding_transcript_for_group(guild_id, retained.group.id)
+                        .unwrap()
+                        .value
+                        .plan,
+                    successor
+                );
+                assert!(
+                    node.coding_launch_information_to_stage(expired.value.attempt_id)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    node.coding_launch_information_to_stage(successor.value.attempt_id)
+                        .unwrap()
+                        .is_none()
+                );
+            }
             if let Some(expected) = &accepted_evidence {
                 assert_eq!(
                     node.coding_transcript_for_group(
@@ -22890,7 +23274,14 @@ mod tests {
             } else {
                 assert!(evidence.complete);
                 if replanning != RetryReplanningCase::None {
-                    if replanning == RetryReplanningCase::StagingRestart {
+                    if matches!(
+                        replanning,
+                        RetryReplanningCase::StagingRestart
+                            | RetryReplanningCase::ExpiredPartial
+                            | RetryReplanningCase::ExpiredFinalized
+                            | RetryReplanningCase::ExpiredCompleted
+                            | RetryReplanningCase::LaunchFairness
+                    ) {
                         assert_eq!(evidence.retry_plan, old_job.retry_plan);
                     } else {
                         assert_eq!(evidence, old_job);
@@ -22951,6 +23342,8 @@ mod tests {
                 assert_eq!(
                     node.coding_used_bytes_for_test().unwrap(),
                     if index == 1
+                        || replanning == RetryReplanningCase::LaunchFairness
+                            && matches!(index, 2 | 4)
                         || index == 0
                             && !matches!(
                                 replanning,
@@ -22985,6 +23378,40 @@ mod tests {
                 let node =
                     Node::open(temp.path().join(format!("node-{index}")), seed.clone()).unwrap();
                 if index == 0 {
+                    if let Some(expired) = &expired_launch {
+                        assert_eq!(
+                            node.retired_coding_plan_for_test(expired.value.attempt_id)
+                                .unwrap(),
+                            Some(expired.clone())
+                        );
+                        let successor = node
+                            .coding_launch_successor_for_test(expired.value.attempt_id)
+                            .unwrap()
+                            .unwrap();
+                        let current = node.dynamic_guild_state().unwrap().unwrap();
+                        let retained = current
+                            .coding_groups
+                            .iter()
+                            .find(|retained| retained.retired_at_event.is_none())
+                            .unwrap();
+                        assert_eq!(
+                            node.coding_transcript_for_group(guild_id, retained.group.id)
+                                .unwrap()
+                                .value
+                                .plan,
+                            successor
+                        );
+                        assert!(
+                            node.coding_launch_information_to_stage(expired.value.attempt_id)
+                                .unwrap()
+                                .is_none()
+                        );
+                        assert!(
+                            node.coding_launch_information_to_stage(successor.value.attempt_id)
+                                .unwrap()
+                                .is_none()
+                        );
+                    }
                     if let Some(expected) = &accepted_evidence {
                         assert_eq!(
                             node.coding_transcript_for_group(
@@ -23023,6 +23450,8 @@ mod tests {
                     assert_eq!(
                         node.coding_used_bytes_for_test().unwrap(),
                         if index == 1
+                            || replanning == RetryReplanningCase::LaunchFairness
+                                && matches!(index, 2 | 4)
                             || index == 0
                                 && !matches!(
                                     replanning,

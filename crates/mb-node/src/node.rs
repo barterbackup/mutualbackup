@@ -3946,12 +3946,43 @@ impl Node {
 
     pub(crate) fn enqueue_coding_launch_with_information(
         &mut self,
-        plan: SignedRecord<CodingAttemptPlan>,
+        mut plan: SignedRecord<CodingAttemptPlan>,
         information_to_stage: Option<BTreeMap<SectorId, PackedSectorDescriptor>>,
     ) -> Result<SignedRecord<CodingAttemptPlan>> {
         self.validate_coding_attempt_plan(&plan)?;
         if plan.value.delegator != self.keys.node_id() {
             anyhow::bail!("only the coding delegator may queue its launch");
+        }
+        if let Some(bytes) = self
+            .control
+            .get_record("coding-retired-attempt", &plan.value.attempt_id)?
+        {
+            let retired: SignedRecord<CodingAttemptPlan> = decode_canonical(&bytes)?;
+            self.validate_coding_attempt_authority(&retired)?;
+            if !same_coding_lane_attempt(&retired.value, &plan.value) {
+                anyhow::bail!("coding launch conflicts with a retired attempt");
+            }
+            if let Some(bytes) = self
+                .control
+                .get_record("coding-launch-job", &plan.value.attempt_id)?
+            {
+                let cleanup: CodingLaunchJob = decode_canonical(&bytes)?;
+                if cleanup.plan != retired {
+                    anyhow::bail!("retired launch cleanup conflicts with its signed plan");
+                }
+                // This durable cleanup still owns the renewal transition.
+                return Ok(cleanup.plan);
+            }
+            // The deterministic initial ID can be proposed again after its
+            // successor fails. Never allocate or sign new bytes under that ID.
+            let mut value = plan.value.clone();
+            loop {
+                rand::rngs::OsRng.fill_bytes(&mut value.attempt_id);
+                if value.attempt_id != [0; 16] && value.attempt_id != retired.value.attempt_id {
+                    break;
+                }
+            }
+            plan = self.sign_coding_attempt_plan(value)?;
         }
         // Prefer verified evidence, then a live retry successor. Completed
         // parents retain their signed children forever, including failed and
@@ -4152,7 +4183,15 @@ impl Node {
         Ok(excluded)
     }
 
+    #[cfg(test)]
     pub(crate) fn claim_coding_launch(&self) -> Result<Option<CodingLaunchJob>> {
+        self.claim_coding_launch_after(None)
+    }
+
+    pub(crate) fn claim_coding_launch_after(
+        &self,
+        after: Option<[u8; 16]>,
+    ) -> Result<Option<CodingLaunchJob>> {
         let records = self.control.records("coding-launch-job")?;
         if records.is_empty() {
             return Ok(None);
@@ -4162,6 +4201,7 @@ impl Node {
             .context("coding launch requires dynamic guild state")?
             .membership_epoch;
         let mut stale = None;
+        let mut first = None;
         for (_, bytes) in records {
             let job: CodingLaunchJob = decode_canonical(&bytes)?;
             if job.format_version != 1
@@ -4171,13 +4211,159 @@ impl Node {
                 anyhow::bail!("durable coding launch job is invalid");
             }
             self.validate_coding_attempt_authority(&job.plan)?;
-            if job.plan.value.membership_epoch != current_membership_epoch {
-                stale.get_or_insert(job);
-            } else if !job.dispatched {
+            let current = job.plan.value.membership_epoch == current_membership_epoch;
+            if current && job.dispatched {
+                continue;
+            }
+            if let Some(cursor) = after {
+                if job.plan.value.attempt_id > cursor {
+                    return Ok(Some(job));
+                }
+                first.get_or_insert(job);
+            } else if current {
                 return Ok(Some(job));
+            } else {
+                stale.get_or_insert(job);
             }
         }
-        Ok(stale)
+        Ok(first.or(stale))
+    }
+
+    pub(crate) fn coding_launch_has_verified_result(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+    ) -> Result<bool> {
+        let Some(bytes) = self
+            .control
+            .get_record("coding-activation-job", &plan.value.attempt_id)?
+        else {
+            return Ok(false);
+        };
+        let activation: CodingActivationJob = decode_canonical(&bytes)?;
+        if activation.format_version != 1 || activation.transcript.value.plan != *plan {
+            anyhow::bail!("coding launch conflicts with its verifier result");
+        }
+        Ok(replay_coding_transcript(&activation.transcript)? == CodingReplayFinding::Verified)
+    }
+
+    pub(crate) fn renew_coding_launch_after_cleanup(
+        &mut self,
+        job: &CodingLaunchJob,
+    ) -> Result<SignedRecord<CodingAttemptPlan>> {
+        let prior = &job.plan;
+        let id = prior.value.attempt_id;
+        self.validate_coding_attempt_authority(prior)?;
+        if prior.value.expires_at_unix_seconds >= unix_seconds()
+            || self.control.get_record("coding-retired-attempt", &id)?
+                != Some(canonical_bytes(prior)?)
+            || self.control.get_record("coding-launch-job", &id)? != Some(canonical_bytes(job)?)
+        {
+            anyhow::bail!("expired coding launch changed or was not fenced before cleanup");
+        }
+        // The successor, staging intent, and lineage are one transaction. If a
+        // crash precedes removing the parent, repeating cleanup reuses this ID.
+        let successor =
+            if let Some(bytes) = self.control.get_record("coding-launch-successor", &id)? {
+                decode_canonical(&bytes)?
+            } else {
+                let mut replacement = None;
+                for (_, bytes) in self.control.records("coding-launch-job")? {
+                    let existing: CodingLaunchJob = decode_canonical(&bytes)?;
+                    let candidate = &existing.plan;
+                    if candidate.value.attempt_id != id
+                        && same_coding_lane(&candidate.value, &prior.value)
+                        && self.validate_coding_attempt_plan(candidate).is_ok()
+                        && self
+                            .control
+                            .get_record("coding-retired-attempt", &candidate.value.attempt_id)?
+                            .is_none()
+                        && self
+                            .control
+                            .get_record("coding-retry-job", &candidate.value.attempt_id)?
+                            .is_none()
+                    {
+                        replacement = Some(existing);
+                        break;
+                    }
+                }
+                let new_launch = replacement.is_none();
+                let launch = match replacement {
+                    Some(existing) => existing,
+                    None => {
+                        let mut value = prior.value.clone();
+                        loop {
+                            rand::rngs::OsRng.fill_bytes(&mut value.attempt_id);
+                            if value.attempt_id != [0; 16] && value.attempt_id != id {
+                                break;
+                            }
+                        }
+                        value.expires_at_unix_seconds = unix_seconds()
+                            .checked_add(24 * 60 * 60)
+                            .context("coding launch renewal expiry overflow")?;
+                        CodingLaunchJob {
+                            format_version: 1,
+                            plan: self.sign_coding_attempt_plan(value)?,
+                            dispatched: false,
+                            error: None,
+                        }
+                    }
+                };
+                let successor = launch.plan.clone();
+                let mut records = vec![(
+                    "coding-launch-successor".to_owned(),
+                    id.to_vec(),
+                    canonical_bytes(&successor)?,
+                )];
+                if new_launch {
+                    records.push((
+                        "coding-launch-job".to_owned(),
+                        successor.value.attempt_id.to_vec(),
+                        canonical_bytes(&launch)?,
+                    ));
+                }
+                if !launch.dispatched
+                    && self
+                        .coding_launch_information_to_stage(successor.value.attempt_id)?
+                        .is_none()
+                    && let Some(information) = self.coding_launch_information_to_stage(id)?
+                {
+                    records.push((
+                        "coding-launch-information".to_owned(),
+                        successor.value.attempt_id.to_vec(),
+                        canonical_bytes(&information)?,
+                    ));
+                }
+                self.control.put_records(&records)?;
+                successor
+            };
+        self.validate_coding_attempt_authority(&successor)?;
+        if !same_coding_lane(&prior.value, &successor.value) || successor.value.attempt_id == id {
+            anyhow::bail!("coding launch successor conflicts with its retired parent");
+        }
+        self.abandon_coding_launch(id)?;
+        Ok(successor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coding_launch_successor_for_test(
+        &self,
+        id: [u8; 16],
+    ) -> Result<Option<SignedRecord<CodingAttemptPlan>>> {
+        self.control
+            .get_record("coding-launch-successor", &id)?
+            .map(|bytes| decode_canonical(&bytes).map_err(Into::into))
+            .transpose()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retired_coding_plan_for_test(
+        &self,
+        id: [u8; 16],
+    ) -> Result<Option<SignedRecord<CodingAttemptPlan>>> {
+        self.control
+            .get_record("coding-retired-attempt", &id)?
+            .map(|bytes| decode_canonical(&bytes).map_err(Into::into))
+            .transpose()
     }
 
     pub(crate) fn coding_checkpoint_has_pending(&self, checkpoint_hash: [u8; 32]) -> Result<bool> {
@@ -4241,7 +4427,37 @@ impl Node {
 
     pub(crate) fn complete_coding_launch_information(&self, attempt_id: [u8; 16]) -> Result<()> {
         self.control
+            .delete_record("coding-launch-staged", &attempt_id)?;
+        self.control
             .delete_record("coding-launch-information", &attempt_id)?;
+        Ok(())
+    }
+
+    pub(crate) fn pending_coding_launch_information(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+    ) -> Result<Option<BTreeMap<SectorId, PackedSectorDescriptor>>> {
+        if let Some(bytes) = self
+            .control
+            .get_record("coding-launch-staged", &plan.value.attempt_id)?
+        {
+            if decode_canonical::<[u8; 32]>(&bytes)? != plan.value.hash()? {
+                anyhow::bail!("staging completion conflicts with its signed launch");
+            }
+            return Ok(None);
+        }
+        self.coding_launch_information_to_stage(plan.value.attempt_id)
+    }
+
+    pub(crate) fn mark_coding_launch_staged(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+    ) -> Result<()> {
+        self.control.put_record(
+            "coding-launch-staged",
+            &plan.value.attempt_id,
+            &canonical_bytes(&plan.value.hash()?)?,
+        )?;
         Ok(())
     }
 
@@ -4284,6 +4500,12 @@ impl Node {
             &canonical_bytes(job)?,
         )?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_coding_launch_for_test(&self, job: &CodingLaunchJob) -> Result<()> {
+        self.validate_coding_attempt_plan(&job.plan)?;
+        self.put_coding_launch_job(job)
     }
 
     pub fn enqueue_delegated_coding(
@@ -5151,6 +5373,7 @@ impl Node {
             complete: false,
             error: None,
         })?;
+        self.complete_coding_launch_information(attempt_id)?;
         self.control
             .delete_record("coding-launch-job", &attempt_id)?;
         Ok(())
@@ -5525,6 +5748,7 @@ impl Node {
 
     pub(crate) fn complete_coding_activation(&self, attempt_id: [u8; 16]) -> Result<()> {
         self.update_coding_activation_job(attempt_id, true, None)?;
+        self.complete_coding_launch_information(attempt_id)?;
         self.control
             .delete_record("coding-launch-job", &attempt_id)?;
         Ok(())
@@ -14440,8 +14664,99 @@ pub(crate) mod tests {
         let transcript = test_coding_transcript(verified.clone(), &shards, &keys);
         node.accept_coding_transcript(verified.value.coding_coordinator, transcript)
             .unwrap();
-        assert_eq!(node.enqueue_coding_launch(initial).unwrap(), verified);
+        assert_eq!(
+            node.enqueue_coding_launch(initial.clone()).unwrap(),
+            verified
+        );
         assert!(node.claim_coding_launch().unwrap().is_none());
+
+        // Simulate a crash after the successor transaction but before parent
+        // removal. Reopening and repeating renewal must reuse the signed ID.
+        let mut value = initial.value.clone();
+        value.checkpoint_hash = [74; 32];
+        value.expires_at_unix_seconds = unix_seconds() - 1;
+        let expired = SignedRecord::sign(
+            CODING_ATTEMPT_PLAN_DOMAIN,
+            value,
+            keys.iter().find(|key| key.node_id() == owner).unwrap(),
+        )
+        .unwrap();
+        let job = CodingLaunchJob {
+            format_version: 1,
+            plan: expired.clone(),
+            dispatched: false,
+            error: None,
+        };
+        node.put_coding_launch_job(&job).unwrap();
+        node.control
+            .put_record(
+                "coding-launch-information",
+                &expired.value.attempt_id,
+                &canonical_bytes(&BTreeMap::<SectorId, PackedSectorDescriptor>::new()).unwrap(),
+            )
+            .unwrap();
+        assert!(node.retire_coding_retry_plan(&expired).unwrap());
+        let successor = node.renew_coding_launch_after_cleanup(&job).unwrap();
+        assert_ne!(successor.value.attempt_id, expired.value.attempt_id);
+        assert!(successor.value.expires_at_unix_seconds > unix_seconds());
+        node.put_coding_launch_job(&job).unwrap();
+        drop(node);
+        node = Node::open(temp.path(), seed.clone()).unwrap();
+        assert_eq!(
+            node.renew_coding_launch_after_cleanup(&job).unwrap(),
+            successor
+        );
+        assert_eq!(node.control.records("coding-launch-job").unwrap().len(), 1);
+        assert_eq!(
+            node.control
+                .get_record("coding-retired-attempt", &expired.value.attempt_id)
+                .unwrap(),
+            Some(canonical_bytes(&expired).unwrap())
+        );
+        assert!(
+            node.coding_launch_information_to_stage(expired.value.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            node.coding_launch_information_to_stage(successor.value.attempt_id)
+                .unwrap()
+                .is_some()
+        );
+        // A deferred lower-ID launch gets one turn, followed by another lane.
+        let mut other = initial.value.clone();
+        other.attempt_id = [255; 16];
+        other.checkpoint_hash = [75; 32];
+        let other = node.sign_coding_attempt_plan(other).unwrap();
+        node.enqueue_coding_launch(other.clone()).unwrap();
+        node.defer_coding_launch(successor.value.attempt_id, "input disk offline")
+            .unwrap();
+        assert_eq!(
+            node.claim_coding_launch_after(Some(successor.value.attempt_id))
+                .unwrap()
+                .unwrap()
+                .plan,
+            other
+        );
+        assert_eq!(
+            node.claim_coding_launch_after(Some(other.value.attempt_id))
+                .unwrap()
+                .unwrap()
+                .plan,
+            successor
+        );
+        node.abandon_coding_launch(successor.value.attempt_id)
+            .unwrap();
+        let mut replacement = expired.value.clone();
+        replacement.expires_at_unix_seconds = unix_seconds() + 600;
+        let replacement = node.sign_coding_attempt_plan(replacement).unwrap();
+        let replacement = node.enqueue_coding_launch(replacement).unwrap();
+        assert_ne!(replacement.value.attempt_id, expired.value.attempt_id);
+        assert_eq!(
+            node.retired_coding_plan_for_test(expired.value.attempt_id)
+                .unwrap(),
+            Some(expired)
+        );
     }
 
     #[test]

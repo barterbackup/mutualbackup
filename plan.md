@@ -602,7 +602,8 @@ coalescing and staging. Those corrections and focused restart/replanning
 regressions now pass. Milestone 5 remains open and Milestone 6 waits for
 the complete M5-104 gate. Source-only review through `1f3141e` also requires
 M5-108/M5-109: safely renew expired durable launches and give deferred launches
-bounded scheduling turns. The preceding
+bounded scheduling turns. Both corrections and all 21 focused tests pass;
+the complete new local gate remains required. The preceding
 records are closure history.
 Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
@@ -826,7 +827,8 @@ and focused production regressions now pass. Milestone 5 remains open for the
 complete M5-104 gate, including M5-107's verified-placement/epoch-identity
 follow-up whose focused checks pass. Source-only review of `c4e97f8..1f3141e`
 also finds M5-108 (expired launches cannot renew) and M5-109 (blocked staging
-launches hide later runnable launches). Correct both before the final gate.
+launches hide later runnable launches). Both corrections and all 21 focused
+tests pass; the complete new local gate remains required.
 Milestone 6 waits. The complete M5-97 local gate passed on source `c7033fa`
 on 2026-09-26; provisioned acceptance ran at documentation-only successor
 `4170dce`. That gate remains historical evidence for its tested scenarios.
@@ -1987,6 +1989,31 @@ in `TODO.md`. Milestone 5 remains open; correct both before M5-104's complete
 local gate and Milestone 6. This review ran no builds, tests, daemons, runtime
 probes, or remote compilation. The following paragraphs retain earlier review
 and validation history.
+
+The M5-108/M5-109 correction now durably fences and cleans expired launches,
+renews with a fresh signed identity, and atomically links the successor and its
+staging intent. Existing live replacements and outstanding cleanup transitions
+are reused; retired initial identities cannot be recreated. Input descriptors
+survive staging/delegation deferral until terminal activation or failure, while
+a hash-bound completion marker avoids redundant staging. Launch claims rotate,
+including stale cleanup turns. Accepted verifier evidence is handed to activation
+before launch cleanup, including the dispatched-record membership-change case.
+New production-worker QUIC regressions cover partial/finalized upload expiry,
+interrupted offline-volume cleanup, actual coordinator shutdown after staging,
+same-epoch reopen, independent blocked/healthy lanes, exact signed evidence,
+activation/checkpoint coverage, aggregate capacity/receipt cleanup on all holders,
+and two further reopens. Node coverage proves idempotent successor persistence
+and retired-ID replanning. Final focused validation passes: all 17 `retry` tests
+in 35.46 seconds and all four `launch_` tests in 69.49 seconds. The complete
+committed-source M5-104 gate remains required before closure and Milestone 6.
+
+The earlier complete M5-104 local gate finished successfully on source `1f3141e`:
+locked all-target workspace tests (including 264 node passes), strict locked
+all-target Clippy, formatting, Docker lab safety, and all 23 fresh disposable
+Btrfs/network acceptance invocations passed. The final five-daemon scenario took
+1347.19 seconds. Disposable resources were removed and cleanup independently
+checked. That result predates M5-108/M5-109 and remains historical evidence;
+their final source needs its own complete local gate.
 
 Previously closed on 2026-09-26 after the complete M5-97 gate on corrected source
 `c7033fa`. Formatting, locked all-target workspace tests, strict locked

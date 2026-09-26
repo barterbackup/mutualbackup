@@ -589,8 +589,8 @@ implemented with passing restart/replanning regressions. Milestone 5 remains
 open; the M5-107 membership-transition follow-up also passes its focused
 checks. Source-only review of `c4e97f8..1f3141e` found M5-108 and M5-109:
 expired durable launches cannot renew, and blocked staging launches hide
-later runnable launches. Milestone 6 waits for those corrections and the
-complete new M5-104 gate.
+later runnable launches. Both corrections and all 21 focused tests now pass;
+the complete new M5-104 gate remains required. Milestone 6 waits.
 M5-97 and earlier gate records remain evidence for their exact trees. This
 review ran no builds, tests, daemons, runtime probes, or remote compilation.
 
@@ -2435,6 +2435,15 @@ node Clippy gate passed locally. No remote compilation server was used.
   commits and outcomes, and remove disposable resources. M5-97 remains a
   passed historical gate; it does not cover the missing retry schedule.
   All compilation and execution must remain local, with no remote server.
+  The complete local gate on source `1f3141e` subsequently finished: locked
+  all-target workspace tests passed (48 core, 264 node with 10 ignored, and 50
+  store with 14 ignored), strict locked all-target Clippy passed, formatting
+  passed, and Docker lab safety passed. All 23 fresh Btrfs/network acceptance
+  invocations passed; repeated multi-owner QUIC took 557.28 seconds and the
+  final five-daemon recovery/transport scenario took 1347.19 seconds. Cleanup
+  reported success; the image/directory, loop device, and namespaces were
+  independently confirmed removed. This is historical evidence for `1f3141e`,
+  preceding M5-108/M5-109. Run a new complete gate on their final source.
 
 - [x] **M5-105 / P1 — Coalesce only with live retry work or completed protection.**
   The new format-3 scan in `enqueue_coding_launch`
@@ -2541,7 +2550,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   all volumes, matching the production fixture's actual storage layout. No
   remote compilation server is used.
 
-- [ ] **M5-108 / P1 — Renew expired durable launches after safe input cleanup.**
+  The M5-108/M5-109 follow-up also preserves accepted verifier evidence when a
+  dispatched launch still exists across the membership change. Launch dispatch
+  now hands accepted results to activation before considering epoch/expiry
+  cleanup; it removes only redundant launch metadata. The real QUIC regression
+  now retains the dispatched record across relabel/reopen, as production does.
+
+- [x] **M5-108 / P1 — Renew expired durable launches after safe input cleanup.**
   Source-only review of `c4e97f8..1f3141e` on 2026-09-26 finds no same-epoch
   expiry transition for the new durable staging path. Production launches
   expire after 24 hours (`crates/mb-node/src/network/p2p.rs:12471`–`:12473`).
@@ -2571,7 +2586,27 @@ node Clippy gate passed locally. No remote compilation server was used.
   restart fixture restores its volume before launch expiry. This review ran
   no builds, tests, or runtime probes.
 
-- [ ] **M5-109 / P1 — Give deferred launches bounded scheduling turns.**
+  The correction fences expired launches before resumable cleanup, preserving
+  signed history and rejecting late results. Renewal atomically stores its
+  successor link, a fresh signed launch, and required input descriptors; an
+  already queued live replacement is reused. Replanning preserves an outstanding
+  cleanup transition and never recreates a retired deterministic initial ID.
+  Input descriptors now survive completed staging until activation or failure,
+  with a plan-hash-bound completion marker to avoid repeating successful uploads.
+  Accepted verifier evidence takes priority over launch cleanup. Node regression
+  coverage includes the crash window between successor persistence and parent
+  deletion, repeated reopen, and retired-ID replanning. Three real QUIC cases
+  exercise partial staging, finalized staging, and completed staging with an
+  actual coordinator shutdown, followed by same-epoch expiry/reopen and fresh
+  activation/checkpoint coverage. The offline-volume cases also interrupt expiry
+  cleanup and retain its fence across reopen. All cases assert exact successor
+  transcript identity, immutable retired evidence, zero staged receipts and
+  reservations, expected aggregate capacity on every holder, and two further
+  reopens. Final focused validation passes: all 17 `retry` tests in 35.46 seconds
+  and all four `launch_` tests in 69.49 seconds, including the dispatched-record
+  membership-change case. The complete final M5-104 gate remains required.
+
+- [x] **M5-109 / P1 — Give deferred launches bounded scheduling turns.**
   Source-only review of `c4e97f8..1f3141e` on 2026-09-26 finds launch claims
   always return the first undispatched current-epoch record
   (`crates/mb-node/src/node.rs:4155`–`:4180`). Records are ordered by attempt ID
@@ -2590,6 +2625,17 @@ node Clippy gate passed locally. No remote compilation server was used.
   reaches checkpoint coverage, then restore and finish the first. Cover
   repeated reopen and all holders' reservations, staged receipts, and used
   capacity. This review ran no builds, tests, or runtime probes.
+
+  The correction rotates launch claims by attempt ID, including stale cleanup
+  turns, and advances the worker cursor before staging or delegation. Deferral
+  preserves the launch and its error while allowing the next eligible ID a turn.
+  A real QUIC regression retains a lower-ID partial upload on an offline volume
+  through reopen while another lane verifies, activates, and signs its covered
+  checkpoint. Restoring the first destination then finishes its packed-input
+  lane. Both groups remain active through two further reopens, with exact used
+  capacity and no staged receipts/reservations on any holder. Final focused
+  validation passes: all four `launch_` tests in 69.49 seconds and all 17 `retry`
+  tests in 35.46 seconds. The complete final M5-104 gate remains required.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
