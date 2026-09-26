@@ -2408,6 +2408,16 @@ node Clippy gate passed locally. No remote compilation server was used.
   Node regressions cover rotating claims, retirement fences, idempotent late
   failure archival, and preserving already submitted verifier evidence.
   The complete final M5-104 gate remains pending. All validation is local.
+  Final review also found that completed delegated jobs were considered stale
+  before their terminal state was checked. A lower-ID completed job could
+  repeatedly hide an unfinished old-epoch upload. Claims now skip completed
+  work before authority replay. The legacy restart regression covers both
+  jobs across membership change and reopen, then selects and discards the
+  unfinished upload without resurrecting either completed record. Its focused
+  run passes. The initial M5-104 acceptance run passed 21 checks on `b9aadcc`
+  before it was deliberately stopped for this correction; its disposable
+  filesystem, image, loop device, and namespaces were removed. A new complete
+  gate is required on the final corrected source.
 
 - [ ] **M5-104 / gate — Recheck Milestone 5 after durable retry scheduling is corrected.**
   Review the M5-103 correction and its production-worker restart regressions.

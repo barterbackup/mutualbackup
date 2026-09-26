@@ -1997,6 +1997,13 @@ changes also clean prepared uploads. Four real QUIC restart regressions pass
 through partial parity upload, verification, activation, checkpoint signing,
 cleanup, and repeated reopen. Focused retry tests pass locally; M5-104's
 complete workspace and provisioned correction gate is still pending.
+Final review also corrected completed old-epoch delegated jobs shadowing
+unfinished stale cleanup. Claims skip terminal jobs before authority replay;
+a membership-change/reopen regression selects the unfinished upload, releases
+its capacity, and leaves both terminal records unclaimed. The initial
+acceptance run on `b9aadcc` passed 21 checks before deliberate interruption
+for this correction, with all disposable resources removed. M5-104 still
+requires a complete gate on the final source.
 
 M5-36 through M5-44 are implemented, and the complete M5-45 correction gate
 passed locally on 2026-09-19. The final committed tree passed formatting,

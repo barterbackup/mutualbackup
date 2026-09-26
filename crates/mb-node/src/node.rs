@@ -4160,6 +4160,9 @@ impl Node {
             if job.format_version != 1 || job.plan.value.coding_coordinator != self.keys.node_id() {
                 anyhow::bail!("durable delegated coding job is invalid");
             }
+            if job.state == DelegatedCodingJobState::Complete {
+                continue;
+            }
             if job.plan.value.membership_epoch != current_membership_epoch {
                 self.validate_coding_attempt_authority(&job.plan)?;
                 stale.get_or_insert(job);
@@ -14226,7 +14229,7 @@ pub(crate) mod tests {
                 .put_record(kind, &old.value.attempt_id, &bytes)
                 .unwrap();
             drop(node);
-            let node = Node::open(&dir, seed.clone()).unwrap();
+            let mut node = Node::open(&dir, seed.clone()).unwrap();
             assert_eq!(node.enqueue_coding_launch(new.clone()).unwrap(), new);
             assert_eq!(
                 node.control
@@ -14236,7 +14239,72 @@ pub(crate) mod tests {
                 bytes
             );
             assert_eq!(node.claim_coding_launch().unwrap().unwrap().plan, new);
-            if kind == "coding-retry-job" {
+            if kind == "coding-launch-job" {
+                let volume = temp.path().join("stale-delegated-volume");
+                std::fs::create_dir(&volume).unwrap();
+                node.configure_storage_volumes(&[volume], 4 * 1024 * 1024, 0)
+                    .unwrap();
+                let delegated = |attempt_id| {
+                    let mut plan = old.value.clone();
+                    plan.attempt_id = attempt_id;
+                    plan.delegator = remotes[0].node_id();
+                    plan.coding_coordinator = local_id;
+                    plan.verification_coordinator = remotes[1].node_id();
+                    SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, remotes[0]).unwrap()
+                };
+                let complete = delegated([82; 16]);
+                let pending = delegated([83; 16]);
+                node.enqueue_delegated_coding(complete.value.delegator, complete.clone())
+                    .unwrap();
+                node.complete_delegated_coding(complete.value.attempt_id)
+                    .unwrap();
+                node.enqueue_delegated_coding(pending.value.delegator, pending.clone())
+                    .unwrap();
+                node.reserve_coding_information(&pending, 0).unwrap();
+                node.write_coding_information_range(&pending, 0, 0, &shards[0])
+                    .unwrap();
+                node.finish_coding_information_upload(&pending, 0).unwrap();
+                assert_eq!(
+                    node.storage_status().unwrap()[0].used_bytes,
+                    Some(u64::from(shard_size))
+                );
+                let state = node.dynamic_guild_state().unwrap().unwrap();
+                let event = GuildEvent {
+                    format_version: 1,
+                    guild_id: state.guild_id,
+                    sequence: state.event_sequence + 1,
+                    parent: state.event_head,
+                    kind: mb_core::GuildEventKind::RelabelMember {
+                        node_id: remotes[2].node_id(),
+                        failure_domain: "epoch-change-for-cleanup".to_owned(),
+                    },
+                };
+                let mut signatures = keys
+                    .iter()
+                    .map(|key| sign_guild_event(&event, key).unwrap())
+                    .collect::<Vec<_>>();
+                signatures.sort_by_key(|signature| signature.signer);
+                node.install_guild_event(QuorumGuildEvent { event, signatures })
+                    .unwrap();
+                drop(node);
+                let mut node = Node::open(&dir, seed.clone()).unwrap();
+                assert_eq!(
+                    node.claim_delegated_coding().unwrap().unwrap().plan,
+                    pending
+                );
+                assert!(
+                    node.discard_coding_attempt(&pending.value.attempt_id)
+                        .unwrap()
+                );
+                node.complete_delegated_coding(pending.value.attempt_id)
+                    .unwrap();
+                assert_eq!(node.coding_reservation_count_for_test().unwrap(), 0);
+                assert_eq!(node.storage_status().unwrap()[0].used_bytes, Some(0));
+                assert!(node.claim_delegated_coding().unwrap().is_none());
+                drop(node);
+                let node = Node::open(&dir, seed.clone()).unwrap();
+                assert!(node.claim_delegated_coding().unwrap().is_none());
+            } else if kind == "coding-retry-job" {
                 let mut prepared = old.value.clone();
                 prepared.attempt_id = [79; 16];
                 let prepared =
