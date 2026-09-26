@@ -144,6 +144,9 @@ M5-102 is now implemented and its focused local regression passes. Adaptive
 parity ranges are leaf-aligned, and frame-limited uploads survive encrypted
 holder-storage reopening and reservation resume through finalization. M5-101
 and M5-102 are corrected; the complete M5-97 gate remains open.
+The corrected source `c7033fa` passed formatting, locked all-target workspace
+tests, strict locked all-target workspace Clippy, and Docker lab safety locally
+on 2026-09-26. Final fresh disposable Btrfs/network acceptance remains pending.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,

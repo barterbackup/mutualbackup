@@ -2214,6 +2214,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   parity range calculation. Correct it before the final gate. The uncommitted
   M5-101 length checks are present in the working tree but do not constitute
   committed, validated milestone closure evidence.
+  Commits `8433c86` and `c7033fa` now implement M5-101 and M5-102. The final
+  source tree `c7033fa` passed formatting, locked all-target workspace tests,
+  warning-free locked all-target workspace Clippy, and Docker lab safety
+  locally on 2026-09-26. Node tests: 255 passed, 10 provisioned tests ignored;
+  core: 48 passed; store: 50 passed, 14 provisioned tests ignored. These counts
+  exclude the other passing workspace targets. Complete fresh disposable
+  Btrfs/network acceptance on this final source tree is still required.
 
 - [x] **M5-98 / P1 — Give upgraded legacy attempts a distinct durable identity.**
   `queue_variable_coding_lanes` now emits format-3 legacy plans but derives
