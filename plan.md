@@ -602,8 +602,10 @@ coalescing and staging. Those corrections and focused restart/replanning
 regressions now pass. Milestone 5 remains open and Milestone 6 waits for
 the complete M5-104 gate. Source-only review through `1f3141e` also requires
 M5-108/M5-109: safely renew expired durable launches and give deferred launches
-bounded scheduling turns. Both corrections and all 21 focused tests pass;
-the complete new local gate remains required. The preceding
+bounded scheduling turns. Both corrections and all 21 focused tests pass.
+Source-only review through `16c28a5` finds M5-110: acknowledged launches
+are skipped after expiry if their coordinator disappears. Correct this
+delegator recovery gap before the complete new local gate. The preceding
 records are closure history.
 Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
@@ -828,7 +830,9 @@ complete M5-104 gate, including M5-107's verified-placement/epoch-identity
 follow-up whose focused checks pass. Source-only review of `c4e97f8..1f3141e`
 also finds M5-108 (expired launches cannot renew) and M5-109 (blocked staging
 launches hide later runnable launches). Both corrections and all 21 focused
-tests pass; the complete new local gate remains required.
+tests pass. Source-only review through `16c28a5` finds M5-110: current-epoch
+dispatched launches never reach expiry recovery after coordinator loss.
+Correct M5-110 and pass the complete new local gate before closure.
 Milestone 6 waits. The complete M5-97 local gate passed on source `c7033fa`
 on 2026-09-26; provisioned acceptance ran at documentation-only successor
 `4170dce`. That gate remains historical evidence for its tested scenarios.
@@ -1973,7 +1977,23 @@ source locations, failure cases, and recorded gate evidence.
 
 ### Milestone 5 — efficient and flexible data/guild protocol (reopened)
 
-Current source-only review of `c4e97f8..1f3141e` on 2026-09-26 finds two remaining
+Source-only review of `1f3141e..16c28a5` on 2026-09-26 finds M5-110 after
+reviewing the launch renewal, staging metadata, fair selection, and restart
+regressions. A successful delegation leaves a durable launch marked dispatched.
+Claims skip all dispatched current-epoch launches, including expired ones, so
+coordinator loss before a result or failure report makes the new expiry recovery
+branch unreachable. The pending launch also suppresses lifecycle replanning.
+Allow the delegator to fence and clean expired dispatched work, preserving
+accepted verifier evidence, and choose reachable replacement coordinators.
+Keep signed history immutable and treat silence only as unavailability. Add an
+acknowledged-delegation/coordinator-loss regression through same-epoch expiry
+and reopen, fresh activation/checkpoint coverage, late-result rejection, all
+holders' capacity/receipt cleanup, and repeated reopen. Exact source evidence
+and the correction gate are in `TODO.md`. Milestone 5 remains open for M5-110
+and the complete M5-104 local gate; Milestone 6 waits. This review ran no builds,
+tests, daemons, runtime probes, or remote compilation.
+
+Earlier source-only review of `c4e97f8..1f3141e` on 2026-09-26 found two
 production-worker blockers after M5-105 through M5-107. M5-108: a durable launch
 that outlives its 24-hour deadline is still claimed, but input staging and
 delegation reject its immutable expired plan. Same-epoch restart and restored

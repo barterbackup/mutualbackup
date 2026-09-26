@@ -590,7 +590,10 @@ open; the M5-107 membership-transition follow-up also passes its focused
 checks. Source-only review of `c4e97f8..1f3141e` found M5-108 and M5-109:
 expired durable launches cannot renew, and blocked staging launches hide
 later runnable launches. Both corrections and all 21 focused tests now pass;
-the complete new M5-104 gate remains required. Milestone 6 waits.
+the complete new M5-104 gate remains required. Source-only review of
+`1f3141e..16c28a5` finds M5-110: successfully dispatched current-epoch
+launches are skipped even after expiry, leaving coordinator-loss recovery
+unreachable. Correct M5-110 before the final gate. Milestone 6 waits.
 M5-97 and earlier gate records remain evidence for their exact trees. This
 review ran no builds, tests, daemons, runtime probes, or remote compilation.
 
@@ -2427,7 +2430,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   gate is required on the final corrected source.
 
 - [ ] **M5-104 / gate — Recheck Milestone 5 after durable retry scheduling is corrected.**
-  Correct M5-108 and M5-109 after M5-105 through M5-107, then review the complete
+  Correct M5-110 after the M5-108/M5-109 follow-up, then review the complete
   M5-103 follow-up and its production-worker restart/replanning regressions.
   Then run formatting, locked all-target workspace tests, strict locked
   all-target workspace Clippy, Docker lab safety, and the complete fresh
@@ -2636,6 +2639,42 @@ node Clippy gate passed locally. No remote compilation server was used.
   capacity and no staged receipts/reservations on any holder. Final focused
   validation passes: all four `launch_` tests in 69.49 seconds and all 17 `retry`
   tests in 35.46 seconds. The complete final M5-104 gate remains required.
+
+- [ ] **M5-110 / P1 — Recover expired launches after successful delegation.**
+  Source-only review of `1f3141e..16c28a5` on 2026-09-26 finds that the new
+  launch expiry transition cannot handle a coordinator disappearing after
+  acknowledging delegation. Successful dispatch calls `complete_coding_launch`
+  (`crates/mb-node/src/network/p2p.rs:6415`–`:6422`), which retains the launch
+  and sets `dispatched = true` (`crates/mb-node/src/node.rs:4414`–`:4415`,
+  `:4477`–`:4493`). `claim_coding_launch_after` unconditionally skips such
+  current-epoch jobs before checking any deadline (`node.rs:4213`–`:4216`).
+  Therefore the worker never reaches the new expiry cleanup/renewal branch
+  (`network/p2p.rs:6346`–`:6352`), even after the delegator reopens in the same
+  epoch. A concrete case is an acknowledged remote coordinator that stops
+  before submitting either verifier evidence or a signed failure, while all
+  information/parity holders and alternative coordinators remain available.
+  Only that remote coordinator can submit the normal failure report
+  (`node.rs:5320`–`:5332`); its absence does not create a retry. The retained
+  launch continues to count as pending (`node.rs:4369`–`:4376`), suppressing
+  lifecycle replanning (`network/p2p.rs:7774`–`:7780`). Staged inputs and any
+  partial parity remain stranded, and checkpoint coverage cannot finish.
+
+  Make expired dispatched launches eligible for delegator-owned recovery.
+  Preserve accepted verifier evidence before fencing late results; durably
+  clean the old attempt and select reachable replacement coordinators without
+  modifying its signed history or treating silence as attributable misconduct.
+  Simply selecting the expired job is insufficient if renewal repeatedly
+  copies the unavailable coordinator. Gate actual successful remote delegation
+  followed by coordinator shutdown before result/failure submission, expiry,
+  and same-epoch delegator reopen. Keep the old coordinator unavailable while
+  the production worker reaches fresh verification, activation, and checkpoint
+  coverage. Assert immutable retired evidence, rejection of late old results,
+  zero reservations/staged receipts, exact capacity on every holder, and two
+  further reopens. Also retain the accepted-verifier-result case across expiry.
+  The three new expiry regressions exercise unsuccessful dispatch and leave
+  their launch undispatched (`network/p2p.rs:22901`–`:22913`); they do not cover
+  this acknowledged-delegation window. This review ran no builds, tests,
+  daemons, runtime probes, or remote compilation.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
