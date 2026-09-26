@@ -2312,7 +2312,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   migration and successor signing, staging/activation, and both authentication
   modes. The complete final M5-97 gate remains pending.
 
-- [ ] **M5-102 / P1 — Align adaptive parity uploads to Merkle leaves.**
+- [x] **M5-102 / P1 — Align adaptive parity uploads to Merkle leaves.**
   `coding_parity_range_bytes` returns the remaining encoded-frame budget,
   divided by two for CBOR and capped at 256 KiB, without rounding it down to
   `MERKLE_LEAF_SIZE` (`crates/mb-node/src/network/wire.rs:625`–`:646`).
@@ -2332,6 +2332,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   sizes; every chosen chunk and resumed offset must remain aligned while both
   encoded transports stay within their limits. This finding is source-only;
   no builds, tests, daemons, or runtime probes were run for this review.
+  The shared range budget now rounds down to complete Merkle leaves. The
+  focused local frame regression passes with four envelope/domain sizes,
+  including a raw unaligned budget: it writes every chunk through the holder's
+  SQLCipher range API, reopens after the first chunk, resumes the reservation,
+  finalizes the committed parity row, and verifies its opening. Every upload
+  also fits both serialized transport limits. The final M5-97 gate remains open.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

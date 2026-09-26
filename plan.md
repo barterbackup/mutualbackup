@@ -140,6 +140,10 @@ M5-101 is now implemented: legacy coverage and recovery/audit require 64 KiB
 ciphertext, while packed descriptors retain their explicit lengths. The
 positive migration/lifecycle and negative short-proof regressions pass locally.
 M5-102 and the complete final M5-97 gate remain open.
+M5-102 is now implemented and its focused local regression passes. Adaptive
+parity ranges are leaf-aligned, and frame-limited uploads survive encrypted
+holder-storage reopening and reservation resume through finalization. M5-101
+and M5-102 are corrected; the complete M5-97 gate remains open.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,

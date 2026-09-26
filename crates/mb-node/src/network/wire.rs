@@ -638,6 +638,7 @@ pub(super) fn coding_parity_range_bytes(
         .saturating_sub(tcp.saturating_add(8))
         .min(limit.saturating_sub(cbor.saturating_add(8)) / 2)
         .min(256 * 1024);
+    let bytes = bytes / mb_core::MERKLE_LEAF_SIZE * mb_core::MERKLE_LEAF_SIZE;
     if bytes < mb_core::MERKLE_LEAF_SIZE {
         anyhow::bail!("coding evidence leaves no peer-frame space for a parity range");
     }
@@ -1004,6 +1005,97 @@ mod tests {
         );
         let range_bytes = coding_parity_range_bytes(&signed_plan, &manifest).unwrap();
         assert!(range_bytes < profile.shard_size as usize);
+        // Exercise the holder's actual durable range preconditions, including
+        // restart after the first frame-limited chunk. Envelope sizes vary with
+        // domain length; fitting a frame alone does not imply leaf alignment.
+        let mut raw_unaligned_budget_seen = false;
+        for variation in 0..4 {
+            let mut varied_plan = plan.clone();
+            varied_plan.geometry.information[0]
+                .failure_domain
+                .truncate(256 - variation);
+            let varied_plan =
+                SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, varied_plan, &keys[0]).unwrap();
+            let varied_manifest =
+                crate::node::tests::test_coding_transcript(varied_plan.clone(), &shards, &keys)
+                    .value
+                    .manifest;
+            let range_bytes = coding_parity_range_bytes(&varied_plan, &varied_manifest).unwrap();
+            let empty_request = PeerRequest::UploadCodingParityRange {
+                plan: Box::new(varied_plan.clone()),
+                manifest: Box::new(varied_manifest.clone()),
+                shard_index: u16::MAX,
+                offset: u32::MAX,
+                bytes: Vec::new(),
+            };
+            let (tcp, cbor) = frame_sizes(&budget_request(empty_request)).unwrap();
+            let raw_budget = super::super::MAX_PEER_FRAME_BYTES
+                .saturating_sub(tcp + 8)
+                .min(super::super::MAX_PEER_FRAME_BYTES.saturating_sub(cbor + 8) / 2)
+                .min(256 * 1024);
+            raw_unaligned_budget_seen |= !raw_budget.is_multiple_of(mb_core::MERKLE_LEAF_SIZE);
+            assert!(range_bytes < shards[4].len());
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("parity.db");
+            let volume_id = [1; 16];
+            let attempt_id = varied_plan.value.attempt_id;
+            let guild_id = varied_plan.value.geometry.guild_id;
+            let mut store = mb_store::ParityStore::open(&path, &volume_id, &keys[4]).unwrap();
+            let mut offset = store
+                .reserve_coding_attempt(
+                    &attempt_id,
+                    &guild_id,
+                    4,
+                    profile.shard_size,
+                    8 * 1024 * 1024,
+                )
+                .unwrap() as usize;
+            while offset < shards[4].len() {
+                let end = (offset + range_bytes).min(shards[4].len());
+                let chunk = &shards[4][offset..end];
+                let request = budget_request(PeerRequest::UploadCodingParityRange {
+                    plan: Box::new(varied_plan.clone()),
+                    manifest: Box::new(varied_manifest.clone()),
+                    shard_index: 4,
+                    offset: offset as u32,
+                    bytes: chunk.to_vec(),
+                });
+                let (tcp, cbor) = frame_sizes(&request).unwrap();
+                assert!(tcp.max(cbor) <= super::super::MAX_PEER_FRAME_BYTES);
+                offset = store
+                    .write_coding_attempt_range(&attempt_id, 4, offset as u32, chunk)
+                    .unwrap() as usize;
+                if offset == range_bytes {
+                    drop(store);
+                    store = mb_store::ParityStore::open(&path, &volume_id, &keys[4]).unwrap();
+                    assert_eq!(
+                        store
+                            .reserve_coding_attempt(
+                                &attempt_id,
+                                &guild_id,
+                                4,
+                                profile.shard_size,
+                                8 * 1024 * 1024,
+                            )
+                            .unwrap() as usize,
+                        offset
+                    );
+                }
+            }
+            let commitment = mb_core::merkle_commit(&shards[4]).unwrap();
+            let group_id = varied_manifest.value.group.id;
+            store
+                .finish_coding_attempt_upload(&attempt_id, &group_id, 4, &commitment)
+                .unwrap();
+            let proof = store
+                .open_attempt_range(&attempt_id, &group_id, 4, 0, 1)
+                .unwrap();
+            mb_core::merkle_verify_range(&commitment, &proof).unwrap();
+        }
+        assert!(
+            raw_unaligned_budget_seen,
+            "exercise a budget rejected before leaf rounding"
+        );
         let event = GuildEvent {
             format_version: 1,
             guild_id: plan.geometry.guild_id,
