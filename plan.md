@@ -136,6 +136,10 @@ alignment requirement. Round the budget down to complete Merkle leaves and
 cover holder staging and interrupted resume before M5-97. M5-101's length
 correction is currently uncommitted in the working tree. Milestone 5 remains
 open; Milestone 6 waits for these corrections and the final local gate.
+M5-101 is now implemented: legacy coverage and recovery/audit require 64 KiB
+ciphertext, while packed descriptors retain their explicit lengths. The
+positive migration/lifecycle and negative short-proof regressions pass locally.
+M5-102 and the complete final M5-97 gate remain open.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,

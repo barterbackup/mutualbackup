@@ -2287,7 +2287,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   Postcard, verifies historical layout compatibility, and rejects a dense
   raw-size-valid plan whose control evidence cannot fit its containing frames.
 
-- [ ] **M5-101 / P2 — Enforce the fixed legacy ciphertext sector length.**
+- [x] **M5-101 / P2 — Enforce the fixed legacy ciphertext sector length.**
   `verified_variable_sector_coverage` matches owner, sector ID, logical length,
   and the replay-verified flat root without requiring the information
   commitment's byte length to equal `V1_SECTOR_SIZE`
@@ -2305,6 +2305,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   their explicit descriptor commitments. Gate a fully root-bound short shard
   against checkpoint signing and recovery/audit authentication, and use full
   V1 ciphertext sectors for positive legacy checkpoint fixtures.
+  Checkpoint coverage, audit candidate selection, and shared recovery/audit
+  authentication now require complete V1 ciphertext sectors for legacy
+  references. Packed descriptors retain their explicit length. Focused local
+  regressions pass for fully root-bound short-shard rejection, complete-sector
+  migration and successor signing, staging/activation, and both authentication
+  modes. The complete final M5-97 gate remains pending.
 
 - [ ] **M5-102 / P1 — Align adaptive parity uploads to Merkle leaves.**
   `coding_parity_range_bytes` returns the remaining encoded-frame budget,

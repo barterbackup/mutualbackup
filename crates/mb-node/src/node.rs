@@ -6404,7 +6404,8 @@ impl Node {
                     if !information.sector.virtual_zero
                         && information.owner == owner
                         && information.sector.id == reference.id
-                        && information.sector.logical_len == reference.logical_len)
+                        && information.sector.logical_len == reference.logical_len
+                        && information.sector.commitment.byte_len == V1_SECTOR_SIZE as u32)
             }) else {
                 continue;
             };
@@ -9782,6 +9783,7 @@ pub(crate) fn variable_group_protects_checkpoint(
                     matches!(role, ShardRoleV2::Information(information)
                         if !information.sector.virtual_zero
                             && information.owner == revision.value.owner
+                            && information.sector.commitment.byte_len == V1_SECTOR_SIZE as u32
                             && revision.value.metadata_sectors.iter()
                                 .chain(&revision.value.data_sectors)
                                 .enumerate()
@@ -13815,6 +13817,15 @@ pub(crate) mod tests {
 
     #[test]
     fn legacy_proof_upgrade_preserves_durable_jobs_and_certified_groups() {
+        legacy_proof_upgrade_fixture(V1_SECTOR_SIZE as u32, true);
+    }
+
+    #[test]
+    fn short_information_proof_cannot_protect_legacy_checkpoint() {
+        legacy_proof_upgrade_fixture(64, false);
+    }
+
+    fn legacy_proof_upgrade_fixture(shard_size: u32, legacy_coverage_expected: bool) {
         let temp = tempfile::tempdir().unwrap();
         let (seed, certificate, peers) = recovery_guild_fixture();
         let keys = (0_u8..5)
@@ -13833,8 +13844,8 @@ pub(crate) mod tests {
                 .member
                 .clone()
         };
-        let profile = mb_core::CodingProfile::new(1, 1, 64);
-        let shards = mb_core::encode(profile, vec![vec![67; 64]]).unwrap();
+        let profile = mb_core::CodingProfile::new(1, 1, shard_size);
+        let shards = mb_core::encode(profile, vec![vec![67; shard_size as usize]]).unwrap();
         let geometry = mb_core::CodingPlanGeometry {
             format_version: 1,
             guild_id: certificate.genesis.guild_id,
@@ -14060,11 +14071,17 @@ pub(crate) mod tests {
                     node.validate_variable_checkpoint_coverage(&checkpoint, false)
                         .is_err()
                 );
-                node.validate_variable_checkpoint_coverage(&checkpoint, true)
-                    .unwrap();
+                assert_eq!(
+                    node.validate_variable_checkpoint_coverage(&checkpoint, true)
+                        .is_ok(),
+                    legacy_coverage_expected
+                );
             } else {
-                node.validate_variable_checkpoint_coverage(&checkpoint, false)
-                    .unwrap();
+                assert_eq!(
+                    node.validate_variable_checkpoint_coverage(&checkpoint, false)
+                        .is_ok(),
+                    legacy_coverage_expected
+                );
             }
         }
         drop(node);
@@ -14098,7 +14115,7 @@ pub(crate) mod tests {
                 shards[0]
             );
         }
-        assert!(
+        assert_eq!(
             node.verified_variable_sector_coverage(
                 &node.dynamic_guild_state().unwrap().unwrap(),
                 local_id,
@@ -14111,11 +14128,18 @@ pub(crate) mod tests {
                 false,
                 true
             )
-            .unwrap()
+            .unwrap(),
+            legacy_coverage_expected
         );
-        node.validate_variable_checkpoint_coverage(&checkpoint, false)
-            .unwrap();
-        node.sign_checkpoint(&checkpoint).unwrap();
+        assert_eq!(
+            node.validate_variable_checkpoint_coverage(&checkpoint, false)
+                .is_ok(),
+            legacy_coverage_expected
+        );
+        assert_eq!(
+            node.sign_checkpoint(&checkpoint).is_ok(),
+            legacy_coverage_expected
+        );
     }
 
     #[test]
@@ -14168,7 +14192,7 @@ pub(crate) mod tests {
         let mut node = Node::open(data_dir.path(), identities[4].1.clone()).unwrap();
         node.adopt_recovered_guild(certificate.clone(), peers.clone())
             .unwrap();
-        node.configure_storage_volumes(&[storage.path().to_path_buf()], 4096, 0)
+        node.configure_storage_volumes(&[storage.path().to_path_buf()], 8 * 1024 * 1024, 0)
             .unwrap();
         let mut information_node =
             Node::open(information_data_dir.path(), identities[2].1.clone()).unwrap();
@@ -14176,11 +14200,19 @@ pub(crate) mod tests {
             .adopt_recovered_guild(certificate.clone(), peers)
             .unwrap();
         information_node
-            .configure_storage_volumes(&[information_storage.path().to_path_buf()], 4096, 0)
+            .configure_storage_volumes(
+                &[information_storage.path().to_path_buf()],
+                8 * 1024 * 1024,
+                0,
+            )
             .unwrap();
 
-        let profile = mb_core::CodingProfile::new(3, 2, 64);
-        let information = vec![vec![7; 64], vec![19; 64], vec![31; 64]];
+        let profile = mb_core::CodingProfile::new(3, 2, V1_SECTOR_SIZE as u32);
+        let information = vec![
+            vec![7; V1_SECTOR_SIZE],
+            vec![19; V1_SECTOR_SIZE],
+            vec![31; V1_SECTOR_SIZE],
+        ];
         let shards = mb_core::encode(profile, information).unwrap();
         let mut roles = shards[..3]
             .iter()
@@ -14273,7 +14305,7 @@ pub(crate) mod tests {
             information_node
                 .write_coding_information_range(&plan, 2, 32, &shards[2][32..])
                 .unwrap(),
-            64
+            V1_SECTOR_SIZE as u32
         );
         information_node
             .finish_coding_information_upload(&plan, 2)
@@ -14349,7 +14381,7 @@ pub(crate) mod tests {
         assert_eq!(
             node.write_coding_parity_range(&plan, &manifest, 4, 32, &local_object.bytes[32..])
                 .unwrap(),
-            64
+            V1_SECTOR_SIZE as u32
         );
         let local_receipt = node
             .finish_coding_parity_upload(&plan, &manifest, 4)
@@ -14499,7 +14531,7 @@ pub(crate) mod tests {
                 &local_object.bytes,
             )
             .unwrap(),
-            64
+            V1_SECTOR_SIZE as u32
         );
         assert_eq!(
             node.finish_coding_parity_upload(

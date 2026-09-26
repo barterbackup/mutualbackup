@@ -10351,6 +10351,7 @@ impl RecoverySectorAuthentication {
                 information.owner == *owner
                     && information.sector.id == reference.id
                     && information.sector.logical_len == reference.logical_len
+                    && information.sector.commitment.byte_len == V1_SECTOR_SIZE as u32
                     && commitment
                         .as_ref()
                         .is_none_or(|expected| information.sector.commitment == *expected)
@@ -10370,7 +10371,8 @@ impl RecoverySectorAuthentication {
                 commitment,
                 ..
             } => {
-                sector_root(bytes) == reference.root
+                bytes.len() == V1_SECTOR_SIZE
+                    && sector_root(bytes) == reference.root
                     && commitment
                         .as_ref()
                         .is_none_or(|expected| merkle_commit(bytes).ok().as_ref() == Some(expected))
@@ -15094,6 +15096,59 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn legacy_recovery_and_audit_authentication_reject_short_sectors() {
+        let owner = NodeId([31; 32]);
+        let sector_id = [32; 32];
+        let short = vec![33; 64];
+        let full = vec![33; V1_SECTOR_SIZE];
+        for bytes in [&short, &full] {
+            let commitment = merkle_commit(bytes).unwrap();
+            let information = InformationRoleV2 {
+                owner,
+                failure_domain: "size-domain".to_owned(),
+                sector: mb_core::RangeSectorRef {
+                    id: sector_id,
+                    commitment: commitment.clone(),
+                    logical_len: 64,
+                    virtual_zero: false,
+                },
+            };
+            for signed_commitment in [None, Some(commitment.clone())] {
+                let legacy = RecoverySectorAuthentication::Legacy {
+                    owner,
+                    reference: SectorRef {
+                        id: sector_id,
+                        root: sector_root(bytes),
+                        logical_len: 64,
+                    },
+                    commitment: signed_commitment,
+                };
+                assert_eq!(
+                    legacy.matches_role(&information),
+                    bytes.len() == V1_SECTOR_SIZE
+                );
+                assert_eq!(
+                    legacy.matches_bytes(bytes).unwrap(),
+                    bytes.len() == V1_SECTOR_SIZE
+                );
+            }
+            // Packed rows use their explicit authenticated length, which can
+            // differ from the legacy cipher sector size.
+            let packed = RecoverySectorAuthentication::Packed(PackedSectorDescriptor {
+                id: sector_id,
+                sector_index: 0,
+                flat_root: commitment.root,
+                commitment,
+                slots: Vec::new(),
+            });
+            let mut packed_information = information;
+            packed_information.sector.logical_len = bytes.len() as u32;
+            assert!(packed.matches_role(&packed_information));
+            assert!(packed.matches_bytes(bytes).unwrap());
+        }
     }
 
     #[tokio::test]
