@@ -2075,7 +2075,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   Gate a replay-valid, false-root transcript against wrong committed bytes and
   an unavailable correct stale placement.
 
-- [ ] **M5-93 / P1 — Require live `k` when current local targets are READY.**
+- [x] **M5-93 / P1 — Require live `k` when current local targets are READY.**
   `recover_variable_group_plan` proves a live quorum for coverage-only plans,
   but sends current plans with local targets to `recover_variable_plan`
   (`crates/mb-node/src/network/p2p.rs:10649`–`:10705`). That function skips
@@ -2085,7 +2085,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   complete with fewer than `k` live shards and skip a stale fallback. Prove a
   live decoding quorum before crediting the current group even when every
   local target is READY. Gate interrupted recovery with one READY local shard,
-  fewer than `k` live shards, and an available correct fallback.
+  fewer than `k` live shards, and an available correct fallback. Recovery now
+  proves a live quorum for every group before crediting it and reuses the
+  verified bytes to stage a local target. A focused local regression rejects
+  a READY local parity shard alone and succeeds when another valid remote
+  shard becomes reachable; fallback scheduling remains covered by the existing
+  current/fallback recovery tests.
 
 - [x] **M5-94 / P1 — Continue ordinary restore after a wrong-root placement.**
   Legacy restore selects certified variable placements by sector ID, prefers

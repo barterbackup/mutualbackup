@@ -10647,6 +10647,7 @@ async fn recover_variable_group_plan(
     })
     .await?;
     let missing_roots = recovery_plan_missing_roots(&plan, &transcript, &authentication)?;
+    let mut quorum_shards = BTreeMap::new();
     for (index, expected) in &missing_roots {
         let bytes = reconstruct_variable_shard_from_peers_requiring_quorum(
             node.clone(),
@@ -10660,36 +10661,44 @@ async fn recover_variable_group_plan(
         if !expected.matches_bytes(&bytes)? {
             bail!("reconstructed recovery sector root differs from the checkpoint");
         }
+        quorum_shards.insert(*index, bytes);
+    }
+    // A locally READY target does not establish that the certified group still
+    // has a live decoding quorum. The same proof also covers a plan without a
+    // local target; reuse a reconstructed root shard when there is one.
+    if quorum_shards.is_empty() {
+        let probe_index = plan
+            .targets
+            .first()
+            .copied()
+            .or_else(|| {
+                plan.group
+                    .roles
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, role)| match role {
+                        ShardRoleV2::Information(information)
+                            if !information.sector.virtual_zero
+                                && plan.covered.contains(&information.sector.id) =>
+                        {
+                            Some(index)
+                        }
+                        _ => None,
+                    })
+            })
+            .context("recovery plan has no shard to prove a live quorum")?;
+        let bytes = reconstruct_variable_shard_from_peers_requiring_quorum(
+            node.clone(),
+            p2p,
+            &plan.group,
+            probe_index,
+            roster,
+            deferred_holders.as_ref(),
+        )
+        .await?;
+        quorum_shards.insert(probe_index, bytes);
     }
     if plan.targets.is_empty() {
-        // A current replacement can cover stale local parity without assigning
-        // this node a new shard. Prove a live k before skipping the stale group.
-        let probe_index = plan
-            .group
-            .roles
-            .iter()
-            .enumerate()
-            .find_map(|(index, role)| match role {
-                ShardRoleV2::Information(information)
-                    if !information.sector.virtual_zero
-                        && plan.covered.contains(&information.sector.id) =>
-                {
-                    Some(index)
-                }
-                _ => None,
-            })
-            .context("coverage-only recovery plan has no live information shard")?;
-        if missing_roots.is_empty() {
-            reconstruct_variable_shard_from_peers_requiring_quorum(
-                node,
-                p2p,
-                &plan.group,
-                probe_index,
-                roster,
-                deferred_holders.as_ref(),
-            )
-            .await?;
-        }
         return Ok(());
     }
     recover_variable_plan(
@@ -10698,6 +10707,7 @@ async fn recover_variable_group_plan(
         checkpoint_hash,
         transcript,
         plan.targets,
+        quorum_shards,
         roster,
         deferred_holders,
     )
@@ -10710,6 +10720,7 @@ async fn recover_variable_plan(
     checkpoint_hash: [u8; 32],
     transcript: SignedRecord<CodingVerificationTranscript>,
     targets: Vec<usize>,
+    mut quorum_shards: BTreeMap<usize, Vec<u8>>,
     roster: &[GuildPeer],
     deferred_holders: Arc<Mutex<BTreeSet<NodeId>>>,
 ) -> Result<()> {
@@ -10729,15 +10740,19 @@ async fn recover_variable_plan(
         if already_ready {
             continue;
         }
-        let bytes = reconstruct_variable_shard_from_peers(
-            node.clone(),
-            p2p,
-            &group,
-            target_index,
-            roster,
-            deferred_holders.as_ref(),
-        )
-        .await?;
+        let bytes = if let Some(bytes) = quorum_shards.remove(&target_index) {
+            bytes
+        } else {
+            reconstruct_variable_shard_from_peers(
+                node.clone(),
+                p2p,
+                &group,
+                target_index,
+                roster,
+                deferred_holders.as_ref(),
+            )
+            .await?
+        };
         let transcript_for_stage = transcript.clone();
         node_blocking(node.clone(), move |node| {
             node.stage_recovered_variable_shard(
@@ -17206,6 +17221,273 @@ mod tests {
             .unwrap(),
             first_bytes
         );
+        drop(p2p);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ready_local_recovery_target_still_requires_live_quorum() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let local_seed = Seed::from_bytes([231; 32]);
+        let local_id = KeyMaterial::from_seed(&local_seed).node_id();
+        let signing_keys = (231_u8..235)
+            .map(|value| KeyMaterial::from_seed(&Seed::from_bytes([value; 32])))
+            .map(|keys| (keys.node_id(), keys))
+            .collect::<BTreeMap<_, _>>();
+        let peers = signing_keys
+            .values()
+            .enumerate()
+            .map(|(index, keys)| GuildPeer {
+                member: Member {
+                    node_id: keys.node_id(),
+                    recovery_public_key: keys.recovery_public_key(),
+                    failure_domain: format!("ready-domain-{index}"),
+                },
+                endpoints: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let owners = peers
+            .iter()
+            .filter(|peer| peer.member.node_id != local_id)
+            .map(|peer| peer.member.node_id)
+            .take(2)
+            .collect::<Vec<_>>();
+        let guild_id = [235; 32];
+        let bytes = [vec![31; V1_SECTOR_SIZE], vec![32; V1_SECTOR_SIZE]];
+        let references = bytes
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| SectorRef {
+                id: [236 + index as u8; 32],
+                root: sector_root(bytes),
+                logical_len: V1_SECTOR_SIZE as u32,
+            })
+            .collect::<Vec<_>>();
+        let commitments = bytes
+            .iter()
+            .map(|bytes| merkle_commit(bytes).unwrap())
+            .collect::<Vec<_>>();
+        let sources = (0..2)
+            .map(|index| VariableInformationInput {
+                owner: owners[index],
+                sector: &references[index],
+                commitment: &commitments[index],
+            })
+            .collect::<Vec<_>>();
+        let lane = variable_coding_lane(guild_id, Uuid::from_bytes([238; 16]), 0, &sources, &peers)
+            .unwrap();
+        let group = materialize_variable_lane(&lane, &bytes);
+        assert_eq!(group.profile.data_shards, 2);
+        let shards = encode(group.profile, bytes.to_vec()).unwrap();
+        let local_target = group
+            .roles
+            .iter()
+            .position(
+                |role| matches!(role, ShardRoleV2::Parity(parity) if parity.holder == local_id),
+            )
+            .unwrap();
+        let quorum = QuorumPolicy {
+            format_version: 1,
+            rule: QuorumRule::Majority,
+        };
+        let genesis_hash = [239; 32];
+        let state = DynamicGuildState {
+            event_sequence: 1,
+            event_head: [240; 32],
+            coding_groups: vec![mb_core::RetainedCodingGroup {
+                group: group.clone(),
+                added_at_event: 1,
+                retired_at_event: None,
+                retain_through_event: None,
+            }],
+            ..DynamicGuildState::new(
+                guild_id,
+                genesis_hash,
+                quorum,
+                peers.iter().map(|peer| peer.member.clone()).collect(),
+            )
+            .unwrap()
+        };
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[241; 32]);
+        let mut revision = UserRevision {
+            format_version: 4,
+            guild_id,
+            protected_root_id: Uuid::from_bytes([242; 16]),
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id: Uuid::from_bytes([243; 16]),
+            owner: owners[0],
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![references[0].clone()],
+            data_sectors: Vec::new(),
+            sector_commitments: Some(vec![commitments[0].clone()]),
+        };
+        revision.sign_writer(&writer).unwrap();
+        let revision = SignedRecord::sign(
+            mb_core::USER_REVISION_DOMAIN,
+            revision,
+            signing_keys.get(&owners[0]).unwrap(),
+        )
+        .unwrap();
+        let mut checkpoint = QuorumCheckpoint {
+            checkpoint: GuildCheckpoint {
+                format_version: 5,
+                guild_id,
+                genesis_hash,
+                generation: 1,
+                parent: None,
+                members: peers.iter().map(|peer| peer.member.clone()).collect(),
+                writer_fences: vec![mb_core::WriterFence {
+                    owner: owners[0],
+                    epoch: 1,
+                    public_key: writer.verifying_key().to_bytes(),
+                }],
+                revision_tombstones: Vec::new(),
+                revisions: vec![revision],
+                coding_groups: Vec::new(),
+                authority: Some(CheckpointAuthority {
+                    format_version: 1,
+                    membership_epoch: state.membership_epoch,
+                    quorum,
+                }),
+                packing_catalog: None,
+            },
+            signatures: Vec::new(),
+        };
+        for keys in signing_keys.values() {
+            checkpoint.add_signature(keys).unwrap();
+        }
+        let checkpoint_hash = checkpoint.hash().unwrap();
+        let transcript = signed_replacement_transcript(
+            &group,
+            &shards,
+            &signing_keys,
+            checkpoint_hash,
+            state.membership_epoch,
+            1,
+            None,
+        );
+        let mut local = Node::open(temp.path().join("node"), local_seed).unwrap();
+        crate::node::tests::install_test_checkpoint_and_dynamic_state(
+            &mut local,
+            &checkpoint,
+            &state,
+        );
+        crate::node::tests::install_test_recovery_transcript(&mut local, &transcript);
+        let volume = temp.path().join("volume");
+        std::fs::create_dir_all(&volume).unwrap();
+        local
+            .configure_storage_volumes(&[volume], 16 * 1024 * 1024, 0)
+            .unwrap();
+        local
+            .stage_recovered_variable_shard(
+                &checkpoint_hash,
+                &transcript,
+                local_target as u16,
+                &shards[local_target],
+            )
+            .unwrap();
+        local
+            .activate_recovered_coding_attempt(checkpoint_hash, &transcript)
+            .unwrap();
+        assert!(
+            local
+                .variable_shard_for_guild(&guild_id, &group.id, local_target as u16)
+                .is_ok()
+        );
+        let node = Arc::new(Mutex::new(local));
+        let (commands, mut commands_rx) = mpsc::channel(16);
+        let (request_cancellations, _cancellations_rx) = mpsc::unbounded_channel();
+        let (_port_state, port_mapping_listener_state) =
+            watch::channel(PortMappingListenerState::Pending);
+        let p2p = P2pClient {
+            local_peer_id: local_id.libp2p_peer_id().unwrap(),
+            commands,
+            request_cancellations,
+            outbound_permits: Arc::new(Semaphore::new(8)),
+            cold_recovery_permit: Arc::new(Semaphore::new(1)),
+            port_mapping_listener_state,
+        };
+        let remote_available = Arc::new(AtomicBool::new(false));
+        let worker = tokio::spawn({
+            let group = group.clone();
+            let remote_available = remote_available.clone();
+            async move {
+                while let Some(command) = commands_rx.recv().await {
+                    let Command::Request {
+                        recipient,
+                        request,
+                        response,
+                        ..
+                    } = command
+                    else {
+                        panic!("unexpected ready recovery command");
+                    };
+                    let reply = match *request {
+                        PeerRequest::GetVariableShard {
+                            guild_id: requested_guild,
+                            group_id,
+                            shard_index,
+                        } if requested_guild == guild_id && group_id == group.id => {
+                            let index = usize::from(shard_index);
+                            if remote_available.load(Ordering::SeqCst)
+                                && index == 0
+                                && variable_shard_holder(&group.roles[index]) == recipient
+                            {
+                                Ok(PeerResponse::Bytes(shards[index].clone()))
+                            } else {
+                                Err(anyhow::anyhow!("remote shard is unavailable"))
+                            }
+                        }
+                        _ => Err(anyhow::anyhow!("unexpected ready recovery request")),
+                    };
+                    let _ = response.send(reply);
+                }
+            }
+        });
+        let plan = || VariableRecoveryPlan {
+            group: group.clone(),
+            targets: vec![local_target],
+            covered: BTreeSet::from([references[0].id]),
+            priority: 0,
+        };
+        let authentication = Arc::new(BTreeMap::from([(
+            references[0].id,
+            RecoverySectorAuthentication::Legacy {
+                owner: owners[0],
+                reference: references[0].clone(),
+            },
+        )]));
+        assert!(
+            recover_variable_group_plan(
+                node.clone(),
+                &p2p,
+                checkpoint_hash,
+                plan(),
+                authentication.clone(),
+                &peers,
+                Arc::new(Mutex::new(BTreeSet::new())),
+            )
+            .await
+            .is_err()
+        );
+        remote_available.store(true, Ordering::SeqCst);
+        recover_variable_group_plan(
+            node,
+            &p2p,
+            checkpoint_hash,
+            plan(),
+            authentication,
+            &peers,
+            Arc::new(Mutex::new(BTreeSet::new())),
+        )
+        .await
+        .unwrap();
         drop(p2p);
         worker.await.unwrap();
     }
