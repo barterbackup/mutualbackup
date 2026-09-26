@@ -234,6 +234,36 @@ where
 }
 
 impl CodingAttemptPlan {
+    /// Keep epoch-one identities compatible while separating later authority.
+    /// Historical signed plans retain their original attempt IDs.
+    pub fn initial_attempt_id_at_membership(
+        format_version: u16,
+        checkpoint_hash: [u8; 32],
+        membership_epoch: u64,
+        geometry: &CodingPlanGeometry,
+        information_roots: &[[u8; 32]],
+    ) -> Result<[u8; 16], CodingAttemptError> {
+        if membership_epoch == 0 {
+            return Err(CodingAttemptError::InvalidPlan);
+        }
+        let prior =
+            Self::initial_attempt_id(format_version, checkpoint_hash, geometry, information_roots)?;
+        if membership_epoch == 1 {
+            return Ok(prior);
+        }
+        let mut hasher =
+            blake3::Hasher::new_derive_key("mutualbackup initial coding attempt membership v1");
+        hasher.update(&prior);
+        hasher.update(&membership_epoch.to_le_bytes());
+        let mut id: [u8; 16] = hasher.finalize().as_bytes()[..16]
+            .try_into()
+            .expect("fixed digest prefix");
+        if id == [0; 16] {
+            id[0] = 1;
+        }
+        Ok(id)
+    }
+
     /// Stable lane identity within one checkpoint. Preserve historical IDs for
     /// compact plans while giving full-byte proof attempts their own namespace.
     pub fn initial_attempt_id(
@@ -1213,6 +1243,41 @@ mod tests {
         )
         .unwrap();
         let mut old_hash = blake3::Hasher::new_derive_key("mutualbackup initial coding attempt v1");
+        for version in [2, 3] {
+            let roots = rooted_plan.value.information_roots.as_ref().unwrap();
+            let at_epoch = |epoch| {
+                CodingAttemptPlan::initial_attempt_id_at_membership(
+                    version,
+                    plan.checkpoint_hash,
+                    epoch,
+                    &plan.geometry,
+                    roots,
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                at_epoch(1),
+                CodingAttemptPlan::initial_attempt_id(
+                    version,
+                    plan.checkpoint_hash,
+                    &plan.geometry,
+                    roots
+                )
+                .unwrap()
+            );
+            assert_ne!(at_epoch(1), at_epoch(2));
+            assert_ne!(at_epoch(2), at_epoch(3));
+            assert!(
+                CodingAttemptPlan::initial_attempt_id_at_membership(
+                    version,
+                    plan.checkpoint_hash,
+                    0,
+                    &plan.geometry,
+                    roots
+                )
+                .is_err()
+            );
+        }
         old_hash.update(&plan.checkpoint_hash);
         old_hash.update(
             &canonical_bytes(&(

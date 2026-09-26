@@ -278,9 +278,12 @@ fn same_coding_lane_attempt(left: &CodingAttemptPlan, right: &CodingAttemptPlan)
 }
 
 fn same_coding_lane(left: &CodingAttemptPlan, right: &CodingAttemptPlan) -> bool {
+    left.membership_epoch == right.membership_epoch && same_coding_lane_geometry(left, right)
+}
+
+fn same_coding_lane_geometry(left: &CodingAttemptPlan, right: &CodingAttemptPlan) -> bool {
     left.format_version == right.format_version
         && left.checkpoint_hash == right.checkpoint_hash
-        && left.membership_epoch == right.membership_epoch
         && left.geometry == right.geometry
         && left.delegator == right.delegator
         && left.information_roots == right.information_roots
@@ -3953,14 +3956,14 @@ impl Node {
         // Prefer verified evidence, then a live retry successor. Completed
         // parents retain their signed children forever, including failed and
         // retired children; historical authority alone does not make them work.
-        if plan.value.format_version == 3 {
+        if matches!(plan.value.format_version, 2 | 3) {
             let state = self
                 .dynamic_guild_state()?
                 .context("coding launch requires dynamic guild state")?;
             for (_, bytes) in self.control.records("coding-activation-job")? {
                 let activation: CodingActivationJob = decode_canonical(&bytes)?;
                 let prior = &activation.transcript.value.plan;
-                if same_coding_lane(&prior.value, &plan.value) {
+                if same_coding_lane_geometry(&prior.value, &plan.value) {
                     self.validate_coding_attempt_authority(prior)?;
                     if replay_coding_transcript(&activation.transcript)?
                         != CodingReplayFinding::Verified
@@ -3968,12 +3971,11 @@ impl Node {
                         anyhow::bail!("coding activation has invalid verifier evidence");
                     }
                     let group = &activation.transcript.value.manifest.value.group;
-                    if !activation.complete
-                        || state.coding_groups.iter().any(|retained| {
-                            retained.retired_at_event.is_none()
-                                && retained.group == *group
-                                && state.validate_current_group_placement(group).is_ok()
-                        })
+                    if state.validate_current_group_placement(group).is_ok()
+                        && (!activation.complete
+                            || state.coding_groups.iter().any(|retained| {
+                                retained.retired_at_event.is_none() && retained.group == *group
+                            }))
                     {
                         return Ok(prior.clone());
                     }
@@ -4008,6 +4010,25 @@ impl Node {
                     {
                         return Ok(prior);
                     }
+                }
+            }
+            // Reuse an in-flight pre-epoch-binding launch as well. Its signed
+            // ID stays immutable when the planner begins generating newer IDs.
+            for (_, bytes) in self.control.records("coding-launch-job")? {
+                let launch: CodingLaunchJob = decode_canonical(&bytes)?;
+                if launch.plan.value.attempt_id != plan.value.attempt_id
+                    && same_coding_lane(&launch.plan.value, &plan.value)
+                    && self.validate_coding_attempt_plan(&launch.plan).is_ok()
+                    && self
+                        .control
+                        .get_record("coding-retry-job", &launch.plan.value.attempt_id)?
+                        .is_none()
+                    && self
+                        .control
+                        .get_record("coding-retired-attempt", &launch.plan.value.attempt_id)?
+                        .is_none()
+                {
+                    return Ok(launch.plan);
                 }
             }
         }
@@ -5474,7 +5495,13 @@ impl Node {
             }
             if !job.complete {
                 self.validate_coding_attempt_authority(&job.transcript.value.plan)?;
-                if job.transcript.value.plan.value.membership_epoch != current_membership_epoch {
+                if job.transcript.value.plan.value.membership_epoch != current_membership_epoch
+                    && state
+                        .validate_current_group_placement(
+                            &job.transcript.value.manifest.value.group,
+                        )
+                        .is_err()
+                {
                     stale.get_or_insert(job);
                     continue;
                 }
@@ -14589,8 +14616,8 @@ pub(crate) mod tests {
                     .unwrap();
                 node.finish_coding_information_upload(&pending, 0).unwrap();
                 assert_eq!(
-                    node.storage_status().unwrap()[0].used_bytes,
-                    Some(u64::from(shard_size))
+                    node.coding_used_bytes_for_test().unwrap(),
+                    u64::from(shard_size)
                 );
                 let state = node.dynamic_guild_state().unwrap().unwrap();
                 let event = GuildEvent {
@@ -14623,7 +14650,7 @@ pub(crate) mod tests {
                 node.complete_delegated_coding(pending.value.attempt_id)
                     .unwrap();
                 assert_eq!(node.coding_reservation_count_for_test().unwrap(), 0);
-                assert_eq!(node.storage_status().unwrap()[0].used_bytes, Some(0));
+                assert_eq!(node.coding_used_bytes_for_test().unwrap(), 0);
                 assert!(node.claim_delegated_coding().unwrap().is_none());
                 drop(node);
                 let node = Node::open(&dir, seed.clone()).unwrap();

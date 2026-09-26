@@ -6202,16 +6202,19 @@ async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
     .await?;
     if attempt_membership_epoch != current_membership_epoch {
         let group_id = job.transcript.value.manifest.value.group.id;
-        let group_committed = node_blocking(node.clone(), move |node| {
-            Ok(node
+        let group = job.transcript.value.manifest.value.group.clone();
+        let can_finish = node_blocking(node.clone(), move |node| {
+            let state = node
                 .dynamic_guild_state()?
-                .context("coding activation requires dynamic guild state")?
-                .coding_groups
-                .iter()
-                .any(|retained| retained.group.id == group_id))
+                .context("coding activation requires dynamic guild state")?;
+            Ok(state.validate_current_group_placement(&group).is_ok()
+                || state
+                    .coding_groups
+                    .iter()
+                    .any(|retained| retained.group.id == group_id))
         })
         .await?;
-        if group_committed {
+        if can_finish {
             match finish_coding_activation(node.clone(), p2p, &job.transcript).await {
                 Ok(()) => {
                     node_blocking(node.clone(), move |node| {
@@ -6225,7 +6228,7 @@ async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
                         node.defer_coding_activation(attempt_id, &message)
                     })
                     .await?;
-                    tracing::warn!(?attempt_id, %error, "committed coding activation deferred");
+                    tracing::warn!(?attempt_id, %error, "historical coding activation deferred");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             }
@@ -12532,9 +12535,10 @@ async fn queue_variable_coding_lanes(
                 &verifier_path_ranks,
             )?
         };
-        let attempt_id = CodingAttemptPlan::initial_attempt_id(
+        let attempt_id = CodingAttemptPlan::initial_attempt_id_at_membership(
             format_version,
             checkpoint_hash,
+            membership_epoch,
             &lane.geometry,
             &lane.information_roots,
         )?;
@@ -22170,12 +22174,24 @@ mod tests {
         coding_retry_restart_fixture(true, false, false, RetryReplanningCase::StagingRestart).await;
     }
 
+    #[tokio::test]
+    async fn verified_retry_survives_unrelated_membership_change_after_reopen() {
+        coding_retry_restart_fixture(
+            false,
+            false,
+            false,
+            RetryReplanningCase::VerifiedEpochChange,
+        )
+        .await;
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum RetryReplanningCase {
         None,
         Live,
         FailedChain,
         StagingRestart,
+        VerifiedEpochChange,
     }
 
     fn install_coding_test_event(nodes: &[Arc<Mutex<Node>>], kind: mb_core::GuildEventKind) {
@@ -22374,7 +22390,9 @@ mod tests {
             plan.attempt_id = [219; 16];
             if matches!(
                 replanning,
-                RetryReplanningCase::Live | RetryReplanningCase::FailedChain
+                RetryReplanningCase::Live
+                    | RetryReplanningCase::FailedChain
+                    | RetryReplanningCase::VerifiedEpochChange
             ) {
                 plan.format_version = 3;
             }
@@ -22384,6 +22402,7 @@ mod tests {
                 + if stale_epoch
                     || replanning == RetryReplanningCase::Live
                     || replanning == RetryReplanningCase::FailedChain
+                    || replanning == RetryReplanningCase::VerifiedEpochChange
                 {
                     600
                 } else {
@@ -22403,7 +22422,9 @@ mod tests {
             retry_plan: expired_plan.clone(),
             complete: matches!(
                 replanning,
-                RetryReplanningCase::Live | RetryReplanningCase::FailedChain
+                RetryReplanningCase::Live
+                    | RetryReplanningCase::FailedChain
+                    | RetryReplanningCase::VerifiedEpochChange
             ),
             error: None,
         };
@@ -22487,6 +22508,42 @@ mod tests {
                 .unwrap()
                 .enqueue_delegated_coding(owner, plan)
                 .unwrap();
+        }
+        let mut accepted_evidence = None;
+        if replanning == RetryReplanningCase::VerifiedEpochChange {
+            for (remote, remote_node) in nodes.iter().enumerate() {
+                if remote != 3 {
+                    let id = remote_node.lock().unwrap().keys().node_id();
+                    clients[3]
+                        .add_peer_address(id, addresses[remote].clone())
+                        .await
+                        .unwrap();
+                    clients[3].profile(id).await.unwrap();
+                }
+            }
+            let plan = expired_plan.as_ref().unwrap().clone();
+            let job = DelegatedCodingJob {
+                format_version: 1,
+                plan,
+                state: DelegatedCodingJobState::Pending,
+                transcript: None,
+                error: None,
+            };
+            let transcript = execute_delegated_coding(nodes[3].clone(), &clients[3], &job)
+                .await
+                .unwrap();
+            accepted_evidence = Some(transcript.clone());
+            submit_delegated_coding_result(nodes[3].clone(), &clients[3], transcript)
+                .await
+                .unwrap();
+            install_coding_test_event(
+                &nodes,
+                mb_core::GuildEventKind::RelabelMember {
+                    node_id: member(2).node_id,
+                    failure_domain: "unrelated-verified-placement-change".to_owned(),
+                },
+            );
+            replacement.membership_epoch += 1;
         }
         if let Some(job) = &child_job {
             assert!(
@@ -22649,7 +22706,13 @@ mod tests {
             )
             .unwrap();
         }
-        if !three_members && !stale_epoch && replanning != RetryReplanningCase::Live {
+        if !three_members
+            && !stale_epoch
+            && !matches!(
+                replanning,
+                RetryReplanningCase::Live | RetryReplanningCase::VerifiedEpochChange
+            )
+        {
             tokio::time::sleep(Duration::from_secs(4)).await;
         }
         nodes = open_nodes();
@@ -22740,7 +22803,10 @@ mod tests {
             )
             .await
             .unwrap();
-            if replanning == RetryReplanningCase::Live {
+            if matches!(
+                replanning,
+                RetryReplanningCase::Live | RetryReplanningCase::VerifiedEpochChange
+            ) {
                 let node = nodes[0].lock().unwrap();
                 assert!(node.claim_coding_launch().unwrap().is_none());
                 assert_eq!(node.coding_staged_receipt_count_for_test().unwrap(), 0);
@@ -22799,6 +22865,16 @@ mod tests {
                 });
             }
             node.sign_checkpoint(&checkpoint).unwrap();
+            if let Some(expected) = &accepted_evidence {
+                assert_eq!(
+                    node.coding_transcript_for_group(
+                        guild_id,
+                        expected.value.manifest.value.group.id
+                    )
+                    .unwrap(),
+                    *expected
+                );
+            }
             let evidence = node
                 .coding_retry_evidence_for_test(old.value.attempt_id)
                 .unwrap();
@@ -22874,7 +22950,14 @@ mod tests {
                 assert_eq!(node.coding_staged_receipt_count_for_test().unwrap(), 0);
                 assert_eq!(
                     node.coding_used_bytes_for_test().unwrap(),
-                    if index == 1 || index == 0 && replanning != RetryReplanningCase::Live {
+                    if index == 1
+                        || index == 0
+                            && !matches!(
+                                replanning,
+                                RetryReplanningCase::Live
+                                    | RetryReplanningCase::VerifiedEpochChange
+                            )
+                    {
                         V1_SECTOR_SIZE as u64
                     } else {
                         0
@@ -22902,6 +22985,16 @@ mod tests {
                 let node =
                     Node::open(temp.path().join(format!("node-{index}")), seed.clone()).unwrap();
                 if index == 0 {
+                    if let Some(expected) = &accepted_evidence {
+                        assert_eq!(
+                            node.coding_transcript_for_group(
+                                guild_id,
+                                expected.value.manifest.value.group.id
+                            )
+                            .unwrap(),
+                            *expected
+                        );
+                    }
                     node.validate_variable_checkpoint_coverage(&checkpoint, false)
                         .unwrap();
                     assert_eq!(
@@ -22910,9 +23003,10 @@ mod tests {
                     );
                     assert!(node.claim_coding_launch().unwrap().is_none());
                     assert!(node.claim_coding_activation().unwrap().is_none());
-                    let initial_id = CodingAttemptPlan::initial_attempt_id(
+                    let initial_id = CodingAttemptPlan::initial_attempt_id_at_membership(
                         3,
                         replacement.checkpoint_hash,
+                        replacement.membership_epoch,
                         &replacement.geometry,
                         replacement.information_roots.as_ref().unwrap(),
                     )
@@ -22928,7 +23022,14 @@ mod tests {
                     assert_eq!(node.coding_staged_receipt_count_for_test().unwrap(), 0);
                     assert_eq!(
                         node.coding_used_bytes_for_test().unwrap(),
-                        if index == 1 || index == 0 && replanning != RetryReplanningCase::Live {
+                        if index == 1
+                            || index == 0
+                                && !matches!(
+                                    replanning,
+                                    RetryReplanningCase::Live
+                                        | RetryReplanningCase::VerifiedEpochChange
+                                )
+                        {
                             V1_SECTOR_SIZE as u64
                         } else {
                             0

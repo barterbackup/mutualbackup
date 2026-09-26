@@ -586,7 +586,8 @@ M5-103 is now implemented with passing production-worker restart regressions.
 Source-only review through `c4e97f8` finds M5-105 and M5-106 in retry lane
 coalescing and its production staging caller. Both corrections are now
 implemented with passing restart/replanning regressions. Milestone 5 remains
-open; Milestone 6 waits for the complete new M5-104 gate.
+open; the M5-107 membership-transition follow-up also passes its focused
+checks. Milestone 6 waits for the complete new M5-104 gate.
 M5-97 and earlier gate records remain evidence for their exact trees. This
 review ran no builds, tests, daemons, runtime probes, or remote compilation.
 
@@ -2423,7 +2424,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   gate is required on the final corrected source.
 
 - [ ] **M5-104 / gate — Recheck Milestone 5 after durable retry scheduling is corrected.**
-  Correct M5-105 and M5-106, then review the complete M5-103 follow-up and its
+  Correct M5-105 through M5-107, then review the complete M5-103 follow-up and its
   production-worker restart/replanning regressions.
   Then run formatting, locked all-target workspace tests, strict locked
   all-target workspace Clippy, Docker lab safety, and the complete fresh
@@ -2508,6 +2509,34 @@ node Clippy gate passed locally. No remote compilation server was used.
   used capacity, including two further reopens. Verification, activation, and
   checkpoint signing pass. The focused `retry` run passed all 16 selected tests
   locally; the full M5-104 gate is still required.
+
+- [x] **M5-107 / P1 — Preserve verified placement across unrelated membership changes.**
+  Final source audit found that activation dispatch aborts every uncommitted
+  old-epoch verifier result, even when all shard holders and their authenticated
+  domains are still current. Relabeling an unused member therefore discards
+  already verified work. Replanning can then collide with retained immutable
+  attempt/group evidence: the initial attempt ID excludes membership epoch,
+  while replay correctly distinguishes epochs. The new real QUIC regression
+  reproduced this on `4f8c685`: after verification, an unrelated relabel and
+  reopen caused production replanning to create a second launch rather than
+  retain the verifier result. Preserve accepted verified evidence when current
+  shard placement is valid, and use current quorum authority to commit it.
+  Continue cleanup when current placement is invalid. Bind new initial IDs to
+  membership epoch without rewriting historical signed plans; coalesce with
+  valid existing launches/retries so rollout cannot duplicate group evidence.
+  Gate exact signed-transcript preservation through verification, an unused
+  member relabel, production replanning, reopen, activation/current checkpoint,
+  capacity cleanup, and two more reopens; retain epoch-one IDs and distinguish
+  later epochs for both compact and fully bound plans.
+  The correction is implemented. The focused `retry` run passes all 17 tests;
+  the exact transcript-preservation regression passes, including both reopens,
+  as does the corrected migration regression. All 48 core tests pass, including
+  identity separation for later epochs and epoch-one compatibility. The final
+  committed-source M5-104 gate remains pending. That gate's first
+  workspace attempt on `4f8c685` reported 261 node passes and two failing older
+  capacity assertions that inspected an offline default volume. They now sum
+  all volumes, matching the production fixture's actual storage layout. No
+  remote compilation server is used.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

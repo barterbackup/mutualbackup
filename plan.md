@@ -170,6 +170,8 @@ coalescing can suppress a launch using failed/retired historical retry plans,
 and its production caller stages inputs under an ID that coalescing never
 dispatches. Both corrections are now implemented with passing production
 restart/replanning regressions. The final M5-104 gate is pending; Milestone 6 waits.
+The M5-107 verified-placement/epoch-identity follow-up also passes its focused
+QUIC, migration, and core checks; the complete final gate remains required.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -819,7 +821,8 @@ review at every gate before committing the next milestone's detailed scope.
 correction and focused regressions pass; source review through `c4e97f8` finds
 M5-105 and M5-106 in lane coalescing and production staging. Both corrections
 and focused production regressions now pass. Milestone 5 remains open for the
-complete M5-104 gate. Milestone 6
+complete M5-104 gate, including M5-107's verified-placement/epoch-identity
+follow-up whose focused checks pass. Milestone 6
 waits. The complete M5-97 local gate passed on source `c7033fa`
 on 2026-09-26; provisioned acceptance ran at documentation-only successor
 `4170dce`. That gate remains historical evidence for its tested scenarios.
@@ -2047,6 +2050,23 @@ receipt/reservation cleanup, exact used-capacity checks on every holder, and
 two further reopens. The node regression also checks adverse ordering and
 rejected coordinator reuse. All 16 focused `retry` tests pass locally; the
 complete final M5-104 workspace/provisioned gate remains pending.
+
+Final source audit also found M5-107: an unused member's relabel discards
+accepted verifier evidence despite unchanged valid shard placement, and
+epoch-independent initial IDs can collide with retained historical records.
+A real QUIC regression reproduced the unwanted second launch after reopen.
+The correction preserves replay-verified evidence when current placement is
+valid, commits using the current quorum, and keeps invalid-placement cleanup.
+New initial IDs bind later membership epochs while retaining epoch-one IDs;
+existing live launches/retries coalesce without rewriting signed history.
+All 17 focused `retry` tests pass. The exact transcript-preservation regression
+passes across two further reopens, the corrected migration regression passes,
+and all 48 core tests pass, including epoch-bound identity checks. The complete
+final committed-source M5-104 gate remains pending.
+The first workspace attempt on `4f8c685` passed 261 node tests and failed two
+older assertions that inspected an offline default volume; those assertions
+now sum used capacity across all volumes. Milestone 5 remains open and
+Milestone 6 waits. All compilation and execution stay local.
 
 M5-36 through M5-44 are implemented, and the complete M5-45 correction gate
 passed locally on 2026-09-19. The final committed tree passed formatting,
