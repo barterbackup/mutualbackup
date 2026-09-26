@@ -125,6 +125,11 @@ input reuse, compact version-three manifests, and encoded peer-message budgets.
 Focused migration, checkpoint-signing, lifecycle, and transport regressions pass
 locally. M5-98 through M5-100 are corrected; the complete M5-97 gate remains
 pending, so Milestone 5 stays open.
+The final source audit of `99c3c82` also found M5-101: root-bound legacy
+coverage can accept a short information shard even though the V1 cipher and
+restore require a complete 64 KiB sector. Correct the implicit length check
+in signing, recovery, and audit before the final M5-97 gate. Packed variable
+profiles retain their explicitly authenticated descriptor lengths.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -1957,6 +1962,9 @@ launch/retry/activation records and both certified groups across restart,
 checks historical coverage, and signs a new checkpoint with the stronger proof.
 Worst-case witness messages round-trip through the bounded CBOR codec and the
 Postcard serializer. M5-97's final local workspace/provisioned gate is pending.
+Final source audit of `99c3c82` found M5-101's implicit legacy ciphertext
+length gap. Its correction and positive/negative length regressions must also
+pass before the complete M5-97 gate closes Milestone 5.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and

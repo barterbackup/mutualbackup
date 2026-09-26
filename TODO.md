@@ -2196,7 +2196,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   an inconsistent retained revision; audit continues to check reconstructed
   bytes against the committed checkpoint.
 
-- [ ] **M5-97 / gate — Close Milestone 5 after the root-binding and migration corrections.**
+- [ ] **M5-97 / gate — Close Milestone 5 after the root-binding, migration, and length corrections.**
   After correcting the source blockers, run fresh source review, formatting,
   locked all-target workspace tests, warning-free locked all-target workspace
   Clippy, Docker lab safety, and the complete provisioned Btrfs/network
@@ -2208,6 +2208,8 @@ node Clippy gate passed locally. No remote compilation server was used.
   before running and recording the complete local closure gate.
   M5-98 through M5-100 are now implemented and focused regressions pass; the
   complete final workspace/provisioned acceptance gate remains pending.
+  Final source audit of `99c3c82` found M5-101 below; its correction must be
+  included in the final source review and complete local gate.
 
 - [x] **M5-98 / P1 — Give upgraded legacy attempts a distinct durable identity.**
   `queue_variable_coding_lanes` now emits format-3 legacy plans but derives
@@ -2280,6 +2282,25 @@ node Clippy gate passed locally. No remote compilation server was used.
   staging/challenge/transcript/certification envelopes with the CBOR codec and
   Postcard, verifies historical layout compatibility, and rejects a dense
   raw-size-valid plan whose control evidence cannot fit its containing frames.
+
+- [ ] **M5-101 / P2 — Enforce the fixed legacy ciphertext sector length.**
+  `verified_variable_sector_coverage` matches owner, sector ID, logical length,
+  and the replay-verified flat root without requiring the information
+  commitment's byte length to equal `V1_SECTOR_SIZE`
+  (`crates/mb-node/src/node.rs:6401`–`:6442`). Legacy recovery/audit
+  authentication likewise checks roots but accepts any full-shard length
+  (`crates/mb-node/src/network/p2p.rs:10346`–`:10383`). A version-three user
+  revision without a separately signed Merkle commitment can therefore receive
+  new checkpoint protection from a correct proof for a short shard, while
+  ordinary restore and `crypt_sector` require 64 KiB
+  (`crates/mb-node/src/network/p2p.rs:11520`,
+  `crates/mb-core/src/content.rs:100`–`:102`). The migration/lifecycle fixtures
+  currently use 64-byte shards and demonstrate this accepted checkpoint shape.
+  Require the implicit V1 ciphertext length for legacy references in checkpoint
+  coverage, cold recovery, and audit; keep packed variable profiles governed by
+  their explicit descriptor commitments. Gate a fully root-bound short shard
+  against checkpoint signing and recovery/audit authentication, and use full
+  V1 ciphertext sectors for positive legacy checkpoint fixtures.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
