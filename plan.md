@@ -58,8 +58,9 @@ them as ADRs and test vectors before promising wire compatibility.
 
 ### Implemented baseline — efficient and flexible guild protocol beta reopened
 
-Milestones 0 through 4 have passed. Milestone 5 remains open for the complete
-M5-114 final local gate after acknowledged retry recovery and confirmed cleanup
+Milestones 0 through 4 have passed. Milestone 5 remains open for M5-118's
+renewal ownership correction and the complete M5-114 final local gate after
+acknowledged retry recovery and confirmed cleanup
 completion (M5-116/M5-117). Those corrections now distinguish delegation
 acknowledgement from terminal cleanup and retain accepted child ownership.
 M5-113 now transfers packed input intent atomically and resumes successor
@@ -606,7 +607,7 @@ machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
 than a daemon prerequisite. Milestones 0 through 4 have passed. Milestone 5
-remains open for the final M5-114 gate; Milestone 6 waits.
+remains open for M5-118 and the final M5-114 gate; Milestone 6 waits.
 M5-111/M5-112/M5-113/M5-115 corrections pass focused local validation. Complete locked
 workspace and fresh Btrfs/network gates on the final corrected commit remain
 required. All compilation and execution take place locally.
@@ -862,7 +863,8 @@ integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
 **Current position:** Milestones 0 through 4 are passed. Milestone 5 remains
-open for the complete final committed-source gate (M5-114). Acknowledged retry
+open for renewal coalescing (M5-118) and the complete final committed-source
+gate (M5-114). Acknowledged retry
 successor recovery (M5-116) and confirmed cleanup completion (M5-117) are
 implemented; a fence or delayed acknowledgement cannot replace holder cleanup.
 Packed-input restaging (M5-113), cleanup/verifier
@@ -2016,6 +2018,19 @@ source locations, failure cases, and recorded gate evidence.
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
 ### Milestone 5 — efficient and flexible data/guild protocol (reopened)
+
+The first full M5-114 workspace run on `3e5a7e3` exposes **M5-118**. All
+48 core tests, 275 node tests, formatting and strict workspace Clippy pass;
+four real launch-expiry regressions fail their exact-successor assertion.
+Recovered acknowledged retry ownership progresses first, but launch renewal
+searches only other launches and creates a second successor rather than reusing
+the live retry child. Make renewal coalesce with authenticated retry ownership
+and accepted verified activation, preserving exact signed lineage and atomic
+input-intent handoff. Retain the regressions' capacity/cleanup and checkpoint
+assertions. Later workspace suites and Docker safety did not run after the node
+failure; fresh Btrfs/network acceptance has not begun. Correct M5-118, then run
+the complete final M5-114 gate on the committed source before Milestone 6.
+Details and evidence are in TODO.md; all builds and runs were local.
 
 M5-116/M5-117 implementation update (2026-09-26): durable claims reclaim an
 acknowledged child after expiry, staleness or retirement unless terminal cleanup

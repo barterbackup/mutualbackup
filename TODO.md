@@ -588,7 +588,9 @@ Accepted child result/failure
 owners win successor retirement arbitration under the writer lock; late parent
 completion preserves child-owned input intent. Terminal metadata binds the
 exact signed child without changing persisted job encodings or signed records.
-Milestone 5 remains open for the complete final M5-114 gate; Milestone 6 waits.
+The first complete workspace run exposes M5-118: expired-launch renewal does
+not coalesce with a recovered live retry successor. Correct that ownership gap
+and complete the final M5-114 gate before Milestone 6.
 All compilation and execution are local.
 
 Earlier source-review record:
@@ -3164,8 +3166,40 @@ node Clippy gate passed locally. No remote compilation server was used.
   exact-commit M5-114 workspace and fresh provisioned acceptance gate remain
   required. All builds and runs were local.
 
+- [ ] **M5-118 / P1 — Reuse live retry ownership during expired-launch renewal.**
+  The first full M5-114 workspace run on `3e5a7e3` passes strict workspace
+  Clippy, formatting, all 48 core tests and 275 node tests, but four launch
+  expiry regressions fail at the exact-successor assertion
+  (`crates/mb-node/src/network/p2p.rs:25444`). The recovered acknowledged retry
+  creates a live format-3 successor before the worker visits a same-lane expired
+  launch. `coding_launch_renewal_candidate` searches only `coding-launch-job`
+  (`crates/mb-node/src/node.rs:4329`–`:4356`); renewal directly publishes a new
+  launch and staging intent without checking live retry/activation ownership
+  (`:4396`–`:4440`). It therefore creates a second independently delegated
+  successor even though the retry already owns progress. Coverage can activate
+  the retry child while launch lineage points at the other child, allowing
+  duplicate groups/uploads and unfinished staging rather than the milestone's
+  coalesced ownership and bounded storage/transfer behavior.
+
+  Include authenticated live retry children and accepted verified activation
+  in renewal selection, with accepted valid coverage taking priority. Link the
+  retired parent to the existing signed owner without creating another launch
+  or mutating retry acknowledgement/history. Transfer still-needed input intent
+  atomically, preserving accepted/terminal metadata and cache lifetime. Retain
+  fresh coordinator selection for actual new work, exact signed lineage,
+  interrupted cleanup/reopen and late-result rejection. Extend controlled node
+  ownership checks through retry-first renewal, activation arrival during
+  renewal and repeated reopen. Keep the four real launch regressions' exact
+  successor, capacity/receipt/reservation and checkpoint assertions; do not
+  relax them to accept duplicate ownership. Then rerun M5-114 completely on the
+  final committed source. The failed workspace log is
+  `/tmp/mutualbackup-m5-114-workspace-v1.log`; node runtime was 436.14 seconds.
+  Workspace tests stopped at the node failure, so later suites and Docker lab
+  safety did not run. Fresh Btrfs/network acceptance has not begun and no
+  provisioned resources were created. All compilation and execution were local.
+
 - [ ] **M5-114 / gate — Recheck Milestone 5 after cleanup ownership and packed retries.**
-  Correct M5-111 through M5-113 and M5-115 through M5-117, then source-review
+  Correct M5-111 through M5-113 and M5-115 through M5-118, then source-review
   the final committed tree and run their controlled production-worker
   regressions locally. On that exact source, pass strict locked all-target
   workspace Clippy, locked
