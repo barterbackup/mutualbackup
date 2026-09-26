@@ -1,5 +1,5 @@
-use serde::de::{SeqAccess, Visitor};
-use serde::ser::SerializeTuple;
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::ser::{SerializeStruct, SerializeTuple};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
@@ -303,15 +303,15 @@ impl Serialize for CodingRootManifest {
             (2, Some(_)) => 5,
             _ => return Err(serde::ser::Error::custom("invalid coding manifest version")),
         };
-        let mut tuple = serializer.serialize_tuple(field_count)?;
-        tuple.serialize_element(&self.format_version)?;
-        tuple.serialize_element(&self.attempt_id)?;
-        tuple.serialize_element(&self.plan_hash)?;
-        tuple.serialize_element(&self.group)?;
+        let mut fields = serializer.serialize_struct("CodingRootManifest", field_count)?;
+        fields.serialize_field("format_version", &self.format_version)?;
+        fields.serialize_field("attempt_id", &self.attempt_id)?;
+        fields.serialize_field("plan_hash", &self.plan_hash)?;
+        fields.serialize_field("group", &self.group)?;
         if let Some(information_bytes) = &self.information_bytes {
-            tuple.serialize_element(information_bytes)?;
+            fields.serialize_field("information_bytes", information_bytes)?;
         }
-        tuple.end()
+        fields.end()
     }
 }
 
@@ -350,9 +350,87 @@ impl<'de> Deserialize<'de> for CodingRootManifest {
                     information_bytes,
                 })
             }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                #[derive(Deserialize)]
+                struct Fields {
+                    format_version: u16,
+                    attempt_id: [u8; 16],
+                    plan_hash: [u8; 32],
+                    group: CodingGroupV2,
+                    information_bytes: Option<Vec<Option<Vec<u8>>>>,
+                }
+                let fields =
+                    Fields::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                if !matches!(
+                    (fields.format_version, &fields.information_bytes),
+                    (1, None) | (2, Some(_))
+                ) {
+                    return Err(serde::de::Error::custom("invalid coding manifest version"));
+                }
+                Ok(CodingRootManifest {
+                    format_version: fields.format_version,
+                    attempt_id: fields.attempt_id,
+                    plan_hash: fields.plan_hash,
+                    group: fields.group,
+                    information_bytes: fields.information_bytes,
+                })
+            }
         }
 
-        deserializer.deserialize_tuple(5, CodingRootManifestVisitor)
+        deserializer.deserialize_struct(
+            "CodingRootManifest",
+            &[
+                "format_version",
+                "attempt_id",
+                "plan_hash",
+                "group",
+                "information_bytes",
+            ],
+            CodingRootManifestVisitor,
+        )
+    }
+}
+
+impl CodingRootManifest {
+    pub fn validate_for_plan(&self, plan: &CodingAttemptPlan) -> Result<(), CodingAttemptError> {
+        if !matches!(
+            (
+                plan.format_version,
+                self.format_version,
+                &self.information_bytes
+            ),
+            (1 | 2, 1, None) | (3, 2, Some(_))
+        ) || self.attempt_id != plan.attempt_id
+            || self.plan_hash != plan.hash()?
+        {
+            return Err(CodingAttemptError::InvalidTranscript);
+        }
+        plan.geometry.validate_group(&self.group)?;
+        if let Some(information_bytes) = &self.information_bytes {
+            if information_bytes.len() != usize::from(self.group.profile.data_shards) {
+                return Err(CodingAttemptError::InvalidTranscript);
+            }
+            for (index, (role, bytes)) in self.group.roles.iter().zip(information_bytes).enumerate()
+            {
+                let ShardRoleV2::Information(information) = role else {
+                    return Err(CodingAttemptError::InvalidTranscript);
+                };
+                match (information.sector.virtual_zero, bytes) {
+                    (true, None) => {}
+                    (false, Some(bytes))
+                        if bytes.len() == self.group.profile.shard_size as usize
+                            && merkle_commit(bytes).ok()
+                                == Some(information.sector.commitment.clone())
+                            && plan.information_root(index) == Some(sector_root(bytes)) => {}
+                    _ => return Err(CodingAttemptError::InvalidTranscript),
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -467,6 +545,8 @@ pub enum CodingReplayFinding {
 pub struct CodingTransferEstimate {
     pub information_shard_transfers: u16,
     pub parity_shard_transfers: u16,
+    /// Full encrypted information payload in each version-two manifest.
+    pub root_binding_bytes: u64,
     pub bulk_bytes: u64,
 }
 
@@ -505,8 +585,9 @@ pub fn coding_sample_guarantee(
     })
 }
 
-/// Count the complete-shard-equivalent bulk paths in one immutable plan.
-/// Merkle proofs and control messages are deliberately excluded.
+/// Count the complete-shard-equivalent data paths in one immutable plan.
+/// `bulk_bytes` excludes control messages; `root_binding_bytes` separately
+/// reports the full-byte compatibility witness carried by each manifest.
 pub fn coding_transfer_estimate(
     plan: &CodingAttemptPlan,
 ) -> Result<CodingTransferEstimate, CodingAttemptError> {
@@ -527,9 +608,20 @@ pub fn coding_transfer_estimate(
         .checked_add(u64::from(parity_shard_transfers))
         .and_then(|count| count.checked_mul(u64::from(plan.geometry.profile.shard_size)))
         .ok_or(CodingAttemptError::InvalidPlan)?;
+    let root_binding_bytes = if plan.format_version == 3 {
+        plan.geometry
+            .information
+            .iter()
+            .filter(|role| !role.sector.virtual_zero)
+            .count() as u64
+            * u64::from(plan.geometry.profile.shard_size)
+    } else {
+        0
+    };
     Ok(CodingTransferEstimate {
         information_shard_transfers,
         parity_shard_transfers,
+        root_binding_bytes,
         bulk_bytes: total,
     })
 }
@@ -693,42 +785,11 @@ pub fn replay_coding_transcript(
 
     let manifest = &transcript.manifest.value;
     transcript.manifest.verify(CODING_ROOT_MANIFEST_DOMAIN)?;
-    if transcript.manifest.signer != plan.coding_coordinator
-        || !matches!(
-            (plan.format_version, manifest.format_version),
-            (1 | 2, 1) | (3, 2)
-        )
-        || manifest.attempt_id != plan.attempt_id
-        || manifest.plan_hash != plan_hash
-    {
+    if transcript.manifest.signer != plan.coding_coordinator {
         return Err(CodingAttemptError::InvalidTranscript);
     }
-    plan.geometry.validate_group(&manifest.group)?;
+    manifest.validate_for_plan(plan)?;
     let group = &manifest.group;
-
-    if plan.format_version == 3 {
-        let information_bytes = manifest
-            .information_bytes
-            .as_ref()
-            .ok_or(CodingAttemptError::InvalidTranscript)?;
-        if information_bytes.len() != usize::from(group.profile.data_shards) {
-            return Err(CodingAttemptError::InvalidTranscript);
-        }
-        for (index, (role, bytes)) in group.roles.iter().zip(information_bytes).enumerate() {
-            let ShardRoleV2::Information(information) = role else {
-                return Err(CodingAttemptError::InvalidTranscript);
-            };
-            match (information.sector.virtual_zero, bytes) {
-                (true, None) => {}
-                (false, Some(bytes))
-                    if bytes.len() == group.profile.shard_size as usize
-                        && merkle_commit(bytes).ok()
-                            == Some(information.sector.commitment.clone())
-                        && plan.information_root(index) == Some(sector_root(bytes)) => {}
-                _ => return Err(CodingAttemptError::InvalidTranscript),
-            }
-        }
-    }
 
     let parity_start = usize::from(group.profile.data_shards);
     if transcript.staged_receipts.len() != usize::from(group.profile.parity_shards) {
@@ -933,6 +994,7 @@ mod tests {
             CodingTransferEstimate {
                 information_shard_transfers: 4,
                 parity_shard_transfers: 2,
+                root_binding_bytes: 0,
                 bulk_bytes: 6 * 64,
             }
         );
@@ -943,6 +1005,7 @@ mod tests {
             CodingTransferEstimate {
                 information_shard_transfers: 3,
                 parity_shard_transfers: 2,
+                root_binding_bytes: 0,
                 bulk_bytes: 5 * 64,
             }
         );
@@ -999,6 +1062,12 @@ mod tests {
         fully_bound_plan.format_version = 3;
         let fully_bound_plan =
             SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, fully_bound_plan, &keys[6]).unwrap();
+        assert_eq!(
+            coding_transfer_estimate(&fully_bound_plan.value)
+                .unwrap()
+                .root_binding_bytes,
+            4 * 64,
+        );
         let fully_bound_manifest = encode_coding_attempt(
             &fully_bound_plan,
             information.iter().cloned().map(Some).collect(),

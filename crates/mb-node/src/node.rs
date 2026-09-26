@@ -4390,13 +4390,12 @@ impl Node {
         let plan_hash = plan.value.hash()?;
         manifest.verify(CODING_ROOT_MANIFEST_DOMAIN)?;
         if manifest.signer != plan.value.coding_coordinator
-            || manifest.value.format_version != 1
             || manifest.value.attempt_id != plan.value.attempt_id
             || manifest.value.plan_hash != plan_hash
         {
             anyhow::bail!("coding root manifest or staged receipt set is invalid");
         }
-        plan.value.geometry.validate_group(&manifest.value.group)?;
+        manifest.value.validate_for_plan(&plan.value)?;
         let group = &manifest.value.group;
         if receipts.len() != usize::from(group.profile.parity_shards) {
             anyhow::bail!("coding root manifest or staged receipt set is invalid");
@@ -4466,7 +4465,7 @@ impl Node {
         {
             anyhow::bail!("coding root manifest conflicts with the delegated plan");
         }
-        plan.value.geometry.validate_group(&manifest.value.group)?;
+        manifest.value.validate_for_plan(&plan.value)?;
         let group = &manifest.value.group;
         let index = usize::from(object.shard_index);
         let Some(ShardRoleV2::Parity(role)) = group.roles.get(index) else {
@@ -4720,13 +4719,12 @@ impl Node {
         let plan_hash = plan.value.hash()?;
         manifest.verify(CODING_ROOT_MANIFEST_DOMAIN)?;
         if manifest.signer != plan.value.coding_coordinator
-            || manifest.value.format_version != 1
             || manifest.value.attempt_id != plan.value.attempt_id
             || manifest.value.plan_hash != plan_hash
         {
             anyhow::bail!("coding root manifest conflicts with the delegated plan");
         }
-        plan.value.geometry.validate_group(&manifest.value.group)?;
+        manifest.value.validate_for_plan(&plan.value)?;
         let Some(ShardRoleV2::Parity(role)) =
             manifest.value.group.roles.get(usize::from(shard_index))
         else {
@@ -4754,7 +4752,7 @@ impl Node {
         {
             anyhow::bail!("coding root manifest conflicts with the delegated plan");
         }
-        plan.value.geometry.validate_group(&manifest.value.group)?;
+        manifest.value.validate_for_plan(&plan.value)?;
         let group = &manifest.value.group;
         let role = group
             .roles
@@ -13781,7 +13779,7 @@ pub(crate) mod tests {
         };
         group.id = group.calculate_id().unwrap();
         let plan = CodingAttemptPlan {
-            format_version: 2,
+            format_version: 3,
             attempt_id: [182; 16],
             checkpoint_hash: [183; 32],
             membership_epoch: 1,
@@ -13847,15 +13845,55 @@ pub(crate) mod tests {
         let manifest = SignedRecord::sign(
             CODING_ROOT_MANIFEST_DOMAIN,
             CodingRootManifest {
-                format_version: 1,
+                format_version: 2,
                 attempt_id: [182; 16],
                 plan_hash,
                 group,
-                information_bytes: None,
+                information_bytes: Some(shards[..3].iter().cloned().map(Some).collect()),
             },
             &keys[1],
         )
         .unwrap();
+        #[derive(serde::Serialize)]
+        struct LegacyManifest<'a> {
+            format_version: u16,
+            attempt_id: [u8; 16],
+            plan_hash: [u8; 32],
+            group: &'a mb_core::CodingGroupV2,
+        }
+        let legacy_manifest = CodingRootManifest {
+            format_version: 1,
+            attempt_id: manifest.value.attempt_id,
+            plan_hash: manifest.value.plan_hash,
+            group: manifest.value.group.clone(),
+            information_bytes: None,
+        };
+        let legacy_layout = LegacyManifest {
+            format_version: 1,
+            attempt_id: legacy_manifest.attempt_id,
+            plan_hash: legacy_manifest.plan_hash,
+            group: &legacy_manifest.group,
+        };
+        let legacy_cbor = cbor4ii::serde::to_vec(Vec::new(), &legacy_layout).unwrap();
+        assert_eq!(
+            cbor4ii::serde::to_vec(Vec::new(), &legacy_manifest).unwrap(),
+            legacy_cbor
+        );
+        assert_eq!(
+            canonical_bytes(&legacy_manifest).unwrap(),
+            canonical_bytes(&legacy_layout).unwrap(),
+        );
+        assert_eq!(
+            cbor4ii::serde::from_slice::<CodingRootManifest>(&legacy_cbor).unwrap(),
+            legacy_manifest,
+        );
+        assert_eq!(
+            cbor4ii::serde::from_slice::<SignedRecord<CodingRootManifest>>(
+                &cbor4ii::serde::to_vec(Vec::new(), &manifest).unwrap()
+            )
+            .unwrap(),
+            manifest,
+        );
         let local_object = VariableParityObject {
             format_version: 2,
             guild_id: [181; 32],
@@ -14186,11 +14224,8 @@ pub(crate) mod tests {
                 .unwrap(),
             vec![changed]
         );
-        assert!(
-            node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, false)
-                .is_err(),
-            "a new legacy checkpoint needs a revision-signed full-content commitment"
-        );
+        node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, false)
+            .unwrap();
         node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, true)
             .unwrap();
         let checkpoint_hash = checkpoint.hash().unwrap();

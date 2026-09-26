@@ -1937,6 +1937,11 @@ corrections are implemented; M5-97 has not yet passed on this tree.
   to confirm deletes all parity staged by that attempt and restarts the complete
   upload with fresh coordinators and challenge. Signed invalid openings and a
   valid-proof RS mismatch are attributable; timeouts prove only unavailability.
+  Current packed inputs use their Merkle root directly. Legacy flat-root plans
+  additionally carry complete encrypted information in the manifest to prove
+  that the two root representations describe the same bytes. That compatibility
+  payload is bounded to 512 KiB per manifest and reported separately as
+  `root_binding_bytes`; current production packed plans carry no such payload.
 - Add versioned variable `k/m` and sector profiles, dynamic membership and event
   tails, quorum policy, writer/key epochs, recovery-key envelopes, rotation and
   revocation. Keep old committed layouts decodable until their retention ends.

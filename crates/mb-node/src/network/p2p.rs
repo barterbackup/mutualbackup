@@ -6609,6 +6609,7 @@ async fn execute_delegated_coding(
         attempt_id = ?plan.value.attempt_id,
         information_shard_transfers = estimate.information_shard_transfers,
         parity_shard_transfers = estimate.parity_shard_transfers,
+        root_binding_bytes = estimate.root_binding_bytes,
         bulk_bytes = estimate.bulk_bytes,
         "starting delegated coding attempt"
     );
@@ -16255,6 +16256,7 @@ mod tests {
         worker.await.unwrap();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn signed_replacement_transcript(
         group: &CodingGroupV2,
         shards: &[Vec<u8>],
@@ -16440,7 +16442,7 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        let transcript = SignedRecord::sign(
+        SignedRecord::sign(
             mb_core::CODING_TRANSCRIPT_DOMAIN,
             CodingVerificationTranscript {
                 format_version: 1,
@@ -16454,8 +16456,7 @@ mod tests {
             },
             signing_keys.get(&verifier).unwrap(),
         )
-        .unwrap();
-        transcript
+        .unwrap()
     }
 
     #[tokio::test]
