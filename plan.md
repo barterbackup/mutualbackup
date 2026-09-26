@@ -63,6 +63,11 @@ review of `16c28a5..88898a6` on 2026-09-26: M5-111 through M5-113 expose
 concurrent verifier acceptance during stale cleanup, signed-failure ownership
 transfer during expiry recovery, and missing packed-input restaging after
 failure. Correct these and pass the new M5-114 local gate before Milestone 6.
+Follow-up source-only review of `d3fd117` plus pending changes finds M5-115:
+a retired stale `Submitting` job retries rejected delivery forever and blocks
+later stale cleanup. The pending M5-111/M5-112 fixes are not yet committed or
+closed; M5-113's packed-input restaging is still absent. Correct M5-115 too,
+complete the requested regression coverage, and pass M5-114 on the final tree.
 No builds or runtime validation were run in this review.
 
 The previous complete final M5-104 local gate on
@@ -595,7 +600,7 @@ machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
 than a daemon prerequisite. Milestones 0 through 4 have passed. Milestone 5
-is reopened for M5-111 through M5-113 and the new M5-114 gate; Milestone 6
+is reopened for M5-111 through M5-113, M5-115 and the new M5-114 gate; Milestone 6
 waits. This source-only review ran no builds, tests, daemons or runtime probes.
 The previous final M5-104 workspace and fresh provisioned gate passed on
 `f8e47d3`, with all
@@ -852,6 +857,10 @@ review at every gate before committing the next milestone's detailed scope.
 reopened by source-only review of `16c28a5..88898a6` on 2026-09-26. Correct
 M5-111's stale cleanup/verifier race, M5-112's failure/expiry ownership race
 that can stop the daemon, and M5-113's packed-input retry restaging gap.
+Pending source changes address M5-111/M5-112, but follow-up source review finds
+M5-115: retired stale submissions never finish and block later stale cleanup.
+M5-113 remains unchanged. Finish authenticated submission reconciliation,
+packed-input restaging, and the requested regression coverage before closure.
 Pass M5-114's complete local gate on the corrected committed source before
 Milestone 6's guarded link-freeze capture, native platforms and capture hooks.
 No builds, tests, daemons or runtime probes ran in this review. The earlier
@@ -1999,6 +2008,29 @@ source locations, failure cases, and recorded gate evidence.
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
 ### Milestone 5 — efficient and flexible data/guild protocol (reopened)
+
+Follow-up source-only review on 2026-09-26 covers `d3fd117` plus the pending
+source/protocol changes. Delegator-owned retirement now arbitrates stale launch
+and delegated cleanup against accepted verification; expired launch recovery
+recognizes an authenticated transfer to retry/activation, and delayed launch
+deferral/acknowledgement can yield to that owner. These M5-111/M5-112 changes
+and regression sources are still uncommitted and have not been validated by
+this review. M5-112's regression must also cover unrelated coding progress.
+M5-113 remains a production blocker: packed input intent is deleted on failure
+and no successor restaging is performed.
+
+The pending delegated change introduces **M5-115**. A stale durable `Submitting`
+job bypasses retirement reconciliation; when the delegator's fence won before
+delivery, rejection leaves that job unfinished forever. The claim loop then
+repeatedly chooses the same stale job and prevents later stale cleanup, including
+after reopen. Reconcile the exact attempt with authenticated delegator evidence,
+preserve accepted activation, and complete safely fenced cleanup. Cover both
+arrival orderings with a persisted submission job, another stale cleanup job,
+offline/interrupted cleanup, worker liveness and repeated reopen. Details and
+source locations are in `TODO.md`. Correct M5-115 along with M5-111 through
+M5-113 before M5-114's complete final local gate. Milestone 5 remains open and
+Milestone 6 waits. This review ran no builds, tests, daemons or runtime probes;
+the earlier passing M5-104 record remains historical evidence for its exact tree.
 
 Source-only review of `16c28a5..88898a6` on 2026-09-26 finds three production
 P1 blockers. The recent acknowledged-launch ownership, renewal and relay

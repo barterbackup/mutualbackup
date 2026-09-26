@@ -2891,9 +2891,53 @@ node Clippy gate passed locally. No remote compilation server was used.
   staged receipts/reservations through repeated reopen. This finding is
   source-only.
 
+- [ ] **M5-115 / P1 — Finish retired delegated submissions without starving stale cleanup.**
+  Source-only review on 2026-09-26 covers `d3fd117` plus the pending cleanup
+  ownership changes. The new stale-job branch deliberately excludes
+  `Submitting` (`crates/mb-node/src/network/p2p.rs:6067`–`:6071`), allowing a
+  valid historical result to be delivered. However, the delegator may already
+  have retired that exact attempt during stale launch or expiry cleanup before
+  delivery. `accept_coding_transcript` permanently rejects results behind the
+  durable retirement fence (`crates/mb-node/src/node.rs:5384`–`:5390`). The
+  submission error path only logs and sleeps (`network/p2p.rs:6148`–`:6162`);
+  it never reconciles retirement or changes the durable `Submitting` state.
+  `claim_delegated_coding` selects the first unfinished stale job without a
+  cursor (`node.rs:4643`–`:4646`, `:4682`), so that job is selected forever
+  when no current-epoch work is present. Later stale jobs cannot clean their
+  staged objects or reservations. Reopening retains the same stuck owner.
+  Current-epoch work is preferred by the claim loop, but this does not unblock
+  the stale cleanup queue.
+
+  After unsuccessful delivery, reconcile the exact signed attempt with its
+  delegator's authenticated durable decision. If retirement won, resume safe
+  cleanup and finish the redundant delegated job; if accepted evidence won,
+  preserve activation data and finish or confirm idempotent delivery. Keep
+  transient transport errors retryable, and never infer permission to delete
+  from a timeout or an arbitrary submission error. Preserve valid historical
+  submission when no fence exists. Gate a real durable `Submitting` job with
+  retirement before delivery, an unrelated epoch change, a second stale job
+  requiring cleanup, interrupted/offline cleanup and repeated reopen. Assert
+  both jobs finish, worker liveness, exact holder capacity, no leaked receipts
+  or reservations, and the acceptance-before-retirement ordering too. The
+  existing new retirement fixture submits directly without persisting a coder
+  `Submitting` job, so it does not cover this production path. No builds or
+  runtime validation were run in this review.
+
+  Follow-up status: the pending source adds delegator-owned retirement for
+  M5-111 and recognizes retry/activation ownership transfer for M5-112,
+  including focused regression sources. These corrections are uncommitted
+  and not closed by this review; M5-115 remains in the delegated submission
+  path. M5-113 remains unchanged: failure acceptance still deletes packed
+  input intent (`node.rs:5464`), successor preparation stores only the retry
+  job (`:5557`–`:5561`), and `execute_coding_retry` delegates without restaging
+  (`network/p2p.rs:6714`–`:6722`). M5-112's new fixture also needs the requested
+  assertion that unrelated coding work progresses alongside the failure race;
+  its new failure branch exercises replacement coverage but creates no such
+  unrelated lane. M5-114 still requires the complete final committed-tree gate.
+
 - [ ] **M5-114 / gate — Recheck Milestone 5 after cleanup ownership and packed retries.**
-  Correct M5-111 through M5-113, then source-review the final committed tree
-  and run their controlled production-worker regressions locally. On that
+  Correct M5-111 through M5-113 and M5-115, then source-review the final
+  committed tree and run their controlled production-worker regressions locally. On that
   exact source, pass strict locked all-target workspace Clippy, locked
   all-target workspace tests, formatting, Docker lab safety, and the complete
   fresh disposable Btrfs/network acceptance script. Retain acknowledged expiry,
