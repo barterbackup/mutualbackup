@@ -574,13 +574,17 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (closed 2026-09-26)
+## Milestone 5 guild geometry and coding protocol (reopened 2026-09-26)
 
 The final corrected source `c7033fa` passed the complete M5-97 local gate on
 2026-09-26. Provisioned acceptance ran at `4170dce`, which changes only these
-status documents from that source. M5-92 through M5-102 are resolved, all
-Milestone 5 items are checked, and Milestone 6 is next. Earlier reopening and
-gate records below remain the review history for their respective trees.
+status documents from that source. M5-92 through M5-102's recorded corrections
+remain implemented, but source-only review through `515260c` found M5-103:
+a preserved incomplete retry can indefinitely prevent the background worker
+from dispatching a stronger replacement or finishing unrelated activations.
+Milestone 5 is reopened; Milestone 6 waits for M5-103 and the new M5-104 gate.
+M5-97 and earlier gate records remain evidence for their exact trees. This
+review ran no builds, tests, daemons, runtime probes, or remote compilation.
 
 Source-only review of `8135e0b..da8974a` on 2026-09-18 found the M5-36 through
 M5-44 blockers below; all are now corrected. The production gate recorded in
@@ -2354,6 +2358,47 @@ node Clippy gate passed locally. No remote compilation server was used.
   SQLCipher range API, reopens after the first chunk, resumes the reservation,
   finalizes the committed parity row, and verifies its opening. Every upload
   also fits both serialized transport limits. The final M5-97 gate remains open.
+
+- [ ] **M5-103 / P1 — Let replacement coding work progress past a blocked durable retry.**
+  Distinct format-3 attempt IDs allow enqueue alongside the old format-2
+  retry, but do not make the production worker dispatch it. The first
+  incomplete retry is claimed repeatedly, and deferral only records an error
+  while leaving it incomplete (`crates/mb-node/src/node.rs:4944`–`:4960`,
+  `:5015`–`:5040`). `run_delegated_coding_jobs` unconditionally continues
+  after retry failure, before launch dispatch or activation
+  (`crates/mb-node/src/network/p2p.rs:6131`–`:6173`). A concrete same-epoch
+  restart can leave a prepared retry past its ten-minute deadline: retry
+  execution reuses that exact signed plan forever (`:6352`–`:6353`), while
+  delegated enqueue rejects expired plans (`crates/mb-node/src/node.rs:4110`,
+  `:5382`; `crates/mb-core/src/guild.rs:575`). Even with all peers back online,
+  the queued stronger legacy proof and every unrelated launch/activation stay
+  unreachable. A retry without a prepared plan also fails indefinitely in a
+  supported three-member guild: excluding both old coordinators leaves only
+  one fresh candidate, but retry requires two (`network/p2p.rs:6381`–`:6400`).
+  Membership-epoch changes retire these retries, but an ordinary restart or
+  proof-format upgrade does not change the epoch. The new migration regression
+  directly claims the replacement launch (`node.rs:13922`–`:13964`), bypassing
+  this worker schedule.
+  Handle expired or superseded retries with fresh identities and valid
+  authority while preserving signed history and safe staged-data cleanup.
+  Give deferred retries bounded scheduling turns so launches and activations
+  can progress; keep insufficient fresh coordinators an explicit blocked
+  state rather than monopolizing the worker. Gate a same-epoch reopen with an
+  expired prepared format-2 retry, all peers reachable, and a queued format-3
+  replacement through the actual background worker to verified activation
+  and checkpoint coverage, preserving old evidence. Also cover a three-member
+  retry lacking two fresh coordinators alongside unrelated eligible launch
+  and activation work, and repeated reopen without resurrecting expired work.
+  This finding is source-only; no builds or tests were run.
+
+- [ ] **M5-104 / gate — Recheck Milestone 5 after durable retry scheduling is corrected.**
+  Review the M5-103 correction and its production-worker restart regressions.
+  Then run formatting, locked all-target workspace tests, strict locked
+  all-target workspace Clippy, Docker lab safety, and the complete fresh
+  disposable local Btrfs/network acceptance script. Record exact source
+  commits and outcomes, and remove disposable resources. M5-97 remains a
+  passed historical gate; it does not cover the missing retry schedule.
+  All compilation and execution must remain local, with no remote server.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

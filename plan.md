@@ -56,7 +56,7 @@ them as ADRs and test vectors before promising wire compatibility.
   checkpoints. Leave a compatible authorization interface for later quorum
   policies and FROST once membership and recovery policy are stable.
 
-### Implemented baseline — efficient and flexible guild protocol beta passed
+### Implemented baseline — efficient and flexible guild protocol beta reopened
 
 The first usable architectural prototype and the Milestone 2
 operator-configuration and identity-state slice have passed their review gates.
@@ -151,8 +151,16 @@ also passed at `4170dce`, whose changes from `c7033fa` are documentation only.
 The five-daemon scenario passed owner/storage-only seed recovery and direct,
 DCUtR, and forced relay bulk transfers. Cleanup and subsequent checks confirm
 all disposable mounts, loop/image, namespaces, and daemons are gone. M5-97
-is passed, Milestone 5 is closed, and Milestone 6 is next. All builds and runs
+is passed; Milestone 5 was closed at that point. All builds and runs
 were local; no remote compilation server was used.
+Source-only review through `515260c` on 2026-09-26 reopens Milestone 5 for
+M5-103: a preserved incomplete retry monopolizes the coding worker even when
+a stronger format-3 replacement is queued. An expired prepared retry is reused
+forever and rejected at delegation; insufficient fresh coordinators also keep
+the retry incomplete. New launches and activations are never reached. Correct
+retry expiry/supersession and scheduling, then pass the new M5-104 local gate.
+M5-97 remains passed historical evidence; Milestone 6 waits. This review ran no
+builds, tests, daemons, runtime probes, or remote compilation.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -576,7 +584,9 @@ M5-100 in the stronger legacy proof's migration and encoded-frame handling;
 these also require correction before M5-97 and Milestone 6.
 The final correction series through `c7033fa` now passes the complete M5-97
 local workspace and fresh disposable Btrfs/network gate. Milestones 0 through
-5 are passed; Milestone 6 is next. The preceding records are closure history.
+4 are passed. Subsequent source-only review found M5-103 in same-epoch durable
+retry scheduling, so Milestone 5 is reopened and Milestone 6 waits for its
+correction and M5-104. The preceding records are closure history.
 Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
@@ -792,9 +802,11 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 5 are passed. The complete M5-97
-local gate passed on final source `c7033fa` on 2026-09-26; provisioned
-acceptance ran at documentation-only successor `4170dce`. Milestone 6 is next.
+**Current position:** Milestones 0 through 4 are passed. Milestone 5 is
+reopened for M5-103's durable retry starvation and the new M5-104 gate;
+Milestone 6 waits. The complete M5-97 local gate passed on source `c7033fa`
+on 2026-09-26; provisioned acceptance ran at documentation-only successor
+`4170dce`. That gate remains historical evidence for its tested scenarios.
 The following records retain the correction and closure history. The M5-36
 through M5-66 correction history and M5-45/M5-67 gates remain historical evidence.
 Fresh source-only review of `81ec33b..b65c79a` found M5-68 through M5-76 and
@@ -1934,9 +1946,9 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (closed)
+### Milestone 5 — efficient and flexible data/guild protocol (reopened)
 
-Closed on 2026-09-26 after the complete M5-97 gate on corrected source
+Previously closed on 2026-09-26 after the complete M5-97 gate on corrected source
 `c7033fa`. Formatting, locked all-target workspace tests, strict locked
 all-target Clippy, Docker lab safety, and the complete fresh disposable
 Btrfs/network acceptance script passed locally. The provisioned run used
@@ -1952,7 +1964,23 @@ root/length authentication, encoded-frame limits and aligned upload resume,
 and real multi-owner backup, restore, audit/repair, and seed-only recovery.
 The corresponding core/node/store regressions passed in the workspace gate;
 provisioned filesystem and real-network scenarios passed in M5-97. M5-92
-through M5-102 are resolved; Milestone 6 is next. The records below are history.
+through M5-102's recorded corrections remain implemented. Source-only review
+through `515260c` found M5-103 and reopens this milestone; Milestone 6 waits.
+
+M5-103 blocks actual background progress after the proof-identity migration.
+The worker claims an incomplete old retry before launches and activations,
+then continues even after failure. A retry prepared before downtime is reused
+after its deadline and rejected by delegated enqueue indefinitely, even with
+all peers online in the same membership epoch. Without a prepared plan, a
+three-member guild cannot supply two fresh coordinators after excluding the
+old pair, so that retry also monopolizes the worker. The migration regression
+queues and directly claims the stronger launch but does not drive this worker.
+Preserve signed evidence and safe cleanup while renewing or superseding expired
+work and giving deferred retries bounded scheduling turns. Required source
+paths and restart/activation/checkpoint regressions are in `TODO.md` M5-103.
+M5-104 requires fresh source review and the complete local workspace and
+provisioned acceptance gate after correction. This review ran no builds,
+tests, daemons, or runtime probes. The records below are history.
 
 M5-36 through M5-44 are implemented, and the complete M5-45 correction gate
 passed locally on 2026-09-19. The final committed tree passed formatting,
