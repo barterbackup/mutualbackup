@@ -574,7 +574,13 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (reopened 2026-09-26)
+## Milestone 5 guild geometry and coding protocol (closed 2026-09-26)
+
+The final corrected source `c7033fa` passed the complete M5-97 local gate on
+2026-09-26. Provisioned acceptance ran at `4170dce`, which changes only these
+status documents from that source. M5-92 through M5-102 are resolved, all
+Milestone 5 items are checked, and Milestone 6 is next. Earlier reopening and
+gate records below remain the review history for their respective trees.
 
 Source-only review of `8135e0b..da8974a` on 2026-09-18 found the M5-36 through
 M5-44 blockers below; all are now corrected. The production gate recorded in
@@ -2196,31 +2202,34 @@ node Clippy gate passed locally. No remote compilation server was used.
   an inconsistent retained revision; audit continues to check reconstructed
   bytes against the committed checkpoint.
 
-- [ ] **M5-97 / gate — Close Milestone 5 after the root-binding, migration, and length corrections.**
+- [x] **M5-97 / gate — Close Milestone 5 after the root-binding, migration, length, and alignment corrections.**
   After correcting the source blockers, run fresh source review, formatting,
   locked all-target workspace tests, warning-free locked all-target workspace
   Clippy, Docker lab safety, and the complete provisioned Btrfs/network
   acceptance script on a fresh disposable local filesystem. Build and run
   locally; do not use a remote compilation server. M5-91 remains historical
-  evidence for its exact source tree. M5-92 and M5-96 are corrected in
-  `c7cc6fd`; the complete gate has not yet passed on the final corrected tree.
-  Source review of `e64f76e` found M5-98 through M5-100 below; correct these
-  before running and recording the complete local closure gate.
-  M5-98 through M5-100 are now implemented and focused regressions pass; the
-  complete final workspace/provisioned acceptance gate remains pending.
-  Final source audit of `99c3c82` found M5-101 below; its correction must be
-  included in the final source review and complete local gate.
-  Follow-up source-only review on 2026-09-26 found M5-102 in the adaptive
-  parity range calculation. Correct it before the final gate. The uncommitted
-  M5-101 length checks are present in the working tree but do not constitute
-  committed, validated milestone closure evidence.
-  Commits `8433c86` and `c7033fa` now implement M5-101 and M5-102. The final
+  evidence for its exact source tree. The correction series through `c7033fa`
+  resolves M5-92 through M5-102. Final source review covers legacy full-byte
+  root/length binding in signing, recovery and audit, historical evidence and
+  durable-job migration, both transport encodings, and aligned resumable
+  holder writes. Focused positive/negative regressions and the full gate pass.
+  Commits `8433c86` and `c7033fa` implement M5-101 and M5-102. The final
   source tree `c7033fa` passed formatting, locked all-target workspace tests,
   warning-free locked all-target workspace Clippy, and Docker lab safety
   locally on 2026-09-26. Node tests: 255 passed, 10 provisioned tests ignored;
   core: 48 passed; store: 50 passed, 14 provisioned tests ignored. These counts
-  exclude the other passing workspace targets. Complete fresh disposable
-  Btrfs/network acceptance on this final source tree is still required.
+  exclude the other passing workspace targets. The complete
+  `MUTUALBACKUP_REFLINK_TEST_ROOT=... bash scripts/reflink-acceptance.sh` also
+  passed on a fresh disposable local 8 GiB Btrfs filesystem at `4170dce`
+  (documentation-only changes from `c7033fa`). It includes capture/resumption,
+  descriptor and storage-headroom checks, five-active-node seed recovery,
+  signed network commit/recovery, repeated multi-owner QUIC backups, and real
+  five-daemon seed/DHT recovery with direct, DCUtR, and forced relay bulk
+  transfers. All 23 test invocations passed; the final process test passed in
+  1348.52 seconds. Cleanup and
+  subsequent checks confirm the mount, loop/image, namespaces, and test
+  daemons are gone. No remote compilation server was used. Milestone 5 is
+  closed; Milestone 6 is next.
 
 - [x] **M5-98 / P1 — Give upgraded legacy attempts a distinct durable identity.**
   `queue_variable_coding_lanes` now emits format-3 legacy plans but derives

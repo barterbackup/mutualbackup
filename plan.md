@@ -56,7 +56,7 @@ them as ADRs and test vectors before promising wire compatibility.
   checkpoints. Leave a compatible authorization interface for later quorum
   policies and FROST once membership and recovery policy are stable.
 
-### Implemented baseline — durable operations beta passed
+### Implemented baseline — efficient and flexible guild protocol beta passed
 
 The first usable architectural prototype and the Milestone 2
 operator-configuration and identity-state slice have passed their review gates.
@@ -133,9 +133,9 @@ profiles retain their explicitly authenticated descriptor lengths.
 Follow-up source-only review on 2026-09-26 also found M5-102: adaptive parity
 upload sizes are bounded by the peer frame but can violate storage's 16-byte
 alignment requirement. Round the budget down to complete Merkle leaves and
-cover holder staging and interrupted resume before M5-97. M5-101's length
-correction is currently uncommitted in the working tree. Milestone 5 remains
-open; Milestone 6 waits for these corrections and the final local gate.
+cover holder staging and interrupted resume before M5-97. At that review,
+M5-101's length correction was uncommitted in the working tree. Milestone 5
+remained open; Milestone 6 waited for these corrections and the final local gate.
 M5-101 is now implemented: legacy coverage and recovery/audit require 64 KiB
 ciphertext, while packed descriptors retain their explicit lengths. The
 positive migration/lifecycle and negative short-proof regressions pass locally.
@@ -146,7 +146,13 @@ holder-storage reopening and reservation resume through finalization. M5-101
 and M5-102 are corrected; the complete M5-97 gate remains open.
 The corrected source `c7033fa` passed formatting, locked all-target workspace
 tests, strict locked all-target workspace Clippy, and Docker lab safety locally
-on 2026-09-26. Final fresh disposable Btrfs/network acceptance remains pending.
+on 2026-09-26. The complete fresh disposable 8 GiB Btrfs/network acceptance
+also passed at `4170dce`, whose changes from `c7033fa` are documentation only.
+The five-daemon scenario passed owner/storage-only seed recovery and direct,
+DCUtR, and forced relay bulk transfers. Cleanup and subsequent checks confirm
+all disposable mounts, loop/image, namespaces, and daemons are gone. M5-97
+is passed, Milestone 5 is closed, and Milestone 6 is next. All builds and runs
+were local; no remote compilation server was used.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -568,6 +574,9 @@ for the correction and closure gate. M5-91 remains evidence for its exact
 source tree. Source-only review of `e64f76e` on 2026-09-26 finds M5-98 through
 M5-100 in the stronger legacy proof's migration and encoded-frame handling;
 these also require correction before M5-97 and Milestone 6.
+The final correction series through `c7033fa` now passes the complete M5-97
+local workspace and fresh disposable Btrfs/network gate. Milestones 0 through
+5 are passed; Milestone 6 is next. The preceding records are closure history.
 Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
@@ -783,8 +792,11 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 4 are passed. The M5-36 through
-M5-66 correction history and M5-45/M5-67 gates remain historical evidence.
+**Current position:** Milestones 0 through 5 are passed. The complete M5-97
+local gate passed on final source `c7033fa` on 2026-09-26; provisioned
+acceptance ran at documentation-only successor `4170dce`. Milestone 6 is next.
+The following records retain the correction and closure history. The M5-36
+through M5-66 correction history and M5-45/M5-67 gates remain historical evidence.
 Fresh source-only review of `81ec33b..b65c79a` found M5-68 through M5-76 and
 reopened Milestone 5. Those implementation blockers are corrected, and the
 complete local M5-77 workspace/provisioned gate passed on 2026-09-22.
@@ -1922,7 +1934,25 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (reopened)
+### Milestone 5 — efficient and flexible data/guild protocol (closed)
+
+Closed on 2026-09-26 after the complete M5-97 gate on corrected source
+`c7033fa`. Formatting, locked all-target workspace tests, strict locked
+all-target Clippy, Docker lab safety, and the complete fresh disposable
+Btrfs/network acceptance script passed locally. The provisioned run used
+documentation-only successor `4170dce`; its final five-daemon scenario passed
+in 1348.52 seconds. Disposable resources and test daemons were removed.
+
+The closure audit covers variable-profile every-`k` reconstruction, fair stable
+slots and multiple roots, authenticated virtual zeros and sparse/large-tree
+metrics, delegated coding and sampled transcript replay/attribution, bulk
+transfer estimates, membership and retained key/history transitions, current
+capacity and crash-safe cleanup/activation/retention, legacy migration and
+root/length authentication, encoded-frame limits and aligned upload resume,
+and real multi-owner backup, restore, audit/repair, and seed-only recovery.
+The corresponding core/node/store regressions passed in the workspace gate;
+provisioned filesystem and real-network scenarios passed in M5-97. M5-92
+through M5-102 are resolved; Milestone 6 is next. The records below are history.
 
 M5-36 through M5-44 are implemented, and the complete M5-45 correction gate
 passed locally on 2026-09-19. The final committed tree passed formatting,
@@ -1987,9 +2017,12 @@ frame-limited result is not rounded to a 16-byte leaf, while holder storage
 rejects unaligned upload lengths and offsets. Correct the shared range sizing
 used by full-byte staging and delegated encoding, and validate actual writes,
 interrupted reservation resume, and finalization at frame-limited geometries.
-The current M5-101 working-tree correction adds length checks to signing,
-recovery, and audit while preserving explicit packed lengths; it still needs
-commit and validation. This review ran no builds or tests. M5-97 remains open.
+At that source review, the M5-101 working-tree correction added length checks
+to signing, recovery, and audit while preserving explicit packed lengths; it
+still needed commit and validation. That review ran no builds or tests.
+Subsequent commits `8433c86` and `c7033fa` correct M5-101 and M5-102. Both
+focused regressions and the complete local M5-97 gate now pass, closing
+Milestone 5.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and
