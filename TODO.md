@@ -576,6 +576,20 @@ implementation; Milestone 4 was reopened until they were resolved.
 
 ## Milestone 5 guild geometry and coding protocol (reopened 2026-09-26)
 
+Latest source-only review covers `88898a6..687e207` and the pending M5-116
+changes in `crates/mb-node/src/node.rs` and `network/p2p.rs`. The committed
+M5-111/M5-112/M5-113/M5-115 corrections preserve cleanup/submission ownership
+and restage packed retry inputs. The pending M5-116 correction makes
+acknowledged successor expiry and stale cleanup reachable, but introduces
+M5-117: a retirement fence and absent input descriptors can be mistaken for
+completed holder cleanup. M5-116 remains uncommitted; resolve M5-117 before
+the complete final M5-114 gate. Milestone 5 is unfinished and Milestone 6
+waits. This review ran no builds, tests, daemons, or runtime probes and changes
+only these status documents. Existing passing results remain historical
+evidence for their recorded source.
+
+Earlier review record:
+
 Source-only review of `16c28a5..88898a6` on 2026-09-26 finds three outstanding
 P1 blockers in the production cleanup/retry paths: stale membership cleanup
 can discard concurrently accepted verifier evidence (M5-111); a signed failure
@@ -3040,10 +3054,62 @@ node Clippy gate passed locally. No remote compilation server was used.
   and stale acknowledged ownership so completed cleanup does not loop.
   This finding is from source inspection; correction and validation are pending.
 
+  Source-only follow-up (2026-09-26, `687e207` plus working tree): the pending
+  claim path reopens completed parents when their unsubmitted child expires or
+  becomes stale. Exact signed-child hashes bind terminal metadata; accepted
+  activation/failure owners take priority, and late parent completion preserves
+  child-owned input intent. New regression sources cover acknowledged packed
+  expiry/reopen and accepted/stale ownership. These source changes remain
+  uncommitted and are not closed by this review. The descriptor-less,
+  retirement-before-cleanup schedule below is still unsafe; the new ownership
+  test installs `Some(BTreeMap::new())` and does not exercise absent intent or
+  interrupted remote cleanup after an independently established fence.
+
+- [ ] **M5-117 / P2 — Do not infer completed retry cleanup from absent input intent.**
+  In the pending M5-116 source, `coding_retry_needs_recovery` treats an exact
+  child retirement fence plus absent parent/child `coding-launch-information`
+  records as terminal cleanup (`crates/mb-node/src/node.rs:5606`–`:5629`). It
+  writes `coding-retry-terminal` and leaves the acknowledged parent complete,
+  so all later claims skip it, including after reopen (`:5546`, `:5568`).
+  Descriptor-less retries are supported: `coding_retry_information` returns
+  None when no retained descriptors or packed cache exist (`:5707`–`:5745`),
+  and successor preparation then creates no input-intent record (`:5748`–`:5765`).
+  Those absent records say nothing about a coder's staged parity or partial
+  reservation on another holder.
+
+  A retirement fence precedes deletion rather than acknowledging it:
+  `retire_delegated_coding_attempt` only persists the signed fence
+  (`node.rs:5877`–`:5911`), and the stale coder awaits retirement before
+  `abort_stale_delegated_coding` (`network/p2p.rs:6092`–`:6108`). Start with
+  a descriptor-less retry A whose successor B was acknowledged and has staged
+  parity. Advance membership without invalidating those holders. B's coder
+  requests retirement, then stops after the delegator commits that fence and
+  before any holder cleanup. A remains complete, neither input-intent record
+  exists, and the next delegator claim permanently marks A terminal instead
+  of cleaning B. With that coder unavailable, staged bytes, receipts and
+  reservations have no reachable delegator cleanup owner; repeated cases
+  consume storage capacity. Waiting through B's deadline or reopening does
+  not repair the terminal marker.
+
+  Keep fenced but unconfirmed cleanup recoverable regardless of whether packed
+  input intent exists. Persist terminal cleanup evidence only after required
+  holder cleanup succeeds, or after authenticated submission ownership takes
+  over. Older completed histories without explicit cleanup evidence can be
+  reconciled once rather than being declared clean from missing descriptors.
+  Preserve accepted results/failures, exact signed history, and quiescent live
+  acknowledgements. Add a real descriptor-less acknowledged-successor case
+  with staged parity/partial reservations, unrelated epoch change, retirement
+  committed before coder shutdown, interrupted/offline holder cleanup and
+  delegator reopen. Keep the coder offline and assert delegator cleanup
+  converges, every holder's exact capacity and zero staged receipts/reservations,
+  and terminal history remains complete through repeated reopen. This finding
+  is source-only and applies to the uncommitted M5-116 correction.
+
 - [ ] **M5-114 / gate — Recheck Milestone 5 after cleanup ownership and packed retries.**
-  Correct M5-111 through M5-113, M5-115 and M5-116, then source-review the final
-  committed tree and run their controlled production-worker regressions locally. On that
-  exact source, pass strict locked all-target workspace Clippy, locked
+  Correct M5-111 through M5-113 and M5-115 through M5-117, then source-review
+  the final committed tree and run their controlled production-worker
+  regressions locally. On that exact source, pass strict locked all-target
+  workspace Clippy, locked
   all-target workspace tests, formatting, Docker lab safety, and the complete
   fresh disposable Btrfs/network acceptance script. Retain acknowledged expiry,
   accepted-result expiry/membership, staging, fairness, checkpoint, migration,

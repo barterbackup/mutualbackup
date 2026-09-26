@@ -59,7 +59,8 @@ them as ADRs and test vectors before promising wire compatibility.
 ### Implemented baseline — efficient and flexible guild protocol beta reopened
 
 Milestones 0 through 4 have passed. Milestone 5 remains open for M5-116's
-acknowledged retry successor recovery and the complete M5-114 final local gate.
+acknowledged retry successor recovery, M5-117's cleanup-completion correction,
+and the complete M5-114 final local gate.
 M5-113 now transfers packed input intent atomically and resumes successor
 uploads before delegation; its production partial-upload/offline/reopen,
 checkpoint, capacity and cache/GC regressions pass locally.
@@ -604,7 +605,7 @@ machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
 than a daemon prerequisite. Milestones 0 through 4 have passed. Milestone 5
-remains open for M5-116 and the new M5-114 gate; Milestone 6 waits.
+remains open for M5-116/M5-117 and the new M5-114 gate; Milestone 6 waits.
 M5-111/M5-112/M5-113/M5-115 corrections pass focused local validation. Complete locked
 workspace and fresh Btrfs/network gates on the final corrected commit remain
 required. All compilation and execution take place locally.
@@ -860,12 +861,14 @@ integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
 **Current position:** Milestones 0 through 4 are passed. Milestone 5 remains
-open for acknowledged retry successor recovery (M5-116) and the complete final
-committed-source gate (M5-114). Packed-input restaging (M5-113), cleanup/verifier
+open for acknowledged retry successor recovery (M5-116), confirmed cleanup
+completion (M5-117), and the complete final committed-source gate (M5-114).
+Packed-input restaging (M5-113), cleanup/verifier
 arbitration, expired-launch
 failure ownership, and retired durable submission reconciliation
 (M5-111/M5-112/M5-115) are implemented with passing focused local regressions.
-Make acknowledged retry expiry and stale cleanup reachable, then run the full
+Make acknowledged retry expiry and stale cleanup reachable without treating
+a fence and missing descriptors as completed holder cleanup, then run the full
 workspace and fresh local Btrfs/network acceptance gate and verify disposable
 resource cleanup before Milestone 6. The earlier
 M5-104 gate on `f8e47d3`, including all 23 provisioned invocations and verified
@@ -2012,6 +2015,25 @@ source locations, failure cases, and recorded gate evidence.
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
 ### Milestone 5 — efficient and flexible data/guild protocol (reopened)
+
+Latest source-only review (2026-09-26) covers `88898a6..687e207` plus the
+pending M5-116 source changes. Acknowledged successor recovery is now present
+in the working tree, with priority for accepted child owners and signed-child
+terminal metadata. It remains uncommitted and has a new **M5-117 / P2**
+blocker: a retirement fence plus absent packed-input descriptors is treated
+as completed cleanup. Descriptor-less legacy retries can still have staged
+parity or reservations. If the coder stops after retirement is committed but
+before holder deletion, the delegator permanently skips its acknowledged
+parent and leaks that capacity through reopen. Require explicit successful
+cleanup or authenticated ownership transfer before making that history
+terminal; gate retirement-before-coder-shutdown with absent descriptors,
+interrupted holder cleanup, delegator recovery and exact capacity/receipt
+checks. Details and source locations are in TODO.md. Finish M5-116/M5-117,
+commit the corrected source, then complete M5-114's full local gate before
+Milestone 6. This review ran no builds, tests, daemons or runtime probes;
+existing passing results remain historical evidence.
+
+Earlier implementation and review records:
 
 M5-113's packed-input correction now passes focused local validation. Failure
 handoff and successor preparation preserve input descriptors atomically; workers
