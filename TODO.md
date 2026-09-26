@@ -2210,6 +2210,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   complete final workspace/provisioned acceptance gate remains pending.
   Final source audit of `99c3c82` found M5-101 below; its correction must be
   included in the final source review and complete local gate.
+  Follow-up source-only review on 2026-09-26 found M5-102 in the adaptive
+  parity range calculation. Correct it before the final gate. The uncommitted
+  M5-101 length checks are present in the working tree but do not constitute
+  committed, validated milestone closure evidence.
 
 - [x] **M5-98 / P1 — Give upgraded legacy attempts a distinct durable identity.**
   `queue_variable_coding_lanes` now emits format-3 legacy plans but derives
@@ -2301,6 +2305,27 @@ node Clippy gate passed locally. No remote compilation server was used.
   their explicit descriptor commitments. Gate a fully root-bound short shard
   against checkpoint signing and recovery/audit authentication, and use full
   V1 ciphertext sectors for positive legacy checkpoint fixtures.
+
+- [ ] **M5-102 / P1 — Align adaptive parity uploads to Merkle leaves.**
+  `coding_parity_range_bytes` returns the remaining encoded-frame budget,
+  divided by two for CBOR and capped at 256 KiB, without rounding it down to
+  `MERKLE_LEAF_SIZE` (`crates/mb-node/src/network/wire.rs:625`–`:646`).
+  Both full-byte staging and delegated encoding use that number directly as
+  the next upload length (`crates/mb-node/src/network/p2p.rs:2474`–`:2484`,
+  `:6702`–`:6730`). For a frame-limited witness, the available budget need not
+  be a multiple of 16. The holder rejects such a range before writing because
+  both its offset and byte count must be leaf-aligned
+  (`crates/mb-store/src/database.rs:1502`–`:1514`, reached through
+  `crates/mb-node/src/node.rs:4677` and `crates/mb-node/src/volume.rs:881`).
+  Thus an accepted, transportable plan can repeatedly fail staging; the current
+  frame regression only serializes uploads and does not exercise this storage
+  precondition (`crates/mb-node/src/network/wire.rs:1005`, `:1024`). Round the
+  chosen size down to a complete leaf before checking the minimum. Gate a
+  frame-limited full-byte manifest through actual holder writes, interrupted
+  upload/reservation resume, and finalization, with varying envelope/domain
+  sizes; every chosen chunk and resumed offset must remain aligned while both
+  encoded transports stay within their limits. This finding is source-only;
+  no builds, tests, daemons, or runtime probes were run for this review.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

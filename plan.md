@@ -130,6 +130,12 @@ coverage can accept a short information shard even though the V1 cipher and
 restore require a complete 64 KiB sector. Correct the implicit length check
 in signing, recovery, and audit before the final M5-97 gate. Packed variable
 profiles retain their explicitly authenticated descriptor lengths.
+Follow-up source-only review on 2026-09-26 also found M5-102: adaptive parity
+upload sizes are bounded by the peer frame but can violate storage's 16-byte
+alignment requirement. Round the budget down to complete Merkle leaves and
+cover holder staging and interrupted resume before M5-97. M5-101's length
+correction is currently uncommitted in the working tree. Milestone 5 remains
+open; Milestone 6 waits for these corrections and the final local gate.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -1965,6 +1971,14 @@ Postcard serializer. M5-97's final local workspace/provisioned gate is pending.
 Final source audit of `99c3c82` found M5-101's implicit legacy ciphertext
 length gap. Its correction and positive/negative length regressions must also
 pass before the complete M5-97 gate closes Milestone 5.
+Follow-up source-only review finds M5-102 in `coding_parity_range_bytes`: its
+frame-limited result is not rounded to a 16-byte leaf, while holder storage
+rejects unaligned upload lengths and offsets. Correct the shared range sizing
+used by full-byte staging and delegated encoding, and validate actual writes,
+interrupted reservation resume, and finalization at frame-limited geometries.
+The current M5-101 working-tree correction adds length checks to signing,
+recovery, and audit while preserving explicit packed lengths; it still needs
+commit and validation. This review ran no builds or tests. M5-97 remains open.
 
 - Replace deterministic fillers with cross-user sector packing and fair
   scheduling. Add incremental updates, hierarchical Merkle range proofs and
