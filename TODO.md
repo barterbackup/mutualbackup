@@ -582,7 +582,8 @@ status documents from that source. M5-92 through M5-102's recorded corrections
 remain implemented, but source-only review through `515260c` found M5-103:
 a preserved incomplete retry can indefinitely prevent the background worker
 from dispatching a stronger replacement or finishing unrelated activations.
-Milestone 5 is reopened; Milestone 6 waits for M5-103 and the new M5-104 gate.
+M5-103 is now implemented with passing production-worker restart regressions.
+Milestone 5 remains open; Milestone 6 waits for the complete new M5-104 gate.
 M5-97 and earlier gate records remain evidence for their exact trees. This
 review ran no builds, tests, daemons, runtime probes, or remote compilation.
 
@@ -2359,7 +2360,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   finalizes the committed parity row, and verifies its opening. Every upload
   also fits both serialized transport limits. The final M5-97 gate remains open.
 
-- [ ] **M5-103 / P1 — Let replacement coding work progress past a blocked durable retry.**
+- [x] **M5-103 / P1 — Let replacement coding work progress past a blocked durable retry.**
   Distinct format-3 attempt IDs allow enqueue alongside the old format-2
   retry, but do not make the production worker dispatch it. The first
   incomplete retry is claimed repeatedly, and deferral only records an error
@@ -2390,6 +2391,23 @@ node Clippy gate passed locally. No remote compilation server was used.
   retry lacking two fresh coordinators alongside unrelated eligible launch
   and activation work, and repeated reopen without resurrecting expired work.
   This finding is source-only; no builds or tests were run.
+  The correction gives every worker queue a turn and rotates retry claims.
+  Before cleanup it durably fences late results; late failure reports are
+  archived without resurrecting work. Expired plans and the original signed
+  failure remain intact. Successful cleanup records the expired parent and
+  renews with a fresh attempt ID, fresh coordinator pair, current authority,
+  and format 3 when legacy flat roots require complete-byte evidence. A queued
+  stronger replacement supersedes compact work; same-format replanning reuses
+  an already prepared retry instead of creating conflicting group evidence.
+  Stale membership retries also clean their prepared uploads before completion.
+  Four real QUIC worker regressions pass for stronger replacement after reopen,
+  renewal without replacement, three-member blocked retry fairness, and stale
+  prepared-upload cleanup. They exercise partial durable parity writes,
+  verification, activation, checkpoint signing, reservation removal, and two
+  further reopens. The focused `retry` run passed all 12 selected tests locally.
+  Node regressions cover rotating claims, retirement fences, idempotent late
+  failure archival, and preserving already submitted verifier evidence.
+  The complete final M5-104 gate remains pending. All validation is local.
 
 - [ ] **M5-104 / gate — Recheck Milestone 5 after durable retry scheduling is corrected.**
   Review the M5-103 correction and its production-worker restart regressions.

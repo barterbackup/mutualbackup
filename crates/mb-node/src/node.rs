@@ -274,8 +274,11 @@ pub struct DhtSequenceFloors {
 }
 
 fn same_coding_lane_attempt(left: &CodingAttemptPlan, right: &CodingAttemptPlan) -> bool {
+    left.attempt_id == right.attempt_id && same_coding_lane(left, right)
+}
+
+fn same_coding_lane(left: &CodingAttemptPlan, right: &CodingAttemptPlan) -> bool {
     left.format_version == right.format_version
-        && left.attempt_id == right.attempt_id
         && left.checkpoint_hash == right.checkpoint_hash
         && left.membership_epoch == right.membership_epoch
         && left.geometry == right.geometry
@@ -3938,6 +3941,20 @@ impl Node {
         if plan.value.delegator != self.keys.node_id() {
             anyhow::bail!("only the coding delegator may queue its launch");
         }
+        // An upgraded retry may already own the format-3 lane under a fresh
+        // random ID. Preserve that work instead of launching a second attempt
+        // that would produce the same immutable group ID with different evidence.
+        if plan.value.format_version == 3 {
+            for (_, bytes) in self.control.records("coding-retry-job")? {
+                let retry: CodingRetryJob = decode_canonical(&bytes)?;
+                if let Some(prior) = retry.retry_plan
+                    && same_coding_lane(&prior.value, &plan.value)
+                {
+                    self.validate_coding_attempt_authority(&prior)?;
+                    return Ok(prior);
+                }
+            }
+        }
         let attempt_id = plan.value.attempt_id;
         if let Some(bytes) = self.control.get_record("coding-retry-job", &attempt_id)? {
             let existing: CodingRetryJob = decode_canonical(&bytes)?;
@@ -4884,6 +4901,14 @@ impl Node {
         }
         let id = plan.attempt_id;
         replay_coding_transcript(&transcript)?;
+        if self
+            .control
+            .get_record("coding-retired-attempt", &id)?
+            .is_some()
+            || self.control.get_record("coding-retry-job", &id)?.is_some()
+        {
+            anyhow::bail!("coding attempt was failed or retired before result submission");
+        }
         if let Some(bytes) = self.control.get_record("coding-activation-job", &id)? {
             let existing: CodingActivationJob = decode_canonical(&bytes)?;
             if existing.format_version != 1 || existing.transcript != transcript {
@@ -4915,6 +4940,26 @@ impl Node {
             anyhow::bail!("coding failure was not submitted by its assigned coordinator");
         }
         let attempt_id = plan.value.attempt_id;
+        if let Some(bytes) = self
+            .control
+            .get_record("coding-retired-attempt", &attempt_id)?
+        {
+            let retired: SignedRecord<CodingAttemptPlan> = decode_canonical(&bytes)?;
+            if retired != *plan {
+                anyhow::bail!("late coding failure conflicts with retired plan");
+            }
+            let bytes = canonical_bytes(&failure)?;
+            if self
+                .control
+                .get_record("coding-retired-failure", &attempt_id)?
+                .is_some_and(|existing| existing != bytes)
+            {
+                anyhow::bail!("retired coding attempt has a different failure report");
+            }
+            self.control
+                .put_record("coding-retired-failure", &attempt_id, &bytes)?;
+            return Ok(());
+        }
         if self
             .control
             .get_record("coding-activation-job", &attempt_id)?
@@ -4941,7 +4986,11 @@ impl Node {
         Ok(())
     }
 
-    pub(crate) fn claim_coding_retry(&self) -> Result<Option<CodingRetryJob>> {
+    pub(crate) fn claim_coding_retry(
+        &self,
+        after: Option<[u8; 16]>,
+    ) -> Result<Option<CodingRetryJob>> {
+        let mut first = None;
         for (_, bytes) in self.control.records("coding-retry-job")? {
             let job: CodingRetryJob = decode_canonical(&bytes)?;
             if job.format_version != 1 {
@@ -4955,10 +5004,13 @@ impl Node {
                 anyhow::bail!("durable coding retry job belongs to another delegator");
             }
             if !job.complete {
-                return Ok(Some(job));
+                if after.is_none_or(|cursor| job.failure.value.plan.value.attempt_id > cursor) {
+                    return Ok(Some(job));
+                }
+                first.get_or_insert(job);
             }
         }
-        Ok(None)
+        Ok(first)
     }
 
     pub(crate) fn prepare_coding_retry(
@@ -4973,10 +5025,14 @@ impl Node {
             .get_record("coding-retry-job", &failed_attempt_id)?
             .context("coding retry job is unavailable")?;
         let mut job: CodingRetryJob = decode_canonical(&bytes)?;
+        if job.complete {
+            anyhow::bail!("completed coding retry cannot prepare another attempt");
+        }
         if let Some(plan) = &job.retry_plan {
             return Ok(plan.clone());
         }
-        let prior = &job.failure.value.plan.value;
+        let previous = self.coding_retry_previous_plan(&job)?;
+        let prior = &previous.value;
         let state = self
             .dynamic_guild_state()?
             .context("node has no dynamic guild state")?;
@@ -4988,7 +5044,19 @@ impl Node {
         let plan = SignedRecord::sign(
             CODING_ATTEMPT_PLAN_DOMAIN,
             CodingAttemptPlan {
-                format_version: prior.format_version,
+                format_version: if prior.format_version == 2
+                    && prior.information_roots.as_ref().is_some_and(|roots| {
+                        roots
+                            .iter()
+                            .zip(&prior.geometry.information)
+                            .any(|(root, role)| {
+                                !role.sector.virtual_zero && *root != role.sector.commitment.root
+                            })
+                    }) {
+                    3
+                } else {
+                    prior.format_version
+                },
                 attempt_id,
                 checkpoint_hash: prior.checkpoint_hash,
                 membership_epoch: state.membership_epoch,
@@ -5006,6 +5074,161 @@ impl Node {
         job.error = None;
         self.put_coding_retry_job(&job)?;
         Ok(plan)
+    }
+
+    pub(crate) fn coding_retry_previous_plan(
+        &self,
+        job: &CodingRetryJob,
+    ) -> Result<SignedRecord<CodingAttemptPlan>> {
+        let Some(bytes) = self.control.get_record(
+            "coding-retry-parent",
+            &job.failure.value.plan.value.attempt_id,
+        )?
+        else {
+            return Ok(job.failure.value.plan.clone());
+        };
+        let previous: SignedRecord<CodingAttemptPlan> = decode_canonical(&bytes)?;
+        self.validate_coding_attempt_authority(&previous)?;
+        let prior = &job.failure.value.plan.value;
+        if previous.value.checkpoint_hash != prior.checkpoint_hash
+            || previous.value.membership_epoch != prior.membership_epoch
+            || previous.value.geometry != prior.geometry
+            || previous.value.delegator != prior.delegator
+            || previous.value.information_roots != prior.information_roots
+        {
+            anyhow::bail!("expired retry parent conflicts with its coding lane");
+        }
+        Ok(previous)
+    }
+
+    pub(crate) fn coding_retry_has_stronger_replacement(
+        &self,
+        job: &CodingRetryJob,
+    ) -> Result<bool> {
+        let prior = &job.failure.value.plan.value;
+        let replaces = |plan: &CodingAttemptPlan| {
+            prior.format_version == 2
+                && plan.format_version == 3
+                && plan.checkpoint_hash == prior.checkpoint_hash
+                && plan.membership_epoch == prior.membership_epoch
+                && plan.delegator == prior.delegator
+                && plan.geometry == prior.geometry
+                && plan.information_roots == prior.information_roots
+        };
+        for (_, bytes) in self.control.records("coding-launch-job")? {
+            let launch: CodingLaunchJob = decode_canonical(&bytes)?;
+            if replaces(&launch.plan.value)
+                && self.validate_coding_attempt_plan(&launch.plan).is_ok()
+            {
+                return Ok(true);
+            }
+        }
+        for (_, bytes) in self.control.records("coding-activation-job")? {
+            let activation: CodingActivationJob = decode_canonical(&bytes)?;
+            if replaces(&activation.transcript.value.plan.value) {
+                self.validate_coding_attempt_authority(&activation.transcript.value.plan)?;
+                replay_coding_transcript(&activation.transcript)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // Fence late submissions before remote cleanup. Keep this signed plan even
+    // if cleanup or the process is interrupted; a retry never mutates its bytes.
+    pub(crate) fn retire_coding_retry_plan(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+    ) -> Result<bool> {
+        self.validate_coding_attempt_authority(plan)?;
+        if plan.value.delegator != self.keys.node_id() {
+            anyhow::bail!("only the delegator may retire a coding retry");
+        }
+        if self
+            .control
+            .get_record("coding-activation-job", &plan.value.attempt_id)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let bytes = canonical_bytes(plan)?;
+        if self
+            .control
+            .get_record("coding-retired-attempt", &plan.value.attempt_id)?
+            .is_some_and(|existing| existing != bytes)
+        {
+            anyhow::bail!("retired attempt conflicts with its durable signed plan");
+        }
+        self.control
+            .put_record("coding-retired-attempt", &plan.value.attempt_id, &bytes)?;
+        Ok(true)
+    }
+
+    pub(crate) fn renew_coding_retry_after_cleanup(&mut self, job: &CodingRetryJob) -> Result<()> {
+        let plan = job
+            .retry_plan
+            .as_ref()
+            .context("coding retry has no expired plan")?;
+        if plan.value.expires_at_unix_seconds >= unix_seconds()
+            || job.complete
+            || self
+                .control
+                .get_record("coding-retry-job", &job.failure.value.plan.value.attempt_id)?
+                != Some(canonical_bytes(job)?)
+        {
+            anyhow::bail!("coding retry changed or has not expired before renewal");
+        }
+        if self
+            .control
+            .get_record("coding-retired-attempt", &plan.value.attempt_id)?
+            != Some(canonical_bytes(plan)?)
+        {
+            anyhow::bail!("expired coding retry was not fenced before cleanup");
+        }
+        let mut updated = job.clone();
+        updated.retry_plan = None;
+        updated.error = None;
+        self.control.put_records(&[
+            (
+                "coding-retry-parent".to_owned(),
+                job.failure.value.plan.value.attempt_id.to_vec(),
+                canonical_bytes(plan)?,
+            ),
+            (
+                "coding-retry-job".to_owned(),
+                job.failure.value.plan.value.attempt_id.to_vec(),
+                canonical_bytes(&updated)?,
+            ),
+        ])?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_historical_coding_retry_for_test(
+        &self,
+        job: &CodingRetryJob,
+    ) -> Result<()> {
+        self.accept_coding_failure(job.failure.signer, job.failure.clone())?;
+        if let Some(plan) = &job.retry_plan {
+            self.validate_coding_attempt_authority(plan)?;
+        }
+        self.put_coding_retry_job(job)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coding_retry_evidence_for_test(&self, id: [u8; 16]) -> Result<CodingRetryJob> {
+        decode_canonical(
+            &self
+                .control
+                .get_record("coding-retry-job", &id)?
+                .context("missing retry")?,
+        )
+        .map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coding_reservation_count_for_test(&self) -> Result<usize> {
+        Ok(self.control.records("volume-attempt-reservation")?.len())
     }
 
     pub(crate) fn complete_coding_retry(&self, failed_attempt_id: [u8; 16]) -> Result<()> {
@@ -13466,7 +13689,7 @@ pub(crate) mod tests {
         drop(node);
         let mut node = Node::open(temp.path(), local_seed).unwrap();
         assert!(node.claim_coding_launch().unwrap().is_none());
-        let retry = node.claim_coding_retry().unwrap().unwrap();
+        let retry = node.claim_coding_retry(None).unwrap().unwrap();
         assert!(retry.retry_plan.is_none());
         let fresh = node
             .prepare_coding_retry(
@@ -13486,6 +13709,58 @@ pub(crate) mod tests {
             failed.value.verification_coordinator
         );
         assert_eq!(fresh.value.geometry, failed.value.geometry);
+        let mut other = failed.value.clone();
+        other.attempt_id = [1; 16];
+        let other = node.sign_coding_attempt_plan(other).unwrap();
+        let other_failure = SignedRecord::sign(
+            CODING_FAILURE_REPORT_DOMAIN,
+            CodingFailureReport {
+                format_version: 1,
+                failed_at_unix_seconds: unix_seconds(),
+                plan: other,
+                error_hash: [2; 32],
+            },
+            &keys[remote[0]],
+        )
+        .unwrap();
+        node.accept_coding_failure(other_failure.signer, other_failure)
+            .unwrap();
+        node.defer_coding_retry([1; 16], "no fresh reachable coordinators")
+            .unwrap();
+        assert_eq!(
+            node.claim_coding_retry(None)
+                .unwrap()
+                .unwrap()
+                .failure
+                .value
+                .plan
+                .value
+                .attempt_id,
+            [1; 16]
+        );
+        assert_eq!(
+            node.claim_coding_retry(Some([1; 16]))
+                .unwrap()
+                .unwrap()
+                .failure
+                .value
+                .plan
+                .value
+                .attempt_id,
+            [212; 16]
+        );
+        assert_eq!(
+            node.claim_coding_retry(Some([212; 16]))
+                .unwrap()
+                .unwrap()
+                .failure
+                .value
+                .plan
+                .value
+                .attempt_id,
+            [1; 16]
+        );
+        node.complete_coding_retry([1; 16]).unwrap();
         assert_eq!(
             node.prepare_coding_retry(
                 [212; 16],
@@ -13497,7 +13772,7 @@ pub(crate) mod tests {
             fresh
         );
         node.complete_coding_retry([212; 16]).unwrap();
-        assert!(node.claim_coding_retry().unwrap().is_none());
+        assert!(node.claim_coding_retry(None).unwrap().is_none());
         assert!(!node.coding_checkpoint_has_pending([213; 32]).unwrap());
         assert_eq!(node.enqueue_coding_launch(failed.clone()).unwrap(), failed);
         assert!(node.claim_coding_launch().unwrap().is_none());
@@ -13961,6 +14236,76 @@ pub(crate) mod tests {
                 bytes
             );
             assert_eq!(node.claim_coding_launch().unwrap().unwrap().plan, new);
+            if kind == "coding-retry-job" {
+                let mut prepared = old.value.clone();
+                prepared.attempt_id = [79; 16];
+                let prepared =
+                    SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, prepared, signer).unwrap();
+                let late_result = test_coding_transcript(prepared.clone(), &shards, &keys);
+                assert!(node.retire_coding_retry_plan(&prepared).unwrap());
+                assert!(
+                    node.accept_coding_transcript(prepared.value.coding_coordinator, late_result)
+                        .is_err()
+                );
+                let late_failure = SignedRecord::sign(
+                    CODING_FAILURE_REPORT_DOMAIN,
+                    CodingFailureReport {
+                        format_version: 1,
+                        failed_at_unix_seconds: unix_seconds(),
+                        plan: prepared.clone(),
+                        error_hash: [80; 32],
+                    },
+                    remotes[1],
+                )
+                .unwrap();
+                node.accept_coding_failure(late_failure.signer, late_failure.clone())
+                    .unwrap();
+                node.accept_coding_failure(late_failure.signer, late_failure.clone())
+                    .unwrap();
+                assert!(
+                    node.control
+                        .get_record("coding-retry-job", &prepared.value.attempt_id)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    node.control
+                        .get_record("coding-retired-failure", &prepared.value.attempt_id)
+                        .unwrap(),
+                    Some(canonical_bytes(&late_failure).unwrap())
+                );
+                assert_eq!(
+                    node.claim_coding_retry(Some(old.value.attempt_id))
+                        .unwrap()
+                        .unwrap()
+                        .failure,
+                    failure
+                );
+                let mut verified = prepared.value.clone();
+                verified.attempt_id = [81; 16];
+                let verified =
+                    SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, verified, signer).unwrap();
+                let result = test_coding_transcript(verified.clone(), &shards, &keys);
+                node.accept_coding_transcript(verified.value.coding_coordinator, result.clone())
+                    .unwrap();
+                assert!(!node.retire_coding_retry_plan(&verified).unwrap());
+                assert_eq!(
+                    node.claim_coding_activation().unwrap().unwrap().transcript,
+                    result
+                );
+                drop(node);
+                let node = Node::open(&dir, seed.clone()).unwrap();
+                assert_eq!(
+                    node.control
+                        .get_record("coding-retired-attempt", &prepared.value.attempt_id)
+                        .unwrap(),
+                    Some(canonical_bytes(&prepared).unwrap())
+                );
+                assert_eq!(
+                    node.claim_coding_activation().unwrap().unwrap().transcript,
+                    result
+                );
+            }
         }
         let dir = temp.path().join("groups");
         let volume = temp.path().join("volume");

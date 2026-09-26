@@ -6012,233 +6012,207 @@ impl P2pEventLoop {
 const CODING_INPUT_RANGE_BYTES: usize = 256 * 1024;
 
 pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {
+    let mut retry_cursor = None;
     loop {
-        if let Some(job) = node_blocking(node.clone(), |node| node.claim_delegated_coding()).await?
+        // Every queue gets a turn, including when a retry or cleanup is blocked.
+        // The retry cursor also prevents one failed retry from hiding later retries.
+        process_delegated_coding_job(node.clone(), &p2p).await?;
+        if let Some(job) = node_blocking(node.clone(), move |node| {
+            node.claim_coding_retry(retry_cursor)
+        })
+        .await?
         {
-            let attempt_id = job.plan.value.attempt_id;
-            let attempt_membership_epoch = job.plan.value.membership_epoch;
-            let current_membership_epoch = node_blocking(node.clone(), |node| {
-                Ok(node
-                    .dynamic_guild_state()?
-                    .context("delegated coding requires dynamic guild state")?
-                    .membership_epoch)
-            })
-            .await?;
-            if attempt_membership_epoch != current_membership_epoch {
-                match abort_stale_delegated_coding(node.clone(), &p2p, &job).await {
-                    Ok(()) => {
-                        node_blocking(node.clone(), move |node| {
-                            node.complete_delegated_coding(attempt_id)
-                        })
-                        .await?;
-                    }
-                    Err(error) => {
-                        tracing::warn!(?attempt_id, %error, "stale delegated coding cleanup deferred");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
-                }
-                continue;
-            }
-            if job.state == DelegatedCodingJobState::ReportingFailure {
-                let failure = node_blocking(node.clone(), move |node| {
-                    node.delegated_coding_failure(attempt_id)
-                })
-                .await?;
-                match submit_delegated_coding_failure(node.clone(), &p2p, failure).await {
-                    Ok(()) => {
-                        node_blocking(node.clone(), move |node| {
-                            node.complete_delegated_coding(attempt_id)
-                        })
-                        .await?;
-                    }
-                    Err(error) => {
-                        tracing::warn!(?attempt_id, %error, "coding failure submission deferred");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
-                }
-                continue;
-            }
-            if job.state == DelegatedCodingJobState::Cleanup {
-                match abort_delegated_coding(node.clone(), &p2p, &job).await {
-                    Ok(()) => {
-                        let error = job
-                            .error
-                            .as_deref()
-                            .unwrap_or("coding attempt failed and was cleaned up")
-                            .to_owned();
-                        node_blocking(node.clone(), move |node| {
-                            node.record_delegated_coding_failure(attempt_id, &error)
-                                .map(|_| ())
-                        })
-                        .await?;
-                    }
-                    Err(error) => {
-                        tracing::warn!(?attempt_id, %error, "coding attempt cleanup deferred");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
-                }
-                continue;
-            }
-            if job.state == DelegatedCodingJobState::Submitting {
-                let transcript = job
-                    .transcript
-                    .clone()
-                    .context("coding submission job has no verifier transcript")?;
-                match submit_delegated_coding_result(node.clone(), &p2p, transcript).await {
-                    Ok(()) => {
-                        node_blocking(node.clone(), move |node| {
-                            node.complete_delegated_coding(attempt_id)
-                        })
-                        .await?;
-                    }
-                    Err(error) => {
-                        tracing::warn!(?attempt_id, %error, "coding result submission deferred");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
-                }
-                continue;
-            }
-            match execute_delegated_coding(node.clone(), &p2p, &job).await {
-                Ok(transcript) => {
-                    node_blocking(node.clone(), move |node| {
-                        node.record_delegated_coding_result(attempt_id, transcript)
-                    })
-                    .await?;
-                }
-                Err(error) => {
-                    let message = format!("{error:#}");
-                    let cleanup_message = message.clone();
-                    node_blocking(node.clone(), move |node| {
-                        node.cleanup_delegated_coding(attempt_id, &cleanup_message)
-                    })
-                    .await?;
-                    if abort_delegated_coding(node.clone(), &p2p, &job)
-                        .await
-                        .is_ok()
-                    {
-                        node_blocking(node.clone(), move |node| {
-                            node.record_delegated_coding_failure(attempt_id, &message)
-                                .map(|_| ())
-                        })
-                        .await?;
-                    }
-                    tracing::warn!(?attempt_id, %error, "delegated coding attempt failed");
-                }
-            }
-            continue;
+            retry_cursor = Some(job.failure.value.plan.value.attempt_id);
+            process_coding_retry_job(node.clone(), &p2p, &job).await?;
         }
+        dispatch_next_coding_launch(node.clone(), &p2p).await?;
+        process_coding_activation_job(node.clone(), &p2p).await?;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
 
-        if let Some(job) = node_blocking(node.clone(), |node| node.claim_coding_retry()).await? {
-            let failed_attempt_id = job.failure.value.plan.value.attempt_id;
-            let attempt_membership_epoch = job.failure.value.plan.value.membership_epoch;
-            let current_membership_epoch = node_blocking(node.clone(), |node| {
-                Ok(node
-                    .dynamic_guild_state()?
-                    .context("coding retry requires dynamic guild state")?
-                    .membership_epoch)
-            })
-            .await?;
-            if attempt_membership_epoch != current_membership_epoch {
+async fn process_delegated_coding_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
+    let Some(job) = node_blocking(node.clone(), |node| node.claim_delegated_coding()).await? else {
+        return Ok(());
+    };
+    let attempt_id = job.plan.value.attempt_id;
+    let attempt_membership_epoch = job.plan.value.membership_epoch;
+    let current_membership_epoch = node_blocking(node.clone(), |node| {
+        Ok(node
+            .dynamic_guild_state()?
+            .context("delegated coding requires dynamic guild state")?
+            .membership_epoch)
+    })
+    .await?;
+    if attempt_membership_epoch != current_membership_epoch {
+        match abort_stale_delegated_coding(node.clone(), p2p, &job).await {
+            Ok(()) => {
                 node_blocking(node.clone(), move |node| {
-                    node.complete_coding_retry(failed_attempt_id)
+                    node.complete_delegated_coding(attempt_id)
                 })
                 .await?;
-                continue;
             }
-            match execute_coding_retry(node.clone(), &p2p, &job).await {
-                Ok(()) => {
-                    node_blocking(node.clone(), move |node| {
-                        node.complete_coding_retry(failed_attempt_id)
-                    })
-                    .await?;
-                }
-                Err(error) => {
-                    let message = format!("{error:#}");
-                    node_blocking(node.clone(), move |node| {
-                        node.defer_coding_retry(failed_attempt_id, &message)
-                    })
-                    .await?;
-                    tracing::warn!(?failed_attempt_id, %error, "fresh coding retry deferred");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
+            Err(error) => {
+                tracing::warn!(?attempt_id, %error, "stale delegated coding cleanup deferred");
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            continue;
         }
-
-        if dispatch_next_coding_launch(node.clone(), &p2p).await? {
-            continue;
+        return Ok(());
+    }
+    if job.state == DelegatedCodingJobState::ReportingFailure {
+        let failure = node_blocking(node.clone(), move |node| {
+            node.delegated_coding_failure(attempt_id)
+        })
+        .await?;
+        match submit_delegated_coding_failure(node.clone(), p2p, failure).await {
+            Ok(()) => {
+                node_blocking(node.clone(), move |node| {
+                    node.complete_delegated_coding(attempt_id)
+                })
+                .await?;
+            }
+            Err(error) => {
+                tracing::warn!(?attempt_id, %error, "coding failure submission deferred");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
         }
-
-        if let Some(job) =
-            node_blocking(node.clone(), |node| node.claim_coding_activation()).await?
-        {
-            let attempt_id = job.transcript.value.plan.value.attempt_id;
-            let attempt_membership_epoch = job.transcript.value.plan.value.membership_epoch;
-            let current_membership_epoch = node_blocking(node.clone(), |node| {
-                Ok(node
-                    .dynamic_guild_state()?
-                    .context("coding activation requires dynamic guild state")?
-                    .membership_epoch)
+        return Ok(());
+    }
+    if job.state == DelegatedCodingJobState::Cleanup {
+        match abort_delegated_coding(node.clone(), p2p, &job).await {
+            Ok(()) => {
+                let error = job
+                    .error
+                    .as_deref()
+                    .unwrap_or("coding attempt failed and was cleaned up")
+                    .to_owned();
+                node_blocking(node.clone(), move |node| {
+                    node.record_delegated_coding_failure(attempt_id, &error)
+                        .map(|_| ())
+                })
+                .await?;
+            }
+            Err(error) => {
+                tracing::warn!(?attempt_id, %error, "coding attempt cleanup deferred");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+        return Ok(());
+    }
+    if job.state == DelegatedCodingJobState::Submitting {
+        let transcript = job
+            .transcript
+            .clone()
+            .context("coding submission job has no verifier transcript")?;
+        match submit_delegated_coding_result(node.clone(), p2p, transcript).await {
+            Ok(()) => {
+                node_blocking(node.clone(), move |node| {
+                    node.complete_delegated_coding(attempt_id)
+                })
+                .await?;
+            }
+            Err(error) => {
+                tracing::warn!(?attempt_id, %error, "coding result submission deferred");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+        return Ok(());
+    }
+    match execute_delegated_coding(node.clone(), p2p, &job).await {
+        Ok(transcript) => {
+            node_blocking(node.clone(), move |node| {
+                node.record_delegated_coding_result(attempt_id, transcript)
             })
             .await?;
-            if attempt_membership_epoch != current_membership_epoch {
-                let group_id = job.transcript.value.manifest.value.group.id;
-                let group_committed = node_blocking(node.clone(), move |node| {
-                    Ok(node
-                        .dynamic_guild_state()?
-                        .context("coding activation requires dynamic guild state")?
-                        .coding_groups
-                        .iter()
-                        .any(|retained| retained.group.id == group_id))
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            let cleanup_message = message.clone();
+            node_blocking(node.clone(), move |node| {
+                node.cleanup_delegated_coding(attempt_id, &cleanup_message)
+            })
+            .await?;
+            if abort_delegated_coding(node.clone(), p2p, &job)
+                .await
+                .is_ok()
+            {
+                node_blocking(node.clone(), move |node| {
+                    node.record_delegated_coding_failure(attempt_id, &message)
+                        .map(|_| ())
                 })
                 .await?;
-                if group_committed {
-                    match finish_coding_activation(node.clone(), &p2p, &job.transcript).await {
-                        Ok(()) => {
-                            node_blocking(node.clone(), move |node| {
-                                node.complete_coding_activation(attempt_id)
-                            })
-                            .await?;
-                        }
-                        Err(error) => {
-                            let message = format!("{error:#}");
-                            node_blocking(node.clone(), move |node| {
-                                node.defer_coding_activation(attempt_id, &message)
-                            })
-                            .await?;
-                            tracing::warn!(?attempt_id, %error, "committed coding activation deferred");
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                        }
-                    }
-                    continue;
-                }
-                let cleanup_job = DelegatedCodingJob {
-                    format_version: 1,
-                    plan: job.transcript.value.plan.clone(),
-                    state: DelegatedCodingJobState::Cleanup,
-                    transcript: None,
-                    error: Some("guild authority changed before coding activation".to_owned()),
-                };
-                match abort_stale_delegated_coding(node.clone(), &p2p, &cleanup_job).await {
-                    Ok(()) => {
-                        node_blocking(node.clone(), move |node| {
-                            node.complete_coding_activation(attempt_id)
-                        })
-                        .await?;
-                    }
-                    Err(error) => {
-                        let message = format!("stale coding cleanup failed: {error:#}");
-                        node_blocking(node.clone(), move |node| {
-                            node.defer_coding_activation(attempt_id, &message)
-                        })
-                        .await?;
-                        tracing::warn!(?attempt_id, %error, "stale coding activation cleanup deferred");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
-                }
-                continue;
             }
-            match finish_coding_activation(node.clone(), &p2p, &job.transcript).await {
+            tracing::warn!(?attempt_id, %error, "delegated coding attempt failed");
+        }
+    }
+    Ok(())
+}
+
+async fn process_coding_retry_job(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    job: &CodingRetryJob,
+) -> Result<()> {
+    let failed_attempt_id = job.failure.value.plan.value.attempt_id;
+    let current_membership_epoch = node_blocking(node.clone(), |node| {
+        Ok(node
+            .dynamic_guild_state()?
+            .context("coding retry requires dynamic guild state")?
+            .membership_epoch)
+    })
+    .await?;
+    let result = if job.failure.value.plan.value.membership_epoch != current_membership_epoch {
+        cleanup_coding_retry_job(node.clone(), p2p, job).await
+    } else {
+        execute_coding_retry(node.clone(), p2p, job).await
+    };
+    match result {
+        Ok(()) => {
+            node_blocking(node, move |node| {
+                node.complete_coding_retry(failed_attempt_id)
+            })
+            .await?
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            node_blocking(node, move |node| {
+                node.defer_coding_retry(failed_attempt_id, &message)
+            })
+            .await?;
+            tracing::warn!(?failed_attempt_id, %error, "fresh coding retry deferred");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+    Ok(())
+}
+
+async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
+    let Some(job) = node_blocking(node.clone(), |node| node.claim_coding_activation()).await?
+    else {
+        return Ok(());
+    };
+    let attempt_id = job.transcript.value.plan.value.attempt_id;
+    let attempt_membership_epoch = job.transcript.value.plan.value.membership_epoch;
+    let current_membership_epoch = node_blocking(node.clone(), |node| {
+        Ok(node
+            .dynamic_guild_state()?
+            .context("coding activation requires dynamic guild state")?
+            .membership_epoch)
+    })
+    .await?;
+    if attempt_membership_epoch != current_membership_epoch {
+        let group_id = job.transcript.value.manifest.value.group.id;
+        let group_committed = node_blocking(node.clone(), move |node| {
+            Ok(node
+                .dynamic_guild_state()?
+                .context("coding activation requires dynamic guild state")?
+                .coding_groups
+                .iter()
+                .any(|retained| retained.group.id == group_id))
+        })
+        .await?;
+        if group_committed {
+            match finish_coding_activation(node.clone(), p2p, &job.transcript).await {
                 Ok(()) => {
                     node_blocking(node.clone(), move |node| {
                         node.complete_coding_activation(attempt_id)
@@ -6251,15 +6225,56 @@ pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -
                         node.defer_coding_activation(attempt_id, &message)
                     })
                     .await?;
-                    tracing::warn!(?attempt_id, %error, "coding activation deferred");
+                    tracing::warn!(?attempt_id, %error, "committed coding activation deferred");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             }
-            continue;
+            return Ok(());
         }
-
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        let cleanup_job = DelegatedCodingJob {
+            format_version: 1,
+            plan: job.transcript.value.plan.clone(),
+            state: DelegatedCodingJobState::Cleanup,
+            transcript: None,
+            error: Some("guild authority changed before coding activation".to_owned()),
+        };
+        match abort_stale_delegated_coding(node.clone(), p2p, &cleanup_job).await {
+            Ok(()) => {
+                node_blocking(node.clone(), move |node| {
+                    node.complete_coding_activation(attempt_id)
+                })
+                .await?;
+            }
+            Err(error) => {
+                let message = format!("stale coding cleanup failed: {error:#}");
+                node_blocking(node.clone(), move |node| {
+                    node.defer_coding_activation(attempt_id, &message)
+                })
+                .await?;
+                tracing::warn!(?attempt_id, %error, "stale coding activation cleanup deferred");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+        return Ok(());
     }
+    match finish_coding_activation(node.clone(), p2p, &job.transcript).await {
+        Ok(()) => {
+            node_blocking(node.clone(), move |node| {
+                node.complete_coding_activation(attempt_id)
+            })
+            .await?;
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            node_blocking(node.clone(), move |node| {
+                node.defer_coding_activation(attempt_id, &message)
+            })
+            .await?;
+            tracing::warn!(?attempt_id, %error, "coding activation deferred");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+    Ok(())
 }
 
 async fn dispatch_next_coding_launch(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<bool> {
@@ -6347,11 +6362,38 @@ async fn execute_coding_retry(
     p2p: &P2pClient,
     job: &CodingRetryJob,
 ) -> Result<()> {
+    let mut job = job.clone();
+    let retry = job.clone();
+    let superseded = node_blocking(node.clone(), move |node| {
+        node.coding_retry_has_stronger_replacement(&retry)
+    })
+    .await?;
+    if superseded {
+        return cleanup_coding_retry_job(node, p2p, &job).await;
+    }
+    if let Some(plan) = &job.retry_plan
+        && plan.value.expires_at_unix_seconds < unix_seconds()
+    {
+        if !cleanup_coding_retry_plan(node.clone(), p2p, plan).await? {
+            // Already submitted evidence remains activatable after its deadline.
+            return Ok(());
+        }
+        let expired = job.clone();
+        node_blocking(node.clone(), move |node| {
+            node.renew_coding_retry_after_cleanup(&expired)
+        })
+        .await?;
+        job.retry_plan = None;
+    }
     let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
     let plan = match &job.retry_plan {
         Some(plan) => plan.clone(),
         None => {
-            let prior = job.failure.value.plan.value.clone();
+            let retry = job.clone();
+            let prior = node_blocking(node.clone(), move |node| {
+                Ok(node.coding_retry_previous_plan(&retry)?.value)
+            })
+            .await?;
             let (guild, old_coder, old_verifier, participants) =
                 node_blocking(node.clone(), move |node| {
                     let guild = node
@@ -6448,6 +6490,42 @@ async fn execute_coding_retry(
     } else {
         p2p.delegate_coding_attempt(coordinator, plan).await
     }
+}
+
+async fn cleanup_coding_retry_job(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    job: &CodingRetryJob,
+) -> Result<()> {
+    cleanup_coding_retry_plan(node.clone(), p2p, &job.failure.value.plan).await?;
+    if let Some(plan) = &job.retry_plan {
+        cleanup_coding_retry_plan(node, p2p, plan).await?;
+    }
+    Ok(())
+}
+
+async fn cleanup_coding_retry_plan(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    plan: &SignedRecord<CodingAttemptPlan>,
+) -> Result<bool> {
+    let retired = plan.clone();
+    if !node_blocking(node.clone(), move |node| {
+        node.retire_coding_retry_plan(&retired)
+    })
+    .await?
+    {
+        return Ok(false);
+    }
+    let cleanup = DelegatedCodingJob {
+        format_version: 1,
+        plan: plan.clone(),
+        state: DelegatedCodingJobState::Cleanup,
+        transcript: None,
+        error: Some("coding retry expired or has stronger replacement evidence".to_owned()),
+    };
+    abort_stale_delegated_coding(node, p2p, &cleanup).await?;
+    Ok(true)
 }
 
 fn coding_path_rank(path: P2pPath) -> usize {
@@ -22023,6 +22101,522 @@ mod tests {
             .into_iter()
             .map(|node| Arc::try_unwrap(node).ok().unwrap().into_inner().unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn expired_legacy_retry_yields_to_stronger_proof_after_reopen() {
+        coding_retry_restart_fixture(true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn expired_legacy_retry_renews_with_fresh_authority_after_reopen() {
+        coding_retry_restart_fixture(false, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn three_member_blocked_retry_yields_to_unrelated_coding() {
+        coding_retry_restart_fixture(true, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn stale_retry_cleans_prepared_upload_before_completing() {
+        coding_retry_restart_fixture(true, false, true).await;
+    }
+
+    fn install_coding_test_event(nodes: &[Arc<Mutex<Node>>], kind: mb_core::GuildEventKind) {
+        let state = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap();
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind,
+        };
+        let mut signatures = nodes
+            .iter()
+            .filter_map(|node| {
+                let node = node.lock().unwrap();
+                state
+                    .active_members()
+                    .any(|member| member.node_id == node.keys().node_id())
+                    .then(|| mb_core::sign_guild_event(&event, node.keys()).unwrap())
+            })
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        let certified = QuorumGuildEvent { event, signatures };
+        for node in nodes {
+            node.lock()
+                .unwrap()
+                .install_guild_event(certified.clone())
+                .unwrap();
+        }
+    }
+
+    async fn coding_retry_restart_fixture(
+        queue_replacement: bool,
+        three_members: bool,
+        stale_epoch: bool,
+    ) {
+        let active_count = if three_members {
+            3
+        } else if stale_epoch {
+            4
+        } else {
+            5
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let seeds = (201_u8..206)
+            .map(|byte| Seed::from_bytes([byte; 32]))
+            .collect::<Vec<_>>();
+        let open_nodes = || {
+            seeds
+                .iter()
+                .enumerate()
+                .map(|(index, seed)| {
+                    Arc::new(Mutex::new(
+                        Node::open(temp.path().join(format!("node-{index}")), seed.clone())
+                            .unwrap(),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut nodes = open_nodes();
+        let mut clients = Vec::new();
+        let mut network_tasks = Vec::new();
+        for (index, node) in nodes.iter().enumerate() {
+            let volume = temp.path().join(format!("volume-{index}"));
+            std::fs::create_dir(&volume).unwrap();
+            node.lock()
+                .unwrap()
+                .configure_storage_volumes(&[volume], 4 * 1024 * 1024, 0)
+                .unwrap();
+            let mut cfg = config(node.lock().unwrap().keys().node_id());
+            cfg.enable_relay_server = false;
+            let (client, event_loop) = build_p2p(node.clone(), cfg).unwrap();
+            clients.push(client);
+            network_tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let addresses = futures::future::join_all(clients.iter().map(listening_address)).await;
+        let endpoints = clients
+            .iter()
+            .zip(addresses.iter().cloned())
+            .map(|(client, address)| peer_endpoint(client, address))
+            .collect::<Vec<_>>();
+        let certificate = form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+        if three_members {
+            for index in [4, 3] {
+                let removed = nodes[index].lock().unwrap().keys().node_id();
+                install_coding_test_event(
+                    &nodes,
+                    mb_core::GuildEventKind::RemoveMember { node_id: removed },
+                );
+            }
+        }
+        let owner = nodes[0].lock().unwrap().keys().node_id();
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[211; 32]);
+        install_coding_test_event(
+            &nodes,
+            mb_core::GuildEventKind::RotateWriterKey {
+                owner,
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            },
+        );
+        let state = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap();
+        let guild_id = state.guild_id;
+        let revision_id = Uuid::from_bytes([212; 16]);
+        let sector_id =
+            mb_core::make_sector_id(owner, revision_id, mb_core::SectorPurpose::Metadata, 0);
+        let (reference, bytes) = mb_core::encrypted_sector(
+            &nodes[0].lock().unwrap().keys().guild_data_key(&guild_id),
+            sector_id,
+            &[42],
+        )
+        .unwrap();
+        nodes[0]
+            .lock()
+            .unwrap()
+            .install_repaired_information_sector(guild_id, reference.clone(), &bytes)
+            .unwrap();
+        let member = |index: usize| {
+            state
+                .active_members()
+                .find(|member| member.node_id == nodes[index].lock().unwrap().keys().node_id())
+                .unwrap()
+                .clone()
+        };
+        let geometry = mb_core::CodingPlanGeometry {
+            format_version: 1,
+            guild_id,
+            profile: CodingProfile::new(1, 1, V1_SECTOR_SIZE as u32),
+            information: vec![mb_core::InformationRoleV2 {
+                owner,
+                failure_domain: member(0).failure_domain,
+                sector: mb_core::RangeSectorRef {
+                    id: sector_id,
+                    commitment: merkle_commit(&bytes).unwrap(),
+                    logical_len: reference.logical_len,
+                    virtual_zero: false,
+                },
+            }],
+            parity: vec![mb_core::ParityPlacementV2 {
+                holder: member(1).node_id,
+                failure_domain: member(1).failure_domain,
+                row: 0,
+            }],
+        };
+        let mut old = CodingAttemptPlan {
+            format_version: 2,
+            attempt_id: [213; 16],
+            checkpoint_hash: [214; 32],
+            membership_epoch: state.membership_epoch,
+            geometry,
+            delegator: owner,
+            coding_coordinator: member(1).node_id,
+            verification_coordinator: member(2).node_id,
+            expires_at_unix_seconds: unix_seconds() + 600,
+            information_roots: Some(vec![reference.root]),
+        };
+        let mut replacement = old.clone();
+        replacement.format_version = 3;
+        replacement.attempt_id = [215; 16];
+        if three_members {
+            // A different lane is eligible even though the old lane lacks two fresh coordinators.
+            old.geometry.information[0].sector.id = [216; 32];
+            old.checkpoint_hash = [217; 32];
+        }
+        let old = nodes[0]
+            .lock()
+            .unwrap()
+            .sign_coding_attempt_plan(old)
+            .unwrap();
+        let failure = SignedRecord::sign(
+            CODING_FAILURE_REPORT_DOMAIN,
+            mb_core::CodingFailureReport {
+                format_version: 1,
+                failed_at_unix_seconds: unix_seconds(),
+                plan: old.clone(),
+                error_hash: [218; 32],
+            },
+            nodes[1].lock().unwrap().keys(),
+        )
+        .unwrap();
+        let expired_plan = if three_members {
+            None
+        } else {
+            let mut plan = old.value.clone();
+            plan.attempt_id = [219; 16];
+            plan.coding_coordinator = member(3).node_id;
+            plan.verification_coordinator = member(4).node_id;
+            plan.expires_at_unix_seconds = unix_seconds() + if stale_epoch { 600 } else { 3 };
+            Some(
+                nodes[0]
+                    .lock()
+                    .unwrap()
+                    .sign_coding_attempt_plan(plan)
+                    .unwrap(),
+            )
+        };
+        let old_job = CodingRetryJob {
+            format_version: 1,
+            failure,
+            retry_plan: expired_plan.clone(),
+            complete: false,
+            error: None,
+        };
+        nodes[0]
+            .lock()
+            .unwrap()
+            .install_historical_coding_retry_for_test(&old_job)
+            .unwrap();
+        if let Some(plan) = &expired_plan {
+            // A partial durable upload must be cleaned before renewal or supersession.
+            nodes[1]
+                .lock()
+                .unwrap()
+                .reserve_coding_parity(plan, 1)
+                .unwrap();
+            let (manifest, parity) = nodes[3]
+                .lock()
+                .unwrap()
+                .encode_delegated_coding(plan, vec![Some(bytes.clone())])
+                .unwrap();
+            assert_eq!(
+                nodes[1]
+                    .lock()
+                    .unwrap()
+                    .write_coding_parity_range(
+                        plan,
+                        &manifest,
+                        1,
+                        0,
+                        &parity[0][..MERKLE_LEAF_SIZE]
+                    )
+                    .unwrap(),
+                MERKLE_LEAF_SIZE as u32
+            );
+        }
+        if stale_epoch {
+            let removed = nodes[4].lock().unwrap().keys().node_id();
+            install_coding_test_event(
+                &nodes,
+                mb_core::GuildEventKind::RemoveMember { node_id: removed },
+            );
+            replacement.membership_epoch += 1;
+        }
+        let state = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap();
+        let mut revision = UserRevision {
+            format_version: 3,
+            guild_id,
+            protected_root_id: Uuid::from_bytes([220; 16]),
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id,
+            owner,
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![reference],
+            data_sectors: Vec::new(),
+            sector_commitments: None,
+        };
+        revision.sign_writer(&writer).unwrap();
+        let mut checkpoint = GuildCheckpoint {
+            format_version: 4,
+            guild_id,
+            genesis_hash: certificate.hash().unwrap(),
+            generation: 1,
+            parent: None,
+            members: state.active_members().cloned().collect(),
+            writer_fences: vec![mb_core::WriterFence {
+                owner,
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            }],
+            revision_tombstones: Vec::new(),
+            revisions: vec![
+                SignedRecord::sign(
+                    mb_core::USER_REVISION_DOMAIN,
+                    revision,
+                    nodes[0].lock().unwrap().keys(),
+                )
+                .unwrap(),
+            ],
+            coding_groups: Vec::new(),
+            authority: None,
+            packing_catalog: None,
+        };
+        for client in &clients {
+            client.shutdown().await.unwrap();
+        }
+        for task in network_tasks.drain(..) {
+            task.await.unwrap().unwrap();
+        }
+        clients.clear();
+        drop(nodes);
+        if !three_members && !stale_epoch {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+        }
+        nodes = open_nodes();
+        assert_eq!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .coding_retry_evidence_for_test(old.value.attempt_id)
+                .unwrap(),
+            old_job
+        );
+        let mut coding_tasks = Vec::new();
+        for node in &nodes {
+            let mut cfg = config(node.lock().unwrap().keys().node_id());
+            cfg.enable_relay_server = false;
+            let (client, event_loop) = build_p2p(node.clone(), cfg).unwrap();
+            clients.push(client);
+            network_tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let reopened_addresses =
+            futures::future::join_all(clients.iter().map(listening_address)).await;
+        let reopened_peers = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                let member = certificate
+                    .genesis
+                    .members
+                    .iter()
+                    .find(|member| member.node_id == node.lock().unwrap().keys().node_id())
+                    .unwrap()
+                    .clone();
+                GuildPeer {
+                    member,
+                    endpoints: vec![peer_endpoint(
+                        &clients[index],
+                        reopened_addresses[index].clone(),
+                    )],
+                }
+            })
+            .collect::<Vec<_>>();
+        for node in &nodes {
+            node.lock()
+                .unwrap()
+                .install_guild_genesis(certificate.clone(), reopened_peers.clone())
+                .unwrap();
+        }
+        for (index, client) in clients.iter().enumerate().take(active_count) {
+            for (remote, node) in nodes.iter().enumerate().take(active_count) {
+                if remote != index {
+                    let id = node.lock().unwrap().keys().node_id();
+                    client
+                        .add_peer_address(id, reopened_addresses[remote].clone())
+                        .await
+                        .unwrap();
+                    client.profile(id).await.unwrap();
+                }
+            }
+        }
+        if queue_replacement {
+            let replacement = nodes[0]
+                .lock()
+                .unwrap()
+                .sign_coding_attempt_plan(replacement.clone())
+                .unwrap();
+            nodes[0]
+                .lock()
+                .unwrap()
+                .enqueue_coding_launch(replacement)
+                .unwrap();
+        }
+        for (index, node) in nodes.iter().enumerate().take(active_count) {
+            coding_tasks.push(tokio::spawn(run_delegated_coding_jobs(
+                node.clone(),
+                clients[index].clone(),
+            )));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let complete = {
+                let node = nodes[0].lock().unwrap();
+                node.validate_variable_checkpoint_coverage(&checkpoint, false)
+                    .is_ok()
+                    && node.claim_coding_activation().unwrap().is_none()
+            };
+            if complete {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "coding worker did not finish checkpoint coverage: {:?}",
+                nodes[0]
+                    .lock()
+                    .unwrap()
+                    .coding_retry_evidence_for_test(old.value.attempt_id)
+                    .unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        {
+            let mut node = nodes[0].lock().unwrap();
+            if state.membership_epoch != 1 {
+                let current = node.dynamic_guild_state().unwrap().unwrap();
+                checkpoint.format_version = 5;
+                checkpoint.authority = Some(CheckpointAuthority {
+                    format_version: 1,
+                    membership_epoch: current.membership_epoch,
+                    quorum: current.quorum,
+                });
+            }
+            node.sign_checkpoint(&checkpoint).unwrap();
+            let evidence = node
+                .coding_retry_evidence_for_test(old.value.attempt_id)
+                .unwrap();
+            assert_eq!(evidence.failure, old_job.failure);
+            if three_members {
+                assert!(!evidence.complete);
+                assert!(
+                    evidence
+                        .error
+                        .unwrap()
+                        .contains("fewer than two fresh reachable coordinators")
+                );
+            } else {
+                assert!(evidence.complete);
+                if queue_replacement {
+                    assert_eq!(evidence.retry_plan, expired_plan);
+                } else {
+                    let renewed = evidence.retry_plan.as_ref().unwrap();
+                    assert_eq!(renewed.value.format_version, 3);
+                    assert_ne!(
+                        renewed.value.attempt_id,
+                        expired_plan.as_ref().unwrap().value.attempt_id
+                    );
+                    assert_ne!(
+                        renewed.value.coding_coordinator,
+                        expired_plan.as_ref().unwrap().value.coding_coordinator
+                    );
+                    assert_ne!(
+                        renewed.value.verification_coordinator,
+                        expired_plan
+                            .as_ref()
+                            .unwrap()
+                            .value
+                            .verification_coordinator
+                    );
+                    assert_eq!(
+                        node.coding_retry_previous_plan(&evidence).unwrap(),
+                        expired_plan.unwrap()
+                    );
+                    let initial = node.sign_coding_attempt_plan(replacement.clone()).unwrap();
+                    assert_eq!(node.enqueue_coding_launch(initial).unwrap(), *renewed);
+                }
+            }
+        }
+        assert_eq!(
+            nodes[1]
+                .lock()
+                .unwrap()
+                .coding_reservation_count_for_test()
+                .unwrap(),
+            0
+        );
+        for task in coding_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        for client in &clients {
+            client.shutdown().await.unwrap();
+        }
+        for task in network_tasks {
+            task.await.unwrap().unwrap();
+        }
+        drop(clients);
+        drop(nodes);
+        for _ in 0..2 {
+            let node = Node::open(temp.path().join("node-0"), seeds[0].clone()).unwrap();
+            node.validate_variable_checkpoint_coverage(&checkpoint, false)
+                .unwrap();
+            assert_eq!(
+                node.claim_coding_retry(None).unwrap().is_some(),
+                three_members
+            );
+            assert!(node.claim_coding_launch().unwrap().is_none());
+            assert!(node.claim_coding_activation().unwrap().is_none());
+        }
     }
 
     #[tokio::test]

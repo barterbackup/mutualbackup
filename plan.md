@@ -161,6 +161,10 @@ the retry incomplete. New launches and activations are never reached. Correct
 retry expiry/supersession and scheduling, then pass the new M5-104 local gate.
 M5-97 remains passed historical evidence; Milestone 6 waits. This review ran no
 builds, tests, daemons, runtime probes, or remote compilation.
+The M5-103 follow-up is now implemented. Four real QUIC restart regressions
+pass through verification, activation, checkpoint signing, staged cleanup,
+and repeated reopen; retry rotation and late-evidence fences are also covered.
+The complete final M5-104 gate remains pending, so Milestone 5 stays open.
 
 The repository connects two real binaries and persistent local control to
 static five-member guild onboarding,
@@ -585,8 +589,9 @@ these also require correction before M5-97 and Milestone 6.
 The final correction series through `c7033fa` now passes the complete M5-97
 local workspace and fresh disposable Btrfs/network gate. Milestones 0 through
 4 are passed. Subsequent source-only review found M5-103 in same-epoch durable
-retry scheduling, so Milestone 5 is reopened and Milestone 6 waits for its
-correction and M5-104. The preceding records are closure history.
+retry scheduling. Its correction and focused restart regressions now pass;
+Milestone 5 remains open and Milestone 6 waits for M5-104. The preceding
+records are closure history.
 Later wire or durable-state changes
 require the review and gate of the milestone that owns them. Build and run all
 subsequent validation locally; do not use a remote compilation server.
@@ -802,9 +807,9 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 4 are passed. Milestone 5 is
-reopened for M5-103's durable retry starvation and the new M5-104 gate;
-Milestone 6 waits. The complete M5-97 local gate passed on source `c7033fa`
+**Current position:** Milestones 0 through 4 are passed. M5-103's durable retry
+correction and focused regressions pass; Milestone 5 remains open for the
+complete M5-104 gate. Milestone 6 waits. The complete M5-97 local gate passed on source `c7033fa`
 on 2026-09-26; provisioned acceptance ran at documentation-only successor
 `4170dce`. That gate remains historical evidence for its tested scenarios.
 The following records retain the correction and closure history. The M5-36
@@ -1981,6 +1986,17 @@ paths and restart/activation/checkpoint regressions are in `TODO.md` M5-103.
 M5-104 requires fresh source review and the complete local workspace and
 provisioned acceptance gate after correction. This review ran no builds,
 tests, daemons, or runtime probes. The records below are history.
+
+The M5-103 correction now visits every worker queue each cycle and rotates
+pending retries. It fences late results before cleanup, retains signed expired
+plans and failures, and renews with fresh attempt identities, fresh roles, and
+current authority. Legacy flat-root retries upgrade to complete-byte format 3;
+stronger queued work supersedes compact attempts, and replanning preserves an
+existing format-3 retry rather than duplicating its group evidence. Membership
+changes also clean prepared uploads. Four real QUIC restart regressions pass
+through partial parity upload, verification, activation, checkpoint signing,
+cleanup, and repeated reopen. Focused retry tests pass locally; M5-104's
+complete workspace and provisioned correction gate is still pending.
 
 M5-36 through M5-44 are implemented, and the complete M5-45 correction gate
 passed locally on 2026-09-19. The final committed tree passed formatting,
