@@ -4102,15 +4102,15 @@ impl Node {
             return Ok(prior.clone());
         }
         if let Some(bytes) = self.control.get_record("coding-launch-job", &attempt_id)? {
-            let mut existing: CodingLaunchJob = decode_canonical(&bytes)?;
+            let existing: CodingLaunchJob = decode_canonical(&bytes)?;
             if existing.format_version != 1
                 || !same_coding_lane_attempt(&existing.plan.value, &plan.value)
             {
                 anyhow::bail!("coding launch conflicts with a durable attempt");
             }
-            existing.dispatched = false;
-            existing.error = None;
-            self.put_coding_launch_job(&existing)?;
+            // Replanning coalesces with the durable owner. Do not revoke its
+            // acknowledgement or erase a cleanup deferral; expiry recovery
+            // still needs to distinguish an acknowledged silent attempt.
             return Ok(existing.plan);
         }
         let job = CodingLaunchJob {
@@ -14724,6 +14724,16 @@ pub(crate) mod tests {
         let job = node.claim_coding_launch().unwrap().unwrap();
         assert!(job.dispatched);
         assert!(job.error.is_some());
+        // Replanning can run before the worker persists the retirement fence.
+        // A fresh proposal under the deterministic ID must preserve the old
+        // signed plan, acknowledgement, and explicit deferral after reopen.
+        let mut proposed = expired.value.clone();
+        proposed.expires_at_unix_seconds = unix_seconds() + 600;
+        let proposed = node.sign_coding_attempt_plan(proposed).unwrap();
+        assert_eq!(node.enqueue_coding_launch(proposed).unwrap(), expired);
+        drop(node);
+        node = Node::open(temp.path(), seed.clone()).unwrap();
+        assert_eq!(node.claim_coding_launch().unwrap(), Some(job.clone()));
         node.control
             .put_record(
                 "coding-launch-information",
@@ -14740,10 +14750,7 @@ pub(crate) mod tests {
         let successor = node
             .renew_coding_launch_after_cleanup(
                 &job,
-                Some((
-                    expired.value.coding_coordinator,
-                    expired.value.verification_coordinator,
-                )),
+                Some((remotes[0].node_id(), remotes[1].node_id())),
             )
             .unwrap();
         assert_ne!(successor.value.attempt_id, expired.value.attempt_id);

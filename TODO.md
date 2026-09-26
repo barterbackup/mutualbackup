@@ -2706,6 +2706,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   now allow 120 seconds for successful setup, then wait through the actual
   signed deadline before exercising expiry. Production deadlines and recovery
   behavior are unchanged. A new complete committed-source gate is required.
+  The final ownership audit also found that same-ID replanning cleared the
+  acknowledgement and deferral before retirement. Re-enqueue now preserves
+  the entire durable owner's state, so expired acknowledged work still selects
+  fresh roles and an explicit cleanup error survives replanning. The lineage
+  regression proposes fresh signed bytes under the same deterministic ID
+  before fencing, reopens, and checks the exact original plan, acknowledgement,
+  and error before renewal. It passes locally in 16.36 seconds. The complete
+  final gate must cover this ownership correction too.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

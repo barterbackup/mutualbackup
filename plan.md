@@ -2016,6 +2016,13 @@ expiry fixtures outlived their short deadlines during initial dispatch or
 verification under suite load. They now allow 120 seconds for setup and then
 wait for their unchanged signed deadline before exercising expiry. Production
 behavior is unchanged. Rerun the complete gate on the final committed source.
+The ownership follow-up also preserves the acknowledgement and explicit
+cleanup deferral when the planner proposes the same attempt ID again. The
+original signed plan and durable owner remain intact; replanning cannot turn
+an acknowledged silent attempt into an undispatched one before retirement.
+The lineage regression covers a fresh signed proposal followed by reopen
+before fencing, and passes locally in 16.36 seconds. The complete final gate
+must include this correction.
 
 Earlier source-only review of `c4e97f8..1f3141e` on 2026-09-26 found two
 production-worker blockers after M5-105 through M5-107. M5-108: a durable launch
