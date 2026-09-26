@@ -6310,6 +6310,9 @@ impl Node {
             let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(&bytes)?;
             if transcript.value.manifest.value.group == retained.group
                 && replay_coding_transcript(&transcript)? == CodingReplayFinding::Verified
+                && (allow_legacy_placement
+                    || descriptor.flat_root == descriptor.commitment.root
+                    || transcript.value.plan.value.format_version == 3)
                 && transcript
                     .value
                     .plan
@@ -6344,7 +6347,7 @@ impl Node {
                 sector,
                 expected_commitment,
                 false,
-                expected_commitment.is_some(),
+                true,
             )? {
                 uncovered.push(sector.clone());
             }
@@ -6378,7 +6381,7 @@ impl Node {
         reference: &SectorRef,
         expected_commitment: Option<&mb_core::MerkleCommitment>,
         allow_legacy_root: bool,
-        require_signed_commitment: bool,
+        require_full_root_binding: bool,
     ) -> Result<bool> {
         for retained in state
             .coding_groups
@@ -6407,7 +6410,7 @@ impl Node {
             };
             let commitment_matches = expected_commitment
                 .is_some_and(|expected| information.sector.commitment == *expected);
-            if require_signed_commitment && !commitment_matches {
+            if require_full_root_binding && expected_commitment.is_some() && !commitment_matches {
                 continue;
             }
             let Some(bytes) = self
@@ -6417,16 +6420,17 @@ impl Node {
                 continue;
             };
             let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(&bytes)?;
+            let plan = &transcript.value.plan.value;
+            let root_matches = plan.information_root(information_index) == Some(reference.root);
+            let accepted_root = if require_full_root_binding {
+                plan.format_version == 3 && root_matches
+            } else {
+                root_matches
+                    || plan.format_version == 1 && (allow_legacy_root || commitment_matches)
+            };
             if transcript.value.manifest.value.group == retained.group
                 && replay_coding_transcript(&transcript)? == CodingReplayFinding::Verified
-                && (transcript
-                    .value
-                    .plan
-                    .value
-                    .information_root(information_index)
-                    == Some(reference.root)
-                    || transcript.value.plan.value.format_version == 1
-                        && (allow_legacy_root || commitment_matches))
+                && accepted_root
             {
                 return Ok(true);
             }
@@ -13847,6 +13851,7 @@ pub(crate) mod tests {
                 attempt_id: [182; 16],
                 plan_hash,
                 group,
+                information_bytes: None,
             },
             &keys[1],
         )

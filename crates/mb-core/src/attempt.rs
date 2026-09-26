@@ -19,6 +19,9 @@ pub const CODING_CHALLENGE_REVEAL_DOMAIN: &[u8] = b"mutualbackup/coding-challeng
 pub const CODING_SHARD_OPENING_DOMAIN: &[u8] = b"mutualbackup/coding-shard-opening/v1";
 pub const CODING_TRANSCRIPT_DOMAIN: &[u8] = b"mutualbackup/coding-transcript/v1";
 pub const CODING_FAILURE_REPORT_DOMAIN: &[u8] = b"mutualbackup/coding-failure-report/v1";
+/// Leave room for signed roles, receipts, and openings in the 600 KiB peer
+/// frame when a flat-root manifest carries complete encrypted information.
+const MAX_FULL_ROOT_BINDING_BYTES: u64 = 512 * 1024;
 
 /// The immutable, narrow delegation for one complete coding attempt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -136,7 +139,8 @@ pub struct CodingAttemptPlan {
     /// Canonical roots aligned with `information`. Historical inputs use flat
     /// roots; root-bound packed inputs use their authenticated Merkle root.
     /// Virtual-zero inputs use the all-zero sentinel. Version one plans omit
-    /// this field and retain their original canonical layout.
+    /// this field and retain their original canonical layout. Version three
+    /// requires flat roots and full information bytes in the root manifest.
     pub information_roots: Option<Vec<[u8; 32]>>,
 }
 
@@ -147,7 +151,7 @@ impl Serialize for CodingAttemptPlan {
     {
         let field_count = match (self.format_version, &self.information_roots) {
             (1, None) => 9,
-            (2, Some(_)) => 10,
+            (2 | 3, Some(_)) => 10,
             _ => return Err(serde::ser::Error::custom("invalid coding plan version")),
         };
         let mut tuple = serializer.serialize_tuple(field_count)?;
@@ -197,7 +201,7 @@ impl<'de> Deserialize<'de> for CodingAttemptPlan {
                 let expires_at_unix_seconds = next_plan_field(&mut sequence, "expiry")?;
                 let information_roots = match format_version {
                     1 => None,
-                    2 => Some(next_plan_field(&mut sequence, "information roots")?),
+                    2 | 3 => Some(next_plan_field(&mut sequence, "information roots")?),
                     _ => return Err(serde::de::Error::custom("invalid coding plan version")),
                 };
                 Ok(CodingAttemptPlan {
@@ -234,7 +238,7 @@ impl CodingAttemptPlan {
         self.geometry.validate()?;
         if !matches!(
             (self.format_version, &self.information_roots),
-            (1, None) | (2, Some(_))
+            (1, None) | (2 | 3, Some(_))
         ) || self.attempt_id == [0; 16]
             || self.checkpoint_hash == [0; 32]
             || self.membership_epoch == 0
@@ -243,6 +247,10 @@ impl CodingAttemptPlan {
             || self.verification_coordinator == NodeId([0; 32])
             || self.coding_coordinator == self.verification_coordinator
             || self.expires_at_unix_seconds == 0
+            || self.format_version == 3
+                && u64::from(self.geometry.profile.data_shards)
+                    .saturating_mul(u64::from(self.geometry.profile.shard_size))
+                    > MAX_FULL_ROOT_BINDING_BYTES
         {
             return Err(CodingAttemptError::InvalidPlan);
         }
@@ -273,12 +281,79 @@ impl CodingAttemptPlan {
 
 /// The coordinator's signed result, binding the delegated inputs and placement
 /// geometry to the parity commitments produced by this attempt.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodingRootManifest {
     pub format_version: u16,
     pub attempt_id: [u8; 16],
     pub plan_hash: [u8; 32],
     pub group: CodingGroupV2,
+    /// Version two carries the complete encrypted information shards needed
+    /// to recompute both their Merkle commitments and legacy flat roots.
+    /// Virtual-zero roles have no payload.
+    pub information_bytes: Option<Vec<Option<Vec<u8>>>>,
+}
+
+impl Serialize for CodingRootManifest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let field_count = match (self.format_version, &self.information_bytes) {
+            (1, None) => 4,
+            (2, Some(_)) => 5,
+            _ => return Err(serde::ser::Error::custom("invalid coding manifest version")),
+        };
+        let mut tuple = serializer.serialize_tuple(field_count)?;
+        tuple.serialize_element(&self.format_version)?;
+        tuple.serialize_element(&self.attempt_id)?;
+        tuple.serialize_element(&self.plan_hash)?;
+        tuple.serialize_element(&self.group)?;
+        if let Some(information_bytes) = &self.information_bytes {
+            tuple.serialize_element(information_bytes)?;
+        }
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CodingRootManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CodingRootManifestVisitor;
+
+        impl<'de> Visitor<'de> for CodingRootManifestVisitor {
+            type Value = CodingRootManifest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a versioned coding root manifest")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let format_version = next_plan_field(&mut sequence, "format version")?;
+                let attempt_id = next_plan_field(&mut sequence, "attempt ID")?;
+                let plan_hash = next_plan_field(&mut sequence, "plan hash")?;
+                let group = next_plan_field(&mut sequence, "group")?;
+                let information_bytes = match format_version {
+                    1 => None,
+                    2 => Some(next_plan_field(&mut sequence, "information bytes")?),
+                    _ => return Err(serde::de::Error::custom("invalid coding manifest version")),
+                };
+                Ok(CodingRootManifest {
+                    format_version,
+                    attempt_id,
+                    plan_hash,
+                    group,
+                    information_bytes,
+                })
+            }
+        }
+
+        deserializer.deserialize_tuple(5, CodingRootManifestVisitor)
+    }
 }
 
 /// A parity holder's durable fact that one attempt's bytes are present but not
@@ -328,7 +403,8 @@ pub struct CodingShardOpening {
 }
 
 /// All evidence needed for any checkpoint signer to replay the verifier's
-/// decision without receiving complete shards.
+/// decision. Version-three flat-root plans carry complete information bytes
+/// in the manifest; earlier plans retain their compact sampled evidence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CodingVerificationTranscript {
     pub format_version: u16,
@@ -509,7 +585,7 @@ pub fn encode_coding_attempt(
             != role.sector.commitment
             || plan.information_root(index).is_some_and(|root| {
                 !role.sector.virtual_zero
-                    && root != role.sector.commitment.root
+                    && (plan.format_version == 3 || root != role.sector.commitment.root)
                     && sector_root(&bytes) != root
             })
         {
@@ -518,6 +594,14 @@ pub fn encode_coding_attempt(
         input_bytes.push(bytes);
     }
 
+    let manifest_information_bytes = (plan.format_version == 3).then(|| {
+        plan.geometry
+            .information
+            .iter()
+            .zip(&input_bytes)
+            .map(|(role, bytes)| (!role.sector.virtual_zero).then(|| bytes.clone()))
+            .collect::<Vec<_>>()
+    });
     let encoded = encode(plan.geometry.profile, input_bytes)?;
     let parity_start = usize::from(plan.geometry.profile.data_shards);
     let parity = encoded[parity_start..].to_vec();
@@ -548,10 +632,11 @@ pub fn encode_coding_attempt(
     let manifest = SignedRecord::sign(
         CODING_ROOT_MANIFEST_DOMAIN,
         CodingRootManifest {
-            format_version: 1,
+            format_version: if plan.format_version == 3 { 2 } else { 1 },
             attempt_id: plan.attempt_id,
             plan_hash: plan.hash()?,
             group,
+            information_bytes: manifest_information_bytes,
         },
         coordinator_keys,
     )?;
@@ -583,7 +668,8 @@ pub fn coding_challenge(plan_hash: [u8; 32], nonce: [u8; 32], evidence_hash: [u8
     *hasher.finalize().as_bytes()
 }
 
-/// Verify signatures and replay every proof and sampled RS equation.
+/// Verify signatures, full-byte flat-root bindings when present, and every
+/// sampled RS equation.
 ///
 /// Missing evidence is classified only as unavailability. Attribution is
 /// returned only after an expected signer has authenticated the bad evidence.
@@ -608,7 +694,10 @@ pub fn replay_coding_transcript(
     let manifest = &transcript.manifest.value;
     transcript.manifest.verify(CODING_ROOT_MANIFEST_DOMAIN)?;
     if transcript.manifest.signer != plan.coding_coordinator
-        || manifest.format_version != 1
+        || !matches!(
+            (plan.format_version, manifest.format_version),
+            (1 | 2, 1) | (3, 2)
+        )
         || manifest.attempt_id != plan.attempt_id
         || manifest.plan_hash != plan_hash
     {
@@ -616,6 +705,30 @@ pub fn replay_coding_transcript(
     }
     plan.geometry.validate_group(&manifest.group)?;
     let group = &manifest.group;
+
+    if plan.format_version == 3 {
+        let information_bytes = manifest
+            .information_bytes
+            .as_ref()
+            .ok_or(CodingAttemptError::InvalidTranscript)?;
+        if information_bytes.len() != usize::from(group.profile.data_shards) {
+            return Err(CodingAttemptError::InvalidTranscript);
+        }
+        for (index, (role, bytes)) in group.roles.iter().zip(information_bytes).enumerate() {
+            let ShardRoleV2::Information(information) = role else {
+                return Err(CodingAttemptError::InvalidTranscript);
+            };
+            match (information.sector.virtual_zero, bytes) {
+                (true, None) => {}
+                (false, Some(bytes))
+                    if bytes.len() == group.profile.shard_size as usize
+                        && merkle_commit(bytes).ok()
+                            == Some(information.sector.commitment.clone())
+                        && plan.information_root(index) == Some(sector_root(bytes)) => {}
+                _ => return Err(CodingAttemptError::InvalidTranscript),
+            }
+        }
+    }
 
     let parity_start = usize::from(group.profile.data_shards);
     if transcript.staged_receipts.len() != usize::from(group.profile.parity_shards) {
@@ -882,6 +995,25 @@ mod tests {
             .group,
             group
         );
+        let mut fully_bound_plan = rooted_plan.value.clone();
+        fully_bound_plan.format_version = 3;
+        let fully_bound_plan =
+            SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, fully_bound_plan, &keys[6]).unwrap();
+        let fully_bound_manifest = encode_coding_attempt(
+            &fully_bound_plan,
+            information.iter().cloned().map(Some).collect(),
+            &keys[7],
+        )
+        .unwrap()
+        .0;
+        assert_eq!(fully_bound_manifest.value.format_version, 2);
+        assert_eq!(
+            crate::decode_canonical::<SignedRecord<CodingRootManifest>>(
+                &canonical_bytes(&fully_bound_manifest).unwrap()
+            )
+            .unwrap(),
+            fully_bound_manifest
+        );
         let mut commitment_rooted_plan = rooted_plan.value.clone();
         commitment_rooted_plan.information_roots = Some(
             information
@@ -898,6 +1030,18 @@ mod tests {
             &keys[7],
         )
         .unwrap();
+        let mut false_flat_plan = commitment_rooted_plan.value.clone();
+        false_flat_plan.format_version = 3;
+        let false_flat_plan =
+            SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, false_flat_plan, &keys[6]).unwrap();
+        assert!(matches!(
+            encode_coding_attempt(
+                &false_flat_plan,
+                information.iter().cloned().map(Some).collect(),
+                &keys[7],
+            ),
+            Err(CodingAttemptError::InvalidInformation)
+        ));
         let mut wrong_root = rooted_plan.value.clone();
         wrong_root.information_roots.as_mut().unwrap()[0] = [99; 32];
         let wrong_root =

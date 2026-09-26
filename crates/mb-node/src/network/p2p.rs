@@ -12318,6 +12318,12 @@ async fn queue_variable_coding_lanes(
     for lane in lanes {
         let packed_information = lane.packed_information;
         let is_packed_lane = !packed_information.is_empty();
+        let requires_flat_binding = lane
+            .geometry
+            .information
+            .iter()
+            .zip(&lane.information_roots)
+            .any(|(role, root)| !role.sector.virtual_zero && *root != role.sector.commitment.root);
         let participants = lane
             .geometry
             .information
@@ -12362,7 +12368,11 @@ async fn queue_variable_coding_lanes(
         }
         let plan = node_blocking(node.clone(), move |node| {
             node.sign_coding_attempt_plan(CodingAttemptPlan {
-                format_version: 2,
+                format_version: if !is_packed_lane || requires_flat_binding {
+                    3
+                } else {
+                    2
+                },
                 attempt_id,
                 checkpoint_hash,
                 membership_epoch,
@@ -16254,13 +16264,21 @@ mod tests {
         ordinal: u8,
         information_roots: Option<&BTreeMap<SectorId, [u8; 32]>>,
         rootless: bool,
+        full_binding: bool,
     ) -> SignedRecord<CodingVerificationTranscript> {
         let members = signing_keys.keys().copied().collect::<Vec<_>>();
+        assert!(!rootless || !full_binding);
         let coordinator = members[1];
         let verifier = members[2];
         let attempt_id = [ordinal; 16];
         let plan = CodingAttemptPlan {
-            format_version: if rootless { 1 } else { 2 },
+            format_version: if rootless {
+                1
+            } else if full_binding {
+                3
+            } else {
+                2
+            },
             attempt_id,
             checkpoint_hash,
             membership_epoch,
@@ -16320,10 +16338,25 @@ mod tests {
         let manifest = SignedRecord::sign(
             mb_core::CODING_ROOT_MANIFEST_DOMAIN,
             CodingRootManifest {
-                format_version: 1,
+                format_version: if full_binding { 2 } else { 1 },
                 attempt_id,
                 plan_hash,
                 group: group.clone(),
+                information_bytes: full_binding.then(|| {
+                    group.roles[..usize::from(group.profile.data_shards)]
+                        .iter()
+                        .enumerate()
+                        .map(|(index, role)| match role {
+                            ShardRoleV2::Information(information)
+                                if information.sector.virtual_zero =>
+                            {
+                                None
+                            }
+                            ShardRoleV2::Information(_) => Some(shards[index].clone()),
+                            _ => unreachable!(),
+                        })
+                        .collect()
+                }),
             },
             signing_keys.get(&coordinator).unwrap(),
         )
@@ -16422,10 +16455,6 @@ mod tests {
             signing_keys.get(&verifier).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            replay_coding_transcript(&transcript).unwrap(),
-            mb_core::CodingReplayFinding::Verified
-        );
         transcript
     }
 
@@ -16651,6 +16680,7 @@ mod tests {
                 1,
                 index as u8 + 1,
                 Some(&packed_roots),
+                false,
                 false,
             );
             crate::node::tests::install_test_recovery_transcript(&mut cold, &transcript);
@@ -16996,6 +17026,7 @@ mod tests {
             1,
             None,
             false,
+            false,
         );
         let redundant_information = redundant
             .roles
@@ -17018,6 +17049,7 @@ mod tests {
             3,
             3,
             None,
+            false,
             false,
         );
         let wrong_bytes = vec![18; V1_SECTOR_SIZE];
@@ -17062,6 +17094,7 @@ mod tests {
             2,
             None,
             false,
+            false,
         );
         let false_root_transcript = signed_replacement_transcript(
             &wrong,
@@ -17071,6 +17104,7 @@ mod tests {
             3,
             4,
             Some(&BTreeMap::from([(reference.id, reference.root)])),
+            false,
             false,
         );
         assert_eq!(
@@ -17606,8 +17640,9 @@ mod tests {
             1,
             None,
             false,
+            true,
         );
-        let mut local = Node::open(temp.path().join("node"), local_seed).unwrap();
+        let mut local = Node::open(temp.path().join("node"), local_seed.clone()).unwrap();
         crate::node::tests::install_test_checkpoint_and_dynamic_state(
             &mut local,
             &checkpoint,
@@ -17641,6 +17676,23 @@ mod tests {
         local
             .validate_variable_checkpoint_coverage(&successor, false)
             .unwrap();
+        let mut old_revision_checkpoint = successor.clone();
+        let mut old_revision = old_revision_checkpoint.revisions[0].value.clone();
+        old_revision.format_version = 3;
+        old_revision.sector_commitments = None;
+        old_revision.sign_writer(&writer).unwrap();
+        old_revision_checkpoint.revisions = vec![
+            SignedRecord::sign(
+                mb_core::USER_REVISION_DOMAIN,
+                old_revision,
+                signing_keys.get(&owners[0]).unwrap(),
+            )
+            .unwrap(),
+        ];
+        old_revision_checkpoint.validate().unwrap();
+        local
+            .validate_variable_checkpoint_coverage(&old_revision_checkpoint, false)
+            .unwrap();
         let mut false_binding = successor.clone();
         let mut changed_revision = false_binding.revisions[0].value.clone();
         changed_revision.sector_commitments = Some(vec![false_commitment]);
@@ -17659,6 +17711,109 @@ mod tests {
                 .is_err(),
             "a plan root claim cannot certify a different revision-signed commitment"
         );
+        let mut inconsistent_revision = successor.revisions[0].value.clone();
+        inconsistent_revision.metadata_sectors[0].root = sector_root(&vec![98; V1_SECTOR_SIZE]);
+        inconsistent_revision.sign_writer(&writer).unwrap();
+        let mut inconsistent_checkpoint = successor.clone();
+        inconsistent_checkpoint.revisions = vec![
+            SignedRecord::sign(
+                mb_core::USER_REVISION_DOMAIN,
+                inconsistent_revision,
+                signing_keys.get(&owners[0]).unwrap(),
+            )
+            .unwrap(),
+        ];
+        inconsistent_checkpoint.validate().unwrap();
+        assert!(
+            local
+                .validate_variable_checkpoint_coverage(&inconsistent_checkpoint, false)
+                .is_err(),
+            "a full-byte manifest must reject inconsistent signed flat and Merkle roots"
+        );
+        let false_root = inconsistent_checkpoint.revisions[0].value.metadata_sectors[0].root;
+        let forged_full_binding = signed_replacement_transcript(
+            &group,
+            &shards,
+            &signing_keys,
+            checkpoint_hash,
+            state.membership_epoch,
+            4,
+            Some(&BTreeMap::from([(references[0].id, false_root)])),
+            false,
+            true,
+        );
+        assert!(
+            replay_coding_transcript(&forged_full_binding).is_err(),
+            "full information bytes must refute a forged flat-root claim"
+        );
+        for (ordinal, rootless) in [(2, false), (3, true)] {
+            let claimed = signed_replacement_transcript(
+                &group,
+                &shards,
+                &signing_keys,
+                checkpoint_hash,
+                state.membership_epoch,
+                ordinal,
+                Some(&BTreeMap::from([(references[0].id, false_root)])),
+                rootless,
+                false,
+            );
+            assert_eq!(
+                replay_coding_transcript(&claimed).unwrap(),
+                mb_core::CodingReplayFinding::Verified,
+            );
+            crate::node::tests::install_test_recovery_transcript(&mut local, &claimed);
+            assert!(
+                local
+                    .validate_variable_checkpoint_coverage(&inconsistent_checkpoint, false)
+                    .is_err(),
+                "legacy transcripts cannot turn inconsistent signed roots into checkpoint coverage"
+            );
+        }
+        let mut retained_head = QuorumCheckpoint {
+            checkpoint: checkpoint.checkpoint.clone(),
+            signatures: Vec::new(),
+        };
+        retained_head.checkpoint.revisions = inconsistent_checkpoint.revisions.clone();
+        for keys in signing_keys.values() {
+            retained_head.add_signature(keys).unwrap();
+        }
+        retained_head.verify().unwrap();
+        let retained_hash = retained_head.hash().unwrap();
+        let mut retained_successor = retained_head.checkpoint.clone();
+        retained_successor.generation = 2;
+        retained_successor.parent = Some(retained_hash);
+        let mut retained_node =
+            Node::open(temp.path().join("retained-inconsistent"), local_seed).unwrap();
+        crate::node::tests::install_test_checkpoint_and_dynamic_state(
+            &mut retained_node,
+            &retained_head,
+            &state,
+        );
+        for (ordinal, rootless) in [(5, false), (6, true)] {
+            let claimed = signed_replacement_transcript(
+                &group,
+                &shards,
+                &signing_keys,
+                retained_hash,
+                state.membership_epoch,
+                ordinal,
+                Some(&BTreeMap::from([(references[0].id, false_root)])),
+                rootless,
+                false,
+            );
+            crate::node::tests::install_test_recovery_transcript(&mut retained_node, &claimed);
+            assert!(
+                retained_node
+                    .validate_variable_checkpoint_coverage(&retained_successor, false)
+                    .is_err(),
+                "a retained revision cannot bypass full-byte root binding"
+            );
+        }
+        crate::node::tests::install_test_recovery_transcript(&mut local, &transcript);
+        local
+            .validate_variable_checkpoint_coverage(&successor, false)
+            .unwrap();
         let volume = temp.path().join("volume");
         std::fs::create_dir_all(&volume).unwrap();
         local
@@ -17985,6 +18140,7 @@ mod tests {
             1,
             None,
             true,
+            false,
         );
         let mut local = Node::open(temp.path().join("node"), local_seed).unwrap();
         local
