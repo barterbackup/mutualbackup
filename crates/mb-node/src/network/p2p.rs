@@ -22775,17 +22775,20 @@ mod tests {
             value.information_roots = Some(vec![packed_sector.descriptor.flat_root]);
             value.coding_coordinator = member(3).node_id;
             value.verification_coordinator = member(4).node_id;
-            let mut node = nodes[0].lock().unwrap();
-            node.store_packed_sector(guild_id, profile, packed_sector)
-                .unwrap();
-            assert_eq!(
-                node.sector_for_guild(&guild_id, &value.geometry.information[0].sector.id)
-                    .unwrap(),
-                blocked_bytes
-            );
-            let plan = node.sign_coding_attempt_plan(value).unwrap();
-            node.enqueue_coding_launch_with_information(plan.clone(), Some(BTreeMap::new()))
-                .unwrap();
+            let plan = {
+                let mut node = nodes[0].lock().unwrap();
+                node.store_packed_sector(guild_id, profile, packed_sector)
+                    .unwrap();
+                assert_eq!(
+                    node.sector_for_guild(&guild_id, &value.geometry.information[0].sector.id)
+                        .unwrap(),
+                    blocked_bytes
+                );
+                let plan = node.sign_coding_attempt_plan(value).unwrap();
+                node.enqueue_coding_launch_with_information(plan.clone(), Some(BTreeMap::new()))
+                    .unwrap();
+                plan
+            };
             nodes[2]
                 .lock()
                 .unwrap()
@@ -22797,7 +22800,6 @@ mod tests {
                 .write_coding_information_range(&plan, 0, 0, &blocked_bytes[..MERKLE_LEAF_SIZE])
                 .unwrap();
             blocked_launch = Some(plan);
-            drop(node);
             let volume = temp.path().join("volume-2");
             std::fs::rename(&volume, temp.path().join("offline-volume-2")).unwrap();
             nodes[2]
