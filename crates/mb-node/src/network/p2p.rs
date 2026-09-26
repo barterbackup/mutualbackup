@@ -6494,6 +6494,18 @@ async fn dispatch_claimed_coding_launch(
         }
         return Ok(true);
     }
+    // A crash may have left an unexpired redundant launch beside a submitted
+    // owner. Yield before recreating any of that owner's discarded inputs.
+    let submitted = job.plan.clone();
+    if node_blocking(node.clone(), move |node| {
+        node.coding_launch_submission_is_failure(&submitted)
+    })
+    .await?
+    .is_some()
+    {
+        node_blocking(node, move |node| node.abandon_coding_launch(attempt_id)).await?;
+        return Ok(true);
+    }
     let coordinator = job.plan.value.coding_coordinator;
     let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
     let staging_plan = job.plan.clone();
@@ -6528,6 +6540,21 @@ async fn dispatch_claimed_coding_launch(
             node.mark_coding_launch_staged(&staged_plan)
         })
         .await?;
+    }
+    // A failure can arrive while the last input upload is awaited. Do not
+    // delegate its discarded parent again or leave those late uploads behind.
+    let submitted = job.plan.clone();
+    if let Some(failed) = node_blocking(node.clone(), move |node| {
+        node.coding_launch_submission_is_failure(&submitted)
+    })
+    .await?
+    {
+        if failed && let Err(error) = cleanup_coding_retry_plan(node.clone(), p2p, &job.plan).await
+        {
+            tracing::warn!(?attempt_id, %error, "submitted launch cleanup deferred to retry owner");
+        }
+        node_blocking(node, move |node| node.abandon_coding_launch(attempt_id)).await?;
+        return Ok(true);
     }
     let result = if coordinator == local_id {
         let plan = job.plan.clone();
@@ -6657,6 +6684,12 @@ async fn execute_coding_retry(
     if superseded {
         return cleanup_coding_retry_job(node, p2p, &job).await;
     }
+    // Retry owns any parent uploads that completed around failure handoff,
+    // including a crashed launch worker. Finish parent cleanup before staging
+    // a successor so cached abort acknowledgements cannot hide late data.
+    if !cleanup_coding_retry_plan(node.clone(), p2p, &job.failure.value.plan).await? {
+        return Ok(());
+    }
     if let Some(plan) = &job.retry_plan
         && plan.value.expires_at_unix_seconds < unix_seconds()
     {
@@ -6673,7 +6706,16 @@ async fn execute_coding_retry(
     }
     let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
     let plan = match &job.retry_plan {
-        Some(plan) => plan.clone(),
+        Some(plan) => {
+            let attempt = job.failure.value.plan.value.attempt_id;
+            let coder = plan.value.coding_coordinator;
+            let verifier = plan.value.verification_coordinator;
+            let expires = plan.value.expires_at_unix_seconds;
+            node_blocking(node.clone(), move |node| {
+                node.prepare_coding_retry(attempt, coder, verifier, expires)
+            })
+            .await?
+        }
         None => {
             let retry = job.clone();
             let prior = node_blocking(node.clone(), move |node| {
@@ -6766,6 +6808,21 @@ async fn execute_coding_retry(
             .await?
         }
     };
+    // Reuse the durable successor ID and resume its own uploads. Receipts
+    // from the failed parent never count as staging for a new attempt.
+    let stage_plan = plan.clone();
+    if let Some(input) = node_blocking(node.clone(), move |node| {
+        node.pending_coding_launch_information(&stage_plan)
+    })
+    .await?
+    {
+        stage_locally_available_information(node.clone(), p2p, local_id, &plan, &input).await?;
+        let staged = plan.clone();
+        node_blocking(node.clone(), move |node| {
+            node.mark_coding_launch_staged(&staged)
+        })
+        .await?;
+    }
     let coordinator = plan.value.coding_coordinator;
     if coordinator == local_id {
         let local_plan = plan.clone();
@@ -12019,6 +12076,7 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
+#[derive(Clone)]
 struct VariableCodingLane {
     geometry: CodingPlanGeometry,
     information_roots: Vec<[u8; 32]>,
@@ -22438,6 +22496,664 @@ mod tests {
             RetryReplanningCase::VerifiedEpochChange,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn packed_failure_retry_restages_remote_inputs_after_partial_upload_and_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds = (101_u8..106)
+            .map(|byte| Seed::from_bytes([byte; 32]))
+            .collect::<Vec<_>>();
+        let open_nodes = || {
+            seeds
+                .iter()
+                .enumerate()
+                .map(|(index, seed)| {
+                    Arc::new(Mutex::new(
+                        Node::open(temp.path().join(format!("node-{index}")), seed.clone())
+                            .unwrap(),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut nodes = open_nodes();
+        for (index, node) in nodes.iter().enumerate() {
+            let volume = temp.path().join(format!("volume-{index}"));
+            std::fs::create_dir(&volume).unwrap();
+            // The delegator keeps its packed cache but cannot hold a shard.
+            node.lock()
+                .unwrap()
+                .configure_storage_volumes(
+                    &[volume],
+                    if index == 0 { 1 } else { 4 * 1024 * 1024 },
+                    0,
+                )
+                .unwrap();
+        }
+        let mut clients = Vec::new();
+        let mut network_tasks = Vec::new();
+        for node in &nodes {
+            let mut cfg = config(node.lock().unwrap().keys().node_id());
+            cfg.enable_relay_server = false;
+            let (client, event_loop) = build_p2p(node.clone(), cfg).unwrap();
+            clients.push(client);
+            network_tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let addresses = futures::future::join_all(clients.iter().map(listening_address)).await;
+        let endpoints = clients
+            .iter()
+            .zip(addresses.iter().cloned())
+            .map(|(client, address)| peer_endpoint(client, address))
+            .collect::<Vec<_>>();
+        let certificate = form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+        let owner = nodes[0].lock().unwrap().keys().node_id();
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[106; 32]);
+        install_coding_test_event(
+            &nodes,
+            mb_core::GuildEventKind::RotateWriterKey {
+                owner,
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            },
+        );
+        let state = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap();
+        let guild_id = state.guild_id;
+        let revision_id = Uuid::from_bytes([107; 16]);
+        let protected_root = Uuid::from_bytes([108; 16]);
+        let source_id =
+            mb_core::make_sector_id(owner, revision_id, mb_core::SectorPurpose::Metadata, 0);
+        let (reference, source_bytes) = mb_core::encrypted_sector(
+            &nodes[0].lock().unwrap().keys().guild_data_key(&guild_id),
+            source_id,
+            &[73],
+        )
+        .unwrap();
+        let source_commitment = merkle_commit(&source_bytes).unwrap();
+        let profile = PackingProfile {
+            format_version: 1,
+            sector_size: V1_SECTOR_SIZE as u32,
+            slot_size: MERKLE_LEAF_SIZE as u32,
+        };
+        let packed = pack_incremental(
+            profile,
+            None,
+            vec![PackingInput {
+                owner,
+                protected_root: packing_protected_root(protected_root),
+                object_id: source_id,
+                source_commitment: Some(source_commitment.clone()),
+                bytes: source_bytes.clone(),
+            }],
+        )
+        .unwrap();
+        {
+            let mut node = nodes[0].lock().unwrap();
+            node.install_repaired_information_sector(guild_id, reference.clone(), &source_bytes)
+                .unwrap();
+            for sector in &packed.sectors {
+                node.store_packed_sector(guild_id, profile, sector.clone())
+                    .unwrap();
+            }
+        }
+        let peers = nodes[0]
+            .lock()
+            .unwrap()
+            .guild_summary()
+            .unwrap()
+            .unwrap()
+            .peers;
+        let mut capacity = nodes
+            .iter()
+            .map(|node| {
+                let node = node.lock().unwrap();
+                (
+                    node.keys().node_id(),
+                    node.coding_capacity(V1_SECTOR_SIZE as u32).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(capacity[&owner], 0);
+        let lanes = build_packed_coding_lanes(
+            packed.catalog.sectors.clone(),
+            PackedCodingContext {
+                guild_id,
+                geometry_id: Uuid::from_bytes([109; 16]),
+                peers: &peers,
+                placement_capacity: &mut capacity,
+            },
+        )
+        .unwrap();
+        assert_eq!(lanes.len(), 1);
+        let lane = lanes[0].clone();
+        assert!(
+            lane.geometry
+                .information
+                .iter()
+                .filter(|role| !role.sector.virtual_zero)
+                .all(|role| role.owner != owner)
+        );
+        let mut revision = UserRevision {
+            format_version: 4,
+            guild_id,
+            protected_root_id: protected_root,
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id,
+            owner,
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![reference],
+            data_sectors: Vec::new(),
+            sector_commitments: Some(vec![source_commitment]),
+        };
+        revision.sign_writer(&writer).unwrap();
+        let checkpoint = GuildCheckpoint {
+            format_version: 7,
+            guild_id,
+            genesis_hash: certificate.hash().unwrap(),
+            generation: 1,
+            parent: None,
+            members: state.active_members().cloned().collect(),
+            writer_fences: vec![mb_core::WriterFence {
+                owner,
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            }],
+            revision_tombstones: Vec::new(),
+            revisions: vec![
+                SignedRecord::sign(
+                    mb_core::USER_REVISION_DOMAIN,
+                    revision,
+                    nodes[0].lock().unwrap().keys(),
+                )
+                .unwrap(),
+            ],
+            coding_groups: Vec::new(),
+            authority: Some(CheckpointAuthority {
+                format_version: 1,
+                membership_epoch: state.membership_epoch,
+                quorum: state.quorum,
+            }),
+            packing_catalog: Some(packed.catalog.clone()),
+        };
+        let checkpoint_hash = checkpoint.hash().unwrap();
+        for (index, client) in clients.iter().enumerate() {
+            for (remote, node) in nodes.iter().enumerate() {
+                if index != remote {
+                    let id = node.lock().unwrap().keys().node_id();
+                    client
+                        .add_peer_address(id, addresses[remote].clone())
+                        .await
+                        .unwrap();
+                    client.profile(id).await.unwrap();
+                }
+            }
+        }
+        let index_of = |id: NodeId| {
+            nodes
+                .iter()
+                .position(|node| node.lock().unwrap().keys().node_id() == id)
+                .unwrap()
+        };
+        for role in lane
+            .geometry
+            .information
+            .iter()
+            .filter(|role| !role.sector.virtual_zero)
+        {
+            let node = nodes[index_of(role.owner)].lock().unwrap();
+            assert!(node.sector_for_guild(&guild_id, &role.sector.id).is_err());
+            assert_eq!(node.coding_used_bytes_for_test().unwrap(), 0);
+        }
+        queue_variable_coding_lanes(
+            nodes[0].clone(),
+            &clients[0],
+            owner,
+            checkpoint_hash,
+            state.membership_epoch,
+            &peers,
+            lanes,
+        )
+        .await
+        .unwrap();
+        let initial = nodes[0]
+            .lock()
+            .unwrap()
+            .claim_coding_launch()
+            .unwrap()
+            .unwrap()
+            .plan;
+        assert_eq!(initial.value.coding_coordinator, owner);
+        assert!(
+            dispatch_next_coding_launch(nodes[0].clone(), &clients[0])
+                .await
+                .unwrap()
+        );
+        for role in initial
+            .value
+            .geometry
+            .information
+            .iter()
+            .filter(|role| !role.sector.virtual_zero)
+        {
+            let node = nodes[index_of(role.owner)].lock().unwrap();
+            assert_eq!(node.coding_staged_receipt_count_for_test().unwrap(), 1);
+            assert!(
+                node.sector_for_guild(&guild_id, &role.sector.id).is_err(),
+                "information holder must have only the attempt's staged copy"
+            );
+        }
+        {
+            let node = nodes[0].lock().unwrap();
+            assert_eq!(
+                node.claim_delegated_coding().unwrap().unwrap().state,
+                DelegatedCodingJobState::Running
+            );
+            node.cleanup_delegated_coding(
+                initial.value.attempt_id,
+                "injected failure after packed input staging",
+            )
+            .unwrap();
+        }
+        process_delegated_coding_job(nodes[0].clone(), &clients[0])
+            .await
+            .unwrap();
+        process_delegated_coding_job(nodes[0].clone(), &clients[0])
+            .await
+            .unwrap();
+        let failure = nodes[0]
+            .lock()
+            .unwrap()
+            .coding_retry_evidence_for_test(initial.value.attempt_id)
+            .unwrap()
+            .failure;
+        assert_eq!(failure.value.plan, initial);
+        assert_eq!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .coding_launch_information_to_stage(initial.value.attempt_id)
+                .unwrap(),
+            Some(lane.packed_information.clone())
+        );
+        for node in &nodes {
+            let node = node.lock().unwrap();
+            assert_eq!(node.coding_used_bytes_for_test().unwrap(), 0);
+            assert_eq!(node.coding_staged_receipt_count_for_test().unwrap(), 0);
+            assert_eq!(node.coding_reservation_count_for_test().unwrap(), 0);
+        }
+        let fresh = nodes
+            .iter()
+            .map(|node| node.lock().unwrap().keys().node_id())
+            .filter(|id| *id != owner && *id != initial.value.verification_coordinator)
+            .collect::<Vec<_>>();
+        let successor = nodes[0]
+            .lock()
+            .unwrap()
+            .prepare_coding_retry(
+                initial.value.attempt_id,
+                fresh[0],
+                fresh[1],
+                unix_seconds() + 600,
+            )
+            .unwrap();
+        let (input_index, input_role) = successor
+            .value
+            .geometry
+            .information
+            .iter()
+            .enumerate()
+            .find(|(_, role)| !role.sector.virtual_zero)
+            .unwrap();
+        let input_holder = index_of(input_role.owner);
+        let input_bytes = &packed
+            .sectors
+            .iter()
+            .find(|sector| sector.descriptor.id == input_role.sector.id)
+            .unwrap()
+            .bytes;
+        assert_eq!(
+            clients[0]
+                .reserve_coding_information(input_role.owner, successor.clone(), input_index as u16)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            clients[0]
+                .upload_coding_information_range(
+                    input_role.owner,
+                    successor.clone(),
+                    input_index as u16,
+                    0,
+                    input_bytes[..MERKLE_LEAF_SIZE].to_vec()
+                )
+                .await
+                .unwrap(),
+            MERKLE_LEAF_SIZE as u32
+        );
+        // Exercise the same journal-cursor rule for a real parity upload.
+        let coder_index = index_of(successor.value.coding_coordinator);
+        let information = successor
+            .value
+            .geometry
+            .information
+            .iter()
+            .map(|role| {
+                (!role.sector.virtual_zero).then(|| {
+                    packed
+                        .sectors
+                        .iter()
+                        .find(|sector| sector.descriptor.id == role.sector.id)
+                        .unwrap()
+                        .bytes
+                        .clone()
+                })
+            })
+            .collect();
+        let (manifest, parity) = nodes[coder_index]
+            .lock()
+            .unwrap()
+            .encode_delegated_coding(&successor, information)
+            .unwrap();
+        let (parity_row, placement) = successor
+            .value
+            .geometry
+            .parity
+            .iter()
+            .enumerate()
+            .find(|(_, placement)| placement.holder != successor.value.coding_coordinator)
+            .unwrap();
+        let parity_holder = placement.holder;
+        let parity_index = successor.value.geometry.profile.data_shards + parity_row as u16;
+        assert_eq!(
+            clients[coder_index]
+                .reserve_coding_parity(parity_holder, successor.clone(), parity_index)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            clients[coder_index]
+                .upload_coding_parity_range(
+                    parity_holder,
+                    successor.clone(),
+                    manifest,
+                    parity_index,
+                    0,
+                    parity[parity_row][..MERKLE_LEAF_SIZE].to_vec()
+                )
+                .await
+                .unwrap(),
+            MERKLE_LEAF_SIZE as u32
+        );
+        assert_eq!(
+            clients[coder_index]
+                .reserve_coding_parity(parity_holder, successor.clone(), parity_index)
+                .await
+                .unwrap(),
+            MERKLE_LEAF_SIZE as u32
+        );
+        let volume = temp.path().join(format!("volume-{input_holder}"));
+        let offline = temp.path().join(format!("offline-{input_holder}"));
+        std::fs::rename(&volume, &offline).unwrap();
+        nodes[input_holder]
+            .lock()
+            .unwrap()
+            .configure_storage_volumes(std::slice::from_ref(&volume), 4 * 1024 * 1024, 0)
+            .unwrap();
+        let retry = nodes[0]
+            .lock()
+            .unwrap()
+            .claim_coding_retry(None)
+            .unwrap()
+            .unwrap();
+        process_coding_retry_job(nodes[0].clone(), &clients[0], &retry)
+            .await
+            .unwrap();
+        {
+            let node = nodes[0].lock().unwrap();
+            let deferred = node
+                .coding_retry_evidence_for_test(initial.value.attempt_id)
+                .unwrap();
+            assert!(!deferred.complete);
+            assert!(deferred.error.is_some());
+            assert_eq!(deferred.retry_plan, Some(successor.clone()));
+            assert_eq!(
+                node.pending_coding_launch_information(&successor).unwrap(),
+                Some(lane.packed_information.clone())
+            );
+        }
+        assert!(
+            nodes[index_of(successor.value.coding_coordinator)]
+                .lock()
+                .unwrap()
+                .claim_delegated_coding()
+                .unwrap()
+                .is_none()
+        );
+        queue_variable_coding_lanes(
+            nodes[0].clone(),
+            &clients[0],
+            owner,
+            checkpoint_hash,
+            state.membership_epoch,
+            &peers,
+            vec![lane.clone()],
+        )
+        .await
+        .unwrap();
+        {
+            let node = nodes[0].lock().unwrap();
+            assert!(node.claim_coding_launch().unwrap().is_none());
+            assert_eq!(
+                node.coding_retry_evidence_for_test(initial.value.attempt_id)
+                    .unwrap()
+                    .retry_plan,
+                Some(successor.clone())
+            );
+        }
+        for client in &clients {
+            client.shutdown().await.unwrap();
+        }
+        for task in network_tasks.drain(..) {
+            task.await.unwrap().unwrap();
+        }
+        clients.clear();
+        drop(nodes);
+        std::fs::rename(&offline, &volume).unwrap();
+        nodes = open_nodes();
+        nodes[input_holder]
+            .lock()
+            .unwrap()
+            .configure_storage_volumes(std::slice::from_ref(&volume), 4 * 1024 * 1024, 0)
+            .unwrap();
+        {
+            let holder = nodes[input_holder].lock().unwrap();
+            assert_eq!(holder.coding_reservation_count_for_test().unwrap(), 1);
+        }
+        {
+            let mut holder = nodes[input_holder].lock().unwrap();
+            assert_eq!(
+                holder
+                    .reserve_coding_information(&successor, input_index as u16)
+                    .unwrap(),
+                MERKLE_LEAF_SIZE as u32
+            );
+        }
+        assert_eq!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .pending_coding_launch_information(&successor)
+                .unwrap(),
+            Some(lane.packed_information.clone())
+        );
+        for node in &nodes {
+            let mut cfg = config(node.lock().unwrap().keys().node_id());
+            cfg.enable_relay_server = false;
+            let (client, event_loop) = build_p2p(node.clone(), cfg).unwrap();
+            clients.push(client);
+            network_tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let addresses = futures::future::join_all(clients.iter().map(listening_address)).await;
+        for (index, client) in clients.iter().enumerate() {
+            for (remote, node) in nodes.iter().enumerate() {
+                if index != remote {
+                    let id = node.lock().unwrap().keys().node_id();
+                    client
+                        .add_peer_address(id, addresses[remote].clone())
+                        .await
+                        .unwrap();
+                    client.profile(id).await.unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            clients[0]
+                .reserve_coding_information(input_role.owner, successor.clone(), input_index as u16)
+                .await
+                .unwrap(),
+            MERKLE_LEAF_SIZE as u32
+        );
+        assert_eq!(
+            clients[coder_index]
+                .reserve_coding_parity(parity_holder, successor.clone(), parity_index)
+                .await
+                .unwrap(),
+            MERKLE_LEAF_SIZE as u32
+        );
+        let workers = nodes
+            .iter()
+            .zip(&clients)
+            .map(|(node, client)| {
+                tokio::spawn(run_delegated_coding_jobs(node.clone(), client.clone()))
+            })
+            .collect::<Vec<_>>();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        loop {
+            assert!(workers.iter().all(|worker| !worker.is_finished()));
+            let complete = {
+                let node = nodes[0].lock().unwrap();
+                node.validate_variable_checkpoint_coverage(&checkpoint, false)
+                    .is_ok()
+                    && node
+                        .coding_activation_jobs_for_test()
+                        .unwrap()
+                        .iter()
+                        .all(|job| job.complete)
+                    && node
+                        .coding_launch_information_to_stage(initial.value.attempt_id)
+                        .unwrap()
+                        .is_none()
+                    && node
+                        .coding_launch_information_to_stage(successor.value.attempt_id)
+                        .unwrap()
+                        .is_none()
+            };
+            if complete {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let node = nodes[0].lock().unwrap();
+                panic!(
+                    "packed retry failed; retry={:?}; activation={:?}; coverage={:?}",
+                    node.coding_retry_evidence_for_test(initial.value.attempt_id)
+                        .unwrap(),
+                    node.coding_activation_jobs_for_test().unwrap(),
+                    node.validate_variable_checkpoint_coverage(&checkpoint, false)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        nodes[0]
+            .lock()
+            .unwrap()
+            .sign_checkpoint(&checkpoint)
+            .unwrap();
+        let mut expected = BTreeMap::<NodeId, u64>::new();
+        for role in &successor.value.geometry.information {
+            if !role.sector.virtual_zero {
+                *expected.entry(role.owner).or_default() += V1_SECTOR_SIZE as u64;
+            }
+        }
+        for role in &successor.value.geometry.parity {
+            *expected.entry(role.holder).or_default() += V1_SECTOR_SIZE as u64;
+        }
+        for node in &nodes {
+            let node = node.lock().unwrap();
+            assert_eq!(
+                node.coding_used_bytes_for_test().unwrap(),
+                expected.get(&node.keys().node_id()).copied().unwrap_or(0)
+            );
+            assert_eq!(node.coding_staged_receipt_count_for_test().unwrap(), 0);
+            assert_eq!(node.coding_reservation_count_for_test().unwrap(), 0);
+        }
+        for worker in workers {
+            worker.abort();
+            let _ = worker.await;
+        }
+        for client in &clients {
+            client.shutdown().await.unwrap();
+        }
+        for task in network_tasks {
+            task.await.unwrap().unwrap();
+        }
+        drop(clients);
+        drop(nodes);
+        for _ in 0..2 {
+            for (index, seed) in seeds.iter().enumerate() {
+                let node =
+                    Node::open(temp.path().join(format!("node-{index}")), seed.clone()).unwrap();
+                assert_eq!(
+                    node.coding_used_bytes_for_test().unwrap(),
+                    expected.get(&node.keys().node_id()).copied().unwrap_or(0)
+                );
+                assert_eq!(node.coding_staged_receipt_count_for_test().unwrap(), 0);
+                assert_eq!(node.coding_reservation_count_for_test().unwrap(), 0);
+                if index == 0 {
+                    let retry = node
+                        .coding_retry_evidence_for_test(initial.value.attempt_id)
+                        .unwrap();
+                    assert_eq!(retry.failure, failure);
+                    assert_eq!(retry.retry_plan, Some(successor.clone()));
+                    assert!(retry.complete);
+                    for id in [initial.value.attempt_id, successor.value.attempt_id] {
+                        assert!(
+                            node.coding_launch_information_to_stage(id)
+                                .unwrap()
+                                .is_none()
+                        );
+                    }
+                    let group = node.dynamic_guild_state().unwrap().unwrap().coding_groups[0]
+                        .group
+                        .id;
+                    assert_eq!(
+                        node.coding_transcript_for_group(guild_id, group)
+                            .unwrap()
+                            .value
+                            .plan,
+                        successor
+                    );
+                    node.validate_variable_checkpoint_coverage(&checkpoint, false)
+                        .unwrap();
+                    let coder = node
+                        .delegated_coding_jobs_for_test()
+                        .unwrap()
+                        .into_iter()
+                        .find(|job| job.plan == initial)
+                        .unwrap();
+                    assert_eq!(coder.state, DelegatedCodingJobState::Complete);
+                }
+            }
+        }
     }
 
     #[tokio::test]

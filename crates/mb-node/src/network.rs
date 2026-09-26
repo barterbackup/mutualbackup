@@ -786,10 +786,13 @@ fn process_peer_request(
             bail!("only the source node itself may manage its coordinator commit");
         }
         if let Some(kind) = mutation_kind {
-            if kind == "ensure-filler" {
-                // Filler bytes are deterministic and installation is
-                // idempotent. Recompute them instead of retaining a 64 KiB
-                // response for every coding group in the operation journal.
+            if matches!(
+                kind,
+                "ensure-filler" | "reserve-coding-information" | "reserve-coding-parity"
+            ) {
+                // Filler installation is idempotent. Reservation replies carry
+                // a mutable durable upload cursor, so an old journal response
+                // must never replace the holder's current progress on resume.
                 return execute_peer_request(&mut node_guard, config, request_id, caller, request);
             }
             if let Some(cached_bytes) =

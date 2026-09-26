@@ -44,3 +44,14 @@ that exact historical signed plan without creating a fence. Its authenticated
 retirement. A false response leaves delivery retryable. Following rejected
 result delivery, a true response allows the coder to resume holder cleanup and
 finish its durable submission job; transport errors never authorize deletion.
+
+Information and parity reservations return the holder's current durable upload
+cursor. Repeated requests, including after reopen, recheck that cursor rather
+than replaying a previously journaled offset. An interrupted upload resumes
+from its acknowledged prefix under the same immutable plan.
+
+Signed failure transfers packed-input intent to retry ownership. Each successor
+receives that intent durably and stages its own information before delegation;
+discarded parent receipts do not establish successor availability. Input intent
+pins the delegator's packed cache until terminal activation, cleanup, or durable
+handoff to another failure owner.

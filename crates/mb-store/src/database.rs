@@ -237,6 +237,33 @@ impl ControlStore {
         Ok(())
     }
 
+    /// Publish protocol ownership and retire obsolete records in one commit.
+    /// As with the conditional record helpers, the caller owns the writer.
+    pub fn put_records_and_delete(
+        &self,
+        records: &[(String, Vec<u8>, Vec<u8>)],
+        deletions: &[(String, Vec<u8>)],
+    ) -> Result<(), DatabaseError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        {
+            let mut put = transaction.prepare_cached(
+                "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+            )?;
+            for (kind, id, bytes) in records {
+                put.execute(params![kind, id, bytes])?;
+            }
+            let mut delete = transaction.prepare_cached(
+                "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
+            )?;
+            for (kind, id) in deletions {
+                delete.execute(params![kind, id])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn move_protocol_record(
         &mut self,
         source_kind: &str,
@@ -3465,6 +3492,68 @@ mod tests {
             })
             .unwrap();
         assert_eq!(visited, 130);
+    }
+
+    #[test]
+    fn protocol_ownership_handoff_rolls_back_and_survives_reopen() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([74; 32]));
+        let path = temp.path().join("control.db");
+        let store = ControlStore::open(&path, &keys).unwrap();
+        store.put_record("launch", b"A", b"signed-plan").unwrap();
+        store
+            .put_record("input", b"A", b"packed-descriptor")
+            .unwrap();
+        store.put_record("staged", b"A", b"parent-receipt").unwrap();
+        let records = vec![
+            (
+                "retry".to_owned(),
+                b"A".to_vec(),
+                b"failure-and-successor".to_vec(),
+            ),
+            (
+                "input".to_owned(),
+                b"B".to_vec(),
+                b"packed-descriptor".to_vec(),
+            ),
+        ];
+        let deletions = vec![
+            ("staged".to_owned(), b"A".to_vec()),
+            ("launch".to_owned(), b"A".to_vec()),
+        ];
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_handoff BEFORE DELETE ON protocol_records
+             WHEN OLD.kind = 'launch' BEGIN SELECT RAISE(ABORT, 'injected crash'); END;",
+            )
+            .unwrap();
+        assert!(store.put_records_and_delete(&records, &deletions).is_err());
+        assert!(store.get_record("retry", b"A").unwrap().is_none());
+        assert!(store.get_record("input", b"B").unwrap().is_none());
+        assert!(store.get_record("staged", b"A").unwrap().is_some());
+        assert!(store.get_record("launch", b"A").unwrap().is_some());
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_handoff;")
+            .unwrap();
+        store.put_records_and_delete(&records, &deletions).unwrap();
+        drop(store);
+        for _ in 0..2 {
+            let store = ControlStore::open(&path, &keys).unwrap();
+            assert!(store.get_record("launch", b"A").unwrap().is_none());
+            assert!(store.get_record("staged", b"A").unwrap().is_none());
+            assert_eq!(
+                store.get_record("retry", b"A").unwrap().unwrap(),
+                b"failure-and-successor"
+            );
+            for id in [b"A", b"B"] {
+                assert_eq!(
+                    store.get_record("input", id).unwrap().unwrap(),
+                    b"packed-descriptor"
+                );
+            }
+        }
     }
 
     #[test]

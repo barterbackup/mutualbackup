@@ -2857,7 +2857,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   plans stay immutable, and all holders finish without leaked staged objects,
   receipts or reservations after repeated reopen. This finding is source-only.
 
-- [ ] **M5-113 / P1 — Restage packed information for signed-failure retry successors.**
+- [x] **M5-113 / P1 — Restage packed information for signed-failure retry successors.**
   Packed lanes can place information on a holder other than the delegator
   (`network/p2p.rs:12368`–`:12385`), while their initial coder is the delegator
   (`:6866`–`:6889`, `:12666`). Initial launch staging uploads those packed bytes
@@ -2890,6 +2890,45 @@ node Clippy gate passed locally. No remote compilation server was used.
   coverage, immutable signed history, exact capacity on every holder, and zero
   staged receipts/reservations through repeated reopen. This finding is
   source-only.
+
+  Implementation update (2026-09-26): signed-failure acceptance now atomically
+  retains input intent and publishes retry ownership while deleting the old
+  launch/staging marker. Successor preparation commits its immutable plan and
+  input descriptors together. Retry execution cleans the parent, resumes all
+  successor input uploads under the selected ID, and marks staging complete
+  before delegation. Partial/offline uploads defer the same durable successor;
+  coalesced replanning does not create another launch. A further signed failure
+  transfers intent to its own retry before dropping parent metadata. Terminal
+  activation/cleanup releases input records atomically; dispatch acknowledgement
+  keeps them. Existing descriptor-less failed jobs can recover authenticated
+  descriptors from the delegator's packed cache. Input intent pins that cache
+  through unrelated checkpoint GC until terminal cleanup.
+
+  The real packed-lane regression passes locally in 108.45 seconds. Actual
+  production packing/placement puts two nonzero inputs on holders with no
+  source/cache/READY copies; the initial coder is the delegator. After initial
+  input staging, the production failure path cleans the parent and accepts its
+  signed report. A fresh pair excludes both initial roles. Real partial input
+  and parity uploads, an offline input volume, coalesced replanning, same-epoch
+  reopen, verifier acceptance, activation and checkpoint coverage all pass.
+  Every holder has exact expected capacity and zero staged receipts/reservations
+  after two more reopens, with immutable plans/failure retained and input intent
+  released. The test also exposed cached reservation offsets: information and
+  parity reservations now recheck their current durable cursor on every request
+  rather than replaying a journaled old offset, including after reopen.
+
+  All 13 retry regressions pass together (102.86 seconds), including existing
+  expiry, lineage, staging, membership and unrelated-work cases. Durable-history
+  migration passes (19.48 seconds). The cache/GC regression passes (40.44
+  seconds), retaining the packed copy across advancing unrelated checkpoints
+  and reopen, then collecting it after terminal cleanup. The store rollback/
+  reopen test passes (0.70 seconds), proving failed ownership transactions do
+  not publish partial retry/input state or delete the launch. Strict locked
+  mb-node/mb-store all-target Clippy passes (14.83 seconds), and formatting
+  passes. Logs are `/tmp/mutualbackup-m5-113-*`; failed development runs are
+  not passing evidence. Cleanup/submission corrections were committed as
+  `6cbe822`. M5-116's acknowledged-successor recovery gap and the complete
+  final M5-114 gate remain open. All builds and runs were local.
 
 - [x] **M5-115 / P1 — Finish retired delegated submissions without starving stale cleanup.**
   Source-only review on 2026-09-26 covers `d3fd117` plus the pending cleanup
@@ -2973,8 +3012,36 @@ node Clippy gate passed locally. No remote compilation server was used.
   `/tmp/mutualbackup-m5-112-failure-unrelated-v2.log`. M5-113 and the complete
   exact-commit M5-114 gate remain open. All builds and runs are local.
 
+- [ ] **M5-116 / P1 — Recover acknowledged retry successors after silence or epoch change.**
+  The input-intent audit during M5-113 implementation found a separate owner
+  gap. `process_coding_retry_job` completes the parent when successor delegation
+  returns an acknowledgement (`crates/mb-node/src/network/p2p.rs:6252`;
+  `:6673`). `claim_coding_retry` skips that completed parent forever
+  (`crates/mb-node/src/node.rs:5536`), so its existing successor-expiry branch
+  cannot run if the new coder disappears before sending result/failure.
+  No launch job is created for that acknowledged successor. Checkpoint coverage
+  keeps waiting (`network/p2p.rs:12964`), and coalescing alone does not create
+  a new owner. Retained input intent now makes recovery possible but cannot
+  make this unreachable worker transition execute. A completed parent can
+  also retain cleanup/input ownership through an epoch change when its child
+  has no accepted submission.
+
+  Distinguish delegation acknowledgement from terminal completion when
+  selecting durable retry ownership. Make acknowledged expiry and stale
+  cleanup reachable without repeatedly dispatching a live successor or
+  reopening terminal history. Prefer accepted child activation/failure over
+  cleanup; preserve exact signed parent and successor history, reclaim
+  unfinished staging before renewal, and retain recoverable input intent
+  until the next owner takes it durably. Gate a real remotely placed packed
+  successor acknowledged before coordinator silence, its actual signed
+  deadline, same-epoch reopen, fresh replacement roles, verifier acceptance,
+  activation/checkpoint coverage, all holders' exact capacity and no staged
+  receipts/reservations through repeated reopen. Include accepted evidence
+  and stale acknowledged ownership so completed cleanup does not loop.
+  This finding is from source inspection; correction and validation are pending.
+
 - [ ] **M5-114 / gate — Recheck Milestone 5 after cleanup ownership and packed retries.**
-  Correct M5-111 through M5-113 and M5-115, then source-review the final
+  Correct M5-111 through M5-113, M5-115 and M5-116, then source-review the final
   committed tree and run their controlled production-worker regressions locally. On that
   exact source, pass strict locked all-target workspace Clippy, locked
   all-target workspace tests, formatting, Docker lab safety, and the complete
