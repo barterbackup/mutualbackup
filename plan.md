@@ -58,10 +58,10 @@ them as ADRs and test vectors before promising wire compatibility.
 
 ### Implemented baseline — efficient and flexible guild protocol beta reopened
 
-Milestones 0 through 4 have passed. Milestone 5 remains open for M5-118's
-renewal ownership correction and the complete M5-114 final local gate after
-acknowledged retry recovery and confirmed cleanup
-completion (M5-116/M5-117). Those corrections now distinguish delegation
+Milestones 0 through 4 have passed. Milestone 5 remains open for the complete
+M5-114 final local gate after the renewal ownership correction (M5-118),
+acknowledged retry recovery and confirmed cleanup completion (M5-116/M5-117).
+Those corrections now distinguish delegation
 acknowledgement from terminal cleanup and retain accepted child ownership.
 M5-113 now transfers packed input intent atomically and resumes successor
 uploads before delegation; its production partial-upload/offline/reopen,
@@ -2019,18 +2019,20 @@ source locations, failure cases, and recorded gate evidence.
 
 ### Milestone 5 — efficient and flexible data/guild protocol (reopened)
 
-The first full M5-114 workspace run on `3e5a7e3` exposes **M5-118**. All
-48 core tests, 275 node tests, formatting and strict workspace Clippy pass;
-four real launch-expiry regressions fail their exact-successor assertion.
-Recovered acknowledged retry ownership progresses first, but launch renewal
-searches only other launches and creates a second successor rather than reusing
-the live retry child. Make renewal coalesce with authenticated retry ownership
-and accepted verified activation, preserving exact signed lineage and atomic
-input-intent handoff. Retain the regressions' capacity/cleanup and checkpoint
-assertions. Later workspace suites and Docker safety did not run after the node
-failure; fresh Btrfs/network acceptance has not begun. Correct M5-118, then run
-the complete final M5-114 gate on the committed source before Milestone 6.
-Details and evidence are in TODO.md; all builds and runs were local.
+The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
+launch-expiry regressions found duplicate same-lane successors. Renewal now
+reuses accepted verified activation or a live retry child before an existing
+launch, preserving exact signed lineage and atomic input-intent handoff. An
+expired durable launch retains cleanup/renewal priority over retry replanning.
+All eight focused launch tests now pass, including the four real regressions
+with exact successor, capacity/cleanup and checkpoint assertions unchanged.
+The controlled retry/activation ownership and repeated-reopen assertions,
+strict focused Clippy, formatting and whitespace checks also pass. The first
+workspace run had passed formatting, Clippy, 48 core tests and 275 node tests
+but stopped at those four failures; later suites, Docker safety and fresh
+Btrfs/network acceptance have not run on the corrected source. The complete
+M5-114 gate on the final committed source remains before Milestone 6. Details
+and local evidence are in TODO.md.
 
 M5-116/M5-117 implementation update (2026-09-26): durable claims reclaim an
 acknowledged child after expiry, staleness or retirement unless terminal cleanup

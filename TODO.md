@@ -3166,7 +3166,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   exact-commit M5-114 workspace and fresh provisioned acceptance gate remain
   required. All builds and runs were local.
 
-- [ ] **M5-118 / P1 — Reuse live retry ownership during expired-launch renewal.**
+- [x] **M5-118 / P1 — Reuse live retry ownership during expired-launch renewal.**
   The first full M5-114 workspace run on `3e5a7e3` passes strict workspace
   Clippy, formatting, all 48 core tests and 275 node tests, but four launch
   expiry regressions fail at the exact-successor assertion
@@ -3197,6 +3197,21 @@ node Clippy gate passed locally. No remote compilation server was used.
   Workspace tests stopped at the node failure, so later suites and Docker lab
   safety did not run. Fresh Btrfs/network acceptance has not begun and no
   provisioned resources were created. All compilation and execution were local.
+
+  Implemented on 2026-09-27: renewal now selects accepted verified activation,
+  then a live authenticated retry child, then an existing launch. It links the
+  retired launch to that exact signed owner and atomically transfers any missing
+  input intent needed for unfinished work without creating a second launch.
+  A durable expired launch also keeps priority over retry replanning while its
+  cleanup and renewal remain pending. Controlled node assertions verify retry
+  and activation ownership, input handling, history, and two reopens. All eight
+  focused launch tests pass, including the four previously failing real QUIC
+  cases with exact successor/capacity/checkpoint assertions unchanged; the
+  controlled ownership test, strict locked mb-node/mb-store all-target Clippy,
+  formatting, and whitespace checks pass. Logs are
+  `/tmp/mutualbackup-m5-118-launches-v1.log`,
+  `/tmp/mutualbackup-m5-118-unit-v1.log`, and
+  `/tmp/mutualbackup-m5-118-clippy-v1.log`. The full M5-114 gate remains open.
 
 - [ ] **M5-114 / gate — Recheck Milestone 5 after cleanup ownership and packed retries.**
   Correct M5-111 through M5-113 and M5-115 through M5-118, then source-review

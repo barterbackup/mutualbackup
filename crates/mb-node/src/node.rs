@@ -182,6 +182,25 @@ pub(crate) struct CodingLaunchJob {
     pub error: Option<String>,
 }
 
+enum CodingLaunchRenewalCandidate {
+    Launch(CodingLaunchJob),
+    Retry(SignedRecord<CodingAttemptPlan>),
+    Activation(SignedRecord<CodingAttemptPlan>),
+}
+
+impl CodingLaunchRenewalCandidate {
+    fn plan(&self) -> &SignedRecord<CodingAttemptPlan> {
+        match self {
+            Self::Launch(job) => &job.plan,
+            Self::Retry(plan) | Self::Activation(plan) => plan,
+        }
+    }
+
+    fn needs_input_intent(&self) -> bool {
+        !matches!(self, Self::Activation(_))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct VerifiedCodingTranscript(SignedRecord<CodingVerificationTranscript>);
 
@@ -4329,7 +4348,64 @@ impl Node {
     fn coding_launch_renewal_candidate(
         &self,
         prior: &SignedRecord<CodingAttemptPlan>,
-    ) -> Result<Option<CodingLaunchJob>> {
+    ) -> Result<Option<CodingLaunchRenewalCandidate>> {
+        let state = self
+            .dynamic_guild_state()?
+            .context("coding renewal requires a guild")?;
+        for (_, bytes) in self.control.records("coding-activation-job")? {
+            let activation: CodingActivationJob = decode_canonical(&bytes)?;
+            let candidate = &activation.transcript.value.plan;
+            if candidate.value.attempt_id != prior.value.attempt_id
+                && same_coding_lane(&candidate.value, &prior.value)
+            {
+                self.validate_coding_attempt_authority(candidate)?;
+                let group = &activation.transcript.value.manifest.value.group;
+                if replay_coding_transcript(&activation.transcript)?
+                    == CodingReplayFinding::Verified
+                    && state.validate_current_group_placement(group).is_ok()
+                    && (!activation.complete
+                        || state.coding_groups.iter().any(|retained| {
+                            retained.retired_at_event.is_none() && retained.group == *group
+                        }))
+                {
+                    return Ok(Some(CodingLaunchRenewalCandidate::Activation(
+                        candidate.clone(),
+                    )));
+                }
+            }
+        }
+        for (_, bytes) in self.control.records("coding-retry-job")? {
+            let retry: CodingRetryJob = decode_canonical(&bytes)?;
+            if let Some(candidate) = &retry.retry_plan
+                && candidate.value.attempt_id != prior.value.attempt_id
+                && same_coding_lane(&candidate.value, &prior.value)
+            {
+                self.validate_coding_attempt_authority(candidate)?;
+                let id = candidate.value.attempt_id;
+                if self.validate_coding_attempt_plan(candidate).is_ok()
+                    && self
+                        .control
+                        .get_record("coding-retired-attempt", &id)?
+                        .is_none()
+                    && self.control.get_record("coding-retry-job", &id)?.is_none()
+                    && (!retry.complete
+                        || self
+                            .control
+                            .get_record("delegated-coding-job", &id)?
+                            .map(|bytes| decode_canonical::<DelegatedCodingJob>(&bytes))
+                            .transpose()?
+                            .is_none_or(|delegated| {
+                                !matches!(
+                                    delegated.state,
+                                    DelegatedCodingJobState::Complete
+                                        | DelegatedCodingJobState::Failed
+                                )
+                            }))
+                {
+                    return Ok(Some(CodingLaunchRenewalCandidate::Retry(candidate.clone())));
+                }
+            }
+        }
         for (_, bytes) in self.control.records("coding-launch-job")? {
             let existing: CodingLaunchJob = decode_canonical(&bytes)?;
             let candidate = &existing.plan;
@@ -4345,7 +4421,7 @@ impl Node {
                     .get_record("coding-retry-job", &candidate.value.attempt_id)?
                     .is_none()
             {
-                return Ok(Some(existing));
+                return Ok(Some(CodingLaunchRenewalCandidate::Launch(existing)));
             }
         }
         Ok(None)
@@ -4385,7 +4461,7 @@ impl Node {
             } else {
                 let replacement = self.coding_launch_renewal_candidate(prior)?;
                 let new_launch = replacement.is_none();
-                let launch = match replacement {
+                let owner = match replacement {
                     Some(existing) => existing,
                     None => {
                         let (coding_coordinator, verification_coordinator) = coordinators
@@ -4402,28 +4478,31 @@ impl Node {
                         value.expires_at_unix_seconds = unix_seconds()
                             .checked_add(24 * 60 * 60)
                             .context("coding launch renewal expiry overflow")?;
-                        CodingLaunchJob {
+                        CodingLaunchRenewalCandidate::Launch(CodingLaunchJob {
                             format_version: 1,
                             plan: self.sign_coding_attempt_plan(value)?,
                             dispatched: false,
                             error: None,
-                        }
+                        })
                     }
                 };
-                let successor = launch.plan.clone();
+                let successor = owner.plan().clone();
                 let mut records = vec![(
                     "coding-launch-successor".to_owned(),
                     id.to_vec(),
                     canonical_bytes(&successor)?,
                 )];
                 if new_launch {
+                    let CodingLaunchRenewalCandidate::Launch(launch) = &owner else {
+                        anyhow::bail!("new coding renewal has no launch owner");
+                    };
                     records.push((
                         "coding-launch-job".to_owned(),
                         successor.value.attempt_id.to_vec(),
                         canonical_bytes(&launch)?,
                     ));
                 }
-                if !launch.dispatched
+                if owner.needs_input_intent()
                     && self
                         .coding_launch_information_to_stage(successor.value.attempt_id)?
                         .is_none()
@@ -5826,8 +5905,10 @@ impl Node {
         for (_, bytes) in self.control.records("coding-launch-job")? {
             let launch: CodingLaunchJob = decode_canonical(&bytes)?;
             if replaces(&launch.plan.value)
-                && self.validate_coding_attempt_plan(&launch.plan).is_ok()
+                && self.validate_coding_attempt_authority(&launch.plan).is_ok()
             {
+                // An expired or fenced launch still owns cleanup and renewal.
+                // Yield to that durable owner before creating a competing retry.
                 return Ok(true);
             }
         }
@@ -15320,6 +15401,56 @@ pub(crate) mod tests {
             );
             assert_eq!(node.coding_retry_evidence_for_test([2; 16]).unwrap(), child);
         }
+        // The retry child owns this lane even when an expired launch is
+        // renewed after the child was acknowledged and the delegator reopened.
+        let retry_first = sign(252, 3, unix_seconds() - 1);
+        let retry_first_job = CodingLaunchJob {
+            format_version: 1,
+            plan: retry_first.clone(),
+            dispatched: true,
+            error: None,
+        };
+        node.put_coding_launch_job(&retry_first_job).unwrap();
+        node.control
+            .put_record(
+                "coding-launch-information",
+                &retry_first.value.attempt_id,
+                &canonical_bytes(&BTreeMap::<SectorId, PackedSectorDescriptor>::new()).unwrap(),
+            )
+            .unwrap();
+        assert!(node.retire_coding_retry_plan(&retry_first).unwrap());
+        assert_eq!(
+            node.renew_coding_launch_after_cleanup(&retry_first_job, None)
+                .unwrap(),
+            live
+        );
+        assert!(
+            node.control
+                .records("coding-launch-job")
+                .unwrap()
+                .is_empty()
+        );
+        for _ in 0..2 {
+            drop(node);
+            node = Node::open(temp.path(), seed.clone()).unwrap();
+            assert_eq!(
+                node.coding_launch_successor_for_test(retry_first.value.attempt_id)
+                    .unwrap(),
+                Some(live.clone())
+            );
+            assert_eq!(
+                node.coding_launch_information_to_stage(live.value.attempt_id)
+                    .unwrap(),
+                Some(BTreeMap::new())
+            );
+            assert_eq!(node.coding_retry_evidence_for_test([2; 16]).unwrap(), child);
+            assert!(
+                node.control
+                    .records("coding-launch-job")
+                    .unwrap()
+                    .is_empty()
+            );
+        }
         node.complete_coding_retry([2; 16]).unwrap();
         node.accept_coding_failure(live.value.coding_coordinator, failure(live.clone()))
             .unwrap();
@@ -15345,6 +15476,49 @@ pub(crate) mod tests {
             verified
         );
         assert!(node.claim_coding_launch().unwrap().is_none());
+        // A verified accepted result is stronger than a fresh launch. Renewal
+        // records its exact signed owner without recreating staging intent.
+        let activation_first = sign(248, 3, unix_seconds() - 1);
+        let activation_first_job = CodingLaunchJob {
+            format_version: 1,
+            plan: activation_first.clone(),
+            dispatched: true,
+            error: None,
+        };
+        node.put_coding_launch_job(&activation_first_job).unwrap();
+        node.control
+            .put_record(
+                "coding-launch-information",
+                &activation_first.value.attempt_id,
+                &canonical_bytes(&BTreeMap::<SectorId, PackedSectorDescriptor>::new()).unwrap(),
+            )
+            .unwrap();
+        assert!(node.retire_coding_retry_plan(&activation_first).unwrap());
+        assert_eq!(
+            node.renew_coding_launch_after_cleanup(&activation_first_job, None)
+                .unwrap(),
+            verified
+        );
+        for _ in 0..2 {
+            drop(node);
+            node = Node::open(temp.path(), seed.clone()).unwrap();
+            assert_eq!(
+                node.coding_launch_successor_for_test(activation_first.value.attempt_id)
+                    .unwrap(),
+                Some(verified.clone())
+            );
+            assert!(
+                node.coding_launch_information_to_stage(verified.value.attempt_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                node.control
+                    .records("coding-launch-job")
+                    .unwrap()
+                    .is_empty()
+            );
+        }
 
         // Simulate a crash after the successor transaction but before parent
         // removal. Reopening and repeating renewal must reuse the signed ID.
