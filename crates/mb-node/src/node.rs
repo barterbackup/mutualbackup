@@ -182,6 +182,20 @@ pub(crate) struct CodingLaunchJob {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CodingHolderCleanupObligation {
+    pub format_version: u16,
+    pub plan: SignedRecord<CodingAttemptPlan>,
+    pub holder: NodeId,
+}
+
+fn coding_holder_cleanup_id(obligation: &CodingHolderCleanupObligation) -> Vec<u8> {
+    let mut id = Vec::with_capacity(48);
+    id.extend_from_slice(&obligation.plan.value.attempt_id);
+    id.extend_from_slice(&obligation.holder.0);
+    id
+}
+
 enum CodingLaunchRenewalCandidate {
     Launch(CodingLaunchJob),
     Retry(SignedRecord<CodingAttemptPlan>),
@@ -6657,6 +6671,113 @@ impl Node {
             }
         }
         self.volumes.discard_attempt(&self.control, attempt_id)
+    }
+
+    pub(crate) fn record_coding_holder_cleanup(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+        holder: NodeId,
+    ) -> Result<()> {
+        self.validate_coding_attempt_authority(plan)?;
+        if !plan
+            .value
+            .geometry
+            .information
+            .iter()
+            .any(|role| !role.sector.virtual_zero && role.owner == holder)
+            && !plan
+                .value
+                .geometry
+                .parity
+                .iter()
+                .any(|role| role.holder == holder)
+        {
+            anyhow::bail!("coding cleanup holder is absent from the signed plan");
+        }
+        let obligation = CodingHolderCleanupObligation {
+            format_version: 1,
+            plan: plan.clone(),
+            holder,
+        };
+        let id = coding_holder_cleanup_id(&obligation);
+        let bytes = canonical_bytes(&obligation)?;
+        if let Some(existing) = self.control.get_record("coding-holder-cleanup", &id)?
+            && existing != bytes
+        {
+            anyhow::bail!("coding holder cleanup conflicts with its durable obligation");
+        }
+        self.control
+            .put_record("coding-holder-cleanup", &id, &bytes)?;
+        Ok(())
+    }
+
+    pub(crate) fn claim_coding_holder_cleanup_after(
+        &self,
+        after: Option<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, CodingHolderCleanupObligation)>> {
+        let mut first = None;
+        for (id, bytes) in self.control.records("coding-holder-cleanup")? {
+            let obligation: CodingHolderCleanupObligation = decode_canonical(&bytes)?;
+            if obligation.format_version != 1 || id != coding_holder_cleanup_id(&obligation) {
+                anyhow::bail!("durable coding holder cleanup is invalid");
+            }
+            self.validate_coding_attempt_authority(&obligation.plan)?;
+            if after.as_ref().is_none_or(|cursor| id > *cursor) {
+                return Ok(Some((id, obligation)));
+            }
+            first.get_or_insert((id, obligation));
+        }
+        Ok(first)
+    }
+
+    pub(crate) fn complete_coding_holder_cleanup(
+        &self,
+        obligation: &CodingHolderCleanupObligation,
+    ) -> Result<()> {
+        let id = coding_holder_cleanup_id(obligation);
+        if let Some(existing) = self.control.get_record("coding-holder-cleanup", &id)? {
+            if existing != canonical_bytes(obligation)? {
+                anyhow::bail!("coding holder cleanup changed before acknowledgement");
+            }
+            self.control.delete_record("coding-holder-cleanup", &id)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_coding_holder_cleanup(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+        holder: NodeId,
+    ) -> Result<()> {
+        self.complete_coding_holder_cleanup(&CodingHolderCleanupObligation {
+            format_version: 1,
+            plan: plan.clone(),
+            holder,
+        })
+    }
+
+    pub(crate) fn coding_holder_cleanup_endpoints(
+        &self,
+        guild_id: [u8; 32],
+        holder: NodeId,
+    ) -> Result<Vec<String>> {
+        let Some(cache) = self.guild_endpoint_cache()? else {
+            return Ok(Vec::new());
+        };
+        if cache.format_version != 1 || cache.guild_id != guild_id {
+            anyhow::bail!("coding cleanup endpoint cache belongs to another guild");
+        }
+        Ok(cache
+            .endpoints
+            .into_iter()
+            .find(|(member, _)| *member == holder)
+            .map(|(_, endpoints)| endpoints)
+            .unwrap_or_default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coding_holder_cleanup_count_for_test(&self) -> Result<usize> {
+        Ok(self.control.records("coding-holder-cleanup")?.len())
     }
 
     pub(crate) fn validate_coding_attempt_for_cleanup(

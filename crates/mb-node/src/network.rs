@@ -55,9 +55,9 @@ pub use p2p::{
     P2pPathMetrics, P2pPathTransfer, P2pPeerProfile, P2pPeerStatus, P2pSessionDirection,
     P2pSessionHistory, P2pSessionOutcome, P2pStartup, P2pStartupReceiver, P2pStatus, audit_guild,
     build_p2p, build_p2p_with_tor, endpoint_record_key, recover_from_dht, recovery_bundle_key,
-    recovery_mailbox_key, run_coordinator_jobs, run_delegated_coding_jobs, run_dht_publications,
-    run_peer_exchange, run_relay_membership_sync, validate_bootstrap_addresses,
-    validate_local_advertised_endpoints,
+    recovery_mailbox_key, run_coding_holder_cleanup_jobs, run_coordinator_jobs,
+    run_delegated_coding_jobs, run_dht_publications, run_peer_exchange, run_relay_membership_sync,
+    validate_bootstrap_addresses, validate_local_advertised_endpoints,
 };
 pub(crate) use p2p::{
     GuildAdministration, commit_guild_administration, is_retryable_p2p_request_error,

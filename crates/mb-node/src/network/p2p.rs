@@ -6070,6 +6070,69 @@ pub async fn run_delegated_coding_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -
     }
 }
 
+pub async fn run_coding_holder_cleanup_jobs(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result<()> {
+    let mut cursor = None;
+    loop {
+        process_coding_holder_cleanup_job(node.clone(), &p2p, &mut cursor).await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn process_coding_holder_cleanup_job(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    cursor: &mut Option<Vec<u8>>,
+) -> Result<()> {
+    let after = cursor.clone();
+    let Some((id, obligation)) = node_blocking(node.clone(), move |node| {
+        node.claim_coding_holder_cleanup_after(after)
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    *cursor = Some(id);
+    let holder = obligation.holder;
+    let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
+    let result = if holder == local_id {
+        let attempt_id = obligation.plan.value.attempt_id;
+        node_blocking(node.clone(), move |node| {
+            if node.discard_coding_attempt(&attempt_id)? {
+                Ok(())
+            } else {
+                bail!("some staged coding volumes are offline")
+            }
+        })
+        .await
+    } else {
+        let guild_id = obligation.plan.value.geometry.guild_id;
+        let endpoints = node_blocking(node.clone(), move |node| {
+            node.coding_holder_cleanup_endpoints(guild_id, holder)
+        })
+        .await?;
+        for endpoint in endpoints {
+            if let Ok(address) = endpoint.parse() {
+                let _ = p2p.add_peer_address(holder, address).await;
+            }
+        }
+        p2p.abort_coding_attempt(holder, obligation.plan.clone())
+            .await
+    };
+    match result {
+        Ok(()) => {
+            node_blocking(node, move |node| {
+                node.complete_coding_holder_cleanup(&obligation)
+            })
+            .await?;
+        }
+        Err(error) => {
+            tracing::debug!(%holder, ?obligation.plan.value.attempt_id, %error,
+                "coding holder cleanup remains pending");
+        }
+    }
+    Ok(())
+}
+
 async fn process_delegated_coding_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
     let Some(job) = node_blocking(node.clone(), |node| node.claim_delegated_coding()).await? else {
         return Ok(());
@@ -7409,10 +7472,23 @@ async fn abort_delegated_coding_with_policy(
         } else {
             p2p.abort_coding_attempt(holder, job.plan.clone()).await
         };
-        if let Err(error) = result {
-            if tolerate_inactive_holders && !active_holders.contains(&holder) {
-                tracing::debug!(%holder, %error, "inactive holder did not acknowledge stale coding cleanup");
-            } else {
+        match result {
+            Ok(()) => {
+                let plan = job.plan.clone();
+                node_blocking(node.clone(), move |node| {
+                    node.clear_coding_holder_cleanup(&plan, holder)
+                })
+                .await?;
+            }
+            Err(error) if tolerate_inactive_holders && !active_holders.contains(&holder) => {
+                let plan = job.plan.clone();
+                node_blocking(node.clone(), move |node| {
+                    node.record_coding_holder_cleanup(&plan, holder)
+                })
+                .await?;
+                tracing::debug!(%holder, %error, "inactive holder cleanup retained for retry");
+            }
+            Err(error) => {
                 first_error.get_or_insert(error);
             }
         }
@@ -23419,6 +23495,272 @@ mod tests {
             Some(CodingCleanupRace::Retired),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn removed_offline_holder_cleanup_retries_after_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds = (201_u8..206)
+            .map(|byte| Seed::from_bytes([byte; 32]))
+            .collect::<Vec<_>>();
+        let nodes = seeds
+            .iter()
+            .enumerate()
+            .map(|(index, seed)| {
+                Arc::new(Mutex::new(
+                    Node::open(temp.path().join(format!("node-{index}")), seed.clone()).unwrap(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for (index, node) in nodes.iter().enumerate() {
+            let volume = temp.path().join(format!("volume-{index}"));
+            std::fs::create_dir(&volume).unwrap();
+            node.lock()
+                .unwrap()
+                .configure_storage_volumes(&[volume], 4 * 1024 * 1024, 0)
+                .unwrap();
+            let mut cfg = config(node.lock().unwrap().keys().node_id());
+            cfg.enable_relay_server = false;
+            let (client, event_loop) = build_p2p(node.clone(), cfg).unwrap();
+            clients.push(client);
+            tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let addresses = futures::future::join_all(clients.iter().map(listening_address)).await;
+        let endpoints = clients
+            .iter()
+            .zip(addresses.iter().cloned())
+            .map(|(client, address)| peer_endpoint(client, address))
+            .collect::<Vec<_>>();
+        form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+        let ids = nodes
+            .iter()
+            .map(|node| node.lock().unwrap().keys().node_id())
+            .collect::<Vec<_>>();
+        let state = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap();
+        let member = |id| {
+            state
+                .active_members()
+                .find(|member| member.node_id == id)
+                .unwrap()
+                .clone()
+        };
+        let bytes = vec![67; 64];
+        let plan = nodes[0]
+            .lock()
+            .unwrap()
+            .sign_coding_attempt_plan(CodingAttemptPlan {
+                format_version: 3,
+                attempt_id: [73; 16],
+                checkpoint_hash: [74; 32],
+                membership_epoch: state.membership_epoch,
+                geometry: CodingPlanGeometry {
+                    format_version: 1,
+                    guild_id: state.guild_id,
+                    profile: CodingProfile::new(1, 1, 64),
+                    information: vec![InformationRoleV2 {
+                        owner: ids[0],
+                        failure_domain: member(ids[0]).failure_domain,
+                        sector: RangeSectorRef {
+                            id: [75; 32],
+                            commitment: merkle_commit(&bytes).unwrap(),
+                            logical_len: 64,
+                            virtual_zero: false,
+                        },
+                    }],
+                    parity: vec![ParityPlacementV2 {
+                        holder: ids[1],
+                        failure_domain: member(ids[1]).failure_domain,
+                        row: 0,
+                    }],
+                },
+                delegator: ids[0],
+                coding_coordinator: ids[2],
+                verification_coordinator: ids[3],
+                expires_at_unix_seconds: unix_seconds() + 600,
+                information_roots: Some(vec![sector_root(&bytes)]),
+            })
+            .unwrap();
+        let mut reserved_value = plan.value.clone();
+        reserved_value.attempt_id = [76; 16];
+        let reserved = nodes[0]
+            .lock()
+            .unwrap()
+            .sign_coding_attempt_plan(reserved_value)
+            .unwrap();
+        let (manifest, parity) = nodes[2]
+            .lock()
+            .unwrap()
+            .encode_delegated_coding(&plan, vec![Some(bytes)])
+            .unwrap();
+        let ShardRoleV2::Parity(role) = &manifest.value.group.roles[1] else {
+            unreachable!();
+        };
+        nodes[1]
+            .lock()
+            .unwrap()
+            .stage_coding_parity(
+                &plan,
+                &manifest,
+                &VariableParityObject {
+                    format_version: 2,
+                    guild_id: state.guild_id,
+                    group_id: manifest.value.group.id,
+                    shard_index: 1,
+                    commitment: role.commitment.clone(),
+                    bytes: parity[0].clone(),
+                },
+            )
+            .unwrap();
+        nodes[1]
+            .lock()
+            .unwrap()
+            .reserve_coding_parity(&reserved, 1)
+            .unwrap();
+        {
+            let holder = nodes[1].lock().unwrap();
+            assert!(holder.coding_used_bytes_for_test().unwrap() > 0);
+            assert_eq!(holder.coding_staged_receipt_count_for_test().unwrap(), 1);
+            assert_eq!(holder.coding_reservation_count_for_test().unwrap(), 1);
+        }
+
+        // The holder misses the removal event while its network is offline.
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RemoveMember { node_id: ids[1] },
+        };
+        let mut signatures = nodes
+            .iter()
+            .map(|node| mb_core::sign_guild_event(&event, node.lock().unwrap().keys()).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        let certified = QuorumGuildEvent { event, signatures };
+        for (index, node) in nodes.iter().enumerate() {
+            if index != 1 {
+                node.lock()
+                    .unwrap()
+                    .install_guild_event(certified.clone())
+                    .unwrap();
+            }
+        }
+        clients[1].shutdown().await.unwrap();
+        tasks.remove(1).await.unwrap().unwrap();
+        for pending in [&plan, &reserved] {
+            abort_stale_delegated_coding(
+                nodes[0].clone(),
+                &clients[0],
+                &DelegatedCodingJob {
+                    format_version: 1,
+                    plan: pending.clone(),
+                    state: DelegatedCodingJobState::Cleanup,
+                    transcript: None,
+                    error: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .coding_holder_cleanup_count_for_test()
+                .unwrap(),
+            2
+        );
+        for (index, client) in clients.iter().enumerate() {
+            if index != 1 {
+                client.shutdown().await.unwrap();
+            }
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        drop(clients);
+        drop(nodes);
+
+        for _ in 0..2 {
+            let owner = Node::open(temp.path().join("node-0"), seeds[0].clone()).unwrap();
+            let holder = Node::open(temp.path().join("node-1"), seeds[1].clone()).unwrap();
+            assert_eq!(owner.coding_holder_cleanup_count_for_test().unwrap(), 2);
+            assert!(holder.coding_used_bytes_for_test().unwrap() > 0);
+            assert_eq!(holder.coding_staged_receipt_count_for_test().unwrap(), 1);
+            assert_eq!(holder.coding_reservation_count_for_test().unwrap(), 1);
+        }
+
+        let owner = Arc::new(Mutex::new(
+            Node::open(temp.path().join("node-0"), seeds[0].clone()).unwrap(),
+        ));
+        let holder = Arc::new(Mutex::new(
+            Node::open(temp.path().join("node-1"), seeds[1].clone()).unwrap(),
+        ));
+        let mut owner_cfg = config(ids[0]);
+        owner_cfg.enable_relay_server = false;
+        let mut holder_cfg = config(ids[1]);
+        holder_cfg.enable_relay_server = false;
+        let (owner_client, owner_event) = build_p2p(owner.clone(), owner_cfg).unwrap();
+        let (holder_client, holder_event) = build_p2p(holder.clone(), holder_cfg).unwrap();
+        let owner_task = tokio::spawn(owner_event.run());
+        let holder_task = tokio::spawn(holder_event.run());
+        let holder_address = listening_address(&holder_client).await;
+        owner_client
+            .add_peer_address(ids[1], holder_address)
+            .await
+            .unwrap();
+        let mut cursor = None;
+        for _ in 0..8 {
+            process_coding_holder_cleanup_job(owner.clone(), &owner_client, &mut cursor)
+                .await
+                .unwrap();
+            if owner
+                .lock()
+                .unwrap()
+                .coding_holder_cleanup_count_for_test()
+                .unwrap()
+                == 0
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            owner
+                .lock()
+                .unwrap()
+                .coding_holder_cleanup_count_for_test()
+                .unwrap(),
+            0
+        );
+        {
+            let holder = holder.lock().unwrap();
+            assert_eq!(holder.coding_used_bytes_for_test().unwrap(), 0);
+            assert_eq!(holder.coding_staged_receipt_count_for_test().unwrap(), 0);
+            assert_eq!(holder.coding_reservation_count_for_test().unwrap(), 0);
+        }
+        owner_client.shutdown().await.unwrap();
+        holder_client.shutdown().await.unwrap();
+        owner_task.await.unwrap().unwrap();
+        holder_task.await.unwrap().unwrap();
+        drop(owner_client);
+        drop(holder_client);
+        drop(owner);
+        drop(holder);
+        for _ in 0..2 {
+            let owner = Node::open(temp.path().join("node-0"), seeds[0].clone()).unwrap();
+            let holder = Node::open(temp.path().join("node-1"), seeds[1].clone()).unwrap();
+            assert_eq!(owner.coding_holder_cleanup_count_for_test().unwrap(), 0);
+            assert_eq!(holder.coding_used_bytes_for_test().unwrap(), 0);
+            assert_eq!(holder.coding_staged_receipt_count_for_test().unwrap(), 0);
+            assert_eq!(holder.coding_reservation_count_for_test().unwrap(), 0);
+        }
     }
 
     #[tokio::test]
