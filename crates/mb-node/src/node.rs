@@ -6556,6 +6556,53 @@ impl Node {
                 {
                     value.format_version = 3;
                 }
+                let state = self
+                    .dynamic_guild_state()?
+                    .context("coding activation requires dynamic guild state")?;
+                let group = &job.transcript.value.manifest.value.group;
+                let mut candidate = group.clone();
+                candidate.format_version = value.format_version;
+                candidate.id = candidate.calculate_id()?;
+                if state
+                    .coding_groups
+                    .iter()
+                    .any(|retained| retained.group.id == candidate.id)
+                {
+                    // Re-encoding with only a new attempt ID would produce
+                    // a group ID that the guild has already recorded.
+                    let mut replacement = None;
+                    'placements: for index in 0..value.geometry.parity.len() {
+                        for member in state.active_members() {
+                            let mut geometry = value.geometry.clone();
+                            geometry.parity[index].holder = member.node_id;
+                            geometry.parity[index].failure_domain = member.failure_domain.clone();
+                            if geometry.validate().is_err() {
+                                continue;
+                            }
+                            let mut candidate = candidate.clone();
+                            let role_index = geometry.information.len() + index;
+                            let mb_core::ShardRoleV2::Parity(role) =
+                                &mut candidate.roles[role_index]
+                            else {
+                                anyhow::bail!("verified coding group has an invalid parity role");
+                            };
+                            role.holder = member.node_id;
+                            role.failure_domain = member.failure_domain.clone();
+                            candidate.id = candidate.calculate_id()?;
+                            if state
+                                .coding_groups
+                                .iter()
+                                .any(|retained| retained.group.id == candidate.id)
+                            {
+                                continue;
+                            }
+                            replacement = Some(geometry);
+                            break 'placements;
+                        }
+                    }
+                    value.geometry =
+                        replacement.context("coding group has no unused parity placement")?;
+                }
                 loop {
                     rand::rngs::OsRng.fill_bytes(&mut value.attempt_id);
                     if value.attempt_id != [0; 16] && value.attempt_id != prior.value.attempt_id {
