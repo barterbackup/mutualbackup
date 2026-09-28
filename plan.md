@@ -72,13 +72,14 @@ A further source-only review of that same code found M5-128 through M5-130:
 full-width retired activation can terminate the daemon and strand coverage,
 replacement parity can choose an unusable holder, and initial negative coding
 evidence can relaunch with the same faulty coordinator. Milestone 5 is open;
-Milestone 6 waits for those corrections and M5-131.
-The follow-up commits `561a438`, `95962be`, and `2affb17` add durable
-post-forget replanning, capacity-aware parity rotation across retries and
-expiry, and historical invalid-coder exclusion. M5-130 is corrected at source
-level. M5-128 still needs a passing full-width production worker through
-backup completion and repeated reopen; M5-129 still needs the integrated
-offline-first-spare coverage/reopen schedule. M5-131 has not run on this code.
+Milestone 6 waits for M5-131.
+The follow-up commits through `ae081a3` add durable post-forget replanning,
+capacity-aware parity rotation across retries and expiry, historical
+invalid-coder exclusion, and a fresh holder-abort check after Forget.
+Committed regressions cover full-width three- and five-domain backup commit
+and repeated reopen, plus full and offline first-spare replacement through
+coverage and reopen. M5-128 through M5-130 are corrected at source level;
+the complete exact-source M5-131 gate has not run on this code.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and
@@ -629,9 +630,10 @@ application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
 than a daemon prerequisite. Milestones 0 through 4 have passed. M5-123 through
 M5-127 passed their recorded gate on exact code source `e09a13f`, but the later
-source-only review found M5-128 through M5-130; Milestone 5 is open and
-Milestone 6 waits. The earlier M5-119 through M5-122 gate passed on
-`4880c28` and remains historical evidence for that source.
+source-only review found M5-128 through M5-130. Those corrections and focused
+regressions are now committed through `ae081a3`; Milestone 5 remains open for
+the exact-source M5-131 gate, and Milestone 6 waits. The earlier M5-119 through
+M5-122 gate passed on `4880c28` and remains historical evidence for that source.
 M5-111–M5-113 and M5-115–M5-118 corrections passed
 focused local validation and the complete locked workspace and fresh
 Btrfs/network gates on exact source `720920d`. All compilation and execution
@@ -887,9 +889,9 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 4 are passed; Milestone 5 is open for
-M5-128, M5-129 and M5-131, and Milestone 6 waits. M5-130 is corrected by
-`2affb17`, subject to the final exact-source gate.
+**Current position:** Milestones 0 through 4 are passed; M5-128 through M5-130
+are corrected at source level through `ae081a3`. Milestone 5 is open for the
+complete exact-source M5-131 gate, and Milestone 6 waits.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
@@ -2142,16 +2144,18 @@ renewal. M5-128 through M5-130 and the exact-source M5-131 gate remain open;
 Milestone 6 waits. No builds, tests, daemons or runtime probes were run in this
 review.
 
-Source-only follow-up through `2affb17` supersedes those draft findings: the
+Source-only follow-up through `ae081a3` supersedes those draft findings: the
 renewal helper and call sites exist, retry and expiry can change parity
 geometry, and three-member coordinator rotation excludes historically blamed
-coders. M5-130 is corrected at source level. The uncommitted 3-/5-domain
-worker fixture does not yet assert backup completion or repeated reopen, and
-its three-domain coverage wait failed in the preceding local development run.
-The full-width retirement schedule (M5-128) therefore remains unproven. The
-live placement test covers a full first spare but not an offline first spare
-through renewed coverage and reopen (M5-129). Complete and commit those
-schedules, then run M5-131 on the exact final source. Milestone 5 remains open;
+coders (M5-130). Repeated holder abort now rechecks retired group state after
+Forget instead of returning its cached pre-Forget acknowledgement. Committed
+three- and five-domain worker regressions cover the full-width retirement,
+cleanup, renewal, coverage and reopen path; the new provisioned Btrfs/QUIC
+fixture also drives both schedules through backup checkpoint commit and two
+reopens (M5-128). Live regressions cover both full and offline first spares,
+later usable placement, renewed coverage and reopen (M5-129). These source
+corrections still require the complete exact-source M5-131 workspace,
+Docker, Btrfs/network and resource-cleanup gate. Milestone 5 remains open and
 Milestone 6 waits. This review ran no builds, tests, daemons or runtime probes.
 
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four

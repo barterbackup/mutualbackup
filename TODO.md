@@ -588,8 +588,10 @@ source-only review of the corrections through `8712ac3` found four blockers
 `dd942a6`, and `e09a13f`; the complete M5-127 local gate passed on exact code
 source `e09a13f`. A fresh source-only review of that same code finds M5-128
 through M5-130 below and reopens Milestone 5. M5-127 remains passing evidence
-for its exercised cases, but it does not cover these schedules. Milestone 6
-waits. This review ran no builds, tests, daemons, or runtime probes. M5-122
+for its exercised cases, but it does not cover these schedules. The corrections
+and focused regressions are now committed through `ae081a3`; the complete
+exact-source M5-131 gate remains open, so Milestone 6 waits. This review ran
+no builds, tests, daemons, or runtime probes. M5-122
 and M5-114 remain passing historical evidence for their exact source trees.
 
 M5-116/M5-117 implementation update (2026-09-26): acknowledged retry parents
@@ -3476,7 +3478,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   were local; no remote compilation server was used. That exact-source gate
   closed Milestone 5 at the time; the source-only review below reopens it.
 
-- [ ] **M5-128 / P1 — Keep retired full-width activation recoverable through
+- [x] **M5-128 / P1 — Keep retired full-width activation recoverable through
   forgetting.** Production chooses a `2+1` or `3+2` profile for three or five
   distinct domains, using every domain (`crates/mb-node/src/network/p2p.rs:12349`).
   If a verified group retires before its activation job completes, the worker
@@ -3496,15 +3498,16 @@ node Clippy gate passed locally. No remote compilation server was used.
   across five nodes (`p2p.rs:24435`), so it always has a spare placement. Gate
   real full-width 3- and 5-domain production workers through retire,
   acknowledged cleanup, forget, renewed coverage, backup completion and
-  repeated reopen. Source-only follow-up through `2affb17` finds the durable
-  replan marker, retained input handoff and post-forget replacement implemented
-  in `561a438`. The current uncommitted 3-/5-domain fixture reaches only
-  coverage and one reopen in its source; it does not assert backup completion
-  or repeated reopen. Its three-domain coverage wait failed in the preceding
-  local development run, so the real worker schedule remains unproven. Finish
-  and commit a passing full-width production regression before closing this.
+  repeated reopen. `561a438` retains the replan marker and packed input
+  through cleanup; `dba09d0` makes a repeated holder abort recheck group state
+  after Forget instead of replaying a cached pre-Forget acknowledgement. The
+  committed worker regressions cover three and five domains, parity deletion
+  after Forget, renewed coverage and repeated reopen. The provisioned Btrfs
+  acceptance fixture in `ae081a3` also drives real backup commit through both
+  full-width schedules and checks the committed checkpoint after two reopens.
+  The complete exact-source gate remains M5-131.
 
-- [ ] **M5-129 / P1 — Select a usable parity holder when replanning a retired
+- [x] **M5-129 / P1 — Select a usable parity holder when replanning a retired
   group.** The new placement search takes the first active member that produces
   a valid, unused group ID (`crates/mb-node/src/node.rs:6574`), without the
   reachability and free-capacity checks used by initial placement
@@ -3520,10 +3523,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   offline first spare, a usable later spare, fresh coverage and reopen.
   `561a438` samples reachable capacity before retired activation replanning;
   `95962be` rotates geometry in retry and expiry renewal and retains active
-  offline-holder cleanup obligations. The live regression covers a full first
-  spare and later usable holder. Source-only review still finds no integrated
-  offline-first-spare to fresh coverage and reopen regression. Keep this open
-  until that schedule is covered and the corrected code passes the gate.
+  offline-holder cleanup obligations. The live regressions cover both a full
+  first spare and an offline first spare, a usable later holder, renewed
+  coverage and reopen (`1a34fce`). The complete exact-source gate remains
+  M5-131.
 
 - [x] **M5-130 / P1 — Rotate coordinators after an initial negative verifier
   finding.** The no-retry-parent completion path clones the negative attempt's
@@ -3560,13 +3563,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   confirm cleanup of owned images, mounts, loop devices, namespaces,
   interfaces/rules and processes. Record the exact commit and outcomes.
   M5-127 remains historical evidence for `e09a13f`; build and run locally,
-  with no remote compilation server. Source-only review through `2affb17`
-  confirms that the earlier undefined helper, old-arity call sites and fixed
-  retry/expiry geometry have been corrected. M5-128 and M5-129 still lack the
-  full production schedules above. The 408-line full-width fixture is
-  uncommitted, and this gate has not run on the latest committed source.
-  Finish those cases, commit the code, then perform the exact-source gate.
-  This review ran no builds, tests, daemons or runtime probes.
+  with no remote compilation server. Source-only review through `ae081a3`
+  finds M5-128 through M5-130 corrected and their missing schedules committed.
+  The provisioned acceptance script now includes 24 invocations. The full
+  exact-source workspace, Docker, Btrfs/network and cleanup gate has not run
+  on `ae081a3`, so Milestone 5 cannot close yet. This review ran no builds,
+  tests, daemons or runtime probes.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
