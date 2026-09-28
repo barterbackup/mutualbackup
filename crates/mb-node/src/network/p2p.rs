@@ -6419,13 +6419,15 @@ async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
         })
         .await?;
         if can_finish {
-            match finish_coding_activation(node.clone(), p2p, &job.transcript).await {
-                Ok(()) => {
-                    node_blocking(node.clone(), move |node| {
-                        node.complete_coding_activation(attempt_id, verified)
-                    })
-                    .await?;
-                }
+            match finish_and_complete_coding_activation(
+                node.clone(),
+                p2p,
+                &job.transcript,
+                verified,
+            )
+            .await
+            {
+                Ok(()) => {}
                 Err(error) => {
                     let message = format!("{error:#}");
                     node_blocking(node.clone(), move |node| {
@@ -6464,13 +6466,9 @@ async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
         }
         return Ok(());
     }
-    match finish_coding_activation(node.clone(), p2p, &job.transcript).await {
-        Ok(()) => {
-            node_blocking(node.clone(), move |node| {
-                node.complete_coding_activation(attempt_id, verified)
-            })
-            .await?;
-        }
+    match finish_and_complete_coding_activation(node.clone(), p2p, &job.transcript, verified).await
+    {
+        Ok(()) => {}
         Err(error) => {
             let message = format!("{error:#}");
             node_blocking(node.clone(), move |node| {
@@ -6480,6 +6478,37 @@ async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
             tracing::warn!(?attempt_id, %error, "coding activation deferred");
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
+    }
+    Ok(())
+}
+
+async fn finish_and_complete_coding_activation(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    transcript: &SignedRecord<CodingVerificationTranscript>,
+    verified: bool,
+) -> Result<()> {
+    finish_coding_activation(node.clone(), p2p, transcript).await?;
+    let attempt_id = transcript.value.plan.value.attempt_id;
+    let completed = node_blocking(node.clone(), move |node| {
+        node.complete_coding_activation(attempt_id, verified)
+    })
+    .await?;
+    if !completed {
+        // The group retired between installation and completion. The first
+        // completion left the durable job and retry inputs untouched.
+        let cleanup_job = DelegatedCodingJob {
+            format_version: 1,
+            plan: transcript.value.plan.clone(),
+            state: DelegatedCodingJobState::Cleanup,
+            transcript: None,
+            error: Some("coding group retired before activation completed".to_owned()),
+        };
+        abort_stale_delegated_coding(node.clone(), p2p, &cleanup_job).await?;
+        node_blocking(node, move |node| {
+            node.complete_coding_activation(attempt_id, false)
+        })
+        .await?;
     }
     Ok(())
 }

@@ -6439,14 +6439,16 @@ impl Node {
         &self,
         attempt_id: [u8; 16],
         covered: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let bytes = self
             .control
             .get_record("coding-activation-job", &attempt_id)?
             .context("coding activation job is unavailable")?;
         let mut job: CodingActivationJob = decode_canonical(&bytes)?;
         if covered && !self.coding_activation_has_coverage(&job)? {
-            anyhow::bail!("coding activation cannot complete coverage without an installed group");
+            // The group may have retired after the worker installed it. Keep
+            // the job and its retry parent until holder cleanup has run.
+            return Ok(false);
         }
         let mut records = Vec::new();
         let mut deletions = if covered {
@@ -6502,7 +6504,7 @@ impl Node {
             canonical_bytes(&job)?,
         ));
         self.control.put_records_and_delete(&records, &deletions)?;
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn defer_coding_activation(&self, attempt_id: [u8; 16], error: &str) -> Result<()> {
@@ -15766,6 +15768,35 @@ pub(crate) mod tests {
         let fresh = node.enqueue_coding_launch(separate.clone()).unwrap();
         assert_ne!(fresh.value.attempt_id, separate.value.attempt_id);
         assert_eq!(fresh.value.checkpoint_hash, separate.value.checkpoint_hash);
+
+        // A verified transcript alone is not installed coverage. If group
+        // retirement races completion, the job must remain for holder cleanup.
+        let mut uninstalled_value = value.clone();
+        uninstalled_value.checkpoint_hash = [76; 32];
+        uninstalled_value.attempt_id = [92; 16];
+        let uninstalled = node.sign_coding_attempt_plan(uninstalled_value).unwrap();
+        let verified = test_coding_transcript(uninstalled.clone(), &shards, &keys);
+        assert_eq!(
+            replay_coding_transcript(&verified).unwrap(),
+            CodingReplayFinding::Verified
+        );
+        node.accept_coding_transcript(uninstalled.value.coding_coordinator, verified)
+            .unwrap();
+        assert!(
+            !node
+                .complete_coding_activation(uninstalled.value.attempt_id, true)
+                .unwrap()
+        );
+        assert!(
+            node.coding_activation_jobs_for_test()
+                .unwrap()
+                .iter()
+                .any(|job| job.transcript.value.plan == uninstalled && !job.complete)
+        );
+        assert!(
+            node.complete_coding_activation(uninstalled.value.attempt_id, false)
+                .unwrap()
+        );
 
         let mut coding_value = value;
         coding_value.checkpoint_hash = [75; 32];
