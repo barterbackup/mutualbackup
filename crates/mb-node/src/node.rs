@@ -12850,7 +12850,7 @@ pub(crate) mod tests {
         (seeds, checkpoint)
     }
 
-    fn recovery_guild_fixture() -> (Seed, QuorumGuildGenesis, Vec<GuildPeer>) {
+    pub(crate) fn recovery_guild_fixture() -> (Seed, QuorumGuildGenesis, Vec<GuildPeer>) {
         let mut identities = (0_u8..5)
             .map(|index| {
                 let seed = Seed::from_bytes([index + 120; 32]);
@@ -15754,7 +15754,7 @@ pub(crate) mod tests {
 
         // A completed negative initial attempt must not capture its old
         // deterministic launch ID when the planner runs again.
-        let mut separate = value;
+        let mut separate = value.clone();
         separate.checkpoint_hash = [74; 32];
         separate.attempt_id = [90; 16];
         let separate = node.sign_coding_attempt_plan(separate).unwrap();
@@ -15766,6 +15766,105 @@ pub(crate) mod tests {
         let fresh = node.enqueue_coding_launch(separate.clone()).unwrap();
         assert_ne!(fresh.value.attempt_id, separate.value.attempt_id);
         assert_eq!(fresh.value.checkpoint_hash, separate.value.checkpoint_hash);
+
+        let mut coding_value = value;
+        coding_value.checkpoint_hash = [75; 32];
+        coding_value.attempt_id = [91; 16];
+        let coding = node.sign_coding_attempt_plan(coding_value).unwrap();
+        let mut invalid_coding = test_coding_transcript(coding.clone(), &shards, &keys);
+        let mut corrupt_shards = shards.clone();
+        for byte in &mut corrupt_shards[1] {
+            *byte ^= 1;
+        }
+        let commitment = merkle_commit(&corrupt_shards[1]).unwrap();
+        let ShardRoleV2::Parity(parity) = &mut invalid_coding.value.manifest.value.group.roles[1]
+        else {
+            unreachable!();
+        };
+        parity.commitment = commitment.clone();
+        invalid_coding.value.manifest.value.group.id = invalid_coding
+            .value
+            .manifest
+            .value
+            .group
+            .calculate_id()
+            .unwrap();
+        let coder = keys
+            .iter()
+            .find(|key| key.node_id() == coding.value.coding_coordinator)
+            .unwrap();
+        let verifier = keys
+            .iter()
+            .find(|key| key.node_id() == coding.value.verification_coordinator)
+            .unwrap();
+        invalid_coding.value.manifest = SignedRecord::sign(
+            CODING_ROOT_MANIFEST_DOMAIN,
+            invalid_coding.value.manifest.value.clone(),
+            coder,
+        )
+        .unwrap();
+        let receipt = &mut invalid_coding.value.staged_receipts[0];
+        receipt.value.group_id = invalid_coding.value.manifest.value.group.id;
+        receipt.value.commitment = commitment;
+        *receipt = SignedRecord::sign(
+            STAGED_STORAGE_RECEIPT_DOMAIN,
+            receipt.value.clone(),
+            keys.iter()
+                .find(|key| key.node_id() == receipt.signer)
+                .unwrap(),
+        )
+        .unwrap();
+        let evidence_hash = mb_core::coding_evidence_hash(
+            &invalid_coding.value.manifest,
+            &invalid_coding.value.staged_receipts,
+        )
+        .unwrap();
+        invalid_coding.value.challenge_reveal.value.evidence_hash = evidence_hash;
+        invalid_coding.value.challenge_reveal = SignedRecord::sign(
+            CODING_CHALLENGE_REVEAL_DOMAIN,
+            invalid_coding.value.challenge_reveal.value.clone(),
+            verifier,
+        )
+        .unwrap();
+        let challenge = mb_core::coding_challenge(
+            coding.value.hash().unwrap(),
+            invalid_coding.value.challenge_reveal.value.nonce,
+            evidence_hash,
+        );
+        for (index, opening) in invalid_coding.value.openings.iter_mut().enumerate() {
+            let role = &invalid_coding.value.manifest.value.group.roles[index];
+            let commitment = match role {
+                ShardRoleV2::Information(info) => &info.sector.commitment,
+                ShardRoleV2::Parity(parity) => &parity.commitment,
+            };
+            let leaf = challenged_leaf(&challenge, commitment).unwrap();
+            opening.value.challenge = challenge;
+            opening.value.commitment = commitment.clone();
+            opening.value.proof = merkle_open_range(&corrupt_shards[index], leaf, 1).unwrap();
+            *opening = SignedRecord::sign(
+                CODING_SHARD_OPENING_DOMAIN,
+                opening.value.clone(),
+                keys.iter()
+                    .find(|key| key.node_id() == opening.signer)
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        invalid_coding =
+            SignedRecord::sign(CODING_TRANSCRIPT_DOMAIN, invalid_coding.value, verifier).unwrap();
+        assert_eq!(
+            replay_coding_transcript(&invalid_coding).unwrap(),
+            CodingReplayFinding::InvalidCoding {
+                coordinator: coding.value.coding_coordinator
+            }
+        );
+        node.accept_coding_transcript(coding.value.coding_coordinator, invalid_coding)
+            .unwrap();
+        node.complete_coding_activation(coding.value.attempt_id, false)
+            .unwrap();
+        let fresh = node.enqueue_coding_launch(coding.clone()).unwrap();
+        assert_ne!(fresh.value.attempt_id, coding.value.attempt_id);
+        assert_eq!(fresh.value.checkpoint_hash, coding.value.checkpoint_hash);
     }
 
     #[test]
