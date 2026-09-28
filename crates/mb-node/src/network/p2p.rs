@@ -6799,13 +6799,17 @@ async fn dispatch_claimed_coding_launch(
                     node.coding_launch_has_renewal(&prior)
                 })
                 .await?;
-                let coordinators = if existing {
-                    None
+                let (coordinators, eligible) = if existing {
+                    (None, None)
                 } else {
-                    Some(choose_coding_launch_renewal_coordinators(node.clone(), p2p, &job).await?)
+                    let coordinators =
+                        fresh_coding_activation_coordinators(node.clone(), p2p, &job.plan).await;
+                    let eligible =
+                        usable_coding_activation_parity_holders(node.clone(), p2p, &job.plan).await;
+                    (coordinators, Some(eligible))
                 };
                 node_blocking(node.clone(), move |node| {
-                    node.renew_coding_launch_after_cleanup(&job, coordinators)
+                    node.renew_coding_launch_after_cleanup(&job, coordinators, eligible)
                         .map(|_| ())
                 })
                 .await?;
@@ -7028,6 +7032,8 @@ async fn execute_coding_retry(
     if !cleanup_coding_retry_plan(node.clone(), p2p, &job.failure.value.plan).await? {
         return Ok(false);
     }
+    let eligible =
+        usable_coding_activation_parity_holders(node.clone(), p2p, &job.failure.value.plan).await;
     if let Some(plan) = &job.retry_plan {
         let child = plan.clone();
         let (submitted, retired) = node_blocking(node.clone(), move |node| {
@@ -7040,7 +7046,16 @@ async fn execute_coding_retry(
         if submitted {
             return Ok(false);
         }
-        if retired || plan.value.expires_at_unix_seconds < unix_seconds() {
+        if retired
+            || plan.value.expires_at_unix_seconds < unix_seconds()
+            || !eligible.is_empty()
+                && plan
+                    .value
+                    .geometry
+                    .parity
+                    .iter()
+                    .any(|placement| !eligible.contains(&placement.holder))
+        {
             let child = plan.clone();
             if !node_blocking(node.clone(), move |node| {
                 node.retire_coding_retry_successor(&child)
@@ -7059,6 +7074,28 @@ async fn execute_coding_retry(
             .await?;
             job.retry_plan = None;
         }
+    }
+    if job
+        .failure
+        .value
+        .plan
+        .value
+        .geometry
+        .parity
+        .iter()
+        .any(|placement| !eligible.contains(&placement.holder))
+    {
+        let fresh =
+            fresh_coding_activation_coordinators(node.clone(), p2p, &job.failure.value.plan).await;
+        let failed_attempt_id = job.failure.value.plan.value.attempt_id;
+        if !node_blocking(node, move |node| {
+            node.replan_coding_retry_after_cleanup(failed_attempt_id, fresh, eligible)
+        })
+        .await?
+        {
+            bail!("coding retry is waiting for reachable parity capacity and fresh roles");
+        }
+        return Ok(true);
     }
     let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
     let plan = match &job.retry_plan {
@@ -7238,7 +7275,7 @@ async fn cleanup_coding_retry_plan(
         transcript: None,
         error: Some("coding retry expired or has stronger replacement evidence".to_owned()),
     };
-    abort_stale_delegated_coding(node, p2p, &cleanup).await?;
+    abort_fenced_delegated_coding(node, p2p, &cleanup).await?;
     Ok(true)
 }
 
@@ -7684,7 +7721,7 @@ async fn abort_delegated_coding(
     p2p: &P2pClient,
     job: &DelegatedCodingJob,
 ) -> Result<()> {
-    abort_delegated_coding_with_policy(node, p2p, job, false).await
+    abort_delegated_coding_with_policy(node, p2p, job, false, false).await
 }
 
 async fn abort_stale_delegated_coding(
@@ -7692,7 +7729,18 @@ async fn abort_stale_delegated_coding(
     p2p: &P2pClient,
     job: &DelegatedCodingJob,
 ) -> Result<()> {
-    abort_delegated_coding_with_policy(node, p2p, job, true).await
+    abort_delegated_coding_with_policy(node, p2p, job, true, false).await
+}
+
+async fn abort_fenced_delegated_coding(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    job: &DelegatedCodingJob,
+) -> Result<()> {
+    // A failed attempt is fenced at its delegator before retry cleanup. An
+    // unreachable active holder may retain old bytes, so keep an independent
+    // durable obligation while a new placement takes over progress.
+    abort_delegated_coding_with_policy(node, p2p, job, true, true).await
 }
 
 async fn abort_delegated_coding_with_policy(
@@ -7700,6 +7748,7 @@ async fn abort_delegated_coding_with_policy(
     p2p: &P2pClient,
     job: &DelegatedCodingJob,
     tolerate_inactive_holders: bool,
+    defer_active_holders: bool,
 ) -> Result<()> {
     let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
     let active_holders = if tolerate_inactive_holders {
@@ -7750,7 +7799,10 @@ async fn abort_delegated_coding_with_policy(
                 })
                 .await?;
             }
-            Err(error) if tolerate_inactive_holders && !active_holders.contains(&holder) => {
+            Err(error)
+                if tolerate_inactive_holders
+                    && (defer_active_holders || !active_holders.contains(&holder)) =>
+            {
                 let plan = job.plan.clone();
                 node_blocking(node.clone(), move |node| {
                     node.record_coding_holder_cleanup(&plan, holder)
@@ -23947,6 +23999,39 @@ mod tests {
             assert_eq!(holder.coding_reservation_count_for_test().unwrap(), 1);
         }
 
+        // A fenced failed attempt can transfer progress while an active
+        // holder is offline, provided its cleanup obligation stays durable.
+        clients[1].shutdown().await.unwrap();
+        tasks.remove(1).await.unwrap().unwrap();
+        assert!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .retire_coding_retry_plan(&plan)
+                .unwrap()
+        );
+        abort_fenced_delegated_coding(
+            nodes[0].clone(),
+            &clients[0],
+            &DelegatedCodingJob {
+                format_version: 1,
+                plan: plan.clone(),
+                state: DelegatedCodingJobState::Cleanup,
+                transcript: None,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .coding_holder_cleanup_count_for_test()
+                .unwrap(),
+            1
+        );
+
         // The holder misses the removal event while its network is offline.
         let event = GuildEvent {
             format_version: 1,
@@ -23969,8 +24054,6 @@ mod tests {
                     .unwrap();
             }
         }
-        clients[1].shutdown().await.unwrap();
-        tasks.remove(1).await.unwrap().unwrap();
         for pending in [&plan, &reserved] {
             abort_stale_delegated_coding(
                 nodes[0].clone(),
@@ -24994,6 +25077,22 @@ mod tests {
                 retain_through_event: current.event_sequence + 1,
             },
         );
+        let first_spare = (2..5)
+            .min_by_key(|index| nodes[*index].lock().unwrap().keys().node_id())
+            .unwrap();
+        nodes[first_spare]
+            .lock()
+            .unwrap()
+            .configure_storage_volumes(&[temp.path().join(format!("volume-{first_spare}"))], 1, 0)
+            .unwrap();
+        assert_eq!(
+            nodes[first_spare]
+                .lock()
+                .unwrap()
+                .coding_capacity(V1_SECTOR_SIZE as u32)
+                .unwrap(),
+            0
+        );
         process_coding_activation_job(nodes[0].clone(), &clients[0])
             .await
             .unwrap();
@@ -25006,6 +25105,10 @@ mod tests {
         assert_ne!(
             replacement.value.geometry.parity,
             verified.value.geometry.parity
+        );
+        assert_ne!(
+            replacement.value.geometry.parity[0].holder,
+            nodes[first_spare].lock().unwrap().keys().node_id()
         );
         {
             let node = nodes[0].lock().unwrap();
