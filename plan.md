@@ -80,8 +80,11 @@ Committed regressions cover full-width three- and five-domain backup commit
 and repeated reopen, plus full and offline first-spare replacement through
 coverage and reopen. M5-128 through M5-130 are corrected at source level;
 the complete local M5-131 gate passed on exact code source `39a99e7` after
-restart/cleanup regressions were aligned with durable handoff. Milestone 5 is
-closed and Milestone 6 is next.
+restart/cleanup regressions were aligned with durable handoff. A later
+source-only review of the unchanged code found that early holder abort can
+leave retired READY parity after Forget (M5-132), and the required
+three-member negative-result production/reopen regression is absent (M5-133).
+Milestone 5 is reopened for those corrections and M5-134; Milestone 6 waits.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and
@@ -892,9 +895,11 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 5 have passed. M5-128 through
+**Current position:** Milestones 0 through 4 have passed. M5-128 through
 M5-130 were corrected through `39a99e7`, and the complete M5-131 local gate
-passed on that exact code source. Milestone 6 is next.
+passed on that exact code source. Source-only review of the unchanged code
+found M5-132 and M5-133; Milestone 5 is reopened until those corrections and
+M5-134 pass. Milestone 6 waits.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
@@ -2056,7 +2061,7 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (passed)
+### Milestone 5 — efficient and flexible data/guild protocol (reopened)
 
 The historical source-only review through `a6b5d7d` found three blockers in
 the recently changed coding ownership and cleanup paths. A replayable negative
@@ -2175,7 +2180,22 @@ independent audit found the baseline restored for mounts, loops, namespaces,
 interfaces, forwarding and firewall rules, with no owned image or process
 remaining. All compilation and execution were local, with no remote server.
 The exact commands, counts, timings and logs are recorded in TODO.md.
-Milestone 5 is closed; Milestone 6 is next.
+That gate closed Milestone 5 at the time; the source-only review below reopens
+it.
+
+Source-only review of that unchanged code reopens Milestone 5. In the
+spare-placement retirement path, a holder can acknowledge abort while the old
+group is still retained, finalizing attempt receipts but leaving READY parity.
+The delegator may then complete activation and create its successor; when the
+old group is later forgotten, neither holder deletion nor a second abort is
+guaranteed. A group that was added and forgotten between checkpoints also
+falls outside the checkpoint garbage-collection inputs (M5-132). Separately,
+the required three-member negative-evidence rotation was tested only at the
+coordinator-selector level; the live production-worker coverage/reopen test
+uses five members (M5-133). Correct the cleanup ownership, add the missing
+three-member regression, and pass the exact-source M5-134 gate in TODO.md
+before closing Milestone 5. M5-131 remains passing evidence for the cases it
+exercised. This review ran no builds, tests, daemons or runtime probes.
 
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
 launch-expiry regressions found duplicate same-lane successors. Renewal now
