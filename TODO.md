@@ -574,17 +574,18 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (reopened 2026-09-28)
+## Milestone 5 guild geometry and coding protocol (closed after M5-122, 2026-09-28)
 
-Source-only review of the recent Milestone 5 changes through `a6b5d7d` found
-three outstanding blockers: negative verifier evidence can terminate retry
-ownership and block replanning (M5-119); an expiring format-2 launch can renew
-beside a live format-3 retry for the same lane (M5-120); and stale cleanup can
-forget an offline removed holder's staged data (M5-121). Correct these and
-pass the new exact-source M5-122 local gate before closing Milestone 5.
-Milestones 0 through 4 remain passed; Milestone 6 waits. This review ran no
-builds, tests, daemons, or runtime probes. M5-114 remains passing historical
-evidence for its exact source tree.
+The historical source-only review of the Milestone 5 changes through `a6b5d7d`
+found three blockers: negative verifier evidence could terminate retry
+ownership and block replanning (M5-119); an expiring format-2 launch could
+renew beside a live format-3 retry for the same lane (M5-120); and stale
+cleanup could forget an offline removed holder's staged data (M5-121). The
+review required these corrections and a new exact-source M5-122 local gate.
+All three corrections and M5-122 have now passed on exact source `4880c28`;
+Milestones 0 through 5 are passed, and Milestone 6 is next. The original
+review ran no builds, tests, daemons, or runtime probes. M5-114 remains
+passing historical evidence for its earlier source tree.
 
 M5-116/M5-117 implementation update (2026-09-26): acknowledged retry parents
 now remain quiescent only while their successor is live and unfenced, or after
@@ -3266,7 +3267,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   was closed at this exact-source gate; the later M5-119 through M5-121 review
   reopens it without changing the tested source.
 
-- [ ] **M5-119 / P1 — Keep negative verifier evidence distinct from successful
+- [x] **M5-119 / P1 — Keep negative verifier evidence distinct from successful
   coverage and retry completion.** `replay_coding_transcript` can return an
   authenticated `InvalidOpening` or `InvalidCoding` finding, and
   `accept_coding_transcript` stores that result in a `coding-activation-job`
@@ -3283,7 +3284,15 @@ node Clippy gate passed locally. No remote compilation server was used.
   allow a fresh authorized attempt. Gate negative opening and coding findings
   through cleanup, retry, replanning, checkpoint coverage, and repeated reopen.
 
-- [ ] **M5-120 / P1 — Coalesce legacy format-2 launch renewal with stronger
+  Completed in `6b7c79e`, `3d42888`, `520e73e`, and `4880c28`. Negative
+  findings remain attributable history and requeue retry ownership only after
+  holder abort; verified active group coverage alone can terminalize it.
+  Retained input intent, same-lane replanning, checkpoint pending state,
+  invalid-opening/invalid-coding evidence, production activation cleanup and
+  repeated reopen have focused regressions. Completion now also handles a
+  group retiring between activation and recording coverage.
+
+- [x] **M5-120 / P1 — Coalesce legacy format-2 launch renewal with stronger
   format-3 ownership.** The migration fixture proves that a durable format-2
   launch and a new format-3 launch can coexist after reopen (`node.rs:15949`).
   After the format-3 launch fails into a live retry, expiry of the old launch
@@ -3299,7 +3308,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   retry, expiry, reopen, exact successor, checkpoint coverage and holder
   capacity.
 
-- [ ] **M5-121 / P1 — Retain cleanup obligations for offline removed holders.**
+  Completed in `6dc5c67` and `96560cc`. Renewal follows valid format-3
+  activation, retry or launch ownership directionally, while an unowned legacy
+  flat-root renewal upgrades to format 3. Controlled and real production-worker
+  expiry regressions verify exact successor, retained input intent, repeated
+  reopen and holder capacity.
+
+- [x] **M5-121 / P1 — Retain cleanup obligations for offline removed holders.**
   Stale cleanup suppresses a failed abort RPC when the holder is absent from
   `active_members`, then reports success (`crates/mb-node/src/network/p2p.rs:7367`,
   `:7414`). Delegated, launch and retry owners can consequently complete or
@@ -3312,7 +3327,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   offline holder return, repeated reopen, and exact zero staged bytes,
   receipts and reservations.
 
-- [ ] **M5-122 / gate — Recheck Milestone 5 after M5-119 through M5-121.**
+  Completed in `0862134`. Inactive-holder abort failures write durable
+  per-holder obligations; an independent daemon worker retries them with cached
+  endpoints and deletes them only after acknowledgement. A real five-node
+  removed/offline-holder regression returns the holder after repeated reopen
+  and confirms zero staged bytes, receipts and reservations.
+
+- [x] **M5-122 / gate — Recheck Milestone 5 after M5-119 through M5-121.**
   Correct the three source blockers, review the committed source, and run
   focused production-worker and reopen regressions for each ownership and
   cleanup path. On the exact corrected commit, pass local formatting, strict
@@ -3321,7 +3342,25 @@ node Clippy gate passed locally. No remote compilation server was used.
   confirm cleanup of owned images, mounts, loop devices, namespaces,
   interfaces/rules and processes. Record the exact commit and outcomes;
   M5-114 remains historical evidence only. Build and run locally, with no
-  remote compilation server. This source-only review did not execute M5-122.
+  remote compilation server. The original source-only review did not execute
+  M5-122.
+
+  Passed on clean committed source `4880c28fbfce9a1654f970eb11e71d020e938b37`.
+  Local formatting, strict locked all-target workspace Clippy, locked all-target
+  workspace tests and Docker lab safety passed. The node suite had 284 passed,
+  10 expected ignored; the core suite had 48 passed and store had 51 passed,
+  14 expected ignored. All 23 fresh `scripts/reflink-acceptance.sh` invocations
+  passed on a disposable local 8 GiB Btrfs image: repeated multi-owner QUIC
+  passed in 585.81 seconds; five-daemon seed/DHT recovery with direct, DCUtR
+  and relay fallback passed in 1976.51 seconds. Runner cleanup exited zero.
+  Independent audit confirmed the owned image and mount absent, `/dev/loop0`
+  detached, namespaces, interfaces, forwarding and firewall rules restored to
+  baseline, and no acceptance harness or daemon process remained. Logs:
+  `/tmp/mutualbackup-m5-122-workspace-v2.log`,
+  `/tmp/mutualbackup-m5-122-provisioned-v2.log`, and
+  `/tmp/mutualbackup-m5-122-cleanup-audit-v2.log`. All builds and runs were
+  local. Milestone 5 is closed on this exact code commit; M5-114 remains
+  historical evidence for its earlier tree.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
