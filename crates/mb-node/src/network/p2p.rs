@@ -6586,18 +6586,30 @@ async fn fresh_coding_activation_coordinators(
     p2p: &P2pClient,
     prior: &SignedRecord<CodingAttemptPlan>,
 ) -> Option<(NodeId, NodeId)> {
+    let source = prior.clone();
+    let invalid = match node_blocking(node.clone(), move |node| {
+        node.coding_invalid_coordinators_for_source(&source)
+    })
+    .await
+    {
+        Ok(invalid) => invalid,
+        Err(error) => {
+            tracing::debug!(%error, "coding activation cannot inspect invalid-coder history");
+            return None;
+        }
+    };
     let job = crate::node::CodingLaunchJob {
         format_version: 1,
         plan: prior.clone(),
         dispatched: true,
         error: None,
     };
-    match choose_coding_launch_renewal_coordinators(node.clone(), p2p, &job).await {
+    match choose_coding_launch_renewal_coordinators(node.clone(), p2p, &job, &invalid).await {
         Ok(pair) => Some(pair),
         Err(error) => {
             tracing::debug!(attempt_id = ?prior.value.attempt_id, %error,
                 "coding activation is waiting for fresh coordinators");
-            rotated_coding_activation_coordinators(node, p2p, prior).await
+            rotated_coding_activation_coordinators(node, p2p, prior, &invalid).await
         }
     }
 }
@@ -6606,6 +6618,7 @@ async fn rotated_coding_activation_coordinators(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
     prior: &SignedRecord<CodingAttemptPlan>,
+    invalid: &BTreeSet<NodeId>,
 ) -> Option<(NodeId, NodeId)> {
     // In a three-member guild only one member is outside the old pair. A
     // verifier that signed the evidence may become the coder, but an
@@ -6631,7 +6644,7 @@ async fn rotated_coding_activation_coordinators(
         .into_iter()
         .map(|peer| peer.member.node_id)
         .collect::<Vec<_>>();
-    if !reachable.contains(&old_verifier) {
+    if !reachable.contains(&old_verifier) || invalid.contains(&old_verifier) {
         return None;
     }
     let participants = prior
@@ -6654,7 +6667,7 @@ async fn rotated_coding_activation_coordinators(
     let status = p2p.status().await.ok()?;
     reachable
         .into_iter()
-        .filter(|candidate| *candidate != old_verifier)
+        .filter(|candidate| *candidate != old_verifier && !invalid.contains(candidate))
         .min_by_key(|candidate| {
             (
                 coding_candidate_path_rank(*candidate, local_id, &status),
@@ -6928,6 +6941,7 @@ async fn choose_coding_launch_renewal_coordinators(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
     job: &crate::node::CodingLaunchJob,
+    invalid: &BTreeSet<NodeId>,
 ) -> Result<(NodeId, NodeId)> {
     let (guild, local_id) = node_blocking(node, |node| {
         Ok((
@@ -6952,9 +6966,10 @@ async fn choose_coding_launch_renewal_coordinators(
         .peers
         .into_iter()
         .filter(|peer| {
-            !job.dispatched
-                || (peer.member.node_id != prior.coding_coordinator
-                    && peer.member.node_id != prior.verification_coordinator)
+            !invalid.contains(&peer.member.node_id)
+                && (!job.dispatched
+                    || (peer.member.node_id != prior.coding_coordinator
+                        && peer.member.node_id != prior.verification_coordinator))
         })
         .collect::<Vec<_>>();
     let reachable = reachable_coding_peers(p2p, local_id, &peers)
@@ -7111,8 +7126,10 @@ async fn execute_coding_retry(
         }
         None => {
             let retry = job.clone();
-            let prior = node_blocking(node.clone(), move |node| {
-                Ok(node.coding_retry_previous_plan(&retry)?.value)
+            let (prior, invalid) = node_blocking(node.clone(), move |node| {
+                let prior = node.coding_retry_previous_plan(&retry)?;
+                let invalid = node.coding_invalid_coordinators_for_source(&prior)?;
+                Ok((prior.value, invalid))
             })
             .await?;
             let (guild, old_coder, old_verifier, participants) =
@@ -7140,7 +7157,10 @@ async fn execute_coding_retry(
             let mut reachable = Vec::new();
             for peer in guild.peers {
                 let candidate = peer.member.node_id;
-                if candidate == old_coder || candidate == old_verifier {
+                if candidate == old_coder
+                    || candidate == old_verifier
+                    || invalid.contains(&candidate)
+                {
                     continue;
                 }
                 for endpoint in peer.endpoints {
@@ -24649,6 +24669,17 @@ mod tests {
                 information_roots: Some(data.iter().map(|bytes| sector_root(bytes)).collect()),
             })
             .unwrap();
+        let keys = (0_u8..5)
+            .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([160 + index; 32])))
+            .collect::<Vec<_>>();
+        let shards = encode(plan.value.geometry.profile, data.to_vec()).unwrap();
+        let invalid =
+            crate::node::tests::test_invalid_coding_transcript(plan.clone(), &shards, &keys);
+        nodes[0]
+            .lock()
+            .unwrap()
+            .accept_coding_transcript(plan.value.coding_coordinator, invalid)
+            .unwrap();
         assert_eq!(
             fresh_coding_activation_coordinators(nodes[0].clone(), &clients[0], &plan).await,
             Some((ids[2], ids[0]))
@@ -24853,26 +24884,54 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut negative =
-            crate::node::tests::test_coding_transcript(initial.clone(), &shards, &keys);
-        negative.value.openings[1].value.proof.leaves[0][0] ^= 1;
-        negative.value.openings[1] = SignedRecord::sign(
-            CODING_SHARD_OPENING_DOMAIN,
-            negative.value.openings[1].value.clone(),
-            &keys[1],
-        )
-        .unwrap();
-        negative = SignedRecord::sign(mb_core::CODING_TRANSCRIPT_DOMAIN, negative.value, &keys[3])
-            .unwrap();
-        assert!(matches!(
-            replay_coding_transcript(&negative).unwrap(),
-            mb_core::CodingReplayFinding::InvalidOpening { .. }
-        ));
+        let negative =
+            crate::node::tests::test_invalid_coding_transcript(initial.clone(), &shards, &keys);
         nodes[0]
             .lock()
             .unwrap()
             .accept_coding_transcript(initial.value.coding_coordinator, negative)
             .unwrap();
+        process_coding_activation_job(nodes[0].clone(), &clients[0])
+            .await
+            .unwrap();
+        let successor = nodes[0]
+            .lock()
+            .unwrap()
+            .coding_launch_successor_for_test(initial.value.attempt_id)
+            .unwrap()
+            .unwrap();
+        let second_negative =
+            crate::node::tests::test_invalid_coding_transcript(successor.clone(), &shards, &keys);
+        nodes[0]
+            .lock()
+            .unwrap()
+            .accept_coding_transcript(successor.value.coding_coordinator, second_negative)
+            .unwrap();
+        process_coding_activation_job(nodes[0].clone(), &clients[0])
+            .await
+            .unwrap();
+        let healthy = nodes[0]
+            .lock()
+            .unwrap()
+            .coding_launch_successor_for_test(successor.value.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            healthy.value.coding_coordinator,
+            initial.value.coding_coordinator
+        );
+        assert_ne!(
+            healthy.value.coding_coordinator,
+            successor.value.coding_coordinator
+        );
+        assert_ne!(
+            healthy.value.verification_coordinator,
+            initial.value.coding_coordinator
+        );
+        assert_ne!(
+            healthy.value.verification_coordinator,
+            successor.value.coding_coordinator
+        );
         let coding_tasks = nodes
             .iter()
             .zip(clients.iter())
@@ -24887,12 +24946,6 @@ mod tests {
         .await
         .expect("uninterrupted backup wait must finish")
         .unwrap();
-        let successor = nodes[0]
-            .lock()
-            .unwrap()
-            .coding_launch_successor_for_test(initial.value.attempt_id)
-            .unwrap()
-            .unwrap();
         assert_ne!(successor.value.attempt_id, initial.value.attempt_id);
         assert_ne!(
             successor.value.coding_coordinator,
@@ -25156,7 +25209,15 @@ mod tests {
                 .unwrap()
                 .coding_launch_successor_for_test(initial.value.attempt_id)
                 .unwrap(),
-            Some(successor)
+            Some(successor.clone())
+        );
+        assert_eq!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .coding_launch_successor_for_test(successor.value.attempt_id)
+                .unwrap(),
+            Some(healthy)
         );
         nodes[0]
             .lock()
@@ -25786,7 +25847,13 @@ mod tests {
         };
         let mut signatures = nodes
             .iter()
-            .map(|node| mb_core::sign_guild_event(&event, node.lock().unwrap().keys()).unwrap())
+            .filter_map(|node| {
+                let node = node.lock().unwrap();
+                state
+                    .active_members()
+                    .any(|member| member.node_id == node.keys().node_id())
+                    .then(|| mb_core::sign_guild_event(&event, node.keys()).unwrap())
+            })
             .collect::<Vec<_>>();
         signatures.sort_by_key(|signature| signature.signer);
         let certified = QuorumGuildEvent { event, signatures };

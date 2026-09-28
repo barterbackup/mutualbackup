@@ -356,6 +356,17 @@ fn coding_renewal_can_follow_with_new_parity(
             && prior.geometry.parity != candidate.geometry.parity
 }
 
+fn same_coding_source_lane(left: &CodingAttemptPlan, right: &CodingAttemptPlan) -> bool {
+    left.checkpoint_hash == right.checkpoint_hash
+        && left.membership_epoch == right.membership_epoch
+        && left.delegator == right.delegator
+        && left.information_roots == right.information_roots
+        && left.geometry.format_version == right.geometry.format_version
+        && left.geometry.guild_id == right.geometry.guild_id
+        && left.geometry.profile == right.geometry.profile
+        && left.geometry.information == right.geometry.information
+}
+
 fn choose_usable_parity_geometry(
     original: &mb_core::CodingPlanGeometry,
     eligible: &[&Member],
@@ -4345,6 +4356,24 @@ impl Node {
         Ok(excluded)
     }
 
+    pub(crate) fn coding_invalid_coordinators_for_source(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+    ) -> Result<BTreeSet<NodeId>> {
+        self.validate_coding_attempt_authority(plan)?;
+        let mut excluded = BTreeSet::new();
+        for (_, bytes) in self.control.records("coding-activation-job")? {
+            let activation: CodingActivationJob = decode_canonical(&bytes)?;
+            if same_coding_source_lane(&activation.transcript.value.plan.value, &plan.value)
+                && let CodingReplayFinding::InvalidCoding { coordinator } =
+                    replay_coding_transcript(&activation.transcript)?
+            {
+                excluded.insert(coordinator);
+            }
+        }
+        Ok(excluded)
+    }
+
     #[cfg(test)]
     pub(crate) fn claim_coding_launch(&self) -> Result<Option<CodingLaunchJob>> {
         self.claim_coding_launch_after(None)
@@ -4648,6 +4677,12 @@ impl Node {
                     None => {
                         let (coding_coordinator, verification_coordinator) = coordinators
                             .context("coding launch renewal requires reachable coordinators")?;
+                        let invalid = self.coding_invalid_coordinators_for_source(prior)?;
+                        if invalid.contains(&coding_coordinator)
+                            || invalid.contains(&verification_coordinator)
+                        {
+                            anyhow::bail!("coding launch renewal selected an invalid coder");
+                        }
                         let mut value = prior.value.clone();
                         if value.format_version == 2
                             && value.information_roots.as_ref().is_some_and(|roots| {
@@ -5963,6 +5998,10 @@ impl Node {
         }
         let previous = self.coding_retry_previous_plan(&job)?;
         let prior = &previous.value;
+        let invalid = self.coding_invalid_coordinators_for_source(&previous)?;
+        if invalid.contains(&coding_coordinator) || invalid.contains(&verification_coordinator) {
+            anyhow::bail!("coding retry selected an invalid coder");
+        }
         let state = self
             .dynamic_guild_state()?
             .context("node has no dynamic guild state")?;
@@ -6760,6 +6799,12 @@ impl Node {
                 // its packed input and exact lineage in the same transaction
                 // that marks holder cleanup complete.
                 let prior = &job.transcript.value.plan;
+                let invalid = self.coding_invalid_coordinators_for_source(prior)?;
+                if invalid.contains(&coding_coordinator)
+                    || invalid.contains(&verification_coordinator)
+                {
+                    return Ok(false);
+                }
                 if coding_coordinator == prior.value.coding_coordinator
                     || verification_coordinator == prior.value.coding_coordinator
                     || verification_coordinator == prior.value.verification_coordinator
@@ -6899,6 +6944,10 @@ impl Node {
         let Some((coding_coordinator, verification_coordinator)) = fresh_coordinators else {
             return Ok(false);
         };
+        let invalid = self.coding_invalid_coordinators_for_source(prior)?;
+        if invalid.contains(&coding_coordinator) || invalid.contains(&verification_coordinator) {
+            return Ok(false);
+        }
         if coding_coordinator == prior.value.coding_coordinator
             || verification_coordinator == prior.value.coding_coordinator
             || verification_coordinator == prior.value.verification_coordinator
@@ -16056,8 +16105,8 @@ pub(crate) mod tests {
             &plan,
             shards[..usize::from(value.geometry.profile.data_shards)]
                 .iter()
-                .cloned()
-                .map(Some)
+                .zip(&value.geometry.information)
+                .map(|(bytes, role)| (!role.sector.virtual_zero).then(|| bytes.clone()))
                 .collect(),
             key(value.coding_coordinator),
         )
@@ -16164,6 +16213,99 @@ pub(crate) mod tests {
         assert_eq!(
             replay_coding_transcript(&transcript).unwrap(),
             CodingReplayFinding::Verified
+        );
+        transcript
+    }
+
+    pub(crate) fn test_invalid_coding_transcript(
+        plan: SignedRecord<CodingAttemptPlan>,
+        shards: &[Vec<u8>],
+        keys: &[KeyMaterial],
+    ) -> SignedRecord<CodingVerificationTranscript> {
+        let mut transcript = test_coding_transcript(plan.clone(), shards, keys);
+        let mut corrupt_shards = shards.to_vec();
+        let parity_index = usize::from(plan.value.geometry.profile.data_shards);
+        for byte in &mut corrupt_shards[parity_index] {
+            *byte ^= 1;
+        }
+        let commitment = merkle_commit(&corrupt_shards[parity_index]).unwrap();
+        let ShardRoleV2::Parity(parity) =
+            &mut transcript.value.manifest.value.group.roles[parity_index]
+        else {
+            unreachable!();
+        };
+        parity.commitment = commitment.clone();
+        transcript.value.manifest.value.group.id = transcript
+            .value
+            .manifest
+            .value
+            .group
+            .calculate_id()
+            .unwrap();
+        let key = |id| keys.iter().find(|key| key.node_id() == id).unwrap();
+        let coder = key(plan.value.coding_coordinator);
+        let verifier = key(plan.value.verification_coordinator);
+        transcript.value.manifest = SignedRecord::sign(
+            CODING_ROOT_MANIFEST_DOMAIN,
+            transcript.value.manifest.value.clone(),
+            coder,
+        )
+        .unwrap();
+        let receipt = transcript
+            .value
+            .staged_receipts
+            .iter_mut()
+            .find(|receipt| receipt.value.shard_index as usize == parity_index)
+            .unwrap();
+        receipt.value.group_id = transcript.value.manifest.value.group.id;
+        receipt.value.commitment = commitment;
+        *receipt = SignedRecord::sign(
+            STAGED_STORAGE_RECEIPT_DOMAIN,
+            receipt.value.clone(),
+            key(receipt.signer),
+        )
+        .unwrap();
+        let evidence_hash = mb_core::coding_evidence_hash(
+            &transcript.value.manifest,
+            &transcript.value.staged_receipts,
+        )
+        .unwrap();
+        transcript.value.challenge_reveal.value.evidence_hash = evidence_hash;
+        transcript.value.challenge_reveal = SignedRecord::sign(
+            CODING_CHALLENGE_REVEAL_DOMAIN,
+            transcript.value.challenge_reveal.value.clone(),
+            verifier,
+        )
+        .unwrap();
+        let challenge = mb_core::coding_challenge(
+            plan.value.hash().unwrap(),
+            transcript.value.challenge_reveal.value.nonce,
+            evidence_hash,
+        );
+        for (index, opening) in transcript.value.openings.iter_mut().enumerate() {
+            let role = &transcript.value.manifest.value.group.roles[index];
+            let commitment = match role {
+                ShardRoleV2::Information(info) => &info.sector.commitment,
+                ShardRoleV2::Parity(parity) => &parity.commitment,
+            };
+            let leaf = challenged_leaf(&challenge, commitment).unwrap();
+            opening.value.challenge = challenge;
+            opening.value.commitment = commitment.clone();
+            opening.value.proof = merkle_open_range(&corrupt_shards[index], leaf, 1).unwrap();
+            *opening = SignedRecord::sign(
+                CODING_SHARD_OPENING_DOMAIN,
+                opening.value.clone(),
+                key(opening.signer),
+            )
+            .unwrap();
+        }
+        let transcript =
+            SignedRecord::sign(CODING_TRANSCRIPT_DOMAIN, transcript.value, verifier).unwrap();
+        assert_eq!(
+            replay_coding_transcript(&transcript).unwrap(),
+            CodingReplayFinding::InvalidCoding {
+                coordinator: plan.value.coding_coordinator
+            }
         );
         transcript
     }
@@ -16513,6 +16655,13 @@ pub(crate) mod tests {
         coding_value.checkpoint_hash = [75; 32];
         coding_value.attempt_id = [91; 16];
         let coding = node.sign_coding_attempt_plan(coding_value).unwrap();
+        node.control
+            .put_record(
+                "coding-launch-information",
+                &coding.value.attempt_id,
+                &canonical_bytes(&BTreeMap::<SectorId, PackedSectorDescriptor>::new()).unwrap(),
+            )
+            .unwrap();
         let mut invalid_coding = test_coding_transcript(coding.clone(), &shards, &keys);
         let mut corrupt_shards = shards.clone();
         for byte in &mut corrupt_shards[1] {
@@ -16622,6 +16771,107 @@ pub(crate) mod tests {
         assert_ne!(
             fresh.value.verification_coordinator,
             coding.value.verification_coordinator
+        );
+        assert_eq!(
+            node.coding_invalid_coordinators_for_source(&fresh).unwrap(),
+            [coding.value.coding_coordinator].into()
+        );
+        let second_invalid = test_invalid_coding_transcript(fresh.clone(), &shards, &keys);
+        node.accept_coding_transcript(fresh.value.coding_coordinator, second_invalid)
+            .unwrap();
+        let invalid = node.coding_invalid_coordinators_for_source(&fresh).unwrap();
+        assert_eq!(invalid.len(), 2);
+        assert!(invalid.contains(&coding.value.coding_coordinator));
+        assert!(invalid.contains(&fresh.value.coding_coordinator));
+        let next_coder = fresh.value.verification_coordinator;
+        let next_verifier = node
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap()
+            .active_members()
+            .map(|member| member.node_id)
+            .find(|id| !invalid.contains(id) && *id != next_coder)
+            .unwrap();
+        let eligible = node
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap()
+            .active_members()
+            .map(|member| member.node_id)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !node
+                .complete_coding_activation_with_coordinators(
+                    fresh.value.attempt_id,
+                    false,
+                    Some((next_coder, coding.value.coding_coordinator)),
+                    eligible.clone(),
+                )
+                .unwrap()
+        );
+        assert!(
+            node.complete_coding_activation_with_coordinators(
+                fresh.value.attempt_id,
+                false,
+                Some((next_coder, next_verifier)),
+                eligible,
+            )
+            .unwrap()
+        );
+        let healthy = node
+            .coding_launch_successor_for_test(fresh.value.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert!(!invalid.contains(&healthy.value.coding_coordinator));
+        assert!(!invalid.contains(&healthy.value.verification_coordinator));
+        assert_eq!(
+            node.coding_launch_information_to_stage(healthy.value.attempt_id)
+                .unwrap(),
+            Some(BTreeMap::new())
+        );
+        let verified = test_coding_transcript(healthy.clone(), &shards, &keys);
+        node.accept_coding_transcript(healthy.value.coding_coordinator, verified.clone())
+            .unwrap();
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::AddCodingGroup {
+                group: verified.value.manifest.value.group.clone(),
+            },
+        };
+        let mut signatures = keys
+            .iter()
+            .map(|key| sign_guild_event(&event, key).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        node.install_coding_group_event(QuorumGuildEvent { event, signatures }, verified.clone())
+            .unwrap();
+        assert!(
+            node.complete_coding_activation_with_coordinators(
+                healthy.value.attempt_id,
+                true,
+                None,
+                BTreeSet::new(),
+            )
+            .unwrap()
+        );
+        drop(node);
+        let node = Node::open(temp.path(), seed).unwrap();
+        assert_eq!(
+            node.coding_transcript_for_group(
+                state.guild_id,
+                verified.value.manifest.value.group.id,
+            )
+            .unwrap(),
+            verified
+        );
+        assert_eq!(
+            node.coding_launch_successor_for_test(fresh.value.attempt_id)
+                .unwrap(),
+            Some(healthy)
         );
     }
 
