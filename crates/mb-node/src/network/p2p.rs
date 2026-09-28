@@ -24692,6 +24692,467 @@ mod tests {
         }
     }
 
+    async fn retired_full_width_activation_worker_fixture(active_count: usize) {
+        assert!(matches!(active_count, 3 | 5));
+        let temp = tempfile::tempdir().unwrap();
+        let seeds = (0_u8..5)
+            .map(|index| Seed::from_bytes([180 + index; 32]))
+            .collect::<Vec<_>>();
+        let keys = seeds.iter().map(KeyMaterial::from_seed).collect::<Vec<_>>();
+        let open_nodes = || {
+            seeds
+                .iter()
+                .enumerate()
+                .map(|(index, seed)| {
+                    Arc::new(Mutex::new(
+                        Node::open(temp.path().join(format!("node-{index}")), seed.clone())
+                            .unwrap(),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut nodes = open_nodes();
+        let mut clients = Vec::new();
+        let mut network_tasks = Vec::new();
+        for (index, node) in nodes.iter().enumerate() {
+            let volume = temp.path().join(format!("volume-{index}"));
+            std::fs::create_dir(&volume).unwrap();
+            node.lock()
+                .unwrap()
+                .configure_storage_volumes(&[volume], 4 * 1024 * 1024, 0)
+                .unwrap();
+            let mut cfg = config(node.lock().unwrap().keys().node_id());
+            cfg.enable_relay_server = false;
+            let (client, event_loop) = build_p2p(node.clone(), cfg).unwrap();
+            clients.push(client);
+            network_tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let addresses = futures::future::join_all(clients.iter().map(listening_address)).await;
+        let endpoints = clients
+            .iter()
+            .zip(addresses.iter().cloned())
+            .map(|(client, address)| peer_endpoint(client, address))
+            .collect::<Vec<_>>();
+        let certificate = form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+        for index in (active_count..5).rev() {
+            let removed = nodes[index].lock().unwrap().keys().node_id();
+            install_coding_test_event(
+                &nodes,
+                mb_core::GuildEventKind::RemoveMember { node_id: removed },
+            );
+        }
+        let ids = nodes
+            .iter()
+            .take(active_count)
+            .map(|node| node.lock().unwrap().keys().node_id())
+            .collect::<Vec<_>>();
+        let owner = ids[0];
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[190; 32]);
+        install_coding_test_event(
+            &nodes,
+            mb_core::GuildEventKind::RotateWriterKey {
+                owner,
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            },
+        );
+        let state = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap();
+        let guild_id = state.guild_id;
+        let member = |id| {
+            state
+                .active_members()
+                .find(|member| member.node_id == id)
+                .unwrap()
+                .clone()
+        };
+        let revision_id = Uuid::from_bytes([191; 16]);
+        let sector_id =
+            mb_core::make_sector_id(owner, revision_id, mb_core::SectorPurpose::Metadata, 0);
+        let (reference, bytes) = mb_core::encrypted_sector(
+            &nodes[0].lock().unwrap().keys().guild_data_key(&guild_id),
+            sector_id,
+            &[42],
+        )
+        .unwrap();
+        nodes[0]
+            .lock()
+            .unwrap()
+            .install_repaired_information_sector(guild_id, reference.clone(), &bytes)
+            .unwrap();
+        let mut revision = UserRevision {
+            format_version: 4,
+            guild_id,
+            protected_root_id: Uuid::from_bytes([192; 16]),
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id,
+            owner,
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![reference.clone()],
+            data_sectors: Vec::new(),
+            sector_commitments: Some(vec![merkle_commit(&bytes).unwrap()]),
+        };
+        revision.sign_writer(&writer).unwrap();
+        let checkpoint = GuildCheckpoint {
+            format_version: 5,
+            guild_id,
+            genesis_hash: certificate.hash().unwrap(),
+            generation: 1,
+            parent: None,
+            members: state.active_members().cloned().collect(),
+            writer_fences: vec![mb_core::WriterFence {
+                owner,
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            }],
+            revision_tombstones: Vec::new(),
+            revisions: vec![
+                SignedRecord::sign(
+                    mb_core::USER_REVISION_DOMAIN,
+                    revision,
+                    nodes[0].lock().unwrap().keys(),
+                )
+                .unwrap(),
+            ],
+            coding_groups: Vec::new(),
+            authority: Some(CheckpointAuthority {
+                format_version: 1,
+                membership_epoch: state.membership_epoch,
+                quorum: state.quorum,
+            }),
+            packing_catalog: None,
+        };
+        let data_count = if active_count == 3 { 2 } else { 3 };
+        let parity_indices = if active_count == 3 {
+            vec![2]
+        } else {
+            vec![3, 4]
+        };
+        let profile = CodingProfile::new(
+            data_count as u16,
+            parity_indices.len() as u16,
+            V1_SECTOR_SIZE as u32,
+        );
+        let zero = vec![0; V1_SECTOR_SIZE];
+        let zero_commitment = mb_core::merkle_zero_commitment(profile.shard_size).unwrap();
+        let mut information = vec![InformationRoleV2 {
+            owner,
+            failure_domain: member(owner).failure_domain,
+            sector: RangeSectorRef {
+                id: sector_id,
+                commitment: merkle_commit(&bytes).unwrap(),
+                logical_len: reference.logical_len,
+                virtual_zero: false,
+            },
+        }];
+        for (index, id) in ids.iter().take(data_count).enumerate().skip(1) {
+            information.push(InformationRoleV2 {
+                owner: *id,
+                failure_domain: member(*id).failure_domain,
+                sector: RangeSectorRef {
+                    id: [index as u8 + 1; 32],
+                    commitment: zero_commitment.clone(),
+                    logical_len: profile.shard_size,
+                    virtual_zero: true,
+                },
+            });
+        }
+        let parity = parity_indices
+            .iter()
+            .enumerate()
+            .map(|(row, index)| ParityPlacementV2 {
+                holder: ids[*index],
+                failure_domain: member(ids[*index]).failure_domain,
+                row: row as u16,
+            })
+            .collect();
+        let plan = nodes[0]
+            .lock()
+            .unwrap()
+            .sign_coding_attempt_plan(CodingAttemptPlan {
+                format_version: 3,
+                attempt_id: [193; 16],
+                checkpoint_hash: checkpoint.hash().unwrap(),
+                membership_epoch: state.membership_epoch,
+                geometry: CodingPlanGeometry {
+                    format_version: 1,
+                    guild_id,
+                    profile,
+                    information,
+                    parity,
+                },
+                delegator: owner,
+                coding_coordinator: ids[1],
+                verification_coordinator: ids[2],
+                expires_at_unix_seconds: unix_seconds() + 600,
+                information_roots: Some(
+                    std::iter::once(reference.root)
+                        .chain(std::iter::repeat_n([0; 32], data_count - 1))
+                        .collect(),
+                ),
+            })
+            .unwrap();
+        nodes[0]
+            .lock()
+            .unwrap()
+            .enqueue_coding_launch_with_information(plan.clone(), Some(BTreeMap::new()))
+            .unwrap();
+        let mut data = vec![bytes.clone()];
+        data.extend(std::iter::repeat_n(zero, data_count - 1));
+        let shards = encode(profile, data).unwrap();
+        let transcript = crate::node::tests::test_coding_transcript(plan.clone(), &shards, &keys);
+        let group = transcript.value.manifest.value.group.clone();
+        for (row, index) in parity_indices.iter().copied().enumerate() {
+            let shard_index = data_count + row;
+            let ShardRoleV2::Parity(role) = &group.roles[shard_index] else {
+                unreachable!();
+            };
+            nodes[index]
+                .lock()
+                .unwrap()
+                .stage_coding_parity(
+                    &plan,
+                    &transcript.value.manifest,
+                    &VariableParityObject {
+                        format_version: 2,
+                        guild_id,
+                        group_id: group.id,
+                        shard_index: shard_index as u16,
+                        commitment: role.commitment.clone(),
+                        bytes: shards[shard_index].clone(),
+                    },
+                )
+                .unwrap();
+            nodes[index]
+                .lock()
+                .unwrap()
+                .activate_coding_attempt(&transcript)
+                .unwrap();
+        }
+        install_coding_test_group_event(&nodes, &transcript);
+        nodes[0]
+            .lock()
+            .unwrap()
+            .accept_coding_transcript(plan.value.coding_coordinator, transcript.clone())
+            .unwrap();
+        let current = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap();
+        install_coding_test_event(
+            &nodes,
+            mb_core::GuildEventKind::RetireCodingGroup {
+                group_id: group.id,
+                retain_through_event: current.event_sequence + 1,
+            },
+        );
+        for index in &parity_indices {
+            nodes[*index]
+                .lock()
+                .unwrap()
+                .configure_storage_volumes(&[temp.path().join(format!("volume-{index}"))], 1, 0)
+                .unwrap();
+        }
+        process_coding_activation_job(nodes[0].clone(), &clients[0])
+            .await
+            .unwrap();
+        assert!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .coding_launch_successor_for_test(plan.value.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .coding_activation_needs_replan(&transcript)
+                .unwrap()
+        );
+        for client in &clients {
+            client.shutdown().await.unwrap();
+        }
+        for task in network_tasks {
+            task.await.unwrap().unwrap();
+        }
+        drop(clients);
+        drop(nodes);
+        nodes = open_nodes();
+        let mut clients = Vec::new();
+        let mut network_tasks = Vec::new();
+        for node in &nodes {
+            let mut cfg = config(node.lock().unwrap().keys().node_id());
+            cfg.enable_relay_server = false;
+            let (client, event_loop) = build_p2p(node.clone(), cfg).unwrap();
+            clients.push(client);
+            network_tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let addresses = futures::future::join_all(clients.iter().map(listening_address)).await;
+        for (index, client) in clients.iter().enumerate() {
+            for (remote, id) in ids.iter().enumerate() {
+                if index != remote {
+                    client
+                        .add_peer_address(*id, addresses[remote].clone())
+                        .await
+                        .unwrap();
+                    client.profile(*id).await.unwrap();
+                }
+            }
+        }
+        install_coding_test_event(
+            &nodes,
+            mb_core::GuildEventKind::ForgetCodingGroup { group_id: group.id },
+        );
+        for index in &parity_indices {
+            nodes[*index]
+                .lock()
+                .unwrap()
+                .configure_storage_volumes(
+                    &[temp.path().join(format!("volume-{index}"))],
+                    4 * 1024 * 1024,
+                    0,
+                )
+                .unwrap();
+        }
+        process_coding_activation_job(nodes[0].clone(), &clients[0])
+            .await
+            .unwrap();
+        let successor = nodes[0]
+            .lock()
+            .unwrap()
+            .coding_launch_successor_for_test(plan.value.attempt_id)
+            .unwrap()
+            .unwrap();
+        for index in &parity_indices {
+            assert_eq!(
+                nodes[*index]
+                    .lock()
+                    .unwrap()
+                    .coding_used_bytes_for_test()
+                    .unwrap(),
+                0,
+                "forgotten parity on holder {index} was not cleaned before renewal"
+            );
+        }
+        assert_ne!(successor.value.attempt_id, plan.value.attempt_id);
+        assert_eq!(successor.value.geometry, plan.value.geometry);
+        let coding_tasks = nodes
+            .iter()
+            .take(active_count)
+            .zip(clients.iter())
+            .map(|(node, client)| {
+                tokio::spawn(run_delegated_coding_jobs(node.clone(), client.clone()))
+            })
+            .collect::<Vec<_>>();
+        let coverage = tokio::time::timeout(
+            Duration::from_secs(90),
+            wait_for_variable_coding_groups(nodes[0].clone(), checkpoint.clone()),
+        )
+        .await;
+        if coverage.is_err() {
+            let owner = nodes[0].lock().unwrap();
+            let launches = owner
+                .coding_launch_jobs_for_test()
+                .unwrap()
+                .into_iter()
+                .map(|job| (job.plan.value.attempt_id, job.dispatched, job.error))
+                .collect::<Vec<_>>();
+            let activations = owner
+                .coding_activation_jobs_for_test()
+                .unwrap()
+                .into_iter()
+                .map(|job| {
+                    (
+                        job.transcript.value.plan.value.attempt_id,
+                        job.complete,
+                        job.error,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let groups = owner
+                .dynamic_guild_state()
+                .unwrap()
+                .unwrap()
+                .coding_groups
+                .into_iter()
+                .map(|group| (group.group.id, group.retired_at_event))
+                .collect::<Vec<_>>();
+            drop(owner);
+            let delegated = nodes
+                .iter()
+                .take(active_count)
+                .map(|node| {
+                    node.lock()
+                        .unwrap()
+                        .delegated_coding_jobs_for_test()
+                        .unwrap()
+                        .into_iter()
+                        .map(|job| (job.plan.value.attempt_id, job.state, job.error))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            panic!(
+                "full-width coverage stalled: coverage={:?}, launches={launches:?}, activations={activations:?}, groups={groups:?}, delegated={delegated:?}, workers={:?}",
+                nodes[0]
+                    .lock()
+                    .unwrap()
+                    .validate_variable_checkpoint_coverage(&checkpoint, false),
+                coding_tasks
+                    .iter()
+                    .map(|task| task.is_finished())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        coverage.unwrap().unwrap();
+        for task in coding_tasks {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        for client in &clients {
+            client.shutdown().await.unwrap();
+        }
+        for task in network_tasks {
+            task.await.unwrap().unwrap();
+        }
+        drop(clients);
+        drop(nodes);
+        for _ in 0..2 {
+            let owner = Node::open(temp.path().join("node-0"), seeds[0].clone()).unwrap();
+            owner
+                .validate_variable_checkpoint_coverage(&checkpoint, false)
+                .unwrap();
+            assert_eq!(
+                owner
+                    .coding_launch_successor_for_test(plan.value.attempt_id)
+                    .unwrap(),
+                Some(successor.clone())
+            );
+            assert!(!owner.coding_activation_needs_replan(&transcript).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_three_domain_activation_worker_forgets_and_reopens() {
+        retired_full_width_activation_worker_fixture(3).await;
+    }
+
+    #[tokio::test]
+    async fn retired_five_domain_activation_worker_forgets_and_reopens() {
+        retired_full_width_activation_worker_fixture(5).await;
+    }
+
     #[tokio::test]
     async fn uncovered_activations_unblock_live_checkpoint_wait() {
         let temp = tempfile::tempdir().unwrap();

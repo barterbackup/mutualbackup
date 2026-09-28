@@ -788,11 +788,17 @@ fn process_peer_request(
         if let Some(kind) = mutation_kind {
             if matches!(
                 kind,
-                "ensure-filler" | "reserve-coding-information" | "reserve-coding-parity"
+                "ensure-filler"
+                    | "reserve-coding-information"
+                    | "reserve-coding-parity"
+                    | "abort-coding-attempt"
             ) {
                 // Filler installation is idempotent. Reservation replies carry
                 // a mutable durable upload cursor, so an old journal response
                 // must never replace the holder's current progress on resume.
+                // Abort must recheck retained-group state: an acknowledgement
+                // before Forget may finalize receipts while keeping READY
+                // parity, but a later abort must remove that object.
                 return execute_peer_request(&mut node_guard, config, request_id, caller, request);
             }
             if let Some(cached_bytes) =
