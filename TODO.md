@@ -588,10 +588,11 @@ Accepted child result/failure
 owners win successor retirement arbitration under the writer lock; late parent
 completion preserves child-owned input intent. Terminal metadata binds the
 exact signed child without changing persisted job encodings or signed records.
-The first complete workspace run exposes M5-118: expired-launch renewal does
-not coalesce with a recovered live retry successor. Correct that ownership gap
-and complete the final M5-114 gate before Milestone 6.
-All compilation and execution are local.
+The first complete workspace run exposed M5-118: expired-launch renewal did
+not coalesce with a recovered live retry successor. M5-118 is corrected, and
+the final M5-114 workspace and fresh provisioned gate passed on exact source
+`720920def00323c7efbcc347df8447e3e98fa6ec`. Milestone 5 is closed;
+Milestone 6 may proceed. All compilation and execution were local.
 
 Earlier source-review record:
 
@@ -3211,9 +3212,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   formatting, and whitespace checks pass. Logs are
   `/tmp/mutualbackup-m5-118-launches-v1.log`,
   `/tmp/mutualbackup-m5-118-unit-v1.log`, and
-  `/tmp/mutualbackup-m5-118-clippy-v1.log`. The full M5-114 gate remains open.
+  `/tmp/mutualbackup-m5-118-clippy-v1.log`. The later M5-114 gate passed on
+  `720920d`.
 
-- [ ] **M5-114 / gate — Recheck Milestone 5 after cleanup ownership and packed retries.**
+- [x] **M5-114 / gate — Recheck Milestone 5 after cleanup ownership and packed retries.**
   Correct M5-111 through M5-113 and M5-115 through M5-118, then source-review
   the final committed tree and run their controlled production-worker
   regressions locally. On that exact source, pass strict locked all-target
@@ -3226,7 +3228,31 @@ node Clippy gate passed locally. No remote compilation server was used.
   images/mounts, loop devices, namespaces, interfaces/rules and processes.
   Earlier M5-104 results remain historical; only this new gate can close the
   follow-up corrections. Build and run everything locally; never use a remote
-  compilation server. This source-only review did not execute the gate.
+  compilation server. The original source-only review did not execute the gate.
+
+  Completed on 2026-09-28 against exact clean committed source
+  `720920def00323c7efbcc347df8447e3e98fa6ec` after the M5-118 focused
+  production-worker and controlled ownership checks. Formatting, strict locked
+  all-target workspace Clippy, locked all-target workspace tests, and Docker
+  lab safety passed. Workspace tests include 48 core, 279 node (10 ignored),
+  51 store (14 ignored), CLI/application, and vendored targets. The node suite
+  passed the four previously failing real launch-expiry regressions without
+  weakening their exact-successor, cleanup/capacity, or checkpoint assertions.
+  The complete fresh `scripts/reflink-acceptance.sh` run passed all 23
+  invocations on a disposable local 8 GiB Btrfs image: repeated multi-owner
+  QUIC passed in 749.36 seconds and the five-daemon seed/DHT recovery plus
+  direct, DCUtR and relay fallback scenario passed in 2314.21 seconds.
+  Runner cleanup exited zero. Independent post-run checks confirmed the owned
+  `/tmp/mutualbackup-m5-114.aq7ldZ` image and mount were absent, `/dev/loop0`
+  detached, namespaces and interfaces restored to baseline, forwarding
+  restored, and no acceptance harness or daemon processes remained. The
+  firewall contained only empty built-in tables materialized by the run; no
+  custom chains or rules remained. Workspace, acceptance, and independent
+  cleanup evidence are in `/tmp/mutualbackup-m5-114-workspace-v2.log`,
+  `/tmp/mutualbackup-m5-114-provisioned-v1.log`, and
+  `/tmp/mutualbackup-m5-114-cleanup-audit-v2.log`. The worktree stayed clean
+  throughout both gates. No remote compilation server was used. Milestone 5
+  is closed; this status-document update does not change the tested source.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
