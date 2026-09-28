@@ -7211,18 +7211,24 @@ impl Node {
             .transpose()?;
         if let Some(transcript) = &transcript {
             let group_id = transcript.value.manifest.value.group.id;
-            if self.dynamic_guild_state()?.is_some_and(|state| {
+            let retained = self.dynamic_guild_state()?.is_some_and(|state| {
                 state
                     .coding_groups
                     .iter()
                     .any(|retained| retained.group.id == group_id)
-            }) {
+            });
+            if retained {
+                // The delegator may have retired this group even if this
+                // holder has not received Retire yet. Acknowledgement cannot
+                // remove READY parity until this holder installs Forget, so
+                // retain the second phase before finalizing rollback receipts.
+                self.record_coding_holder_cleanup(&transcript.value.plan, self.keys.node_id())?;
                 self.volumes.finalize_attempt(&self.control, attempt_id)?;
                 return Ok(true);
             }
         }
         let mut complete = self.volumes.discard_attempt(&self.control, attempt_id)?;
-        if let Some(transcript) = transcript {
+        if let Some(transcript) = &transcript {
             let group = &transcript.value.manifest.value.group;
             for (index, role) in group.roles.iter().enumerate() {
                 if let ShardRoleV2::Parity(parity) = role
@@ -7237,8 +7243,34 @@ impl Node {
                     )?;
                 }
             }
+            if complete {
+                self.clear_coding_holder_cleanup(&transcript.value.plan, self.keys.node_id())?;
+            }
         }
         Ok(complete)
+    }
+
+    pub(crate) fn coding_holder_cleanup_waits_for_forget(
+        &self,
+        plan: &SignedRecord<CodingAttemptPlan>,
+    ) -> Result<bool> {
+        let Some(bytes) = self
+            .control
+            .get_record("coding-transcript", &plan.value.attempt_id)?
+        else {
+            return Ok(false);
+        };
+        let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(&bytes)?;
+        if transcript.value.plan != *plan {
+            anyhow::bail!("coding cleanup transcript conflicts with its signed plan");
+        }
+        let group_id = transcript.value.manifest.value.group.id;
+        Ok(self.dynamic_guild_state()?.is_some_and(|state| {
+            state
+                .coding_groups
+                .iter()
+                .any(|retained| retained.group.id == group_id)
+        }))
     }
 
     pub(crate) fn record_coding_holder_cleanup(
@@ -17006,6 +17038,11 @@ pub(crate) mod tests {
         );
         node.install_coding_group_event(add, transcript.clone())
             .unwrap();
+        // The delegator can have retired the group while this holder has only
+        // installed Add. Its early abort must still leave a durable cleanup
+        // owner for the later Forget.
+        assert!(node.discard_coding_attempt(&plan.value.attempt_id).unwrap());
+        assert_eq!(node.coding_holder_cleanup_count_for_test().unwrap(), 1);
         node.accept_coding_transcript(plan.value.coding_coordinator, transcript.clone())
             .unwrap();
         let state = node.dynamic_guild_state().unwrap().unwrap();
@@ -17043,6 +17080,7 @@ pub(crate) mod tests {
         drop(node);
         let mut node = Node::open(temp.path().join("node"), seed).unwrap();
         assert!(node.coding_activation_needs_replan(&transcript).unwrap());
+        assert_eq!(node.coding_holder_cleanup_count_for_test().unwrap(), 1);
         let state = node.dynamic_guild_state().unwrap().unwrap();
         let forget = sign_event(
             &state,
@@ -17050,6 +17088,7 @@ pub(crate) mod tests {
         );
         node.install_guild_event(forget).unwrap();
         assert!(node.discard_coding_attempt(&plan.value.attempt_id).unwrap());
+        assert_eq!(node.coding_holder_cleanup_count_for_test().unwrap(), 0);
         assert!(
             node.variable_parity_for_guild(&state.guild_id, &group.id, local_parity_index as u16)
                 .is_err()

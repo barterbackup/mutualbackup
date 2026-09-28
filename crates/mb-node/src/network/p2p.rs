@@ -6094,6 +6094,16 @@ async fn process_coding_holder_cleanup_job(
     *cursor = Some(id);
     let holder = obligation.holder;
     let local_id = node_blocking(node.clone(), |node| Ok(node.keys().node_id())).await?;
+    if holder == local_id {
+        let plan = obligation.plan.clone();
+        if node_blocking(node.clone(), move |node| {
+            node.coding_holder_cleanup_waits_for_forget(&plan)
+        })
+        .await?
+        {
+            return Ok(());
+        }
+    }
     let result = if holder == local_id {
         let attempt_id = obligation.plan.value.attempt_id;
         node_blocking(node.clone(), move |node| {
@@ -7815,7 +7825,12 @@ async fn abort_delegated_coding_with_policy(
             Ok(()) => {
                 let plan = job.plan.clone();
                 node_blocking(node.clone(), move |node| {
-                    node.clear_coding_holder_cleanup(&plan, holder)
+                    if holder != node.keys().node_id()
+                        || !node.coding_holder_cleanup_waits_for_forget(&plan)?
+                    {
+                        node.clear_coding_holder_cleanup(&plan, holder)?;
+                    }
+                    Ok(())
                 })
                 .await?;
             }
@@ -24569,12 +24584,15 @@ mod tests {
     #[tokio::test]
     async fn three_member_negative_activation_rotates_verifier_into_coder() {
         let temp = tempfile::tempdir().unwrap();
+        let seeds = (0_u8..5)
+            .map(|index| Seed::from_bytes([160 + index; 32]))
+            .collect::<Vec<_>>();
         let nodes = (0_u8..5)
             .map(|index| {
                 Arc::new(Mutex::new(
                     Node::open(
                         temp.path().join(format!("node-{index}")),
-                        Seed::from_bytes([160 + index; 32]),
+                        seeds[index as usize].clone(),
                     )
                     .unwrap(),
                 ))
@@ -24582,7 +24600,13 @@ mod tests {
             .collect::<Vec<_>>();
         let mut clients = Vec::new();
         let mut tasks = Vec::new();
-        for node in &nodes {
+        for (index, node) in nodes.iter().enumerate() {
+            let volume = temp.path().join(format!("volume-{index}"));
+            std::fs::create_dir(&volume).unwrap();
+            node.lock()
+                .unwrap()
+                .configure_storage_volumes(&[volume], 4 * 1024 * 1024, 0)
+                .unwrap();
             let mut cfg = config(node.lock().unwrap().keys().node_id());
             cfg.enable_relay_server = false;
             let (client, event_loop) = build_p2p(node.clone(), cfg).unwrap();
@@ -24595,7 +24619,7 @@ mod tests {
             .zip(addresses.iter().cloned())
             .map(|(client, address)| peer_endpoint(client, address))
             .collect::<Vec<_>>();
-        form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+        let certificate = form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
         for index in [4, 3] {
             let removed = nodes[index].lock().unwrap().keys().node_id();
             install_coding_test_event(
@@ -24608,6 +24632,15 @@ mod tests {
             .take(3)
             .map(|node| node.lock().unwrap().keys().node_id())
             .collect::<Vec<_>>();
+        let writer = ed25519_dalek::SigningKey::from_bytes(&[165; 32]);
+        install_coding_test_event(
+            &nodes,
+            mb_core::GuildEventKind::RotateWriterKey {
+                owner: ids[0],
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            },
+        );
         for (client, self_id) in clients.iter().take(3).zip(&ids) {
             for (peer_id, address) in ids.iter().zip(&addresses) {
                 if peer_id != self_id {
@@ -24631,31 +24664,104 @@ mod tests {
                 .unwrap()
                 .clone()
         };
-        let data = [vec![31; 64], vec![32; 64]];
+        let guild_id = state.guild_id;
+        let revision_id = Uuid::from_bytes([166; 16]);
+        let sector_id =
+            mb_core::make_sector_id(ids[0], revision_id, mb_core::SectorPurpose::Metadata, 0);
+        let (reference, bytes) = mb_core::encrypted_sector(
+            &nodes[0].lock().unwrap().keys().guild_data_key(&guild_id),
+            sector_id,
+            &[31],
+        )
+        .unwrap();
+        nodes[0]
+            .lock()
+            .unwrap()
+            .install_repaired_information_sector(guild_id, reference.clone(), &bytes)
+            .unwrap();
+        let mut revision = UserRevision {
+            format_version: 4,
+            guild_id,
+            protected_root_id: Uuid::from_bytes([167; 16]),
+            cipher_profile: mb_core::V1_CIPHER_PROFILE,
+            revision_id,
+            owner: ids[0],
+            writer_epoch: 1,
+            writer_public_key: writer.verifying_key().to_bytes(),
+            writer_signature: Vec::new(),
+            sequence: 1,
+            parent: None,
+            metadata_sectors: vec![reference.clone()],
+            data_sectors: Vec::new(),
+            sector_commitments: Some(vec![merkle_commit(&bytes).unwrap()]),
+        };
+        revision.sign_writer(&writer).unwrap();
+        let checkpoint = GuildCheckpoint {
+            format_version: 5,
+            guild_id,
+            genesis_hash: certificate.hash().unwrap(),
+            generation: 1,
+            parent: None,
+            members: state.active_members().cloned().collect(),
+            writer_fences: vec![mb_core::WriterFence {
+                owner: ids[0],
+                epoch: 1,
+                public_key: writer.verifying_key().to_bytes(),
+            }],
+            revision_tombstones: Vec::new(),
+            revisions: vec![
+                SignedRecord::sign(
+                    mb_core::USER_REVISION_DOMAIN,
+                    revision,
+                    nodes[0].lock().unwrap().keys(),
+                )
+                .unwrap(),
+            ],
+            coding_groups: Vec::new(),
+            authority: Some(CheckpointAuthority {
+                format_version: 1,
+                membership_epoch: state.membership_epoch,
+                quorum: state.quorum,
+            }),
+            packing_catalog: None,
+        };
+        let profile = CodingProfile::new(2, 1, V1_SECTOR_SIZE as u32);
+        let data = [bytes, vec![0; V1_SECTOR_SIZE]];
         let plan = nodes[0]
             .lock()
             .unwrap()
             .sign_coding_attempt_plan(CodingAttemptPlan {
                 format_version: 3,
                 attempt_id: [161; 16],
-                checkpoint_hash: [162; 32],
+                checkpoint_hash: checkpoint.hash().unwrap(),
                 membership_epoch: state.membership_epoch,
                 geometry: CodingPlanGeometry {
                     format_version: 1,
-                    guild_id: state.guild_id,
-                    profile: CodingProfile::new(2, 1, 64),
-                    information: (0..2)
-                        .map(|index| InformationRoleV2 {
-                            owner: ids[index],
-                            failure_domain: member(ids[index]).failure_domain,
+                    guild_id,
+                    profile,
+                    information: vec![
+                        InformationRoleV2 {
+                            owner: ids[0],
+                            failure_domain: member(ids[0]).failure_domain,
                             sector: RangeSectorRef {
-                                id: [index as u8 + 1; 32],
-                                commitment: merkle_commit(&data[index]).unwrap(),
-                                logical_len: 64,
+                                id: sector_id,
+                                commitment: merkle_commit(&data[0]).unwrap(),
+                                logical_len: reference.logical_len,
                                 virtual_zero: false,
                             },
-                        })
-                        .collect(),
+                        },
+                        InformationRoleV2 {
+                            owner: ids[1],
+                            failure_domain: member(ids[1]).failure_domain,
+                            sector: RangeSectorRef {
+                                id: [168; 32],
+                                commitment: mb_core::merkle_zero_commitment(profile.shard_size)
+                                    .unwrap(),
+                                logical_len: profile.shard_size,
+                                virtual_zero: true,
+                            },
+                        },
+                    ],
                     parity: vec![ParityPlacementV2 {
                         holder: ids[2],
                         failure_domain: member(ids[2]).failure_domain,
@@ -24666,15 +24772,43 @@ mod tests {
                 coding_coordinator: ids[1],
                 verification_coordinator: ids[2],
                 expires_at_unix_seconds: unix_seconds() + 600,
-                information_roots: Some(data.iter().map(|bytes| sector_root(bytes)).collect()),
+                information_roots: Some(vec![reference.root, [0; 32]]),
             })
             .unwrap();
-        let keys = (0_u8..5)
-            .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([160 + index; 32])))
-            .collect::<Vec<_>>();
+        nodes[0]
+            .lock()
+            .unwrap()
+            .enqueue_coding_launch_with_information(plan.clone(), Some(BTreeMap::new()))
+            .unwrap();
+        let keys = seeds.iter().map(KeyMaterial::from_seed).collect::<Vec<_>>();
         let shards = encode(plan.value.geometry.profile, data.to_vec()).unwrap();
         let invalid =
             crate::node::tests::test_invalid_coding_transcript(plan.clone(), &shards, &keys);
+        let old_group = invalid.value.manifest.value.group.id;
+        let ShardRoleV2::Parity(old_parity_role) = &invalid.value.manifest.value.group.roles[2]
+        else {
+            unreachable!();
+        };
+        let mut old_parity = shards[2].clone();
+        for byte in &mut old_parity {
+            *byte ^= 1;
+        }
+        nodes[2]
+            .lock()
+            .unwrap()
+            .stage_coding_parity(
+                &plan,
+                &invalid.value.manifest,
+                &VariableParityObject {
+                    format_version: 2,
+                    guild_id,
+                    group_id: old_group,
+                    shard_index: 2,
+                    commitment: old_parity_role.commitment.clone(),
+                    bytes: old_parity,
+                },
+            )
+            .unwrap();
         nodes[0]
             .lock()
             .unwrap()
@@ -24684,11 +24818,93 @@ mod tests {
             fresh_coding_activation_coordinators(nodes[0].clone(), &clients[0], &plan).await,
             Some((ids[2], ids[0]))
         );
+        process_coding_activation_job(nodes[0].clone(), &clients[0])
+            .await
+            .unwrap();
+        let successor = nodes[0]
+            .lock()
+            .unwrap()
+            .coding_launch_successor_for_test(plan.value.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                successor.value.coding_coordinator,
+                successor.value.verification_coordinator
+            ),
+            (ids[2], ids[0])
+        );
+        assert_ne!(successor.value.attempt_id, plan.value.attempt_id);
+        assert_eq!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .coding_launch_information_to_stage(successor.value.attempt_id)
+                .unwrap(),
+            Some(BTreeMap::new())
+        );
+        assert!(
+            nodes[2]
+                .lock()
+                .unwrap()
+                .variable_parity_for_guild(&guild_id, &old_group, 2)
+                .is_err()
+        );
+        let coding_tasks = nodes
+            .iter()
+            .take(3)
+            .zip(clients.iter())
+            .map(|(node, client)| {
+                tokio::spawn(run_delegated_coding_jobs(node.clone(), client.clone()))
+            })
+            .collect::<Vec<_>>();
+        tokio::time::timeout(
+            Duration::from_secs(90),
+            wait_for_variable_coding_groups(nodes[0].clone(), checkpoint.clone()),
+        )
+        .await
+        .expect("three-member negative renewal did not reach verified coverage")
+        .unwrap();
+        let group = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap()
+            .coding_groups
+            .into_iter()
+            .find(|group| group.retired_at_event.is_none())
+            .unwrap();
+        assert_ne!(group.group.id, old_group);
+        for task in coding_tasks {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
         for client in &clients {
             client.shutdown().await.unwrap();
         }
         for task in tasks {
             task.await.unwrap().unwrap();
+        }
+        drop(clients);
+        drop(nodes);
+        for _ in 0..2 {
+            let owner = Node::open(temp.path().join("node-0"), seeds[0].clone()).unwrap();
+            let holder = Node::open(temp.path().join("node-2"), seeds[2].clone()).unwrap();
+            assert_eq!(
+                owner
+                    .coding_launch_successor_for_test(plan.value.attempt_id)
+                    .unwrap(),
+                Some(successor.clone())
+            );
+            owner
+                .validate_variable_checkpoint_coverage(&checkpoint, false)
+                .unwrap();
+            assert!(
+                holder
+                    .variable_parity_for_guild(&guild_id, &old_group, 2)
+                    .is_err()
+            );
         }
     }
 
@@ -25865,6 +26081,11 @@ mod tests {
             replay_coding_transcript(&verified_transcript).unwrap(),
             mb_core::CodingReplayFinding::Verified
         );
+        nodes[1]
+            .lock()
+            .unwrap()
+            .activate_coding_attempt(&verified_transcript)
+            .unwrap();
         nodes[0]
             .lock()
             .unwrap()
@@ -26047,6 +26268,108 @@ mod tests {
             );
         }
         coverage.unwrap().unwrap();
+        if !offline_spare {
+            // The old holder acknowledged abort before Forget, so its READY
+            // parity and local cleanup obligation must survive until its own
+            // guild tail catches up, even after the successor has coverage.
+            let old_group = verified_transcript.value.manifest.value.group.id;
+            assert_eq!(
+                nodes[1]
+                    .lock()
+                    .unwrap()
+                    .coding_holder_cleanup_count_for_test()
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                nodes[0]
+                    .lock()
+                    .unwrap()
+                    .coding_holder_cleanup_count_for_test()
+                    .unwrap(),
+                1,
+                "local holder cleanup must survive its successful early abort"
+            );
+            assert!(
+                nodes[1]
+                    .lock()
+                    .unwrap()
+                    .variable_parity_for_guild(&guild_id, &old_group, 1)
+                    .is_ok()
+            );
+            let state = nodes[0]
+                .lock()
+                .unwrap()
+                .dynamic_guild_state()
+                .unwrap()
+                .unwrap();
+            let event = GuildEvent {
+                format_version: 1,
+                guild_id,
+                sequence: state.event_sequence + 1,
+                parent: state.event_head,
+                kind: mb_core::GuildEventKind::ForgetCodingGroup {
+                    group_id: old_group,
+                },
+            };
+            let mut signatures = nodes
+                .iter()
+                .map(|node| mb_core::sign_guild_event(&event, node.lock().unwrap().keys()).unwrap())
+                .collect::<Vec<_>>();
+            signatures.sort_by_key(|signature| signature.signer);
+            let certified = QuorumGuildEvent { event, signatures };
+            for (index, node) in nodes.iter().enumerate() {
+                if index != 1 {
+                    node.lock()
+                        .unwrap()
+                        .install_guild_event(certified.clone())
+                        .unwrap();
+                }
+            }
+            let mut owner_cleanup_cursor = None;
+            process_coding_holder_cleanup_job(
+                nodes[0].clone(),
+                &clients[0],
+                &mut owner_cleanup_cursor,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                nodes[0]
+                    .lock()
+                    .unwrap()
+                    .coding_holder_cleanup_count_for_test()
+                    .unwrap(),
+                0
+            );
+            let mut cleanup_cursor = None;
+            process_coding_holder_cleanup_job(nodes[1].clone(), &clients[1], &mut cleanup_cursor)
+                .await
+                .unwrap();
+            assert_eq!(
+                nodes[1]
+                    .lock()
+                    .unwrap()
+                    .coding_holder_cleanup_count_for_test()
+                    .unwrap(),
+                1
+            );
+            nodes[1]
+                .lock()
+                .unwrap()
+                .install_guild_event(certified)
+                .unwrap();
+            process_coding_holder_cleanup_job(nodes[1].clone(), &clients[1], &mut cleanup_cursor)
+                .await
+                .unwrap();
+            let holder = nodes[1].lock().unwrap();
+            assert_eq!(holder.coding_holder_cleanup_count_for_test().unwrap(), 0);
+            assert!(
+                holder
+                    .variable_parity_for_guild(&guild_id, &old_group, 1)
+                    .is_err()
+            );
+        }
         for task in second_coding_tasks {
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
@@ -26104,6 +26427,20 @@ mod tests {
         );
         node.validate_variable_checkpoint_coverage(&second_checkpoint, false)
             .unwrap();
+        if !offline_spare {
+            let old_group = verified_transcript.value.manifest.value.group.id;
+            drop(node);
+            drop(nodes);
+            for _ in 0..2 {
+                let holder = Node::open(temp.path().join("node-1"), seeds[1].clone()).unwrap();
+                assert_eq!(holder.coding_holder_cleanup_count_for_test().unwrap(), 0);
+                assert!(
+                    holder
+                        .variable_parity_for_guild(&guild_id, &old_group, 1)
+                        .is_err()
+                );
+            }
+        }
     }
 
     #[tokio::test]
