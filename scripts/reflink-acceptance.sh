@@ -32,5 +32,6 @@ cargo test -p mb-node volume::tests::physical_reservation_preserves_headroom_aft
 cargo test -p mb-node node::tests::complete_recovery_verifies_a_relocated_anchor_without_writing --locked -- --ignored --exact
 cargo test -p mb-node lab::tests::seed_only_recovery_over_five_active_nodes --locked -- --ignored --exact
 cargo test -p mb-node network::tests::signed_network_commit_and_seed_recovery --locked -- --ignored --exact
+cargo test -p mb-node network::p2p::tests::retired_full_width_backups_commit_over_quic --locked -- --ignored --exact
 cargo test -p mb-node network::p2p::tests::repeated_multi_owner_backups_commit_over_quic --locked -- --ignored --exact
 bash scripts/network-smoke.sh "$MUTUALBACKUP_REFLINK_TEST_ROOT"

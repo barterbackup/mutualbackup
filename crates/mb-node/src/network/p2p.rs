@@ -25153,6 +25153,321 @@ mod tests {
         retired_full_width_activation_worker_fixture(5).await;
     }
 
+    async fn retired_full_width_backup_completion_fixture(active_count: usize) {
+        let provisioned = std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT");
+        let run_root = std::path::PathBuf::from(provisioned).join(format!(
+            "retired-full-width-{active_count}-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&run_root).unwrap();
+        let seeds = (0_u8..5)
+            .map(|index| Seed::from_bytes([161 + index; 32]))
+            .collect::<Vec<_>>();
+        let open_nodes = || {
+            seeds
+                .iter()
+                .enumerate()
+                .map(|(index, seed)| {
+                    Arc::new(Mutex::new(
+                        Node::open(run_root.join(format!("node-{index}")), seed.clone()).unwrap(),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        let nodes = open_nodes();
+        let mut clients = Vec::new();
+        let mut network_tasks = Vec::new();
+        for (index, node) in nodes.iter().enumerate() {
+            let volume = run_root.join(format!("volume-{index}"));
+            std::fs::create_dir(&volume).unwrap();
+            node.lock()
+                .unwrap()
+                .configure_storage_volumes(&[volume], 16 * 1024 * 1024, 0)
+                .unwrap();
+            let mut cfg = config(node.lock().unwrap().keys().node_id());
+            cfg.enable_relay_server = false;
+            let (client, event_loop) = build_p2p(node.clone(), cfg).unwrap();
+            clients.push(client);
+            network_tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let addresses = futures::future::join_all(clients.iter().map(listening_address)).await;
+        let endpoints = clients
+            .iter()
+            .zip(addresses.iter().cloned())
+            .map(|(client, address)| peer_endpoint(client, address))
+            .collect::<Vec<_>>();
+        form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+        for index in (active_count..5).rev() {
+            let removed = nodes[index].lock().unwrap().keys().node_id();
+            install_coding_test_event(
+                &nodes,
+                mb_core::GuildEventKind::RemoveMember { node_id: removed },
+            );
+        }
+        let ids = nodes
+            .iter()
+            .take(active_count)
+            .map(|node| node.lock().unwrap().keys().node_id())
+            .collect::<Vec<_>>();
+        let guild_id = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap()
+            .guild_id;
+        let source = run_root.join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("payload"), vec![42; 4096]).unwrap();
+        nodes[0]
+            .lock()
+            .unwrap()
+            .add_protected_root(&source)
+            .unwrap();
+        let descriptor = nodes[0]
+            .lock()
+            .unwrap()
+            .prepare_protected_backup(None)
+            .unwrap();
+        let job = nodes[0]
+            .lock()
+            .unwrap()
+            .enqueue_backup(ids[0], descriptor.clone())
+            .unwrap();
+        let backup_node = nodes[0].clone();
+        let backup_client = clients[0].clone();
+        let backup =
+            tokio::spawn(async move { commit_backup_job(backup_node, &backup_client, &job).await });
+        let launch = tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                if let Some(job) = nodes[0]
+                    .lock()
+                    .unwrap()
+                    .coding_launch_jobs_for_test()
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                {
+                    break job;
+                }
+                assert!(
+                    !backup.is_finished(),
+                    "backup exited before its coding launch"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("production backup did not enqueue coding");
+        let plan = launch.plan.clone();
+        assert_eq!(
+            usize::from(plan.value.geometry.profile.data_shards)
+                + usize::from(plan.value.geometry.profile.parity_shards),
+            active_count
+        );
+        assert_eq!(
+            plan.value.geometry.parity.len(),
+            active_count - usize::from(plan.value.geometry.profile.data_shards)
+        );
+        assert!(
+            dispatch_claimed_coding_launch(nodes[0].clone(), &clients[0], launch)
+                .await
+                .unwrap()
+        );
+        let mut coding_tasks = nodes
+            .iter()
+            .take(active_count)
+            .skip(1)
+            .zip(clients.iter().skip(1))
+            .map(|(node, client)| {
+                tokio::spawn(run_delegated_coding_jobs(node.clone(), client.clone()))
+            })
+            .collect::<Vec<_>>();
+        let transcript = tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                if let Some(job) = nodes[0]
+                    .lock()
+                    .unwrap()
+                    .coding_activation_jobs_for_test()
+                    .unwrap()
+                    .into_iter()
+                    .find(|job| job.transcript.value.plan == plan)
+                {
+                    break job.transcript;
+                }
+                if plan.value.coding_coordinator == ids[0] {
+                    process_delegated_coding_job(nodes[0].clone(), &clients[0])
+                        .await
+                        .unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("production coder did not submit its full-width transcript");
+        assert_eq!(
+            replay_coding_transcript(&transcript).unwrap(),
+            mb_core::CodingReplayFinding::Verified
+        );
+        let group = transcript.value.manifest.value.group.clone();
+        let holders = group
+            .roles
+            .iter()
+            .filter_map(|role| match role {
+                ShardRoleV2::Information(information) if !information.sector.virtual_zero => {
+                    Some(information.owner)
+                }
+                ShardRoleV2::Parity(parity) => Some(parity.holder),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for holder in holders {
+            let index = ids.iter().position(|id| *id == holder).unwrap();
+            nodes[index]
+                .lock()
+                .unwrap()
+                .activate_coding_attempt(&transcript)
+                .unwrap();
+        }
+        install_coding_test_group_event(&nodes[..active_count], &transcript);
+        let current = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap();
+        install_coding_test_event(
+            &nodes[..active_count],
+            mb_core::GuildEventKind::RetireCodingGroup {
+                group_id: group.id,
+                retain_through_event: current.event_sequence + 1,
+            },
+        );
+        process_coding_activation_job(nodes[0].clone(), &clients[0])
+            .await
+            .unwrap();
+        assert!(!backup.is_finished());
+        let before_forget = nodes[0]
+            .lock()
+            .unwrap()
+            .coding_launch_successor_for_test(plan.value.attempt_id)
+            .unwrap();
+        if before_forget.is_none() {
+            assert!(
+                nodes[0]
+                    .lock()
+                    .unwrap()
+                    .coding_activation_needs_replan(&transcript)
+                    .unwrap()
+            );
+        }
+        install_coding_test_event(
+            &nodes[..active_count],
+            mb_core::GuildEventKind::ForgetCodingGroup { group_id: group.id },
+        );
+        process_coding_activation_job(nodes[0].clone(), &clients[0])
+            .await
+            .unwrap();
+        let successor = nodes[0]
+            .lock()
+            .unwrap()
+            .coding_launch_successor_for_test(plan.value.attempt_id)
+            .unwrap()
+            .unwrap();
+        if let Some(before_forget) = before_forget {
+            assert_eq!(successor, before_forget);
+        }
+        assert_ne!(successor.value.attempt_id, plan.value.attempt_id);
+        assert_eq!(
+            successor.value.geometry.profile,
+            plan.value.geometry.profile
+        );
+        assert_eq!(
+            successor.value.geometry.information,
+            plan.value.geometry.information
+        );
+        assert_eq!(
+            successor
+                .value
+                .geometry
+                .parity
+                .iter()
+                .map(|role| role.holder)
+                .collect::<BTreeSet<_>>(),
+            plan.value
+                .geometry
+                .parity
+                .iter()
+                .map(|role| role.holder)
+                .collect::<BTreeSet<_>>()
+        );
+        coding_tasks.push(tokio::spawn(run_delegated_coding_jobs(
+            nodes[0].clone(),
+            clients[0].clone(),
+        )));
+        let checkpoint_hash = tokio::time::timeout(Duration::from_secs(240), backup)
+            .await
+            .expect("retired full-width backup did not complete")
+            .unwrap()
+            .unwrap();
+        nodes[0]
+            .lock()
+            .unwrap()
+            .complete_backup_job(&descriptor, checkpoint_hash)
+            .unwrap();
+        assert_eq!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .backup_job(guild_id, descriptor.revision_id)
+                .unwrap()
+                .state,
+            crate::node::BackupJobState::Committed
+        );
+        for task in coding_tasks {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        for client in &clients {
+            client.shutdown().await.unwrap();
+        }
+        for task in network_tasks {
+            task.await.unwrap().unwrap();
+        }
+        drop(clients);
+        drop(nodes);
+        for _ in 0..2 {
+            let owner = Node::open(run_root.join("node-0"), seeds[0].clone()).unwrap();
+            let backup = owner.backup_job(guild_id, descriptor.revision_id).unwrap();
+            assert_eq!(backup.state, crate::node::BackupJobState::Committed);
+            assert_eq!(backup.checkpoint_hash, Some(checkpoint_hash));
+            assert_eq!(
+                owner
+                    .current_checkpoint(guild_id)
+                    .unwrap()
+                    .unwrap()
+                    .hash()
+                    .unwrap(),
+                checkpoint_hash
+            );
+            assert_eq!(
+                owner
+                    .coding_launch_successor_for_test(plan.value.attempt_id)
+                    .unwrap(),
+                Some(successor.clone())
+            );
+        }
+        std::fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    async fn retired_full_width_backups_commit_over_quic() {
+        retired_full_width_backup_completion_fixture(3).await;
+        retired_full_width_backup_completion_fixture(5).await;
+    }
+
     async fn uncovered_activations_unblock_live_checkpoint_wait_fixture(offline_spare: bool) {
         let temp = tempfile::tempdir().unwrap();
         let seeds = (201_u8..206)
