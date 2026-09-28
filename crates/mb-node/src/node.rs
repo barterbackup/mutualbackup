@@ -199,19 +199,22 @@ fn coding_holder_cleanup_id(obligation: &CodingHolderCleanupObligation) -> Vec<u
 enum CodingLaunchRenewalCandidate {
     Launch(CodingLaunchJob),
     Retry(SignedRecord<CodingAttemptPlan>),
-    Activation(SignedRecord<CodingAttemptPlan>),
+    Activation {
+        plan: SignedRecord<CodingAttemptPlan>,
+        pending: bool,
+    },
 }
 
 impl CodingLaunchRenewalCandidate {
     fn plan(&self) -> &SignedRecord<CodingAttemptPlan> {
         match self {
             Self::Launch(job) => &job.plan,
-            Self::Retry(plan) | Self::Activation(plan) => plan,
+            Self::Retry(plan) | Self::Activation { plan, .. } => plan,
         }
     }
 
     fn needs_input_intent(&self) -> bool {
-        !matches!(self, Self::Activation(_))
+        !matches!(self, Self::Activation { pending: false, .. })
     }
 }
 
@@ -4417,6 +4420,28 @@ impl Node {
         self.retire_coding_retry_plan(plan)
     }
 
+    fn coding_launch_waits_for_negative_cleanup(
+        &self,
+        prior: &SignedRecord<CodingAttemptPlan>,
+    ) -> Result<bool> {
+        for (_, bytes) in self.control.records("coding-activation-job")? {
+            let activation: CodingActivationJob = decode_canonical(&bytes)?;
+            let candidate = &activation.transcript.value.plan;
+            if !activation.complete
+                && candidate.value.attempt_id != prior.value.attempt_id
+                && coding_renewal_can_follow(&prior.value, &candidate.value)
+            {
+                self.validate_coding_attempt_authority(candidate)?;
+                if replay_coding_transcript(&activation.transcript)?
+                    != CodingReplayFinding::Verified
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     fn coding_launch_renewal_candidate(
         &self,
         prior: &SignedRecord<CodingAttemptPlan>,
@@ -4440,9 +4465,10 @@ impl Node {
                             retained.retired_at_event.is_none() && retained.group == *group
                         }))
                 {
-                    return Ok(Some(CodingLaunchRenewalCandidate::Activation(
-                        candidate.clone(),
-                    )));
+                    return Ok(Some(CodingLaunchRenewalCandidate::Activation {
+                        plan: candidate.clone(),
+                        pending: !activation.complete,
+                    }));
                 }
             }
         }
@@ -4507,6 +4533,7 @@ impl Node {
             .control
             .get_record("coding-launch-successor", &prior.value.attempt_id)?
             .is_some()
+            || self.coding_launch_waits_for_negative_cleanup(prior)?
             || self.coding_launch_renewal_candidate(prior)?.is_some())
     }
 
@@ -4531,6 +4558,9 @@ impl Node {
             if let Some(bytes) = self.control.get_record("coding-launch-successor", &id)? {
                 decode_canonical(&bytes)?
             } else {
+                if self.coding_launch_waits_for_negative_cleanup(prior)? {
+                    anyhow::bail!("coding launch renewal waits for negative activation cleanup");
+                }
                 let replacement = self.coding_launch_renewal_candidate(prior)?;
                 let new_launch = replacement.is_none();
                 let owner = match replacement {
@@ -4730,10 +4760,17 @@ impl Node {
     }
 
     pub(crate) fn abandon_coding_launch(&self, attempt_id: [u8; 16]) -> Result<()> {
-        if self
+        let pending_activation = self
             .control
-            .get_record("coding-retry-job", &attempt_id)?
-            .is_some()
+            .get_record("coding-activation-job", &attempt_id)?
+            .map(|bytes| decode_canonical::<CodingActivationJob>(&bytes))
+            .transpose()?
+            .is_some_and(|activation| !activation.complete);
+        if pending_activation
+            || self
+                .control
+                .get_record("coding-retry-job", &attempt_id)?
+                .is_some()
         {
             self.control
                 .delete_record("coding-launch-staged", &attempt_id)?;
@@ -6445,6 +6482,9 @@ impl Node {
             .get_record("coding-activation-job", &attempt_id)?
             .context("coding activation job is unavailable")?;
         let mut job: CodingActivationJob = decode_canonical(&bytes)?;
+        if job.complete {
+            return Ok(true);
+        }
         if covered && !self.coding_activation_has_coverage(&job)? {
             // The group may have retired after the worker installed it. Keep
             // the job and its retry parent until holder cleanup has run.
@@ -6455,11 +6495,13 @@ impl Node {
             self.coding_retry_parent_input_deletions(&job.transcript.value.plan, &mut records)?
         } else {
             let mut deletions = Vec::new();
+            let mut has_retry_parent = false;
             for (id, bytes) in self.control.records("coding-retry-job")? {
                 let mut parent: CodingRetryJob = decode_canonical(&bytes)?;
                 if parent.retry_plan.as_ref() != Some(&job.transcript.value.plan) {
                     continue;
                 }
+                has_retry_parent = true;
                 if self
                     .coding_launch_information_to_stage(parent.failure.value.plan.value.attempt_id)?
                     .is_none()
@@ -6488,6 +6530,66 @@ impl Node {
                     ),
                 ]);
                 deletions.push(("coding-retry-terminal".to_owned(), id));
+            }
+            if !has_retry_parent
+                && self
+                    .dynamic_guild_state()?
+                    .context("coding activation requires dynamic guild state")?
+                    .membership_epoch
+                    == job.transcript.value.plan.value.membership_epoch
+            {
+                // An initial result, or an activation selected by an older
+                // launch, has no retry parent to reclaim the lane. Handoff
+                // its packed input and exact lineage in the same transaction
+                // that marks holder cleanup complete.
+                let prior = &job.transcript.value.plan;
+                let mut value = prior.value.clone();
+                if value.format_version == 2
+                    && value.information_roots.as_ref().is_some_and(|roots| {
+                        roots
+                            .iter()
+                            .zip(&value.geometry.information)
+                            .any(|(root, role)| {
+                                !role.sector.virtual_zero && *root != role.sector.commitment.root
+                            })
+                    })
+                {
+                    value.format_version = 3;
+                }
+                loop {
+                    rand::rngs::OsRng.fill_bytes(&mut value.attempt_id);
+                    if value.attempt_id != [0; 16] && value.attempt_id != prior.value.attempt_id {
+                        break;
+                    }
+                }
+                value.expires_at_unix_seconds = unix_seconds()
+                    .checked_add(24 * 60 * 60)
+                    .context("coding activation renewal expiry overflow")?;
+                let successor = self.sign_coding_attempt_plan(value)?;
+                records.extend([
+                    (
+                        "coding-launch-successor".to_owned(),
+                        attempt_id.to_vec(),
+                        canonical_bytes(&successor)?,
+                    ),
+                    (
+                        "coding-launch-job".to_owned(),
+                        successor.value.attempt_id.to_vec(),
+                        canonical_bytes(&CodingLaunchJob {
+                            format_version: 1,
+                            plan: successor.clone(),
+                            dispatched: false,
+                            error: None,
+                        })?,
+                    ),
+                ]);
+                if let Some(input) = self.coding_retry_information(prior)? {
+                    records.push((
+                        "coding-launch-information".to_owned(),
+                        successor.value.attempt_id.to_vec(),
+                        canonical_bytes(&input)?,
+                    ));
+                }
             }
             deletions
         };
@@ -9460,6 +9562,33 @@ impl Node {
             endpoints,
             expires_at_unix_seconds,
             1,
+        )?))
+    }
+
+    pub(crate) fn build_removed_holder_endpoint_publication(
+        &mut self,
+        endpoints: Vec<String>,
+        expires_at_unix_seconds: u64,
+        sequence_floor: u64,
+    ) -> Result<Option<SignedRecord<EndpointRecord>>> {
+        let Some(installed) = self.installed_guild()? else {
+            return Ok(None);
+        };
+        installed.certificate.verify()?;
+        let Some(state) = self.dynamic_guild_state()? else {
+            return Ok(None);
+        };
+        if state
+            .active_members()
+            .any(|member| member.node_id == self.keys.node_id())
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.build_endpoint_publication(
+            installed.certificate.genesis.guild_id,
+            endpoints,
+            expires_at_unix_seconds,
+            sequence_floor,
         )?))
     }
 
@@ -15067,7 +15196,7 @@ pub(crate) mod tests {
         );
         drop(node);
 
-        let reopened = Node::open(temp.path(), added_seed).unwrap();
+        let mut reopened = Node::open(temp.path(), added_seed.clone()).unwrap();
         assert_eq!(reopened.dynamic_guild_state().unwrap().unwrap(), state);
         assert_eq!(
             reopened
@@ -15075,6 +15204,58 @@ pub(crate) mod tests {
                 .unwrap()
                 .events,
             vec![add, rotate_writer]
+        );
+        let remove = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RemoveMember {
+                node_id: added_member.node_id,
+            },
+        };
+        let mut signatures = signer_keys
+            .iter()
+            .map(|keys| sign_guild_event(&remove, keys).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        let remove = QuorumGuildEvent {
+            event: remove,
+            signatures,
+        };
+        reopened.install_guild_event(remove.clone()).unwrap();
+        assert!(
+            reopened
+                .coding_holder_cleanup_endpoints(state.guild_id, added_member.node_id)
+                .unwrap()
+                .is_empty()
+        );
+        let endpoint = format!(
+            "/ip4/127.0.0.1/udp/44001/quic-v1/p2p/{}",
+            added_member.node_id.libp2p_peer_id().unwrap()
+        );
+        let signed = reopened
+            .build_removed_holder_endpoint_publication(
+                vec![endpoint.clone()],
+                unix_seconds() + 600,
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        signed.verify(b"mutualbackup/endpoint-record/v1").unwrap();
+        assert_eq!(signed.signer, added_member.node_id);
+        assert_eq!(signed.value.endpoints, vec![endpoint]);
+        drop(reopened);
+        let mut reopened = Node::open(temp.path(), added_seed).unwrap();
+        assert_eq!(
+            reopened
+                .build_removed_holder_endpoint_publication(
+                    signed.value.endpoints.clone(),
+                    unix_seconds() + 300,
+                    signed.value.sequence,
+                )
+                .unwrap(),
+            Some(signed)
         );
     }
 
@@ -15760,14 +15941,47 @@ pub(crate) mod tests {
         separate.checkpoint_hash = [74; 32];
         separate.attempt_id = [90; 16];
         let separate = node.sign_coding_attempt_plan(separate).unwrap();
+        node.control
+            .put_record(
+                "coding-launch-information",
+                &separate.value.attempt_id,
+                &canonical_bytes(&BTreeMap::<SectorId, PackedSectorDescriptor>::new()).unwrap(),
+            )
+            .unwrap();
         let negative = negative_for(separate.clone());
         node.accept_coding_transcript(separate.value.coding_coordinator, negative)
             .unwrap();
         node.complete_coding_activation(separate.value.attempt_id, false)
             .unwrap();
+        let renewed = node
+            .coding_launch_successor_for_test(separate.value.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            node.coding_launch_information_to_stage(renewed.value.attempt_id)
+                .unwrap(),
+            Some(BTreeMap::new())
+        );
+        assert!(
+            node.coding_launch_information_to_stage(separate.value.attempt_id)
+                .unwrap()
+                .is_none()
+        );
         let fresh = node.enqueue_coding_launch(separate.clone()).unwrap();
-        assert_ne!(fresh.value.attempt_id, separate.value.attempt_id);
+        assert_eq!(fresh, renewed);
         assert_eq!(fresh.value.checkpoint_hash, separate.value.checkpoint_hash);
+        drop(node);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        assert_eq!(
+            node.coding_launch_successor_for_test(separate.value.attempt_id)
+                .unwrap(),
+            Some(renewed.clone())
+        );
+        assert_eq!(
+            node.coding_launch_information_to_stage(renewed.value.attempt_id)
+                .unwrap(),
+            Some(BTreeMap::new())
+        );
 
         // A verified transcript alone is not installed coverage. If group
         // retirement races completion, the job must remain for holder cleanup.
@@ -15796,6 +16010,73 @@ pub(crate) mod tests {
         assert!(
             node.complete_coding_activation(uninstalled.value.attempt_id, false)
                 .unwrap()
+        );
+
+        // A legacy expiry cannot launch across a pending negative format-3
+        // activation. Once its abort is complete, both lineages use one job.
+        let mut legacy_value = value.clone();
+        legacy_value.format_version = 2;
+        legacy_value.attempt_id = [93; 16];
+        legacy_value.checkpoint_hash = [77; 32];
+        legacy_value.expires_at_unix_seconds = unix_seconds() - 1;
+        let legacy =
+            SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, legacy_value, node.keys()).unwrap();
+        let legacy_job = CodingLaunchJob {
+            format_version: 1,
+            plan: legacy.clone(),
+            dispatched: true,
+            error: None,
+        };
+        node.put_coding_launch_job(&legacy_job).unwrap();
+        node.control
+            .put_record(
+                "coding-launch-information",
+                &legacy.value.attempt_id,
+                &canonical_bytes(&BTreeMap::<SectorId, PackedSectorDescriptor>::new()).unwrap(),
+            )
+            .unwrap();
+        assert!(node.retire_coding_retry_plan(&legacy).unwrap());
+        let mut newer_value = legacy.value.clone();
+        newer_value.format_version = 3;
+        newer_value.attempt_id = [94; 16];
+        newer_value.expires_at_unix_seconds = unix_seconds() + 600;
+        let newer = node.sign_coding_attempt_plan(newer_value).unwrap();
+        let negative = negative_for(newer.clone());
+        node.accept_coding_transcript(newer.value.coding_coordinator, negative)
+            .unwrap();
+        assert!(node.coding_launch_has_renewal(&legacy).unwrap());
+        assert!(
+            node.renew_coding_launch_after_cleanup(&legacy_job, None)
+                .unwrap_err()
+                .to_string()
+                .contains("negative activation cleanup")
+        );
+        assert!(
+            node.coding_launch_successor_for_test(legacy.value.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+        drop(node);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        assert!(
+            node.renew_coding_launch_after_cleanup(&legacy_job, None)
+                .is_err()
+        );
+        node.complete_coding_activation(newer.value.attempt_id, false)
+            .unwrap();
+        let renewed = node
+            .coding_launch_successor_for_test(newer.value.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            node.renew_coding_launch_after_cleanup(&legacy_job, None)
+                .unwrap(),
+            renewed
+        );
+        assert_eq!(
+            node.coding_launch_information_to_stage(renewed.value.attempt_id)
+                .unwrap(),
+            Some(BTreeMap::new())
         );
 
         let mut coding_value = value;
@@ -16103,8 +16384,8 @@ pub(crate) mod tests {
             verified
         );
         assert!(node.claim_coding_launch().unwrap().is_none());
-        // A verified accepted result is stronger than a fresh launch. Renewal
-        // records its exact signed owner without recreating staging intent.
+        // A pending verified result is stronger than a fresh launch. Keep its
+        // input pinned until the activation actually retains coverage.
         let activation_first = sign(248, 3, unix_seconds() - 1);
         let activation_first_job = CodingLaunchJob {
             format_version: 1,
@@ -16134,10 +16415,10 @@ pub(crate) mod tests {
                     .unwrap(),
                 Some(verified.clone())
             );
-            assert!(
+            assert_eq!(
                 node.coding_launch_information_to_stage(verified.value.attempt_id)
-                    .unwrap()
-                    .is_none()
+                    .unwrap(),
+                Some(BTreeMap::new())
             );
             assert!(
                 node.control
@@ -16146,7 +16427,6 @@ pub(crate) mod tests {
                     .is_empty()
             );
         }
-
         // Simulate a crash after the successor transaction but before parent
         // removal. Reopening and repeating renewal must reuse the signed ID.
         let mut value = initial.value.clone();
@@ -16348,6 +16628,31 @@ pub(crate) mod tests {
         assert!(
             node.defer_coding_launch([249; 16], "unexpected missing owner")
                 .is_err()
+        );
+        // If the group retires before completion, the activation owns an
+        // atomic input handoff to a fresh signed launch, even after reopen.
+        node.complete_coding_activation(verified.value.attempt_id, false)
+            .unwrap();
+        let after_activation = node
+            .coding_launch_successor_for_test(verified.value.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            node.coding_launch_information_to_stage(after_activation.value.attempt_id)
+                .unwrap(),
+            Some(BTreeMap::new())
+        );
+        assert!(
+            node.coding_launch_information_to_stage(verified.value.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+        drop(node);
+        node = Node::open(temp.path(), seed.clone()).unwrap();
+        assert_eq!(
+            node.coding_launch_successor_for_test(verified.value.attempt_id)
+                .unwrap(),
+            Some(after_activation)
         );
     }
 
