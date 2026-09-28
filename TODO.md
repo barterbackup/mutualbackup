@@ -3496,7 +3496,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   across five nodes (`p2p.rs:24435`), so it always has a spare placement. Gate
   real full-width 3- and 5-domain production workers through retire,
   acknowledged cleanup, forget, renewed coverage, backup completion and
-  repeated reopen.
+  repeated reopen. Source-only follow-up through `2affb17` finds the durable
+  replan marker, retained input handoff and post-forget replacement implemented
+  in `561a438`. The current uncommitted 3-/5-domain fixture reaches only
+  coverage and one reopen in its source; it does not assert backup completion
+  or repeated reopen. Its three-domain coverage wait failed in the preceding
+  local development run, so the real worker schedule remains unproven. Finish
+  and commit a passing full-width production regression before closing this.
 
 - [ ] **M5-129 / P1 — Select a usable parity holder when replanning a retired
   group.** The new placement search takes the first active member that produces
@@ -3512,8 +3518,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   reachable capacity, and rotate geometry after a capacity or availability
   failure while preserving cleanup and input ownership. Cover a full and an
   offline first spare, a usable later spare, fresh coverage and reopen.
+  `561a438` samples reachable capacity before retired activation replanning;
+  `95962be` rotates geometry in retry and expiry renewal and retains active
+  offline-holder cleanup obligations. The live regression covers a full first
+  spare and later usable holder. Source-only review still finds no integrated
+  offline-first-spare to fresh coverage and reopen regression. Keep this open
+  until that schedule is covered and the corrected code passes the gate.
 
-- [ ] **M5-130 / P1 — Rotate coordinators after an initial negative verifier
+- [x] **M5-130 / P1 — Rotate coordinators after an initial negative verifier
   finding.** The no-retry-parent completion path clones the negative attempt's
   plan and changes only format, parity placement if necessary, attempt ID and
   expiry (`crates/mb-node/src/node.rs:6542`, `:6615`). It keeps the same coding
@@ -3532,7 +3544,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   has only one candidate for two distinct roles and waits indefinitely even
   when all members are healthy. Find a safe role rotation for the three-domain
   profile and test it through the production worker and reopen. The committed
-  five-node regression alone does not close this task.
+  five-node regression alone does not close this task. `2affb17` excludes the
+  blamed coder across same-source attempts, including after parity rotation.
+  The three-member fallback rotates the old verifier into coding while
+  excluding the old coder; the live worker regression processes two invalid
+  transcripts before healthy coverage and reopen. This source correction is
+  complete; M5-131 must still validate its exact final tree.
 
 - [ ] **M5-131 / gate — Recheck Milestone 5 after M5-128 through M5-130.**
   Correct all three source blockers and review the committed source. Run focused
@@ -3543,17 +3560,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   confirm cleanup of owned images, mounts, loop devices, namespaces,
   interfaces/rules and processes. Record the exact commit and outcomes.
   M5-127 remains historical evidence for `e09a13f`; build and run locally,
-  with no remote compilation server. Source-only review on 2026-09-28 finds
-  M5-128 through M5-130 still open. The uncommitted M5-128/M5-129 draft calls
-  `coding_activation_renewal_options` without defining it
-  (`network/p2p.rs:6438`, `:6551`) and leaves direct calls of
-  `complete_coding_activation_with_coordinators` at the old argument count
-  (`node.rs:16175`, `:16551`, `:16569`); this working tree cannot pass the
-  source gate. The draft placement filter also does not rotate geometry in
-  the failure-retry or expiry paths, which still clone the prior geometry
-  (`node.rs:5895`, `:6149`). Finish and commit the code, then perform this
-  exact-source gate. This source-only review ran no builds, tests, daemons or
-  runtime probes.
+  with no remote compilation server. Source-only review through `2affb17`
+  confirms that the earlier undefined helper, old-arity call sites and fixed
+  retry/expiry geometry have been corrected. M5-128 and M5-129 still lack the
+  full production schedules above. The 408-line full-width fixture is
+  uncommitted, and this gate has not run on the latest committed source.
+  Finish those cases, commit the code, then perform the exact-source gate.
+  This review ran no builds, tests, daemons or runtime probes.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
