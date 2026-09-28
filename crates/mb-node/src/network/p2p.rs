@@ -6367,6 +6367,43 @@ async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
             .membership_epoch)
     })
     .await?;
+    let group = job.transcript.value.manifest.value.group.clone();
+    let retired_group = node_blocking(node.clone(), move |node| {
+        Ok(node
+            .dynamic_guild_state()?
+            .context("coding activation requires dynamic guild state")?
+            .coding_groups
+            .iter()
+            .any(|retained| retained.group == group && retained.retired_at_event.is_some()))
+    })
+    .await?;
+    if verified && retired_group {
+        let cleanup_job = DelegatedCodingJob {
+            format_version: 1,
+            plan: job.transcript.value.plan.clone(),
+            state: DelegatedCodingJobState::Cleanup,
+            transcript: None,
+            error: Some("coding group retired before activation completed".to_owned()),
+        };
+        match abort_stale_delegated_coding(node.clone(), p2p, &cleanup_job).await {
+            Ok(()) => {
+                node_blocking(node.clone(), move |node| {
+                    node.complete_coding_activation(attempt_id, false)
+                })
+                .await?;
+            }
+            Err(error) => {
+                let message = format!("retired coding cleanup failed: {error:#}");
+                node_blocking(node.clone(), move |node| {
+                    node.defer_coding_activation(attempt_id, &message)
+                })
+                .await?;
+                tracing::warn!(?attempt_id, %error, "retired coding activation cleanup deferred");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+        return Ok(());
+    }
     if attempt_membership_epoch != current_membership_epoch {
         let group_id = job.transcript.value.manifest.value.group.id;
         let group = job.transcript.value.manifest.value.group.clone();
