@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (reopened after M5-127, 2026-09-28)
+## Milestone 5 guild geometry and coding protocol (completed by M5-131, 2026-09-28)
 
 The historical source-only review of the Milestone 5 changes through `a6b5d7d`
 found three blockers: negative verifier evidence could terminate retry
@@ -586,13 +586,12 @@ All three corrections and M5-122 passed on exact source `4880c28`. A later
 source-only review of the corrections through `8712ac3` found four blockers
 (M5-123 through M5-126). Those findings were corrected in `9cfa4b5`,
 `dd942a6`, and `e09a13f`; the complete M5-127 local gate passed on exact code
-source `e09a13f`. A fresh source-only review of that same code finds M5-128
-through M5-130 below and reopens Milestone 5. M5-127 remains passing evidence
-for its exercised cases, but it does not cover these schedules. The corrections
-and focused regressions are now committed through `ae081a3`; the complete
-exact-source M5-131 gate remains open, so Milestone 6 waits. This review ran
-no builds, tests, daemons, or runtime probes. M5-122
-and M5-114 remain passing historical evidence for their exact source trees.
+source `e09a13f`. A later source-only review of that same code found M5-128
+through M5-130 and reopened Milestone 5. M5-127 remains passing evidence for
+its exercised cases, but it did not cover those schedules. The corrections and
+regressions were committed through `39a99e7`, and the complete local M5-131
+gate passed on that exact source. Milestone 5 is closed; Milestone 6 is next.
+M5-122 and M5-114 remain historical evidence for their exact source trees.
 
 M5-116/M5-117 implementation update (2026-09-26): acknowledged retry parents
 now remain quiescent only while their successor is live and unfenced, or after
@@ -3505,7 +3504,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   after Forget, renewed coverage and repeated reopen. The provisioned Btrfs
   acceptance fixture in `ae081a3` also drives real backup commit through both
   full-width schedules and checks the committed checkpoint after two reopens.
-  The complete exact-source gate remains M5-131.
+  The exact-source M5-131 gate passed on `39a99e7`.
 
 - [x] **M5-129 / P1 — Select a usable parity holder when replanning a retired
   group.** The new placement search takes the first active member that produces
@@ -3525,8 +3524,8 @@ node Clippy gate passed locally. No remote compilation server was used.
   `95962be` rotates geometry in retry and expiry renewal and retains active
   offline-holder cleanup obligations. The live regressions cover both a full
   first spare and an offline first spare, a usable later holder, renewed
-  coverage and reopen (`1a34fce`). The complete exact-source gate remains
-  M5-131.
+  coverage and reopen (`1a34fce`). The exact-source M5-131 gate passed on
+  `39a99e7`.
 
 - [x] **M5-130 / P1 — Rotate coordinators after an initial negative verifier
   finding.** The no-retry-parent completion path clones the negative attempt's
@@ -3551,10 +3550,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   blamed coder across same-source attempts, including after parity rotation.
   The three-member fallback rotates the old verifier into coding while
   excluding the old coder; the live worker regression processes two invalid
-  transcripts before healthy coverage and reopen. This source correction is
-  complete; M5-131 must still validate its exact final tree.
+  transcripts before healthy coverage and reopen. The exact-source M5-131 gate
+  passed on `39a99e7`.
 
-- [ ] **M5-131 / gate — Recheck Milestone 5 after M5-128 through M5-130.**
+- [x] **M5-131 / gate — Recheck Milestone 5 after M5-128 through M5-130.**
   Correct all three source blockers and review the committed source. Run focused
   production-worker, full-width placement, negative-evidence and reopen
   regressions. On the exact corrected code commit, pass local formatting,
@@ -3562,13 +3561,29 @@ node Clippy gate passed locally. No remote compilation server was used.
   all fresh disposable Btrfs/network acceptance invocations. Independently
   confirm cleanup of owned images, mounts, loop devices, namespaces,
   interfaces/rules and processes. Record the exact commit and outcomes.
-  M5-127 remains historical evidence for `e09a13f`; build and run locally,
-  with no remote compilation server. Source-only review through `ae081a3`
-  finds M5-128 through M5-130 corrected and their missing schedules committed.
-  The provisioned acceptance script now includes 24 invocations. The full
-  exact-source workspace, Docker, Btrfs/network and cleanup gate has not run
-  on `ae081a3`, so Milestone 5 cannot close yet. This review ran no builds,
-  tests, daemons or runtime probes.
+  Passed on clean committed code source
+  `39a99e7e7ef3f2865d05449bbae2ed25c444a4ad`. The first workspace run
+  exposed six restart/cleanup regression assertions that still expected
+  pre-handoff behavior. `39a99e7` updated them to verify immediate post-Forget
+  parity removal, durable offline-holder obligations, exact successor lineage,
+  cleanup after return and repeated reopen; all six focused reruns passed.
+  Local formatting, strict locked all-target workspace Clippy and tests, and
+  Docker lab safety passed; the node suite had 293 passed and 11 expected
+  ignored. All 24 invocations of the fresh local Btrfs/network acceptance
+  script passed on a disposable 8 GiB Btrfs image. Full-width three- and
+  five-domain backup commit passed in 73.31 seconds, repeated multi-owner QUIC
+  in 545.04 seconds, and five-daemon seed/DHT recovery with direct,
+  hole-punched and relay paths in 1718.80 seconds. The runner exited with
+  cleanup result zero. An independent audit matched the baseline for Btrfs
+  mounts, loop devices, namespaces, interfaces, forwarding and firewall rules;
+  no owned image root or acceptance process remained. Logs:
+  `/tmp/mutualbackup-m5-131-workspace-v2.log`,
+  `/tmp/mutualbackup-m5-131-clippy-v2.log`,
+  `/tmp/mutualbackup-m5-131-docker-safety-v2.log`,
+  `/tmp/mutualbackup-m5-131-provisioned.log`, and
+  `/tmp/mutualbackup-m5-131-cleanup-audit.log`. All compilation and execution
+  were local; no remote compilation server was used. Milestone 5 is closed on
+  this exact code source. M5-127 remains historical evidence for `e09a13f`.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

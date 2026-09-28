@@ -71,15 +71,17 @@ The complete local M5-127 gate passed on exact code source `e09a13f`.
 A further source-only review of that same code found M5-128 through M5-130:
 full-width retired activation can terminate the daemon and strand coverage,
 replacement parity can choose an unusable holder, and initial negative coding
-evidence can relaunch with the same faulty coordinator. Milestone 5 is open;
-Milestone 6 waits for M5-131.
+evidence can relaunch with the same faulty coordinator. At that review,
+Milestone 5 reopened and Milestone 6 waited for M5-131.
 The follow-up commits through `ae081a3` add durable post-forget replanning,
 capacity-aware parity rotation across retries and expiry, historical
 invalid-coder exclusion, and a fresh holder-abort check after Forget.
 Committed regressions cover full-width three- and five-domain backup commit
 and repeated reopen, plus full and offline first-spare replacement through
 coverage and reopen. M5-128 through M5-130 are corrected at source level;
-the complete exact-source M5-131 gate has not run on this code.
+the complete local M5-131 gate passed on exact code source `39a99e7` after
+restart/cleanup regressions were aligned with durable handoff. Milestone 5 is
+closed and Milestone 6 is next.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and
@@ -631,9 +633,10 @@ recovery-string file remains an explicit unattended auto-unlock option rather
 than a daemon prerequisite. Milestones 0 through 4 have passed. M5-123 through
 M5-127 passed their recorded gate on exact code source `e09a13f`, but the later
 source-only review found M5-128 through M5-130. Those corrections and focused
-regressions are now committed through `ae081a3`; Milestone 5 remains open for
-the exact-source M5-131 gate, and Milestone 6 waits. The earlier M5-119 through
-M5-122 gate passed on `4880c28` and remains historical evidence for that source.
+regressions are now committed through `39a99e7`. The complete local M5-131
+gate passed on that exact code source; Milestone 5 is closed and Milestone 6
+is next. The earlier M5-119 through M5-122 gate passed on `4880c28` and
+remains historical evidence for that source.
 M5-111–M5-113 and M5-115–M5-118 corrections passed
 focused local validation and the complete locked workspace and fresh
 Btrfs/network gates on exact source `720920d`. All compilation and execution
@@ -889,9 +892,9 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 4 are passed; M5-128 through M5-130
-are corrected at source level through `ae081a3`. Milestone 5 is open for the
-complete exact-source M5-131 gate, and Milestone 6 waits.
+**Current position:** Milestones 0 through 5 have passed. M5-128 through
+M5-130 were corrected through `39a99e7`, and the complete M5-131 local gate
+passed on that exact code source. Milestone 6 is next.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
@@ -2053,7 +2056,7 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (open)
+### Milestone 5 — efficient and flexible data/guild protocol (passed)
 
 The historical source-only review through `a6b5d7d` found three blockers in
 the recently changed coding ownership and cleanup paths. A replayable negative
@@ -2153,10 +2156,26 @@ three- and five-domain worker regressions cover the full-width retirement,
 cleanup, renewal, coverage and reopen path; the new provisioned Btrfs/QUIC
 fixture also drives both schedules through backup checkpoint commit and two
 reopens (M5-128). Live regressions cover both full and offline first spares,
-later usable placement, renewed coverage and reopen (M5-129). These source
-corrections still require the complete exact-source M5-131 workspace,
-Docker, Btrfs/network and resource-cleanup gate. Milestone 5 remains open and
-Milestone 6 waits. This review ran no builds, tests, daemons or runtime probes.
+later usable placement, renewed coverage and reopen (M5-129). Those source
+corrections still required the complete exact-source M5-131 workspace,
+Docker, Btrfs/network and resource-cleanup gate. At that source-only review,
+Milestone 5 remained open and Milestone 6 waited. No builds, tests, daemons or
+runtime probes were run in that review.
+
+M5-131 passed on clean exact code source `39a99e7`. The first workspace run
+found six restart and cleanup assertions that still expected pre-handoff
+behavior; the committed correction checks durable holder obligations,
+post-Forget parity removal, successor lineage and cleanup after return. The
+corrected tree passed local formatting, strict locked all-target workspace
+Clippy and tests, Docker lab safety, and all 24 invocations of the fresh
+disposable 8 GiB Btrfs/network acceptance script. Three- and five-domain
+full-width backup commit, repeated multi-owner QUIC and five-daemon seed/DHT
+recovery passed. The acceptance runner reported cleanup result zero; an
+independent audit found the baseline restored for mounts, loops, namespaces,
+interfaces, forwarding and firewall rules, with no owned image or process
+remaining. All compilation and execution were local, with no remote server.
+The exact commands, counts, timings and logs are recorded in TODO.md.
+Milestone 5 is closed; Milestone 6 is next.
 
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
 launch-expiry regressions found duplicate same-lane successors. Renewal now
