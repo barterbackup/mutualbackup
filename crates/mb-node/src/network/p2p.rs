@@ -6255,6 +6255,7 @@ async fn process_coding_retry_job(
     job: &CodingRetryJob,
 ) -> Result<()> {
     let failed_attempt_id = job.failure.value.plan.value.attempt_id;
+    let claimed_child = job.retry_plan.as_ref().map(|plan| plan.value.attempt_id);
     let current_membership_epoch = node_blocking(node.clone(), |node| {
         Ok(node
             .dynamic_guild_state()?
@@ -6263,20 +6264,14 @@ async fn process_coding_retry_job(
     })
     .await?;
     let result = if job.failure.value.plan.value.membership_epoch != current_membership_epoch {
-        cleanup_coding_retry_job(node.clone(), p2p, job)
-            .await
-            .map(|()| true)
+        cleanup_coding_retry_job(node.clone(), p2p, job).await
     } else {
         execute_coding_retry(node.clone(), p2p, job).await
     };
     match result {
         Ok(cleaned) => {
             node_blocking(node, move |node| {
-                if cleaned {
-                    node.complete_coding_retry_after_cleanup(failed_attempt_id)
-                } else {
-                    node.complete_coding_retry(failed_attempt_id)
-                }
+                node.complete_claimed_coding_retry(failed_attempt_id, claimed_child, cleaned)
             })
             .await?
         }
@@ -6299,6 +6294,8 @@ async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
         return Ok(());
     };
     let attempt_id = job.transcript.value.plan.value.attempt_id;
+    let verified =
+        replay_coding_transcript(&job.transcript)? == mb_core::CodingReplayFinding::Verified;
     let attempt_membership_epoch = job.transcript.value.plan.value.membership_epoch;
     let current_membership_epoch = node_blocking(node.clone(), |node| {
         Ok(node
@@ -6325,7 +6322,7 @@ async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
             match finish_coding_activation(node.clone(), p2p, &job.transcript).await {
                 Ok(()) => {
                     node_blocking(node.clone(), move |node| {
-                        node.complete_coding_activation(attempt_id)
+                        node.complete_coding_activation(attempt_id, verified)
                     })
                     .await?;
                 }
@@ -6351,7 +6348,7 @@ async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
         match abort_stale_delegated_coding(node.clone(), p2p, &cleanup_job).await {
             Ok(()) => {
                 node_blocking(node.clone(), move |node| {
-                    node.complete_coding_activation(attempt_id)
+                    node.complete_coding_activation(attempt_id, false)
                 })
                 .await?;
             }
@@ -6370,7 +6367,7 @@ async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
     match finish_coding_activation(node.clone(), p2p, &job.transcript).await {
         Ok(()) => {
             node_blocking(node.clone(), move |node| {
-                node.complete_coding_activation(attempt_id)
+                node.complete_coding_activation(attempt_id, verified)
             })
             .await?;
         }
@@ -6690,9 +6687,7 @@ async fn execute_coding_retry(
     })
     .await?;
     if superseded {
-        return cleanup_coding_retry_job(node, p2p, &job)
-            .await
-            .map(|()| true);
+        return cleanup_coding_retry_job(node, p2p, &job).await;
     }
     // Retry owns any parent uploads that completed around failure handoff,
     // including a crashed launch worker. Finish parent cleanup before staging
@@ -6879,12 +6874,15 @@ async fn cleanup_coding_retry_job(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
     job: &CodingRetryJob,
-) -> Result<()> {
-    cleanup_coding_retry_plan(node.clone(), p2p, &job.failure.value.plan).await?;
-    if let Some(plan) = &job.retry_plan {
-        cleanup_coding_retry_plan(node, p2p, plan).await?;
-    }
-    Ok(())
+) -> Result<bool> {
+    let parent_cleaned =
+        cleanup_coding_retry_plan(node.clone(), p2p, &job.failure.value.plan).await?;
+    let child_cleaned = if let Some(plan) = &job.retry_plan {
+        cleanup_coding_retry_plan(node, p2p, plan).await?
+    } else {
+        true
+    };
+    Ok(parent_cleaned && child_cleaned)
 }
 
 async fn cleanup_coding_retry_plan(
