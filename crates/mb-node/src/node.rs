@@ -19393,7 +19393,8 @@ pub(crate) mod tests {
                 &transcript.value.manifest.value.group.id,
                 4,
             )
-            .is_ok()
+            .is_err(),
+            "aborting after Forget must remove the old READY parity"
         );
         node.schedule_garbage(
             "gc-variable-parity",

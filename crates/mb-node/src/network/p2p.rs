@@ -27224,8 +27224,17 @@ mod tests {
                 .unwrap()
                 .coding_retry_evidence_for_test(old.value.attempt_id)
                 .unwrap();
-            assert!(!deferred.complete);
-            assert!(deferred.error.is_some());
+            assert!(deferred.complete);
+            assert!(deferred.error.is_none());
+            assert!(
+                nodes[0]
+                    .lock()
+                    .unwrap()
+                    .coding_holder_cleanup_count_for_test()
+                    .unwrap()
+                    > 0,
+                "offline holder deletion must remain a durable obligation"
+            );
             assert_eq!(
                 nodes[2]
                     .lock()
@@ -27249,10 +27258,17 @@ mod tests {
                 nodes[0]
                     .lock()
                     .unwrap()
-                    .claim_coding_retry(None)
-                    .unwrap()
+                    .coding_retry_evidence_for_test(old.value.attempt_id)
                     .unwrap(),
                 deferred
+            );
+            assert!(
+                nodes[0]
+                    .lock()
+                    .unwrap()
+                    .claim_coding_retry(None)
+                    .unwrap()
+                    .is_none()
             );
             std::fs::rename(&offline, &volume).unwrap();
             nodes[1]
@@ -27279,7 +27295,7 @@ mod tests {
                     .unwrap();
                 clients[0].profile(id).await.unwrap();
             }
-            let worker = tokio::spawn(run_delegated_coding_jobs(
+            let worker = tokio::spawn(run_coding_holder_cleanup_jobs(
                 nodes[0].clone(),
                 clients[0].clone(),
             ));
@@ -27289,15 +27305,15 @@ mod tests {
                 if nodes[0]
                     .lock()
                     .unwrap()
-                    .coding_retry_evidence_for_test(old.value.attempt_id)
+                    .coding_holder_cleanup_count_for_test()
                     .unwrap()
-                    .complete
+                    == 0
                 {
                     break;
                 }
                 assert!(
                     tokio::time::Instant::now() < deadline,
-                    "descriptor-less cleanup did not converge"
+                    "descriptor-less holder cleanup obligation did not converge"
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -27536,13 +27552,22 @@ mod tests {
                             .unwrap()
                     );
                     assert!(
-                        !dispatch_claimed_coding_launch(
+                        dispatch_claimed_coding_launch(
                             nodes[0].clone(),
                             &clients[0],
                             claimed.clone()
                         )
                         .await
                         .unwrap()
+                    );
+                    assert!(
+                        nodes[0]
+                            .lock()
+                            .unwrap()
+                            .coding_holder_cleanup_count_for_test()
+                            .unwrap()
+                            > 0,
+                        "offline retired holder must retain a cleanup obligation"
                     );
                     assert!(
                         submit_delegated_coding_result(
@@ -27771,6 +27796,7 @@ mod tests {
             packed_information: BTreeMap::new(),
         };
         let mut expired_launch = None;
+        let mut early_expired_handoff = false;
         let mut blocked_launch = None;
         if replanning == RetryReplanningCase::LaunchFairness {
             let blocked_owner = member(2).node_id;
@@ -28025,10 +28051,11 @@ mod tests {
                     .configure_storage_volumes(&[volume], 4 * 1024 * 1024, 0)
                     .unwrap();
                 assert!(
-                    !dispatch_next_coding_launch(nodes[0].clone(), &clients[0])
+                    dispatch_next_coding_launch(nodes[0].clone(), &clients[0])
                         .await
                         .unwrap()
                 );
+                early_expired_handoff = true;
             }
             let deferred = nodes[0]
                 .lock()
@@ -28036,7 +28063,19 @@ mod tests {
                 .claim_coding_launch()
                 .unwrap()
                 .unwrap();
-            assert_eq!(deferred.plan, pending.plan);
+            if early_expired_handoff {
+                let successor = nodes[0]
+                    .lock()
+                    .unwrap()
+                    .coding_launch_successor_for_test(pending.plan.value.attempt_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(deferred.plan, successor);
+                assert!(!deferred.dispatched);
+                assert!(deferred.error.is_none());
+            } else {
+                assert_eq!(deferred.plan, pending.plan);
+            }
             assert!(
                 nodes[0]
                     .lock()
@@ -28049,27 +28088,9 @@ mod tests {
                 replanning,
                 RetryReplanningCase::ExpiredCompleted | RetryReplanningCase::ExpiredDispatched
             ) {
-                assert_eq!(
-                    deferred.dispatched,
-                    replanning == RetryReplanningCase::ExpiredDispatched
-                );
-                assert!(deferred.error.is_some());
-                if replanning == RetryReplanningCase::ExpiredDispatched {
-                    assert!(
-                        deferred
-                            .error
-                            .as_ref()
-                            .unwrap()
-                            .contains("expired launch cleanup deferred")
-                    );
-                    assert_eq!(
-                        nodes[0]
-                            .lock()
-                            .unwrap()
-                            .retired_coding_plan_for_test(pending.plan.value.attempt_id)
-                            .unwrap(),
-                        Some(pending.plan.clone())
-                    );
+                if !early_expired_handoff {
+                    assert!(!deferred.dispatched);
+                    assert!(deferred.error.is_some());
                 }
                 assert_eq!(
                     nodes[0]
@@ -28092,29 +28113,28 @@ mod tests {
                 RetryReplanningCase::ExpiredPartial | RetryReplanningCase::ExpiredFinalized
             ) {
                 tokio::time::sleep(Duration::from_secs(4)).await;
-                // Cleanup is interrupted by the same offline volume. Its fence
-                // and staging intent must survive until the later reopen.
+                // Expiry can hand off to a fresh attempt while the offline
+                // volume's deletion remains a durable holder obligation.
                 assert!(
-                    !dispatch_next_coding_launch(nodes[0].clone(), &clients[0])
+                    dispatch_next_coding_launch(nodes[0].clone(), &clients[0])
                         .await
                         .unwrap()
                 );
+                early_expired_handoff = true;
                 let node = nodes[0].lock().unwrap();
                 assert_eq!(
                     node.retired_coding_plan_for_test(pending.plan.value.attempt_id)
                         .unwrap(),
                     Some(pending.plan.clone())
                 );
+                let successor = node
+                    .coding_launch_successor_for_test(pending.plan.value.attempt_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(node.claim_coding_launch().unwrap().unwrap().plan, successor);
+                assert!(node.coding_holder_cleanup_count_for_test().unwrap() > 0);
                 assert!(
-                    node.claim_coding_launch()
-                        .unwrap()
-                        .unwrap()
-                        .error
-                        .unwrap()
-                        .contains("expired launch cleanup deferred")
-                );
-                assert!(
-                    node.coding_launch_information_to_stage(pending.plan.value.attempt_id)
+                    node.coding_launch_information_to_stage(successor.value.attempt_id)
                         .unwrap()
                         .is_some()
                 );
@@ -28188,6 +28208,16 @@ mod tests {
             node.configure_storage_volumes(&[temp.path().join("volume-0")], 4 * 1024 * 1024, 0)
                 .unwrap();
             let pending = node.claim_coding_launch().unwrap().unwrap();
+            if early_expired_handoff {
+                assert_eq!(
+                    Some(pending.plan.clone()),
+                    node.coding_launch_successor_for_test(
+                        expired_launch.as_ref().unwrap().value.attempt_id
+                    )
+                    .unwrap()
+                );
+                assert!(node.coding_holder_cleanup_count_for_test().unwrap() > 0);
+            }
             assert!(
                 node.coding_launch_information_to_stage(pending.plan.value.attempt_id)
                     .unwrap()
@@ -28272,6 +28302,31 @@ mod tests {
                 }
             }
         }
+        if early_expired_handoff || retired_evidence.is_some() {
+            let mut cursor = None;
+            for _ in 0..active_count {
+                if nodes[0]
+                    .lock()
+                    .unwrap()
+                    .coding_holder_cleanup_count_for_test()
+                    .unwrap()
+                    == 0
+                {
+                    break;
+                }
+                process_coding_holder_cleanup_job(nodes[0].clone(), &clients[0], &mut cursor)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                nodes[0]
+                    .lock()
+                    .unwrap()
+                    .coding_holder_cleanup_count_for_test()
+                    .unwrap(),
+                0
+            );
+        }
         if let Some(retired) = &retired_evidence {
             // Reopened Submitting state must finish only after the exact fence
             // is confirmed and all active holders acknowledge resumed cleanup.
@@ -28311,11 +28366,12 @@ mod tests {
                     .await
                     .is_err()
             );
-            assert!(
-                dispatch_next_coding_launch(nodes[0].clone(), &clients[0])
-                    .await
-                    .unwrap()
-            );
+            // The retired launch already handed off before reopen. A single
+            // dispatch pass may defer its successor while holder cleanup is
+            // still outstanding; the queued lane below must retain progress.
+            dispatch_next_coding_launch(nodes[0].clone(), &clients[0])
+                .await
+                .unwrap();
         }
         if cleanup_race != Some(CodingCleanupRace::Failure)
             && !matches!(
@@ -28809,6 +28865,9 @@ mod tests {
                 let node =
                     Node::open(temp.path().join(format!("node-{index}")), seed.clone()).unwrap();
                 if index == 0 {
+                    if early_expired_handoff || retired_evidence.is_some() {
+                        assert_eq!(node.coding_holder_cleanup_count_for_test().unwrap(), 0);
+                    }
                     if let Some(group_id) = unrelated_group {
                         assert!(
                             node.dynamic_guild_state()
