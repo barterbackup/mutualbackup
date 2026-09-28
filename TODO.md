@@ -3525,7 +3525,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   (`plan.md:2570`). Select fresh reachable roles for a negative initial result
   before signing its successor, retain the exact negative evidence and packed
   input intent, and cover repeated invalid-coding evidence followed by a
-  healthy coordinator, verified coverage and reopen.
+  healthy coordinator, verified coverage and reopen. Source-only follow-up on
+  `7fea0e1` finds that its renewal selector excludes both old roles
+  (`network/p2p.rs:6802`), and the new completion check also forbids either
+  old role in either position (`node.rs:6660`). A three-member guild therefore
+  has only one candidate for two distinct roles and waits indefinitely even
+  when all members are healthy. Find a safe role rotation for the three-domain
+  profile and test it through the production worker and reopen. The committed
+  five-node regression alone does not close this task.
 
 - [ ] **M5-131 / gate — Recheck Milestone 5 after M5-128 through M5-130.**
   Correct all three source blockers and review the committed source. Run focused
@@ -3536,8 +3543,17 @@ node Clippy gate passed locally. No remote compilation server was used.
   confirm cleanup of owned images, mounts, loop devices, namespaces,
   interfaces/rules and processes. Record the exact commit and outcomes.
   M5-127 remains historical evidence for `e09a13f`; build and run locally,
-  with no remote compilation server. This source-only review did not execute
-  M5-131.
+  with no remote compilation server. Source-only review on 2026-09-28 finds
+  M5-128 through M5-130 still open. The uncommitted M5-128/M5-129 draft calls
+  `coding_activation_renewal_options` without defining it
+  (`network/p2p.rs:6438`, `:6551`) and leaves direct calls of
+  `complete_coding_activation_with_coordinators` at the old argument count
+  (`node.rs:16175`, `:16551`, `:16569`); this working tree cannot pass the
+  source gate. The draft placement filter also does not rotate geometry in
+  the failure-retry or expiry paths, which still clone the prior geometry
+  (`node.rs:5895`, `:6149`). Finish and commit the code, then perform this
+  exact-source gate. This source-only review ran no builds, tests, daemons or
+  runtime probes.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

@@ -2124,6 +2124,17 @@ Milestone 5 is reopened; Milestone 6 waits. M5-127 remains passing historical
 evidence for its exact source and exercised cases. This review ran no builds,
 tests, daemons or runtime probes.
 
+Source-only follow-up on `7fea0e1` and the current uncommitted replan draft
+keeps Milestone 5 open. The committed negative-evidence correction requires two
+coordinators outside the old pair, which is impossible in a healthy
+three-member guild; the source gate still needs a safe three-domain rotation.
+The replan draft is incomplete at source level because it calls an undefined
+renewal-options helper and retains old-arity test calls. Its current placement
+filter does not address geometry locked into failure retries and expiry
+renewal. M5-128 through M5-130 and the exact-source M5-131 gate remain open;
+Milestone 6 waits. No builds, tests, daemons or runtime probes were run in this
+review.
+
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
 launch-expiry regressions found duplicate same-lane successors. Renewal now
 reuses accepted verified activation or a live retry child before an existing
