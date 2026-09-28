@@ -6423,8 +6423,14 @@ async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
         };
         match abort_stale_delegated_coding(node.clone(), p2p, &cleanup_job).await {
             Ok(()) => {
+                let fresh = fresh_coding_activation_coordinators(
+                    node.clone(),
+                    p2p,
+                    &job.transcript.value.plan,
+                )
+                .await;
                 node_blocking(node.clone(), move |node| {
-                    node.complete_coding_activation(attempt_id, false)
+                    node.complete_coding_activation_with_coordinators(attempt_id, false, fresh)
                 })
                 .await?;
             }
@@ -6486,7 +6492,7 @@ async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
         match abort_stale_delegated_coding(node.clone(), p2p, &cleanup_job).await {
             Ok(()) => {
                 node_blocking(node.clone(), move |node| {
-                    node.complete_coding_activation(attempt_id, false)
+                    node.complete_coding_activation_with_coordinators(attempt_id, false, None)
                 })
                 .await?;
             }
@@ -6526,11 +6532,16 @@ async fn finish_and_complete_coding_activation(
 ) -> Result<()> {
     finish_coding_activation(node.clone(), p2p, transcript).await?;
     let attempt_id = transcript.value.plan.value.attempt_id;
+    let fresh = if verified {
+        None
+    } else {
+        fresh_coding_activation_coordinators(node.clone(), p2p, &transcript.value.plan).await
+    };
     let completed = node_blocking(node.clone(), move |node| {
-        node.complete_coding_activation(attempt_id, verified)
+        node.complete_coding_activation_with_coordinators(attempt_id, verified, fresh)
     })
     .await?;
-    if !completed {
+    if !completed && verified {
         // The group retired between installation and completion. The first
         // completion left the durable job and retry inputs untouched.
         let cleanup_job = DelegatedCodingJob {
@@ -6541,12 +6552,35 @@ async fn finish_and_complete_coding_activation(
             error: Some("coding group retired before activation completed".to_owned()),
         };
         abort_stale_delegated_coding(node.clone(), p2p, &cleanup_job).await?;
+        let fresh =
+            fresh_coding_activation_coordinators(node.clone(), p2p, &transcript.value.plan).await;
         node_blocking(node, move |node| {
-            node.complete_coding_activation(attempt_id, false)
+            node.complete_coding_activation_with_coordinators(attempt_id, false, fresh)
         })
         .await?;
     }
     Ok(())
+}
+
+async fn fresh_coding_activation_coordinators(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    prior: &SignedRecord<CodingAttemptPlan>,
+) -> Option<(NodeId, NodeId)> {
+    let job = crate::node::CodingLaunchJob {
+        format_version: 1,
+        plan: prior.clone(),
+        dispatched: true,
+        error: None,
+    };
+    match choose_coding_launch_renewal_coordinators(node, p2p, &job).await {
+        Ok(pair) => Some(pair),
+        Err(error) => {
+            tracing::debug!(attempt_id = ?prior.value.attempt_id, %error,
+                "coding activation is waiting for fresh coordinators");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -24528,6 +24562,22 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(successor.value.attempt_id, initial.value.attempt_id);
+        assert_ne!(
+            successor.value.coding_coordinator,
+            initial.value.coding_coordinator
+        );
+        assert_ne!(
+            successor.value.coding_coordinator,
+            initial.value.verification_coordinator
+        );
+        assert_ne!(
+            successor.value.verification_coordinator,
+            initial.value.coding_coordinator
+        );
+        assert_ne!(
+            successor.value.verification_coordinator,
+            initial.value.verification_coordinator
+        );
         assert!(
             nodes[0]
                 .lock()

@@ -6472,10 +6472,41 @@ impl Node {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn complete_coding_activation(
         &self,
         attempt_id: [u8; 16],
         covered: bool,
+    ) -> Result<bool> {
+        let fresh_coordinators = if covered {
+            None
+        } else {
+            let bytes = self
+                .control
+                .get_record("coding-activation-job", &attempt_id)?
+                .context("coding activation job is unavailable")?;
+            let job: CodingActivationJob = decode_canonical(&bytes)?;
+            let prior = &job.transcript.value.plan.value;
+            let fresh = self
+                .dynamic_guild_state()?
+                .context("coding activation requires dynamic guild state")?
+                .active_members()
+                .map(|member| member.node_id)
+                .filter(|id| {
+                    *id != prior.coding_coordinator && *id != prior.verification_coordinator
+                })
+                .take(2)
+                .collect::<Vec<_>>();
+            fresh.first().copied().zip(fresh.get(1).copied())
+        };
+        self.complete_coding_activation_with_coordinators(attempt_id, covered, fresh_coordinators)
+    }
+
+    pub(crate) fn complete_coding_activation_with_coordinators(
+        &self,
+        attempt_id: [u8; 16],
+        covered: bool,
+        fresh_coordinators: Option<(NodeId, NodeId)>,
     ) -> Result<bool> {
         let bytes = self
             .control
@@ -6538,12 +6569,29 @@ impl Node {
                     .membership_epoch
                     == job.transcript.value.plan.value.membership_epoch
             {
+                let Some((coding_coordinator, verification_coordinator)) = fresh_coordinators
+                else {
+                    // A negative initial result or uncovered verified result
+                    // retains its activation and input until a fresh pair is
+                    // reachable. Cleanup may be repeated safely after reopen.
+                    return Ok(false);
+                };
                 // An initial result, or an activation selected by an older
                 // launch, has no retry parent to reclaim the lane. Handoff
                 // its packed input and exact lineage in the same transaction
                 // that marks holder cleanup complete.
                 let prior = &job.transcript.value.plan;
+                if coding_coordinator == prior.value.coding_coordinator
+                    || coding_coordinator == prior.value.verification_coordinator
+                    || verification_coordinator == prior.value.coding_coordinator
+                    || verification_coordinator == prior.value.verification_coordinator
+                    || coding_coordinator == verification_coordinator
+                {
+                    anyhow::bail!("coding activation renewal did not select fresh coordinators");
+                }
                 let mut value = prior.value.clone();
+                value.coding_coordinator = coding_coordinator;
+                value.verification_coordinator = verification_coordinator;
                 if value.format_version == 2
                     && value.information_roots.as_ref().is_some_and(|roots| {
                         roots
@@ -15998,6 +16046,20 @@ pub(crate) mod tests {
         let negative = negative_for(separate.clone());
         node.accept_coding_transcript(separate.value.coding_coordinator, negative)
             .unwrap();
+        assert!(
+            !node
+                .complete_coding_activation_with_coordinators(
+                    separate.value.attempt_id,
+                    false,
+                    None,
+                )
+                .unwrap()
+        );
+        assert!(
+            node.coding_launch_information_to_stage(separate.value.attempt_id)
+                .unwrap()
+                .is_some()
+        );
         node.complete_coding_activation(separate.value.attempt_id, false)
             .unwrap();
         let renewed = node
@@ -16224,6 +16286,22 @@ pub(crate) mod tests {
         let fresh = node.enqueue_coding_launch(coding.clone()).unwrap();
         assert_ne!(fresh.value.attempt_id, coding.value.attempt_id);
         assert_eq!(fresh.value.checkpoint_hash, coding.value.checkpoint_hash);
+        assert_ne!(
+            fresh.value.coding_coordinator,
+            coding.value.coding_coordinator
+        );
+        assert_ne!(
+            fresh.value.coding_coordinator,
+            coding.value.verification_coordinator
+        );
+        assert_ne!(
+            fresh.value.verification_coordinator,
+            coding.value.coding_coordinator
+        );
+        assert_ne!(
+            fresh.value.verification_coordinator,
+            coding.value.verification_coordinator
+        );
     }
 
     #[test]
