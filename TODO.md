@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (closed after M5-122, 2026-09-28)
+## Milestone 5 guild geometry and coding protocol (reopened by source review, 2026-09-28)
 
 The historical source-only review of the Milestone 5 changes through `a6b5d7d`
 found three blockers: negative verifier evidence could terminate retry
@@ -582,10 +582,12 @@ ownership and block replanning (M5-119); an expiring format-2 launch could
 renew beside a live format-3 retry for the same lane (M5-120); and stale
 cleanup could forget an offline removed holder's staged data (M5-121). The
 review required these corrections and a new exact-source M5-122 local gate.
-All three corrections and M5-122 have now passed on exact source `4880c28`;
-Milestones 0 through 5 are passed, and Milestone 6 is next. The original
-review ran no builds, tests, daemons, or runtime probes. M5-114 remains
-passing historical evidence for its earlier source tree.
+All three corrections and M5-122 passed on exact source `4880c28`. A later
+source-only review of the corrections through `8712ac3` found four blockers
+(M5-123 through M5-126), so Milestone 5 is open and Milestone 6 waits.
+Neither source-only review ran
+builds, tests, daemons, or runtime probes. M5-122 and M5-114 remain passing
+historical evidence for their exact source trees.
 
 M5-116/M5-117 implementation update (2026-09-26): acknowledged retry parents
 now remain quiescent only while their successor is live and unfenced, or after
@@ -3359,8 +3361,75 @@ node Clippy gate passed locally. No remote compilation server was used.
   `/tmp/mutualbackup-m5-122-workspace-v2.log`,
   `/tmp/mutualbackup-m5-122-provisioned-v2.log`, and
   `/tmp/mutualbackup-m5-122-cleanup-audit-v2.log`. All builds and runs were
-  local. Milestone 5 is closed on this exact code commit; M5-114 remains
-  historical evidence for its earlier tree.
+  local. This gate closed Milestone 5 on that exact code commit; the later
+  source-only review below reopens it. M5-114 remains historical evidence for
+  its earlier tree.
+
+- [ ] **M5-123 / P1 — Replan an initial launch after negative verifier cleanup.**
+  `complete_coding_activation(attempt, false)` requeues only a matching retry
+  parent; when the negative finding belongs to an initial launch, it deletes
+  that launch and its packed-input intent without creating a successor
+  (`crates/mb-node/src/node.rs:6453`). Production `commit_backup_job` queues
+  variable lanes once and then waits only for coverage (`network/p2p.rs:14318`,
+  `:13144`). Lifecycle replanning skips a Running backup (`p2p.rs:8157`), so an
+  uninterrupted daemon can wait forever with no coding owner after an
+  authenticated `InvalidOpening` or `InvalidCoding` finding. A daemon restart
+  may reclaim the backup; it is not a live retry policy. Retain or reconstruct
+  the initial lane's input intent and create a fresh attempt after confirmed
+  holder cleanup. Gate the production backup worker through negative evidence,
+  cleanup, fresh launch, verified checkpoint coverage and uninterrupted wait.
+
+- [ ] **M5-124 / P1 — Gate legacy renewal on pending negative activation cleanup.**
+  An old format-2 launch and a format-3 activation can coexist for the same
+  lane. `coding_launch_renewal_candidate` ignores a negative format-3
+  activation awaiting abort (`node.rs:4427`); expiry renewal then writes a
+  fresh launch directly (`node.rs:4534`), bypassing the negative-cleanup wait
+  in `enqueue_coding_launch_with_information` (`node.rs:4038`). The daemon
+  dispatches launches before processing activations (`p2p.rs:6052`), so a
+  deferred abort can overlap the fresh launch and contend for holder capacity.
+  Keep cleanup ownership across format versions and start renewal only after
+  the negative attempt's holder cleanup is confirmed. Gate old launch expiry,
+  pending invalid-opening/invalid-coding cleanup, constrained holder capacity,
+  repeated reopen and exact successor lineage.
+
+- [ ] **M5-125 / P1 — Recover a launch that yielded to activation without coverage.**
+  Legacy renewal may record a pending verified format-3 activation as the old
+  launch's successor (`node.rs:4427`, `:4534`). It transfers no input intent
+  to an activation, then removes the old launch's intent (`node.rs:212`,
+  `:4590`, `:4732`). If that group retires before activation completion, the
+  worker cleans it as uncovered (`p2p.rs:6380`, `:6485`), but
+  `complete_coding_activation(false)` requeues retry parents only
+  (`node.rs:6453`). The signed launch successor is left as history with no
+  live owner or pinned packed input for the pending checkpoint. Preserve a
+  recoverable launch-parent intent until retained coverage is established, or
+  requeue it after uncovered activation cleanup. Gate verified activation,
+  legacy expiry/yield, retirement before completion, crash/reopen, renewed
+  coverage and packed-input retention.
+
+- [ ] **M5-126 / P1 — Discover returned removed holders for cleanup.**
+  The obligation worker adds addresses only from `guild-endpoints`
+  (`node.rs:6761`, `p2p.rs:6108`). Membership events do not update that cache
+  (`node.rs:2821`), and normal DHT/peer-exchange refresh queries active peers
+  only (`p2p.rs:8863`, `:8904`). A dynamically added holder can have no cached
+  address; after removal and an owner restart, a holder returning at a new
+  address without an existing connection cannot receive its pending abort.
+  The removed-holder regression manually injects the returned address
+  (`p2p.rs:23778`), so it bypasses this discovery path. Resolve obligation
+  holders by authenticated identity after removal, then clear the obligation
+  only after abort acknowledgement. Gate added/removed holder return with
+  address change, no manual address injection, repeated reopen and exact zero
+  staged bytes, receipts and reservations.
+
+- [ ] **M5-127 / gate — Recheck Milestone 5 after M5-123 through M5-126.**
+  Correct the source blockers, review the committed source and run focused
+  production-worker and reopen regressions for each path. On the exact
+  corrected commit, pass local formatting, strict locked all-target workspace
+  Clippy and tests, Docker lab safety, and all fresh disposable Btrfs/network
+  acceptance invocations. Independently confirm cleanup of owned images,
+  mounts, loop devices, namespaces, interfaces/rules and processes. Record
+  the exact commit and outcomes. M5-122 remains historical evidence only;
+  build and run locally, with no remote compilation server. This source-only
+  review did not execute M5-127.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
