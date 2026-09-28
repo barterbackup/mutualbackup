@@ -67,8 +67,12 @@ on exact committed source `4880c28fbfce9a1654f970eb11e71d020e938b37`.
 A later source-only review found M5-123 through M5-126 in initial negative
 attempt replanning, cross-version renewal and removed-holder discovery.
 Those paths were corrected in `9cfa4b5`, `dd942a6`, and `e09a13f`.
-The complete local M5-127 gate passed on exact code source `e09a13f`;
-Milestone 5 is closed and Milestone 6 is next.
+The complete local M5-127 gate passed on exact code source `e09a13f`.
+A further source-only review of that same code found M5-128 through M5-130:
+full-width retired activation can terminate the daemon and strand coverage,
+replacement parity can choose an unusable holder, and initial negative coding
+evidence can relaunch with the same faulty coordinator. Milestone 5 is open;
+Milestone 6 waits for those corrections and M5-131.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and
@@ -617,10 +621,11 @@ expected-identity check, bounded worker ownership, and formal wire-contract
 machinery are implemented and synchronized. Human configuration and
 application-owned identity state are also separate. A strictly checked
 recovery-string file remains an explicit unattended auto-unlock option rather
-than a daemon prerequisite. Milestones 0 through 5 have passed;
-M5-123 through M5-127 passed on exact code source `e09a13f`, and Milestone 6
-is next. The earlier M5-119 through M5-122 gate passed on `4880c28` and
-remains historical evidence for that source.
+than a daemon prerequisite. Milestones 0 through 4 have passed. M5-123 through
+M5-127 passed their recorded gate on exact code source `e09a13f`, but the later
+source-only review found M5-128 through M5-130; Milestone 5 is open and
+Milestone 6 waits. The earlier M5-119 through M5-122 gate passed on
+`4880c28` and remains historical evidence for that source.
 M5-111–M5-113 and M5-115–M5-118 corrections passed
 focused local validation and the complete locked workspace and fresh
 Btrfs/network gates on exact source `720920d`. All compilation and execution
@@ -876,12 +881,15 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 5 are passed; Milestone 6 is next.
+**Current position:** Milestones 0 through 4 are passed; Milestone 5 is open for
+M5-128 through M5-131, and Milestone 6 waits.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
 acceptance invocations, and an independent resource cleanup audit on exact
-code source `e09a13f`. All compilation and execution were local.
+code source `e09a13f`. All compilation and execution were local. The later
+source-only review found uncovered retirement, placement and coordinator
+replanning schedules; M5-127 remains evidence for its exercised cases.
 M5-119 through M5-121 corrected negative verifier findings, cross-version
 launch renewal and offline removed-holder cleanup obligations. M5-122 passed
 formatting, strict locked all-target workspace Clippy and tests, Docker lab
@@ -2036,7 +2044,7 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (passed)
+### Milestone 5 — efficient and flexible data/guild protocol (open)
 
 The historical source-only review through `a6b5d7d` found three blockers in
 the recently changed coding ownership and cleanup paths. A replayable negative
@@ -2096,8 +2104,25 @@ regressions passed. Formatting, strict locked all-target workspace Clippy and
 tests, Docker lab safety, and all 23 fresh local Btrfs/network acceptance
 invocations passed. The disposable image, mount, loop device, namespaces,
 interfaces, forwarding, firewall rules and processes matched the baseline
-after cleanup. Milestone 5 is closed; Milestone 6 is next. Exact evidence is
-recorded in TODO.md.
+after cleanup. That gate closed Milestone 5 at the time; the source review
+below reopens it. Exact evidence is recorded in TODO.md.
+
+The source-only review of the unchanged M5-127 code finds three further
+completion blockers. In a normal three- or five-domain full-width placement,
+retiring a verified group before activation completion can leave no alternate
+parity placement. The new handoff errors after holder cleanup, exits the coding
+worker and daemon, and after eligible forgetting the old transcript cannot
+reactivate because its attempt receipts were finalized (M5-128). With spare
+domains, the handoff may instead pick a full or unreachable parity holder
+ahead of a viable one and keep that geometry through retries (M5-129).
+An initial invalid-coding transcript also renews with its original coding
+coordinator and verifier, allowing repeated attributable failure despite
+healthy alternatives (M5-130). Correct these ownership and placement paths,
+then pass focused full-width, capacity, negative-evidence and reopen
+regressions and the complete exact-source local M5-131 gate in TODO.md.
+Milestone 5 is reopened; Milestone 6 waits. M5-127 remains passing historical
+evidence for its exact source and exercised cases. This review ran no builds,
+tests, daemons or runtime probes.
 
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
 launch-expiry regressions found duplicate same-lane successors. Renewal now

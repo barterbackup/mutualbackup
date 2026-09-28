@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (closed after M5-127, 2026-09-28)
+## Milestone 5 guild geometry and coding protocol (reopened after M5-127, 2026-09-28)
 
 The historical source-only review of the Milestone 5 changes through `a6b5d7d`
 found three blockers: negative verifier evidence could terminate retry
@@ -586,9 +586,11 @@ All three corrections and M5-122 passed on exact source `4880c28`. A later
 source-only review of the corrections through `8712ac3` found four blockers
 (M5-123 through M5-126). Those findings were corrected in `9cfa4b5`,
 `dd942a6`, and `e09a13f`; the complete M5-127 local gate passed on exact code
-source `e09a13f`. Milestone 5 is closed and Milestone 6 is next. Neither
-source-only review ran builds, tests, daemons, or runtime probes. M5-122 and
-M5-114 remain passing historical evidence for their exact source trees.
+source `e09a13f`. A fresh source-only review of that same code finds M5-128
+through M5-130 below and reopens Milestone 5. M5-127 remains passing evidence
+for its exercised cases, but it does not cover these schedules. Milestone 6
+waits. This review ran no builds, tests, daemons, or runtime probes. M5-122
+and M5-114 remain passing historical evidence for their exact source trees.
 
 M5-116/M5-117 implementation update (2026-09-26): acknowledged retry parents
 now remain quiescent only while their successor is live and unfenced, or after
@@ -3471,7 +3473,71 @@ node Clippy gate passed locally. No remote compilation server was used.
   corrected fresh run passed. Logs: `/tmp/mutualbackup-m5-127-workspace-final.log`,
   `/tmp/mutualbackup-m5-127-provisioned-v2.log`, and
   `/tmp/mutualbackup-m5-127-cleanup-audit.log`. All compilation and execution
-  were local; no remote compilation server was used. Milestone 5 is closed.
+  were local; no remote compilation server was used. That exact-source gate
+  closed Milestone 5 at the time; the source-only review below reopens it.
+
+- [ ] **M5-128 / P1 — Keep retired full-width activation recoverable through
+  forgetting.** Production chooses a `2+1` or `3+2` profile for three or five
+  distinct domains, using every domain (`crates/mb-node/src/network/p2p.rs:12349`).
+  If a verified group retires before its activation job completes, the worker
+  acknowledges holder abort and calls `complete_coding_activation(false)`
+  (`p2p.rs:6416`). With no unused parity placement, that method errors before
+  recording a successor or completion (`crates/mb-node/src/node.rs:6570`,
+  `:6604`). The error escapes the coding worker and the daemon's main task
+  selection (`p2p.rs:6068`, `cmd/mutualbackup/src/bin/mutualbackupd.rs:143`).
+  The abort has already finalized the retained group's attempt and deleted its
+  attempt receipts (`node.rs:6810`, `crates/mb-node/src/volume.rs:1088`). If
+  the daemon is restarted and the retired group is forgotten, the pending
+  activation is treated as new; parity activation requires those deleted
+  receipts (`node.rs:6777`, `volume.rs:1033`) and cannot complete. Defer a
+  no-placement handoff without stopping the worker, and after eligible forget
+  create a fresh signed attempt with retained input intent instead of replaying
+  the old transcript. The M5-127 retirement regression uses a `1+1` profile
+  across five nodes (`p2p.rs:24435`), so it always has a spare placement. Gate
+  real full-width 3- and 5-domain production workers through retire,
+  acknowledged cleanup, forget, renewed coverage, backup completion and
+  repeated reopen.
+
+- [ ] **M5-129 / P1 — Select a usable parity holder when replanning a retired
+  group.** The new placement search takes the first active member that produces
+  a valid, unused group ID (`crates/mb-node/src/node.rs:6574`), without the
+  reachability and free-capacity checks used by initial placement
+  (`crates/mb-node/src/network/p2p.rs:12566`, `:12606`, `:12462`). In a guild
+  with spare domains, let the first eligible holder be full or offline while a
+  later holder has capacity and a working path. The signed successor targets
+  the unusable holder; its parity reservation fails (`p2p.rs:7291`) or active
+  holder abort cannot be acknowledged (`p2p.rs:7530`). Failure retries and
+  expiry renewal retain the same geometry (`node.rs:5873`, `:4572`), so the
+  backup can wait indefinitely despite a viable placement. Replan against
+  reachable capacity, and rotate geometry after a capacity or availability
+  failure while preserving cleanup and input ownership. Cover a full and an
+  offline first spare, a usable later spare, fresh coverage and reopen.
+
+- [ ] **M5-130 / P1 — Rotate coordinators after an initial negative verifier
+  finding.** The no-retry-parent completion path clones the negative attempt's
+  plan and changes only format, parity placement if necessary, attempt ID and
+  expiry (`crates/mb-node/src/node.rs:6542`, `:6615`). It keeps the same coding
+  coordinator and verifier. An initial `InvalidCoding` result from a persistently
+  faulty coder can therefore be cleaned up and relaunched to that same coder
+  forever, although healthy alternatives are reachable. Normal failure retry
+  excludes the old coordinators (`network/p2p.rs:6936`); the documented coding
+  invariant requires fresh coordinators after missing confirmation
+  (`plan.md:2570`). Select fresh reachable roles for a negative initial result
+  before signing its successor, retain the exact negative evidence and packed
+  input intent, and cover repeated invalid-coding evidence followed by a
+  healthy coordinator, verified coverage and reopen.
+
+- [ ] **M5-131 / gate — Recheck Milestone 5 after M5-128 through M5-130.**
+  Correct all three source blockers and review the committed source. Run focused
+  production-worker, full-width placement, negative-evidence and reopen
+  regressions. On the exact corrected code commit, pass local formatting,
+  strict locked all-target workspace Clippy and tests, Docker lab safety, and
+  all fresh disposable Btrfs/network acceptance invocations. Independently
+  confirm cleanup of owned images, mounts, loop devices, namespaces,
+  interfaces/rules and processes. Record the exact commit and outcomes.
+  M5-127 remains historical evidence for `e09a13f`; build and run locally,
+  with no remote compilation server. This source-only review did not execute
+  M5-131.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
