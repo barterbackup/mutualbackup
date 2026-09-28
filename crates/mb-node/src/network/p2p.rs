@@ -6414,6 +6414,18 @@ async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
     })
     .await?;
     if verified && retired_group {
+        let retired_transcript = job.transcript.clone();
+        node_blocking(node.clone(), move |node| {
+            node.mark_retired_coding_activation_for_replan(&retired_transcript)
+        })
+        .await?;
+    }
+    let replan_transcript = job.transcript.clone();
+    let needs_replan = node_blocking(node.clone(), move |node| {
+        node.coding_activation_needs_replan(&replan_transcript)
+    })
+    .await?;
+    if verified && (retired_group || needs_replan) {
         let cleanup_job = DelegatedCodingJob {
             format_version: 1,
             plan: job.transcript.value.plan.clone(),
@@ -6423,14 +6435,16 @@ async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
         };
         match abort_stale_delegated_coding(node.clone(), p2p, &cleanup_job).await {
             Ok(()) => {
-                let fresh = fresh_coding_activation_coordinators(
+                let (fresh, eligible) = coding_activation_renewal_options(
                     node.clone(),
                     p2p,
                     &job.transcript.value.plan,
                 )
                 .await;
                 node_blocking(node.clone(), move |node| {
-                    node.complete_coding_activation_with_coordinators(attempt_id, false, fresh)
+                    node.complete_coding_activation_with_coordinators(
+                        attempt_id, false, fresh, eligible,
+                    )
                 })
                 .await?;
             }
@@ -6492,7 +6506,12 @@ async fn process_coding_activation_job(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
         match abort_stale_delegated_coding(node.clone(), p2p, &cleanup_job).await {
             Ok(()) => {
                 node_blocking(node.clone(), move |node| {
-                    node.complete_coding_activation_with_coordinators(attempt_id, false, None)
+                    node.complete_coding_activation_with_coordinators(
+                        attempt_id,
+                        false,
+                        None,
+                        BTreeSet::new(),
+                    )
                 })
                 .await?;
             }
@@ -6532,13 +6551,13 @@ async fn finish_and_complete_coding_activation(
 ) -> Result<()> {
     finish_coding_activation(node.clone(), p2p, transcript).await?;
     let attempt_id = transcript.value.plan.value.attempt_id;
-    let fresh = if verified {
-        None
+    let (fresh, eligible) = if verified {
+        (None, BTreeSet::new())
     } else {
-        fresh_coding_activation_coordinators(node.clone(), p2p, &transcript.value.plan).await
+        coding_activation_renewal_options(node.clone(), p2p, &transcript.value.plan).await
     };
     let completed = node_blocking(node.clone(), move |node| {
-        node.complete_coding_activation_with_coordinators(attempt_id, verified, fresh)
+        node.complete_coding_activation_with_coordinators(attempt_id, verified, fresh, eligible)
     })
     .await?;
     if !completed && verified {
@@ -6552,10 +6571,10 @@ async fn finish_and_complete_coding_activation(
             error: Some("coding group retired before activation completed".to_owned()),
         };
         abort_stale_delegated_coding(node.clone(), p2p, &cleanup_job).await?;
-        let fresh =
-            fresh_coding_activation_coordinators(node.clone(), p2p, &transcript.value.plan).await;
+        let (fresh, eligible) =
+            coding_activation_renewal_options(node.clone(), p2p, &transcript.value.plan).await;
         node_blocking(node, move |node| {
-            node.complete_coding_activation_with_coordinators(attempt_id, false, fresh)
+            node.complete_coding_activation_with_coordinators(attempt_id, false, fresh, eligible)
         })
         .await?;
     }
@@ -6573,12 +6592,127 @@ async fn fresh_coding_activation_coordinators(
         dispatched: true,
         error: None,
     };
-    match choose_coding_launch_renewal_coordinators(node, p2p, &job).await {
+    match choose_coding_launch_renewal_coordinators(node.clone(), p2p, &job).await {
         Ok(pair) => Some(pair),
         Err(error) => {
             tracing::debug!(attempt_id = ?prior.value.attempt_id, %error,
                 "coding activation is waiting for fresh coordinators");
-            None
+            rotated_coding_activation_coordinators(node, p2p, prior).await
+        }
+    }
+}
+
+async fn rotated_coding_activation_coordinators(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    prior: &SignedRecord<CodingAttemptPlan>,
+) -> Option<(NodeId, NodeId)> {
+    // In a three-member guild only one member is outside the old pair. A
+    // verifier that signed the evidence may become the coder, but an
+    // attributable old coder must never become the new verifier.
+    let (guild, local_id) = node_blocking(node, |node| {
+        Ok((
+            node.guild_summary()?
+                .context("coding activation renewal requires a guild")?,
+            node.keys().node_id(),
+        ))
+    })
+    .await
+    .ok()?;
+    let old_coder = prior.value.coding_coordinator;
+    let old_verifier = prior.value.verification_coordinator;
+    let peers = guild
+        .peers
+        .into_iter()
+        .filter(|peer| peer.member.node_id != old_coder)
+        .collect::<Vec<_>>();
+    let reachable = reachable_coding_peers(p2p, local_id, &peers)
+        .await
+        .into_iter()
+        .map(|peer| peer.member.node_id)
+        .collect::<Vec<_>>();
+    if !reachable.contains(&old_verifier) {
+        return None;
+    }
+    let participants = prior
+        .value
+        .geometry
+        .information
+        .iter()
+        .filter(|role| !role.sector.virtual_zero)
+        .map(|role| role.owner)
+        .chain(prior.value.geometry.parity.iter().map(|role| role.holder))
+        .collect::<BTreeSet<_>>();
+    let observations = collect_coding_path_observations(
+        p2p,
+        guild.guild_id,
+        &[old_verifier],
+        &participants.iter().copied().collect::<Vec<_>>(),
+    )
+    .await;
+    coding_candidate_lane_score(old_verifier, &participants, &observations)?;
+    let status = p2p.status().await.ok()?;
+    reachable
+        .into_iter()
+        .filter(|candidate| *candidate != old_verifier)
+        .min_by_key(|candidate| {
+            (
+                coding_candidate_path_rank(*candidate, local_id, &status),
+                *candidate,
+            )
+        })
+        .map(|verifier| (old_verifier, verifier))
+}
+
+async fn coding_activation_renewal_options(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    prior: &SignedRecord<CodingAttemptPlan>,
+) -> (Option<(NodeId, NodeId)>, BTreeSet<NodeId>) {
+    tokio::join!(
+        fresh_coding_activation_coordinators(node.clone(), p2p, prior),
+        usable_coding_activation_parity_holders(node, p2p, prior),
+    )
+}
+
+async fn usable_coding_activation_parity_holders(
+    node: Arc<Mutex<Node>>,
+    p2p: &P2pClient,
+    prior: &SignedRecord<CodingAttemptPlan>,
+) -> BTreeSet<NodeId> {
+    let roster = node_blocking(node.clone(), |node| {
+        Ok((
+            node.guild_summary()?
+                .context("coding activation placement requires a guild")?,
+            node.keys().node_id(),
+        ))
+    })
+    .await;
+    let (guild, local_id) = match roster {
+        Ok(roster) => roster,
+        Err(error) => {
+            tracing::debug!(%error, "coding activation is waiting for a guild roster");
+            return BTreeSet::new();
+        }
+    };
+    let reachable = reachable_coding_peers(p2p, local_id, &guild.peers).await;
+    match coding_capacity_by_peer(
+        node,
+        p2p,
+        local_id,
+        guild.guild_id,
+        &reachable,
+        prior.value.geometry.profile.shard_size,
+    )
+    .await
+    {
+        Ok(capacity) => capacity
+            .into_iter()
+            .filter_map(|(id, slots)| (slots > 0).then_some(id))
+            .collect(),
+        Err(error) => {
+            tracing::debug!(%error, "coding activation is waiting for parity capacity");
+            BTreeSet::new()
         }
     }
 }
@@ -24326,6 +24460,121 @@ mod tests {
             );
             assert_eq!(holder.coding_used_bytes_for_test().unwrap(), 0);
             assert_eq!(holder.coding_staged_receipt_count_for_test().unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn three_member_negative_activation_rotates_verifier_into_coder() {
+        let temp = tempfile::tempdir().unwrap();
+        let nodes = (0_u8..5)
+            .map(|index| {
+                Arc::new(Mutex::new(
+                    Node::open(
+                        temp.path().join(format!("node-{index}")),
+                        Seed::from_bytes([160 + index; 32]),
+                    )
+                    .unwrap(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for node in &nodes {
+            let mut cfg = config(node.lock().unwrap().keys().node_id());
+            cfg.enable_relay_server = false;
+            let (client, event_loop) = build_p2p(node.clone(), cfg).unwrap();
+            clients.push(client);
+            tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let addresses = futures::future::join_all(clients.iter().map(listening_address)).await;
+        let endpoints = clients
+            .iter()
+            .zip(addresses.iter().cloned())
+            .map(|(client, address)| peer_endpoint(client, address))
+            .collect::<Vec<_>>();
+        form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+        for index in [4, 3] {
+            let removed = nodes[index].lock().unwrap().keys().node_id();
+            install_coding_test_event(
+                &nodes,
+                mb_core::GuildEventKind::RemoveMember { node_id: removed },
+            );
+        }
+        let ids = nodes
+            .iter()
+            .take(3)
+            .map(|node| node.lock().unwrap().keys().node_id())
+            .collect::<Vec<_>>();
+        for (client, self_id) in clients.iter().take(3).zip(&ids) {
+            for (peer_id, address) in ids.iter().zip(&addresses) {
+                if peer_id != self_id {
+                    client
+                        .add_peer_address(*peer_id, address.clone())
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        let state = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap();
+        let member = |id| {
+            state
+                .active_members()
+                .find(|member| member.node_id == id)
+                .unwrap()
+                .clone()
+        };
+        let data = [vec![31; 64], vec![32; 64]];
+        let plan = nodes[0]
+            .lock()
+            .unwrap()
+            .sign_coding_attempt_plan(CodingAttemptPlan {
+                format_version: 3,
+                attempt_id: [161; 16],
+                checkpoint_hash: [162; 32],
+                membership_epoch: state.membership_epoch,
+                geometry: CodingPlanGeometry {
+                    format_version: 1,
+                    guild_id: state.guild_id,
+                    profile: CodingProfile::new(2, 1, 64),
+                    information: (0..2)
+                        .map(|index| InformationRoleV2 {
+                            owner: ids[index],
+                            failure_domain: member(ids[index]).failure_domain,
+                            sector: RangeSectorRef {
+                                id: [index as u8 + 1; 32],
+                                commitment: merkle_commit(&data[index]).unwrap(),
+                                logical_len: 64,
+                                virtual_zero: false,
+                            },
+                        })
+                        .collect(),
+                    parity: vec![ParityPlacementV2 {
+                        holder: ids[2],
+                        failure_domain: member(ids[2]).failure_domain,
+                        row: 0,
+                    }],
+                },
+                delegator: ids[0],
+                coding_coordinator: ids[1],
+                verification_coordinator: ids[2],
+                expires_at_unix_seconds: unix_seconds() + 600,
+                information_roots: Some(data.iter().map(|bytes| sector_root(bytes)).collect()),
+            })
+            .unwrap();
+        assert_eq!(
+            fresh_coding_activation_coordinators(nodes[0].clone(), &clients[0], &plan).await,
+            Some((ids[2], ids[0]))
+        );
+        for client in &clients {
+            client.shutdown().await.unwrap();
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
         }
     }
 

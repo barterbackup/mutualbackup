@@ -2918,23 +2918,26 @@ impl Node {
         transcript: &SignedRecord<CodingVerificationTranscript>,
     ) -> Result<()> {
         let bytes = canonical_bytes(transcript)?;
-        for (kind, id) in [
-            (
-                "coding-transcript",
-                transcript.value.plan.value.attempt_id.as_slice(),
-            ),
-            (
-                "coding-group-transcript",
-                transcript.value.manifest.value.group.id.as_slice(),
-            ),
-        ] {
-            if self
-                .control
-                .get_record(kind, id)?
-                .is_some_and(|existing| existing != bytes)
-            {
-                anyhow::bail!("coding group already has conflicting verifier evidence");
-            }
+        if self
+            .control
+            .get_record("coding-transcript", &transcript.value.plan.value.attempt_id)?
+            .is_some_and(|existing| existing != bytes)
+        {
+            anyhow::bail!("coding attempt already has conflicting verifier evidence");
+        }
+        let group_id = transcript.value.manifest.value.group.id;
+        if self
+            .control
+            .get_record("coding-group-transcript", &group_id)?
+            .is_some_and(|existing| existing != bytes)
+            && self.dynamic_guild_state()?.is_some_and(|state| {
+                state
+                    .coding_groups
+                    .iter()
+                    .any(|retained| retained.group.id == group_id)
+            })
+        {
+            anyhow::bail!("retained coding group already has conflicting verifier evidence");
         }
         Ok(())
     }
@@ -6472,6 +6475,69 @@ impl Node {
         }
     }
 
+    pub(crate) fn mark_retired_coding_activation_for_replan(
+        &self,
+        transcript: &SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<()> {
+        let id = transcript.value.plan.value.attempt_id;
+        let bytes = self
+            .control
+            .get_record("coding-activation-job", &id)?
+            .context("coding activation job is unavailable")?;
+        let job: CodingActivationJob = decode_canonical(&bytes)?;
+        if job.complete || job.transcript != *transcript {
+            anyhow::bail!("retired coding activation changed before replanning");
+        }
+        let state = self
+            .dynamic_guild_state()?
+            .context("coding activation requires dynamic guild state")?;
+        if !state.coding_groups.iter().any(|retained| {
+            retained.group == transcript.value.manifest.value.group
+                && retained.retired_at_event.is_some()
+        }) {
+            anyhow::bail!("coding activation group is not retired");
+        }
+        let hash = *blake3::hash(&canonical_bytes(transcript)?).as_bytes();
+        let value = canonical_bytes(&hash)?;
+        if let Some(existing) = self.control.get_record("coding-activation-replan", &id)?
+            && existing != value
+        {
+            anyhow::bail!("retired coding activation replan marker conflicts");
+        }
+        self.control
+            .put_record("coding-activation-replan", &id, &value)?;
+        Ok(())
+    }
+
+    pub(crate) fn coding_activation_needs_replan(
+        &self,
+        transcript: &SignedRecord<CodingVerificationTranscript>,
+    ) -> Result<bool> {
+        let id = transcript.value.plan.value.attempt_id;
+        if let Some(value) = self.control.get_record("coding-activation-replan", &id)? {
+            let hash: [u8; 32] = decode_canonical(&value)?;
+            if hash != *blake3::hash(&canonical_bytes(transcript)?).as_bytes() {
+                anyhow::bail!("retired coding activation replan marker conflicts");
+            }
+            return Ok(true);
+        }
+        // Retirement and forgetting can both commit before this worker first
+        // claims an already verified activation. The exact old transcript is
+        // still durable, while the group is absent from current guild state.
+        let group_id = transcript.value.manifest.value.group.id;
+        let forgotten = self.dynamic_guild_state()?.is_some_and(|state| {
+            !state
+                .coding_groups
+                .iter()
+                .any(|retained| retained.group.id == group_id)
+        });
+        Ok(forgotten
+            && self
+                .control
+                .get_record("coding-group-transcript", &group_id)?
+                == Some(canonical_bytes(transcript)?))
+    }
+
     #[cfg(test)]
     pub(crate) fn complete_coding_activation(
         &self,
@@ -6499,7 +6565,21 @@ impl Node {
                 .collect::<Vec<_>>();
             fresh.first().copied().zip(fresh.get(1).copied())
         };
-        self.complete_coding_activation_with_coordinators(attempt_id, covered, fresh_coordinators)
+        let eligible = self
+            .dynamic_guild_state()?
+            .map(|state| {
+                state
+                    .active_members()
+                    .map(|member| member.node_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.complete_coding_activation_with_coordinators(
+            attempt_id,
+            covered,
+            fresh_coordinators,
+            eligible,
+        )
     }
 
     pub(crate) fn complete_coding_activation_with_coordinators(
@@ -6507,6 +6587,7 @@ impl Node {
         attempt_id: [u8; 16],
         covered: bool,
         fresh_coordinators: Option<(NodeId, NodeId)>,
+        eligible_parity_holders: BTreeSet<NodeId>,
     ) -> Result<bool> {
         let bytes = self
             .control
@@ -6582,7 +6663,6 @@ impl Node {
                 // that marks holder cleanup complete.
                 let prior = &job.transcript.value.plan;
                 if coding_coordinator == prior.value.coding_coordinator
-                    || coding_coordinator == prior.value.verification_coordinator
                     || verification_coordinator == prior.value.coding_coordinator
                     || verification_coordinator == prior.value.verification_coordinator
                     || coding_coordinator == verification_coordinator
@@ -6608,49 +6688,75 @@ impl Node {
                     .dynamic_guild_state()?
                     .context("coding activation requires dynamic guild state")?;
                 let group = &job.transcript.value.manifest.value.group;
-                let mut candidate = group.clone();
-                candidate.format_version = value.format_version;
-                candidate.id = candidate.calculate_id()?;
-                if state
-                    .coding_groups
-                    .iter()
-                    .any(|retained| retained.group.id == candidate.id)
-                {
-                    // Re-encoding with only a new attempt ID would produce
-                    // a group ID that the guild has already recorded.
-                    let mut replacement = None;
-                    'placements: for index in 0..value.geometry.parity.len() {
-                        for member in state.active_members() {
-                            let mut geometry = value.geometry.clone();
+                let eligible = state
+                    .active_members()
+                    .filter(|member| eligible_parity_holders.contains(&member.node_id))
+                    .collect::<Vec<_>>();
+                let original = value.geometry.clone();
+                let mut placements = vec![original.clone()];
+                for index in 0..original.parity.len() {
+                    let mut next = Vec::new();
+                    for geometry in &placements {
+                        for member in &eligible {
+                            let mut geometry = geometry.clone();
                             geometry.parity[index].holder = member.node_id;
                             geometry.parity[index].failure_domain = member.failure_domain.clone();
-                            if geometry.validate().is_err() {
-                                continue;
-                            }
-                            let mut candidate = candidate.clone();
-                            let role_index = geometry.information.len() + index;
-                            let mb_core::ShardRoleV2::Parity(role) =
-                                &mut candidate.roles[role_index]
-                            else {
-                                anyhow::bail!("verified coding group has an invalid parity role");
-                            };
-                            role.holder = member.node_id;
-                            role.failure_domain = member.failure_domain.clone();
-                            candidate.id = candidate.calculate_id()?;
-                            if state
-                                .coding_groups
-                                .iter()
-                                .any(|retained| retained.group.id == candidate.id)
-                            {
-                                continue;
-                            }
-                            replacement = Some(geometry);
-                            break 'placements;
+                            next.push(geometry);
                         }
                     }
-                    value.geometry =
-                        replacement.context("coding group has no unused parity placement")?;
+                    if next.len() > 4096 {
+                        anyhow::bail!("coding activation parity search exceeds its bound");
+                    }
+                    placements = next;
                 }
+                placements.sort_by_key(|geometry| {
+                    (
+                        geometry
+                            .parity
+                            .iter()
+                            .zip(&original.parity)
+                            .filter(|(new, old)| *new != *old)
+                            .count(),
+                        geometry
+                            .parity
+                            .iter()
+                            .map(|role| role.holder)
+                            .collect::<Vec<_>>(),
+                    )
+                });
+                let mut replacement = None;
+                for geometry in placements {
+                    if geometry.validate().is_err() {
+                        continue;
+                    }
+                    let mut candidate = group.clone();
+                    candidate.format_version = value.format_version;
+                    for (index, placement) in geometry.parity.iter().enumerate() {
+                        let role_index = geometry.information.len() + index;
+                        let mb_core::ShardRoleV2::Parity(role) = &mut candidate.roles[role_index]
+                        else {
+                            anyhow::bail!("verified coding group has an invalid parity role");
+                        };
+                        role.holder = placement.holder;
+                        role.failure_domain = placement.failure_domain.clone();
+                    }
+                    candidate.id = candidate.calculate_id()?;
+                    if state
+                        .coding_groups
+                        .iter()
+                        .any(|retained| retained.group.id == candidate.id)
+                    {
+                        continue;
+                    }
+                    replacement = Some(geometry);
+                    break;
+                }
+                let Some(replacement) = replacement else {
+                    // Retain activation and input ownership until a usable
+                    // placement exists or history can be forgotten.
+                    return Ok(false);
+                };
+                value.geometry = replacement;
                 loop {
                     rand::rngs::OsRng.fill_bytes(&mut value.attempt_id);
                     if value.attempt_id != [0; 16] && value.attempt_id != prior.value.attempt_id {
@@ -6692,6 +6798,7 @@ impl Node {
             ("coding-launch-job".to_owned(), attempt_id.to_vec()),
             ("coding-launch-information".to_owned(), attempt_id.to_vec()),
             ("coding-launch-staged".to_owned(), attempt_id.to_vec()),
+            ("coding-activation-replan".to_owned(), attempt_id.to_vec()),
         ]);
         job.complete = true;
         job.error = None;
@@ -6856,8 +6963,12 @@ impl Node {
     }
 
     pub fn discard_coding_attempt(&mut self, attempt_id: &[u8; 16]) -> Result<bool> {
-        if let Some(bytes) = self.control.get_record("coding-transcript", attempt_id)? {
-            let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(&bytes)?;
+        let transcript = self
+            .control
+            .get_record("coding-transcript", attempt_id)?
+            .map(|bytes| decode_canonical::<SignedRecord<CodingVerificationTranscript>>(&bytes))
+            .transpose()?;
+        if let Some(transcript) = &transcript {
             let group_id = transcript.value.manifest.value.group.id;
             if self.dynamic_guild_state()?.is_some_and(|state| {
                 state
@@ -6869,7 +6980,24 @@ impl Node {
                 return Ok(true);
             }
         }
-        self.volumes.discard_attempt(&self.control, attempt_id)
+        let mut complete = self.volumes.discard_attempt(&self.control, attempt_id)?;
+        if let Some(transcript) = transcript {
+            let group = &transcript.value.manifest.value.group;
+            for (index, role) in group.roles.iter().enumerate() {
+                if let ShardRoleV2::Parity(parity) = role
+                    && parity.holder == self.keys.node_id()
+                {
+                    complete &= self.volumes.remove_unreachable(
+                        &self.control,
+                        &group.id,
+                        u8::try_from(index)
+                            .context("coding parity index exceeds storage format")?,
+                        &parity.commitment.root,
+                    )?;
+                }
+            }
+        }
+        Ok(complete)
     }
 
     pub(crate) fn record_coding_holder_cleanup(
@@ -16052,6 +16180,7 @@ pub(crate) mod tests {
                     separate.value.attempt_id,
                     false,
                     None,
+                    BTreeSet::new(),
                 )
                 .unwrap()
         );
@@ -16301,6 +16430,185 @@ pub(crate) mod tests {
         assert_ne!(
             fresh.value.verification_coordinator,
             coding.value.verification_coordinator
+        );
+    }
+
+    #[test]
+    fn forgotten_full_width_group_replans_after_retired_activation_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let volume = temp.path().join("volume");
+        std::fs::create_dir(&volume).unwrap();
+        let (seed, certificate, peers) = recovery_guild_fixture();
+        let keys = (0_u8..5)
+            .map(|i| KeyMaterial::from_seed(&Seed::from_bytes([120 + i; 32])))
+            .collect::<Vec<_>>();
+        let mut node = Node::open(temp.path().join("node"), seed.clone()).unwrap();
+        node.configure_storage_volumes(std::slice::from_ref(&volume), 4 * 1024 * 1024, 0)
+            .unwrap();
+        node.adopt_recovered_guild(certificate, peers).unwrap();
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let members = state.active_members().cloned().collect::<Vec<_>>();
+        assert_eq!(members[2].node_id, node.keys().node_id());
+        let profile = mb_core::CodingProfile::new(3, 2, 64);
+        let data = vec![vec![21; 64], vec![22; 64], vec![23; 64]];
+        let shards = mb_core::encode(profile, data.clone()).unwrap();
+        let information = [0, 1, 3]
+            .into_iter()
+            .enumerate()
+            .map(|(index, member)| mb_core::InformationRoleV2 {
+                owner: members[member].node_id,
+                failure_domain: members[member].failure_domain.clone(),
+                sector: mb_core::RangeSectorRef {
+                    id: [index as u8 + 1; 32],
+                    commitment: merkle_commit(&data[index]).unwrap(),
+                    logical_len: 64,
+                    virtual_zero: false,
+                },
+            })
+            .collect::<Vec<_>>();
+        let parity = [2, 4]
+            .into_iter()
+            .enumerate()
+            .map(|(row, member)| mb_core::ParityPlacementV2 {
+                holder: members[member].node_id,
+                failure_domain: members[member].failure_domain.clone(),
+                row: row as u16,
+            })
+            .collect::<Vec<_>>();
+        let plan = node
+            .sign_coding_attempt_plan(CodingAttemptPlan {
+                format_version: 3,
+                attempt_id: [211; 16],
+                checkpoint_hash: [212; 32],
+                membership_epoch: state.membership_epoch,
+                geometry: mb_core::CodingPlanGeometry {
+                    format_version: 1,
+                    guild_id: state.guild_id,
+                    profile,
+                    information,
+                    parity,
+                },
+                delegator: node.keys().node_id(),
+                coding_coordinator: members[0].node_id,
+                verification_coordinator: members[1].node_id,
+                expires_at_unix_seconds: unix_seconds() + 600,
+                information_roots: Some(data.iter().map(|bytes| sector_root(bytes)).collect()),
+            })
+            .unwrap();
+        let transcript = test_coding_transcript(plan.clone(), &shards, &keys);
+        let group = transcript.value.manifest.value.group.clone();
+        let local_parity = VariableParityObject {
+            format_version: 2,
+            guild_id: state.guild_id,
+            group_id: group.id,
+            shard_index: 3,
+            commitment: merkle_commit(&shards[3]).unwrap(),
+            bytes: shards[3].clone(),
+        };
+        let sign_event = |state: &DynamicGuildState, kind| {
+            let event = GuildEvent {
+                format_version: 1,
+                guild_id: state.guild_id,
+                sequence: state.event_sequence + 1,
+                parent: state.event_head,
+                kind,
+            };
+            let mut signatures = keys
+                .iter()
+                .map(|key| sign_guild_event(&event, key).unwrap())
+                .collect::<Vec<_>>();
+            signatures.sort_by_key(|signature| signature.signer);
+            QuorumGuildEvent { event, signatures }
+        };
+        node.stage_coding_parity(&plan, &transcript.value.manifest, &local_parity)
+            .unwrap();
+        node.activate_coding_attempt(&transcript).unwrap();
+        let add = sign_event(
+            &state,
+            mb_core::GuildEventKind::AddCodingGroup {
+                group: group.clone(),
+            },
+        );
+        node.install_coding_group_event(add, transcript.clone())
+            .unwrap();
+        node.accept_coding_transcript(plan.value.coding_coordinator, transcript.clone())
+            .unwrap();
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let retire = sign_event(
+            &state,
+            mb_core::GuildEventKind::RetireCodingGroup {
+                group_id: group.id,
+                retain_through_event: state.event_sequence + 1,
+            },
+        );
+        node.install_guild_event(retire).unwrap();
+        node.mark_retired_coding_activation_for_replan(&transcript)
+            .unwrap();
+        assert!(node.discard_coding_attempt(&plan.value.attempt_id).unwrap());
+        assert_eq!(
+            node.variable_parity_for_guild(&state.guild_id, &group.id, 3)
+                .unwrap(),
+            local_parity
+        );
+        let fresh = Some((members[2].node_id, members[3].node_id));
+        assert!(
+            !node
+                .complete_coding_activation_with_coordinators(
+                    plan.value.attempt_id,
+                    false,
+                    fresh,
+                    BTreeSet::new(),
+                )
+                .unwrap()
+        );
+        drop(node);
+        let mut node = Node::open(temp.path().join("node"), seed).unwrap();
+        assert!(node.coding_activation_needs_replan(&transcript).unwrap());
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        let forget = sign_event(
+            &state,
+            mb_core::GuildEventKind::ForgetCodingGroup { group_id: group.id },
+        );
+        node.install_guild_event(forget).unwrap();
+        assert!(node.discard_coding_attempt(&plan.value.attempt_id).unwrap());
+        assert!(
+            node.variable_parity_for_guild(&state.guild_id, &group.id, 3)
+                .is_err()
+        );
+        assert!(
+            node.complete_coding_activation_with_coordinators(
+                plan.value.attempt_id,
+                false,
+                fresh,
+                members.iter().map(|member| member.node_id).collect(),
+            )
+            .unwrap()
+        );
+        let successor = node
+            .coding_launch_successor_for_test(plan.value.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(successor.value.geometry, plan.value.geometry);
+        let next = test_coding_transcript(successor.clone(), &shards, &keys);
+        assert_eq!(next.value.manifest.value.group.id, group.id);
+        node.stage_coding_parity(&successor, &next.value.manifest, &local_parity)
+            .unwrap();
+        node.activate_coding_attempt(&next).unwrap();
+        let state = node.dynamic_guild_state().unwrap().unwrap();
+        node.install_coding_group_event(
+            sign_event(
+                &state,
+                mb_core::GuildEventKind::AddCodingGroup {
+                    group: group.clone(),
+                },
+            ),
+            next.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            node.coding_transcript_for_group(state.guild_id, group.id)
+                .unwrap(),
+            next
         );
     }
 
