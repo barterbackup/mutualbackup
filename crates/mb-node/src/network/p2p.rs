@@ -8194,7 +8194,25 @@ async fn reconcile_variable_group_lifecycle_once(
         return Ok(());
     }
     if backup_commit_in_progress {
-        return Ok(());
+        // A pending activation may have no unused placement until an old
+        // retired group is forgotten. Forgetting it cannot remove live
+        // coverage, so let this advance even while the backup waits.
+        let sequence = state
+            .event_sequence
+            .checked_add(1)
+            .context("guild event sequence exhausted")?;
+        let Some(group_id) = variable_group_ready_to_forget(&state, sequence) else {
+            return Ok(());
+        };
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::ForgetCodingGroup { group_id },
+        };
+        state.validate_event_proposal(&event)?;
+        return commit_plain_guild_event(node, p2p, state, guild, local_id, event).await;
     }
     let Some(checkpoint) = checkpoint else {
         return Ok(());
@@ -8380,15 +8398,9 @@ fn variable_group_lifecycle_kind(
     live_sectors: &BTreeSet<[u8; 32]>,
     sequence: u64,
 ) -> Option<mb_core::GuildEventKind> {
-    let forget = state
-        .coding_groups
-        .iter()
-        .filter(|retained| {
-            retained
-                .retain_through_event
-                .is_some_and(|retain_through| sequence > retain_through)
-        })
-        .min_by_key(|retained| (retained.added_at_event, retained.group.id));
+    if let Some(group_id) = variable_group_ready_to_forget(state, sequence) {
+        return Some(mb_core::GuildEventKind::ForgetCodingGroup { group_id });
+    }
     let mut live_by_group = BTreeMap::<[u8; 32], BTreeSet<[u8; 32]>>::new();
     let mut coverage = BTreeMap::<[u8; 32], usize>::new();
     for retained in state
@@ -8433,16 +8445,23 @@ fn variable_group_lifecycle_kind(
                 retained.group.id,
             )
         });
-    if let Some(candidate) = forget {
-        Some(mb_core::GuildEventKind::ForgetCodingGroup {
-            group_id: candidate.group.id,
+    redundant.map(|candidate| mb_core::GuildEventKind::RetireCodingGroup {
+        group_id: candidate.group.id,
+        retain_through_event: sequence,
+    })
+}
+
+fn variable_group_ready_to_forget(state: &DynamicGuildState, sequence: u64) -> Option<[u8; 32]> {
+    state
+        .coding_groups
+        .iter()
+        .filter(|retained| {
+            retained
+                .retain_through_event
+                .is_some_and(|retain_through| sequence > retain_through)
         })
-    } else {
-        redundant.map(|candidate| mb_core::GuildEventKind::RetireCodingGroup {
-            group_id: candidate.group.id,
-            retain_through_event: sequence,
-        })
-    }
+        .min_by_key(|retained| (retained.added_at_event, retained.group.id))
+        .map(|retained| retained.group.id)
 }
 
 async fn commit_plain_guild_event(
