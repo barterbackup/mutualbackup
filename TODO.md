@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (reopened by source review, 2026-09-28)
+## Milestone 5 guild geometry and coding protocol (closed after M5-127, 2026-09-28)
 
 The historical source-only review of the Milestone 5 changes through `a6b5d7d`
 found three blockers: negative verifier evidence could terminate retry
@@ -584,10 +584,11 @@ cleanup could forget an offline removed holder's staged data (M5-121). The
 review required these corrections and a new exact-source M5-122 local gate.
 All three corrections and M5-122 passed on exact source `4880c28`. A later
 source-only review of the corrections through `8712ac3` found four blockers
-(M5-123 through M5-126), so Milestone 5 is open and Milestone 6 waits.
-Neither source-only review ran
-builds, tests, daemons, or runtime probes. M5-122 and M5-114 remain passing
-historical evidence for their exact source trees.
+(M5-123 through M5-126). Those findings were corrected in `9cfa4b5`,
+`dd942a6`, and `e09a13f`; the complete M5-127 local gate passed on exact code
+source `e09a13f`. Milestone 5 is closed and Milestone 6 is next. Neither
+source-only review ran builds, tests, daemons, or runtime probes. M5-122 and
+M5-114 remain passing historical evidence for their exact source trees.
 
 M5-116/M5-117 implementation update (2026-09-26): acknowledged retry parents
 now remain quiescent only while their successor is live and unfenced, or after
@@ -3365,7 +3366,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   source-only review below reopens it. M5-114 remains historical evidence for
   its earlier tree.
 
-- [ ] **M5-123 / P1 — Replan an initial launch after negative verifier cleanup.**
+- [x] **M5-123 / P1 — Replan an initial launch after negative verifier cleanup.**
   `complete_coding_activation(attempt, false)` requeues only a matching retry
   parent; when the negative finding belongs to an initial launch, it deletes
   that launch and its packed-input intent without creating a successor
@@ -3379,7 +3380,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   holder cleanup. Gate the production backup worker through negative evidence,
   cleanup, fresh launch, verified checkpoint coverage and uninterrupted wait.
 
-- [ ] **M5-124 / P1 — Gate legacy renewal on pending negative activation cleanup.**
+  Corrected in `9cfa4b5`. Negative activation completion atomically creates a
+  fresh signed launch and transfers its input intent after acknowledged holder
+  cleanup. The production-worker regression drives an invalid opening through
+  cleanup, live checkpoint wait, renewed verified coverage and reopen.
+
+- [x] **M5-124 / P1 — Gate legacy renewal on pending negative activation cleanup.**
   An old format-2 launch and a format-3 activation can coexist for the same
   lane. `coding_launch_renewal_candidate` ignores a negative format-3
   activation awaiting abort (`node.rs:4427`); expiry renewal then writes a
@@ -3392,7 +3398,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   pending invalid-opening/invalid-coding cleanup, constrained holder capacity,
   repeated reopen and exact successor lineage.
 
-- [ ] **M5-125 / P1 — Recover a launch that yielded to activation without coverage.**
+  Corrected in `9cfa4b5`. Cross-version renewal treats a pending negative
+  activation as cleanup ownership and defers fresh launch creation until its
+  holder abort is confirmed. The expiry/negative-cleanup worker regression and
+  repeated-reopen checks pass.
+
+- [x] **M5-125 / P1 — Recover a launch that yielded to activation without coverage.**
   Legacy renewal may record a pending verified format-3 activation as the old
   launch's successor (`node.rs:4427`, `:4534`). It transfers no input intent
   to an activation, then removes the old launch's intent (`node.rs:212`,
@@ -3406,7 +3417,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   legacy expiry/yield, retirement before completion, crash/reopen, renewed
   coverage and packed-input retention.
 
-- [ ] **M5-126 / P1 — Discover returned removed holders for cleanup.**
+  Corrected in `9cfa4b5`, `dd942a6`, and `e09a13f`. Pending activation keeps
+  the old launch's input, and uncovered completion atomically hands it to a
+  successor. A retired group is re-encoded on an unused parity placement; if
+  none exists, the pending job survives until eligible retirement history is
+  forgotten. The live production-worker regression covers legacy yield,
+  retirement, renewed coverage and reopen.
+
+- [x] **M5-126 / P1 — Discover returned removed holders for cleanup.**
   The obligation worker adds addresses only from `guild-endpoints`
   (`node.rs:6761`, `p2p.rs:6108`). Membership events do not update that cache
   (`node.rs:2821`), and normal DHT/peer-exchange refresh queries active peers
@@ -3420,7 +3438,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   address change, no manual address injection, repeated reopen and exact zero
   staged bytes, receipts and reservations.
 
-- [ ] **M5-127 / gate — Recheck Milestone 5 after M5-123 through M5-126.**
+  Corrected in `9cfa4b5`. A removed holder publishes only its signed endpoint
+  to DHT; the cleanup worker resolves that identity after cached/direct abort
+  fails, then clears its obligation only after acknowledgement. The network
+  return regression changes address without manual injection and verifies
+  zero staged bytes, receipts and reservations through reopen.
+
+- [x] **M5-127 / gate — Recheck Milestone 5 after M5-123 through M5-126.**
   Correct the source blockers, review the committed source and run focused
   production-worker and reopen regressions for each path. On the exact
   corrected commit, pass local formatting, strict locked all-target workspace
@@ -3428,8 +3452,26 @@ node Clippy gate passed locally. No remote compilation server was used.
   acceptance invocations. Independently confirm cleanup of owned images,
   mounts, loop devices, namespaces, interfaces/rules and processes. Record
   the exact commit and outcomes. M5-122 remains historical evidence only;
-  build and run locally, with no remote compilation server. This source-only
-  review did not execute M5-127.
+  build and run locally, with no remote compilation server. The source-only
+  review that opened this gate did not execute M5-127.
+
+  Passed on clean committed code source
+  `e09a13f8fcdfca1626e04118a668f67e1c4208d9`. Focused production-worker
+  and reopen regressions passed. Local formatting, strict locked all-target
+  workspace Clippy and tests, and Docker lab safety passed; the node suite had
+  286 passed and 10 expected ignored. All 23 invocations of the fresh local
+  Btrfs/network acceptance suite passed on a disposable 8 GiB image. Repeated
+  multi-owner QUIC passed in 788.94 seconds, and five-daemon seed/DHT recovery
+  with direct, hole-punched and relay paths passed in 2331.72 seconds. The
+  runner exited with cleanup result zero; an independent audit matched the
+  baseline for namespaces, interfaces, loop devices, Btrfs mounts, forwarding
+  and firewall rules, with no acceptance process or owned image remaining.
+  The first disposable run used a mount without `user_subvol_rm_allowed` and
+  failed a subvolume deletion test; its resources were removed, and the full
+  corrected fresh run passed. Logs: `/tmp/mutualbackup-m5-127-workspace-final.log`,
+  `/tmp/mutualbackup-m5-127-provisioned-v2.log`, and
+  `/tmp/mutualbackup-m5-127-cleanup-audit.log`. All compilation and execution
+  were local; no remote compilation server was used. Milestone 5 is closed.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
