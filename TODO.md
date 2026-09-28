@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (reopened 2026-09-26)
+## Milestone 5 guild geometry and coding protocol (closed 2026-09-28)
 
 M5-116/M5-117 implementation update (2026-09-26): acknowledged retry parents
 now remain quiescent only while their successor is live and unfenced, or after
