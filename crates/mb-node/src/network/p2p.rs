@@ -25153,8 +25153,7 @@ mod tests {
         retired_full_width_activation_worker_fixture(5).await;
     }
 
-    #[tokio::test]
-    async fn uncovered_activations_unblock_live_checkpoint_wait() {
+    async fn uncovered_activations_unblock_live_checkpoint_wait_fixture(offline_spare: bool) {
         let temp = tempfile::tempdir().unwrap();
         let seeds = (201_u8..206)
             .map(|byte| Seed::from_bytes([byte; 32]))
@@ -25196,6 +25195,17 @@ mod tests {
         let certificate = form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
         let owner = nodes[0].lock().unwrap().keys().node_id();
         let writer = ed25519_dalek::SigningKey::from_bytes(&[211; 32]);
+        if offline_spare {
+            install_coding_test_event(
+                &nodes,
+                mb_core::GuildEventKind::SetQuorum {
+                    policy: QuorumPolicy {
+                        format_version: 1,
+                        rule: QuorumRule::Majority,
+                    },
+                },
+            );
+        }
         install_coding_test_event(
             &nodes,
             mb_core::GuildEventKind::RotateWriterKey {
@@ -25594,19 +25604,28 @@ mod tests {
         let first_spare = (2..5)
             .min_by_key(|index| nodes[*index].lock().unwrap().keys().node_id())
             .unwrap();
-        nodes[first_spare]
-            .lock()
-            .unwrap()
-            .configure_storage_volumes(&[temp.path().join(format!("volume-{first_spare}"))], 1, 0)
-            .unwrap();
-        assert_eq!(
+        if offline_spare {
+            clients[first_spare].shutdown().await.unwrap();
+            (&mut network_tasks[first_spare]).await.unwrap().unwrap();
+        } else {
             nodes[first_spare]
                 .lock()
                 .unwrap()
-                .coding_capacity(V1_SECTOR_SIZE as u32)
-                .unwrap(),
-            0
-        );
+                .configure_storage_volumes(
+                    &[temp.path().join(format!("volume-{first_spare}"))],
+                    1,
+                    0,
+                )
+                .unwrap();
+            assert_eq!(
+                nodes[first_spare]
+                    .lock()
+                    .unwrap()
+                    .coding_capacity(V1_SECTOR_SIZE as u32)
+                    .unwrap(),
+                0
+            );
+        }
         process_coding_activation_job(nodes[0].clone(), &clients[0])
             .await
             .unwrap();
@@ -25624,6 +25643,11 @@ mod tests {
             replacement.value.geometry.parity[0].holder,
             nodes[first_spare].lock().unwrap().keys().node_id()
         );
+        if offline_spare {
+            let offline_id = nodes[first_spare].lock().unwrap().keys().node_id();
+            assert_ne!(replacement.value.coding_coordinator, offline_id);
+            assert_ne!(replacement.value.verification_coordinator, offline_id);
+        }
         {
             let node = nodes[0].lock().unwrap();
             assert_eq!(
@@ -25640,30 +25664,97 @@ mod tests {
         let second_coding_tasks = nodes
             .iter()
             .zip(clients.iter())
-            .map(|(node, client)| {
+            .enumerate()
+            .filter(|(index, _)| !offline_spare || *index != first_spare)
+            .map(|(_, (node, client))| {
                 tokio::spawn(run_delegated_coding_jobs(node.clone(), client.clone()))
             })
             .collect::<Vec<_>>();
-        tokio::time::timeout(
+        let coverage = tokio::time::timeout(
             Duration::from_secs(90),
             wait_for_variable_coding_groups(nodes[0].clone(), second_checkpoint.clone()),
         )
-        .await
-        .expect("retired activation must renew checkpoint coverage")
-        .unwrap();
+        .await;
+        if coverage.is_err() {
+            let owner = nodes[0].lock().unwrap();
+            let launches = owner
+                .coding_launch_jobs_for_test()
+                .unwrap()
+                .into_iter()
+                .map(|job| (job.plan.value.attempt_id, job.dispatched, job.error))
+                .collect::<Vec<_>>();
+            let activations = owner
+                .coding_activation_jobs_for_test()
+                .unwrap()
+                .into_iter()
+                .map(|job| {
+                    (
+                        job.transcript.value.plan.value.attempt_id,
+                        replay_coding_transcript(&job.transcript).unwrap(),
+                        job.complete,
+                        job.error,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let groups = owner
+                .dynamic_guild_state()
+                .unwrap()
+                .unwrap()
+                .coding_groups
+                .into_iter()
+                .map(|group| (group.group.id, group.retired_at_event))
+                .collect::<Vec<_>>();
+            let coverage_error = owner
+                .validate_variable_checkpoint_coverage(&second_checkpoint, false)
+                .err()
+                .map(|error| error.to_string());
+            drop(owner);
+            let delegated = nodes
+                .iter()
+                .map(|node| {
+                    node.lock()
+                        .unwrap()
+                        .delegated_coding_jobs_for_test()
+                        .unwrap()
+                        .into_iter()
+                        .map(|job| (job.plan.value.attempt_id, job.state, job.error))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            panic!(
+                "offline spare renewal stalled: coverage={coverage_error:?}, offline={:?}, replacement={:?}, launches={launches:?}, activations={activations:?}, groups={groups:?}, delegated={delegated:?}, workers={:?}",
+                nodes[first_spare].lock().unwrap().keys().node_id(),
+                replacement.value.attempt_id,
+                second_coding_tasks
+                    .iter()
+                    .map(|task| task.is_finished())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        coverage.unwrap().unwrap();
         for task in second_coding_tasks {
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
         }
-        for client in &clients {
-            client.shutdown().await.unwrap();
+        for (index, client) in clients.iter().enumerate() {
+            if !offline_spare || index != first_spare {
+                client.shutdown().await.unwrap();
+            }
         }
-        for task in network_tasks {
-            task.await.unwrap().unwrap();
+        for (index, task) in network_tasks.into_iter().enumerate() {
+            if !offline_spare || index != first_spare {
+                task.await.unwrap().unwrap();
+            }
         }
         drop(clients);
         drop(nodes);
-        let nodes = open_nodes();
+        let nodes = if offline_spare {
+            vec![Arc::new(Mutex::new(
+                Node::open(temp.path().join("node-0"), seeds[0].clone()).unwrap(),
+            ))]
+        } else {
+            open_nodes()
+        };
         assert_eq!(
             nodes[0]
                 .lock()
@@ -25698,6 +25789,16 @@ mod tests {
         );
         node.validate_variable_checkpoint_coverage(&second_checkpoint, false)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn uncovered_activations_unblock_live_checkpoint_wait() {
+        uncovered_activations_unblock_live_checkpoint_wait_fixture(false).await;
+    }
+
+    #[tokio::test]
+    async fn offline_first_spare_renews_live_checkpoint_coverage() {
+        uncovered_activations_unblock_live_checkpoint_wait_fixture(true).await;
     }
 
     #[tokio::test]
