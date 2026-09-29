@@ -85,7 +85,11 @@ source-only review of the unchanged code found that early holder abort can
 leave retired READY parity after Forget (M5-132), and the required
 three-member negative-result production/reopen regression is absent (M5-133).
 Those corrections and the complete local M5-134 gate passed on exact code
-source `a7da0ce`. Milestone 5 is closed and Milestone 6 is next.
+source `a7da0ce`. A later source-only review found that post-Forget cleanup
+can delete READY information reused by a verified successor (M5-135), and
+ordinary lifecycle Forget can leave completed-group parity without cleanup
+ownership (M5-136). Milestone 5 is reopened for those corrections and the
+M5-137 local gate; Milestone 6 waits.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and
@@ -896,9 +900,11 @@ architecture and real data/network path; do not build a parallel replacement to
 integrate later. Pause for a focused source, runtime, security, and usability
 review at every gate before committing the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 5 have passed. M5-132 and M5-133
+**Current position:** Milestones 0 through 4 have passed. M5-132 and M5-133
 were corrected on `a7da0ce`, and the complete local M5-134 gate passed on that
-exact code source. Milestone 6 is next.
+exact code source. Source-only review found M5-135 and M5-136; Milestone 5 is
+reopened for those fixes and the M5-137 exact-source local gate. Milestone 6
+waits. M5-134 remains historical evidence for its exercised cases.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
@@ -2060,7 +2066,7 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (passed)
+### Milestone 5 — efficient and flexible data/guild protocol (reopened; M5-135/M5-136 pending)
 
 The historical source-only review through `a6b5d7d` found three blockers in
 the recently changed coding ownership and cleanup paths. A replayable negative
@@ -2210,8 +2216,23 @@ tests, Docker lab safety, and all 24 fresh disposable 8 GiB Btrfs/network
 acceptance invocations passed. An independent audit confirmed cleanup of the
 owned image, mounts, loop devices, namespaces, links, forwarding, firewall
 rules and processes. Exact results and logs are in TODO.md. All builds and
-runs were local; no remote server was used. M5-134 closes Milestone 5 and
-Milestone 6 is next.
+runs were local; no remote server was used. M5-134 closed Milestone 5 at that
+time; the source-only review below reopens it.
+
+Source-only review of the unchanged `a7da0ce` code found two cleanup blockers.
+An old attempt's post-Forget cleanup deletes READY information by attempt ID
+even when a verified successor reuses that same sector; it can leave a stale
+volume receipt and remove the successor's readable shard when the source
+recipe is unavailable (M5-135). Separately, ordinary lifecycle Retire and
+Forget do not create an abort or holder cleanup obligation for a successfully
+completed group. Garbage collection considers a redundant group with still-live
+sectors live while it is retained, then loses it as an input after Forget, so
+its READY parity and receipt can survive later checkpoints (M5-136). Preserve
+live information and make every Forget own parity cleanup, then pass the
+focused regressions and complete exact-source local M5-137 gate in TODO.md.
+Milestone 5 is reopened and Milestone 6 waits. This
+review ran no builds, tests, daemons or runtime probes; M5-134 remains passing
+historical evidence for `a7da0ce`.
 
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
 launch-expiry regressions found duplicate same-lane successors. Renewal now

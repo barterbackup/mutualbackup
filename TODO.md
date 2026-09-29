@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (completed by M5-134, 2026-09-29)
+## Milestone 5 guild geometry and coding protocol (reopened by source review, 2026-09-29)
 
 The historical source-only review of the Milestone 5 changes through `a6b5d7d`
 found three blockers: negative verifier evidence could terminate retry
@@ -592,8 +592,11 @@ its exercised cases, but it did not cover those schedules. The corrections and
 regressions were committed through `39a99e7`, and the complete local M5-131
 gate passed on that exact source. A source-only review of the unchanged code
 found M5-132 and M5-133 below. Their corrections passed the complete local
-M5-134 gate on exact code source `a7da0ce`; Milestone 5 is closed and Milestone
-6 is next. M5-131 remains passing historical evidence for its exercised cases.
+M5-134 gate on exact code source `a7da0ce`. A source-only review of that code
+found M5-135 and M5-136 below, so Milestone 5 is reopened and Milestone 6
+waits. M5-134 remains passing evidence for its exercised cases; this review
+ran no builds, tests, daemons or runtime probes. M5-131 remains passing
+historical evidence for its exercised cases.
 M5-122 and M5-114 remain historical evidence for their exact source trees.
 
 M5-116/M5-117 implementation update (2026-09-26): acknowledged retry parents
@@ -3660,8 +3663,59 @@ node Clippy gate passed locally. No remote compilation server was used.
   `/tmp/mutualbackup-m5-134-docker-safety.log`,
   `/tmp/mutualbackup-m5-134-provisioned-v2.log`, and
   `/tmp/mutualbackup-m5-134-cleanup-audit.log`. All compilation and execution
-  were local, with no remote compilation server. Milestone 5 is closed;
-  Milestone 6 is next. M5-131 remains historical evidence for `39a99e7`.
+  were local, with no remote compilation server. This gate closed Milestone 5
+  at that time; the source-only review below reopens it. M5-131 remains
+  historical evidence for `39a99e7`.
+
+- [ ] **M5-135 / P1 — Preserve live READY information when retiring an old
+  attempt.** The M5-132 cleanup records obligations for information owners as
+  well as parity holders (`node.rs:7276-7306`). A successor can keep the same
+  information sector while changing parity placement (`node.rs:6815-6853`),
+  and explicitly reuses its existing READY information object without taking
+  ownership of the old attempt (`node.rs:5399-5414`, `:5502-5518`,
+  `:7124-7140`). Once the old group is forgotten, the holder cleanup worker
+  calls `discard_coding_attempt` (`network/p2p.rs:6096-6117`), which invokes
+  `discard_attempt` (`node.rs:7206-7248`). That scans every online volume and
+  deletes all objects with the old attempt ID, including READY information
+  used by the successor (`volume.rs:1105-1140`,
+  `crates/mb-store/src/database.rs:2286-2307`). The old attempt receipts were
+  finalized before Forget, so the information `volume-receipt` can remain
+  pointing at a deleted object; only old parity gets explicit receipt cleanup
+  (`node.rs:7220-7248`). If the source recipe is unavailable,
+  `variable_shard_for_guild` can no longer serve that verified successor's
+  information shard (`node.rs:7420-7464`). Make post-Forget cleanup distinguish
+  retired parity from information still live in a successor or checkpoint, and
+  keep object and receipt state consistent. Regress an activated successor
+  reusing an old READY information shard through old-group Forget and cleanup,
+  with the source recipe unavailable, then verify shard reads and repeated
+  reopen. This review was source-only.
+
+- [ ] **M5-136 / P1 — Give routinely forgotten groups a parity cleanup
+  owner.** The new holder-local obligation is created by attempt abort
+  (`node.rs:7206-7228`), but ordinary lifecycle retirement and forgetting
+  only commit guild events (`network/p2p.rs:8490-8719`, `:8722-8775`); a
+  successfully completed activation need not receive an abort. The lifecycle
+  retires a redundant group when another group covers its still-live sectors,
+  then forgets it. Before Forget, garbage collection regards that group's
+  still-live sectors as making it live; after Forget the group is absent from
+  dynamic state, the only input from which variable-group garbage candidates
+  are derived (`node.rs:9388-9406`, `:9530-9594`). Its READY parity and
+  volume receipt can therefore remain allocated indefinitely, even across
+  later checkpoints. A later attempt with the same geometry also meets that
+  old READY row under the same group ID and cannot stage a different attempt
+  over it (`crates/mb-store/src/database.rs:2120-2153`). Persist cleanup
+  ownership for every certified Forget, including completed groups, and
+  remove old parity only after each holder has installed Forget; preserve
+  information shared by live groups. Regress
+  a completed Add, redundant Retire, Forget, delayed holder sync, parity
+  removal and repeated reopen. This review was source-only.
+
+- [ ] **M5-137 / gate — Recheck Milestone 5 after M5-135 and M5-136.** Review
+  both cleanup paths and pass focused live-information retention, ordinary
+  lifecycle Forget, delayed-holder and repeated-reopen regressions. Then run
+  the complete local exact-source workspace, Docker safety, fresh disposable
+  Btrfs/network acceptance and independent resource-cleanup gate before
+  closing Milestone 5. Keep M5-134 as historical evidence for `a7da0ce`.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
