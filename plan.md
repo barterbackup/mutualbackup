@@ -88,8 +88,11 @@ Those corrections and the complete local M5-134 gate passed on exact code
 source `a7da0ce`. A later source-only review found that post-Forget cleanup
 can delete READY information reused by a verified successor (M5-135), and
 ordinary lifecycle Forget can leave completed-group parity without cleanup
-ownership (M5-136). Milestone 5 is reopened for those corrections and the
-M5-137 local gate; Milestone 6 waits.
+ownership (M5-136). M5-135/M5-136/M5-138 were corrected in `9da97eb`, and
+the M5-137 local gate passed on `666697a`. A source-only review of `0000d9d`
+found M5-139 through M5-142 in same-ID volume receipts, historical Add replay,
+pending information retention, and partial repair cleanup. Milestone 5 is
+reopened for these corrections and M5-143; Milestone 6 waits.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and
@@ -2066,7 +2069,7 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (closed at M5-137)
+### Milestone 5 — efficient and flexible data/guild protocol (reopened after M5-137)
 
 The historical source-only review through `a6b5d7d` found three blockers in
 the recently changed coding ownership and cleanup paths. A replayable negative
@@ -2269,8 +2272,26 @@ iptables timestamp/counter changes and veth links still settling after
 namespace teardown; a later independent audit confirmed the owned image and
 processes gone and mounts, loops, namespaces, links, forwarding and firewall
 rules restored to baseline. Exact results and logs are in TODO.md. Compilation
-and execution were local, with no remote server. Milestone 5 is closed;
-Milestone 6 is next. M5-134 remains historical evidence for `a7da0ce`.
+and execution were local, with no remote server. This gate closed Milestone 5
+at that time. M5-134 remains historical evidence for `a7da0ce`.
+
+A source-only review of `0000d9d` reopened Milestone 5. A same-ID successor
+can stage on another volume, become READY before its active receipt can replace
+the old one, and then be stranded when old-attempt cleanup removes the old
+object but retains its stale receipt (M5-139). Event-tail catch-up fetches
+transcripts only by group ID; after a same-ID re-Add, a lagging peer can use
+the successor transcript for the earlier Add and, when it is the successor's
+delegator or coding coordinator, schedule an abort of that successor at the
+earlier Forget (M5-140). A remote information holder without a local coding
+job has no durable pending-plan GC pin between activation and Add, so a queued
+candidate can delete its READY information after unrelated checkpoint advances
+if no current checkpoint or retained group names that sector (M5-141). Partial
+cleanup of repaired parity can delete its object before finalizing the repair
+attempt receipt, losing the row from which the current retry path discovers it
+(M5-142). Fix these paths, add focused crash/reopen and delayed-event
+regressions, and pass the complete exact-source local M5-143 gate before
+closing Milestone 5. M5-137 remains passing historical evidence for its tested
+source; this review ran no builds, tests, daemons, or runtime probes.
 
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
 launch-expiry regressions found duplicate same-lane successors. Renewal now

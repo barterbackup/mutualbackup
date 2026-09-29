@@ -3745,8 +3745,8 @@ node Clippy gate passed locally. No remote compilation server was used.
   `/tmp/mutualbackup-m5-137-docker-safety-v2.log`,
   `/tmp/mutualbackup-m5-137-provisioned.log`, and
   `/tmp/mutualbackup-m5-137-cleanup-audit-final.log`. All compilation and
-  execution were local; no remote compilation server was used. Milestone 5 is
-  closed. M5-134 remains historical evidence for `a7da0ce`.
+  execution were local; no remote compilation server was used. This gate closed
+  Milestone 5 at that time. M5-134 remains historical evidence for `a7da0ce`.
 
 - [x] **M5-138 / P1 — Clean repaired parity after ordinary Forget.** Source-only
   review of the current uncommitted M5-135/M5-136 changes found that a parity
@@ -3770,6 +3770,66 @@ node Clippy gate passed locally. No remote compilation server was used.
   different evidence. Object and repair receipts are removed together. The
   repair/Forget regression now checks receipts and two reopens without manual
   GC setup. Focused tests and the full M5-137 gate passed on `666697a`.
+
+- [ ] **M5-139 / P1 — Transfer same-ID successor receipts across volumes.**
+  A successor may stage on less-used volume B while the old group's active
+  receipt points to A (`volume.rs:780-829`, `:878-902`). Activation makes B's
+  row READY before rejecting A's conflicting receipt (`volume.rs:1090-1141`).
+  Delayed old-attempt cleanup removes A, sees the newer READY row on B, retains A's
+  receipt, and reports completion (`volume.rs:693-741`). Reads then follow the
+  removed A row, and activation retries keep failing. The existing same-ID
+  regression uses one volume and cleans the old attempt before staging its
+  successor (`node.rs:17261-17321`). Make receipt handoff and old cleanup
+  atomic or replayable across volumes. Regress two-volume delayed cleanup,
+  successor activation/read with the source unavailable, and repeated reopen.
+
+- [ ] **M5-140 / P1 — Bind historical Add replay and Forget cleanup to the
+  original attempt.** After old Forget, a same-ID successor overwrites the
+  group-key transcript (`node.rs:3083-3117`), but event-tail catch-up fetches
+  evidence for an earlier Add by group ID alone (`network/p2p.rs:9015-9027`,
+  `:9093-9107`). Event installation accepts a replayable transcript with the
+  same group, without binding it to that Add's attempt (`node.rs:3054-3068`).
+  The earlier Forget then schedules cleanup using the successor's plan
+  (`node.rs:2953-3025`). If the lagging peer is that successor's delegator or
+  coding coordinator, it can send an abort to a holder that activated the
+  successor but has not installed its Add; that abort deletes READY parity
+  (`node.rs:7274-7345`, `network/p2p.rs:6128-6130`). Preserve event-bound
+  historical evidence and cleanup lineage. Regress a lagging peer across old
+  Add, Forget, and same-ID re-Add while successor Add dissemination is delayed,
+  including holder cleanup and reopen.
+
+- [ ] **M5-141 / P1 — Pin information on remote holders between activation
+  and Add.** A remote information holder without a local coding job persists
+  the activated transcript but has no launch/activation/retry job
+  (`network/p2p.rs:7983-7993`, `node.rs:7154-7162`, `:9481-9524`). If neither
+  its current checkpoint nor a retained group names sector S, an existing
+  `gc-variable-sector` candidate can mature at the next checkpoint while
+  successor Add is delayed; collection
+  removes the READY object and receipt (`node.rs:9858-9878`, `:9921-9942`).
+  Add can subsequently install without restoring S. Keep a durable holder-side
+  pin for a verified pending activation until Add or terminal cleanup. Regress
+  a pending reused sector with a matured candidate, delayed Add, source loss,
+  and reopen. Current-checkpoint and retained-group references already pin S.
+
+- [ ] **M5-142 / P2 — Finish repaired-parity receipts after partial cleanup.**
+  Repair can leave old volume A in `volume-copy-cleanup` while its READY copy
+  and repair attempt receipt are on B (`volume.rs:1318-1361`,
+  `node.rs:8031-8066`).
+  Old-group cleanup removes B's row, but finalizes the discovered repair
+  attempt only after all volumes complete (`volume.rs:680-734`). If A is
+  offline, or cleanup stops after `GarbageObjectRemoved`, retry no longer sees
+  B's row and does not rediscover the repair ID; the receipt remains after the
+  cleanup obligation completes. Reconcile does not process attempt receipts
+  (`volume.rs:1481-1525`). Persist receipt-cleanup progress across partial
+  passes, and regress offline/restore plus interruption and repeated reopen.
+
+- [ ] **M5-143 / gate — Recheck Milestone 5 after M5-139 through M5-142.**
+  Review the corrected receipt, event-replay, information-GC, and repair paths
+  with focused regressions. Then run the complete local exact-source workspace,
+  Docker safety, fresh disposable Btrfs/network acceptance, and independent
+  resource-cleanup gate before closing Milestone 5. This source-only review of
+  `0000d9d` ran no builds, tests, daemons, or runtime probes. M5-137 remains
+  historical passing evidence for its exact committed source.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
