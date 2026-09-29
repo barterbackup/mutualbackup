@@ -94,8 +94,13 @@ found M5-139 through M5-142 in same-ID volume receipts, historical Add replay,
 pending information retention, and partial repair cleanup. The corrections
 are implemented in `123d5af`, `3419415`, `366e9e5`, and `7392e6d`. The
 complete local M5-143 gate passed on exact committed code source
-`8f60298a74b74fbef8b92b4eb6a00a92385e7a37`, closing Milestone 5.
-Milestone 6 is next.
+`8f60298a74b74fbef8b92b4eb6a00a92385e7a37`, closing Milestone 5 at that
+point. A source-only review of `6606cc1` found M5-144 through M5-148:
+variable-profile shards are stranded by volume drain; cold recovery and legacy
+Forget can each lose historical Add evidence; a certified Add does not bind
+its exact verifier attempt against a wrong but replay-valid peer response; and
+stale abort leaves virtual-zero-only activation pins. Milestone 5 is reopened
+for these corrections and a new exact-source gate; Milestone 6 waits.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and
@@ -2310,6 +2315,23 @@ Docker safety and all 24 fresh disposable Btrfs/network acceptance invocations
 passed locally on `8f60298`. An independent audit confirmed resource cleanup
 after the immediate snapshot differed only in iptables timestamps and counters.
 M5-143 passed and Milestone 5 is closed; exact results and logs are in TODO.md.
+
+The subsequent source-only review of `6606cc1` reopened Milestone 5. Public
+volume drain currently migrates only format-1 objects and can retire a volume
+with READY variable-profile shards while deleting their receipts (M5-144).
+Seed-only recovery keeps complete event history but retains transcripts only
+for live groups, so its recovered node cannot serve a forgotten Add to a
+lagging member (M5-145). An upgraded pre-binding store similarly loses an
+unambiguous old Add transcript when Forget removes the retained fallback
+without backfilling its event record (M5-146). Event-tail installation still
+accepts any replay-valid same-group transcript from the first responding peer
+because certified Add does not name the verifier attempt (M5-147). Finally,
+virtual-zero-only owners activated before Add are omitted from stale abort and
+keep durable pending pins (M5-148). Correct these paths, review the resulting
+source, and rerun the complete local exact-source workspace, Docker safety,
+fresh disposable Btrfs/network and independent resource-cleanup gate before
+closing Milestone 5. M5-143 remains passing evidence for its exact prior
+source; this review ran no builds, tests, daemons or runtime probes.
 
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
 launch-expiry regressions found duplicate same-lane successors. Renewal now

@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (closed after M5-143, 2026-09-29)
+## Milestone 5 guild geometry and coding protocol (reopened by source review, 2026-09-29)
 
 The historical source-only review of the Milestone 5 changes through `a6b5d7d`
 found three blockers: negative verifier evidence could terminate retry
@@ -3864,7 +3864,78 @@ node Clippy gate passed locally. No remote compilation server was used.
   `/tmp/mutualbackup-m5-143-provisioned.log`, and
   `/tmp/mutualbackup-m5-143-independent-audit.log`. All compilation and
   execution were local; no remote compilation server was used. Milestone 5
-  is closed. M5-137 remains historical evidence for its earlier source.
+  was closed at that point. This source-only review of `6606cc1` found
+  M5-144 through M5-148 below and reopened it. M5-143 and M5-137 remain
+  historical passing evidence for their exact tested sources.
+
+- [ ] **M5-144 / P1 — Migrate variable-profile READY shards before retiring a volume.**
+  The public drain/migrate path reaches `StorageVolumes::migrate_draining`
+  without a variable-shard guard (`node.rs:2112-2120`). Its only drain
+  iterator, `ParityStore::first_ready_object`, selects `format_version = 1`
+  (`database.rs:1755-1771`; `volume.rs:1735-1742`). A volume containing only
+  READY format-2 information or parity therefore reports zero moved objects;
+  retirement deletes its active receipts and closes the store while those
+  shards remain on it (`volume.rs:1798-1804`, `:1915-1938`). Subsequent
+  variable reads require that missing receipt (`volume.rs:1405-1427`), and the
+  volume is reported safe to remove. Include format-2 objects in a durable
+  cross-volume migration or refuse retirement while any remain. Regress a
+  two-volume format-2 shard, interrupted migration, repeated reopen, source
+  removal, and successful recovery from the destination.
+
+- [ ] **M5-145 / P1 — Preserve forgotten-Add evidence during seed recovery.**
+  Cold dynamic recovery fetches transcripts only for currently retained
+  groups (`network/p2p.rs:10080-10097`). Adoption stores all historical guild
+  events but writes `coding-event-transcript` only for those retained groups
+  (`node.rs:2581-2600`, `:2631-2670`). A seed-recovered peer can consequently
+  serve an Add/Retire/Forget event tail but cannot serve the transcript for the
+  forgotten Add; event-tail sync requires that evidence before advancing
+  (`network/p2p.rs:9047-9065`, `:9122-9162`). If it is the only available
+  source, an honest lagging member remains stuck before that Add and all later
+  events. Recover and validate historical Add bindings needed for tail service,
+  or provide another sound replay path. Regress a cold-recovered sole source
+  and a lagging member crossing a forgotten Add and later events.
+
+- [ ] **M5-146 / P1 — Backfill a legacy retained Add binding before Forget.**
+  A pre-M5-140 store has a retained group transcript but no event-keyed
+  transcript. The new lookup can use that group-key record while the Add is
+  retained (`node.rs:12282-12299`), and Forget loads it successfully
+  (`node.rs:3008-3036`). Forget then commits the new state and cleanup without
+  persisting the old Add's event-keyed binding (`node.rs:3043-3092`). Once the
+  group is forgotten, the fallback rejects the same Add even before a same-ID
+  successor arrives, blocking lagging event-tail catch-up. Atomically preserve
+  the unambiguous original binding during Forget; regress upgrade from a
+  pre-binding retained Add, Forget, same-ID re-Add and lagging catch-up.
+
+- [ ] **M5-147 / P1 — Certify the Add event's exact verifier attempt.**
+  `AddCodingGroup` signs only the group (`guild.rs:135-137`), and the group ID
+  excludes attempt identity (`model.rs:278-296`, `:420-433`). A later same-ID
+  attempt can have another replay-valid transcript. Event-tail catch-up takes
+  the first peer response whose transcript verifies and names that group
+  (`network/p2p.rs:2052-2083`, `:9122-9162`), while installation checks only
+  replay and group equality (`node.rs:3136-3150`). A guild peer can return the
+  successor transcript for an earlier certified Add; the lagging node accepts
+  the wrong lineage and its earlier Forget can abort successor shards. A
+  source-local event-keyed record does not prove this binding to the receiver.
+  Commit the transcript or attempt hash in certified Add authority and verify
+  it on catch-up, recovery and Forget. Regress a replay-valid wrong-attempt
+  response preceding the correct source.
+
+- [ ] **M5-148 / P2 — Clear orphan pending activation pins.**
+  Activation contacts every information owner, including virtual-zero-only
+  owners (`network/p2p.rs:8006-8025`), and writes their durable
+  `coding-pending-activation` record before recognizing the zero role
+  (`node.rs:7284-7311`). If membership or placement changes before Add, stale
+  activation cleanup runs, but its abort holder set excludes virtual-zero
+  owners (`network/p2p.rs:6505-6549`, `:7830-7837`). No Add or abort then
+  removes their records, which accumulate and keep every nonzero sector ID in
+  each abandoned plan in the GC live set (`node.rs:9646-9651`). The method
+  also writes a pin before checking for any local role, so an activation sent
+  to a non-holder returns an error but leaves a record (`node.rs:7382-7384`).
+  Include every activated holder in terminal cleanup and validate the local
+  role before persisting a pin. Regress stale abort, checkpoint GC and repeated
+  reopen for a virtual-zero-only owner, plus rejected non-holder activation.
+  This review ran no builds, tests, daemons or runtime probes; M5-143's
+  passing gate remains evidence for its exercised cases.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
