@@ -2066,7 +2066,7 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (reopened; M5-135/M5-136 pending)
+### Milestone 5 — efficient and flexible data/guild protocol (closed at M5-137)
 
 The historical source-only review through `a6b5d7d` found three blockers in
 the recently changed coding ownership and cleanup paths. A replayable negative
@@ -2257,6 +2257,20 @@ same-ID successor, and repeated-reopen regressions passed locally, as did
 strict workspace Clippy. Milestone 5 stays open until M5-137's complete
 exact-source local workspace, Docker, disposable Btrfs/network and resource
 cleanup gate passes on committed code.
+
+M5-137 passed on clean committed code
+`666697aafca6a93cd76c0f54da47c7db4f8edf4a`. The full locked all-target
+workspace run passed, including 294 node tests and 11 expected ignored cases;
+formatting, strict workspace Clippy and Docker lab safety passed. All 24 fresh
+local 8 GiB Btrfs/network acceptance invocations passed, including full-width
+and repeated multi-owner QUIC backups and five-daemon seed/DHT recovery over
+direct, hole-punched and relay paths. The immediate resource snapshot saw
+iptables timestamp/counter changes and veth links still settling after
+namespace teardown; a later independent audit confirmed the owned image and
+processes gone and mounts, loops, namespaces, links, forwarding and firewall
+rules restored to baseline. Exact results and logs are in TODO.md. Compilation
+and execution were local, with no remote server. Milestone 5 is closed;
+Milestone 6 is next. M5-134 remains historical evidence for `a7da0ce`.
 
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
 launch-expiry regressions found duplicate same-lane successors. Renewal now

@@ -3692,7 +3692,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   source checkpoint: old-attempt cleanup retains READY information and its
   active receipt, and GC pins retained or pending successor information.
   Source-unavailable successor and repeated-reopen regressions passed locally;
-  the complete M5-137 gate remains pending.
+  the complete M5-137 gate passed on committed code `666697a`.
 
 - [x] **M5-136 / P1 — Give routinely forgotten groups a parity cleanup
   owner.** The new holder-local obligation is created by attempt abort
@@ -3716,14 +3716,37 @@ node Clippy gate passed locally. No remote compilation server was used.
   M5-135/M5-136/M5-138 source checkpoint: certified Forget atomically records
   holder cleanup obligations, and local cleanup waits for that holder's own
   Forget. The ordinary completed-group/delayed-holder network regression and
-  repeated-reopen checks passed locally; M5-137 remains pending.
+  repeated-reopen checks passed locally; M5-137 passed on `666697a`.
 
-- [ ] **M5-137 / gate — Recheck Milestone 5 after M5-135 and M5-136.** Review
+- [x] **M5-137 / gate — Recheck Milestone 5 after M5-135 and M5-136.** Review
   both cleanup paths and pass focused live-information retention, ordinary
   lifecycle Forget, delayed-holder and repeated-reopen regressions. Then run
   the complete local exact-source workspace, Docker safety, fresh disposable
   Btrfs/network acceptance and independent resource-cleanup gate before
-  closing Milestone 5. Keep M5-134 as historical evidence for `a7da0ce`.
+  closing Milestone 5. Passed on clean committed code
+  `666697aafca6a93cd76c0f54da47c7db4f8edf4a` (source implementation
+  `9da97eb`, fixture shutdown stabilization `666697a`). Focused M5-135,
+  M5-136, M5-138, same-group-ID successor, offline/online spare and repeated
+  reopen regressions passed. Exact-source formatting, strict locked all-target
+  workspace Clippy, Docker lab safety and the complete locked all-target
+  workspace tests passed locally (node suite: 294 passed, 11 expected ignored).
+  A fresh local 8 GiB Btrfs image mounted with `user_subvol_rm_allowed` passed
+  all 24 `reflink-acceptance.sh` invocations: full-width QUIC backup (75.21s),
+  repeated multi-owner QUIC backup (556.70s), and five-daemon seed/DHT
+  recovery across direct, hole-punched and relay paths (2157.21s). The first
+  immediate resource snapshot differed only in changing iptables timestamps
+  and packet counters plus three transient veth links during namespace teardown.
+  A subsequent independent audit found the owned image root gone, 31 baseline
+  mounts, no loops or namespaces, the two baseline links, forwarding restored
+  to zero, and no owned firewall chains or processes. Logs:
+  `/tmp/mutualbackup-m5-137-workspace-v2.log`,
+  `/tmp/mutualbackup-m5-137-format.log`,
+  `/tmp/mutualbackup-m5-137-clippy.log`,
+  `/tmp/mutualbackup-m5-137-docker-safety-v2.log`,
+  `/tmp/mutualbackup-m5-137-provisioned.log`, and
+  `/tmp/mutualbackup-m5-137-cleanup-audit-final.log`. All compilation and
+  execution were local; no remote compilation server was used. Milestone 5 is
+  closed. M5-134 remains historical evidence for `a7da0ce`.
 
 - [x] **M5-138 / P1 — Clean repaired parity after ordinary Forget.** Source-only
   review of the current uncommitted M5-135/M5-136 changes found that a parity
@@ -3746,7 +3769,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   of the old group while preserving a successor with the same group ID and
   different evidence. Object and repair receipts are removed together. The
   repair/Forget regression now checks receipts and two reopens without manual
-  GC setup. Focused tests and strict Clippy passed; M5-137 remains pending.
+  GC setup. Focused tests and the full M5-137 gate passed on `666697a`.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
