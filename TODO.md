@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (reopened by source review, 2026-09-28)
+## Milestone 5 guild geometry and coding protocol (completed by M5-134, 2026-09-29)
 
 The historical source-only review of the Milestone 5 changes through `a6b5d7d`
 found three blockers: negative verifier evidence could terminate retry
@@ -591,8 +591,9 @@ through M5-130 and reopened Milestone 5. M5-127 remains passing evidence for
 its exercised cases, but it did not cover those schedules. The corrections and
 regressions were committed through `39a99e7`, and the complete local M5-131
 gate passed on that exact source. A source-only review of the unchanged code
-found M5-132 and M5-133 below, so Milestone 5 is reopened and Milestone 6 waits.
-M5-131 remains passing evidence for the cases it exercised.
+found M5-132 and M5-133 below. Their corrections passed the complete local
+M5-134 gate on exact code source `a7da0ce`; Milestone 5 is closed and Milestone
+6 is next. M5-131 remains passing historical evidence for its exercised cases.
 M5-122 and M5-114 remain historical evidence for their exact source trees.
 
 M5-116/M5-117 implementation update (2026-09-26): acknowledged retry parents
@@ -3588,7 +3589,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   Milestone 5 at the time on its exact code source; the source-only review
   below reopens it. M5-127 remains historical evidence for `e09a13f`.
 
-- [ ] **M5-132 / P1 — Retain post-Forget cleanup ownership for retired READY
+- [x] **M5-132 / P1 — Retain post-Forget cleanup ownership for retired READY
   parity.** A retired activation with a usable spare aborts its holders while
   the old group is still retained. `discard_coding_attempt` treats any retained
   group, including a retired one, as successful abort after only finalizing
@@ -3607,9 +3608,17 @@ node Clippy gate passed locally. No remote compilation server was used.
   holder cleanup obligation until forgetting is observed and deletion is
   acknowledged, or make Forget reliably schedule equivalent deletion on each
   holder. Regress the spare-placement path through Retire, successor creation,
-  Forget, delayed holder sync, parity removal, and repeated reopen.
+  Forget, delayed holder sync, parity removal, and repeated reopen. `a7da0ce`
+  records a holder-local durable cleanup obligation before finalizing any
+  retained group's attempt receipts, including when the holder has not yet
+  received Retire. Its cleanup worker waits for that holder's Forget, then
+  removes READY parity and clears the obligation; a successful early local
+  abort at the delegator no longer erases the obligation. The spare-placement
+  regression now activates real READY parity and checks successor coverage,
+  local and remote obligations, delayed holder Forget, removal and two reopens.
+  The M5-134 exact-source gate passed.
 
-- [ ] **M5-133 / P1 — Exercise three-member negative-evidence rotation through
+- [x] **M5-133 / P1 — Exercise three-member negative-evidence rotation through
   the production worker.** M5-130 explicitly required a three-domain
   production-worker and reopen regression. The committed
   `three_member_negative_activation_rotates_verifier_into_coder` test only
@@ -3620,16 +3629,39 @@ node Clippy gate passed locally. No remote compilation server was used.
   (`network/p2p.rs:25471-25750`). Add the missing three-member worker path
   with holder cleanup, renewed attempt, verified coverage and repeated reopen;
   confirm the fallback works after an actual negative result rather than only
-  when queried directly.
+  when queried directly. `a7da0ce` extends the three-member regression with a
+  real encrypted source sector and checkpoint, staged bad parity, negative
+  activation cleanup, a renewed signed plan, production coding workers,
+  verified checkpoint coverage and two reopens. The M5-134 gate passed.
 
-- [ ] **M5-134 / gate — Recheck Milestone 5 after M5-132 and M5-133.** Review
+- [x] **M5-134 / gate — Recheck Milestone 5 after M5-132 and M5-133.** Review
   both corrections and pass focused retained-group cleanup, delayed Forget,
   three-member negative-evidence, backup coverage and reopen regressions.
   Then run the complete local exact-source workspace, Docker safety,
   disposable Btrfs/network acceptance and independent resource-cleanup gate.
-  Record the code commit and results. This source-only review ran no builds,
-  tests, daemons or runtime probes; M5-131 remains historical evidence for
-  `39a99e7` and does not close the newly found schedules.
+  Record the code commit and results. Passed on clean committed code source
+  `a7da0ceb81ee1fa9c82dc3c7b9e7ee12998d684c`. Focused three-member
+  negative activation, spare-placement cleanup, offline first spare, and
+  three- and five-domain full-width regressions passed locally. Formatting,
+  strict locked all-target workspace Clippy, and Docker lab safety passed.
+  The first workspace run hit the shell's 1,024-file-descriptor limit in three
+  parallel network tests; the unchanged source passed the complete locked
+  all-target workspace run with a local soft limit of 8,192 (node suite: 293
+  passed, 11 expected ignored). The first disposable Btrfs run exposed a mount
+  setup omission: unprivileged subvolume deletion needs
+  `user_subvol_rm_allowed`. A second fresh local 8 GiB image with that option
+  passed all 24 `reflink-acceptance.sh` invocations. Full-width backup commit
+  passed in 89.10 seconds, repeated multi-owner QUIC in 806.09 seconds, and
+  five-daemon seed/DHT recovery with direct, hole-punched and relay paths in
+  2484.54 seconds. The runner reported acceptance and cleanup result zero. An
+  independent audit matched the pre-run baseline for mounts, loop devices,
+  namespaces, links, forwarding and firewall rules; no owned image root or
+  process remained. Logs: `/tmp/mutualbackup-m5-134-workspace-v2.log`,
+  `/tmp/mutualbackup-m5-134-docker-safety.log`,
+  `/tmp/mutualbackup-m5-134-provisioned-v2.log`, and
+  `/tmp/mutualbackup-m5-134-cleanup-audit.log`. All compilation and execution
+  were local, with no remote compilation server. Milestone 5 is closed;
+  Milestone 6 is next. M5-131 remains historical evidence for `39a99e7`.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
