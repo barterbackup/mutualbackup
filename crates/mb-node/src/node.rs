@@ -2932,6 +2932,12 @@ impl Node {
                 self.persist_coding_group_transcript(&transcript)?;
                 self.volumes.finalize_attempt(&self.control, &attempt_id)?;
             }
+            if matches!(
+                certified.event.kind,
+                mb_core::GuildEventKind::ForgetCodingGroup { .. }
+            ) {
+                self.reconcile_garbage_collection()?;
+            }
             return Ok(());
         }
         if let Some(existing) = self.control.get_record("guild-event", &record_id)?
@@ -2944,6 +2950,23 @@ impl Node {
             mb_core::GuildEventKind::RemoveMember { .. }
                 | mb_core::GuildEventKind::RelabelMember { .. }
         );
+        let forgotten_group = if let mb_core::GuildEventKind::ForgetCodingGroup { group_id } =
+            &certified.event.kind
+        {
+            let retained = state
+                .coding_groups
+                .iter()
+                .find(|retained| retained.group.id == *group_id)
+                .context("forgotten coding group is absent from guild history")?;
+            let transcript = self.coding_transcript_for_group(state.guild_id, *group_id)?;
+            if transcript.value.manifest.value.group != retained.group {
+                anyhow::bail!("forgotten coding group has conflicting verifier evidence");
+            }
+            Some(transcript)
+        } else {
+            None
+        };
+        let is_forget = forgotten_group.is_some();
         state.apply_event(&certified)?;
         if invalidates_placement_audit {
             // Invalidate before committing the valid event so an interruption
@@ -2959,6 +2982,48 @@ impl Node {
                 canonical_bytes(&state)?,
             ),
         ];
+        if let Some(transcript) = forgotten_group {
+            let plan = transcript.value.plan.clone();
+            self.validate_coding_attempt_authority(&plan)?;
+            let parity_holders = transcript
+                .value
+                .manifest
+                .value
+                .group
+                .roles
+                .iter()
+                .filter_map(|role| match role {
+                    ShardRoleV2::Parity(parity) => Some(parity.holder),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            for holder in parity_holders {
+                // Only the original delegator/coder can ask another holder
+                // to abort a historical attempt. Every holder also keeps its
+                // own obligation once it installs Forget.
+                if holder != self.keys.node_id()
+                    && self.keys.node_id() != plan.value.delegator
+                    && self.keys.node_id() != plan.value.coding_coordinator
+                {
+                    continue;
+                }
+                let obligation = CodingHolderCleanupObligation {
+                    format_version: 1,
+                    plan: plan.clone(),
+                    holder,
+                };
+                let id = coding_holder_cleanup_id(&obligation);
+                let bytes = canonical_bytes(&obligation)?;
+                if self
+                    .control
+                    .get_record("coding-holder-cleanup", &id)?
+                    .is_some_and(|existing| existing != bytes)
+                {
+                    anyhow::bail!("forgotten coding group has conflicting cleanup ownership");
+                }
+                records.push(("coding-holder-cleanup".to_owned(), id, bytes));
+            }
+        }
         let attempt_id = transcript
             .as_ref()
             .map(|transcript| transcript.value.plan.value.attempt_id);
@@ -2979,6 +3044,9 @@ impl Node {
         self.control.put_records(&records)?;
         if let Some(attempt_id) = attempt_id {
             self.volumes.finalize_attempt(&self.control, &attempt_id)?;
+        }
+        if is_forget {
+            self.reconcile_garbage_collection()?;
         }
         Ok(())
     }
@@ -7227,15 +7295,42 @@ impl Node {
                 return Ok(true);
             }
         }
-        let mut complete = self.volumes.discard_attempt(&self.control, attempt_id)?;
+        let preserve_ready = transcript
+            .as_ref()
+            .map(|transcript| {
+                transcript
+                    .value
+                    .manifest
+                    .value
+                    .group
+                    .roles
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, role)| match role {
+                        ShardRoleV2::Information(information)
+                            if !information.sector.virtual_zero =>
+                        {
+                            Some((information.sector.id, index as u16))
+                        }
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let mut complete =
+            self.volumes
+                .discard_attempt(&self.control, attempt_id, &preserve_ready)?;
         if let Some(transcript) = &transcript {
             let group = &transcript.value.manifest.value.group;
+            let verification_hash = *blake3::hash(&canonical_bytes(transcript)?).as_bytes();
             for (index, role) in group.roles.iter().enumerate() {
                 if let ShardRoleV2::Parity(parity) = role
                     && parity.holder == self.keys.node_id()
                 {
-                    complete &= self.volumes.remove_unreachable(
+                    complete &= self.volumes.remove_unreachable_for_attempt(
                         &self.control,
+                        attempt_id,
+                        &verification_hash,
                         &group.id,
                         u8::try_from(index)
                             .context("coding parity index exceeds storage format")?,
@@ -9383,6 +9478,51 @@ impl Node {
             let input: BTreeMap<SectorId, PackedSectorDescriptor> = decode_canonical(&bytes)?;
             live_sectors.extend(input.keys().copied());
         }
+        // A pending successor may reuse READY information before its Add
+        // event is installed. Keep those sectors pinned across an unrelated
+        // checkpoint generation while cleanup of an older group is pending.
+        {
+            let mut pin_plan = |plan: &SignedRecord<CodingAttemptPlan>| {
+                if plan.value.geometry.guild_id == current.checkpoint.guild_id {
+                    live_sectors.extend(
+                        plan.value
+                            .geometry
+                            .information
+                            .iter()
+                            .filter(|role| !role.sector.virtual_zero)
+                            .map(|role| role.sector.id),
+                    );
+                }
+            };
+            for (_, bytes) in self.control.records("coding-launch-job")? {
+                let job: CodingLaunchJob = decode_canonical(&bytes)?;
+                pin_plan(&job.plan);
+            }
+            for (_, bytes) in self.control.records("coding-activation-job")? {
+                let job: CodingActivationJob = decode_canonical(&bytes)?;
+                if !job.complete {
+                    pin_plan(&job.transcript.value.plan);
+                }
+            }
+            for (_, bytes) in self.control.records("coding-retry-job")? {
+                let job: CodingRetryJob = decode_canonical(&bytes)?;
+                if !job.complete {
+                    pin_plan(&job.failure.value.plan);
+                    if let Some(retry_plan) = &job.retry_plan {
+                        pin_plan(retry_plan);
+                    }
+                }
+            }
+            for (_, bytes) in self.control.records("delegated-coding-job")? {
+                let job: DelegatedCodingJob = decode_canonical(&bytes)?;
+                if !matches!(
+                    job.state,
+                    DelegatedCodingJobState::Complete | DelegatedCodingJobState::Failed
+                ) {
+                    pin_plan(&job.plan);
+                }
+            }
+        }
         let mut live_groups = current
             .checkpoint
             .coding_groups
@@ -9393,20 +9533,52 @@ impl Node {
             .dynamic_guild_state()?
             .map(|state| state.coding_groups)
             .unwrap_or_default();
-        live_groups.extend(dynamic_groups.iter().filter_map(|retained| {
-            retained
-                .group
-                .roles
-                .iter()
-                .any(|role| {
-                    matches!(role, ShardRoleV2::Information(information)
-                        if !information.sector.virtual_zero
-                            && live_sectors.contains(&information.sector.id))
-                })
-                .then_some(retained.group.id)
+        let retained_group_ids = dynamic_groups
+            .iter()
+            .map(|retained| retained.group.id)
+            .collect::<BTreeSet<_>>();
+        // A retained group keeps its shards until Forget. A source sector may
+        // also be shared by another group even when no checkpoint names it.
+        live_groups.extend(retained_group_ids.iter().copied());
+        live_sectors.extend(dynamic_groups.iter().flat_map(|retained| {
+            retained.group.roles.iter().filter_map(|role| match role {
+                ShardRoleV2::Information(information) if !information.sector.virtual_zero => {
+                    Some(information.sector.id)
+                }
+                _ => None,
+            })
         }));
 
         self.collect_mature_garbage(generation, &live_revisions, &live_sectors, &live_groups)?;
+
+        // Information READY objects can outlive the attempt that first
+        // activated them. Their historical transcript remains after Forget,
+        // so schedule removal only once no checkpoint or retained group uses
+        // the sector; the candidate still needs a later generation to mature.
+        for (_, bytes) in self.control.records("coding-group-transcript")? {
+            let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(&bytes)?;
+            let group = &transcript.value.manifest.value.group;
+            if group.guild_id != current.checkpoint.guild_id
+                || retained_group_ids.contains(&group.id)
+            {
+                continue;
+            }
+            for (index, role) in group.roles.iter().enumerate() {
+                if let ShardRoleV2::Information(information) = role
+                    && information.owner == self.keys.node_id()
+                    && !information.sector.virtual_zero
+                    && !live_sectors.contains(&information.sector.id)
+                {
+                    self.schedule_garbage(
+                        "gc-variable-sector",
+                        &variable_emergency_id(&information.sector.id, index as u16),
+                        generation,
+                        checkpoint_hash,
+                        Some(information.sector.commitment.root),
+                    )?;
+                }
+            }
+        }
 
         for (record_id, _) in self.control.records("packed-sector")? {
             if record_id.len() != 64 {
@@ -17088,7 +17260,18 @@ pub(crate) mod tests {
         );
         node.install_guild_event(forget).unwrap();
         assert!(node.discard_coding_attempt(&plan.value.attempt_id).unwrap());
-        assert_eq!(node.coding_holder_cleanup_count_for_test().unwrap(), 0);
+        assert_eq!(
+            node.coding_holder_cleanup_count_for_test().unwrap(),
+            usize::from(active_count == 5),
+            "local cleanup must finish while any remote parity cleanup stays durable"
+        );
+        if active_count == 5 {
+            let (_, remote) = node
+                .claim_coding_holder_cleanup_after(None)
+                .unwrap()
+                .unwrap();
+            assert_ne!(remote.holder, node.keys().node_id());
+        }
         assert!(
             node.variable_parity_for_guild(&state.guild_id, &group.id, local_parity_index as u16)
                 .is_err()
@@ -17112,6 +17295,14 @@ pub(crate) mod tests {
         node.stage_coding_parity(&successor, &next.value.manifest, &local_parity)
             .unwrap();
         node.activate_coding_attempt(&next).unwrap();
+        // An old delegator may send its delayed abort after the successor
+        // activates the same group ID but before its Add event reaches us.
+        assert!(node.discard_coding_attempt(&plan.value.attempt_id).unwrap());
+        assert_eq!(
+            node.variable_parity_for_guild(&state.guild_id, &group.id, local_parity_index as u16)
+                .unwrap(),
+            local_parity
+        );
         let state = node.dynamic_guild_state().unwrap().unwrap();
         node.install_coding_group_event(
             sign_event(
@@ -19111,6 +19302,7 @@ pub(crate) mod tests {
             node.dynamic_guild_state().unwrap().unwrap().coding_groups[0].group,
             transcript.value.manifest.value.group
         );
+        assert_eq!(node.coding_holder_cleanup_count_for_test().unwrap(), 0);
         assert_eq!(
             information_node
                 .variable_shard_for_guild(&[181; 32], &transcript.value.manifest.value.group.id, 2,)
@@ -19412,6 +19604,9 @@ pub(crate) mod tests {
             signatures,
         })
         .unwrap();
+        // This completed group was forgotten by the ordinary lifecycle: no
+        // attempt abort was needed to give its parity holder durable cleanup.
+        assert_eq!(node.coding_holder_cleanup_count_for_test().unwrap(), 1);
         assert!(
             node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, false)
                 .is_err()
@@ -19420,6 +19615,7 @@ pub(crate) mod tests {
             .unwrap();
         drop(node);
         let mut node = Node::open(data_dir.path(), identities[4].1.clone()).unwrap();
+        assert_eq!(node.coding_holder_cleanup_count_for_test().unwrap(), 1);
         node.validate_variable_checkpoint_coverage(&checkpoint.checkpoint, true)
             .unwrap();
         assert!(
@@ -19433,26 +19629,38 @@ pub(crate) mod tests {
                 4,
             )
             .is_err(),
-            "aborting after Forget must remove the old READY parity"
+            "Forget cleanup must remove parity installed by a later repair of the old group"
         );
-        node.schedule_garbage(
-            "gc-variable-parity",
-            &variable_emergency_id(&transcript.value.manifest.value.group.id, 4),
-            1,
-            checkpoint_hash,
-            Some(parity_root),
-        )
-        .unwrap();
-        node.collect_mature_garbage(2, &BTreeSet::new(), &BTreeSet::new(), &BTreeSet::new())
-            .unwrap();
+        let mut active_receipt_id = transcript.value.manifest.value.group.id.to_vec();
+        active_receipt_id.push(4);
         assert!(
-            node.variable_shard_for_guild(
-                &[181; 32],
-                &transcript.value.manifest.value.group.id,
-                4,
-            )
-            .is_err()
+            node.control
+                .get_record("volume-receipt", &active_receipt_id)
+                .unwrap()
+                .is_none()
         );
+        let mut repair_receipt_id = [186; 16].to_vec();
+        repair_receipt_id.extend_from_slice(&active_receipt_id);
+        assert!(
+            node.control
+                .get_record("volume-attempt-receipt", &repair_receipt_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(node.coding_holder_cleanup_count_for_test().unwrap(), 0);
+        for _ in 0..2 {
+            drop(node);
+            node = Node::open(data_dir.path(), identities[4].1.clone()).unwrap();
+            assert_eq!(node.coding_holder_cleanup_count_for_test().unwrap(), 0);
+            assert!(
+                node.variable_shard_for_guild(
+                    &[181; 32],
+                    &transcript.value.manifest.value.group.id,
+                    4,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

@@ -26074,7 +26074,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let second_shards = encode(verified.value.geometry.profile, vec![second_bytes]).unwrap();
+        let second_shards =
+            encode(verified.value.geometry.profile, vec![second_bytes.clone()]).unwrap();
         let verified_transcript =
             crate::node::tests::test_coding_transcript(verified.clone(), &second_shards, &keys);
         assert_eq!(
@@ -26268,11 +26269,47 @@ mod tests {
             );
         }
         coverage.unwrap().unwrap();
+        let mut retained_successor_group = None;
         if !offline_spare {
             // The old holder acknowledged abort before Forget, so its READY
             // parity and local cleanup obligation must survive until its own
             // guild tail catches up, even after the successor has coverage.
             let old_group = verified_transcript.value.manifest.value.group.id;
+            let successor_group = nodes[0]
+                .lock()
+                .unwrap()
+                .dynamic_guild_state()
+                .unwrap()
+                .unwrap()
+                .coding_groups
+                .into_iter()
+                .find(|retained| {
+                    retained.retired_at_event.is_none()
+                        && retained.group.roles.iter().any(|role| {
+                            matches!(role, ShardRoleV2::Information(information)
+                                if information.sector.id == second_sector_id)
+                        })
+                })
+                .unwrap()
+                .group
+                .id;
+            retained_successor_group = Some(successor_group);
+            {
+                let owner = nodes[0].lock().unwrap();
+                assert_eq!(
+                    owner
+                        .variable_information_for_guild(&guild_id, &second_sector_id, 0)
+                        .unwrap()
+                        .bytes,
+                    second_bytes
+                );
+                owner.forget_local_sector(&second_sector_id).unwrap();
+                assert!(
+                    owner
+                        .sector_for_guild(&guild_id, &second_sector_id)
+                        .is_err()
+                );
+            }
             assert_eq!(
                 nodes[1]
                     .lock()
@@ -26327,13 +26364,24 @@ mod tests {
                 }
             }
             let mut owner_cleanup_cursor = None;
-            process_coding_holder_cleanup_job(
-                nodes[0].clone(),
-                &clients[0],
-                &mut owner_cleanup_cursor,
-            )
-            .await
-            .unwrap();
+            for _ in 0..3 {
+                process_coding_holder_cleanup_job(
+                    nodes[0].clone(),
+                    &clients[0],
+                    &mut owner_cleanup_cursor,
+                )
+                .await
+                .unwrap();
+                if nodes[0]
+                    .lock()
+                    .unwrap()
+                    .coding_holder_cleanup_count_for_test()
+                    .unwrap()
+                    == 0
+                {
+                    break;
+                }
+            }
             assert_eq!(
                 nodes[0]
                     .lock()
@@ -26341,6 +26389,15 @@ mod tests {
                     .coding_holder_cleanup_count_for_test()
                     .unwrap(),
                 0
+            );
+            assert_eq!(
+                nodes[0]
+                    .lock()
+                    .unwrap()
+                    .variable_shard_for_guild(&guild_id, &successor_group, 0)
+                    .unwrap(),
+                second_bytes,
+                "old-attempt cleanup must preserve the successor's READY information"
             );
             let mut cleanup_cursor = None;
             process_coding_holder_cleanup_job(nodes[1].clone(), &clients[1], &mut cleanup_cursor)
@@ -26429,9 +26486,17 @@ mod tests {
             .unwrap();
         if !offline_spare {
             let old_group = verified_transcript.value.manifest.value.group.id;
+            let successor_group = retained_successor_group.unwrap();
             drop(node);
             drop(nodes);
             for _ in 0..2 {
+                let owner = Node::open(temp.path().join("node-0"), seeds[0].clone()).unwrap();
+                assert_eq!(
+                    owner
+                        .variable_shard_for_guild(&guild_id, &successor_group, 0)
+                        .unwrap(),
+                    second_bytes
+                );
                 let holder = Node::open(temp.path().join("node-1"), seeds[1].clone()).unwrap();
                 assert_eq!(holder.coding_holder_cleanup_count_for_test().unwrap(), 0);
                 assert!(
@@ -26446,6 +26511,264 @@ mod tests {
     #[tokio::test]
     async fn uncovered_activations_unblock_live_checkpoint_wait() {
         uncovered_activations_unblock_live_checkpoint_wait_fixture(false).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_forget_cleans_completed_parity_after_delayed_holder_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeds = (0_u8..5)
+            .map(|index| Seed::from_bytes([90 + index; 32]))
+            .collect::<Vec<_>>();
+        let keys = seeds.iter().map(KeyMaterial::from_seed).collect::<Vec<_>>();
+        let nodes = seeds
+            .iter()
+            .enumerate()
+            .map(|(index, seed)| {
+                Arc::new(Mutex::new(
+                    Node::open(temp.path().join(format!("node-{index}")), seed.clone()).unwrap(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let holder_volume = temp.path().join("holder-volume");
+        std::fs::create_dir(&holder_volume).unwrap();
+        nodes[1]
+            .lock()
+            .unwrap()
+            .configure_storage_volumes(&[holder_volume], 4 * 1024 * 1024, 0)
+            .unwrap();
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for node in &nodes {
+            let mut cfg = config(node.lock().unwrap().keys().node_id());
+            cfg.enable_relay_server = false;
+            let (client, event_loop) = build_p2p(node.clone(), cfg).unwrap();
+            clients.push(client);
+            tasks.push(tokio::spawn(event_loop.run()));
+        }
+        let addresses = futures::future::join_all(clients.iter().map(listening_address)).await;
+        let endpoints = clients
+            .iter()
+            .zip(addresses.iter().cloned())
+            .map(|(client, address)| peer_endpoint(client, address))
+            .collect::<Vec<_>>();
+        form_test_guild(&nodes, &clients, &addresses, &endpoints).await;
+        let ids = nodes
+            .iter()
+            .map(|node| node.lock().unwrap().keys().node_id())
+            .collect::<Vec<_>>();
+        clients[0]
+            .add_peer_address(ids[1], addresses[1].clone())
+            .await
+            .unwrap();
+        let state = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap();
+        let member = |id| {
+            state
+                .active_members()
+                .find(|member| member.node_id == id)
+                .unwrap()
+                .clone()
+        };
+        let bytes = vec![42; 64];
+        let profile = CodingProfile::new(1, 1, 64);
+        let plan = nodes[0]
+            .lock()
+            .unwrap()
+            .sign_coding_attempt_plan(CodingAttemptPlan {
+                format_version: 3,
+                attempt_id: [96; 16],
+                checkpoint_hash: [97; 32],
+                membership_epoch: state.membership_epoch,
+                geometry: CodingPlanGeometry {
+                    format_version: 1,
+                    guild_id: state.guild_id,
+                    profile,
+                    information: vec![InformationRoleV2 {
+                        owner: ids[0],
+                        failure_domain: member(ids[0]).failure_domain,
+                        sector: RangeSectorRef {
+                            id: [98; 32],
+                            commitment: merkle_commit(&bytes).unwrap(),
+                            logical_len: 64,
+                            virtual_zero: false,
+                        },
+                    }],
+                    parity: vec![ParityPlacementV2 {
+                        holder: ids[1],
+                        failure_domain: member(ids[1]).failure_domain,
+                        row: 0,
+                    }],
+                },
+                delegator: ids[0],
+                coding_coordinator: ids[2],
+                verification_coordinator: ids[3],
+                expires_at_unix_seconds: unix_seconds() + 600,
+                information_roots: Some(vec![sector_root(&bytes)]),
+            })
+            .unwrap();
+        let shards = encode(profile, vec![bytes]).unwrap();
+        let transcript = crate::node::tests::test_coding_transcript(plan, &shards, &keys);
+        let group = transcript.value.manifest.value.group.clone();
+        let ShardRoleV2::Parity(parity) = &group.roles[1] else {
+            unreachable!();
+        };
+        nodes[1]
+            .lock()
+            .unwrap()
+            .stage_coding_parity(
+                &transcript.value.plan,
+                &transcript.value.manifest,
+                &VariableParityObject {
+                    format_version: 2,
+                    guild_id: state.guild_id,
+                    group_id: group.id,
+                    shard_index: 1,
+                    commitment: parity.commitment.clone(),
+                    bytes: shards[1].clone(),
+                },
+            )
+            .unwrap();
+        nodes[1]
+            .lock()
+            .unwrap()
+            .activate_coding_attempt(&transcript)
+            .unwrap();
+        install_coding_test_group_event(&nodes, &transcript);
+        assert_eq!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .coding_holder_cleanup_count_for_test()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            nodes[1]
+                .lock()
+                .unwrap()
+                .coding_holder_cleanup_count_for_test()
+                .unwrap(),
+            0
+        );
+        let state = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap();
+        let retire = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::RetireCodingGroup {
+                group_id: group.id,
+                retain_through_event: state.event_sequence + 1,
+            },
+        };
+        let certify = |event: GuildEvent| {
+            let mut signatures = keys
+                .iter()
+                .map(|keys| mb_core::sign_guild_event(&event, keys).unwrap())
+                .collect::<Vec<_>>();
+            signatures.sort_by_key(|signature| signature.signer);
+            QuorumGuildEvent { event, signatures }
+        };
+        for node in &nodes {
+            node.lock()
+                .unwrap()
+                .install_guild_event(certify(retire.clone()))
+                .unwrap();
+        }
+        let state = nodes[0]
+            .lock()
+            .unwrap()
+            .dynamic_guild_state()
+            .unwrap()
+            .unwrap();
+        let forget = certify(GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: state.event_sequence + 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::ForgetCodingGroup { group_id: group.id },
+        });
+        for (index, node) in nodes.iter().enumerate() {
+            if index != 1 {
+                node.lock()
+                    .unwrap()
+                    .install_guild_event(forget.clone())
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .coding_holder_cleanup_count_for_test()
+                .unwrap(),
+            1
+        );
+        let mut owner_cursor = None;
+        process_coding_holder_cleanup_job(nodes[0].clone(), &clients[0], &mut owner_cursor)
+            .await
+            .unwrap();
+        assert_eq!(
+            nodes[0]
+                .lock()
+                .unwrap()
+                .coding_holder_cleanup_count_for_test()
+                .unwrap(),
+            0
+        );
+        {
+            let holder = nodes[1].lock().unwrap();
+            assert_eq!(holder.coding_holder_cleanup_count_for_test().unwrap(), 1);
+            assert!(
+                holder
+                    .variable_parity_for_guild(&state.guild_id, &group.id, 1)
+                    .is_ok()
+            );
+        }
+        nodes[1]
+            .lock()
+            .unwrap()
+            .install_guild_event(forget)
+            .unwrap();
+        let mut holder_cursor = None;
+        process_coding_holder_cleanup_job(nodes[1].clone(), &clients[1], &mut holder_cursor)
+            .await
+            .unwrap();
+        {
+            let holder = nodes[1].lock().unwrap();
+            assert_eq!(holder.coding_holder_cleanup_count_for_test().unwrap(), 0);
+            assert!(
+                holder
+                    .variable_parity_for_guild(&state.guild_id, &group.id, 1)
+                    .is_err()
+            );
+        }
+        for client in &clients {
+            client.shutdown().await.unwrap();
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        drop(clients);
+        drop(nodes);
+        for _ in 0..2 {
+            let holder = Node::open(temp.path().join("node-1"), seeds[1].clone()).unwrap();
+            assert_eq!(holder.coding_holder_cleanup_count_for_test().unwrap(), 0);
+            assert!(
+                holder
+                    .variable_parity_for_guild(&state.guild_id, &group.id, 1)
+                    .is_err()
+            );
+        }
     }
 
     #[tokio::test]

@@ -2246,6 +2246,18 @@ then run M5-137 on the final committed source. Milestone 5 remains open and
 Milestone 6 waits. This review's conclusion is based on source inspection;
 M5-134 remains historical gate evidence for `a7da0ce`.
 
+The M5-135/M5-136/M5-138 implementation now retains READY information and its
+receipt when an old attempt is cleaned up, pins live and pending successor
+information for GC, and creates parity-holder cleanup obligations atomically
+with every certified Forget. Cleanup compares READY parity's verified
+transcript hash: a repaired shard of the old group is removed with its receipts,
+while a successor sharing the group ID keeps its own shard. Focused
+source-unavailable successor, completed-group delayed-holder, repaired-parity,
+same-ID successor, and repeated-reopen regressions passed locally, as did
+strict workspace Clippy. Milestone 5 stays open until M5-137's complete
+exact-source local workspace, Docker, disposable Btrfs/network and resource
+cleanup gate passes on committed code.
+
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
 launch-expiry regressions found duplicate same-lane successors. Renewal now
 reuses accepted verified activation or a live retry child before an existing

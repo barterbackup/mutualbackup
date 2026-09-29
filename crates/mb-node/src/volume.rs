@@ -628,6 +628,35 @@ impl StorageVolumes {
         shard_index: u8,
         root: &[u8; 32],
     ) -> Result<bool> {
+        self.remove_unreachable_matching_attempt(control, group_id, shard_index, root, None)
+    }
+
+    pub(crate) fn remove_unreachable_for_attempt(
+        &mut self,
+        control: &ControlStore,
+        attempt_id: &[u8; 16],
+        verification_hash: &[u8; 32],
+        group_id: &[u8; 32],
+        shard_index: u8,
+        root: &[u8; 32],
+    ) -> Result<bool> {
+        self.remove_unreachable_matching_attempt(
+            control,
+            group_id,
+            shard_index,
+            root,
+            Some((attempt_id, verification_hash)),
+        )
+    }
+
+    fn remove_unreachable_matching_attempt(
+        &mut self,
+        control: &ControlStore,
+        group_id: &[u8; 32],
+        shard_index: u8,
+        root: &[u8; 32],
+        attempt: Option<(&[u8; 16], &[u8; 32])>,
+    ) -> Result<bool> {
         let record_id = volume_object_id(group_id, shard_index);
         let receipt_volume = self
             .receipt(control, group_id, shard_index)?
@@ -648,6 +677,8 @@ impl StorageVolumes {
             .into_iter()
             .chain(intent_volume)
             .all(|volume_id| self.volumes.contains_key(&volume_id));
+        let mut newer_ready = false;
+        let mut removed_attempts = BTreeSet::new();
         for (volume_id, volume) in &mut self.volumes {
             let required = receipt_volume == Some(*volume_id)
                 || intent_volume == Some(*volume_id)
@@ -659,6 +690,26 @@ impl StorageVolumes {
                 }
                 continue;
             };
+            if let Some((attempt_id, verification_hash)) = attempt
+                && let Some(stored) = store.object_attempt_state(group_id, shard_index)?
+            {
+                // A repair carries the same verification evidence as its
+                // original group, but uses a different operation ID. A
+                // successor reusing this group ID carries different evidence.
+                let old_object = if stored.ready {
+                    stored.verification_hash.as_ref() == Some(verification_hash)
+                } else {
+                    stored.attempt_id.as_ref() == Some(attempt_id)
+                };
+                if !old_object {
+                    newer_ready |= stored.ready;
+                    cleanup_volumes.remove(volume_id);
+                    continue;
+                }
+                if let Some(stored_attempt) = stored.attempt_id {
+                    removed_attempts.insert(stored_attempt);
+                }
+            }
             match store.remove_ready(group_id, shard_index, root) {
                 Ok(true) => {
                     volume_interruption(VolumeInterruption::GarbageObjectRemoved)?;
@@ -678,6 +729,11 @@ impl StorageVolumes {
         self.persist(control)?;
         self.store_cleanup_volumes(control, &record_id, &cleanup_volumes)?;
         if complete && cleanup_volumes.is_empty() {
+            for removed_attempt in removed_attempts {
+                self.finalize_attempt_object(control, &removed_attempt, group_id, shard_index)?;
+            }
+        }
+        if complete && cleanup_volumes.is_empty() && !newer_ready {
             control.delete_record("volume-receipt", &record_id)?;
             control.delete_record("volume-write-intent", &record_id)?;
             volume_interruption(VolumeInterruption::GarbageReceiptRetired)?;
@@ -1102,10 +1158,35 @@ impl StorageVolumes {
         Ok(())
     }
 
+    fn finalize_attempt_object(
+        &self,
+        control: &ControlStore,
+        attempt_id: &[u8; 16],
+        group_id: &[u8; 32],
+        shard_index: u8,
+    ) -> Result<()> {
+        let record_id = attempt_volume_object_id(attempt_id, group_id, shard_index);
+        for kind in ["volume-attempt-intent", "volume-attempt-receipt"] {
+            if let Some(bytes) = control.get_record(kind, &record_id)? {
+                let record: AttemptVolumeRecord = decode_canonical(&bytes)?;
+                validate_attempt_volume_record(&record)?;
+                if record.attempt_id != *attempt_id
+                    || record.receipt.group_id != *group_id
+                    || record.receipt.shard_index != shard_index
+                {
+                    bail!("attempt receipt conflicts with object cleanup");
+                }
+                control.delete_record(kind, &record_id)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn discard_attempt(
         &mut self,
         control: &ControlStore,
         attempt_id: &[u8; 16],
+        preserve_ready: &BTreeSet<([u8; 32], u16)>,
     ) -> Result<bool> {
         let mut required_volumes = BTreeSet::new();
         let mut attempt_records = Vec::new();
@@ -1136,7 +1217,7 @@ impl StorageVolumes {
                 }
                 continue;
             };
-            store.discard_uncommitted_attempt(attempt_id)?;
+            store.discard_uncommitted_attempt_preserving_ready(attempt_id, preserve_ready)?;
         }
         for (kind, record_id, record) in attempt_records {
             if self
@@ -1149,7 +1230,20 @@ impl StorageVolumes {
             }
             let receipt = record.receipt;
             let active_id = volume_object_id(&receipt.group_id, receipt.shard_index);
-            if let Some(bytes) = control.get_record("volume-receipt", &active_id)? {
+            let retained_information = preserve_ready
+                .contains(&(receipt.group_id, u16::from(receipt.shard_index)))
+                && self
+                    .volumes
+                    .get(&receipt.volume_id)
+                    .and_then(|volume| volume.store.as_ref())
+                    .is_some_and(|store| {
+                        store
+                            .load_ready_variable(&receipt.group_id, u16::from(receipt.shard_index))
+                            .is_ok()
+                    });
+            if !retained_information
+                && let Some(bytes) = control.get_record("volume-receipt", &active_id)?
+            {
                 let active: VolumeReceipt = decode_canonical(&bytes)?;
                 if active != receipt {
                     bail!("active volume receipt conflicts with aborted coding attempt");

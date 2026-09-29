@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -1361,6 +1362,13 @@ pub struct ParityScrubReport {
     pub corrupt_objects: Vec<([u8; 32], u8)>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectAttemptState {
+    pub attempt_id: Option<[u8; 16]>,
+    pub ready: bool,
+    pub verification_hash: Option<[u8; 32]>,
+}
+
 pub struct ParityStore {
     connection: Connection,
     path: PathBuf,
@@ -1937,6 +1945,42 @@ impl ParityStore {
         Ok(true)
     }
 
+    /// Distinguish a delayed abort from a newer attempt that reused the same
+    /// group ID after Forget. An absent row is different from a legacy row
+    /// without an attempt ID.
+    pub fn object_attempt_state(
+        &self,
+        group_id: &[u8; 32],
+        shard_index: u8,
+    ) -> Result<Option<ObjectAttemptState>, DatabaseError> {
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT attempt_id, state, verification_hash FROM parity_objects WHERE group_id = ?1 AND shard_index = ?2",
+                params![group_id.as_slice(), shard_index],
+                |row| Ok((row.get::<_, Option<Vec<u8>>>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<Vec<u8>>>(2)?)),
+            )
+            .optional()?;
+        stored
+            .map(|(attempt_id, state, verification_hash)| {
+                if !matches!(state.as_str(), "READY" | "STAGED") {
+                    return Err(DatabaseError::Integrity);
+                }
+                let attempt_id = attempt_id
+                    .map(|bytes| bytes.try_into().map_err(|_| DatabaseError::Integrity))
+                    .transpose()?;
+                let verification_hash = verification_hash
+                    .map(|bytes| bytes.try_into().map_err(|_| DatabaseError::Integrity))
+                    .transpose()?;
+                Ok(ObjectAttemptState {
+                    attempt_id,
+                    ready: state == "READY",
+                    verification_hash,
+                })
+            })
+            .transpose()
+    }
+
     pub fn stage_and_publish(&mut self, object: &ParityObject) -> Result<(), DatabaseError> {
         self.stage_and_publish_ack(object, &[], u64::MAX)
     }
@@ -2291,17 +2335,52 @@ impl ParityStore {
         &mut self,
         attempt_id: &[u8; 16],
     ) -> Result<u64, DatabaseError> {
+        self.discard_uncommitted_attempt_preserving_ready(attempt_id, &BTreeSet::new())
+    }
+
+    /// A committed information shard can be reused by later coding groups.
+    /// Discard the failed attempt's other objects without deleting those READY
+    /// shards; their lifetime is governed by sector garbage collection.
+    pub fn discard_uncommitted_attempt_preserving_ready(
+        &mut self,
+        attempt_id: &[u8; 16],
+        preserve_ready: &BTreeSet<([u8; 32], u16)>,
+    ) -> Result<u64, DatabaseError> {
         if *attempt_id == [0; 16] {
             return Err(DatabaseError::Integrity);
         }
-        let objects = self.connection.execute(
-            "DELETE FROM parity_objects WHERE attempt_id = ?1",
-            [attempt_id.as_slice()],
-        )? as u64;
-        let reservations = self.connection.execute(
+        let transaction = self.connection.transaction()?;
+        let rows = {
+            let mut statement = transaction.prepare(
+                "SELECT group_id, shard_index, state FROM parity_objects WHERE attempt_id = ?1",
+            )?;
+            statement
+                .query_map([attempt_id.as_slice()], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut objects = 0;
+        for (group_id, shard_index, state) in rows {
+            let group_id: [u8; 32] = group_id.try_into().map_err(|_| DatabaseError::Integrity)?;
+            let shard_index = u16::try_from(shard_index).map_err(|_| DatabaseError::Integrity)?;
+            if state == "READY" && preserve_ready.contains(&(group_id, shard_index)) {
+                continue;
+            }
+            objects += transaction.execute(
+                "DELETE FROM parity_objects WHERE attempt_id = ?1 AND group_id = ?2 AND shard_index = ?3",
+                params![attempt_id.as_slice(), group_id.as_slice(), shard_index],
+            )? as u64;
+        }
+        let reservations = transaction.execute(
             "DELETE FROM coding_reservations WHERE attempt_id = ?1",
             [attempt_id.as_slice()],
         )? as u64;
+        transaction.commit()?;
         let removed = objects.saturating_add(reservations);
         if removed != 0 {
             self.reclaim_deleted_pages()?;
@@ -4995,12 +5074,37 @@ mod tests {
         assert_eq!(store.ready_object_count().unwrap(), 1);
         assert_eq!(
             store
+                .object_attempt_state(&object.group_id, object.shard_index as u8)
+                .unwrap(),
+            Some(ObjectAttemptState {
+                attempt_id: Some(attempt_id),
+                ready: true,
+                verification_hash: Some(verification_hash),
+            })
+        );
+        assert_eq!(
+            store
                 .load_ready_variable(&object.group_id, object.shard_index)
                 .unwrap(),
             object
         );
         assert_eq!(store.discard_staged_attempt(&attempt_id).unwrap(), 0);
         assert_eq!(store.ready_object_count().unwrap(), 1);
+        assert_eq!(
+            store
+                .discard_uncommitted_attempt_preserving_ready(
+                    &attempt_id,
+                    &BTreeSet::from([(object.group_id, object.shard_index)]),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .load_ready_variable(&object.group_id, object.shard_index)
+                .unwrap(),
+            object
+        );
         assert_eq!(store.discard_uncommitted_attempt(&attempt_id).unwrap(), 1);
         assert_eq!(store.ready_object_count().unwrap(), 0);
     }

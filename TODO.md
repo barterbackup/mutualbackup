@@ -3667,7 +3667,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   at that time; the source-only review below reopens it. M5-131 remains
   historical evidence for `39a99e7`.
 
-- [ ] **M5-135 / P1 — Preserve live READY information when retiring an old
+- [x] **M5-135 / P1 — Preserve live READY information when retiring an old
   attempt.** The M5-132 cleanup records obligations for information owners as
   well as parity holders (`node.rs:7276-7306`). A successor can keep the same
   information sector while changing parity placement (`node.rs:6815-6853`),
@@ -3688,9 +3688,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   keep object and receipt state consistent. Regress an activated successor
   reusing an old READY information shard through old-group Forget and cleanup,
   with the source recipe unavailable, then verify shard reads and repeated
-  reopen. This review was source-only.
+  reopen. This review was source-only. Implemented in the M5-135/M5-136/M5-138
+  source checkpoint: old-attempt cleanup retains READY information and its
+  active receipt, and GC pins retained or pending successor information.
+  Source-unavailable successor and repeated-reopen regressions passed locally;
+  the complete M5-137 gate remains pending.
 
-- [ ] **M5-136 / P1 — Give routinely forgotten groups a parity cleanup
+- [x] **M5-136 / P1 — Give routinely forgotten groups a parity cleanup
   owner.** The new holder-local obligation is created by attempt abort
   (`node.rs:7206-7228`), but ordinary lifecycle retirement and forgetting
   only commit guild events (`network/p2p.rs:8490-8719`, `:8722-8775`); a
@@ -3708,7 +3712,11 @@ node Clippy gate passed locally. No remote compilation server was used.
   remove old parity only after each holder has installed Forget; preserve
   information shared by live groups. Regress
   a completed Add, redundant Retire, Forget, delayed holder sync, parity
-  removal and repeated reopen. This review was source-only.
+  removal and repeated reopen. This review was source-only. Implemented in the
+  M5-135/M5-136/M5-138 source checkpoint: certified Forget atomically records
+  holder cleanup obligations, and local cleanup waits for that holder's own
+  Forget. The ordinary completed-group/delayed-holder network regression and
+  repeated-reopen checks passed locally; M5-137 remains pending.
 
 - [ ] **M5-137 / gate — Recheck Milestone 5 after M5-135 and M5-136.** Review
   both cleanup paths and pass focused live-information retention, ordinary
@@ -3717,7 +3725,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   Btrfs/network acceptance and independent resource-cleanup gate before
   closing Milestone 5. Keep M5-134 as historical evidence for `a7da0ce`.
 
-- [ ] **M5-138 / P1 — Clean repaired parity after ordinary Forget.** Source-only
+- [x] **M5-138 / P1 — Clean repaired parity after ordinary Forget.** Source-only
   review of the current uncommitted M5-135/M5-136 changes found that a parity
   shard repaired while its group is live is stored under the repair ID
   (`node.rs:7958-8061`). After Forget, `discard_coding_attempt` uses the
@@ -3733,7 +3741,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   scheduled by the test, not by the lifecycle. Make Forget cleanup retire
   repaired parity safely without deleting a successor attempt that reuses the
   group ID, and regress the repair/Forget/reopen path without manual GC setup.
-  M5-137 cannot close until this is fixed and its exact-source gate passes.
+  Implemented in the M5-135/M5-136/M5-138 source checkpoint: READY parity is
+  matched to its verified transcript hash, so cleanup includes a later repair
+  of the old group while preserving a successor with the same group ID and
+  different evidence. Object and repair receipts are removed together. The
+  repair/Forget regression now checks receipts and two reopens without manual
+  GC setup. Focused tests and strict Clippy passed; M5-137 remains pending.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
