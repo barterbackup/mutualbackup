@@ -3886,7 +3886,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   attempts and reopen retain the receipt and readable object, then allows
   retirement after terminal cleanup. The volume and store suites pass locally.
 
-- [ ] **M5-145 / P1 — Preserve forgotten-Add evidence during seed recovery.**
+- [x] **M5-145 / P1 — Preserve forgotten-Add evidence during seed recovery.**
   Cold dynamic recovery fetches transcripts only for currently retained
   groups (`network/p2p.rs:10080-10097`). Adoption stores all historical guild
   events but writes `coding-event-transcript` only for those retained groups
@@ -3897,7 +3897,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   source, an honest lagging member remains stuck before that Add and all later
   events. Recover and validate historical Add bindings needed for tail service,
   or provide another sound replay path. Regress a cold-recovered sole source
-  and a lagging member crossing a forgotten Add and later events.
+  and a lagging member crossing a forgotten Add and later events. Recovery now
+  fetches event-bound transcripts for every historical Add and adoption checks
+  each against its Add and signing-epoch authority, storing all event bindings
+  while retaining current group and attempt indexes only for live groups. A
+  recovered-node regression passes through Add/Retire/Forget replay by a
+  lagging member after reopen; the existing dynamic adoption test and strict
+  all-target `mb-node` Clippy pass locally.
 
 - [x] **M5-146 / P1 — Backfill a legacy retained Add binding before Forget.**
   A pre-M5-140 store has a retained group transcript but no event-keyed

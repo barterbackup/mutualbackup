@@ -2023,32 +2023,6 @@ impl P2pClient {
         Ok(())
     }
 
-    pub(crate) async fn coding_transcript(
-        &self,
-        peer: NodeId,
-        guild_id: [u8; 32],
-        group_id: [u8; 32],
-    ) -> Result<VerifiedCodingTranscript> {
-        let response = self
-            .call(
-                peer,
-                PeerRequest::GetCodingTranscript { guild_id, group_id },
-            )
-            .await?;
-        let PeerResponse::CodingVerificationTranscript(transcript) = response else {
-            bail!("peer returned the wrong coding transcript response");
-        };
-        let transcript = *transcript;
-        if transcript.value.manifest.value.group.guild_id != guild_id
-            || transcript.value.manifest.value.group.id != group_id
-        {
-            bail!("peer returned invalid coding-group verifier evidence");
-        }
-        tokio::task::spawn_blocking(move || VerifiedCodingTranscript::verify(transcript))
-            .await
-            .context("coding-transcript verifier failed")?
-    }
-
     pub(crate) async fn coding_transcript_for_event(
         &self,
         peer: NodeId,
@@ -9587,7 +9561,7 @@ struct ValidatedRecoveryHead {
     candidates: Vec<RecoveryCandidate>,
     state: DynamicGuildState,
     events: Vec<QuorumGuildEvent>,
-    transcripts: Vec<VerifiedCodingTranscript>,
+    transcripts: Vec<([u8; 32], VerifiedCodingTranscript)>,
 }
 
 pub async fn recover_from_dht(
@@ -10041,7 +10015,7 @@ async fn validate_recovery_head(
                     p2p,
                     publisher,
                     guild_id,
-                    &state,
+                    &events,
                 )
                 .await
                 {
@@ -10081,19 +10055,26 @@ async fn fetch_recovery_transcripts(
     p2p: &P2pClient,
     publisher: NodeId,
     guild_id: [u8; 32],
-    state: &DynamicGuildState,
-) -> Result<Vec<VerifiedCodingTranscript>> {
-    let group_ids = state
-        .coding_groups
-        .iter()
-        .map(|retained| retained.group.id)
-        .collect::<Vec<_>>();
-    let requests = group_ids
+    events: &[QuorumGuildEvent],
+) -> Result<Vec<([u8; 32], VerifiedCodingTranscript)>> {
+    let mut adds = Vec::new();
+    for event in events {
+        if let mb_core::GuildEventKind::AddCodingGroup { group } = &event.event.kind {
+            adds.push((event.event.sequence, event.event.hash()?, group.id));
+        }
+    }
+    let requests = adds
         .into_iter()
-        .map(|group_id| async move { p2p.coding_transcript(publisher, guild_id, group_id).await });
+        .map(|(sequence, hash, group_id)| async move {
+            Ok((
+                hash,
+                p2p.coding_transcript_for_event(publisher, guild_id, group_id, sequence, hash)
+                    .await?,
+            ))
+        });
     let mut transcripts =
         collect_bounded_recovery_requests(requests, RECOVERY_TRANSCRIPT_FETCH_CONCURRENCY).await?;
-    transcripts.sort_by_key(|transcript| transcript.as_inner().value.manifest.value.group.id);
+    transcripts.sort_by_key(|(hash, _)| *hash);
     Ok(transcripts)
 }
 

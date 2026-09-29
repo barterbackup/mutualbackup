@@ -232,10 +232,6 @@ impl VerifiedCodingTranscript {
     pub(crate) fn into_inner(self) -> SignedRecord<CodingVerificationTranscript> {
         self.0
     }
-
-    pub(crate) fn as_inner(&self) -> &SignedRecord<CodingVerificationTranscript> {
-        &self.0
-    }
 }
 
 const GUILD_INVITE_DOMAIN: &[u8] = b"mutualbackup/guild-invite/v1";
@@ -2558,7 +2554,7 @@ impl Node {
         checkpoint: &QuorumCheckpoint,
         events: Vec<QuorumGuildEvent>,
         mut peers: Vec<GuildPeer>,
-        transcripts: Vec<VerifiedCodingTranscript>,
+        transcripts: Vec<([u8; 32], VerifiedCodingTranscript)>,
     ) -> Result<()> {
         certificate.verify()?;
         checkpoint.verify()?;
@@ -2578,11 +2574,11 @@ impl Node {
         let mut checkpoint_membership =
             checkpoint_matches_dynamic_authority(&checkpoint.checkpoint, &state);
         let mut event_records = Vec::with_capacity(events.len());
-        let mut add_event_hashes = BTreeMap::new();
+        let mut add_events = Vec::new();
         for event in events {
             let record_id = event.event.sequence.to_be_bytes().to_vec();
             if let mb_core::GuildEventKind::AddCodingGroup { group } = &event.event.kind {
-                add_event_hashes.insert((event.event.sequence, group.id), event.event.hash()?);
+                add_events.push((event.event.sequence, group.clone(), event.event.hash()?));
             }
             state.apply_event(&event)?;
             authority_states
@@ -2628,45 +2624,53 @@ impl Node {
                 validate_endpoint_set(peer.member.node_id, &peer.endpoints)?;
             }
         }
-        let transcript_by_group = transcripts
+        let transcript_by_event = transcripts
             .into_iter()
-            .map(VerifiedCodingTranscript::into_inner)
-            .map(|transcript| (transcript.value.manifest.value.group.id, transcript))
+            .map(|(hash, transcript)| (hash, transcript.into_inner()))
             .collect::<BTreeMap<_, _>>();
-        if transcript_by_group.len() != state.coding_groups.len() {
+        if transcript_by_event.len() != add_events.len() {
             anyhow::bail!("dynamic recovery has incomplete or extra coding evidence");
         }
-        let mut transcript_records = Vec::with_capacity(transcript_by_group.len() * 2);
-        for retained in &state.coding_groups {
-            let transcript = transcript_by_group
-                .get(&retained.group.id)
-                .context("dynamic recovery coding transcript is unavailable")?;
+        let mut transcript_records =
+            Vec::with_capacity(add_events.len() + 2 * state.coding_groups.len());
+        let mut retained_evidence = 0;
+        for (sequence, group, add_hash) in add_events {
+            let transcript = transcript_by_event
+                .get(&add_hash)
+                .context("dynamic recovery historical Add transcript is unavailable")?;
             let authority = authority_states
                 .get(&transcript.value.plan.value.membership_epoch)
                 .context("coding transcript membership epoch is absent from event history")?;
             authority.validate_attempt_authority(&transcript.value.plan.value)?;
-            if transcript.value.manifest.value.group != retained.group {
+            if transcript.value.manifest.value.group != group {
                 anyhow::bail!("dynamic recovery coding transcript is invalid");
             }
             let bytes = canonical_bytes(transcript)?;
             transcript_records.push((
-                "coding-transcript".to_owned(),
-                transcript.value.plan.value.attempt_id.to_vec(),
-                bytes.clone(),
-            ));
-            transcript_records.push((
-                "coding-group-transcript".to_owned(),
-                retained.group.id.to_vec(),
-                bytes.clone(),
-            ));
-            let add_hash = add_event_hashes
-                .get(&(retained.added_at_event, retained.group.id))
-                .context("retained coding group has no historical Add event")?;
-            transcript_records.push((
                 "coding-event-transcript".to_owned(),
                 add_hash.to_vec(),
-                bytes,
+                bytes.clone(),
             ));
+            if state
+                .coding_groups
+                .iter()
+                .any(|retained| retained.added_at_event == sequence && retained.group == group)
+            {
+                retained_evidence += 1;
+                transcript_records.push((
+                    "coding-transcript".to_owned(),
+                    transcript.value.plan.value.attempt_id.to_vec(),
+                    bytes.clone(),
+                ));
+                transcript_records.push((
+                    "coding-group-transcript".to_owned(),
+                    group.id.to_vec(),
+                    bytes,
+                ));
+            }
+        }
+        if retained_evidence != state.coding_groups.len() {
+            anyhow::bail!("dynamic recovery has incomplete retained coding evidence");
         }
         if let Some(existing) = self.installed_guild()?
             && existing != installed
@@ -15146,6 +15150,207 @@ pub(crate) mod tests {
         assert_eq!(
             reopened.current_checkpoint(guild_id).unwrap().unwrap(),
             second
+        );
+    }
+
+    #[test]
+    fn recovered_dynamic_node_serves_forgotten_add_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([223; 32]);
+        let mut source = Node::open(temp.path().join("source"), seed.clone()).unwrap();
+        let revision = install_public_restore_fixture(&mut source, &seed);
+        let guild_id = revision.value.guild_id;
+        let certificate = source.installed_guild_certificate().unwrap().unwrap();
+        let peers = certificate
+            .genesis
+            .members
+            .iter()
+            .cloned()
+            .map(|member| GuildPeer {
+                member,
+                endpoints: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let keys = std::iter::once(seed.clone())
+            .chain((0_u8..4).map(|index| Seed::from_bytes([index + 228; 32])))
+            .map(|seed| KeyMaterial::from_seed(&seed))
+            .collect::<Vec<_>>();
+        source
+            .adopt_recovered_guild(certificate.clone(), peers.clone())
+            .unwrap();
+        let mut checkpoint = source.current_checkpoint(guild_id).unwrap().unwrap();
+        checkpoint.checkpoint.format_version = 4;
+        checkpoint.signatures.clear();
+        for key in &keys {
+            checkpoint.add_signature(key).unwrap();
+        }
+        checkpoint.verify().unwrap();
+
+        let members = certificate.genesis.members.clone();
+        let local = members
+            .iter()
+            .find(|member| member.node_id == source.keys().node_id())
+            .unwrap();
+        let remotes = members
+            .iter()
+            .filter(|member| member.node_id != local.node_id)
+            .collect::<Vec<_>>();
+        let shards =
+            mb_core::encode(mb_core::CodingProfile::new(1, 1, 64), vec![vec![91; 64]]).unwrap();
+        let plan = CodingAttemptPlan {
+            format_version: 3,
+            attempt_id: [192; 16],
+            checkpoint_hash: checkpoint.hash().unwrap(),
+            membership_epoch: 1,
+            geometry: mb_core::CodingPlanGeometry {
+                format_version: 1,
+                guild_id,
+                profile: mb_core::CodingProfile::new(1, 1, 64),
+                information: vec![mb_core::InformationRoleV2 {
+                    owner: local.node_id,
+                    failure_domain: local.failure_domain.clone(),
+                    sector: mb_core::RangeSectorRef {
+                        id: [193; 32],
+                        commitment: merkle_commit(&shards[0]).unwrap(),
+                        logical_len: 64,
+                        virtual_zero: false,
+                    },
+                }],
+                parity: vec![mb_core::ParityPlacementV2 {
+                    holder: remotes[0].node_id,
+                    failure_domain: remotes[0].failure_domain.clone(),
+                    row: 0,
+                }],
+            },
+            delegator: remotes[1].node_id,
+            coding_coordinator: remotes[2].node_id,
+            verification_coordinator: remotes[3].node_id,
+            expires_at_unix_seconds: unix_seconds() + 600,
+            information_roots: Some(vec![sector_root(&shards[0])]),
+        };
+        let delegator = keys
+            .iter()
+            .find(|key| key.node_id() == plan.delegator)
+            .unwrap();
+        let plan = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, delegator).unwrap();
+        let transcript = test_coding_transcript(plan, &shards, &keys);
+        let certify = |source: &Node, kind| {
+            let state = source.dynamic_guild_state().unwrap().unwrap();
+            let event = GuildEvent {
+                format_version: 1,
+                guild_id,
+                sequence: state.event_sequence + 1,
+                parent: state.event_head,
+                kind,
+            };
+            let mut signatures = keys
+                .iter()
+                .map(|key| sign_guild_event(&event, key).unwrap())
+                .collect::<Vec<_>>();
+            signatures.sort_by_key(|signature| signature.signer);
+            QuorumGuildEvent { event, signatures }
+        };
+        let add = certify(
+            &source,
+            mb_core::GuildEventKind::AddCodingGroup {
+                group: transcript.value.manifest.value.group.clone(),
+            },
+        );
+        let group_id = transcript.value.manifest.value.group.id;
+        let add_hash = add.event.hash().unwrap();
+        source
+            .install_coding_group_event(add.clone(), transcript.clone())
+            .unwrap();
+        let state = source.dynamic_guild_state().unwrap().unwrap();
+        let retire = certify(
+            &source,
+            mb_core::GuildEventKind::RetireCodingGroup {
+                group_id,
+                retain_through_event: state.event_sequence + 1,
+            },
+        );
+        source.install_guild_event(retire).unwrap();
+        let forget = certify(
+            &source,
+            mb_core::GuildEventKind::ForgetCodingGroup { group_id },
+        );
+        source.install_guild_event(forget).unwrap();
+        let events = source
+            .guild_event_tail(0, certificate.hash().unwrap())
+            .unwrap()
+            .events;
+        assert_eq!(events.len(), 3);
+        let evidence = source
+            .coding_transcript_for_event(guild_id, group_id, add.event.sequence, add_hash)
+            .unwrap();
+
+        let recovered_path = temp.path().join("recovered");
+        let mut recovered = Node::open(&recovered_path, seed.clone()).unwrap();
+        recovered
+            .adopt_recovered_dynamic_guild(
+                certificate.clone(),
+                &checkpoint,
+                events,
+                peers.clone(),
+                vec![(
+                    add_hash,
+                    VerifiedCodingTranscript::verify(evidence).unwrap(),
+                )],
+            )
+            .unwrap();
+        assert!(
+            recovered
+                .dynamic_guild_state()
+                .unwrap()
+                .unwrap()
+                .coding_groups
+                .is_empty()
+        );
+        assert_eq!(
+            recovered
+                .coding_transcript_for_event(guild_id, group_id, add.event.sequence, add_hash)
+                .unwrap(),
+            transcript
+        );
+        drop(recovered);
+        let recovered = Node::open(&recovered_path, seed.clone()).unwrap();
+        assert_eq!(
+            recovered
+                .coding_transcript_for_event(guild_id, group_id, add.event.sequence, add_hash)
+                .unwrap(),
+            transcript
+        );
+        let mut lagging = Node::open(temp.path().join("lagging"), seed).unwrap();
+        lagging
+            .adopt_recovered_guild(certificate.clone(), peers)
+            .unwrap();
+        let tail = recovered
+            .guild_event_tail(0, certificate.hash().unwrap())
+            .unwrap();
+        for event in tail.events {
+            if let mb_core::GuildEventKind::AddCodingGroup { group } = &event.event.kind {
+                let transcript = recovered
+                    .coding_transcript_for_event(
+                        guild_id,
+                        group.id,
+                        event.event.sequence,
+                        event.event.hash().unwrap(),
+                    )
+                    .unwrap();
+                lagging
+                    .install_coding_group_event(event, transcript)
+                    .unwrap();
+            } else {
+                lagging.install_guild_event(event).unwrap();
+            }
+        }
+        assert_eq!(
+            lagging
+                .dynamic_guild_state()
+                .unwrap()
+                .unwrap()
+                .event_sequence,
+            3
         );
     }
 

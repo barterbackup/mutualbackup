@@ -103,9 +103,11 @@ stale abort leaves virtual-zero-only activation pins. M5-144 now refuses final
 retirement while variable-profile objects or reservations remain, preserving
 their receipt and readable source until cleanup. M5-146 now atomically
 backfills the original Add binding at Forget, including on upgraded stores.
+M5-145 now fetches and preserves event-bound evidence for every historical
+Add during seed recovery, so a recovered node can serve a lagging member.
 M5-148 is corrected: activation checks local assignment before a pin write,
 zero-only roles make no pin, and GC retires legacy nonphysical pins. Milestone 5
-remains open for M5-145, M5-147 and a new exact-source gate; Milestone 6 waits.
+remains open for M5-147 and a new exact-source gate; Milestone 6 waits.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and
@@ -2327,7 +2329,7 @@ with READY variable-profile shards while deleting their receipts (M5-144, now
 guarded by refusing retirement while any format-2 object remains).
 Seed-only recovery keeps complete event history but retains transcripts only
 for live groups, so its recovered node cannot serve a forgotten Add to a
-lagging member (M5-145). An upgraded pre-binding store similarly loses an
+lagging member (M5-145, now corrected). An upgraded pre-binding store similarly loses an
 unambiguous old Add transcript when Forget removes the retained fallback
 without backfilling its event record (M5-146, now corrected). Event-tail
 installation still accepts any replay-valid same-group transcript from the
@@ -2343,6 +2345,9 @@ Volume drain now retains a readable variable-profile source and receipt rather
 than retiring it; its two-volume reopen regression and the volume/store suites
 pass locally. Format-2 evacuation remains future work if operators need to
 remove a volume before those shards reach terminal cleanup.
+Seed recovery now fetches and retains every Add's event-bound transcript;
+the recovered-node regression serves forgotten evidence to a lagging member
+across reopen, while the dynamic-adoption test and strict Clippy pass locally.
 Correct the remaining paths, review the resulting source, and rerun the
 complete local exact-source workspace, Docker safety, fresh disposable
 Btrfs/network and independent resource-cleanup gate before closing Milestone
