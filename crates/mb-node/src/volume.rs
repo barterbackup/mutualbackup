@@ -39,6 +39,7 @@ pub(crate) enum VolumeInterruption {
     MigrationStateStored,
     GarbageObjectRemoved,
     GarbageReceiptRetired,
+    AttemptObjectActivated,
 }
 
 #[cfg(test)]
@@ -687,7 +688,7 @@ impl StorageVolumes {
             .into_iter()
             .chain(intent_volume)
             .all(|volume_id| self.volumes.contains_key(&volume_id));
-        let mut newer_ready = false;
+        let mut newer_ready_volumes = BTreeSet::new();
         self.settle_attempt_retirements(control, group_id, shard_index, attempt)?;
         for (volume_id, volume) in &mut self.volumes {
             let required = receipt_volume == Some(*volume_id)
@@ -712,7 +713,9 @@ impl StorageVolumes {
                     stored.attempt_id.as_ref() == Some(attempt_id)
                 };
                 if !old_object {
-                    newer_ready |= stored.ready;
+                    if stored.ready {
+                        newer_ready_volumes.insert(*volume_id);
+                    }
                     cleanup_volumes.remove(volume_id);
                     continue;
                 }
@@ -790,12 +793,17 @@ impl StorageVolumes {
         self.persist(control)?;
         self.store_cleanup_volumes(control, &record_id, &cleanup_volumes)?;
         complete &= self.settle_attempt_retirements(control, group_id, shard_index, attempt)?;
-        if complete && cleanup_volumes.is_empty() && !newer_ready {
+        if complete && cleanup_volumes.is_empty() && newer_ready_volumes.is_empty() {
             control.delete_record("volume-receipt", &record_id)?;
             control.delete_record("volume-write-intent", &record_id)?;
             volume_interruption(VolumeInterruption::GarbageReceiptRetired)?;
         }
-        Ok(complete && cleanup_volumes.is_empty())
+        // A newer READY copy does not make an old active receipt valid. Keep
+        // the holder cleanup obligation until activation publishes that copy's
+        // receipt, including after a crash between READY and receipt storage.
+        let successor_located = newer_ready_volumes.is_empty()
+            || receipt_volume.is_some_and(|id| newer_ready_volumes.contains(&id));
+        Ok(complete && cleanup_volumes.is_empty() && successor_located)
     }
 
     pub(crate) fn store(
@@ -1167,6 +1175,23 @@ impl StorageVolumes {
         {
             bail!("staged parity activation conflicts with its volume receipt");
         }
+        let active_id = volume_object_id(group_id, shard);
+        let active = control
+            .get_record("volume-receipt", &active_id)?
+            .map(|bytes| decode_canonical::<VolumeReceipt>(&bytes))
+            .transpose()?;
+        if let Some(existing) = &active
+            && existing != &record.receipt
+        {
+            validate_receipt(existing)?;
+            if existing.guild_id != record.receipt.guild_id
+                || existing.group_id != record.receipt.group_id
+                || existing.shard_index != record.receipt.shard_index
+                || existing.root != record.receipt.root
+            {
+                bail!("active parity volume receipt conflicts with attempt activation");
+            }
+        }
         let store = self
             .volumes
             .get_mut(&record.receipt.volume_id)
@@ -1179,13 +1204,15 @@ impl StorageVolumes {
             commitment,
             verification_hash,
         )?;
-        let active_id = volume_object_id(group_id, shard);
-        if let Some(existing) = control.get_record("volume-receipt", &active_id)? {
-            let existing: VolumeReceipt = decode_canonical(&existing)?;
-            if existing != record.receipt {
-                bail!("active parity volume receipt conflicts with attempt activation");
-            }
-        } else {
+        if let Some(existing) = &active
+            && existing != &record.receipt
+        {
+            // The old volume remains a cleanup obligation after the active
+            // receipt moves, even when that volume is currently offline.
+            self.add_cleanup_volume(control, group_id, shard, existing.volume_id)?;
+        }
+        volume_interruption(VolumeInterruption::AttemptObjectActivated)?;
+        if active.as_ref() != Some(&record.receipt) {
             control.put_record(
                 "volume-receipt",
                 &active_id,
@@ -4236,7 +4263,12 @@ mod tests {
         let (control, _) = open_control_store(data.path(), &keys).unwrap();
         let mut volumes = StorageVolumes::open(data.path(), keys.clone(), &control).unwrap();
         volumes
-            .configure(&control, &[original_path.clone()], 1024 * 1024, 0)
+            .configure(
+                &control,
+                std::slice::from_ref(&original_path),
+                1024 * 1024,
+                0,
+            )
             .unwrap();
         volumes
             .stage_attempt(&control, &original_attempt, &object, b"old")
@@ -4399,6 +4431,145 @@ mod tests {
             volumes
                 .load_ready_variable(&control, &object.group_id, 4)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn same_group_successor_moves_receipt_across_volumes_after_interruption() {
+        let data = TempDir::new().unwrap();
+        let old_volume = TempDir::new().unwrap();
+        let new_volume = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([157; 32])));
+        let old_attempt = [158; 16];
+        let successor_attempt = [159; 16];
+        let old_hash = [160; 32];
+        let successor_hash = [161; 32];
+        let bytes = vec![162; 64];
+        let object = VariableParityObject {
+            format_version: 2,
+            guild_id: [163; 32],
+            group_id: [164; 32],
+            shard_index: 4,
+            commitment: mb_core::merkle_commit(&bytes).unwrap(),
+            bytes,
+        };
+        let active_id = volume_object_id(&object.group_id, 4);
+        let (control, _) = open_control_store(data.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(data.path(), keys.clone(), &control).unwrap();
+        volumes
+            .configure(&control, &[old_volume.path().to_path_buf()], 1024 * 1024, 0)
+            .unwrap();
+        let old_receipt = volumes
+            .stage_attempt(&control, &old_attempt, &object, b"old")
+            .unwrap();
+        volumes
+            .activate_attempt_object(
+                &control,
+                &old_attempt,
+                &object.group_id,
+                4,
+                &object.commitment,
+                &old_hash,
+            )
+            .unwrap();
+        volumes.finalize_attempt(&control, &old_attempt).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[
+                    old_volume.path().to_path_buf(),
+                    new_volume.path().to_path_buf(),
+                ],
+                1024 * 1024,
+                0,
+            )
+            .unwrap();
+        let successor_receipt = volumes
+            .stage_attempt(&control, &successor_attempt, &object, b"new")
+            .unwrap();
+        assert_ne!(successor_receipt.volume_id, old_receipt.volume_id);
+
+        interrupt_next_volume_transition(VolumeInterruption::AttemptObjectActivated);
+        assert!(
+            volumes
+                .activate_attempt_object(
+                    &control,
+                    &successor_attempt,
+                    &object.group_id,
+                    4,
+                    &object.commitment,
+                    &successor_hash,
+                )
+                .is_err()
+        );
+        let still_old: VolumeReceipt = decode_canonical(
+            &control
+                .get_record("volume-receipt", &active_id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(still_old.volume_id, old_receipt.volume_id);
+        assert!(
+            !volumes
+                .remove_unreachable_for_attempt(
+                    &control,
+                    &old_attempt,
+                    &old_hash,
+                    &object.group_id,
+                    4,
+                    &object.commitment.root,
+                )
+                .unwrap()
+        );
+
+        volumes
+            .activate_attempt_object(
+                &control,
+                &successor_attempt,
+                &object.group_id,
+                4,
+                &object.commitment,
+                &successor_hash,
+            )
+            .unwrap();
+        assert!(
+            volumes
+                .remove_unreachable_for_attempt(
+                    &control,
+                    &old_attempt,
+                    &old_hash,
+                    &object.group_id,
+                    4,
+                    &object.commitment.root,
+                )
+                .unwrap()
+        );
+        let active: VolumeReceipt = decode_canonical(
+            &control
+                .get_record("volume-receipt", &active_id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(active.volume_id, successor_receipt.volume_id);
+        assert_eq!(
+            volumes
+                .load_ready_variable(&control, &object.group_id, 4)
+                .unwrap(),
+            object
+        );
+        assert!(control.records("volume-copy-cleanup").unwrap().is_empty());
+        drop(volumes);
+        drop(control);
+
+        let (control, _) = open_control_store(data.path(), &keys).unwrap();
+        let volumes = StorageVolumes::open(data.path(), keys, &control).unwrap();
+        assert_eq!(
+            volumes
+                .load_ready_variable(&control, &object.group_id, 4)
+                .unwrap(),
+            object
         );
     }
 
