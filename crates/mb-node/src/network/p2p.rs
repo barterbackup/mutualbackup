@@ -26443,12 +26443,46 @@ mod tests {
         }
         drop(clients);
         drop(nodes);
+        async fn reopen_after_inbound_workers(path: std::path::PathBuf, seed: Seed) -> Node {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match Node::open(&path, seed.clone()) {
+                        Ok(node) => return node,
+                        Err(error)
+                            if error
+                                .to_string()
+                                .contains("node data directory is already in use") =>
+                        {
+                            // Tokio cannot cancel an already running inbound
+                            // spawn_blocking worker. Its final Arc can briefly
+                            // outlive the stopped network event loop.
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                        Err(error) => {
+                            panic!("could not reopen node after worker shutdown: {error:#}")
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("inbound workers retained the node directory after shutdown")
+        }
         let nodes = if offline_spare {
             vec![Arc::new(Mutex::new(
-                Node::open(temp.path().join("node-0"), seeds[0].clone()).unwrap(),
+                reopen_after_inbound_workers(temp.path().join("node-0"), seeds[0].clone()).await,
             ))]
         } else {
-            open_nodes()
+            let mut reopened = Vec::new();
+            for (index, seed) in seeds.iter().enumerate() {
+                reopened.push(Arc::new(Mutex::new(
+                    reopen_after_inbound_workers(
+                        temp.path().join(format!("node-{index}")),
+                        seed.clone(),
+                    )
+                    .await,
+                )));
+            }
+            reopened
         };
         assert_eq!(
             nodes[0]
