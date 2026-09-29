@@ -7281,7 +7281,21 @@ impl Node {
                 .iter()
                 .any(|retained| retained.group == *group)
         });
-        if !group_committed {
+        let local_id = self.keys.node_id();
+        let assigned = group.roles.iter().any(|role| match role {
+            ShardRoleV2::Information(information) => information.owner == local_id,
+            ShardRoleV2::Parity(parity) => parity.holder == local_id,
+        });
+        if !assigned {
+            anyhow::bail!("coding attempt assigns no shard to the local node");
+        }
+        let physical_shard = group.roles.iter().any(|role| match role {
+            ShardRoleV2::Information(information) => {
+                information.owner == local_id && !information.sector.virtual_zero
+            }
+            ShardRoleV2::Parity(parity) => parity.holder == local_id,
+        });
+        if !group_committed && physical_shard {
             // The holder can activate before receiving Add and has no local
             // launch job to pin reused READY information during checkpoint GC.
             // Publish the pin before making any shard READY in another DB.
@@ -9645,8 +9659,26 @@ impl Node {
             }
             // Remote holders have no delegator job, and activation can reuse
             // an old READY information object before its Add reaches them.
-            for (_, bytes) in self.control.records("coding-pending-activation")? {
+            for (id, bytes) in self.control.records("coding-pending-activation")? {
                 let plan: SignedRecord<CodingAttemptPlan> = decode_canonical(&bytes)?;
+                let local_id = self.keys.node_id();
+                let physical_shard = plan
+                    .value
+                    .geometry
+                    .information
+                    .iter()
+                    .any(|role| role.owner == local_id && !role.sector.virtual_zero)
+                    || plan
+                        .value
+                        .geometry
+                        .parity
+                        .iter()
+                        .any(|role| role.holder == local_id);
+                if !physical_shard {
+                    self.control
+                        .delete_record("coding-pending-activation", &id)?;
+                    continue;
+                }
                 pin_plan(&plan);
             }
         }
@@ -14862,7 +14894,7 @@ pub(crate) mod tests {
     #[test]
     fn retry_input_intent_pins_packed_cache_until_terminal_cleanup() {
         let temp = tempfile::tempdir().unwrap();
-        let seed = Seed::from_bytes([222; 32]);
+        let seed = Seed::from_bytes([223; 32]);
         let mut node = Node::open(temp.path(), seed.clone()).unwrap();
         let revision = install_public_restore_fixture(&mut node, &seed);
         let guild_id = revision.value.guild_id;
@@ -15098,6 +15130,129 @@ pub(crate) mod tests {
         assert_eq!(
             reopened.current_checkpoint(guild_id).unwrap().unwrap(),
             second
+        );
+    }
+
+    #[test]
+    fn zero_only_and_unassigned_activation_leave_no_pending_pin() {
+        let temp = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([222; 32]);
+        let mut node = Node::open(temp.path(), seed.clone()).unwrap();
+        let revision = install_public_restore_fixture(&mut node, &seed);
+        let keys = std::iter::once(seed.clone())
+            .chain((0_u8..4).map(|index| Seed::from_bytes([index + 228; 32])))
+            .map(|seed| KeyMaterial::from_seed(&seed))
+            .collect::<Vec<_>>();
+        let certificate = node.installed_guild_certificate().unwrap().unwrap();
+        let members = certificate.genesis.members.clone();
+        node.adopt_recovered_guild(
+            certificate,
+            members
+                .iter()
+                .cloned()
+                .map(|member| GuildPeer {
+                    member,
+                    endpoints: Vec::new(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        let local = members
+            .iter()
+            .find(|member| member.node_id == node.keys().node_id())
+            .unwrap();
+        let remotes = members
+            .iter()
+            .filter(|member| member.node_id != local.node_id)
+            .collect::<Vec<_>>();
+        let shards =
+            mb_core::encode(mb_core::CodingProfile::new(1, 1, 64), vec![vec![0; 64]]).unwrap();
+        let plan = CodingAttemptPlan {
+            format_version: 3,
+            attempt_id: [181; 16],
+            checkpoint_hash: [182; 32],
+            membership_epoch: 1,
+            geometry: mb_core::CodingPlanGeometry {
+                format_version: 1,
+                guild_id: revision.value.guild_id,
+                profile: mb_core::CodingProfile::new(1, 1, 64),
+                information: vec![mb_core::InformationRoleV2 {
+                    owner: local.node_id,
+                    failure_domain: local.failure_domain.clone(),
+                    sector: mb_core::RangeSectorRef {
+                        id: [183; 32],
+                        commitment: merkle_commit(&shards[0]).unwrap(),
+                        logical_len: 64,
+                        virtual_zero: true,
+                    },
+                }],
+                parity: vec![mb_core::ParityPlacementV2 {
+                    holder: remotes[0].node_id,
+                    failure_domain: remotes[0].failure_domain.clone(),
+                    row: 0,
+                }],
+            },
+            delegator: remotes[1].node_id,
+            coding_coordinator: remotes[2].node_id,
+            verification_coordinator: remotes[3].node_id,
+            expires_at_unix_seconds: unix_seconds() + 600,
+            information_roots: Some(vec![[0; 32]]),
+        };
+        let delegator = keys
+            .iter()
+            .find(|key| key.node_id() == plan.delegator)
+            .unwrap();
+        let plan = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, delegator).unwrap();
+        let transcript = test_coding_transcript(plan.clone(), &shards, &keys);
+        node.activate_coding_attempt(&transcript).unwrap();
+        assert!(
+            node.control
+                .get_record("coding-pending-activation", &plan.value.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut unassigned = plan.value.clone();
+        unassigned.attempt_id = [184; 16];
+        unassigned.geometry.information[0].owner = remotes[1].node_id;
+        unassigned.geometry.information[0].failure_domain = remotes[1].failure_domain.clone();
+        let unassigned =
+            SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, unassigned, delegator).unwrap();
+        let unassigned_transcript = test_coding_transcript(unassigned.clone(), &shards, &keys);
+        assert!(
+            node.activate_coding_attempt(&unassigned_transcript)
+                .is_err()
+        );
+        assert!(
+            node.control
+                .get_record("coding-pending-activation", &unassigned.value.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+
+        // Opening an older store may encounter pins written for attempts that
+        // never had a physical shard on this node. Reconciliation retires them.
+        node.control
+            .put_record(
+                "coding-pending-activation",
+                &plan.value.attempt_id,
+                &canonical_bytes(&plan).unwrap(),
+            )
+            .unwrap();
+        node.reconcile_garbage_collection().unwrap();
+        assert!(
+            node.control
+                .get_record("coding-pending-activation", &plan.value.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+        drop(node);
+        let node = Node::open(temp.path(), seed).unwrap();
+        assert!(
+            node.control
+                .records("coding-pending-activation")
+                .unwrap()
+                .is_empty()
         );
     }
 

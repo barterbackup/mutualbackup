@@ -3920,7 +3920,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   it on catch-up, recovery and Forget. Regress a replay-valid wrong-attempt
   response preceding the correct source.
 
-- [ ] **M5-148 / P2 — Clear orphan pending activation pins.**
+- [x] **M5-148 / P2 — Clear orphan pending activation pins.**
   Activation contacts every information owner, including virtual-zero-only
   owners (`network/p2p.rs:8006-8025`), and writes their durable
   `coding-pending-activation` record before recognizing the zero role
@@ -3935,7 +3935,12 @@ node Clippy gate passed locally. No remote compilation server was used.
   role before persisting a pin. Regress stale abort, checkpoint GC and repeated
   reopen for a virtual-zero-only owner, plus rejected non-holder activation.
   This review ran no builds, tests, daemons or runtime probes; M5-143's
-  passing gate remains evidence for its exercised cases.
+  passing gate remains evidence for its exercised cases. Implemented in the
+  next correction: activation now checks local assignment before any pin write
+  and writes a pin only for a physical local shard. GC retires legacy pins
+  whose plans give this node no physical shard. The zero-only/non-holder and
+  existing remote-information retention regressions pass through reopen;
+  formatting and strict all-target `mb-node` Clippy pass locally.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

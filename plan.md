@@ -99,8 +99,10 @@ point. A source-only review of `6606cc1` found M5-144 through M5-148:
 variable-profile shards are stranded by volume drain; cold recovery and legacy
 Forget can each lose historical Add evidence; a certified Add does not bind
 its exact verifier attempt against a wrong but replay-valid peer response; and
-stale abort leaves virtual-zero-only activation pins. Milestone 5 is reopened
-for these corrections and a new exact-source gate; Milestone 6 waits.
+stale abort leaves virtual-zero-only activation pins. M5-148 is corrected:
+activation checks local assignment before a pin write, zero-only roles make no
+pin, and GC retires legacy nonphysical pins. Milestone 5 remains open for
+M5-144 through M5-147 and a new exact-source gate; Milestone 6 waits.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and
@@ -2327,8 +2329,11 @@ without backfilling its event record (M5-146). Event-tail installation still
 accepts any replay-valid same-group transcript from the first responding peer
 because certified Add does not name the verifier attempt (M5-147). Finally,
 virtual-zero-only owners activated before Add are omitted from stale abort and
-keep durable pending pins (M5-148). Correct these paths, review the resulting
-source, and rerun the complete local exact-source workspace, Docker safety,
+keep durable pending pins (M5-148). M5-148 now avoids those pins, rejects
+non-holder activation before mutation, and retires legacy orphan pins during
+GC; focused regressions and strict `mb-node` Clippy pass locally. Correct the
+remaining paths, review the resulting source, and rerun the complete local
+exact-source workspace, Docker safety,
 fresh disposable Btrfs/network and independent resource-cleanup gate before
 closing Milestone 5. M5-143 remains passing evidence for its exact prior
 source; this review ran no builds, tests, daemons or runtime probes.
