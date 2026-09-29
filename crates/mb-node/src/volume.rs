@@ -1795,6 +1795,17 @@ impl StorageVolumes {
                 volume_interruption(VolumeInterruption::MigrationReceiptStored)?;
                 moved += 1;
             }
+            let remaining = self
+                .volumes
+                .get(&source_id)
+                .and_then(|volume| volume.store.as_ref())
+                .expect("draining source is online")
+                .variable_object_count()?;
+            if remaining != 0 {
+                bail!(
+                    "draining volume still contains {remaining} variable-profile objects or reservations"
+                );
+            }
             self.settle_empty_volume_location_evidence(control, source_id)?;
             let source = self.volumes.get_mut(&source_id).expect("source exists");
             source.record.configured = false;
@@ -4431,6 +4442,123 @@ mod tests {
             volumes
                 .load_ready_variable(&control, &object.group_id, 4)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn draining_volume_with_variable_ready_shard_keeps_receipt_and_source() {
+        let data = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        let destination = TempDir::new().unwrap();
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([165; 32])));
+        let attempt = [166; 16];
+        let verification_hash = [167; 32];
+        let bytes = vec![168; 64];
+        let object = VariableParityObject {
+            format_version: 2,
+            guild_id: [169; 32],
+            group_id: [170; 32],
+            shard_index: 4,
+            commitment: mb_core::merkle_commit(&bytes).unwrap(),
+            bytes,
+        };
+        let (control, _) = open_control_store(data.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(data.path(), keys.clone(), &control).unwrap();
+        volumes
+            .configure(&control, &[source.path().to_path_buf()], 1024 * 1024, 0)
+            .unwrap();
+        let receipt = volumes
+            .stage_attempt(&control, &attempt, &object, b"staged")
+            .unwrap();
+        volumes
+            .activate_attempt_object(
+                &control,
+                &attempt,
+                &object.group_id,
+                object.shard_index,
+                &object.commitment,
+                &verification_hash,
+            )
+            .unwrap();
+        volumes.finalize_attempt(&control, &attempt).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[
+                    source.path().to_path_buf(),
+                    destination.path().to_path_buf(),
+                ],
+                1024 * 1024,
+                0,
+            )
+            .unwrap();
+        volumes.mark_draining(&control, receipt.volume_id).unwrap();
+        assert!(volumes.migrate_draining(&control).is_err());
+        assert_eq!(
+            volumes
+                .volumes
+                .get(&receipt.volume_id)
+                .unwrap()
+                .record
+                .state,
+            StorageVolumeState::Draining
+        );
+        assert_eq!(
+            volumes
+                .receipt(&control, &object.group_id, object.shard_index as u8)
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(
+            volumes
+                .load_ready_variable(&control, &object.group_id, object.shard_index)
+                .unwrap(),
+            object
+        );
+        drop(volumes);
+        drop(control);
+
+        let (control, _) = open_control_store(data.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(data.path(), keys.clone(), &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[
+                    source.path().to_path_buf(),
+                    destination.path().to_path_buf(),
+                ],
+                1024 * 1024,
+                0,
+            )
+            .unwrap();
+        assert!(volumes.migrate_draining(&control).is_err());
+        assert_eq!(
+            volumes
+                .load_ready_variable(&control, &object.group_id, object.shard_index)
+                .unwrap(),
+            object
+        );
+        assert!(
+            volumes
+                .remove_unreachable_for_attempt(
+                    &control,
+                    &attempt,
+                    &verification_hash,
+                    &object.group_id,
+                    object.shard_index as u8,
+                    &object.commitment.root,
+                )
+                .unwrap()
+        );
+        assert_eq!(volumes.migrate_draining(&control).unwrap(), 0);
+        assert_eq!(
+            volumes
+                .volumes
+                .get(&receipt.volume_id)
+                .unwrap()
+                .record
+                .state,
+            StorageVolumeState::Retired
         );
     }
 

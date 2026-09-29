@@ -1752,6 +1752,16 @@ impl ParityStore {
         u64::try_from(count).map_err(|_| DatabaseError::Integrity)
     }
 
+    pub fn variable_object_count(&self) -> Result<u64, DatabaseError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT (SELECT count(*) FROM parity_objects WHERE format_version = 2)
+                  + (SELECT count(*) FROM coding_reservations)",
+            [],
+            |row| row.get(0),
+        )?;
+        u64::try_from(count).map_err(|_| DatabaseError::Integrity)
+    }
+
     pub fn first_ready_object(&self) -> Result<Option<ParityObject>, DatabaseError> {
         let identity = self
             .connection

@@ -3868,7 +3868,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   M5-144 through M5-148 below and reopened it. M5-143 and M5-137 remain
   historical passing evidence for their exact tested sources.
 
-- [ ] **M5-144 / P1 — Migrate variable-profile READY shards before retiring a volume.**
+- [x] **M5-144 / P1 — Keep variable-profile shards accessible during volume drain.**
   The public drain/migrate path reaches `StorageVolumes::migrate_draining`
   without a variable-shard guard (`node.rs:2112-2120`). Its only drain
   iterator, `ParityStore::first_ready_object`, selects `format_version = 1`
@@ -3878,9 +3878,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   shards remain on it (`volume.rs:1798-1804`, `:1915-1938`). Subsequent
   variable reads require that missing receipt (`volume.rs:1405-1427`), and the
   volume is reported safe to remove. Include format-2 objects in a durable
-  cross-volume migration or refuse retirement while any remain. Regress a
-  two-volume format-2 shard, interrupted migration, repeated reopen, source
-  removal, and successful recovery from the destination.
+  cross-volume migration or refuse retirement while any remain. The correction
+  chooses safe refusal: after migrating any format-1 objects, drain will not
+  retire a source while format-2 objects or coding reservations remain. Its
+  receipt and readable source stay durable until ordinary cleanup removes the
+  shard. A two-volume format-2 READY regression confirms repeated migration
+  attempts and reopen retain the receipt and readable object, then allows
+  retirement after terminal cleanup. The volume and store suites pass locally.
 
 - [ ] **M5-145 / P1 — Preserve forgotten-Add evidence during seed recovery.**
   Cold dynamic recovery fetches transcripts only for currently retained
