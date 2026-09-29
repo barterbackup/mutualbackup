@@ -91,8 +91,10 @@ ordinary lifecycle Forget can leave completed-group parity without cleanup
 ownership (M5-136). M5-135/M5-136/M5-138 were corrected in `9da97eb`, and
 the M5-137 local gate passed on `666697a`. A source-only review of `0000d9d`
 found M5-139 through M5-142 in same-ID volume receipts, historical Add replay,
-pending information retention, and partial repair cleanup. Milestone 5 is
-reopened for these corrections and M5-143; Milestone 6 waits.
+pending information retention, and partial repair cleanup. The corrections
+are implemented in `123d5af`, `3419415`, `366e9e5`, and `7392e6d`, with
+focused regressions passing. Milestone 5 remains open for M5-143; Milestone 6
+waits.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and
@@ -2292,6 +2294,18 @@ attempt receipt, losing the row from which the current retry path discovers it
 regressions, and pass the complete exact-source local M5-143 gate before
 closing Milestone 5. M5-137 remains passing historical evidence for its tested
 source; this review ran no builds, tests, daemons, or runtime probes.
+
+M5-139 through M5-142 are now implemented. Cross-volume activation transfers
+the active receipt while retaining old-volume cleanup ownership; cleanup
+cannot acknowledge a newer READY copy through a stale receipt. Add events
+retain their own verifier transcript for catch-up and Forget, with ambiguous
+pre-binding forgotten Adds rejected instead of assigned a successor's attempt.
+Remote holders pin verified pending information until Add or terminal cleanup.
+Repaired-parity deletion records durable per-attempt retirement before removing
+the row, so a later pass can retire its receipt after interruption or offline
+volume recovery. Focused regressions, CDDL/transport checks, dynamic recovery,
+formatting and strict `mb-node` Clippy passed locally. M5-143's complete
+exact-source local gate still determines closure.
 
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
 launch-expiry regressions found duplicate same-lane successors. Renewal now

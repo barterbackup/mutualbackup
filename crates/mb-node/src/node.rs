@@ -17730,7 +17730,9 @@ pub(crate) mod tests {
                 .unwrap();
             lagging.install_guild_event(retire).unwrap();
             lagging.install_guild_event(forget).unwrap();
-            for (_, bytes) in lagging.control.records("coding-holder-cleanup").unwrap() {
+            let obligations = lagging.control.records("coding-holder-cleanup").unwrap();
+            assert!(!obligations.is_empty());
+            for (_, bytes) in obligations {
                 let obligation: CodingHolderCleanupObligation = decode_canonical(&bytes).unwrap();
                 assert_eq!(obligation.plan.value.attempt_id, plan.value.attempt_id);
                 assert_ne!(obligation.plan.value.attempt_id, successor.value.attempt_id);
