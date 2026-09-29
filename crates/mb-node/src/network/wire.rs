@@ -100,6 +100,12 @@ pub(super) enum PeerRequest {
         guild_id: [u8; 32],
         group_id: [u8; 32],
     },
+    GetCodingTranscriptForEvent {
+        guild_id: [u8; 32],
+        group_id: [u8; 32],
+        event_sequence: u64,
+        event_hash: [u8; 32],
+    },
     ExchangeEndpoints {
         guild_id: [u8; 32],
     },
@@ -363,6 +369,7 @@ impl PeerRequest {
                 | Self::GetGuildGenesis { .. }
                 | Self::GetGuildEventTail { .. }
                 | Self::GetCodingTranscript { .. }
+                | Self::GetCodingTranscriptForEvent { .. }
                 | Self::ExchangeEndpoints { .. }
                 | Self::CodingCapacity { .. }
         )
@@ -386,6 +393,7 @@ impl PeerRequest {
             | Self::GetGuildGenesis { .. }
             | Self::GetGuildEventTail { .. }
             | Self::GetCodingTranscript { .. }
+            | Self::GetCodingTranscriptForEvent { .. }
             | Self::ExchangeEndpoints { .. }
             | Self::CodingCapacity { .. } => None,
             #[cfg(test)]
@@ -483,7 +491,8 @@ impl PeerRequest {
             Self::InstallGuildEvent { certified } => Some(certified.event.guild_id),
             Self::SignCodingGroupEvent { event, .. } => Some(event.guild_id),
             Self::InstallCodingGroupEvent { certified, .. } => Some(certified.event.guild_id),
-            Self::GetCodingTranscript { guild_id, .. } => Some(*guild_id),
+            Self::GetCodingTranscript { guild_id, .. }
+            | Self::GetCodingTranscriptForEvent { guild_id, .. } => Some(*guild_id),
             Self::PublishParity { object, .. } => Some(object.guild_id),
             Self::StageCodingParity { plan, .. }
             | Self::ReserveCodingInformation { plan, .. }
@@ -1176,6 +1185,12 @@ mod tests {
                 certified: Box::new(certified.clone()),
                 transcript: Box::new(transcript.clone()),
             },
+            PeerRequest::GetCodingTranscriptForEvent {
+                guild_id: event.guild_id,
+                group_id: manifest.value.group.id,
+                event_sequence: event.sequence,
+                event_hash: event.hash().unwrap(),
+            },
         ];
         let mut codec = libp2p::request_response::cbor::codec::Codec::<
             SignedRecord<PeerRequestEnvelope>,
@@ -1190,6 +1205,7 @@ mod tests {
                 request.value.request,
                 PeerRequest::RetireCodingAttempt { .. }
                     | PeerRequest::GetCodingAttemptRetirement { .. }
+                    | PeerRequest::GetCodingTranscriptForEvent { .. }
             ) {
                 let bytes = cbor4ii::serde::to_vec(Vec::new(), &request).unwrap();
                 cddl_cat::validate_cbor_bytes("signed-peer-request", SCHEMA, &bytes).unwrap();

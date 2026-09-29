@@ -857,6 +857,22 @@ impl NodeReader {
         Ok(transcript)
     }
 
+    pub(crate) fn coding_transcript_for_event(
+        &self,
+        guild_id: [u8; 32],
+        group_id: [u8; 32],
+        event_sequence: u64,
+        event_hash: [u8; 32],
+    ) -> Result<SignedRecord<CodingVerificationTranscript>> {
+        coding_transcript_for_event_from_store(
+            &self.control,
+            guild_id,
+            group_id,
+            event_sequence,
+            event_hash,
+        )
+    }
+
     pub(crate) fn peer_exchange_endpoints(
         &self,
         guild_id: [u8; 32],
@@ -2562,8 +2578,12 @@ impl Node {
         let mut checkpoint_membership =
             checkpoint_matches_dynamic_authority(&checkpoint.checkpoint, &state);
         let mut event_records = Vec::with_capacity(events.len());
+        let mut add_event_hashes = BTreeMap::new();
         for event in events {
             let record_id = event.event.sequence.to_be_bytes().to_vec();
+            if let mb_core::GuildEventKind::AddCodingGroup { group } = &event.event.kind {
+                add_event_hashes.insert((event.event.sequence, group.id), event.event.hash()?);
+            }
             state.apply_event(&event)?;
             authority_states
                 .entry(state.membership_epoch)
@@ -2637,6 +2657,14 @@ impl Node {
             transcript_records.push((
                 "coding-group-transcript".to_owned(),
                 retained.group.id.to_vec(),
+                bytes.clone(),
+            ));
+            let add_hash = add_event_hashes
+                .get(&(retained.added_at_event, retained.group.id))
+                .context("retained coding group has no historical Add event")?;
+            transcript_records.push((
+                "coding-event-transcript".to_owned(),
+                add_hash.to_vec(),
                 bytes,
             ));
         }
@@ -2929,7 +2957,32 @@ impl Node {
             }
             if let Some(transcript) = transcript {
                 let attempt_id = transcript.value.plan.value.attempt_id;
-                self.persist_coding_group_transcript(&transcript)?;
+                let group = &transcript.value.manifest.value.group;
+                let event_hash = certified.event.hash()?;
+                if let Some(existing) = self
+                    .control
+                    .get_record("coding-event-transcript", &event_hash)?
+                    && existing != canonical_bytes(&transcript)?
+                {
+                    anyhow::bail!("historical Add conflicts with its bound verifier evidence");
+                }
+                let current_add = state.coding_groups.iter().any(|retained| {
+                    retained.group == *group && retained.added_at_event == sequence
+                });
+                if current_add {
+                    self.persist_coding_group_transcript(&transcript)?;
+                    self.control.put_record(
+                        "coding-event-transcript",
+                        &event_hash,
+                        &canonical_bytes(&transcript)?,
+                    )?;
+                } else if self
+                    .control
+                    .get_record("coding-event-transcript", &event_hash)?
+                    .is_none()
+                {
+                    anyhow::bail!("historical Add has no event-bound verifier evidence");
+                }
                 self.volumes.finalize_attempt(&self.control, &attempt_id)?;
                 self.control
                     .delete_record("coding-pending-activation", &attempt_id)?;
@@ -2960,7 +3013,18 @@ impl Node {
                 .iter()
                 .find(|retained| retained.group.id == *group_id)
                 .context("forgotten coding group is absent from guild history")?;
-            let transcript = self.coding_transcript_for_group(state.guild_id, *group_id)?;
+            let add_event: QuorumGuildEvent = decode_canonical(
+                &self
+                    .control
+                    .get_record("guild-event", &retained.added_at_event.to_be_bytes())?
+                    .context("forgotten coding group has no historical Add event")?,
+            )?;
+            let transcript = self.coding_transcript_for_event(
+                state.guild_id,
+                *group_id,
+                retained.added_at_event,
+                add_event.event.hash()?,
+            )?;
             if transcript.value.manifest.value.group != retained.group {
                 anyhow::bail!("forgotten coding group has conflicting verifier evidence");
             }
@@ -3032,6 +3096,14 @@ impl Node {
         if let Some(transcript) = transcript {
             self.validate_coding_transcript_storage_conflicts(&transcript)?;
             let bytes = canonical_bytes(&transcript)?;
+            let event_hash = certified.event.hash()?;
+            if self
+                .control
+                .get_record("coding-event-transcript", &event_hash)?
+                .is_some_and(|existing| existing != bytes)
+            {
+                anyhow::bail!("coding Add conflicts with its bound verifier evidence");
+            }
             records.push((
                 "coding-transcript".to_owned(),
                 transcript.value.plan.value.attempt_id.to_vec(),
@@ -3040,6 +3112,11 @@ impl Node {
             records.push((
                 "coding-group-transcript".to_owned(),
                 transcript.value.manifest.value.group.id.to_vec(),
+                bytes.clone(),
+            ));
+            records.push((
+                "coding-event-transcript".to_owned(),
+                event_hash.to_vec(),
                 bytes,
             ));
         }
@@ -3149,6 +3226,22 @@ impl Node {
             anyhow::bail!("stored coding-group verifier transcript is invalid");
         }
         Ok(transcript)
+    }
+
+    pub(crate) fn coding_transcript_for_event(
+        &self,
+        guild_id: [u8; 32],
+        group_id: [u8; 32],
+        event_sequence: u64,
+        event_hash: [u8; 32],
+    ) -> Result<SignedRecord<CodingVerificationTranscript>> {
+        coding_transcript_for_event_from_store(
+            &self.control,
+            guild_id,
+            group_id,
+            event_sequence,
+            event_hash,
+        )
     }
 
     pub(crate) fn recovery_coding_transcript_for_group(
@@ -12162,6 +12255,58 @@ fn validate_dynamic_state_origin(
     Ok(())
 }
 
+fn coding_transcript_for_event_from_store(
+    control: &ControlStore,
+    guild_id: [u8; 32],
+    group_id: [u8; 32],
+    event_sequence: u64,
+    event_hash: [u8; 32],
+) -> Result<SignedRecord<CodingVerificationTranscript>> {
+    let certified: QuorumGuildEvent = decode_canonical(
+        &control
+            .get_record("guild-event", &event_sequence.to_be_bytes())?
+            .context("coding Add event is unavailable")?,
+    )?;
+    if certified.event.guild_id != guild_id
+        || certified.event.sequence != event_sequence
+        || certified.event.hash()? != event_hash
+    {
+        anyhow::bail!("requested coding transcript has the wrong Add event");
+    }
+    let mb_core::GuildEventKind::AddCodingGroup { group } = &certified.event.kind else {
+        anyhow::bail!("requested event is not a coding Add");
+    };
+    if group.id != group_id {
+        anyhow::bail!("requested coding transcript has the wrong group");
+    }
+    let bytes = if let Some(bytes) = control.get_record("coding-event-transcript", &event_hash)? {
+        bytes
+    } else {
+        // Pre-binding stores can safely supply the current retained Add:
+        // another transcript cannot overwrite its group key while retained.
+        let retained: DynamicGuildState = decode_canonical(
+            &control
+                .get_record("guild-dynamic-state", b"primary")?
+                .context("node has no dynamic guild state")?,
+        )?;
+        if !retained.coding_groups.iter().any(|retained| {
+            retained.group.id == group_id && retained.added_at_event == event_sequence
+        }) {
+            anyhow::bail!("historical coding Add has no event-bound verifier evidence");
+        }
+        control
+            .get_record("coding-group-transcript", &group_id)?
+            .context("retained coding-group verifier transcript is unavailable")?
+    };
+    let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(&bytes)?;
+    if transcript.value.manifest.value.group != *group
+        || replay_coding_transcript(&transcript)? != CodingReplayFinding::Verified
+    {
+        anyhow::bail!("event-bound coding transcript is invalid");
+    }
+    Ok(transcript)
+}
+
 fn guild_event_tail_from_store(
     control: &ControlStore,
     base_sequence: u64,
@@ -17307,6 +17452,8 @@ pub(crate) mod tests {
         let volume = temp.path().join("volume");
         std::fs::create_dir(&volume).unwrap();
         let (seed, certificate, peers) = recovery_guild_fixture();
+        let catchup_certificate = certificate.clone();
+        let catchup_peers = peers.clone();
         let keys = (0_u8..5)
             .map(|i| KeyMaterial::from_seed(&Seed::from_bytes([120 + i; 32])))
             .collect::<Vec<_>>();
@@ -17431,7 +17578,7 @@ pub(crate) mod tests {
                 group: group.clone(),
             },
         );
-        node.install_coding_group_event(add, transcript.clone())
+        node.install_coding_group_event(add.clone(), transcript.clone())
             .unwrap();
         // The delegator can have retired the group while this holder has only
         // installed Add. Its early abort must still leave a durable cleanup
@@ -17448,7 +17595,7 @@ pub(crate) mod tests {
                 retain_through_event: state.event_sequence + 1,
             },
         );
-        node.install_guild_event(retire).unwrap();
+        node.install_guild_event(retire.clone()).unwrap();
         node.mark_retired_coding_activation_for_replan(&transcript)
             .unwrap();
         assert!(node.discard_coding_attempt(&plan.value.attempt_id).unwrap());
@@ -17473,7 +17620,7 @@ pub(crate) mod tests {
                 .unwrap()
         );
         drop(node);
-        let mut node = Node::open(temp.path().join("node"), seed).unwrap();
+        let mut node = Node::open(temp.path().join("node"), seed.clone()).unwrap();
         assert!(node.coding_activation_needs_replan(&transcript).unwrap());
         assert_eq!(node.coding_holder_cleanup_count_for_test().unwrap(), 1);
         let state = node.dynamic_guild_state().unwrap().unwrap();
@@ -17481,7 +17628,7 @@ pub(crate) mod tests {
             &state,
             mb_core::GuildEventKind::ForgetCodingGroup { group_id: group.id },
         );
-        node.install_guild_event(forget).unwrap();
+        node.install_guild_event(forget.clone()).unwrap();
         assert!(node.discard_coding_attempt(&plan.value.attempt_id).unwrap());
         assert_eq!(
             node.coding_holder_cleanup_count_for_test().unwrap(),
@@ -17527,21 +17674,68 @@ pub(crate) mod tests {
             local_parity
         );
         let state = node.dynamic_guild_state().unwrap().unwrap();
-        node.install_coding_group_event(
-            sign_event(
-                &state,
-                mb_core::GuildEventKind::AddCodingGroup {
-                    group: group.clone(),
-                },
-            ),
-            next.clone(),
-        )
-        .unwrap();
+        let successor_add = sign_event(
+            &state,
+            mb_core::GuildEventKind::AddCodingGroup {
+                group: group.clone(),
+            },
+        );
+        node.install_coding_group_event(successor_add.clone(), next.clone())
+            .unwrap();
         assert_eq!(
             node.coding_transcript_for_group(state.guild_id, group.id)
                 .unwrap(),
             next
         );
+        if active_count == 5 {
+            let old_hash = add.event.hash().unwrap();
+            let new_hash = successor_add.event.hash().unwrap();
+            assert_eq!(
+                node.coding_transcript_for_event(
+                    state.guild_id,
+                    group.id,
+                    add.event.sequence,
+                    old_hash,
+                )
+                .unwrap(),
+                transcript
+            );
+            assert_eq!(
+                node.reader_config()
+                    .open()
+                    .unwrap()
+                    .coding_transcript_for_event(
+                        state.guild_id,
+                        group.id,
+                        successor_add.event.sequence,
+                        new_hash,
+                    )
+                    .unwrap(),
+                next
+            );
+            assert!(
+                node.install_coding_group_event(add.clone(), next.clone())
+                    .is_err()
+            );
+
+            let mut lagging = Node::open(temp.path().join("lagging"), seed).unwrap();
+            lagging
+                .adopt_recovered_guild(catchup_certificate, catchup_peers)
+                .unwrap();
+            let old_evidence = node
+                .coding_transcript_for_event(state.guild_id, group.id, add.event.sequence, old_hash)
+                .unwrap();
+            lagging
+                .install_coding_group_event(add, old_evidence)
+                .unwrap();
+            lagging.install_guild_event(retire).unwrap();
+            lagging.install_guild_event(forget).unwrap();
+            for (_, bytes) in lagging.control.records("coding-holder-cleanup").unwrap() {
+                let obligation: CodingHolderCleanupObligation = decode_canonical(&bytes).unwrap();
+                assert_eq!(obligation.plan.value.attempt_id, plan.value.attempt_id);
+                assert_ne!(obligation.plan.value.attempt_id, successor.value.attempt_id);
+            }
+        }
     }
 
     #[test]

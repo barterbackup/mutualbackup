@@ -2049,6 +2049,39 @@ impl P2pClient {
             .context("coding-transcript verifier failed")?
     }
 
+    pub(crate) async fn coding_transcript_for_event(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        group_id: [u8; 32],
+        event_sequence: u64,
+        event_hash: [u8; 32],
+    ) -> Result<VerifiedCodingTranscript> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::GetCodingTranscriptForEvent {
+                    guild_id,
+                    group_id,
+                    event_sequence,
+                    event_hash,
+                },
+            )
+            .await?;
+        let PeerResponse::CodingVerificationTranscript(transcript) = response else {
+            bail!("peer returned the wrong event-bound coding transcript response");
+        };
+        let transcript = *transcript;
+        if transcript.value.manifest.value.group.guild_id != guild_id
+            || transcript.value.manifest.value.group.id != group_id
+        {
+            bail!("peer returned invalid event-bound coding evidence");
+        }
+        tokio::task::spawn_blocking(move || VerifiedCodingTranscript::verify(transcript))
+            .await
+            .context("event-bound coding-transcript verifier failed")?
+    }
+
     pub async fn submit_backup(
         &self,
         coordinator: NodeId,
@@ -9090,12 +9123,21 @@ async fn install_coding_group_event_from_sources(
     );
     let mut seen = BTreeSet::new();
     ordered.retain(|source| seen.insert(*source));
+    let event_sequence = event.event.sequence;
+    let event_hash = event.event.hash()?;
     let requests = FuturesUnordered::new();
     for source in ordered {
         requests.push(async move {
             (
                 source,
-                p2p.coding_transcript(source, guild_id, group_id).await,
+                p2p.coding_transcript_for_event(
+                    source,
+                    guild_id,
+                    group_id,
+                    event_sequence,
+                    event_hash,
+                )
+                .await,
             )
         });
     }

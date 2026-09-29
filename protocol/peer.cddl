@@ -56,6 +56,12 @@ peer-request =
         transcript: signed-coding-transcript
       } }
   / { "GetCodingTranscript": { guild_id: bytes32-array, group_id: bytes32-array } }
+  / { "GetCodingTranscriptForEvent": {
+        guild_id: bytes32-array,
+        group_id: bytes32-array,
+        event_sequence: uint,
+        event_hash: bytes32-array
+      } }
   / { "ExchangeEndpoints": { guild_id: bytes32-array } }
   / { "GetPreparedRevisionPage": { guild_id: bytes32-array, revision_id: uuid-bytes, page_index: uint } }
   / { "EnsureFiller": { guild_id: bytes32-array, revision_id: uuid-bytes, ordinal: uint } }
