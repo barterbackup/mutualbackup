@@ -3895,7 +3895,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   or provide another sound replay path. Regress a cold-recovered sole source
   and a lagging member crossing a forgotten Add and later events.
 
-- [ ] **M5-146 / P1 — Backfill a legacy retained Add binding before Forget.**
+- [x] **M5-146 / P1 — Backfill a legacy retained Add binding before Forget.**
   A pre-M5-140 store has a retained group transcript but no event-keyed
   transcript. The new lookup can use that group-key record while the Add is
   retained (`node.rs:12282-12299`), and Forget loads it successfully
@@ -3905,6 +3905,11 @@ node Clippy gate passed locally. No remote compilation server was used.
   successor arrives, blocking lagging event-tail catch-up. Atomically preserve
   the unambiguous original binding during Forget; regress upgrade from a
   pre-binding retained Add, Forget, same-ID re-Add and lagging catch-up.
+  Implemented by writing the original Add's verified transcript atomically
+  with Forget and its cleanup obligations. The existing three- and five-domain
+  same-ID catch-up regressions now simulate a pre-binding store, check the
+  original binding before and after Forget and reopen, and pass locally with
+  formatting and strict all-target `mb-node` Clippy.
 
 - [ ] **M5-147 / P1 — Certify the Add event's exact verifier attempt.**
   `AddCodingGroup` signs only the group (`guild.rs:135-137`), and the group ID

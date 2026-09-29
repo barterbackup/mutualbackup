@@ -3028,7 +3028,7 @@ impl Node {
             if transcript.value.manifest.value.group != retained.group {
                 anyhow::bail!("forgotten coding group has conflicting verifier evidence");
             }
-            Some(transcript)
+            Some((add_event.event.hash()?, transcript))
         } else {
             None
         };
@@ -3048,7 +3048,23 @@ impl Node {
                 canonical_bytes(&state)?,
             ),
         ];
-        if let Some(transcript) = forgotten_group {
+        if let Some((add_hash, transcript)) = forgotten_group {
+            let bytes = canonical_bytes(&transcript)?;
+            if self
+                .control
+                .get_record("coding-event-transcript", &add_hash)?
+                .is_some_and(|existing| existing != bytes)
+            {
+                anyhow::bail!("forgotten coding Add conflicts with its verifier evidence");
+            }
+            // Legacy stores can reach Forget using their retained group-key
+            // transcript. Preserve that unambiguous Add binding atomically
+            // with the event that makes the retained fallback unavailable.
+            records.push((
+                "coding-event-transcript".to_owned(),
+                add_hash.to_vec(),
+                bytes,
+            ));
             let plan = transcript.value.plan.clone();
             self.validate_coding_attempt_authority(&plan)?;
             let parity_holders = transcript
@@ -17735,6 +17751,13 @@ pub(crate) mod tests {
         );
         node.install_coding_group_event(add.clone(), transcript.clone())
             .unwrap();
+        let old_add_hash = add.event.hash().unwrap();
+        assert!(
+            node.control
+                .delete_record("coding-event-transcript", &old_add_hash)
+                .unwrap(),
+            "simulate an upgraded store with a retained pre-binding Add"
+        );
         // The delegator can have retired the group while this holder has only
         // installed Add. Its early abort must still leave a durable cleanup
         // owner for the later Forget.
@@ -17783,7 +17806,39 @@ pub(crate) mod tests {
             &state,
             mb_core::GuildEventKind::ForgetCodingGroup { group_id: group.id },
         );
+        assert_eq!(
+            node.coding_transcript_for_event(
+                state.guild_id,
+                group.id,
+                add.event.sequence,
+                old_add_hash,
+            )
+            .unwrap(),
+            transcript
+        );
         node.install_guild_event(forget.clone()).unwrap();
+        assert_eq!(
+            node.coding_transcript_for_event(
+                state.guild_id,
+                group.id,
+                add.event.sequence,
+                old_add_hash,
+            )
+            .unwrap(),
+            transcript
+        );
+        drop(node);
+        let mut node = Node::open(temp.path().join("node"), seed.clone()).unwrap();
+        assert_eq!(
+            node.coding_transcript_for_event(
+                state.guild_id,
+                group.id,
+                add.event.sequence,
+                old_add_hash,
+            )
+            .unwrap(),
+            transcript
+        );
         assert!(node.discard_coding_attempt(&plan.value.attempt_id).unwrap());
         assert_eq!(
             node.coding_holder_cleanup_count_for_test().unwrap(),
