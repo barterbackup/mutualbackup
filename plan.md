@@ -92,9 +92,10 @@ ownership (M5-136). M5-135/M5-136/M5-138 were corrected in `9da97eb`, and
 the M5-137 local gate passed on `666697a`. A source-only review of `0000d9d`
 found M5-139 through M5-142 in same-ID volume receipts, historical Add replay,
 pending information retention, and partial repair cleanup. The corrections
-are implemented in `123d5af`, `3419415`, `366e9e5`, and `7392e6d`, with
-focused regressions passing. Milestone 5 remains open for M5-143; Milestone 6
-waits.
+are implemented in `123d5af`, `3419415`, `366e9e5`, and `7392e6d`. The
+complete local M5-143 gate passed on exact committed code source
+`8f60298a74b74fbef8b92b4eb6a00a92385e7a37`, closing Milestone 5.
+Milestone 6 is next.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and
@@ -2304,8 +2305,11 @@ Remote holders pin verified pending information until Add or terminal cleanup.
 Repaired-parity deletion records durable per-attempt retirement before removing
 the row, so a later pass can retire its receipt after interruption or offline
 volume recovery. Focused regressions, CDDL/transport checks, dynamic recovery,
-formatting and strict `mb-node` Clippy passed locally. M5-143's complete
-exact-source local gate still determines closure.
+formatting, strict workspace Clippy, the locked all-target workspace tests,
+Docker safety and all 24 fresh disposable Btrfs/network acceptance invocations
+passed locally on `8f60298`. An independent audit confirmed resource cleanup
+after the immediate snapshot differed only in iptables timestamps and counters.
+M5-143 passed and Milestone 5 is closed; exact results and logs are in TODO.md.
 
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
 launch-expiry regressions found duplicate same-lane successors. Renewal now

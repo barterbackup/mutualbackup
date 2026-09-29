@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (reopened by source review, 2026-09-29)
+## Milestone 5 guild geometry and coding protocol (closed after M5-143, 2026-09-29)
 
 The historical source-only review of the Milestone 5 changes through `a6b5d7d`
 found three blockers: negative verifier evidence could terminate retry
@@ -3841,16 +3841,30 @@ node Clippy gate passed locally. No remote compilation server was used.
   another volume is offline. The offline/restore and injected interruption
   regression passed locally through repeated reopen.
 
-- [ ] **M5-143 / gate — Recheck Milestone 5 after M5-139 through M5-142.**
+- [x] **M5-143 / gate — Recheck Milestone 5 after M5-139 through M5-142.**
   Review the corrected receipt, event-replay, information-GC, and repair paths
   with focused regressions. Then run the complete local exact-source workspace,
   Docker safety, fresh disposable Btrfs/network acceptance, and independent
-  resource-cleanup gate before closing Milestone 5. This source-only review of
-  `0000d9d` ran no builds, tests, daemons, or runtime probes. M5-137 remains
-  historical passing evidence for its exact committed source.
-  Focused M5-139 through M5-142, historical catch-up, CDDL/transport, dynamic
-  recovery and strict all-target `mb-node` Clippy have passed on the correction
-  series. The complete exact-source local gate remains pending.
+  resource-cleanup gate before closing Milestone 5. Passed on clean committed
+  code `8f60298a74b74fbef8b92b4eb6a00a92385e7a37`. Focused M5-139 through
+  M5-142, historical catch-up, CDDL/transport and dynamic recovery regressions
+  passed. Formatting, strict locked all-target workspace Clippy, Docker lab
+  safety, and the complete locked all-target workspace tests passed locally
+  (node suite: 297 passed, 11 expected ignored). A fresh disposable local
+  8 GiB Btrfs image passed all 24 `reflink-acceptance.sh` invocations,
+  including full-width QUIC backup (84.07s), repeated multi-owner QUIC backup
+  (592.91s), and five-daemon seed/DHT recovery over direct, hole-punched and
+  relay paths (1857.15s). The immediate resource snapshot differed only in
+  changing IPv4 iptables timestamps and packet counters; a separate normalized
+  audit confirmed the owned image, mount, loop, namespaces, links, daemons and
+  firewall rules gone, with forwarding and all other snapshots identical.
+  Logs: `/tmp/mutualbackup-m5-143-workspace.log`,
+  `/tmp/mutualbackup-m5-143-clippy.log`,
+  `/tmp/mutualbackup-m5-143-docker-safety.log`,
+  `/tmp/mutualbackup-m5-143-provisioned.log`, and
+  `/tmp/mutualbackup-m5-143-independent-audit.log`. All compilation and
+  execution were local; no remote compilation server was used. Milestone 5
+  is closed. M5-137 remains historical evidence for its earlier source.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
