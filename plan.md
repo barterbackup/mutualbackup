@@ -2234,6 +2234,18 @@ Milestone 5 is reopened and Milestone 6 waits. This
 review ran no builds, tests, daemons or runtime probes; M5-134 remains passing
 historical evidence for `a7da0ce`.
 
+The subsequent source-only review of the uncommitted M5-135/M5-136 changes
+found M5-138. A live group's parity can be repaired under a separate repair
+attempt ID. The new old-attempt cleanup correctly avoids deleting rows owned
+by a different attempt, but it acknowledges the Forget cleanup obligation
+while leaving that repaired READY parity and receipt behind. The new historical
+GC pass covers forgotten information, not forgotten parity, and the existing
+repair regression has to schedule parity GC manually. Finish parity cleanup
+for repaired shards while preserving a successor that reuses the group ID,
+then run M5-137 on the final committed source. Milestone 5 remains open and
+Milestone 6 waits. This review's conclusion is based on source inspection;
+M5-134 remains historical gate evidence for `a7da0ce`.
+
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
 launch-expiry regressions found duplicate same-lane successors. Renewal now
 reuses accepted verified activation or a live retry child before an existing

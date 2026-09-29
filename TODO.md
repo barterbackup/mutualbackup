@@ -3717,6 +3717,24 @@ node Clippy gate passed locally. No remote compilation server was used.
   Btrfs/network acceptance and independent resource-cleanup gate before
   closing Milestone 5. Keep M5-134 as historical evidence for `a7da0ce`.
 
+- [ ] **M5-138 / P1 — Clean repaired parity after ordinary Forget.** Source-only
+  review of the current uncommitted M5-135/M5-136 changes found that a parity
+  shard repaired while its group is live is stored under the repair ID
+  (`node.rs:7958-8061`). After Forget, `discard_coding_attempt` uses the
+  original coding attempt ID (`node.rs:7275-7341`), and the new
+  attempt-qualified removal deliberately skips that repaired READY row
+  (`volume.rs:688-703`). The cleanup obligation can then be acknowledged even
+  though the forgotten group's parity and receipt remain. The new historical
+  transcript GC pass schedules only information-sector cleanup
+  (`node.rs:9548-9572`); no routine path schedules the repaired parity after
+  the group has left dynamic state. The existing node regression explicitly
+  repairs this parity, then expects old-attempt cleanup to remove it
+  (`node.rs:19424-19460`, `:19618-19645`); its final GC removal is manually
+  scheduled by the test, not by the lifecycle. Make Forget cleanup retire
+  repaired parity safely without deleting a successor attempt that reuses the
+  group ID, and regress the repair/Forget/reopen path without manual GC setup.
+  M5-137 cannot close until this is fixed and its exact-source gate passes.
+
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
   to a shared disk, host, site, power source, operator, or provider—and no
