@@ -174,6 +174,16 @@ struct AttemptVolumeRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct AttemptRetirement {
+    format_version: u16,
+    volume_id: Uuid,
+    attempt_id: [u8; 16],
+    group_id: [u8; 32],
+    shard_index: u8,
+    cleanup_verification_hash: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct AttemptReservationRecord {
     format_version: u16,
     attempt_id: [u8; 16],
@@ -678,7 +688,7 @@ impl StorageVolumes {
             .chain(intent_volume)
             .all(|volume_id| self.volumes.contains_key(&volume_id));
         let mut newer_ready = false;
-        let mut removed_attempts = BTreeSet::new();
+        self.settle_attempt_retirements(control, group_id, shard_index, attempt)?;
         for (volume_id, volume) in &mut self.volumes {
             let required = receipt_volume == Some(*volume_id)
                 || intent_volume == Some(*volume_id)
@@ -707,7 +717,58 @@ impl StorageVolumes {
                     continue;
                 }
                 if let Some(stored_attempt) = stored.attempt_id {
-                    removed_attempts.insert(stored_attempt);
+                    let retirement = AttemptRetirement {
+                        format_version: 1,
+                        volume_id: *volume_id,
+                        attempt_id: stored_attempt,
+                        group_id: *group_id,
+                        shard_index,
+                        cleanup_verification_hash: Some(*verification_hash),
+                    };
+                    let key = attempt_volume_object_id(&stored_attempt, group_id, shard_index);
+                    let bytes = canonical_bytes(&retirement)?;
+                    if let Some(existing) = control.get_record("volume-attempt-retirement", &key)? {
+                        let existing: AttemptRetirement = decode_canonical(&existing)?;
+                        if existing.volume_id != retirement.volume_id
+                            || existing.attempt_id != retirement.attempt_id
+                            || existing.group_id != retirement.group_id
+                            || existing.shard_index != retirement.shard_index
+                            || existing.cleanup_verification_hash.is_some()
+                                && retirement.cleanup_verification_hash.is_some()
+                                && existing.cleanup_verification_hash
+                                    != retirement.cleanup_verification_hash
+                        {
+                            bail!("attempt retirement conflicts with an earlier cleanup");
+                        }
+                    } else {
+                        control.put_record("volume-attempt-retirement", &key, &bytes)?;
+                    }
+                }
+            } else if attempt.is_none()
+                && let Some(stored) = store.object_attempt_state(group_id, shard_index)?
+                && let Some(stored_attempt) = stored.attempt_id
+            {
+                let retirement = AttemptRetirement {
+                    format_version: 1,
+                    volume_id: *volume_id,
+                    attempt_id: stored_attempt,
+                    group_id: *group_id,
+                    shard_index,
+                    cleanup_verification_hash: None,
+                };
+                let key = attempt_volume_object_id(&stored_attempt, group_id, shard_index);
+                let bytes = canonical_bytes(&retirement)?;
+                if let Some(existing) = control.get_record("volume-attempt-retirement", &key)? {
+                    let existing: AttemptRetirement = decode_canonical(&existing)?;
+                    if existing.volume_id != retirement.volume_id
+                        || existing.attempt_id != retirement.attempt_id
+                        || existing.group_id != retirement.group_id
+                        || existing.shard_index != retirement.shard_index
+                    {
+                        bail!("attempt retirement conflicts with an earlier cleanup");
+                    }
+                } else {
+                    control.put_record("volume-attempt-retirement", &key, &bytes)?;
                 }
             }
             match store.remove_ready(group_id, shard_index, root) {
@@ -728,11 +789,7 @@ impl StorageVolumes {
         }
         self.persist(control)?;
         self.store_cleanup_volumes(control, &record_id, &cleanup_volumes)?;
-        if complete && cleanup_volumes.is_empty() {
-            for removed_attempt in removed_attempts {
-                self.finalize_attempt_object(control, &removed_attempt, group_id, shard_index)?;
-            }
-        }
+        complete &= self.settle_attempt_retirements(control, group_id, shard_index, attempt)?;
         if complete && cleanup_volumes.is_empty() && !newer_ready {
             control.delete_record("volume-receipt", &record_id)?;
             control.delete_record("volume-write-intent", &record_id)?;
@@ -1180,6 +1237,59 @@ impl StorageVolumes {
             }
         }
         Ok(())
+    }
+
+    fn settle_attempt_retirements(
+        &self,
+        control: &ControlStore,
+        group_id: &[u8; 32],
+        shard_index: u8,
+        cleanup_attempt: Option<(&[u8; 16], &[u8; 32])>,
+    ) -> Result<bool> {
+        let mut complete = true;
+        for (key, bytes) in control.records("volume-attempt-retirement")? {
+            let retirement: AttemptRetirement = decode_canonical(&bytes)?;
+            if retirement.format_version != 1
+                || retirement.volume_id.is_nil()
+                || retirement.attempt_id == [0; 16]
+                || key
+                    != attempt_volume_object_id(
+                        &retirement.attempt_id,
+                        &retirement.group_id,
+                        retirement.shard_index,
+                    )
+            {
+                bail!("durable attempt retirement is invalid");
+            }
+            if retirement.group_id != *group_id
+                || retirement.shard_index != shard_index
+                || cleanup_attempt.is_some_and(|(_, hash)| {
+                    retirement
+                        .cleanup_verification_hash
+                        .is_some_and(|stored| stored != *hash)
+                })
+            {
+                continue;
+            }
+            let Some(store) = self
+                .volumes
+                .get(&retirement.volume_id)
+                .and_then(|volume| volume.store.as_ref())
+            else {
+                complete = false;
+                continue;
+            };
+            if store
+                .object_attempt_state(group_id, shard_index)?
+                .is_some_and(|state| state.attempt_id == Some(retirement.attempt_id))
+            {
+                complete = false;
+                continue;
+            }
+            self.finalize_attempt_object(control, &retirement.attempt_id, group_id, shard_index)?;
+            control.delete_record("volume-attempt-retirement", &key)?;
+        }
+        Ok(complete)
     }
 
     pub(crate) fn discard_attempt(
@@ -4099,6 +4209,197 @@ mod tests {
             ));
             assert!(control.records("volume-receipt").unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn repaired_attempt_receipt_retires_after_partial_cleanup_and_reopen() {
+        let data = TempDir::new().unwrap();
+        let original = TempDir::new().unwrap();
+        let replacement = TempDir::new().unwrap();
+        let original_path = original.path().to_path_buf();
+        let offline_path = original_path.with_extension("offline");
+        let keys = Arc::new(KeyMaterial::from_seed(&Seed::from_bytes([150; 32])));
+        let original_attempt = [151; 16];
+        let repair_attempt = [152; 16];
+        let verification_hash = [153; 32];
+        let bytes = vec![154; 64];
+        let object = VariableParityObject {
+            format_version: 2,
+            guild_id: [155; 32],
+            group_id: [156; 32],
+            shard_index: 4,
+            commitment: mb_core::merkle_commit(&bytes).unwrap(),
+            bytes,
+        };
+        let repair_receipt_id = attempt_volume_object_id(&repair_attempt, &object.group_id, 4);
+
+        let (control, _) = open_control_store(data.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(data.path(), keys.clone(), &control).unwrap();
+        volumes
+            .configure(&control, &[original_path.clone()], 1024 * 1024, 0)
+            .unwrap();
+        volumes
+            .stage_attempt(&control, &original_attempt, &object, b"old")
+            .unwrap();
+        volumes
+            .activate_attempt_object(
+                &control,
+                &original_attempt,
+                &object.group_id,
+                4,
+                &object.commitment,
+                &verification_hash,
+            )
+            .unwrap();
+        volumes
+            .finalize_attempt(&control, &original_attempt)
+            .unwrap();
+        drop(volumes);
+        drop(control);
+        fs::rename(&original_path, &offline_path).unwrap();
+
+        let (control, _) = open_control_store(data.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(data.path(), keys.clone(), &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[replacement.path().to_path_buf()],
+                1024 * 1024,
+                0,
+            )
+            .unwrap();
+        assert!(!volumes.prepare_variable_repair(&control, &object).unwrap());
+        volumes
+            .reserve_attempt(&control, &repair_attempt, object.guild_id, 4, 64)
+            .unwrap();
+        volumes
+            .write_attempt_range(&control, &repair_attempt, 4, 0, &object.bytes)
+            .unwrap();
+        volumes
+            .finish_attempt_upload(
+                &control,
+                &repair_attempt,
+                object.group_id,
+                4,
+                &object.commitment,
+            )
+            .unwrap();
+        volumes
+            .attach_attempt_receipt(
+                &control,
+                &repair_attempt,
+                &object.group_id,
+                4,
+                &verification_hash,
+            )
+            .unwrap();
+        volumes
+            .activate_attempt_object(
+                &control,
+                &repair_attempt,
+                &object.group_id,
+                4,
+                &object.commitment,
+                &verification_hash,
+            )
+            .unwrap();
+        interrupt_next_volume_transition(VolumeInterruption::GarbageObjectRemoved);
+        assert!(
+            volumes
+                .remove_unreachable_for_attempt(
+                    &control,
+                    &original_attempt,
+                    &verification_hash,
+                    &object.group_id,
+                    4,
+                    &object.commitment.root,
+                )
+                .is_err()
+        );
+        assert!(
+            control
+                .get_record("volume-attempt-receipt", &repair_receipt_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !control
+                .records("volume-attempt-retirement")
+                .unwrap()
+                .is_empty()
+        );
+        drop(volumes);
+        drop(control);
+
+        let (control, _) = open_control_store(data.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(data.path(), keys.clone(), &control).unwrap();
+        assert!(
+            !volumes
+                .remove_unreachable_for_attempt(
+                    &control,
+                    &original_attempt,
+                    &verification_hash,
+                    &object.group_id,
+                    4,
+                    &object.commitment.root,
+                )
+                .unwrap()
+        );
+        assert!(
+            control
+                .get_record("volume-attempt-receipt", &repair_receipt_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            control
+                .records("volume-attempt-retirement")
+                .unwrap()
+                .is_empty()
+        );
+        drop(volumes);
+        drop(control);
+        fs::rename(&offline_path, &original_path).unwrap();
+
+        let (control, _) = open_control_store(data.path(), &keys).unwrap();
+        let mut volumes = StorageVolumes::open(data.path(), keys.clone(), &control).unwrap();
+        volumes
+            .configure(
+                &control,
+                &[original_path, replacement.path().to_path_buf()],
+                1024 * 1024,
+                0,
+            )
+            .unwrap();
+        assert!(
+            volumes
+                .remove_unreachable_for_attempt(
+                    &control,
+                    &original_attempt,
+                    &verification_hash,
+                    &object.group_id,
+                    4,
+                    &object.commitment.root,
+                )
+                .unwrap()
+        );
+        assert!(
+            control
+                .records("volume-attempt-receipt")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(control.records("volume-copy-cleanup").unwrap().is_empty());
+        drop(volumes);
+        drop(control);
+
+        let (control, _) = open_control_store(data.path(), &keys).unwrap();
+        let volumes = StorageVolumes::open(data.path(), keys, &control).unwrap();
+        assert!(
+            volumes
+                .load_ready_variable(&control, &object.group_id, 4)
+                .is_err()
+        );
     }
 
     #[test]
