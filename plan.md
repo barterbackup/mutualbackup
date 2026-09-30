@@ -111,7 +111,12 @@ now certifies the exact canonical verifier transcript in a new, appended
 format-2 Add variant; historical format-1 Add bytes stay decodable. A final
 source audit found that those old Adds still accept unbound evidence from a
 peer (M5-150). Milestone 5 remains open for that legacy binding decision and
-the M5-149 exact-source local gate; Milestone 6 waits.
+the M5-149 exact-source local gate; Milestone 6 waits. Source-only review of
+the in-progress quorum re-binding found M5-151: excluding the recovering or
+lagging original signer makes unanimous historical Adds impossible to bind,
+breaking seed-only recovery and event-tail catch-up. Historical signer removal
+can cause the same failure. Resolve this migration/availability policy before
+the final gate.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and
@@ -2362,7 +2367,13 @@ This protects newly certified format-2 Adds. Format-1 Adds remain unbound:
 the installation and recovery hash checks are conditional, so a hostile peer
 can still substitute another valid same-group attempt for an old event. This
 is M5-150 and blocks closure while old-history catch-up remains supported.
-Resolve that migration path, review the resulting source and rerun the
+An in-progress correction requests fresh signatures from original Add signers,
+but the source-only review found M5-151: cold recovery and event-tail catch-up
+exclude the recovering or lagging node from witness requests. A unanimous
+historical Add signed by that node can never collect its event-time quorum;
+later signer removal can also strand the binding. This conflicts with the
+seed-only recovery invariant. Resolve the authenticated migration and
+availability policy, review the resulting source and rerun the
 complete local exact-source workspace, Docker safety, fresh disposable
 Btrfs/network and independent resource-cleanup gate before closing Milestone
 5 (M5-149). M5-143 remains passing evidence for its exact prior source.

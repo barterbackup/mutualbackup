@@ -3991,6 +3991,24 @@ node Clippy gate passed locally. No remote compilation server was used.
   re-binding path for old Adds (or explicitly fail closed with an agreed
   migration policy) before calling their catch-up and seed recovery safe.
 
+- [ ] **M5-151 / P1 — Preserve seed recovery and catch-up for historical Adds under the re-binding policy.**
+  Source-only review of the in-progress M5-150 correction found that a legacy
+  binding requires the event-time quorum of original Add signers
+  (`crates/mb-core/src/guild.rs:270-306`; `network/p2p.rs:9111-9140`). Cold
+  recovery removes the recovering subject from every witness source
+  (`network/p2p.rs:10230-10239`), even if that subject signed the old Add.
+  For a five-member unanimous Add, at most four witnesses remain, so the
+  early quorum check always fails; an empty-directory seed recovery containing
+  any such Add cannot complete. Event-tail catch-up similarly excludes the
+  lagging member (`network/p2p.rs:9024-9037`), and later membership removal
+  can make the original quorum unavailable even when all current peers are
+  healthy. Define an explicit, authenticated migration or fail-closed policy
+  for these histories that preserves the seed-only recovery invariant where
+  promised. Regress a historical unanimous Add through empty-directory
+  recovery and lagging catch-up, including original-signer loss and membership
+  change, before closing M5-150. This review ran no builds, tests, daemons or
+  runtime probes; M5-149 remains pending on the final committed source.
+
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
   to a shared disk, host, site, power source, operator, or provider—and no
