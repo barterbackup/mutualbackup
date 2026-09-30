@@ -3995,7 +3995,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   links, daemons and firewall rules were removed and normalized host-resource
   snapshots matched. Local logs: `/tmp/mutualbackup-m5-149-core-gate.log`,
   `/tmp/mutualbackup-m5-149-provisioned.log`, and
-  `/tmp/mutualbackup-m5-149-cleanup-audit.log`.
+  `/tmp/mutualbackup-m5-149-cleanup-audit.log`. A subsequent exact-source
+  workspace rerun on `fef9a25` exposed a separate immediate-reopen race in
+  the three-domain activation fixture after 302 `mb-node` tests passed;
+  M5-153 corrects that fixture. The final complete gate remains pending.
 
 - [x] **M5-150 / P1 — Authenticate historical unbound Add evidence on catch-up.**
   Format-1 `AddCodingGroup` must remain decodable for existing guild history,
@@ -4059,7 +4062,23 @@ node Clippy gate passed locally. No remote compilation server was used.
   backup/coding state and topology path with retained daemon logs on a fresh
   disposable run, correct any source failure, and rerun the full M5-149 gate
   on one committed source. Do not treat the passing workspace and earlier
-  provisioned cases as milestone closure.
+  provisioned cases as milestone closure. Two fresh smoke-only runs on the
+  unchanged production code subsequently passed in 1,644 and 1,972 seconds,
+  including both isolated-topology backups and independent cleanup audits.
+  Their coordinator records showed coding jobs, activation, event signatures
+  and checkpoint generations advancing. This makes the original timeout
+  intermittent, but these runs omitted the preceding Btrfs acceptance cases
+  on the same image; they do not resolve the failed complete sequence.
+
+- [x] **M5-153 / P2 — Wait for aborted coding workers in the activation reopen fixture.**
+  The all-target workspace rerun on `fef9a25` passed 302 `mb-node` tests but
+  `retired_three_domain_activation_worker_forgets_and_reopens` reopened the
+  node directory immediately after aborting async coding workers and hit the
+  same transient lock race previously corrected in the related fixture.
+  Its final reopen now uses a bounded wait while an already running blocking
+  worker releases its node handle. The focused three-domain regression,
+  formatting and strict workspace Clippy pass; M5-149 will exercise it again
+  in the complete concurrent suite.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
