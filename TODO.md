@@ -3983,8 +3983,19 @@ node Clippy gate passed locally. No remote compilation server was used.
   immediate reopen; the same test passed alone. That fixture now waits up to
   30 seconds for already-running blocking workers to release their final node
   handle, matching the existing inbound-worker reopen pattern. Its focused
-  rerun and strict workspace Clippy pass; the full exact-source rerun and
-  provisioned acceptance matrix remain pending.
+  rerun and strict workspace Clippy passed. On committed source
+  `04c6d7a0e671338be469132876ce2cabf86a7db2`, formatting, strict
+  workspace Clippy, locked all-target workspace tests (including 303 passing
+  `mb-node` tests) and Docker safety passed. The fresh disposable Btrfs matrix
+  passed every case before the five-daemon network smoke test, including
+  five-node seed recovery and both QUIC backup cases. That smoke test timed
+  out after 5,400 seconds waiting for the first isolated-topology backup to
+  commit (M5-152), so this exact-source gate did not pass. The gate script and
+  independent audit confirmed that its image, mount, loop device, namespaces,
+  links, daemons and firewall rules were removed and normalized host-resource
+  snapshots matched. Local logs: `/tmp/mutualbackup-m5-149-core-gate.log`,
+  `/tmp/mutualbackup-m5-149-provisioned.log`, and
+  `/tmp/mutualbackup-m5-149-cleanup-audit.log`.
 
 - [x] **M5-150 / P1 — Authenticate historical unbound Add evidence on catch-up.**
   Format-1 `AddCodingGroup` must remain decodable for existing guild history,
@@ -4037,6 +4048,18 @@ node Clippy gate passed locally. No remote compilation server was used.
   construction, rejection of ordinary catch-up, rejection of certificate-free
   recovery, exact-attempt adoption, and reopen. The complete local P2P and
   provisioned gate remains M5-149.
+
+- [ ] **M5-152 / P1 — Resolve isolated-topology backup timeout in the exact-source gate.**
+  The fresh local M5-149 acceptance matrix on `04c6d7a` passed all earlier
+  provisioned cases, then `five_daemons_recover_latest_snapshot_from_seed_and_dht`
+  timed out at `prototype_acceptance.rs:1598` waiting for its first
+  isolated-topology `backup --wait` after 5,400 seconds. The owner still had
+  one checkpoint and a dirty root; direct and relay-fallback transfer counters
+  kept rising, so the process was live but did not commit. Diagnose the durable
+  backup/coding state and topology path with retained daemon logs on a fresh
+  disposable run, correct any source failure, and rerun the full M5-149 gate
+  on one committed source. Do not treat the passing workspace and earlier
+  provisioned cases as milestone closure.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

@@ -119,8 +119,13 @@ ordinary event-tail catch-up rejects format-1 Adds; cold recovery requires an
 existing quorum certificate for each such Add and never reattests on demand.
 Background migration issues and retains certificates while original signers
 are present. A history that lost its original evidence before certification
-fails closed and needs trusted assisted recovery. Milestone 5 remains open for
-the M5-149 exact-source local gate; Milestone 6 waits.
+fails closed and needs trusted assisted recovery. On exact committed source
+`04c6d7a`, formatting, strict workspace Clippy, locked all-target workspace
+tests and Docker safety passed. Fresh disposable Btrfs acceptance passed all
+cases before the five-daemon smoke test, but its first isolated-topology backup
+timed out after 5,400 seconds without committing (M5-152). Independent
+resource cleanup passed. Milestone 5 remains open for M5-152 and a fresh
+complete M5-149 gate; Milestone 6 waits.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and
@@ -2377,10 +2382,14 @@ cannot supply its historical evidence, and membership removal can strand the
 quorum. The selected fail-closed policy rejects format-1 event-tail catch-up
 and requires a preissued certificate for cold recovery; otherwise it requires
 trusted assisted recovery. Background migration can create and replicate
-those certificates before signer loss. Review the resulting source and rerun the
-complete local exact-source workspace, Docker safety, fresh disposable
-Btrfs/network and independent resource-cleanup gate before closing Milestone
-5 (M5-149). M5-143 remains passing evidence for its exact prior source.
+those certificates before signer loss. On `04c6d7a`, formatting, strict
+workspace Clippy, the locked all-target workspace suite, Docker safety and
+every provisioned case before the five-daemon smoke test passed. That smoke
+test timed out after 5,400 seconds waiting for its first isolated-topology
+backup to commit (M5-152); independent resource cleanup passed. Diagnose and
+correct that blocker, then rerun the complete local exact-source gate before
+closing Milestone 5 (M5-149). M5-143 remains passing evidence for its exact
+prior source.
 
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
 launch-expiry regressions found duplicate same-lane successors. Renewal now
