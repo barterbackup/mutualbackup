@@ -16823,13 +16823,48 @@ mod tests {
             accept_legacy_add_attestations(
                 &state,
                 &certified,
-                correct,
+                correct.clone(),
                 Vec::new(),
                 futures::stream::iter(
                     responses[..3]
                         .iter()
                         .map(|(peer, signature)| (*peer, Ok(signature.as_ref().unwrap().clone()))),
                 ),
+            )
+            .await
+            .is_err()
+        );
+
+        let mut unanimous = state.clone();
+        unanimous.quorum.rule = QuorumRule::Unanimous;
+        let local = mb_core::sign_legacy_coding_add_binding(&correct, &keys[0]).unwrap();
+        let remote = keys[1..]
+            .iter()
+            .map(|key| {
+                (
+                    key.node_id(),
+                    Ok(mb_core::sign_legacy_coding_add_binding(&correct, key).unwrap()),
+                )
+            })
+            .collect::<Vec<(NodeId, Result<MemberSignature>)>>();
+        let migrated = accept_legacy_add_attestations(
+            &unanimous,
+            &certified,
+            correct.clone(),
+            vec![local],
+            futures::stream::iter(remote.into_iter()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(migrated.signatures.len(), 5);
+        migrated.verify(&unanimous, &certified).unwrap();
+        assert!(
+            accept_legacy_add_attestations(
+                &unanimous,
+                &certified,
+                correct,
+                Vec::new(),
+                futures::stream::empty(),
             )
             .await
             .is_err()

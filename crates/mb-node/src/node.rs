@@ -15496,6 +15496,15 @@ pub(crate) mod tests {
 
     #[test]
     fn recovered_dynamic_node_serves_forgotten_add_evidence() {
+        recovered_dynamic_node_serves_forgotten_add_evidence_case(false);
+    }
+
+    #[test]
+    fn recovered_legacy_add_uses_preissued_certificate_after_signer_loss() {
+        recovered_dynamic_node_serves_forgotten_add_evidence_case(true);
+    }
+
+    fn recovered_dynamic_node_serves_forgotten_add_evidence_case(legacy: bool) {
         let temp = tempfile::tempdir().unwrap();
         let seed = Seed::from_bytes([223; 32]);
         let mut source = Node::open(temp.path().join("source"), seed.clone()).unwrap();
@@ -15607,18 +15616,50 @@ pub(crate) mod tests {
             signatures.sort_by_key(|signature| signature.signer);
             QuorumGuildEvent { event, signatures }
         };
+        let group = transcript.value.manifest.value.group.clone();
         let add = certify(
             &source,
-            mb_core::GuildEventKind::AddCodingGroupBound {
-                group: transcript.value.manifest.value.group.clone(),
-                transcript_hash: *blake3::hash(&canonical_bytes(&transcript).unwrap()).as_bytes(),
+            if legacy {
+                mb_core::GuildEventKind::AddCodingGroup {
+                    group: group.clone(),
+                }
+            } else {
+                mb_core::GuildEventKind::AddCodingGroupBound {
+                    group: group.clone(),
+                    transcript_hash: *blake3::hash(&canonical_bytes(&transcript).unwrap())
+                        .as_bytes(),
+                }
             },
         );
+        let binding = if legacy {
+            let statement = LegacyCodingAddStatement::for_event(
+                &add,
+                *blake3::hash(&canonical_bytes(&transcript).unwrap()).as_bytes(),
+            )
+            .unwrap();
+            let mut signatures = keys
+                .iter()
+                .map(|key| sign_legacy_coding_add_binding(&statement, key).unwrap())
+                .collect::<Vec<_>>();
+            signatures.sort_by_key(|signature| signature.signer);
+            Some(QuorumLegacyCodingAddBinding {
+                statement,
+                signatures,
+            })
+        } else {
+            None
+        };
         let group_id = transcript.value.manifest.value.group.id;
         let add_hash = add.event.hash().unwrap();
-        source
-            .install_coding_group_event(add.clone(), transcript.clone())
-            .unwrap();
+        if let Some(binding) = &binding {
+            source
+                .install_legacy_coding_group_event(add.clone(), transcript.clone(), binding.clone())
+                .unwrap();
+        } else {
+            source
+                .install_coding_group_event(add.clone(), transcript.clone())
+                .unwrap();
+        }
         let state = source.dynamic_guild_state().unwrap().unwrap();
         let retire = certify(
             &source,
@@ -15645,11 +15686,16 @@ pub(crate) mod tests {
         poisoned
             .adopt_recovered_guild(certificate.clone(), peers.clone())
             .unwrap();
-        assert!(
-            poisoned
-                .install_coding_group_event(add.clone(), wrong_transcript.clone())
-                .is_err()
-        );
+        let wrong_install = if let Some(binding) = &binding {
+            poisoned.install_legacy_coding_group_event(
+                add.clone(),
+                wrong_transcript.clone(),
+                binding.clone(),
+            )
+        } else {
+            poisoned.install_coding_group_event(add.clone(), wrong_transcript.clone())
+        };
+        assert!(wrong_install.is_err());
         assert_eq!(
             poisoned
                 .dynamic_guild_state()
@@ -15658,9 +15704,15 @@ pub(crate) mod tests {
                 .event_sequence,
             0
         );
-        poisoned
-            .install_coding_group_event(add.clone(), transcript.clone())
-            .unwrap();
+        if let Some(binding) = &binding {
+            poisoned
+                .install_legacy_coding_group_event(add.clone(), transcript.clone(), binding.clone())
+                .unwrap();
+        } else {
+            poisoned
+                .install_coding_group_event(add.clone(), transcript.clone())
+                .unwrap();
+        }
         let mut rejected_recovery = Node::open(temp.path().join("rejected"), seed.clone()).unwrap();
         assert!(
             rejected_recovery
@@ -15673,7 +15725,7 @@ pub(crate) mod tests {
                         add_hash,
                         VerifiedCodingTranscript::verify(wrong_transcript).unwrap(),
                     )],
-                    Vec::new(),
+                    binding.clone().into_iter().collect(),
                 )
                 .is_err()
         );
@@ -15690,7 +15742,7 @@ pub(crate) mod tests {
                     add_hash,
                     VerifiedCodingTranscript::verify(evidence).unwrap(),
                 )],
-                Vec::new(),
+                binding.clone().into_iter().collect(),
             )
             .unwrap();
         assert!(
@@ -15715,6 +15767,18 @@ pub(crate) mod tests {
                 .unwrap(),
             transcript
         );
+        if legacy {
+            assert_eq!(
+                legacy_coding_add_binding_from_store(
+                    &recovered.control,
+                    guild_id,
+                    add.event.sequence,
+                    add_hash,
+                )
+                .unwrap(),
+                binding,
+            );
+        }
         let mut lagging = Node::open(temp.path().join("lagging"), seed).unwrap();
         lagging
             .adopt_recovered_guild(certificate.clone(), peers)
@@ -15732,9 +15796,15 @@ pub(crate) mod tests {
                         event.event.hash().unwrap(),
                     )
                     .unwrap();
-                lagging
-                    .install_coding_group_event(event, transcript)
-                    .unwrap();
+                if let Some(binding) = &binding {
+                    lagging
+                        .install_legacy_coding_group_event(event, transcript, binding.clone())
+                        .unwrap();
+                } else {
+                    lagging
+                        .install_coding_group_event(event, transcript)
+                        .unwrap();
+                }
             } else {
                 lagging.install_guild_event(event).unwrap();
             }

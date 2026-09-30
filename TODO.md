@@ -4019,7 +4019,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   after later membership change. Histories that lost required signers before
   any certificate was made remain unrecoverable; define the upgrade policy and
   run the specified end-to-end recovery/catch-up regression before checking
-  this item.
+  this item. Focused source-node regressions now pass for a preissued
+  unanimous certificate through recovered-node adoption, reopen, wrong-attempt
+  rejection and lagging catch-up; the witness collector also passes the local
+  plus four-remote unanimity case. These are not the complete P2P recovery gate.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due
