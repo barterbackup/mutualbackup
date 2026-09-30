@@ -3978,6 +3978,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   shell's 1,024-descriptor limit; that test passed alone with the established
   8,192-descriptor limit. Docker safety, formatting and strict workspace
   Clippy passed locally. This is not yet an exact-source milestone gate.
+  A later four-thread workspace run on `f277419` passed 302 `mb-node` tests
+  but repeated a directory-lock race in the five-domain activation test's
+  immediate reopen; the same test passed alone. That fixture now waits up to
+  30 seconds for already-running blocking workers to release their final node
+  handle, matching the existing inbound-worker reopen pattern. Its focused
+  rerun and strict workspace Clippy pass; the full exact-source rerun and
+  provisioned acceptance matrix remain pending.
 
 - [ ] **M5-150 / P1 — Authenticate historical unbound Add evidence on catch-up.**
   Format-1 `AddCodingGroup` must remain decodable for existing guild history,
