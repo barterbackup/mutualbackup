@@ -25913,8 +25913,30 @@ mod tests {
         }
         drop(clients);
         drop(nodes);
+        async fn reopen_after_coding_workers(path: std::path::PathBuf, seed: Seed) -> Node {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match Node::open(&path, seed.clone()) {
+                        Ok(node) => return node,
+                        Err(error)
+                            if error
+                                .to_string()
+                                .contains("node data directory is already in use") =>
+                        {
+                            // An aborted async worker may still own the node
+                            // while its spawn_blocking operation finishes.
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                        Err(error) => panic!("could not reopen coding node: {error:#}"),
+                    }
+                }
+            })
+            .await
+            .expect("coding workers retained the node directory after shutdown")
+        }
         for _ in 0..2 {
-            let owner = Node::open(temp.path().join("node-0"), seeds[0].clone()).unwrap();
+            let owner =
+                reopen_after_coding_workers(temp.path().join("node-0"), seeds[0].clone()).await;
             owner
                 .validate_variable_checkpoint_coverage(&checkpoint, false)
                 .unwrap();
