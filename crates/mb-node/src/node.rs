@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -754,6 +754,12 @@ pub struct Node {
     control_database_key: [u8; 32],
     volumes: StorageVolumes,
     volume_readers: Arc<RwLock<Vec<VolumeReaderConfig>>>,
+    membership_history_cache: Mutex<Option<MembershipHistoryCache>>,
+}
+
+struct MembershipHistoryCache {
+    durable: DynamicGuildState,
+    by_epoch: BTreeMap<u64, DynamicGuildState>,
 }
 
 #[derive(Clone)]
@@ -1221,6 +1227,7 @@ impl Node {
             control_database_key,
             volumes,
             volume_readers,
+            membership_history_cache: Mutex::new(None),
         };
         node.backfill_checkpoint_generation_index()?;
         node.reconcile_certified_writer_head()?;
@@ -8067,27 +8074,52 @@ impl Node {
         &self,
         membership_epoch: u64,
     ) -> Result<DynamicGuildState> {
-        let installed = self
-            .installed_guild()?
-            .context("node has no installed guild")?;
         let durable = self
             .dynamic_guild_state()?
             .context("node has no dynamic guild state")?;
+        {
+            let cache = self
+                .membership_history_cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("membership history cache is poisoned"))?;
+            if let Some(cache) = cache.as_ref()
+                && cache.durable == durable
+            {
+                return cache
+                    .by_epoch
+                    .get(&membership_epoch)
+                    .cloned()
+                    .context("coding attempt membership epoch is absent from guild history");
+            }
+        }
+        // Event installation changes the durable state. Rebuild the snapshot
+        // index only then, verifying every signed event and its final state.
+        // A new Node starts without a cache, so reopen also verifies history.
+        let installed = self
+            .installed_guild()?
+            .context("node has no installed guild")?;
         let mut replay = initial_dynamic_guild_state(&installed)?;
-        let mut selected = (replay.membership_epoch == membership_epoch).then(|| replay.clone());
+        let mut by_epoch = BTreeMap::new();
+        by_epoch.insert(replay.membership_epoch, replay.clone());
         for (record_id, bytes) in self.control.records("guild-event")? {
             let event: QuorumGuildEvent = decode_canonical(&bytes)?;
             if record_id != event.event.sequence.to_be_bytes() {
                 anyhow::bail!("guild event history has an invalid record ID");
             }
             replay.apply_event(&event)?;
-            if selected.is_none() && replay.membership_epoch == membership_epoch {
-                selected = Some(replay.clone());
-            }
+            by_epoch
+                .entry(replay.membership_epoch)
+                .or_insert_with(|| replay.clone());
         }
         if replay != durable {
             anyhow::bail!("dynamic guild state conflicts with its event history");
         }
+        let selected = by_epoch.get(&membership_epoch).cloned();
+        *self
+            .membership_history_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("membership history cache is poisoned"))? =
+            Some(MembershipHistoryCache { durable, by_epoch });
         selected.context("coding attempt membership epoch is absent from guild history")
     }
 
@@ -13166,6 +13198,77 @@ fn set_private_directory(_path: &Path) -> Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn membership_history_cache_rebuilds_after_event_and_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("node");
+        let (seed, certificate, peers) = recovery_guild_fixture();
+        let mut node = Node::open(&path, seed.clone()).unwrap();
+        node.adopt_recovered_guild(certificate, peers).unwrap();
+        let initial = node.dynamic_guild_state().unwrap().unwrap();
+        assert_eq!(
+            node.dynamic_guild_state_for_membership_epoch(1).unwrap(),
+            initial
+        );
+        assert_eq!(
+            node.dynamic_guild_state_for_membership_epoch(1).unwrap(),
+            initial
+        );
+
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: initial.guild_id,
+            sequence: initial.event_sequence + 1,
+            parent: initial.event_head,
+            kind: mb_core::GuildEventKind::SetQuorum {
+                policy: QuorumPolicy {
+                    format_version: 1,
+                    rule: QuorumRule::Majority,
+                },
+            },
+        };
+        let mut signatures = (120_u8..125)
+            .map(|byte| {
+                sign_guild_event(
+                    &event,
+                    &KeyMaterial::from_seed(&Seed::from_bytes([byte; 32])),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        node.install_guild_event(QuorumGuildEvent { event, signatures })
+            .unwrap();
+        let updated = node.dynamic_guild_state().unwrap().unwrap();
+        assert_eq!(updated.membership_epoch, 2);
+        assert_eq!(
+            node.dynamic_guild_state_for_membership_epoch(1).unwrap(),
+            initial
+        );
+        assert_eq!(
+            node.dynamic_guild_state_for_membership_epoch(2).unwrap(),
+            updated
+        );
+
+        drop(node);
+        let node = Node::open(&path, seed).unwrap();
+        assert!(node.membership_history_cache.lock().unwrap().is_none());
+        assert_eq!(
+            node.dynamic_guild_state_for_membership_epoch(1).unwrap(),
+            initial
+        );
+        let mut conflicting = updated;
+        conflicting.event_head = [77; 32];
+        node.control
+            .put_record(
+                "guild-dynamic-state",
+                b"primary",
+                &canonical_bytes(&conflicting).unwrap(),
+            )
+            .unwrap();
+        assert!(node.dynamic_guild_state_for_membership_epoch(2).is_err());
+    }
 
     #[test]
     fn legacy_packing_attestation_survives_restart_before_publication() {

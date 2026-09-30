@@ -4086,7 +4086,19 @@ node Clippy gate passed locally. No remote compilation server was used.
   show a live connection to the fallback signer before starting the first
   isolated-topology backup. This closes a readiness gap in the test and makes
   a missing circuit fail at the topology boundary; it does not yet diagnose
-  the original timeout. Validate the changed fixture on a fresh local image.
+  the original timeout. A fresh local smoke run on `4ba4d63` reached that
+  check and entered the first isolated backup with all five peers connected,
+  then made no durable coding/event progress for more than 20 minutes. The
+  diagnostic run was stopped and its daemons, namespaces, firewall, mount and
+  image cleaned up. Read-only control DB copies showed three verified but
+  incomplete activations, a locked Add at sequence 32, and the same signed
+  event hash locked on all five peers. A live debugger sample found the coding
+  worker repeatedly replaying the full signed guild history inside
+  `claim_coding_activation` while other workers waited on the node mutex.
+  Membership-history snapshots are now cached by the durable guild state so
+  authority checks replay the event chain once per state change and again
+  after reopen. Validate the source correction with focused, workspace and
+  fresh provisioned gates before closing this blocker.
 
 - [x] **M5-153 / P2 — Wait for aborted coding workers in the activation reopen fixture.**
   The all-target workspace rerun on `fef9a25` passed 302 `mb-node` tests but
