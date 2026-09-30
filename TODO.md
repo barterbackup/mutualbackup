@@ -3986,7 +3986,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   rerun and strict workspace Clippy pass; the full exact-source rerun and
   provisioned acceptance matrix remain pending.
 
-- [ ] **M5-150 / P1 — Authenticate historical unbound Add evidence on catch-up.**
+- [x] **M5-150 / P1 — Authenticate historical unbound Add evidence on catch-up.**
   Format-1 `AddCodingGroup` must remain decodable for existing guild history,
   but it signs only the group. `coding_group_add` returns no transcript hash
   for it; event installation, event evidence service and recovery check an
@@ -3997,12 +3997,18 @@ node Clippy gate passed locally. No remote compilation server was used.
   does not secure all supported history. Define and enforce a trusted
   re-binding path for old Adds (or explicitly fail closed with an agreed
   migration policy) before calling their catch-up and seed recovery safe.
-  Quorum witness signing, durable per-event certificates, certificate fetch on
-  catch-up/recovery, and background migration of installed old Adds are now
-  implemented; histories without an obtainable certificate still fail closed.
-  The missing-evidence policy and end-to-end recovery gate remain open.
+  The selected migration policy rejects every format-1 Add during ordinary
+  event-tail catch-up, before requesting verifier evidence; the public node
+  installation path also rejects it. Existing installed history remains
+  readable for local lifecycle work. Background migration may issue a durable
+  quorum certificate while original signers and evidence still exist. Cold
+  recovery accepts a legacy Add only with an already issued certificate and
+  exact matching transcript; it does not solicit fresh signatures during
+  recovery. Without that certificate, it fails closed and requires trusted
+  assisted recovery. Focused rejection, wrong-attempt, certificate-adoption
+  and reopen regressions pass locally; M5-149 remains the closure gate.
 
-- [ ] **M5-151 / P1 — Preserve seed recovery and catch-up for historical Adds under the re-binding policy.**
+- [x] **M5-151 / P1 — Define the fail-closed migration policy for historical Adds.**
   Source-only review of the in-progress M5-150 correction found that a legacy
   binding requires the event-time quorum of original Add signers
   (`crates/mb-core/src/guild.rs:270-306`; `network/p2p.rs:9111-9140`). Cold
@@ -4019,19 +4025,18 @@ node Clippy gate passed locally. No remote compilation server was used.
   recovery and lagging catch-up, including original-signer loss and membership
   change, before closing M5-150. This review ran no builds, tests, daemons or
   runtime probes; M5-149 remains pending on the final committed source.
-  A follow-up now lets surviving peers fetch a previously certified binding
-  without recontacting the original quorum, and each active node attempts to
-  create and retain one missing certificate per peer-exchange pass. This
-  removes the recovering-subject quorum dependency after migration, including
-  after later membership change. Histories that lost required signers before
-  any certificate was made remain unrecoverable; define the upgrade policy and
-  run the specified end-to-end recovery/catch-up regression before checking
-  this item. Focused source-node regressions now pass for a preissued
-  unanimous certificate through recovered-node adoption, reopen, wrong-attempt
-  rejection and lagging catch-up; the witness collector also passes the local
-  plus four-remote unanimity case. These are not the complete P2P recovery gate.
-  Background migration now processes up to 16 old Adds per peer-exchange pass
-  so a large historical event log does not wait one interval per certificate.
+  The agreed policy is to reject legacy event-tail catch-up entirely and fail
+  closed on seed recovery unless an existing quorum certificate can be
+  obtained. A node with the old history proactively creates and replicates up
+  to 16 certificates per peer-exchange pass while original signers remain.
+  Recovery never asks the lost subject to attest; a certificate already held
+  by a surviving peer is sufficient, including after signer loss or membership
+  change. If no certificate exists, trusted assisted recovery is required:
+  automatic seed-only recovery is intentionally unavailable for that
+  pre-migration legacy history. Focused tests cover unanimous certificate
+  construction, rejection of ordinary catch-up, rejection of certificate-free
+  recovery, exact-attempt adoption, and reopen. The complete local P2P and
+  provisioned gate remains M5-149.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

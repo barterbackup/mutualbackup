@@ -3009,6 +3009,7 @@ impl Node {
         self.install_guild_event_inner(certified, Some(transcript), None)
     }
 
+    #[cfg(test)]
     pub(crate) fn install_legacy_coding_group_event(
         &mut self,
         certified: QuorumGuildEvent,
@@ -15713,6 +15714,26 @@ pub(crate) mod tests {
                 .install_coding_group_event(add.clone(), transcript.clone())
                 .unwrap();
         }
+        if legacy {
+            let mut no_certificate =
+                Node::open(temp.path().join("no-certificate"), seed.clone()).unwrap();
+            assert!(
+                no_certificate
+                    .adopt_recovered_dynamic_guild(
+                        certificate.clone(),
+                        &checkpoint,
+                        events.clone(),
+                        peers.clone(),
+                        vec![(
+                            add_hash,
+                            VerifiedCodingTranscript::verify(evidence.clone()).unwrap(),
+                        )],
+                        Vec::new(),
+                    )
+                    .is_err()
+            );
+            assert!(no_certificate.installed_guild().unwrap().is_none());
+        }
         let mut rejected_recovery = Node::open(temp.path().join("rejected"), seed.clone()).unwrap();
         assert!(
             rejected_recovery
@@ -15796,15 +15817,25 @@ pub(crate) mod tests {
                         event.event.hash().unwrap(),
                     )
                     .unwrap();
-                if let Some(binding) = &binding {
-                    lagging
-                        .install_legacy_coding_group_event(event, transcript, binding.clone())
-                        .unwrap();
-                } else {
-                    lagging
-                        .install_coding_group_event(event, transcript)
-                        .unwrap();
+                if legacy {
+                    assert!(
+                        lagging
+                            .install_coding_group_event(event, transcript)
+                            .is_err()
+                    );
+                    assert_eq!(
+                        lagging
+                            .dynamic_guild_state()
+                            .unwrap()
+                            .unwrap()
+                            .event_sequence,
+                        0
+                    );
+                    return;
                 }
+                lagging
+                    .install_coding_group_event(event, transcript)
+                    .unwrap();
             } else {
                 lagging.install_guild_event(event).unwrap();
             }

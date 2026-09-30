@@ -9374,6 +9374,15 @@ async fn install_coding_group_event_from_sources(
     preferred_source: NodeId,
     sources: &[NodeId],
 ) -> Result<()> {
+    if matches!(
+        event.event.kind,
+        mb_core::GuildEventKind::AddCodingGroup { .. }
+    ) {
+        // A certificate created later cannot turn the old event into a
+        // transcript-bound event-tail transition. This path is deliberately
+        // closed even when peers have migrated their local history.
+        bail!("historical unbound coding Add cannot be installed by event-tail catch-up");
+    }
     let mut ordered = Vec::with_capacity(sources.len());
     ordered.push(preferred_source);
     ordered.extend(
@@ -9386,18 +9395,6 @@ async fn install_coding_group_event_from_sources(
     ordered.retain(|source| seen.insert(*source));
     let event_sequence = event.event.sequence;
     let event_hash = event.event.hash()?;
-    let legacy_state = if matches!(
-        event.event.kind,
-        mb_core::GuildEventKind::AddCodingGroup { .. }
-    ) {
-        Some(
-            node_blocking(node.clone(), |node| node.dynamic_guild_state())
-                .await?
-                .context("historical Add catch-up has no dynamic guild state")?,
-        )
-    } else {
-        None
-    };
     let requests = FuturesUnordered::new();
     for source in ordered.iter().copied() {
         requests.push(async move {
@@ -9417,47 +9414,11 @@ async fn install_coding_group_event_from_sources(
     accept_first_peer_response(requests, move |source, transcript| {
         let node = node.clone();
         let candidate_event = event.clone();
-        let legacy_state = legacy_state.clone();
-        let witnesses = ordered.clone();
         async move {
-            if let Some(state_before) = legacy_state {
-                let transcript_hash = transcript.canonical_hash()?;
-                let binding = match fetch_legacy_add_binding_from_sources(
-                    p2p,
-                    &candidate_event,
-                    transcript_hash,
-                    &state_before,
-                    &witnesses,
-                )
-                .await
-                {
-                    Some(binding) => binding,
-                    None => {
-                        gather_legacy_add_binding(
-                            p2p,
-                            &candidate_event,
-                            transcript_hash,
-                            &state_before,
-                            &witnesses,
-                            None,
-                        )
-                        .await?
-                    }
-                };
-                node_blocking(node, move |node| {
-                    node.install_legacy_coding_group_event(
-                        candidate_event,
-                        transcript.into_inner(),
-                        binding,
-                    )
-                })
-                .await
-            } else {
-                node_blocking(node, move |node| {
-                    node.install_coding_group_event(candidate_event, transcript.into_inner())
-                })
-                .await
-            }
+            node_blocking(node, move |node| {
+                node.install_coding_group_event(candidate_event, transcript.into_inner())
+            })
+            .await
             .with_context(|| format!("peer {source} returned invalid coding evidence"))
         }
     })
@@ -10458,8 +10419,10 @@ async fn fetch_recovery_transcripts(
                 }
                 let binding = if expected_hash.is_none() {
                     let transcript_hash = transcript.canonical_hash()?;
+                    // Recovery may reuse a preissued quorum certificate, but
+                    // must not create one after the subject has lost its store.
                     Some(
-                        match fetch_legacy_add_binding_from_sources(
+                        fetch_legacy_add_binding_from_sources(
                             p2p,
                             &event,
                             transcript_hash,
@@ -10467,20 +10430,7 @@ async fn fetch_recovery_transcripts(
                             &sources,
                         )
                         .await
-                        {
-                            Some(binding) => binding,
-                            None => {
-                                gather_legacy_add_binding(
-                                    p2p,
-                                    &event,
-                                    transcript_hash,
-                                    &state_before,
-                                    &sources,
-                                    None,
-                                )
-                                .await?
-                            }
-                        },
+                        .context("historical Add has no preissued quorum certificate; trusted assisted recovery is required")?,
                     )
                 } else {
                     None
@@ -16843,6 +16793,32 @@ mod tests {
             )
             .await
             .is_err()
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let node = Arc::new(Mutex::new(
+            Node::open(temp.path(), Seed::from_bytes([61; 32])).unwrap(),
+        ));
+        let (client, _event_loop) = build_p2p(node.clone(), config(keys[0].node_id())).unwrap();
+        let group_id = match &certified.event.kind {
+            mb_core::GuildEventKind::AddCodingGroup { group } => group.id,
+            _ => unreachable!(),
+        };
+        let error = install_coding_group_event_from_sources(
+            node,
+            &client,
+            certified.clone(),
+            state.guild_id,
+            group_id,
+            keys[1].node_id(),
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be installed by event-tail catch-up")
         );
 
         let mut unanimous = state.clone();
