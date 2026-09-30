@@ -4023,6 +4023,8 @@ node Clippy gate passed locally. No remote compilation server was used.
   unanimous certificate through recovered-node adoption, reopen, wrong-attempt
   rejection and lagging catch-up; the witness collector also passes the local
   plus four-remote unanimity case. These are not the complete P2P recovery gate.
+  Background migration now processes up to 16 old Adds per peer-exchange pass
+  so a large historical event log does not wait one interval per certificate.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

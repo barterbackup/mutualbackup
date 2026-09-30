@@ -8117,8 +8117,17 @@ pub async fn run_peer_exchange(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result
         if let Err(error) = sync_guild_events_once(node.clone(), &p2p).await {
             tracing::warn!(%error, "guild event-tail synchronization failed");
         }
-        if let Err(error) = rebind_legacy_coding_add_once(node.clone(), &p2p).await {
-            tracing::warn!(%error, "historical coding Add migration is waiting for evidence");
+        // Upgrade large histories in bounded batches rather than leaving one
+        // unbound Add exposed for each five-second peer-exchange interval.
+        for _ in 0..16 {
+            match rebind_legacy_coding_add_once(node.clone(), &p2p).await {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "historical coding Add migration is waiting for evidence");
+                    break;
+                }
+            }
         }
         if let Err(error) = sync_checkpoint_head_once(node.clone(), &p2p).await {
             tracing::warn!(%error, "certified checkpoint-head synchronization failed");
@@ -9022,7 +9031,7 @@ async fn sync_guild_events_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Resu
     sync_guild_event_page(node, p2p, None).await
 }
 
-async fn rebind_legacy_coding_add_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
+async fn rebind_legacy_coding_add_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<bool> {
     let work = node_blocking(node.clone(), |node| {
         let Some((event, state_before, transcript_hash)) = node.next_unbound_legacy_coding_add()?
         else {
@@ -9052,7 +9061,7 @@ async fn rebind_legacy_coding_add_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
     })
     .await?;
     let Some((event, state_before, transcript_hash, peers, local_id, local_active)) = work else {
-        return Ok(());
+        return Ok(false);
     };
     for peer in &peers {
         for endpoint in &peer.endpoints {
@@ -9107,7 +9116,8 @@ async fn rebind_legacy_coding_add_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) 
     node_blocking(node, move |node| {
         node.persist_legacy_coding_add_binding(&event, &binding)
     })
-    .await
+    .await?;
+    Ok(true)
 }
 
 async fn sync_guild_event_page(
