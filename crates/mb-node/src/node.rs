@@ -13,18 +13,18 @@ use mb_core::{
     CodingFailureReport, CodingGroupV2, CodingReplayFinding, CodingRootManifest,
     CodingShardOpening, CodingVerificationTranscript, DynamicGuildState, EndpointRecord,
     GuildCheckpoint, GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, KeyMaterial,
-    MAX_GUILD_EVENT_TAIL, Member, MemberSignature, NodeId, PackedCatalog, PackedSector,
-    PackedSectorDescriptor, PackingProfile, PackingResult, PackingUpdate, QuorumCheckpoint,
-    QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN,
-    RecoveryBundle, RecoveryLocator, STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN,
-    SectorId, SectorRef, Seed, ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt,
-    StorageAcknowledgement, USER_REVISION_DOMAIN, UserRevision, V1_CATALOG_PAGE_BYTES,
-    V1_MAX_CATALOG_PAGES, V1_MAX_ENDPOINTS_PER_PEER, V1_SECTOR_SIZE, canonical_bytes,
-    challenged_leaf, coding_challenge_commitment, coding_evidence_hash, decode_canonical,
-    encode_coding_attempt, merkle_commit, merkle_open_range, merkle_open_zero_range,
-    open_recovery_key_envelope, open_recovery_record, packing_protected_root,
-    replay_coding_transcript, seal_recovery_record, sector_root, sign_guild_event,
-    synthetic_filler_sector,
+    LegacyCodingAddStatement, MAX_GUILD_EVENT_TAIL, Member, MemberSignature, NodeId, PackedCatalog,
+    PackedSector, PackedSectorDescriptor, PackingProfile, PackingResult, PackingUpdate,
+    QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis, QuorumLegacyCodingAddBinding,
+    QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN, RecoveryBundle, RecoveryLocator,
+    STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, Seed,
+    ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
+    USER_REVISION_DOMAIN, UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_PAGES,
+    V1_MAX_ENDPOINTS_PER_PEER, V1_SECTOR_SIZE, canonical_bytes, challenged_leaf,
+    coding_challenge_commitment, coding_evidence_hash, decode_canonical, encode_coding_attempt,
+    merkle_commit, merkle_open_range, merkle_open_zero_range, open_recovery_key_envelope,
+    open_recovery_record, packing_protected_root, replay_coding_transcript, seal_recovery_record,
+    sector_root, sign_guild_event, sign_legacy_coding_add_binding, synthetic_filler_sector,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
@@ -551,6 +551,13 @@ struct GuildEventSignatureLock {
     format_version: u16,
     event_hash: [u8; 32],
     event: GuildEvent,
+    signature: MemberSignature,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+struct LegacyCodingAddSignatureLock {
+    format_version: u16,
+    statement: LegacyCodingAddStatement,
     signature: MemberSignature,
 }
 
@@ -2559,6 +2566,7 @@ impl Node {
         events: Vec<QuorumGuildEvent>,
         mut peers: Vec<GuildPeer>,
         transcripts: Vec<([u8; 32], VerifiedCodingTranscript)>,
+        bindings: Vec<QuorumLegacyCodingAddBinding>,
     ) -> Result<()> {
         certificate.verify()?;
         checkpoint.verify()?;
@@ -2579,14 +2587,37 @@ impl Node {
             checkpoint_matches_dynamic_authority(&checkpoint.checkpoint, &state);
         let mut event_records = Vec::with_capacity(events.len());
         let mut add_events = Vec::new();
+        let binding_count = bindings.len();
+        let mut binding_by_event = bindings
+            .into_iter()
+            .map(|binding| (binding.statement.event_hash, binding))
+            .collect::<BTreeMap<_, _>>();
+        if binding_by_event.len() != binding_count {
+            anyhow::bail!("dynamic recovery has duplicate historical Add bindings");
+        }
+        let mut binding_records = Vec::new();
         for event in events {
             let record_id = event.event.sequence.to_be_bytes().to_vec();
             if let Some((group, transcript_hash)) = event.event.kind.coding_group_add() {
+                let mut expected_hash = transcript_hash;
+                if transcript_hash.is_none() {
+                    let add_hash = event.event.hash()?;
+                    let binding = binding_by_event
+                        .remove(&add_hash)
+                        .context("dynamic recovery historical Add lacks quorum evidence")?;
+                    binding.verify(&state, &event)?;
+                    expected_hash = Some(binding.statement.transcript_hash);
+                    binding_records.push((
+                        "coding-legacy-add-binding".to_owned(),
+                        add_hash.to_vec(),
+                        canonical_bytes(&binding)?,
+                    ));
+                }
                 add_events.push((
                     event.event.sequence,
                     group.clone(),
                     event.event.hash()?,
-                    transcript_hash,
+                    expected_hash,
                 ));
             }
             state.apply_event(&event)?;
@@ -2600,6 +2631,9 @@ impl Node {
                 record_id,
                 canonical_bytes(&event)?,
             ));
+        }
+        if !binding_by_event.is_empty() {
+            anyhow::bail!("dynamic recovery has extra historical Add bindings");
         }
         if !checkpoint_membership {
             anyhow::bail!("dynamic recovery checkpoint membership is absent from event history");
@@ -2700,7 +2734,11 @@ impl Node {
                 anyhow::bail!("configured member conflicts with recovered dynamic membership");
             }
         }
-        for (kind, record_id, bytes) in event_records.iter().chain(&transcript_records) {
+        for (kind, record_id, bytes) in event_records
+            .iter()
+            .chain(&transcript_records)
+            .chain(&binding_records)
+        {
             if self
                 .control
                 .get_record(kind, record_id)?
@@ -2787,6 +2825,7 @@ impl Node {
         }
         records.extend(event_records);
         records.extend(transcript_records);
+        records.extend(binding_records);
         self.control.put_records(&records)?;
         Ok(())
     }
@@ -2943,7 +2982,7 @@ impl Node {
         if certified.event.kind.coding_group_add().is_some() {
             anyhow::bail!("coding-group events require replayable verifier evidence");
         }
-        self.install_guild_event_inner(certified, None)
+        self.install_guild_event_inner(certified, None, None)
     }
 
     pub fn install_coding_group_event(
@@ -2951,14 +2990,70 @@ impl Node {
         certified: QuorumGuildEvent,
         transcript: SignedRecord<CodingVerificationTranscript>,
     ) -> Result<()> {
+        if matches!(
+            certified.event.kind,
+            mb_core::GuildEventKind::AddCodingGroup { .. }
+        ) {
+            anyhow::bail!("historical coding Add requires quorum-bound verifier evidence");
+        }
         self.validate_coding_group_event_evidence(&certified.event, &transcript)?;
-        self.install_guild_event_inner(certified, Some(transcript))
+        self.install_guild_event_inner(certified, Some(transcript), None)
+    }
+
+    pub(crate) fn install_legacy_coding_group_event(
+        &mut self,
+        certified: QuorumGuildEvent,
+        transcript: SignedRecord<CodingVerificationTranscript>,
+        binding: QuorumLegacyCodingAddBinding,
+    ) -> Result<()> {
+        let state = self
+            .dynamic_guild_state()?
+            .context("node has no dynamic guild state")?;
+        let state_before = if state.event_sequence.checked_add(1) == Some(certified.event.sequence)
+        {
+            state
+        } else {
+            self.dynamic_guild_state_before_event(certified.event.sequence)?
+        };
+        binding.verify(&state_before, &certified)?;
+        if binding.statement.transcript_hash
+            != *blake3::hash(&canonical_bytes(&transcript)?).as_bytes()
+        {
+            anyhow::bail!("historical Add binding names different verifier evidence");
+        }
+        self.validate_coding_group_event_evidence(&certified.event, &transcript)?;
+        self.install_guild_event_inner(certified, Some(transcript), Some(binding))
+    }
+
+    fn dynamic_guild_state_before_event(&self, sequence: u64) -> Result<DynamicGuildState> {
+        let installed = decode_installed_guild(
+            &self
+                .control
+                .get_record("guild-installed", b"primary")?
+                .context("node has no installed guild")?,
+        )?;
+        let mut state = initial_dynamic_guild_state(&installed)?;
+        for (record_id, bytes) in self.control.records("guild-event")? {
+            let event: QuorumGuildEvent = decode_canonical(&bytes)?;
+            if event.event.sequence >= sequence {
+                break;
+            }
+            if record_id != event.event.sequence.to_be_bytes() {
+                anyhow::bail!("guild event history has an invalid record ID");
+            }
+            state.apply_event(&event)?;
+        }
+        if state.event_sequence.checked_add(1) != Some(sequence) {
+            anyhow::bail!("historical Add predecessor is unavailable");
+        }
+        Ok(state)
     }
 
     fn install_guild_event_inner(
         &mut self,
         certified: QuorumGuildEvent,
         transcript: Option<SignedRecord<CodingVerificationTranscript>>,
+        binding: Option<QuorumLegacyCodingAddBinding>,
     ) -> Result<()> {
         let mut state = self
             .dynamic_guild_state()?
@@ -2974,6 +3069,20 @@ impl Node {
             if existing != encoded {
                 anyhow::bail!("guild event conflicts with installed history");
             }
+            let binding_record = if let Some(binding) = &binding {
+                let event_hash = certified.event.hash()?;
+                let bytes = canonical_bytes(binding)?;
+                if self
+                    .control
+                    .get_record("coding-legacy-add-binding", &event_hash)?
+                    .is_some_and(|existing| existing != bytes)
+                {
+                    anyhow::bail!("historical Add conflicts with its quorum binding");
+                }
+                Some((event_hash, bytes))
+            } else {
+                None
+            };
             if let Some(transcript) = transcript {
                 let attempt_id = transcript.value.plan.value.attempt_id;
                 let group = &transcript.value.manifest.value.group;
@@ -3005,6 +3114,10 @@ impl Node {
                 self.volumes.finalize_attempt(&self.control, &attempt_id)?;
                 self.control
                     .delete_record("coding-pending-activation", &attempt_id)?;
+            }
+            if let Some((event_hash, bytes)) = binding_record {
+                self.control
+                    .put_record("coding-legacy-add-binding", &event_hash, &bytes)?;
             }
             if matches!(
                 certified.event.kind,
@@ -3067,6 +3180,22 @@ impl Node {
                 canonical_bytes(&state)?,
             ),
         ];
+        if let Some(binding) = binding {
+            let event_hash = certified.event.hash()?;
+            let bytes = canonical_bytes(&binding)?;
+            if self
+                .control
+                .get_record("coding-legacy-add-binding", &event_hash)?
+                .is_some_and(|existing| existing != bytes)
+            {
+                anyhow::bail!("coding Add conflicts with its quorum binding");
+            }
+            records.push((
+                "coding-legacy-add-binding".to_owned(),
+                event_hash.to_vec(),
+                bytes,
+            ));
+        }
         if let Some((add_hash, transcript)) = forgotten_group {
             let bytes = canonical_bytes(&transcript)?;
             if self
@@ -3279,6 +3408,71 @@ impl Node {
             event_sequence,
             event_hash,
         )
+    }
+
+    pub(crate) fn attest_legacy_coding_add(
+        &self,
+        guild_id: [u8; 32],
+        event_sequence: u64,
+        event_hash: [u8; 32],
+        transcript_hash: [u8; 32],
+    ) -> Result<MemberSignature> {
+        let certified: QuorumGuildEvent = decode_canonical(
+            &self
+                .control
+                .get_record("guild-event", &event_sequence.to_be_bytes())?
+                .context("historical coding Add is unavailable")?,
+        )?;
+        let mb_core::GuildEventKind::AddCodingGroup { group } = &certified.event.kind else {
+            anyhow::bail!("historical Add attestation requires an unbound event");
+        };
+        if certified.event.guild_id != guild_id
+            || certified.event.hash()? != event_hash
+            || !certified
+                .signatures
+                .iter()
+                .any(|signature| signature.signer == self.keys.node_id())
+            || !self.dynamic_guild_state()?.is_some_and(|state| {
+                state
+                    .active_members()
+                    .any(|member| member.node_id == self.keys.node_id())
+            })
+        {
+            anyhow::bail!("local node is not an authorized historical Add witness");
+        }
+        let transcript =
+            self.coding_transcript_for_event(guild_id, group.id, event_sequence, event_hash)?;
+        if *blake3::hash(&canonical_bytes(&transcript)?).as_bytes() != transcript_hash {
+            anyhow::bail!("historical Add witness has different verifier evidence");
+        }
+        let statement = LegacyCodingAddStatement::for_event(&certified, transcript_hash)?;
+        let signature = sign_legacy_coding_add_binding(&statement, &self.keys)?;
+        if let Some(bytes) = self
+            .control
+            .get_record("coding-legacy-add-signature-lock", &event_hash)?
+        {
+            let lock: LegacyCodingAddSignatureLock = decode_canonical(&bytes)?;
+            if lock.format_version != 1
+                || lock.statement != statement
+                || lock.signature != signature
+            {
+                anyhow::bail!("local node already attested different historical Add evidence");
+            }
+            return Ok(signature);
+        }
+        let lock = LegacyCodingAddSignatureLock {
+            format_version: 1,
+            statement,
+            signature: signature.clone(),
+        };
+        if !self.control.put_record_if_absent(
+            "coding-legacy-add-signature-lock",
+            &event_hash,
+            &canonical_bytes(&lock)?,
+        )? {
+            anyhow::bail!("historical Add attestation raced another local signature");
+        }
+        Ok(signature)
     }
 
     pub(crate) fn recovery_coding_transcript_for_group(
@@ -15355,6 +15549,7 @@ pub(crate) mod tests {
                         add_hash,
                         VerifiedCodingTranscript::verify(wrong_transcript).unwrap(),
                     )],
+                    Vec::new(),
                 )
                 .is_err()
         );
@@ -15371,6 +15566,7 @@ pub(crate) mod tests {
                     add_hash,
                     VerifiedCodingTranscript::verify(evidence).unwrap(),
                 )],
+                Vec::new(),
             )
             .unwrap();
         assert!(
@@ -16664,6 +16860,7 @@ pub(crate) mod tests {
             &checkpoint,
             vec![add.clone(), rotate_writer.clone()],
             peers,
+            Vec::new(),
             Vec::new(),
         )
         .unwrap();
@@ -18038,14 +18235,67 @@ pub(crate) mod tests {
                 group: group.clone(),
             },
         );
-        node.install_coding_group_event(add.clone(), transcript.clone())
+        let statement = LegacyCodingAddStatement::for_event(
+            &add,
+            *blake3::hash(&canonical_bytes(&transcript).unwrap()).as_bytes(),
+        )
+        .unwrap();
+        let mut signatures = keys
+            .iter()
+            .filter(|key| {
+                state
+                    .active_members()
+                    .any(|member| member.node_id == key.node_id())
+            })
+            .map(|key| sign_legacy_coding_add_binding(&statement, key).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        let binding = QuorumLegacyCodingAddBinding {
+            statement,
+            signatures,
+        };
+        assert!(
+            node.install_coding_group_event(add.clone(), transcript.clone())
+                .is_err()
+        );
+        node.install_legacy_coding_group_event(add.clone(), transcript.clone(), binding.clone())
             .unwrap();
         let old_add_hash = add.event.hash().unwrap();
+        let transcript_hash = binding.statement.transcript_hash;
+        assert_eq!(
+            node.attest_legacy_coding_add(
+                state.guild_id,
+                add.event.sequence,
+                old_add_hash,
+                transcript_hash,
+            )
+            .unwrap(),
+            sign_legacy_coding_add_binding(&binding.statement, node.keys()).unwrap(),
+        );
+        assert!(
+            node.attest_legacy_coding_add(
+                state.guild_id,
+                add.event.sequence,
+                old_add_hash,
+                [197; 32],
+            )
+            .is_err()
+        );
         assert!(
             node.control
                 .delete_record("coding-event-transcript", &old_add_hash)
                 .unwrap(),
             "simulate an upgraded store with a retained pre-binding Add"
+        );
+        assert!(
+            node.control
+                .delete_record("coding-legacy-add-binding", &old_add_hash)
+                .unwrap()
+        );
+        assert!(
+            node.control
+                .delete_record("coding-legacy-add-signature-lock", &old_add_hash)
+                .unwrap()
         );
         // The delegator can have retired the group while this holder has only
         // installed Add. Its early abort must still leave a durable cleanup
@@ -18127,6 +18377,15 @@ pub(crate) mod tests {
             )
             .unwrap(),
             transcript
+        );
+        assert!(
+            node.attest_legacy_coding_add(
+                state.guild_id,
+                add.event.sequence,
+                old_add_hash,
+                transcript_hash,
+            )
+            .is_ok()
         );
         assert!(node.discard_coding_attempt(&plan.value.attempt_id).unwrap());
         assert_eq!(
@@ -18214,7 +18473,7 @@ pub(crate) mod tests {
                 next
             );
             assert!(
-                node.install_coding_group_event(add.clone(), next.clone())
+                node.install_legacy_coding_group_event(add.clone(), next.clone(), binding.clone())
                     .is_err()
             );
 
@@ -18225,8 +18484,13 @@ pub(crate) mod tests {
             let old_evidence = node
                 .coding_transcript_for_event(state.guild_id, group.id, add.event.sequence, old_hash)
                 .unwrap();
+            assert!(
+                lagging
+                    .install_legacy_coding_group_event(add.clone(), next.clone(), binding.clone())
+                    .is_err()
+            );
             lagging
-                .install_coding_group_event(add, old_evidence)
+                .install_legacy_coding_group_event(add, old_evidence, binding)
                 .unwrap();
             lagging.install_guild_event(retire).unwrap();
             lagging.install_guild_event(forget).unwrap();

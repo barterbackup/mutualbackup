@@ -15,6 +15,7 @@ use crate::{
 };
 
 pub const GUILD_EVENT_DOMAIN: &[u8] = b"mutualbackup/guild-event/v1";
+pub const LEGACY_CODING_ADD_BINDING_DOMAIN: &[u8] = b"mutualbackup/legacy-coding-add-binding/v1";
 const MAX_DYNAMIC_MEMBERS: usize = 256;
 pub const MAX_GUILD_EVENT_TAIL: usize = 4096;
 
@@ -193,6 +194,121 @@ fn valid_event_format(event: &GuildEvent) -> bool {
 pub struct QuorumGuildEvent {
     pub event: GuildEvent,
     pub signatures: Vec<MemberSignature>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyCodingAddStatement {
+    pub format_version: u16,
+    pub guild_id: [u8; 32],
+    pub event_sequence: u64,
+    pub event_hash: [u8; 32],
+    pub transcript_hash: [u8; 32],
+}
+
+impl LegacyCodingAddStatement {
+    pub fn for_event(
+        certified: &QuorumGuildEvent,
+        transcript_hash: [u8; 32],
+    ) -> Result<Self, GuildStateError> {
+        if !matches!(certified.event.kind, GuildEventKind::AddCodingGroup { .. })
+            || transcript_hash == [0; 32]
+        {
+            return Err(GuildStateError::InvalidEvent);
+        }
+        Ok(Self {
+            format_version: 1,
+            guild_id: certified.event.guild_id,
+            event_sequence: certified.event.sequence,
+            event_hash: certified.event.hash()?,
+            transcript_hash,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuorumLegacyCodingAddBinding {
+    pub statement: LegacyCodingAddStatement,
+    pub signatures: Vec<MemberSignature>,
+}
+
+pub fn sign_legacy_coding_add_binding(
+    statement: &LegacyCodingAddStatement,
+    keys: &KeyMaterial,
+) -> Result<MemberSignature, GuildStateError> {
+    Ok(MemberSignature {
+        signer: keys.node_id(),
+        signature: keys
+            .sign(
+                LEGACY_CODING_ADD_BINDING_DOMAIN,
+                &canonical_bytes(statement)?,
+            )
+            .to_vec(),
+    })
+}
+
+pub fn verify_legacy_coding_add_signature(
+    statement: &LegacyCodingAddStatement,
+    signature: &MemberSignature,
+) -> Result<(), GuildStateError> {
+    let key = VerifyingKey::from_bytes(&signature.signer.0)?;
+    if key.is_weak() {
+        return Err(GuildStateError::InvalidEvent);
+    }
+    key.verify_strict(
+        &signing_payload(
+            LEGACY_CODING_ADD_BINDING_DOMAIN,
+            &canonical_bytes(statement)?,
+        ),
+        &Signature::from_slice(&signature.signature)?,
+    )?;
+    Ok(())
+}
+
+impl QuorumLegacyCodingAddBinding {
+    pub fn verify(
+        &self,
+        state_before: &DynamicGuildState,
+        certified: &QuorumGuildEvent,
+    ) -> Result<(), GuildStateError> {
+        state_before.verify_event(certified)?;
+        if !matches!(certified.event.kind, GuildEventKind::AddCodingGroup { .. })
+            || self.statement.format_version != 1
+            || self.statement.guild_id != certified.event.guild_id
+            || self.statement.event_sequence != certified.event.sequence
+            || self.statement.event_hash != certified.event.hash()?
+            || self.statement.transcript_hash == [0; 32]
+        {
+            return Err(GuildStateError::InvalidEvent);
+        }
+        let active = state_before
+            .active_members()
+            .map(|member| member.node_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let original_signers = certified
+            .signatures
+            .iter()
+            .map(|signature| signature.signer)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut previous = None;
+        for signature in &self.signatures {
+            if !active.contains(&signature.signer)
+                || !original_signers.contains(&signature.signer)
+                || previous.is_some_and(|signer| signer >= signature.signer)
+            {
+                return Err(GuildStateError::InvalidEvent);
+            }
+            verify_legacy_coding_add_signature(&self.statement, signature)?;
+            previous = Some(signature.signer);
+        }
+        let required = state_before.quorum.required(active.len())?;
+        if self.signatures.len() < required {
+            return Err(GuildStateError::InsufficientQuorum {
+                actual: self.signatures.len(),
+                required,
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1064,6 +1180,42 @@ mod tests {
         let mut invalid = bound;
         invalid.format_version = 1;
         assert!(state.validate_event_proposal(&invalid).is_err());
+    }
+
+    #[test]
+    fn historical_add_binding_requires_the_exact_transcript_and_quorum() {
+        let keys = keys(8);
+        let state = state(&keys);
+        let add = certify(
+            &state,
+            GuildEventKind::AddCodingGroup {
+                group: group(&state, &keys),
+            },
+            &keys[..5],
+        );
+        let statement = LegacyCodingAddStatement::for_event(&add, [9; 32]).unwrap();
+        let mut signatures = keys[..5]
+            .iter()
+            .map(|key| sign_legacy_coding_add_binding(&statement, key).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        let binding = QuorumLegacyCodingAddBinding {
+            statement,
+            signatures,
+        };
+        binding.verify(&state, &add).unwrap();
+
+        let mut wrong = binding.clone();
+        wrong.statement.transcript_hash = [10; 32];
+        assert!(wrong.verify(&state, &add).is_err());
+        let mut partial = binding.clone();
+        partial.signatures.truncate(2);
+        assert!(partial.verify(&state, &add).is_err());
+        let mut duplicate = binding;
+        duplicate
+            .signatures
+            .insert(1, duplicate.signatures[0].clone());
+        assert!(duplicate.verify(&state, &add).is_err());
     }
 
     #[test]

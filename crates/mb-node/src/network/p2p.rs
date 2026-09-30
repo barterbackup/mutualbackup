@@ -33,19 +33,20 @@ use mb_core::{
     CodingGroup, CodingGroupV2, CodingPlanGeometry, CodingProfile, CodingRootManifest,
     CodingShardOpening, CodingVerificationTranscript, DynamicGuildState, GuildCheckpoint,
     GuildEvent, GuildEventTail, GuildGenesis, GuildInvite, InformationRoleV2,
-    LEGACY_PACKING_ATTESTATION_DOMAIN, LEGACY_PACKING_BINDING_DOMAIN, LegacyPackingAttestation,
-    LegacyPackingBinding, MERKLE_LEAF_SIZE, Member, MemberSignature, MerkleCommitment, NodeId,
-    PackedCatalog, PackedSector, PackedSectorDescriptor, PackingInput, PackingProfile,
-    ParityPlacementV2, QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis, QuorumPolicy,
-    QuorumRule, RECOVERY_LOCATOR_DOMAIN, RangeSectorRef, STAGED_STORAGE_RECEIPT_DOMAIN,
-    STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId, SectorRef, ShardRole, ShardRoleV2, SignedRecord,
-    StagedStorageReceipt, StorageAcknowledgement, UserRevision, V1_CATALOG_PAGE_BYTES,
-    V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES, V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES,
-    V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS, V1_SECTOR_SIZE, attach_legacy_packing_bindings,
-    attach_legacy_packing_evidence, canonical_bytes, coding_challenge, coding_transfer_estimate,
-    decode_canonical, merkle_commit, merkle_zero_commitment, pack_incremental,
-    pack_incremental_authenticated, packing_protected_root, replay_coding_transcript, sector_root,
-    unpack_object_from_sectors,
+    LEGACY_PACKING_ATTESTATION_DOMAIN, LEGACY_PACKING_BINDING_DOMAIN, LegacyCodingAddStatement,
+    LegacyPackingAttestation, LegacyPackingBinding, MERKLE_LEAF_SIZE, Member, MemberSignature,
+    MerkleCommitment, NodeId, PackedCatalog, PackedSector, PackedSectorDescriptor, PackingInput,
+    PackingProfile, ParityPlacementV2, QuorumCheckpoint, QuorumGuildEvent, QuorumGuildGenesis,
+    QuorumLegacyCodingAddBinding, QuorumPolicy, QuorumRule, RECOVERY_LOCATOR_DOMAIN,
+    RangeSectorRef, STAGED_STORAGE_RECEIPT_DOMAIN, STORAGE_ACKNOWLEDGEMENT_DOMAIN, SectorId,
+    SectorRef, ShardRole, ShardRoleV2, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
+    UserRevision, V1_CATALOG_PAGE_BYTES, V1_MAX_CATALOG_BYTES, V1_MAX_CATALOG_PAGES,
+    V1_MAX_CODING_GROUPS, V1_MAX_ENDPOINT_BYTES, V1_MAX_ENDPOINTS_PER_PEER, V1_RS_DATA_SHARDS,
+    V1_SECTOR_SIZE, attach_legacy_packing_bindings, attach_legacy_packing_evidence,
+    canonical_bytes, coding_challenge, coding_transfer_estimate, decode_canonical, merkle_commit,
+    merkle_zero_commitment, pack_incremental, pack_incremental_authenticated,
+    packing_protected_root, replay_coding_transcript, sector_root, unpack_object_from_sectors,
+    verify_legacy_coding_add_signature,
 };
 #[cfg(test)]
 use mb_core::{ParityRoleV2, encode};
@@ -2021,6 +2022,34 @@ impl P2pClient {
             bail!("peer returned the wrong coding-group event installation response");
         }
         Ok(())
+    }
+
+    pub(crate) async fn attest_legacy_coding_add(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        event_sequence: u64,
+        event_hash: [u8; 32],
+        transcript_hash: [u8; 32],
+    ) -> Result<MemberSignature> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::AttestLegacyCodingAdd {
+                    guild_id,
+                    event_sequence,
+                    event_hash,
+                    transcript_hash,
+                },
+            )
+            .await?;
+        let PeerResponse::LegacyCodingAddAttestation(signature) = response else {
+            bail!("peer returned the wrong historical Add attestation response");
+        };
+        if signature.signer != peer {
+            bail!("peer returned another member's historical Add attestation");
+        }
+        Ok(signature)
     }
 
     pub(crate) async fn coding_transcript_for_event(
@@ -9079,6 +9108,83 @@ where
     }
 }
 
+async fn gather_legacy_add_binding(
+    p2p: &P2pClient,
+    event: &QuorumGuildEvent,
+    transcript_hash: [u8; 32],
+    state_before: &DynamicGuildState,
+    sources: &[NodeId],
+) -> Result<QuorumLegacyCodingAddBinding> {
+    state_before.verify_event(event)?;
+    let statement = LegacyCodingAddStatement::for_event(event, transcript_hash)?;
+    let required = state_before
+        .quorum
+        .required(state_before.active_members().count())?;
+    let available = sources.iter().copied().collect::<BTreeSet<_>>();
+    let witnesses = event
+        .signatures
+        .iter()
+        .map(|signature| signature.signer)
+        .filter(|signer| available.contains(signer))
+        .collect::<Vec<_>>();
+    if witnesses.len() < required {
+        bail!("historical Add has too few reachable original signers for quorum binding");
+    }
+    let guild_id = statement.guild_id;
+    let event_sequence = statement.event_sequence;
+    let event_hash = statement.event_hash;
+    let transcript_hash = statement.transcript_hash;
+    let requests = futures::stream::iter(witnesses.into_iter().map(|peer| async move {
+        (
+            peer,
+            p2p.attest_legacy_coding_add(
+                peer,
+                guild_id,
+                event_sequence,
+                event_hash,
+                transcript_hash,
+            )
+            .await,
+        )
+    }))
+    .buffer_unordered(8);
+    accept_legacy_add_attestations(state_before, event, statement, requests).await
+}
+
+async fn accept_legacy_add_attestations<S>(
+    state_before: &DynamicGuildState,
+    event: &QuorumGuildEvent,
+    statement: LegacyCodingAddStatement,
+    mut requests: S,
+) -> Result<QuorumLegacyCodingAddBinding>
+where
+    S: futures::Stream<Item = (NodeId, Result<MemberSignature>)> + Unpin,
+{
+    let required = state_before
+        .quorum
+        .required(state_before.active_members().count())?;
+    let mut signatures = Vec::new();
+    while let Some((peer, result)) = requests.next().await {
+        match result {
+            Ok(signature) if verify_legacy_coding_add_signature(&statement, &signature).is_ok() => {
+                signatures.push(signature);
+                if signatures.len() >= required {
+                    signatures.sort_by_key(|signature| signature.signer);
+                    let binding = QuorumLegacyCodingAddBinding {
+                        statement: statement.clone(),
+                        signatures: signatures.clone(),
+                    };
+                    binding.verify(state_before, event)?;
+                    return Ok(binding);
+                }
+            }
+            Ok(_) => tracing::warn!(%peer, "invalid historical Add attestation"),
+            Err(error) => tracing::debug!(%peer, %error, "historical Add witness unavailable"),
+        }
+    }
+    bail!("historical Add lacks a quorum binding for its verifier transcript")
+}
+
 async fn install_coding_group_event_from_sources(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
@@ -9100,8 +9206,20 @@ async fn install_coding_group_event_from_sources(
     ordered.retain(|source| seen.insert(*source));
     let event_sequence = event.event.sequence;
     let event_hash = event.event.hash()?;
+    let legacy_state = if matches!(
+        event.event.kind,
+        mb_core::GuildEventKind::AddCodingGroup { .. }
+    ) {
+        Some(
+            node_blocking(node.clone(), |node| node.dynamic_guild_state())
+                .await?
+                .context("historical Add catch-up has no dynamic guild state")?,
+        )
+    } else {
+        None
+    };
     let requests = FuturesUnordered::new();
-    for source in ordered {
+    for source in ordered.iter().copied() {
         requests.push(async move {
             (
                 source,
@@ -9119,11 +9237,32 @@ async fn install_coding_group_event_from_sources(
     accept_first_peer_response(requests, move |source, transcript| {
         let node = node.clone();
         let candidate_event = event.clone();
+        let legacy_state = legacy_state.clone();
+        let witnesses = ordered.clone();
         async move {
-            node_blocking(node, move |node| {
-                node.install_coding_group_event(candidate_event, transcript.into_inner())
-            })
-            .await
+            if let Some(state_before) = legacy_state {
+                let binding = gather_legacy_add_binding(
+                    p2p,
+                    &candidate_event,
+                    transcript.canonical_hash()?,
+                    &state_before,
+                    &witnesses,
+                )
+                .await?;
+                node_blocking(node, move |node| {
+                    node.install_legacy_coding_group_event(
+                        candidate_event,
+                        transcript.into_inner(),
+                        binding,
+                    )
+                })
+                .await
+            } else {
+                node_blocking(node, move |node| {
+                    node.install_coding_group_event(candidate_event, transcript.into_inner())
+                })
+                .await
+            }
             .with_context(|| format!("peer {source} returned invalid coding evidence"))
         }
     })
@@ -9563,6 +9702,7 @@ struct ValidatedRecoveryHead {
     state: DynamicGuildState,
     events: Vec<QuorumGuildEvent>,
     transcripts: Vec<([u8; 32], VerifiedCodingTranscript)>,
+    bindings: Vec<QuorumLegacyCodingAddBinding>,
 }
 
 pub async fn recover_from_dht(
@@ -9762,6 +9902,7 @@ async fn recover_from_dht_once(
         state,
         events,
         transcripts,
+        bindings,
     } = selected.ok_or(RecoveryDiscoveryPending(
         "no advertised recovery head could be certified",
     ))?;
@@ -9853,6 +9994,7 @@ async fn recover_from_dht_once(
                 events,
                 recovered_roster,
                 transcripts,
+                bindings,
             )
         } else {
             node.adopt_recovered_guild(recovered_genesis, recovered_roster)
@@ -10012,10 +10154,13 @@ async fn validate_recovery_head(
             })
             .await?;
             if valid_candidates.len() >= required_confirmations {
-                let transcripts = match fetch_recovery_transcripts(
+                let (transcripts, bindings) = match fetch_recovery_transcripts(
                     p2p,
                     publisher,
                     guild_id,
+                    &genesis,
+                    &state,
+                    subject,
                     &events,
                 )
                 .await
@@ -10040,6 +10185,7 @@ async fn validate_recovery_head(
                     state,
                     events,
                     transcripts,
+                    bindings,
                 });
             }
         }
@@ -10056,36 +10202,94 @@ async fn fetch_recovery_transcripts(
     p2p: &P2pClient,
     publisher: NodeId,
     guild_id: [u8; 32],
+    genesis: &QuorumGuildGenesis,
+    final_state: &DynamicGuildState,
+    subject: NodeId,
     events: &[QuorumGuildEvent],
-) -> Result<Vec<([u8; 32], VerifiedCodingTranscript)>> {
+) -> Result<(
+    Vec<([u8; 32], VerifiedCodingTranscript)>,
+    Vec<QuorumLegacyCodingAddBinding>,
+)> {
     let mut adds = Vec::new();
+    let mut replay = DynamicGuildState::new(
+        guild_id,
+        genesis.hash()?,
+        QuorumPolicy {
+            format_version: 1,
+            rule: QuorumRule::Unanimous,
+        },
+        genesis.genesis.members.clone(),
+    )?;
     for event in events {
         if let Some((group, transcript_hash)) = event.event.kind.coding_group_add() {
             adds.push((
-                event.event.sequence,
+                event.clone(),
+                replay.clone(),
                 event.event.hash()?,
                 group.id,
                 transcript_hash,
             ));
         }
+        replay.apply_event(event)?;
     }
+    if &replay != final_state {
+        bail!("recovery event history changed before coding evidence fetch");
+    }
+    let sources = Arc::new(
+        final_state
+            .active_members()
+            .map(|member| member.node_id)
+            .filter(|member| *member != subject)
+            .collect::<Vec<_>>(),
+    );
     let requests = adds
         .into_iter()
-        .map(|(sequence, hash, group_id, expected_hash)| async move {
-            let transcript = p2p
-                .coding_transcript_for_event(publisher, guild_id, group_id, sequence, hash)
-                .await?;
-            if let Some(expected) = expected_hash
-                && transcript.canonical_hash()? != expected
-            {
-                bail!("recovery publisher returned evidence for another certified Add");
+        .map(|(event, state_before, hash, group_id, expected_hash)| {
+            let sources = sources.clone();
+            async move {
+                let transcript = p2p
+                    .coding_transcript_for_event(
+                        publisher,
+                        guild_id,
+                        group_id,
+                        event.event.sequence,
+                        hash,
+                    )
+                    .await?;
+                if let Some(expected) = expected_hash
+                    && transcript.canonical_hash()? != expected
+                {
+                    bail!("recovery publisher returned evidence for another certified Add");
+                }
+                let binding = if expected_hash.is_none() {
+                    Some(
+                        gather_legacy_add_binding(
+                            p2p,
+                            &event,
+                            transcript.canonical_hash()?,
+                            &state_before,
+                            &sources,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+                Ok((hash, transcript, binding))
             }
-            Ok((hash, transcript))
         });
-    let mut transcripts =
+    let mut evidence =
         collect_bounded_recovery_requests(requests, RECOVERY_TRANSCRIPT_FETCH_CONCURRENCY).await?;
-    transcripts.sort_by_key(|(hash, _)| *hash);
-    Ok(transcripts)
+    evidence.sort_by_key(|(hash, _, _)| *hash);
+    let mut transcripts = Vec::with_capacity(evidence.len());
+    let mut bindings = Vec::new();
+    for (hash, transcript, binding) in evidence {
+        transcripts.push((hash, transcript));
+        if let Some(binding) = binding {
+            bindings.push(binding);
+        }
+    }
+    Ok((transcripts, bindings))
 }
 
 async fn collect_bounded_recovery_requests<I, Fut, T>(
@@ -16341,6 +16545,93 @@ mod tests {
                 .is_none()
         );
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn legacy_add_witnesses_reject_wrong_attempt_before_quorum() {
+        let keys = (0_u8..5)
+            .map(|index| KeyMaterial::from_seed(&Seed::from_bytes([index + 61; 32])))
+            .collect::<Vec<_>>();
+        let members = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| Member {
+                node_id: key.node_id(),
+                recovery_public_key: key.recovery_public_key(),
+                failure_domain: format!("witness-{index}"),
+            })
+            .collect();
+        let state = DynamicGuildState::new(
+            [71; 32],
+            [72; 32],
+            QuorumPolicy {
+                format_version: 1,
+                rule: QuorumRule::Majority,
+            },
+            members,
+        )
+        .unwrap();
+        let event = GuildEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: 1,
+            parent: state.event_head,
+            kind: mb_core::GuildEventKind::AddCodingGroup {
+                group: CodingGroupV2 {
+                    id: [73; 32],
+                    format_version: 2,
+                    guild_id: state.guild_id,
+                    profile: CodingProfile::new(1, 1, 64),
+                    roles: Vec::new(),
+                },
+            },
+        };
+        let mut signatures = keys
+            .iter()
+            .map(|key| mb_core::sign_guild_event(&event, key).unwrap())
+            .collect::<Vec<_>>();
+        signatures.sort_by_key(|signature| signature.signer);
+        let certified = QuorumGuildEvent { event, signatures };
+        let correct = LegacyCodingAddStatement::for_event(&certified, [74; 32]).unwrap();
+        let wrong = LegacyCodingAddStatement::for_event(&certified, [75; 32]).unwrap();
+        let wrong_first = mb_core::sign_legacy_coding_add_binding(&wrong, &keys[0]).unwrap();
+        let responses: Vec<(NodeId, Result<MemberSignature>)> =
+            std::iter::once((keys[0].node_id(), Ok(wrong_first)))
+                .chain(keys[1..4].iter().map(|key| {
+                    (
+                        key.node_id(),
+                        Ok(mb_core::sign_legacy_coding_add_binding(&correct, key).unwrap()),
+                    )
+                }))
+                .collect::<Vec<_>>();
+        let binding = accept_legacy_add_attestations(
+            &state,
+            &certified,
+            correct.clone(),
+            futures::stream::iter(
+                responses[..4]
+                    .iter()
+                    .map(|(peer, signature)| (*peer, Ok(signature.as_ref().unwrap().clone()))),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(binding.signatures.len(), 3);
+        binding.verify(&state, &certified).unwrap();
+        assert!(
+            accept_legacy_add_attestations(
+                &state,
+                &certified,
+                correct,
+                futures::stream::iter(
+                    responses[..3]
+                        .iter()
+                        .map(|(peer, signature)| (*peer, Ok(signature.as_ref().unwrap().clone()))),
+                ),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

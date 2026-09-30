@@ -738,6 +738,7 @@ fn process_peer_request(
                 | PeerRequest::InstallGuildEvent { .. }
                 | PeerRequest::SignCodingGroupEvent { .. }
                 | PeerRequest::InstallCodingGroupEvent { .. }
+                | PeerRequest::AttestLegacyCodingAdd { .. }
         ) && request
             .guild_scope()
             .is_some_and(|guild_id| node_guard.authorize_member(&guild_id, caller).is_ok());
@@ -1135,6 +1136,14 @@ fn execute_peer_request(
                 node.sign_coding_group_event_proposal(&event, &transcript)?,
             ))
         }
+        PeerRequest::AttestLegacyCodingAdd {
+            guild_id,
+            event_sequence,
+            event_hash,
+            transcript_hash,
+        } => Ok(PeerResponse::LegacyCodingAddAttestation(
+            node.attest_legacy_coding_add(guild_id, event_sequence, event_hash, transcript_hash)?,
+        )),
         PeerRequest::InstallCodingGroupEvent {
             certified,
             transcript,

@@ -327,6 +327,12 @@ pub(super) enum PeerRequest {
     GetCodingAttemptRetirement {
         plan: Box<SignedRecord<CodingAttemptPlan>>,
     },
+    AttestLegacyCodingAdd {
+        guild_id: [u8; 32],
+        event_sequence: u64,
+        event_hash: [u8; 32],
+        transcript_hash: [u8; 32],
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -405,6 +411,7 @@ impl PeerRequest {
             Self::InstallGuildEvent { .. } => Some("install-guild-event"),
             Self::SignCodingGroupEvent { .. } => Some("sign-coding-group-event"),
             Self::InstallCodingGroupEvent { .. } => Some("install-coding-group-event"),
+            Self::AttestLegacyCodingAdd { .. } => Some("attest-legacy-coding-add"),
             Self::SubmitBackup { .. } => Some("submit-backup"),
             #[cfg(test)]
             Self::PrepareSource { .. } => Some("prepare-source"),
@@ -492,7 +499,8 @@ impl PeerRequest {
             Self::SignCodingGroupEvent { event, .. } => Some(event.guild_id),
             Self::InstallCodingGroupEvent { certified, .. } => Some(certified.event.guild_id),
             Self::GetCodingTranscript { guild_id, .. }
-            | Self::GetCodingTranscriptForEvent { guild_id, .. } => Some(*guild_id),
+            | Self::GetCodingTranscriptForEvent { guild_id, .. }
+            | Self::AttestLegacyCodingAdd { guild_id, .. } => Some(*guild_id),
             Self::PublishParity { object, .. } => Some(object.guild_id),
             Self::StageCodingParity { plan, .. }
             | Self::ReserveCodingInformation { plan, .. }
@@ -595,6 +603,7 @@ pub(super) enum PeerResponse {
     CodingAttemptRetired {
         retired: bool,
     },
+    LegacyCodingAddAttestation(MemberSignature),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1386,6 +1395,51 @@ mod tests {
                             path: None,
                         },
                     ],
+                })),
+            },
+            &keys,
+        )
+        .unwrap();
+        let response_bytes = cbor4ii::serde::to_vec(Vec::new(), &response).unwrap();
+        cddl_cat::validate_cbor_bytes("signed-peer-response", SCHEMA, &response_bytes).unwrap();
+    }
+
+    #[test]
+    fn legacy_add_attestation_frames_match_cddl() {
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([21; 32]));
+        let recipient = KeyMaterial::from_seed(&Seed::from_bytes([22; 32])).node_id();
+        let request = SignedRecord::sign(
+            PEER_REQUEST_DOMAIN,
+            PeerRequestEnvelope {
+                format_version: PEER_WIRE_FORMAT_VERSION,
+                request_id: [23; 16],
+                caller: keys.node_id(),
+                recipient: Some(recipient),
+                guild_scope: Some([24; 32]),
+                issued_at_unix_seconds: 1_700_000_000,
+                expires_at_unix_seconds: 1_700_000_060,
+                request: PeerRequest::AttestLegacyCodingAdd {
+                    guild_id: [24; 32],
+                    event_sequence: 7,
+                    event_hash: [25; 32],
+                    transcript_hash: [26; 32],
+                },
+            },
+            &keys,
+        )
+        .unwrap();
+        let request_bytes = cbor4ii::serde::to_vec(Vec::new(), &request).unwrap();
+        cddl_cat::validate_cbor_bytes("signed-peer-request", SCHEMA, &request_bytes).unwrap();
+        let response = SignedRecord::sign(
+            PEER_RESPONSE_DOMAIN,
+            PeerResponseEnvelope {
+                format_version: PEER_WIRE_FORMAT_VERSION,
+                request_id: [23; 16],
+                recipient: keys.node_id(),
+                request_hash: [27; 32],
+                result: Ok(PeerResponse::LegacyCodingAddAttestation(MemberSignature {
+                    signer: recipient,
+                    signature: vec![28; 64],
                 })),
             },
             &keys,

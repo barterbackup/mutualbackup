@@ -36,9 +36,11 @@ pub use content::{
 };
 pub use guild::{
     DynamicGuildState, DynamicMember, GUILD_EVENT_DOMAIN, GuildEvent, GuildEventKind,
-    GuildEventTail, GuildStateError, MAX_GUILD_EVENT_TAIL, QuorumGuildEvent, QuorumPolicy,
-    QuorumRule, RecoveryEpochSecret, RecoveryKeyEnvelope, RecoveryKeyEpoch, RetainedCodingGroup,
+    GuildEventTail, GuildStateError, LEGACY_CODING_ADD_BINDING_DOMAIN, LegacyCodingAddStatement,
+    MAX_GUILD_EVENT_TAIL, QuorumGuildEvent, QuorumLegacyCodingAddBinding, QuorumPolicy, QuorumRule,
+    RecoveryEpochSecret, RecoveryKeyEnvelope, RecoveryKeyEpoch, RetainedCodingGroup,
     WriterKeyEpoch, create_recovery_key_envelope, open_recovery_key_envelope, sign_guild_event,
+    sign_legacy_coding_add_binding, verify_legacy_coding_add_signature,
 };
 pub use keys::{
     DatabaseKeyError, KeyIdentityError, KeyMaterial, NodeId, RecoveryPublicKey, Seed,

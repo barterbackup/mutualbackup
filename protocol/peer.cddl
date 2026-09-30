@@ -62,6 +62,12 @@ peer-request =
         event_sequence: uint,
         event_hash: bytes32-array
       } }
+  / { "AttestLegacyCodingAdd": {
+        guild_id: bytes32-array,
+        event_sequence: uint,
+        event_hash: bytes32-array,
+        transcript_hash: bytes32-array
+      } }
   / { "ExchangeEndpoints": { guild_id: bytes32-array } }
   / { "GetPreparedRevisionPage": { guild_id: bytes32-array, revision_id: uuid-bytes, page_index: uint } }
   / { "EnsureFiller": { guild_id: bytes32-array, revision_id: uuid-bytes, ordinal: uint } }
@@ -218,6 +224,7 @@ peer-response =
   / { "CodingPathObservation": coding-path-observation }
   / { "CodingCapacity": { available_shards: uint } }
   / { "CodingAttemptRetired": { retired: bool } }
+  / { "LegacyCodingAddAttestation": member-signature }
   / "Ack"
 
 peer-profile = { member: member, endpoint: tstr }
