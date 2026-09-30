@@ -3967,7 +3967,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   existing remote-information retention regressions pass through reopen;
   formatting and strict all-target `mb-node` Clippy pass locally.
 
-- [ ] **M5-149 / P1 — Revalidate the corrected milestone on exact source.**
+- [x] **M5-149 / P1 — Revalidate the corrected milestone on exact source.**
   Run formatting, strict workspace Clippy, locked all-target workspace tests,
   Docker safety and the fresh disposable Btrfs/network acceptance matrix on
   one committed source. Independently audit cleanup of owned mounts, loop
@@ -3998,7 +3998,17 @@ node Clippy gate passed locally. No remote compilation server was used.
   `/tmp/mutualbackup-m5-149-cleanup-audit.log`. A subsequent exact-source
   workspace rerun on `fef9a25` exposed a separate immediate-reopen race in
   the three-domain activation fixture after 302 `mb-node` tests passed;
-  M5-153 corrects that fixture. The final complete gate remains pending.
+  M5-153 corrects that fixture. The final complete gate passed on committed
+  source `0c3924457ada6bc3b308a6cdcaeebdf8a83eec21`: formatting,
+  warning-free strict workspace Clippy, locked all-target workspace tests
+  (303 passing `mb-node` tests), Docker safety, all 24 provisioned acceptance
+  invocations including the five-daemon process scenario, and independent
+  cleanup of the image, mount, loop, namespaces, links, daemons and firewall.
+  The complete-gate logs are `/tmp/mutualbackup-m5-152-final-core-gate.log`,
+  `/tmp/mutualbackup-m5-152-full-provisioned.log`, and
+  `/tmp/mutualbackup-m5-152-full-cleanup-audit.log`. M5-152 remains open
+  because the earlier 5,400-second topology timeout was not explained by the
+  passing rerun.
 
 - [x] **M5-150 / P1 — Authenticate historical unbound Add evidence on catch-up.**
   Format-1 `AddCodingGroup` must remain decodable for existing guild history,
@@ -4067,8 +4077,11 @@ node Clippy gate passed locally. No remote compilation server was used.
   including both isolated-topology backups and independent cleanup audits.
   Their coordinator records showed coding jobs, activation, event signatures
   and checkpoint generations advancing. This makes the original timeout
-  intermittent, but these runs omitted the preceding Btrfs acceptance cases
-  on the same image; they do not resolve the failed complete sequence.
+  intermittent. A later complete Btrfs/network gate on `0c39244` also passed,
+  including both topology backups after the preceding provisioned cases on
+  the same image. The full gate is recorded under M5-149. Keep this reliability
+  blocker open until the 5,400-second outlier has a diagnosed cause or a
+  source-level correction; one successful rerun alone does not explain it.
 
 - [x] **M5-153 / P2 — Wait for aborted coding workers in the activation reopen fixture.**
   The all-target workspace rerun on `fef9a25` passed 302 `mb-node` tests but
@@ -4077,8 +4090,8 @@ node Clippy gate passed locally. No remote compilation server was used.
   same transient lock race previously corrected in the related fixture.
   Its final reopen now uses a bounded wait while an already running blocking
   worker releases its node handle. The focused three-domain regression,
-  formatting and strict workspace Clippy pass; M5-149 will exercise it again
-  in the complete concurrent suite.
+  formatting and strict workspace Clippy pass; both three- and five-domain
+  fixtures also pass in M5-149's complete concurrent suite.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

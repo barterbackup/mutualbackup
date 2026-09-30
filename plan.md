@@ -129,8 +129,10 @@ topology backups but did not reproduce the timeout after the preceding Btrfs
 matrix. A later all-target workspace rerun exposed a separate three-domain
 activation fixture reopen race after 302 passing `mb-node` tests; M5-153 now
 waits for the already-running blocking worker to release the directory.
-Milestone 5 remains open for M5-152 and a fresh complete M5-149 gate;
-Milestone 6 waits.
+The complete M5-149 gate then passed on exact committed source `0c39244`,
+including all 24 provisioned invocations and independent cleanup. Milestone 5
+remains open for M5-152: the earlier 5,400-second topology timeout is
+intermittent but unexplained. Milestone 6 waits.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and
@@ -2392,11 +2394,13 @@ workspace Clippy, the locked all-target workspace suite, Docker safety and
 every provisioned case before the five-daemon smoke test passed. That smoke
 test timed out after 5,400 seconds waiting for its first isolated-topology
 backup to commit (M5-152); independent resource cleanup passed. Two
-smoke-only reproductions passed in 1,644 and 1,972 seconds on fresh images,
-so the failed complete sequence remains unexplained. A later workspace rerun
-found an independent three-domain test fixture reopen race (M5-153), now
-corrected. Rerun the complete local exact-source gate before closing Milestone
-5 (M5-149). M5-143 remains passing evidence for its exact prior source.
+smoke-only reproductions passed in 1,644 and 1,972 seconds on fresh images.
+A later workspace rerun found an independent three-domain test fixture reopen
+race (M5-153), now corrected. The complete local exact-source gate subsequently
+passed on `0c39244`: strict workspace checks, Docker safety, all 24 provisioned
+invocations, and independent cleanup (M5-149). The unexplained intermittent
+topology timeout remains M5-152 and keeps Milestone 5 open. M5-143 remains
+passing evidence for its exact prior source.
 
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
 launch-expiry regressions found duplicate same-lane successors. Renewal now
