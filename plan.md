@@ -139,8 +139,11 @@ members holding the same signed Add proposal. A debugger sample found repeated
 full event-history replay under the node mutex during activation selection,
 starving other workers. The authority path now caches verified membership
 snapshots until durable guild state changes, and rebuilds on reopen. Focused,
-workspace and fresh provisioned validation of this correction remain before
-M5-152 can close. Milestone 6 waits.
+strict workspace and all-target workspace checks pass. A fresh provisioned
+five-daemon smoke run on `e44a220` passed both isolated backups, seed/DHT
+recovery and independent cleanup in 1,206.63 seconds. The complete fresh
+provisioned matrix on one committed source remains M5-152's closure gate.
+Milestone 6 waits.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and

@@ -4097,8 +4097,13 @@ node Clippy gate passed locally. No remote compilation server was used.
   `claim_coding_activation` while other workers waited on the node mutex.
   Membership-history snapshots are now cached by the durable guild state so
   authority checks replay the event chain once per state change and again
-  after reopen. Validate the source correction with focused, workspace and
-  fresh provisioned gates before closing this blocker.
+  after reopen. The focused cache/reopen regression, formatting, strict
+  workspace Clippy, and locked all-target workspace tests pass locally; the
+  latter ran with the acceptance harness's 8,192-descriptor limit. A fresh
+  five-daemon provisioned smoke run on `e44a220` passed both topology backups
+  and recovery in 1,206.63 seconds, with its disposable resources cleaned up.
+  The complete fresh provisioned matrix on one committed source remains the
+  final M5-152 closure gate.
 
 - [x] **M5-153 / P2 — Wait for aborted coding workers in the activation reopen fixture.**
   The all-target workspace rerun on `fef9a25` passed 302 `mb-node` tests but
