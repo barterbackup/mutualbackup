@@ -4082,6 +4082,11 @@ node Clippy gate passed locally. No remote compilation server was used.
   the same image. The full gate is recorded under M5-149. Keep this reliability
   blocker open until the 5,400-second outlier has a diagnosed cause or a
   source-level correction; one successful rerun alone does not explain it.
+  The acceptance fixture now waits up to 45 seconds for the coordinator to
+  show a live connection to the fallback signer before starting the first
+  isolated-topology backup. This closes a readiness gap in the test and makes
+  a missing circuit fail at the topology boundary; it does not yet diagnose
+  the original timeout. Validate the changed fixture on a fresh local image.
 
 - [x] **M5-153 / P2 — Wait for aborted coding workers in the activation reopen fixture.**
   The all-target workspace rerun on `fef9a25` passed 302 `mb-node` tests but

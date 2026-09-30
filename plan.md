@@ -132,7 +132,10 @@ waits for the already-running blocking worker to release the directory.
 The complete M5-149 gate then passed on exact committed source `0c39244`,
 including all 24 provisioned invocations and independent cleanup. Milestone 5
 remains open for M5-152: the earlier 5,400-second topology timeout is
-intermittent but unexplained. Milestone 6 waits.
+intermittent but unexplained. The five-daemon fixture now checks the
+coordinator-to-fallback-signer connection before its first topology backup;
+that bounded precondition awaits a fresh provisioned run and does not yet
+explain the earlier stall. Milestone 6 waits.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and

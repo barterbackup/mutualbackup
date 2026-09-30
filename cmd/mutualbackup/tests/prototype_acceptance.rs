@@ -1583,6 +1583,16 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         "relay reservations: 1/1",
         Duration::from_secs(45),
     );
+    // The backup needs every member's signature. A reservation on p4 only
+    // proves its connection to the relay; it does not prove that p0's circuit
+    // dial to p4 has completed. Check that route before entering the long
+    // backup wait so a missing signer is reported at the topology boundary.
+    wait_for_active_peer(
+        &sockets[0],
+        &mut daemons[0],
+        &peer_ids[4],
+        Duration::from_secs(45),
+    );
 
     let direct_before = peer_path_transfer(&sockets[0], &mut daemons[0], &peer_ids[1], "Direct");
     let punched_before_on_coordinator =
@@ -2444,6 +2454,29 @@ fn wait_for_status_text(
             daemon,
             deadline.saturating_duration_since(Instant::now()),
         );
+    }
+}
+
+fn wait_for_active_peer(socket: &Path, daemon: &mut Daemon, peer_id: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = wait_for_status(
+            socket,
+            daemon,
+            deadline.saturating_duration_since(Instant::now()),
+        );
+        let prefix = format!("peer connection: {peer_id} active=[");
+        if status.lines().any(|line| {
+            line.strip_prefix(&prefix)
+                .is_some_and(|paths| !paths.starts_with(']'))
+        }) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "peer {peer_id} had no active connection:\n{status}"
+        );
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
