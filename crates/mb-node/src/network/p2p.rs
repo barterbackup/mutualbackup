@@ -2052,6 +2052,29 @@ impl P2pClient {
         Ok(signature)
     }
 
+    pub(crate) async fn legacy_coding_add_binding(
+        &self,
+        peer: NodeId,
+        guild_id: [u8; 32],
+        event_sequence: u64,
+        event_hash: [u8; 32],
+    ) -> Result<Option<QuorumLegacyCodingAddBinding>> {
+        let response = self
+            .call(
+                peer,
+                PeerRequest::GetLegacyCodingAddBinding {
+                    guild_id,
+                    event_sequence,
+                    event_hash,
+                },
+            )
+            .await?;
+        let PeerResponse::LegacyCodingAddBinding(binding) = response else {
+            bail!("peer returned the wrong historical Add binding response");
+        };
+        Ok(binding)
+    }
+
     pub(crate) async fn coding_transcript_for_event(
         &self,
         peer: NodeId,
@@ -8094,6 +8117,9 @@ pub async fn run_peer_exchange(node: Arc<Mutex<Node>>, p2p: P2pClient) -> Result
         if let Err(error) = sync_guild_events_once(node.clone(), &p2p).await {
             tracing::warn!(%error, "guild event-tail synchronization failed");
         }
+        if let Err(error) = rebind_legacy_coding_add_once(node.clone(), &p2p).await {
+            tracing::warn!(%error, "historical coding Add migration is waiting for evidence");
+        }
         if let Err(error) = sync_checkpoint_head_once(node.clone(), &p2p).await {
             tracing::warn!(%error, "certified checkpoint-head synchronization failed");
         }
@@ -8996,6 +9022,94 @@ async fn sync_guild_events_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Resu
     sync_guild_event_page(node, p2p, None).await
 }
 
+async fn rebind_legacy_coding_add_once(node: Arc<Mutex<Node>>, p2p: &P2pClient) -> Result<()> {
+    let work = node_blocking(node.clone(), |node| {
+        let Some((event, state_before, transcript_hash)) = node.next_unbound_legacy_coding_add()?
+        else {
+            return Ok(None);
+        };
+        let guild = node
+            .guild_summary()?
+            .context("historical Add migration has no installed guild")?;
+        let local_id = node.keys().node_id();
+        let local_active = guild
+            .peers
+            .iter()
+            .any(|peer| peer.member.node_id == local_id);
+        let sources = guild
+            .peers
+            .into_iter()
+            .filter(|peer| peer.member.node_id != local_id)
+            .collect::<Vec<_>>();
+        Ok(Some((
+            event,
+            state_before,
+            transcript_hash,
+            sources,
+            local_id,
+            local_active,
+        )))
+    })
+    .await?;
+    let Some((event, state_before, transcript_hash, peers, local_id, local_active)) = work else {
+        return Ok(());
+    };
+    for peer in &peers {
+        for endpoint in &peer.endpoints {
+            if let Ok(address) = endpoint.parse() {
+                let _ = p2p.add_peer_address(peer.member.node_id, address).await;
+            }
+        }
+    }
+    let sources = peers
+        .iter()
+        .map(|peer| peer.member.node_id)
+        .collect::<Vec<_>>();
+    let binding = if let Some(binding) =
+        fetch_legacy_add_binding_from_sources(p2p, &event, transcript_hash, &state_before, &sources)
+            .await
+    {
+        binding
+    } else {
+        let local_signature = if event
+            .signatures
+            .iter()
+            .any(|signature| signature.signer == local_id)
+            && local_active
+        {
+            let event_hash = event.event.hash()?;
+            let guild_id = event.event.guild_id;
+            let event_sequence = event.event.sequence;
+            Some(
+                node_blocking(node.clone(), move |node| {
+                    node.attest_legacy_coding_add(
+                        guild_id,
+                        event_sequence,
+                        event_hash,
+                        transcript_hash,
+                    )
+                })
+                .await?,
+            )
+        } else {
+            None
+        };
+        gather_legacy_add_binding(
+            p2p,
+            &event,
+            transcript_hash,
+            &state_before,
+            &sources,
+            local_signature,
+        )
+        .await?
+    };
+    node_blocking(node, move |node| {
+        node.persist_legacy_coding_add_binding(&event, &binding)
+    })
+    .await
+}
+
 async fn sync_guild_event_page(
     node: Arc<Mutex<Node>>,
     p2p: &P2pClient,
@@ -9114,6 +9228,7 @@ async fn gather_legacy_add_binding(
     transcript_hash: [u8; 32],
     state_before: &DynamicGuildState,
     sources: &[NodeId],
+    local_signature: Option<MemberSignature>,
 ) -> Result<QuorumLegacyCodingAddBinding> {
     state_before.verify_event(event)?;
     let statement = LegacyCodingAddStatement::for_event(event, transcript_hash)?;
@@ -9127,7 +9242,7 @@ async fn gather_legacy_add_binding(
         .map(|signature| signature.signer)
         .filter(|signer| available.contains(signer))
         .collect::<Vec<_>>();
-    if witnesses.len() < required {
+    if witnesses.len() + usize::from(local_signature.is_some()) < required {
         bail!("historical Add has too few reachable original signers for quorum binding");
     }
     let guild_id = statement.guild_id;
@@ -9148,13 +9263,56 @@ async fn gather_legacy_add_binding(
         )
     }))
     .buffer_unordered(8);
-    accept_legacy_add_attestations(state_before, event, statement, requests).await
+    accept_legacy_add_attestations(
+        state_before,
+        event,
+        statement,
+        local_signature.into_iter().collect(),
+        requests,
+    )
+    .await
+}
+
+async fn fetch_legacy_add_binding_from_sources(
+    p2p: &P2pClient,
+    event: &QuorumGuildEvent,
+    transcript_hash: [u8; 32],
+    state_before: &DynamicGuildState,
+    sources: &[NodeId],
+) -> Option<QuorumLegacyCodingAddBinding> {
+    let guild_id = event.event.guild_id;
+    let sequence = event.event.sequence;
+    let event_hash = event.event.hash().ok()?;
+    let requests = futures::stream::iter(sources.iter().copied().map(|peer| async move {
+        (
+            peer,
+            p2p.legacy_coding_add_binding(peer, guild_id, sequence, event_hash)
+                .await,
+        )
+    }))
+    .buffer_unordered(8);
+    futures::pin_mut!(requests);
+    while let Some((peer, result)) = requests.next().await {
+        match result {
+            Ok(Some(binding))
+                if binding.statement.transcript_hash == transcript_hash
+                    && binding.verify(state_before, event).is_ok() =>
+            {
+                return Some(binding);
+            }
+            Ok(Some(_)) => tracing::warn!(%peer, "peer returned an invalid legacy Add binding"),
+            Ok(None) => {}
+            Err(error) => tracing::debug!(%peer, %error, "legacy Add binding source unavailable"),
+        }
+    }
+    None
 }
 
 async fn accept_legacy_add_attestations<S>(
     state_before: &DynamicGuildState,
     event: &QuorumGuildEvent,
     statement: LegacyCodingAddStatement,
+    initial_signatures: Vec<MemberSignature>,
     mut requests: S,
 ) -> Result<QuorumLegacyCodingAddBinding>
 where
@@ -9163,7 +9321,19 @@ where
     let required = state_before
         .quorum
         .required(state_before.active_members().count())?;
-    let mut signatures = Vec::new();
+    let mut signatures = initial_signatures;
+    for signature in &signatures {
+        verify_legacy_coding_add_signature(&statement, signature)?;
+    }
+    if signatures.len() >= required {
+        signatures.sort_by_key(|signature| signature.signer);
+        let binding = QuorumLegacyCodingAddBinding {
+            statement,
+            signatures,
+        };
+        binding.verify(state_before, event)?;
+        return Ok(binding);
+    }
     while let Some((peer, result)) = requests.next().await {
         match result {
             Ok(signature) if verify_legacy_coding_add_signature(&statement, &signature).is_ok() => {
@@ -9241,14 +9411,29 @@ async fn install_coding_group_event_from_sources(
         let witnesses = ordered.clone();
         async move {
             if let Some(state_before) = legacy_state {
-                let binding = gather_legacy_add_binding(
+                let transcript_hash = transcript.canonical_hash()?;
+                let binding = match fetch_legacy_add_binding_from_sources(
                     p2p,
                     &candidate_event,
-                    transcript.canonical_hash()?,
+                    transcript_hash,
                     &state_before,
                     &witnesses,
                 )
-                .await?;
+                .await
+                {
+                    Some(binding) => binding,
+                    None => {
+                        gather_legacy_add_binding(
+                            p2p,
+                            &candidate_event,
+                            transcript_hash,
+                            &state_before,
+                            &witnesses,
+                            None,
+                        )
+                        .await?
+                    }
+                };
                 node_blocking(node, move |node| {
                     node.install_legacy_coding_group_event(
                         candidate_event,
@@ -10262,15 +10447,30 @@ async fn fetch_recovery_transcripts(
                     bail!("recovery publisher returned evidence for another certified Add");
                 }
                 let binding = if expected_hash.is_none() {
+                    let transcript_hash = transcript.canonical_hash()?;
                     Some(
-                        gather_legacy_add_binding(
+                        match fetch_legacy_add_binding_from_sources(
                             p2p,
                             &event,
-                            transcript.canonical_hash()?,
+                            transcript_hash,
                             &state_before,
                             &sources,
                         )
-                        .await?,
+                        .await
+                        {
+                            Some(binding) => binding,
+                            None => {
+                                gather_legacy_add_binding(
+                                    p2p,
+                                    &event,
+                                    transcript_hash,
+                                    &state_before,
+                                    &sources,
+                                    None,
+                                )
+                                .await?
+                            }
+                        },
                     )
                 } else {
                     None
@@ -16608,6 +16808,7 @@ mod tests {
             &state,
             &certified,
             correct.clone(),
+            Vec::new(),
             futures::stream::iter(
                 responses[..4]
                     .iter()
@@ -16623,6 +16824,7 @@ mod tests {
                 &state,
                 &certified,
                 correct,
+                Vec::new(),
                 futures::stream::iter(
                     responses[..3]
                         .iter()

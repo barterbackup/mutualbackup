@@ -3,8 +3,8 @@ use mb_core::{
     CodingGroup, CodingRootManifest, CodingShardOpening, CodingVerificationTranscript,
     EndpointRecord, GuildEvent, GuildEventTail, GuildGenesis, GuildInvite,
     LegacyPackingAttestation, LegacyPackingBinding, Member, MemberSignature, MerkleCommitment,
-    MerkleRangeProof, NodeId, QuorumGuildEvent, QuorumGuildGenesis, SectorId, SectorRef,
-    SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
+    MerkleRangeProof, NodeId, QuorumGuildEvent, QuorumGuildGenesis, QuorumLegacyCodingAddBinding,
+    SectorId, SectorRef, SignedRecord, StagedStorageReceipt, StorageAcknowledgement,
 };
 use mb_store::{ParityObject, VariableParityObject};
 use serde::{Deserialize, Serialize};
@@ -333,6 +333,11 @@ pub(super) enum PeerRequest {
         event_hash: [u8; 32],
         transcript_hash: [u8; 32],
     },
+    GetLegacyCodingAddBinding {
+        guild_id: [u8; 32],
+        event_sequence: u64,
+        event_hash: [u8; 32],
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -376,6 +381,7 @@ impl PeerRequest {
                 | Self::GetGuildEventTail { .. }
                 | Self::GetCodingTranscript { .. }
                 | Self::GetCodingTranscriptForEvent { .. }
+                | Self::GetLegacyCodingAddBinding { .. }
                 | Self::ExchangeEndpoints { .. }
                 | Self::CodingCapacity { .. }
         )
@@ -400,6 +406,7 @@ impl PeerRequest {
             | Self::GetGuildEventTail { .. }
             | Self::GetCodingTranscript { .. }
             | Self::GetCodingTranscriptForEvent { .. }
+            | Self::GetLegacyCodingAddBinding { .. }
             | Self::ExchangeEndpoints { .. }
             | Self::CodingCapacity { .. } => None,
             #[cfg(test)]
@@ -500,6 +507,7 @@ impl PeerRequest {
             Self::InstallCodingGroupEvent { certified, .. } => Some(certified.event.guild_id),
             Self::GetCodingTranscript { guild_id, .. }
             | Self::GetCodingTranscriptForEvent { guild_id, .. }
+            | Self::GetLegacyCodingAddBinding { guild_id, .. }
             | Self::AttestLegacyCodingAdd { guild_id, .. } => Some(*guild_id),
             Self::PublishParity { object, .. } => Some(object.guild_id),
             Self::StageCodingParity { plan, .. }
@@ -604,6 +612,7 @@ pub(super) enum PeerResponse {
         retired: bool,
     },
     LegacyCodingAddAttestation(MemberSignature),
+    LegacyCodingAddBinding(Option<QuorumLegacyCodingAddBinding>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1447,6 +1456,63 @@ mod tests {
         .unwrap();
         let response_bytes = cbor4ii::serde::to_vec(Vec::new(), &response).unwrap();
         cddl_cat::validate_cbor_bytes("signed-peer-response", SCHEMA, &response_bytes).unwrap();
+
+        let lookup = SignedRecord::sign(
+            PEER_REQUEST_DOMAIN,
+            PeerRequestEnvelope {
+                format_version: PEER_WIRE_FORMAT_VERSION,
+                request_id: [29; 16],
+                caller: keys.node_id(),
+                recipient: Some(recipient),
+                guild_scope: Some([24; 32]),
+                issued_at_unix_seconds: 1_700_000_000,
+                expires_at_unix_seconds: 1_700_000_060,
+                request: PeerRequest::GetLegacyCodingAddBinding {
+                    guild_id: [24; 32],
+                    event_sequence: 7,
+                    event_hash: [25; 32],
+                },
+            },
+            &keys,
+        )
+        .unwrap();
+        cddl_cat::validate_cbor_bytes(
+            "signed-peer-request",
+            SCHEMA,
+            &cbor4ii::serde::to_vec(Vec::new(), &lookup).unwrap(),
+        )
+        .unwrap();
+        let binding = QuorumLegacyCodingAddBinding {
+            statement: mb_core::LegacyCodingAddStatement {
+                format_version: 1,
+                guild_id: [24; 32],
+                event_sequence: 7,
+                event_hash: [25; 32],
+                transcript_hash: [26; 32],
+            },
+            signatures: vec![MemberSignature {
+                signer: recipient,
+                signature: vec![28; 64],
+            }],
+        };
+        let response = SignedRecord::sign(
+            PEER_RESPONSE_DOMAIN,
+            PeerResponseEnvelope {
+                format_version: PEER_WIRE_FORMAT_VERSION,
+                request_id: [29; 16],
+                recipient: keys.node_id(),
+                request_hash: [27; 32],
+                result: Ok(PeerResponse::LegacyCodingAddBinding(Some(binding))),
+            },
+            &keys,
+        )
+        .unwrap();
+        cddl_cat::validate_cbor_bytes(
+            "signed-peer-response",
+            SCHEMA,
+            &cbor4ii::serde::to_vec(Vec::new(), &response).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]

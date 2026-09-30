@@ -3990,6 +3990,10 @@ node Clippy gate passed locally. No remote compilation server was used.
   does not secure all supported history. Define and enforce a trusted
   re-binding path for old Adds (or explicitly fail closed with an agreed
   migration policy) before calling their catch-up and seed recovery safe.
+  Quorum witness signing, durable per-event certificates, certificate fetch on
+  catch-up/recovery, and background migration of installed old Adds are now
+  implemented; histories without an obtainable certificate still fail closed.
+  The missing-evidence policy and end-to-end recovery gate remain open.
 
 - [ ] **M5-151 / P1 — Preserve seed recovery and catch-up for historical Adds under the re-binding policy.**
   Source-only review of the in-progress M5-150 correction found that a legacy
@@ -4008,6 +4012,14 @@ node Clippy gate passed locally. No remote compilation server was used.
   recovery and lagging catch-up, including original-signer loss and membership
   change, before closing M5-150. This review ran no builds, tests, daemons or
   runtime probes; M5-149 remains pending on the final committed source.
+  A follow-up now lets surviving peers fetch a previously certified binding
+  without recontacting the original quorum, and each active node attempts to
+  create and retain one missing certificate per peer-exchange pass. This
+  removes the recovering-subject quorum dependency after migration, including
+  after later membership change. Histories that lost required signers before
+  any certificate was made remain unrecoverable; define the upgrade policy and
+  run the specified end-to-end recovery/catch-up regression before checking
+  this item.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

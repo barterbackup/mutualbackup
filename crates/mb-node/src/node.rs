@@ -808,6 +808,15 @@ impl NodeReader {
         authorize_historical_member(&self.control, guild_id, caller)
     }
 
+    pub(crate) fn legacy_coding_add_binding(
+        &self,
+        guild_id: [u8; 32],
+        event_sequence: u64,
+        event_hash: [u8; 32],
+    ) -> Result<Option<QuorumLegacyCodingAddBinding>> {
+        legacy_coding_add_binding_from_store(&self.control, guild_id, event_sequence, event_hash)
+    }
+
     pub(crate) fn coding_capacity(&self, shard_size: u32) -> Result<u64> {
         let readers = self
             .volume_readers
@@ -3047,6 +3056,95 @@ impl Node {
             anyhow::bail!("historical Add predecessor is unavailable");
         }
         Ok(state)
+    }
+
+    pub(crate) fn next_unbound_legacy_coding_add(
+        &self,
+    ) -> Result<Option<(QuorumGuildEvent, DynamicGuildState, [u8; 32])>> {
+        let installed = match self.control.get_record("guild-installed", b"primary")? {
+            Some(bytes) => decode_installed_guild(&bytes)?,
+            None => return Ok(None),
+        };
+        let mut state = initial_dynamic_guild_state(&installed)?;
+        for (record_id, bytes) in self.control.records("guild-event")? {
+            let event: QuorumGuildEvent = decode_canonical(&bytes)?;
+            if record_id != event.event.sequence.to_be_bytes() {
+                anyhow::bail!("guild event history has an invalid record ID");
+            }
+            if let mb_core::GuildEventKind::AddCodingGroup { group } = &event.event.kind {
+                let hash = event.event.hash()?;
+                if self
+                    .control
+                    .get_record("coding-legacy-add-binding", &hash)?
+                    .is_none()
+                {
+                    let transcript = self.coding_transcript_for_event(
+                        state.guild_id,
+                        group.id,
+                        event.event.sequence,
+                        hash,
+                    )?;
+                    state.verify_event(&event)?;
+                    return Ok(Some((
+                        event,
+                        state,
+                        *blake3::hash(&canonical_bytes(&transcript)?).as_bytes(),
+                    )));
+                }
+            }
+            state.apply_event(&event)?;
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn persist_legacy_coding_add_binding(
+        &self,
+        certified: &QuorumGuildEvent,
+        binding: &QuorumLegacyCodingAddBinding,
+    ) -> Result<()> {
+        let state_before = self.dynamic_guild_state_before_event(certified.event.sequence)?;
+        binding.verify(&state_before, certified)?;
+        let mb_core::GuildEventKind::AddCodingGroup { group } = &certified.event.kind else {
+            anyhow::bail!("legacy binding requires a historical coding Add");
+        };
+        let hash = certified.event.hash()?;
+        let stored: QuorumGuildEvent = decode_canonical(
+            &self
+                .control
+                .get_record("guild-event", &certified.event.sequence.to_be_bytes())?
+                .context("historical coding Add is unavailable")?,
+        )?;
+        if stored != *certified {
+            anyhow::bail!("legacy binding conflicts with installed guild history");
+        }
+        let transcript = self.coding_transcript_for_event(
+            state_before.guild_id,
+            group.id,
+            certified.event.sequence,
+            hash,
+        )?;
+        if binding.statement.transcript_hash
+            != *blake3::hash(&canonical_bytes(&transcript)?).as_bytes()
+        {
+            anyhow::bail!("legacy binding names different local verifier evidence");
+        }
+        let bytes = canonical_bytes(binding)?;
+        if let Some(existing) = self
+            .control
+            .get_record("coding-legacy-add-binding", &hash)?
+        {
+            if existing != bytes {
+                anyhow::bail!("historical Add conflicts with its persisted binding");
+            }
+            return Ok(());
+        }
+        if !self
+            .control
+            .put_record_if_absent("coding-legacy-add-binding", &hash, &bytes)?
+        {
+            anyhow::bail!("historical Add binding raced another certificate");
+        }
+        Ok(())
     }
 
     fn install_guild_event_inner(
@@ -12523,6 +12621,32 @@ fn validate_dynamic_state_origin(
     Ok(())
 }
 
+fn legacy_coding_add_binding_from_store(
+    control: &ControlStore,
+    guild_id: [u8; 32],
+    event_sequence: u64,
+    event_hash: [u8; 32],
+) -> Result<Option<QuorumLegacyCodingAddBinding>> {
+    let certified: QuorumGuildEvent = decode_canonical(
+        &control
+            .get_record("guild-event", &event_sequence.to_be_bytes())?
+            .context("historical coding Add is unavailable")?,
+    )?;
+    if certified.event.guild_id != guild_id
+        || certified.event.hash()? != event_hash
+        || !matches!(
+            certified.event.kind,
+            mb_core::GuildEventKind::AddCodingGroup { .. }
+        )
+    {
+        anyhow::bail!("requested legacy Add binding has a different event");
+    }
+    control
+        .get_record("coding-legacy-add-binding", &event_hash)?
+        .map(|bytes| decode_canonical(&bytes).map_err(Into::into))
+        .transpose()
+}
+
 fn coding_transcript_for_event_from_store(
     control: &ControlStore,
     guild_id: [u8; 32],
@@ -18287,6 +18411,35 @@ pub(crate) mod tests {
                 .unwrap(),
             "simulate an upgraded store with a retained pre-binding Add"
         );
+        assert!(
+            node.control
+                .delete_record("coding-legacy-add-binding", &old_add_hash)
+                .unwrap()
+        );
+        let (pending, before, pending_hash) =
+            node.next_unbound_legacy_coding_add().unwrap().unwrap();
+        assert_eq!(pending, add);
+        assert_eq!(before, state);
+        assert_eq!(pending_hash, transcript_hash);
+        let mut wrong_binding = binding.clone();
+        wrong_binding.statement.transcript_hash = [198; 32];
+        assert!(
+            node.persist_legacy_coding_add_binding(&add, &wrong_binding)
+                .is_err()
+        );
+        node.persist_legacy_coding_add_binding(&add, &binding)
+            .unwrap();
+        assert_eq!(
+            legacy_coding_add_binding_from_store(
+                &node.control,
+                state.guild_id,
+                add.event.sequence,
+                old_add_hash,
+            )
+            .unwrap(),
+            Some(binding.clone()),
+        );
+        assert!(node.next_unbound_legacy_coding_add().unwrap().is_none());
         assert!(
             node.control
                 .delete_record("coding-legacy-add-binding", &old_add_hash)

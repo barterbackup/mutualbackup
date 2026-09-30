@@ -680,6 +680,7 @@ fn process_peer_request(
                         PeerRequest::GetGuildEventTail { .. }
                             | PeerRequest::GetCodingTranscript { .. }
                             | PeerRequest::GetCodingTranscriptForEvent { .. }
+                            | PeerRequest::GetLegacyCodingAddBinding { .. }
                     ) {
                         reader.authorize_historical_member(&guild_id, caller)?;
                     } else {
@@ -1085,6 +1086,13 @@ fn execute_read_request(
         } => Ok(PeerResponse::CodingVerificationTranscript(Box::new(
             node.coding_transcript_for_event(guild_id, group_id, event_sequence, event_hash)?,
         ))),
+        PeerRequest::GetLegacyCodingAddBinding {
+            guild_id,
+            event_sequence,
+            event_hash,
+        } => Ok(PeerResponse::LegacyCodingAddBinding(
+            node.legacy_coding_add_binding(guild_id, event_sequence, event_hash)?,
+        )),
         PeerRequest::ExchangeEndpoints { guild_id } => Ok(PeerResponse::EndpointRecords(
             node.peer_exchange_endpoints(guild_id)?,
         )),
@@ -1491,6 +1499,9 @@ fn execute_peer_request(
         }
         PeerRequest::GetCodingTranscriptForEvent { .. } => {
             bail!("event-bound coding transcript read was sent to a mutation worker")
+        }
+        PeerRequest::GetLegacyCodingAddBinding { .. } => {
+            bail!("legacy coding Add binding read was sent to a mutation worker")
         }
         PeerRequest::ExchangeEndpoints { .. } => {
             bail!("endpoint exchange was sent to a mutation worker")

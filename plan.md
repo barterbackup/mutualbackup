@@ -117,6 +117,10 @@ lagging original signer makes unanimous historical Adds impossible to bind,
 breaking seed-only recovery and event-tail catch-up. Historical signer removal
 can cause the same failure. Resolve this migration/availability policy before
 the final gate.
+Background migration now gathers and stores quorum certificates while original
+signers are present; catch-up and cold recovery can fetch those certificates
+from surviving peers. The pre-migration signer-loss case and full recovery
+regression remain open under M5-151.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and

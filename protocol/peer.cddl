@@ -68,6 +68,11 @@ peer-request =
         event_hash: bytes32-array,
         transcript_hash: bytes32-array
       } }
+  / { "GetLegacyCodingAddBinding": {
+        guild_id: bytes32-array,
+        event_sequence: uint,
+        event_hash: bytes32-array
+      } }
   / { "ExchangeEndpoints": { guild_id: bytes32-array } }
   / { "GetPreparedRevisionPage": { guild_id: bytes32-array, revision_id: uuid-bytes, page_index: uint } }
   / { "EnsureFiller": { guild_id: bytes32-array, revision_id: uuid-bytes, ordinal: uint } }
@@ -225,6 +230,7 @@ peer-response =
   / { "CodingCapacity": { available_shards: uint } }
   / { "CodingAttemptRetired": { retired: bool } }
   / { "LegacyCodingAddAttestation": member-signature }
+  / { "LegacyCodingAddBinding": null / legacy-coding-add-binding }
   / "Ack"
 
 peer-profile = { member: member, endpoint: tstr }
@@ -280,6 +286,16 @@ quorum-guild-event = any
 guild-event-tail = any
 
 member-signature = { signer: bytes32-array, signature: bytes64-array }
+legacy-coding-add-binding = {
+  statement: {
+    format_version: uint,
+    guild_id: bytes32-array,
+    event_sequence: uint,
+    event_hash: bytes32-array,
+    transcript_hash: bytes32-array
+  },
+  signatures: [* member-signature]
+}
 
 backup-descriptor = {
   format_version: uint,
