@@ -130,9 +130,9 @@ matrix. A later all-target workspace rerun exposed a separate three-domain
 activation fixture reopen race after 302 passing `mb-node` tests; M5-153 now
 waits for the already-running blocking worker to release the directory.
 The complete M5-149 gate then passed on exact committed source `0c39244`,
-including all 24 provisioned invocations and independent cleanup. Milestone 5
-remains open for M5-152: the earlier 5,400-second topology timeout is
-intermittent. The five-daemon fixture now checks the coordinator-to-fallback
+including all 24 provisioned invocations and independent cleanup. M5-152
+subsequently explained the earlier 5,400-second topology timeout. The
+five-daemon fixture now checks the coordinator-to-fallback
 connection before its first topology backup. A fresh diagnostic run passed
 that precondition but stalled with verified activations pending and all five
 members holding the same signed Add proposal. A debugger sample found repeated
@@ -141,9 +141,11 @@ starving other workers. The authority path now caches verified membership
 snapshots until durable guild state changes, and rebuilds on reopen. Focused,
 strict workspace and all-target workspace checks pass. A fresh provisioned
 five-daemon smoke run on `e44a220` passed both isolated backups, seed/DHT
-recovery and independent cleanup in 1,206.63 seconds. The complete fresh
-provisioned matrix on one committed source remains M5-152's closure gate.
-Milestone 6 waits.
+recovery and independent cleanup in 1,206.63 seconds. The final gate on
+committed source `53ec2ec` passed formatting, strict workspace Clippy, the
+locked all-target workspace suite, Docker safety, all 24 fresh provisioned
+cases (including the five-daemon test in 1,201.82 seconds), and independent
+resource cleanup. Milestone 5 is closed; Milestone 6 may proceed.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and
@@ -2120,7 +2122,7 @@ source locations, failure cases, and recorded gate evidence.
   DHT/network failure, parity-volume loss and replacement, repair followed by a
   second loss, safe retention/GC, and recovery while a source volume is absent.
 
-### Milestone 5 — efficient and flexible data/guild protocol (reopened after M5-137)
+### Milestone 5 — efficient and flexible data/guild protocol (closed after M5-152)
 
 The historical source-only review through `a6b5d7d` found three blockers in
 the recently changed coding ownership and cleanup paths. A replayable negative
@@ -2409,9 +2411,16 @@ smoke-only reproductions passed in 1,644 and 1,972 seconds on fresh images.
 A later workspace rerun found an independent three-domain test fixture reopen
 race (M5-153), now corrected. The complete local exact-source gate subsequently
 passed on `0c39244`: strict workspace checks, Docker safety, all 24 provisioned
-invocations, and independent cleanup (M5-149). The unexplained intermittent
-topology timeout remains M5-152 and keeps Milestone 5 open. M5-143 remains
-passing evidence for its exact prior source.
+invocations, and independent cleanup (M5-149). A later diagnostic run reached
+the isolated backup with all five peers connected, then stalled with verified
+activations pending and a common signed Add locked on every member. A debugger
+sample found repeated full guild-history replay under the node mutex during
+activation selection. M5-152 caches verified membership snapshots by durable
+guild state and rebuilds them after events or reopen. The final local gate on
+`53ec2ec` passed strict workspace checks, Docker safety, all 24 provisioned
+cases, both topology backups and independent cleanup. Milestone 5 is closed;
+Milestone 6 may proceed. M5-143 remains passing evidence for its exact prior
+source.
 
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
 launch-expiry regressions found duplicate same-lane successors. Renewal now

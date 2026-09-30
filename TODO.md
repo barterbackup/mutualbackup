@@ -574,7 +574,7 @@ implementation; Milestone 4 was reopened until they were resolved.
   the correction series. All compilation and execution were local; no remote
   compilation server was used.
 
-## Milestone 5 guild geometry and coding protocol (reopened by source review, 2026-09-29)
+## Milestone 5 guild geometry and coding protocol (closed 2026-09-30)
 
 The historical source-only review of the Milestone 5 changes through `a6b5d7d`
 found three blockers: negative verifier evidence could terminate retry
@@ -4006,9 +4006,9 @@ node Clippy gate passed locally. No remote compilation server was used.
   cleanup of the image, mount, loop, namespaces, links, daemons and firewall.
   The complete-gate logs are `/tmp/mutualbackup-m5-152-final-core-gate.log`,
   `/tmp/mutualbackup-m5-152-full-provisioned.log`, and
-  `/tmp/mutualbackup-m5-152-full-cleanup-audit.log`. M5-152 remains open
-  because the earlier 5,400-second topology timeout was not explained by the
-  passing rerun.
+  `/tmp/mutualbackup-m5-152-full-cleanup-audit.log`. At that point M5-152
+  remained open because the earlier 5,400-second topology timeout was not
+  explained by the passing rerun.
 
 - [x] **M5-150 / P1 — Authenticate historical unbound Add evidence on catch-up.**
   Format-1 `AddCodingGroup` must remain decodable for existing guild history,
@@ -4062,7 +4062,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   recovery, exact-attempt adoption, and reopen. The complete local P2P and
   provisioned gate remains M5-149.
 
-- [ ] **M5-152 / P1 — Resolve isolated-topology backup timeout in the exact-source gate.**
+- [x] **M5-152 / P1 — Resolve isolated-topology backup timeout in the exact-source gate.**
   The fresh local M5-149 acceptance matrix on `04c6d7a` passed all earlier
   provisioned cases, then `five_daemons_recover_latest_snapshot_from_seed_and_dht`
   timed out at `prototype_acceptance.rs:1598` waiting for its first
@@ -4102,8 +4102,21 @@ node Clippy gate passed locally. No remote compilation server was used.
   latter ran with the acceptance harness's 8,192-descriptor limit. A fresh
   five-daemon provisioned smoke run on `e44a220` passed both topology backups
   and recovery in 1,206.63 seconds, with its disposable resources cleaned up.
-  The complete fresh provisioned matrix on one committed source remains the
-  final M5-152 closure gate.
+  The final exact-source gate passed on committed source `53ec2ec`: formatting,
+  strict locked all-target workspace Clippy, the locked all-target workspace
+  suite (304 passing `mb-node` tests), Docker safety, all 24 fresh provisioned
+  cases, and an independent cleanup audit. The five-daemon case passed both
+  topology backups and seed/DHT recovery in 1,201.82 seconds after the other
+  23 provisioned cases on the same image. Logs are
+  `/tmp/mutualbackup-m5-152-cache-workspace-rerun.log`,
+  `/tmp/mutualbackup-m5-152-cache-full-provisioned.log`, and
+  `/tmp/mutualbackup-m5-152-cache-full-cleanup-audit.log`; separate Docker
+  safety and independent audit logs are
+  `/tmp/mutualbackup-m5-152-cache-docker-safety.log` and
+  `/tmp/mutualbackup-m5-152-cache-full-independent-audit.log`. The independent
+  audit verified absence of the owned image, mount, loop, namespaces, links,
+  daemons and firewall rules, and identical normalized host-resource snapshots.
+  Milestone 5 is closed; Milestone 6 may proceed.
 
 - [x] **M5-153 / P2 — Wait for aborted coding workers in the activation reopen fixture.**
   The all-target workspace rerun on `fef9a25` passed 302 `mb-node` tests but
