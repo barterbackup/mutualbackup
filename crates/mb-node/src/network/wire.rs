@@ -818,12 +818,13 @@ pub(crate) fn validate_root_binding_frame_budget(
         openings,
     });
     let event = GuildEvent {
-        format_version: 1,
+        format_version: 2,
         guild_id: [255; 32],
         sequence: u64::MAX,
         parent: [255; 32],
-        kind: mb_core::GuildEventKind::AddCodingGroup {
+        kind: mb_core::GuildEventKind::AddCodingGroupBound {
             group: manifest.value.group.clone(),
+            transcript_hash: [255; 32],
         },
     };
     for request in [
@@ -1123,12 +1124,13 @@ mod tests {
             "exercise a budget rejected before leaf rounding"
         );
         let event = GuildEvent {
-            format_version: 1,
+            format_version: 2,
             guild_id: plan.geometry.guild_id,
             sequence: 1,
             parent: [4; 32],
-            kind: mb_core::GuildEventKind::AddCodingGroup {
+            kind: mb_core::GuildEventKind::AddCodingGroupBound {
                 group: manifest.value.group.clone(),
+                transcript_hash: [1; 32],
             },
         };
         let certified = QuorumGuildEvent {

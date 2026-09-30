@@ -142,6 +142,24 @@ pub enum GuildEventKind {
     ForgetCodingGroup {
         group_id: [u8; 32],
     },
+    /// Appended to preserve the positional Postcard encoding of earlier event kinds.
+    AddCodingGroupBound {
+        group: CodingGroupV2,
+        transcript_hash: [u8; 32],
+    },
+}
+
+impl GuildEventKind {
+    pub fn coding_group_add(&self) -> Option<(&CodingGroupV2, Option<[u8; 32]>)> {
+        match self {
+            Self::AddCodingGroup { group } => Some((group, None)),
+            Self::AddCodingGroupBound {
+                group,
+                transcript_hash,
+            } => Some((group, Some(*transcript_hash))),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -158,6 +176,16 @@ impl GuildEvent {
         let mut hasher = blake3::Hasher::new_derive_key("mutualbackup guild event v1");
         hasher.update(&canonical_bytes(self)?);
         Ok(*hasher.finalize().as_bytes())
+    }
+}
+
+fn valid_event_format(event: &GuildEvent) -> bool {
+    match &event.kind {
+        GuildEventKind::AddCodingGroupBound {
+            transcript_hash: hash,
+            ..
+        } => event.format_version == 2 && *hash != [0; 32],
+        _ => event.format_version == 1,
     }
 }
 
@@ -285,7 +313,7 @@ impl DynamicGuildState {
     pub fn verify_event(&self, certified: &QuorumGuildEvent) -> Result<(), GuildStateError> {
         self.validate()?;
         let event = &certified.event;
-        if event.format_version != 1
+        if !valid_event_format(event)
             || event.guild_id != self.guild_id
             || event.sequence != self.event_sequence + 1
             || event.parent != self.event_head
@@ -343,7 +371,7 @@ impl DynamicGuildState {
     /// signatures. Quorum authorization remains a property of `verify_event`.
     pub fn validate_event_proposal(&self, event: &GuildEvent) -> Result<(), GuildStateError> {
         self.validate()?;
-        if event.format_version != 1
+        if !valid_event_format(event)
             || event.guild_id != self.guild_id
             || event.sequence != self.event_sequence + 1
             || event.parent != self.event_head
@@ -487,7 +515,8 @@ impl DynamicGuildState {
                 }
                 entry.revoked_at_event = Some(sequence);
             }
-            GuildEventKind::AddCodingGroup { group } => {
+            GuildEventKind::AddCodingGroup { group }
+            | GuildEventKind::AddCodingGroupBound { group, .. } => {
                 group.validate()?;
                 if group.guild_id != self.guild_id
                     || self
@@ -875,7 +904,7 @@ pub enum GuildStateError {
 mod tests {
     use crate::{
         CodingPlanGeometry, CodingProfile, InformationRoleV2, ParityPlacementV2, ParityRoleV2,
-        RangeSectorRef, Seed, encode, merkle_commit,
+        RangeSectorRef, Seed, decode_canonical, encode, merkle_commit,
     };
 
     use super::*;
@@ -968,6 +997,73 @@ mod tests {
         };
         group.id = group.calculate_id().unwrap();
         group
+    }
+
+    #[test]
+    fn legacy_add_event_bytes_remain_decodable() {
+        #[allow(dead_code)]
+        #[derive(Serialize)]
+        enum LegacyKind {
+            AddMember,
+            RemoveMember,
+            RelabelMember,
+            SetQuorum,
+            RotateWriterKey,
+            RevokeWriterKey,
+            RotateRecoveryKey,
+            RevokeRecoveryKey,
+            AddCodingGroup { group: CodingGroupV2 },
+        }
+
+        #[derive(Serialize)]
+        struct LegacyEvent {
+            format_version: u16,
+            guild_id: [u8; 32],
+            sequence: u64,
+            parent: [u8; 32],
+            kind: LegacyKind,
+        }
+
+        let keys = keys(8);
+        let state = state(&keys);
+        let group = group(&state, &keys);
+        let old_bytes = canonical_bytes(&LegacyEvent {
+            format_version: 1,
+            guild_id: state.guild_id,
+            sequence: 1,
+            parent: state.event_head,
+            kind: LegacyKind::AddCodingGroup {
+                group: group.clone(),
+            },
+        })
+        .unwrap();
+        let decoded: GuildEvent = decode_canonical(&old_bytes).unwrap();
+        assert_eq!(
+            decoded.kind,
+            GuildEventKind::AddCodingGroup {
+                group: group.clone()
+            }
+        );
+        assert_eq!(canonical_bytes(&decoded).unwrap(), old_bytes);
+
+        let bound = GuildEvent {
+            format_version: 2,
+            guild_id: state.guild_id,
+            sequence: 1,
+            parent: state.event_head,
+            kind: GuildEventKind::AddCodingGroupBound {
+                group: group.clone(),
+                transcript_hash: [7; 32],
+            },
+        };
+        state.validate_event_proposal(&bound).unwrap();
+        assert_eq!(
+            decode_canonical::<GuildEvent>(&canonical_bytes(&bound).unwrap()).unwrap(),
+            bound
+        );
+        let mut invalid = bound;
+        invalid.format_version = 1;
+        assert!(state.validate_event_proposal(&invalid).is_err());
     }
 
     #[test]

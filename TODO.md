@@ -3921,7 +3921,7 @@ node Clippy gate passed locally. No remote compilation server was used.
   original binding before and after Forget and reopen, and pass locally with
   formatting and strict all-target `mb-node` Clippy.
 
-- [ ] **M5-147 / P1 — Certify the Add event's exact verifier attempt.**
+- [x] **M5-147 / P1 — Certify the Add event's exact verifier attempt.**
   `AddCodingGroup` signs only the group (`guild.rs:135-137`), and the group ID
   excludes attempt identity (`model.rs:278-296`, `:420-433`). A later same-ID
   attempt can have another replay-valid transcript. Event-tail catch-up takes
@@ -3933,7 +3933,17 @@ node Clippy gate passed locally. No remote compilation server was used.
   source-local event-keyed record does not prove this binding to the receiver.
   Commit the transcript or attempt hash in certified Add authority and verify
   it on catch-up, recovery and Forget. Regress a replay-valid wrong-attempt
-  response preceding the correct source.
+  response preceding the correct source. Implemented with an appended
+  `AddCodingGroupBound` event variant (format 2) that signs the canonical
+  verifier transcript hash. New Add proposals require it; installation,
+  event-tail catch-up, seed-recovery fetch/adoption, event evidence service,
+  activation lock matching and Forget compare the exact evidence. A same-ID,
+  different-attempt regression rejects the wrong transcript without advancing
+  state and then installs the correct one; recovery rejects the wrong evidence.
+  The appended variant preserves historical Postcard event bytes and old
+  format-1 Adds remain readable. A byte-level legacy decode/encode regression
+  covers that compatibility. Strict workspace Clippy passes locally. Historical
+  format-1 Adds still have no signed hash; M5-150 tracks that residual gap.
 
 - [x] **M5-148 / P2 — Clear orphan pending activation pins.**
   Activation contacts every information owner, including virtual-zero-only
@@ -3956,6 +3966,30 @@ node Clippy gate passed locally. No remote compilation server was used.
   whose plans give this node no physical shard. The zero-only/non-holder and
   existing remote-information retention regressions pass through reopen;
   formatting and strict all-target `mb-node` Clippy pass locally.
+
+- [ ] **M5-149 / P1 — Revalidate the corrected milestone on exact source.**
+  Run formatting, strict workspace Clippy, locked all-target workspace tests,
+  Docker safety and the fresh disposable Btrfs/network acceptance matrix on
+  one committed source. Independently audit cleanup of owned mounts, loop
+  devices, namespaces, links, daemons and firewall rules. Record the exact
+  source and local logs after M5-150 is resolved, before closing Milestone 5.
+  The first all-target workspace run passed the new legacy-wire and
+  wrong-attempt regressions but one unrelated long network test hit the
+  shell's 1,024-descriptor limit; that test passed alone with the established
+  8,192-descriptor limit. Docker safety, formatting and strict workspace
+  Clippy passed locally. This is not yet an exact-source milestone gate.
+
+- [ ] **M5-150 / P1 — Authenticate historical unbound Add evidence on catch-up.**
+  Format-1 `AddCodingGroup` must remain decodable for existing guild history,
+  but it signs only the group. `coding_group_add` returns no transcript hash
+  for it; event installation, event evidence service and recovery check an
+  expected hash only when present. A malicious peer can still supply a valid
+  same-ID successor transcript for a historical Add, and the lagging member
+  will accept that attempt before replaying Forget. This is precisely the
+  upgraded pre-binding history exercised by M5-146, so the new format-2 Add
+  does not secure all supported history. Define and enforce a trusted
+  re-binding path for old Adds (or explicitly fail closed with an agreed
+  migration policy) before calling their catch-up and seed recovery safe.
 
 - Treat failure domain as a human-supplied correlation claim, never a generated
   guild index. Equal claims mean that nodes may fail together—for example due

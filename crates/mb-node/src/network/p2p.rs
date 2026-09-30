@@ -7887,15 +7887,16 @@ async fn commit_verified_coding_group(
         return Ok(());
     }
     let event = GuildEvent {
-        format_version: 1,
+        format_version: 2,
         guild_id: state.guild_id,
         sequence: state
             .event_sequence
             .checked_add(1)
             .context("guild event sequence exhausted")?,
         parent: state.event_head,
-        kind: mb_core::GuildEventKind::AddCodingGroup {
+        kind: mb_core::GuildEventKind::AddCodingGroupBound {
             group: group.clone(),
+            transcript_hash: *blake3::hash(&canonical_bytes(transcript)?).as_bytes(),
         },
     };
     state.validate_event_proposal(&event)?;
@@ -9020,7 +9021,7 @@ async fn sync_guild_event_page(
     };
     let installed = selected.events.len();
     for event in selected.events {
-        if let mb_core::GuildEventKind::AddCodingGroup { group } = &event.event.kind {
+        if let Some((group, _)) = event.event.kind.coding_group_add() {
             let group_id = group.id;
             install_coding_group_event_from_sources(
                 node.clone(),
@@ -10059,18 +10060,27 @@ async fn fetch_recovery_transcripts(
 ) -> Result<Vec<([u8; 32], VerifiedCodingTranscript)>> {
     let mut adds = Vec::new();
     for event in events {
-        if let mb_core::GuildEventKind::AddCodingGroup { group } = &event.event.kind {
-            adds.push((event.event.sequence, event.event.hash()?, group.id));
+        if let Some((group, transcript_hash)) = event.event.kind.coding_group_add() {
+            adds.push((
+                event.event.sequence,
+                event.event.hash()?,
+                group.id,
+                transcript_hash,
+            ));
         }
     }
     let requests = adds
         .into_iter()
-        .map(|(sequence, hash, group_id)| async move {
-            Ok((
-                hash,
-                p2p.coding_transcript_for_event(publisher, guild_id, group_id, sequence, hash)
-                    .await?,
-            ))
+        .map(|(sequence, hash, group_id, expected_hash)| async move {
+            let transcript = p2p
+                .coding_transcript_for_event(publisher, guild_id, group_id, sequence, hash)
+                .await?;
+            if let Some(expected) = expected_hash
+                && transcript.canonical_hash()? != expected
+            {
+                bail!("recovery publisher returned evidence for another certified Add");
+            }
+            Ok((hash, transcript))
         });
     let mut transcripts =
         collect_bounded_recovery_requests(requests, RECOVERY_TRANSCRIPT_FETCH_CONCURRENCY).await?;
@@ -27431,12 +27441,13 @@ mod tests {
             .unwrap()
             .unwrap();
         let event = GuildEvent {
-            format_version: 1,
+            format_version: 2,
             guild_id: state.guild_id,
             sequence: state.event_sequence + 1,
             parent: state.event_head,
-            kind: mb_core::GuildEventKind::AddCodingGroup {
+            kind: mb_core::GuildEventKind::AddCodingGroupBound {
                 group: transcript.value.manifest.value.group.clone(),
+                transcript_hash: *blake3::hash(&canonical_bytes(transcript).unwrap()).as_bytes(),
             },
         };
         let mut signatures = nodes

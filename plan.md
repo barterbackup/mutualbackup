@@ -106,8 +106,12 @@ backfills the original Add binding at Forget, including on upgraded stores.
 M5-145 now fetches and preserves event-bound evidence for every historical
 Add during seed recovery, so a recovered node can serve a lagging member.
 M5-148 is corrected: activation checks local assignment before a pin write,
-zero-only roles make no pin, and GC retires legacy nonphysical pins. Milestone 5
-remains open for M5-147 and a new exact-source gate; Milestone 6 waits.
+zero-only roles make no pin, and GC retires legacy nonphysical pins. M5-147
+now certifies the exact canonical verifier transcript in a new, appended
+format-2 Add variant; historical format-1 Add bytes stay decodable. A final
+source audit found that those old Adds still accept unbound evidence from a
+peer (M5-150). Milestone 5 remains open for that legacy binding decision and
+the M5-149 exact-source local gate; Milestone 6 waits.
 M5-114's complete local workspace and fresh provisioned gate remain passing
 historical evidence for exact source `720920d`, with independently verified
 cleanup. Renewal ownership (M5-118), acknowledged retry recovery and
@@ -2332,9 +2336,9 @@ for live groups, so its recovered node cannot serve a forgotten Add to a
 lagging member (M5-145, now corrected). An upgraded pre-binding store similarly loses an
 unambiguous old Add transcript when Forget removes the retained fallback
 without backfilling its event record (M5-146, now corrected). Event-tail
-installation still accepts any replay-valid same-group transcript from the
-first responding peer because certified Add does not name the verifier attempt
-(M5-147). Finally,
+installation accepted any replay-valid same-group transcript from the first
+responding peer because certified Add did not name the verifier attempt
+(M5-147, now corrected). Finally,
 virtual-zero-only owners activated before Add are omitted from stale abort and
 keep durable pending pins (M5-148). M5-148 now avoids those pins, rejects
 non-holder activation before mutation, and retires legacy orphan pins during
@@ -2348,11 +2352,20 @@ remove a volume before those shards reach terminal cleanup.
 Seed recovery now fetches and retains every Add's event-bound transcript;
 the recovered-node regression serves forgotten evidence to a lagging member
 across reopen, while the dynamic-adoption test and strict Clippy pass locally.
-Correct the remaining paths, review the resulting source, and rerun the
+The new Add variant certifies the canonical verifier transcript hash. New
+proposal signing requires that binding; installation, catch-up, recovery and
+Forget verify it. A distinct appended variant preserves positional Postcard
+encoding of historical Adds; a byte-level compatibility test covers old
+decoding and hash stability. Same-group, wrong-attempt evidence is rejected
+before the correct transcript advances the event, and recovery rejects it.
+This protects newly certified format-2 Adds. Format-1 Adds remain unbound:
+the installation and recovery hash checks are conditional, so a hostile peer
+can still substitute another valid same-group attempt for an old event. This
+is M5-150 and blocks closure while old-history catch-up remains supported.
+Resolve that migration path, review the resulting source and rerun the
 complete local exact-source workspace, Docker safety, fresh disposable
 Btrfs/network and independent resource-cleanup gate before closing Milestone
-5. M5-143 remains passing evidence for its exact prior
-source; this review ran no builds, tests, daemons or runtime probes.
+5 (M5-149). M5-143 remains passing evidence for its exact prior source.
 
 The first full M5-114 workspace run on `3e5a7e3` exposed **M5-118**: four
 launch-expiry regressions found duplicate same-lane successors. Renewal now

@@ -232,6 +232,10 @@ impl VerifiedCodingTranscript {
     pub(crate) fn into_inner(self) -> SignedRecord<CodingVerificationTranscript> {
         self.0
     }
+
+    pub(crate) fn canonical_hash(&self) -> Result<[u8; 32]> {
+        Ok(*blake3::hash(&canonical_bytes(&self.0)?).as_bytes())
+    }
 }
 
 const GUILD_INVITE_DOMAIN: &[u8] = b"mutualbackup/guild-invite/v1";
@@ -2577,8 +2581,13 @@ impl Node {
         let mut add_events = Vec::new();
         for event in events {
             let record_id = event.event.sequence.to_be_bytes().to_vec();
-            if let mb_core::GuildEventKind::AddCodingGroup { group } = &event.event.kind {
-                add_events.push((event.event.sequence, group.clone(), event.event.hash()?));
+            if let Some((group, transcript_hash)) = event.event.kind.coding_group_add() {
+                add_events.push((
+                    event.event.sequence,
+                    group.clone(),
+                    event.event.hash()?,
+                    transcript_hash,
+                ));
             }
             state.apply_event(&event)?;
             authority_states
@@ -2634,7 +2643,7 @@ impl Node {
         let mut transcript_records =
             Vec::with_capacity(add_events.len() + 2 * state.coding_groups.len());
         let mut retained_evidence = 0;
-        for (sequence, group, add_hash) in add_events {
+        for (sequence, group, add_hash, expected_hash) in add_events {
             let transcript = transcript_by_event
                 .get(&add_hash)
                 .context("dynamic recovery historical Add transcript is unavailable")?;
@@ -2646,6 +2655,9 @@ impl Node {
                 anyhow::bail!("dynamic recovery coding transcript is invalid");
             }
             let bytes = canonical_bytes(transcript)?;
+            if expected_hash.is_some_and(|expected| *blake3::hash(&bytes).as_bytes() != expected) {
+                anyhow::bail!("dynamic recovery Add names different verifier evidence");
+            }
             transcript_records.push((
                 "coding-event-transcript".to_owned(),
                 add_hash.to_vec(),
@@ -2846,7 +2858,7 @@ impl Node {
     }
 
     pub fn sign_guild_event_proposal(&self, event: &GuildEvent) -> Result<MemberSignature> {
-        if matches!(event.kind, mb_core::GuildEventKind::AddCodingGroup { .. }) {
+        if event.kind.coding_group_add().is_some() {
             anyhow::bail!("coding-group events require replayable verifier evidence");
         }
         self.sign_guild_event_proposal_inner(event)
@@ -2877,6 +2889,12 @@ impl Node {
         event: &GuildEvent,
         transcript: &SignedRecord<CodingVerificationTranscript>,
     ) -> Result<MemberSignature> {
+        if !matches!(
+            event.kind,
+            mb_core::GuildEventKind::AddCodingGroupBound { .. }
+        ) {
+            anyhow::bail!("new coding Add proposals must bind verifier evidence");
+        }
         self.validate_coding_group_event_evidence(event, transcript)?;
         self.sign_guild_event_proposal_inner(event)
     }
@@ -2922,10 +2940,7 @@ impl Node {
     }
 
     pub fn install_guild_event(&mut self, certified: QuorumGuildEvent) -> Result<()> {
-        if matches!(
-            certified.event.kind,
-            mb_core::GuildEventKind::AddCodingGroup { .. }
-        ) {
+        if certified.event.kind.coding_group_add().is_some() {
             anyhow::bail!("coding-group events require replayable verifier evidence");
         }
         self.install_guild_event_inner(certified, None)
@@ -3158,12 +3173,14 @@ impl Node {
         event: &GuildEvent,
         transcript: &SignedRecord<CodingVerificationTranscript>,
     ) -> Result<()> {
-        let mb_core::GuildEventKind::AddCodingGroup { group } = &event.kind else {
+        let Some((group, transcript_hash)) = event.kind.coding_group_add() else {
             anyhow::bail!("coding evidence was supplied for another guild event kind");
         };
         self.validate_coding_attempt_authority(&transcript.value.plan)?;
+        let evidence_hash = *blake3::hash(&canonical_bytes(transcript)?).as_bytes();
         if replay_coding_transcript(transcript)? != CodingReplayFinding::Verified
             || transcript.value.manifest.value.group != *group
+            || transcript_hash.is_some_and(|expected| expected != evidence_hash)
         {
             anyhow::bail!("guild coding-group event has invalid verifier evidence");
         }
@@ -6753,11 +6770,10 @@ impl Node {
             .checked_add(1)
             .context("guild event sequence exhausted")?;
         let locked_group = match self.locked_guild_event_proposal(next_event_sequence)? {
-            Some(GuildEvent {
-                kind: mb_core::GuildEventKind::AddCodingGroup { group },
-                ..
-            }) => Some(group),
-            Some(_) => return Ok(None),
+            Some(event) => match event.kind.coding_group_add() {
+                Some((group, transcript_hash)) => Some((group.clone(), transcript_hash)),
+                None => return Ok(None),
+            },
             None => None,
         };
         let mut stale = None;
@@ -6780,11 +6796,17 @@ impl Node {
                     stale.get_or_insert(job);
                     continue;
                 }
-                if locked_group
-                    .as_ref()
-                    .is_some_and(|group| job.transcript.value.manifest.value.group != *group)
-                {
-                    continue;
+                if let Some((group, transcript_hash)) = &locked_group {
+                    let wrong_attempt = match transcript_hash {
+                        Some(expected) => {
+                            *blake3::hash(&canonical_bytes(&job.transcript)?).as_bytes()
+                                != *expected
+                        }
+                        None => false,
+                    };
+                    if job.transcript.value.manifest.value.group != *group || wrong_attempt {
+                        continue;
+                    }
                 }
                 job.error = None;
                 self.put_coding_activation_job(&job)?;
@@ -12325,7 +12347,7 @@ fn coding_transcript_for_event_from_store(
     {
         anyhow::bail!("requested coding transcript has the wrong Add event");
     }
-    let mb_core::GuildEventKind::AddCodingGroup { group } = &certified.event.kind else {
+    let Some((group, transcript_hash)) = certified.event.kind.coding_group_add() else {
         anyhow::bail!("requested event is not a coding Add");
     };
     if group.id != group_id {
@@ -12352,6 +12374,7 @@ fn coding_transcript_for_event_from_store(
     };
     let transcript: SignedRecord<CodingVerificationTranscript> = decode_canonical(&bytes)?;
     if transcript.value.manifest.value.group != *group
+        || transcript_hash.is_some_and(|expected| *blake3::hash(&bytes).as_bytes() != expected)
         || replay_coding_transcript(&transcript)? != CodingReplayFinding::Verified
     {
         anyhow::bail!("event-bound coding transcript is invalid");
@@ -15233,11 +15256,27 @@ pub(crate) mod tests {
             .find(|key| key.node_id() == plan.delegator)
             .unwrap();
         let plan = SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, plan, delegator).unwrap();
-        let transcript = test_coding_transcript(plan, &shards, &keys);
+        let transcript = test_coding_transcript(plan.clone(), &shards, &keys);
+        let mut wrong_plan = plan.value.clone();
+        wrong_plan.attempt_id = [194; 16];
+        let wrong_plan =
+            SignedRecord::sign(CODING_ATTEMPT_PLAN_DOMAIN, wrong_plan, delegator).unwrap();
+        let wrong_transcript = test_coding_transcript(wrong_plan, &shards, &keys);
+        assert_eq!(
+            wrong_transcript.value.manifest.value.group.id,
+            transcript.value.manifest.value.group.id
+        );
         let certify = |source: &Node, kind| {
             let state = source.dynamic_guild_state().unwrap().unwrap();
             let event = GuildEvent {
-                format_version: 1,
+                format_version: if matches!(
+                    kind,
+                    mb_core::GuildEventKind::AddCodingGroupBound { .. }
+                ) {
+                    2
+                } else {
+                    1
+                },
                 guild_id,
                 sequence: state.event_sequence + 1,
                 parent: state.event_head,
@@ -15252,8 +15291,9 @@ pub(crate) mod tests {
         };
         let add = certify(
             &source,
-            mb_core::GuildEventKind::AddCodingGroup {
+            mb_core::GuildEventKind::AddCodingGroupBound {
                 group: transcript.value.manifest.value.group.clone(),
+                transcript_hash: *blake3::hash(&canonical_bytes(&transcript).unwrap()).as_bytes(),
             },
         );
         let group_id = transcript.value.manifest.value.group.id;
@@ -15283,6 +15323,41 @@ pub(crate) mod tests {
         let evidence = source
             .coding_transcript_for_event(guild_id, group_id, add.event.sequence, add_hash)
             .unwrap();
+        let mut poisoned = Node::open(temp.path().join("poisoned"), seed.clone()).unwrap();
+        poisoned
+            .adopt_recovered_guild(certificate.clone(), peers.clone())
+            .unwrap();
+        assert!(
+            poisoned
+                .install_coding_group_event(add.clone(), wrong_transcript.clone())
+                .is_err()
+        );
+        assert_eq!(
+            poisoned
+                .dynamic_guild_state()
+                .unwrap()
+                .unwrap()
+                .event_sequence,
+            0
+        );
+        poisoned
+            .install_coding_group_event(add.clone(), transcript.clone())
+            .unwrap();
+        let mut rejected_recovery = Node::open(temp.path().join("rejected"), seed.clone()).unwrap();
+        assert!(
+            rejected_recovery
+                .adopt_recovered_dynamic_guild(
+                    certificate.clone(),
+                    &checkpoint,
+                    events.clone(),
+                    peers.clone(),
+                    vec![(
+                        add_hash,
+                        VerifiedCodingTranscript::verify(wrong_transcript).unwrap(),
+                    )],
+                )
+                .is_err()
+        );
 
         let recovered_path = temp.path().join("recovered");
         let mut recovered = Node::open(&recovered_path, seed.clone()).unwrap();
@@ -15328,7 +15403,7 @@ pub(crate) mod tests {
             .guild_event_tail(0, certificate.hash().unwrap())
             .unwrap();
         for event in tail.events {
-            if let mb_core::GuildEventKind::AddCodingGroup { group } = &event.event.kind {
+            if let Some((group, _)) = event.event.kind.coding_group_add() {
                 let transcript = recovered
                     .coding_transcript_for_event(
                         guild_id,
@@ -15635,12 +15710,13 @@ pub(crate) mod tests {
 
         let state = node.dynamic_guild_state().unwrap().unwrap();
         let event = GuildEvent {
-            format_version: 1,
+            format_version: 2,
             guild_id,
             sequence: state.event_sequence + 1,
             parent: state.event_head,
-            kind: mb_core::GuildEventKind::AddCodingGroup {
+            kind: mb_core::GuildEventKind::AddCodingGroupBound {
                 group: transcript.value.manifest.value.group.clone(),
+                transcript_hash: *blake3::hash(&canonical_bytes(&transcript).unwrap()).as_bytes(),
             },
         };
         let mut signatures = signing_keys
@@ -17782,12 +17858,13 @@ pub(crate) mod tests {
             .unwrap();
         let state = node.dynamic_guild_state().unwrap().unwrap();
         let event = GuildEvent {
-            format_version: 1,
+            format_version: 2,
             guild_id: state.guild_id,
             sequence: state.event_sequence + 1,
             parent: state.event_head,
-            kind: mb_core::GuildEventKind::AddCodingGroup {
+            kind: mb_core::GuildEventKind::AddCodingGroupBound {
                 group: verified.value.manifest.value.group.clone(),
+                transcript_hash: *blake3::hash(&canonical_bytes(&verified).unwrap()).as_bytes(),
             },
         };
         let mut signatures = keys
@@ -17839,7 +17916,14 @@ pub(crate) mod tests {
         node.adopt_recovered_guild(certificate, peers).unwrap();
         let sign_event = |state: &DynamicGuildState, kind| {
             let event = GuildEvent {
-                format_version: 1,
+                format_version: if matches!(
+                    kind,
+                    mb_core::GuildEventKind::AddCodingGroupBound { .. }
+                ) {
+                    2
+                } else {
+                    1
+                },
                 guild_id: state.guild_id,
                 sequence: state.event_sequence + 1,
                 parent: state.event_head,
@@ -18091,8 +18175,9 @@ pub(crate) mod tests {
         let state = node.dynamic_guild_state().unwrap().unwrap();
         let successor_add = sign_event(
             &state,
-            mb_core::GuildEventKind::AddCodingGroup {
+            mb_core::GuildEventKind::AddCodingGroupBound {
                 group: group.clone(),
+                transcript_hash: *blake3::hash(&canonical_bytes(&next).unwrap()).as_bytes(),
             },
         );
         node.install_coding_group_event(successor_add.clone(), next.clone())
@@ -19601,12 +19686,14 @@ pub(crate) mod tests {
             node.activate_coding_attempt(transcript).unwrap();
             let state = node.dynamic_guild_state().unwrap().unwrap();
             let event = GuildEvent {
-                format_version: 1,
+                format_version: 2,
                 guild_id: state.guild_id,
                 sequence: state.event_sequence + 1,
                 parent: state.event_head,
-                kind: mb_core::GuildEventKind::AddCodingGroup {
+                kind: mb_core::GuildEventKind::AddCodingGroupBound {
                     group: transcript.value.manifest.value.group.clone(),
+                    transcript_hash: *blake3::hash(&canonical_bytes(transcript).unwrap())
+                        .as_bytes(),
                 },
             };
             node.sign_coding_group_event_proposal(&event, transcript)
@@ -20119,12 +20206,13 @@ pub(crate) mod tests {
 
         let state = node.dynamic_guild_state().unwrap().unwrap();
         let event = GuildEvent {
-            format_version: 1,
+            format_version: 2,
             guild_id: state.guild_id,
             sequence: state.event_sequence + 1,
             parent: state.event_head,
-            kind: mb_core::GuildEventKind::AddCodingGroup {
+            kind: mb_core::GuildEventKind::AddCodingGroupBound {
                 group: transcript.value.manifest.value.group.clone(),
+                transcript_hash: *blake3::hash(&canonical_bytes(&transcript).unwrap()).as_bytes(),
             },
         };
         assert!(node.sign_guild_event_proposal(&event).is_err());
