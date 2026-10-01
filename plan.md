@@ -3057,8 +3057,11 @@ Milestone 5.
   storage-amplification gates. Do not implement Git hashing, object encodings,
   or pack parsing ourselves.
 - Add the separate Git-compatible local binary for `init`, `add`, `status`,
-  `commit`, `log`, `diff`, `branch`, `switch`/`checkout`, `merge`, and multiple
-  worktrees. Implement the supported Git index, commit DAG, refs, and safe
+  `commit`, `log`, `diff`, `branch`, `tag`, `switch`/`checkout`, `restore`/`reset`,
+  `merge`, multiple worktrees, `fetch`/`pull`/`push`, explicit `pin`/`unpin`,
+  and history `prune`/`gc`. Document the supported syntax and fail clearly for
+  unsupported Git commands instead of passing them to stock Git. Implement the
+  supported Git index, commit DAG, refs, and safe
   worktree operations over the daemon's single-writer catalog. Stage exact file
   bytes in durable reflink anchors and reflink checkouts on capable same-
   filesystem destinations; use guarded link-freeze only after its own gate.
@@ -3127,6 +3130,15 @@ Milestone 5.
   metadata fidelity, application-consistency, and source-loss recovery gate.
   Milestone 6 closes only after the Git, guarded-link-freeze, and listed
   platform gates.
+
+Iterate through Milestone 6 in this order: versioned source boundary and native
+Git object access; byte-exact local history and worktrees; encrypted graph
+protection and recovery; ordinary-Git exchange in both directions; reachability-
+based expiry and physical reclamation; then guarded link-freeze and the listed
+platform backends. Keep the Git byte-policy and relevant crash/recovery checks
+in each slice, with the complete local gates above required for closure. The Git
+pivot adds local history and interoperability to the original source-backend
+work; it does not replace the guarded link-freeze or platform deliverables.
 
 ### Milestone 7 — release candidate and compatibility freeze
 
