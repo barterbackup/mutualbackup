@@ -78,6 +78,8 @@ pub enum AnchorError {
     UnsafePath,
     #[error("unsupported Git worktree file mode")]
     UnsupportedGitMode,
+    #[error("a pinned file was replaced during a descriptor-relative move")]
+    PinnedFileChanged,
     #[error("an unrecognized or unsafe source-anchor area already exists: {0}")]
     AnchorAreaCollision(PathBuf),
     #[error("owned directory is missing, replaced, mounted, or unsafe to remove: {0}")]
@@ -320,6 +322,59 @@ impl PinnedDirectory {
         )
     }
 
+    /// Move one verified regular-file entry into another pinned directory.
+    /// A different destination entry is never overwritten. Both directories
+    /// are synced after the rename; a sync error may mean the move happened,
+    /// so callers must reconcile it against their durable operation record.
+    pub fn move_child_file_no_replace(
+        &self,
+        source: impl AsRef<Path>,
+        expected: NativeFileId,
+        destination_parent: &Self,
+        destination: impl AsRef<Path>,
+    ) -> Result<(), AnchorError> {
+        let source = source.as_ref();
+        let destination = destination.as_ref();
+        if self.entry_identity(source, false)? != Some(expected) {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        rename_no_replace_at(&self.file, source, &destination_parent.file, destination)?;
+        if destination_parent.entry_identity(destination, false)? != Some(expected) {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        self.sync_all()?;
+        destination_parent.sync_all()
+    }
+
+    /// Atomically exchange two verified regular-file names. This keeps the
+    /// previous worktree inode in private staging until checkout commits.
+    /// The identity checks catch path replacement but cannot prevent a
+    /// concurrent writer; callers must also verify content before cleanup.
+    pub fn exchange_child_files(
+        &self,
+        name: impl AsRef<Path>,
+        expected: NativeFileId,
+        other_parent: &Self,
+        other_name: impl AsRef<Path>,
+        other_expected: NativeFileId,
+    ) -> Result<(), AnchorError> {
+        let name = name.as_ref();
+        let other_name = other_name.as_ref();
+        if self.entry_identity(name, false)? != Some(expected)
+            || other_parent.entry_identity(other_name, false)? != Some(other_expected)
+        {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        exchange_at(&self.file, name, &other_parent.file, other_name)?;
+        if self.entry_identity(name, false)? != Some(other_expected)
+            || other_parent.entry_identity(other_name, false)? != Some(expected)
+        {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        self.sync_all()?;
+        other_parent.sync_all()
+    }
+
     /// Publish verified anchor bytes as a complete, editable worktree file.
     /// The unnamed inode is reflinked and synced before it becomes visible;
     /// an existing path is never replaced. The worktree inode is distinct from
@@ -461,6 +516,27 @@ impl PinnedDirectory {
         &self,
         _source: impl AsRef<Path>,
         _destination: impl AsRef<Path>,
+    ) -> Result<(), AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn move_child_file_no_replace(
+        &self,
+        _source: impl AsRef<Path>,
+        _expected: NativeFileId,
+        _destination_parent: &Self,
+        _destination: impl AsRef<Path>,
+    ) -> Result<(), AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn exchange_child_files(
+        &self,
+        _name: impl AsRef<Path>,
+        _expected: NativeFileId,
+        _other_parent: &Self,
+        _other_name: impl AsRef<Path>,
+        _other_expected: NativeFileId,
     ) -> Result<(), AnchorError> {
         Err(unsupported_pinned_directory())
     }
@@ -2983,6 +3059,37 @@ fn rename_no_replace_at(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn exchange_at(
+    left_parent: &File,
+    left: &Path,
+    right_parent: &File,
+    right: &Path,
+) -> Result<(), AnchorError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    validate_single_component(left)?;
+    validate_single_component(right)?;
+    let left = CString::new(left.as_os_str().as_bytes()).map_err(|_| AnchorError::UnsafePath)?;
+    let right = CString::new(right.as_os_str().as_bytes()).map_err(|_| AnchorError::UnsafePath)?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            left_parent.as_raw_fd(),
+            left.as_ptr(),
+            right_parent.as_raw_fd(),
+            right.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == -1 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 fn rename_no_replace_at(
     _source_parent: &File,
@@ -3721,6 +3828,60 @@ mod tests {
         assert_eq!(anchored, original);
 
         manifest.remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn pinned_checkout_moves_and_swaps_regular_files_without_overwrite() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-move-{}", Uuid::new_v4()));
+        let work = run_root.join("work");
+        let staging = run_root.join("staging");
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(work.join("tracked"), b"old\r\nbytes\0").unwrap();
+        fs::write(staging.join("replacement"), b"new\nbytes").unwrap();
+        let work = PinnedDirectory::open(&work).unwrap();
+        let staging = PinnedDirectory::open(&staging).unwrap();
+        let old = work.entry_identity("tracked", false).unwrap().unwrap();
+        let new = staging
+            .entry_identity("replacement", false)
+            .unwrap()
+            .unwrap();
+        work.exchange_child_files("tracked", old, &staging, "replacement", new)
+            .unwrap();
+        assert_eq!(work.entry_identity("tracked", false).unwrap(), Some(new));
+        assert_eq!(
+            staging.entry_identity("replacement", false).unwrap(),
+            Some(old)
+        );
+        assert_eq!(
+            fs::read(work.descriptor_path().join("tracked")).unwrap(),
+            b"new\nbytes"
+        );
+        assert_eq!(
+            fs::read(staging.descriptor_path().join("replacement")).unwrap(),
+            b"old\r\nbytes\0"
+        );
+        assert!(matches!(
+            staging.move_child_file_no_replace("replacement", old, &work, "tracked"),
+            Err(AnchorError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(work.entry_identity("tracked", false).unwrap(), Some(new));
+        staging
+            .move_child_file_no_replace("replacement", old, &work, "former")
+            .unwrap();
+        assert_eq!(work.entry_identity("former", false).unwrap(), Some(old));
+        assert_eq!(staging.entry_identity("replacement", false).unwrap(), None);
+        assert!(matches!(
+            work.move_child_file_no_replace("tracked", old, &staging, "wrong"),
+            Err(AnchorError::PinnedFileChanged)
+        ));
         fs::remove_dir_all(run_root).unwrap();
     }
 
