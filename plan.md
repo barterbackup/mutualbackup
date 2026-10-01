@@ -725,6 +725,11 @@ Proactive background repair comes later.
   replacement while the anchor survives → sparse detach → exact permission
   restore/edit. If an inode has unaccounted aliases, enroll the whole link group
   explicitly or reject it rather than changing permissions on unknown paths.
+  Exercise writes through descriptors and shared writable mappings opened
+  before the freeze, truncate and allocation through those handles, and races
+  through every known hard-link alias. Record the guard's required privileges
+  and fail closed when they are unavailable; an open-time notification or
+  permission change alone is not evidence that pre-opened writers are blocked.
 - For an in-place edit, use the recoverable local sequence
   `SHARED_FROZEN → COPY_STAGING → PRIVATE_COPY_READY → UNLOCK_PENDING → EDITABLE`.
   Under the guard, make and verify a sparse independent anchor, fsync and install
