@@ -25,6 +25,8 @@ mod head;
 mod history;
 #[cfg(target_os = "linux")]
 mod interop;
+#[cfg(target_os = "linux")]
+mod merge;
 mod odb;
 #[cfg(target_os = "linux")]
 mod prune;
@@ -50,6 +52,8 @@ pub use history::{
 };
 #[cfg(target_os = "linux")]
 pub use interop::GitInteropError;
+#[cfg(target_os = "linux")]
+pub use merge::MergeBlobError;
 pub use odb::NativeOdb;
 #[cfg(target_os = "linux")]
 pub use prune::{GitPruneError, GitPruneReport, GitPruneRoots};

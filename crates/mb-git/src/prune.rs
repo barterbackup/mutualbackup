@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::blob_oid_from_anchor;
 use crate::fetch::{FetchError, has_pending_fetch};
 use crate::history::{HistoryError, export_graph_source, metadata_kind, verified_metadata_ids};
+use crate::merge::{MergeBlobError, has_pending_merge_blob};
 use crate::stage::{StageError, has_pending_stages, object_kind_prefix, staged_entries};
 
 const INTENT_PREFIX: &str = "git-prune-intent-v1/";
@@ -28,6 +29,8 @@ pub enum GitPruneError {
     Stage(#[from] StageError),
     #[error("a Git fetch is unfinished: {0}")]
     Fetch(#[from] FetchError),
+    #[error("a Git content merge is unfinished: {0}")]
+    MergeBlob(#[from] MergeBlobError),
     #[error("encrypted catalog failed: {0}")]
     Database(#[from] DatabaseError),
     #[error("versioned prune intent failed: {0}")]
@@ -137,7 +140,10 @@ pub(crate) fn prune_unreachable(
     protected: &GitPruneRoots,
 ) -> Result<GitPruneReport, GitPruneError> {
     resume_pending_prune(control, repository_id)?;
-    if has_pending_stages(control, repository_id)? || has_pending_fetch(control, repository_id)? {
+    if has_pending_stages(control, repository_id)?
+        || has_pending_fetch(control, repository_id)?
+        || has_pending_merge_blob(control, repository_id)?
+    {
         return Err(GitPruneError::PendingOperation);
     }
     let graph = export_graph_source(control, repository_id)?;

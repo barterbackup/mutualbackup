@@ -27,6 +27,7 @@ use crate::history::{
     pin_commit, switch_same_tree_branch, unpin_commit,
 };
 use crate::interop::{GitInteropError, push_current_branch_to_bare};
+use crate::merge::{MergeBlobError, resume_pending_merge_blob};
 use crate::prune::{
     GitPruneError, GitPruneReport, GitPruneRoots, prune_unreachable, resume_pending_prune,
 };
@@ -66,6 +67,8 @@ pub enum RepositoryError {
     Interop(#[from] GitInteropError),
     #[error("Git fetch error: {0}")]
     Fetch(#[from] FetchError),
+    #[error("Git merge blob error: {0}")]
+    MergeBlob(#[from] MergeBlobError),
     #[error("Git history prune error: {0}")]
     Prune(#[from] GitPruneError),
     #[error("repository marker or catalog identity conflicts with this root")]
@@ -404,6 +407,7 @@ impl GitRepository {
     }
 
     fn resume_checkout(&self) -> Result<(), RepositoryError> {
+        resume_pending_merge_blob(&self.catalog, self.repository_id, &self.root)?;
         Ok(resume_pending_checkout(
             &self.catalog,
             self.repository_id,
@@ -752,6 +756,91 @@ mod tests {
         drop(root_builder);
         drop(nested_builder);
         drop(remote);
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn content_merge_captures_raw_result_and_replays_interrupted_blob_publication() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-content-merge-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        let bare_root = run_root.join("remote.git");
+        fs::create_dir_all(&source_root).unwrap();
+        let base_bytes = b"first\r\nsecond\nthird\r\nfourth\nfifth\r\n";
+        let our_bytes = b"our first\r\nsecond\nthird\r\nfourth\nfifth\r\n";
+        let their_bytes = b"first\r\nsecond\nthird\r\nfourth\ntheir fifth\r\n";
+        let merged_bytes = b"our first\r\nsecond\nthird\r\nfourth\ntheir fifth\r\n";
+        fs::write(source_root.join("tracked"), base_bytes).unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [95_u8; 32];
+        let local = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        local.stage_file("tracked").unwrap();
+        local.commit("Author", "a@example.test", "base").unwrap();
+        local.create_branch("topic").unwrap();
+        local.switch_branch("topic").unwrap();
+        fs::write(source_root.join("tracked"), their_bytes).unwrap();
+        local.stage_file("tracked").unwrap();
+        let topic = local.commit("Author", "a@example.test", "topic").unwrap();
+        local.switch_branch("main").unwrap();
+        fs::write(source_root.join("tracked"), our_bytes).unwrap();
+        local.stage_file("tracked").unwrap();
+        let main = local.commit("Author", "a@example.test", "main").unwrap();
+
+        crate::merge::set_after_merge_blob_capture_hook(Box::new(|| panic!("blob capture crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local
+                .merge_branch("topic", "Author", "a@example.test")
+                .unwrap();
+        }));
+        assert!(interrupted.is_err());
+        assert_eq!(
+            crate::history::ref_oid(&local.catalog, repository_id, b"refs/heads/main").unwrap(),
+            Some(Oid::from_bytes(&main.oid).unwrap())
+        );
+        assert_eq!(fs::read(source_root.join("tracked")).unwrap(), our_bytes);
+        drop(local);
+        let local = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        let merged_blob_oid = Oid::hash_object(git2::ObjectType::Blob, merged_bytes).unwrap();
+        assert_eq!(local.anchors_for_oid(merged_blob_oid).unwrap().len(), 1);
+        assert_eq!(local.status().unwrap().head_oid, Some(main.oid));
+        let merged = local
+            .merge_branch("topic", "Author", "a@example.test")
+            .unwrap();
+        assert_eq!(fs::read(source_root.join("tracked")).unwrap(), merged_bytes);
+        assert_eq!(local.anchors_for_oid(merged_blob_oid).unwrap().len(), 1);
+        assert_eq!(
+            local.log(1).unwrap()[0].parent_oids,
+            vec![main.oid, topic.oid]
+        );
+        git2::Repository::init_bare(&bare_root).unwrap();
+        local.push_current_branch_to_bare(&bare_root).unwrap();
+        let remote = git2::Repository::open_bare(&bare_root).unwrap();
+        let remote_commit = remote.find_commit(merged).unwrap();
+        assert_eq!(
+            remote
+                .find_blob(
+                    remote_commit
+                        .tree()
+                        .unwrap()
+                        .get_name("tracked")
+                        .unwrap()
+                        .id()
+                )
+                .unwrap()
+                .content(),
+            merged_bytes
+        );
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
+        drop(remote_commit);
+        drop(remote);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
         fs::remove_dir_all(run_root).unwrap();
     }
 

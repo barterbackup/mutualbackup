@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use git2::{Branch, Index, IndexEntry, IndexTime, ObjectType, Oid, Repository, Signature};
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
@@ -18,6 +18,10 @@ use crate::head::{
     HeadError, head_kind, selected_branch, selected_branch_record, selected_ref,
     store_selected_branch,
 };
+use crate::merge::{
+    GeneratedBlob, MergeBlobError, MergeFileInput, MergeFileInputs, capture_generated_blob,
+    merge_file_bytes,
+};
 use crate::stage::{
     GitIndexEntry, StageError, anchors_for_oid, has_pending_stages, index_kind, object_kind,
     stage_path_key, staged_entries,
@@ -29,6 +33,7 @@ const METADATA_PREFIX: &str = "git-metadata-object-v1/";
 const REF_PREFIX: &str = "git-ref-v1/";
 const MAIN_REF: &[u8] = b"refs/heads/main";
 const PIN_REF_PREFIX: &str = "refs/mutualbackup/pins/";
+const MAX_AUTOMERGE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_GRAPH_OBJECTS: usize = 100_000;
 pub(crate) const MAX_GRAPH_METADATA_BYTES: usize = 64 * 1024 * 1024;
 
@@ -50,6 +55,8 @@ pub enum HistoryError {
     Head(#[from] HeadError),
     #[error("Git tree read error: {0}")]
     Status(#[from] StatusError),
+    #[error("Git merge blob error: {0}")]
+    MergeBlob(#[from] MergeBlobError),
     #[error("temporary metadata repository error: {0}")]
     Io(#[from] std::io::Error),
     #[error("an unfinished add must be resumed or abandoned before committing")]
@@ -80,7 +87,7 @@ pub enum HistoryError {
     PinNotFound,
     #[error("switching this branch requires a worktree checkout")]
     CheckoutRequired,
-    #[error("both branches changed the same path; content merge is not yet supported")]
+    #[error("the branches changed a path that cannot be merged automatically")]
     ContentMergeRequired,
     #[error("the branches have no unique common ancestor")]
     AmbiguousMergeBase,
@@ -748,17 +755,22 @@ pub fn commit_index(
     })
 }
 
-/// Create a two-parent commit when every changed path can be selected from an
-/// existing parent without synthesizing new blob bytes. The commit and trees
-/// are durable but unreachable until checkout publishes the selected ref.
+pub(crate) struct MergeIdentity<'a> {
+    pub name: &'a str,
+    pub email: &'a str,
+    pub message: &'a str,
+}
+
+/// Create a two-parent commit from parent blobs and bounded raw-byte file
+/// merges. The commit and trees are durable but unreachable until checkout
+/// publishes the selected ref.
 pub(crate) fn create_pathwise_merge_commit(
     control: &ControlStore,
     repository_id: Uuid,
+    root_path: &Path,
     ours: Oid,
     theirs: Oid,
-    author_name: &str,
-    author_email: &str,
-    message: &str,
+    identity: MergeIdentity<'_>,
 ) -> Result<Oid, HistoryError> {
     let temporary = tempfile::tempdir()?;
     let repository = Repository::init_bare(temporary.path())?;
@@ -782,6 +794,8 @@ pub(crate) fn create_pathwise_merge_commit(
         .chain(their_files.keys())
         .collect::<BTreeSet<_>>();
     let mut merged = TreeFiles::new();
+    let mut generated = Vec::<(Vec<u8>, MergeFileInputs, GeneratedBlob)>::new();
+    let mut generated_len = 0_usize;
     for path in paths {
         let base_file = base_files.get(path);
         let our_file = our_files.get(path);
@@ -793,7 +807,35 @@ pub(crate) fn create_pathwise_merge_commit(
         } else if their_file == base_file {
             our_file
         } else {
-            return Err(HistoryError::ContentMergeRequired);
+            let (Some(base_file), Some(our_file), Some(their_file)) =
+                (base_file, our_file, their_file)
+            else {
+                return Err(HistoryError::ContentMergeRequired);
+            };
+            let input = |(oid, mode): &([u8; 20], u32)| MergeFileInput {
+                oid: *oid,
+                mode: *mode,
+            };
+            let inputs = MergeFileInputs {
+                base: input(base_file),
+                ours: input(our_file),
+                theirs: input(their_file),
+            };
+            let blob = merge_file_bytes(control, repository_id, path, inputs)?
+                .ok_or(HistoryError::ContentMergeRequired)?;
+            generated_len = generated_len
+                .checked_add(blob.bytes.len())
+                .filter(|total| *total <= MAX_AUTOMERGE_TOTAL_BYTES)
+                .ok_or(HistoryError::ContentMergeRequired)?;
+            merged.insert(
+                path.clone(),
+                (
+                    blob.oid.as_bytes().try_into().expect("SHA-1 OID"),
+                    blob.mode,
+                ),
+            );
+            generated.push((path.clone(), inputs, blob));
+            continue;
         };
         if let Some(file) = chosen {
             merged.insert(path.clone(), *file);
@@ -805,6 +847,9 @@ pub(crate) fn create_pathwise_merge_commit(
                 return Err(HistoryError::ContentMergeRequired);
             }
         }
+    }
+    for (path, inputs, blob) in &generated {
+        capture_generated_blob(control, repository_id, root_path, path, *inputs, blob)?;
     }
 
     let mut anchors = Vec::new();
@@ -844,12 +889,12 @@ pub(crate) fn create_pathwise_merge_commit(
     let their_commit = repository
         .find_commit(theirs)
         .map_err(|_| HistoryError::IncompatibleRecord)?;
-    let signature = Signature::now(author_name, author_email)?;
+    let signature = Signature::now(identity.name, identity.email)?;
     let commit_bytes = repository
         .commit_create_buffer(
             &signature,
             &signature,
-            message,
+            identity.message,
             &root_tree,
             &[&our_commit, &their_commit],
         )?

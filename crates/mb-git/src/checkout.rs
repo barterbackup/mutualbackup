@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::head::{HeadError, selected_branch, selected_branch_record, selected_ref};
 use crate::history::{
-    GitBranchInfo, HistoryError, commit_descends_from, create_pathwise_merge_commit,
+    GitBranchInfo, HistoryError, MergeIdentity, commit_descends_from, create_pathwise_merge_commit,
     fetched_ref_record, list_branches, merge_commit_parents, ref_kind, ref_oid,
 };
 use crate::stage::{
@@ -1055,11 +1055,14 @@ pub(crate) fn begin_merge_branch(
             let merged = create_pathwise_merge_commit(
                 control,
                 repository_id,
+                root_path,
                 old,
                 target,
-                author_name,
-                author_email,
-                &message,
+                MergeIdentity {
+                    name: author_name,
+                    email: author_email,
+                    message: &message,
+                },
             )?;
             begin_checkout_to(
                 control,
