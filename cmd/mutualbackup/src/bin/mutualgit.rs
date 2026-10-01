@@ -31,7 +31,7 @@ struct Cli {
 enum Command {
     /// Enroll this directory as a protected Git-compatible repository.
     Init { directory: Option<PathBuf> },
-    /// Stage exact regular-file bytes or a tracked file's deletion.
+    /// Stage exact file or symlink bytes, or a tracked path's deletion.
     Add {
         /// Discard an unfinished add after its captured source changed.
         #[arg(long)]
@@ -65,6 +65,8 @@ enum Command {
     Branch { name: Option<String> },
     /// Switch to a branch using exact-byte reflink checkout.
     Switch { name: String },
+    /// Check out a branch using the same protected worktree transition.
+    Checkout { name: String },
     /// Show raw-byte changes in the worktree or staged index.
     Diff {
         #[arg(long, alias = "staged")]
@@ -275,7 +277,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Command::Switch { name } => {
+        Command::Switch { name } | Command::Checkout { name } => {
             let (_, repository_id) = discover_repository(&working_directory)?;
             let LocalResponse::GitBranchSelected(branch) = local_control_call(
                 &socket,
