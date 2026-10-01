@@ -274,8 +274,15 @@ impl GitRepository {
         &self,
         relative: &Path,
     ) -> Result<Option<GitIndexEntry>, RepositoryError> {
-        if !self.remove_cached(relative)? {
+        let path = stage_path_key(relative)?;
+        let removed = self.remove_cached(relative)?;
+        let conflict = load_merge_session(&self.catalog, self.repository_id)?
+            .is_some_and(|(session, _)| session.conflicts.binary_search(&path).is_ok());
+        if !removed && !conflict {
             return Err(StageError::MissingUntrackedPath.into());
+        }
+        if conflict {
+            mark_merge_resolved(&self.catalog, self.repository_id, &path)?;
         }
         Ok(None)
     }
@@ -1006,6 +1013,79 @@ mod tests {
         drop(local);
         drop(remote_commit);
         drop(remote);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn deleted_file_can_resolve_a_modify_delete_merge_conflict() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-delete-conflict-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("conflict"), b"base\n").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [96_u8; 32];
+        let local = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        local.stage_file("conflict").unwrap();
+        local.commit("Author", "a@example.test", "base").unwrap();
+        local.create_branch("topic").unwrap();
+        local.switch_branch("topic").unwrap();
+        fs::write(source_root.join("conflict"), b"topic\n").unwrap();
+        local.stage_file("conflict").unwrap();
+        let topic = local.commit("Author", "a@example.test", "topic").unwrap();
+        local.switch_branch("main").unwrap();
+        fs::remove_file(source_root.join("conflict")).unwrap();
+        assert!(local.add_path("conflict").unwrap().is_none());
+        let main = local.commit("Author", "a@example.test", "delete").unwrap();
+        assert!(matches!(
+            local.merge_branch("topic", "Author", "a@example.test"),
+            Err(RepositoryError::Checkout(crate::CheckoutError::MergeConflicts(paths)))
+                if paths == vec![b"conflict".to_vec()]
+        ));
+        assert_eq!(
+            local.status().unwrap().merge.unwrap().unresolved_paths,
+            vec![b"conflict".to_vec()]
+        );
+        assert!(local.add_path("conflict").unwrap().is_none());
+        assert!(
+            local
+                .status()
+                .unwrap()
+                .merge
+                .unwrap()
+                .unresolved_paths
+                .is_empty()
+        );
+        fs::write(source_root.join("conflict"), b"stray bytes").unwrap();
+        assert!(matches!(
+            local.merge_continue(),
+            Err(RepositoryError::Checkout(
+                crate::CheckoutError::DirtyWorktree
+            ))
+        ));
+        assert_eq!(local.status().unwrap().head_oid, Some(main.oid));
+        fs::remove_file(source_root.join("conflict")).unwrap();
+        let merged = local.merge_continue().unwrap();
+        assert_eq!(
+            local.status().unwrap().head_oid,
+            Some(merged.as_bytes().try_into().unwrap())
+        );
+        assert!(local.status().unwrap().merge.is_none());
+        assert!(!source_root.join("conflict").exists());
+        assert_eq!(
+            local.log(1).unwrap()[0].parent_oids,
+            vec![main.oid, topic.oid]
+        );
+        assert!(local.status().unwrap().changes.is_empty());
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
         for blob in graph.blobs {
             blob.anchor.remove().unwrap();
         }

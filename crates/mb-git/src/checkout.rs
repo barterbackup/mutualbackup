@@ -826,22 +826,15 @@ fn index_matches_checkout(
     let Some(resolved) = resolved else {
         return index_matches_tree(staged, old_tree);
     };
-    staged.len() == old_tree.len()
-        && resolved.iter().all(|path| {
-            old_tree.contains_key(path)
-                && new_tree.contains_key(path)
-                && old_tree.get(path) != new_tree.get(path)
-        })
-        && old_tree.iter().all(|(path, old)| {
-            let expected = if resolved.contains(path) {
-                new_tree.get(path).unwrap_or(old)
-            } else {
-                old
-            };
-            staged
-                .get(path)
-                .is_some_and(|entry| entry.oid == expected.0 && entry.mode == expected.1)
-        })
+    let mut expected = old_tree.clone();
+    for path in resolved {
+        if let Some(file) = new_tree.get(path) {
+            expected.insert(path.clone(), *file);
+        } else {
+            expected.remove(path);
+        }
+    }
+    index_matches_tree(staged, &expected)
 }
 
 fn parent_directory_paths(tree: &TreeFiles) -> Result<BTreeSet<Vec<u8>>, CheckoutError> {
@@ -1258,8 +1251,7 @@ pub(crate) fn continue_merge(
     let mut resolutions = BTreeMap::new();
     let mut resolved_paths = BTreeSet::new();
     for path in &session.conflicts {
-        let entry = staged.get(path).ok_or(CheckoutError::IncompatibleIntent)?;
-        resolutions.insert(path.clone(), entry.clone());
+        resolutions.insert(path.clone(), staged.get(path).cloned());
         resolved_paths.insert(path.clone());
     }
     let merged = create_pathwise_merge_commit(
@@ -1332,16 +1324,24 @@ fn begin_checkout_to(
     if old_tree.len().max(new_tree.len()) > MAX_CHECKOUT_FILES {
         return Err(CheckoutError::TooManyFiles);
     }
-    for (path, (oid, mode)) in &old_tree {
-        let (oid, mode) = if target
+    for (path, (old_oid, old_mode)) in &old_tree {
+        let resolved = target
             .resolved_paths
-            .is_some_and(|paths| paths.contains(path))
-        {
+            .is_some_and(|paths| paths.contains(path));
+        if resolved && !new_tree.contains_key(path) {
+            if let Some((parent, leaf)) = parent_and_name_if_exists(&root, path)?
+                && entry_exists(&parent, &leaf)?
+            {
+                return Err(CheckoutError::DirtyWorktree);
+            }
+            continue;
+        }
+        let (oid, mode) = if resolved {
             *new_tree
                 .get(path)
                 .ok_or(CheckoutError::IncompatibleIntent)?
         } else {
-            (*oid, *mode)
+            (*old_oid, *old_mode)
         };
         entry_kind(mode)?;
         let (parent, leaf) = parent_and_name(&root, path)?;
@@ -1357,6 +1357,31 @@ fn begin_checkout_to(
                 anchor_id: staged[path].anchor_id,
             },
         )?;
+    }
+    if let Some(paths) = target.resolved_paths {
+        for path in paths.iter().filter(|path| !old_tree.contains_key(*path)) {
+            let Some((oid, mode)) = new_tree.get(path) else {
+                if let Some((parent, leaf)) = parent_and_name_if_exists(&root, path)?
+                    && entry_exists(&parent, &leaf)?
+                {
+                    return Err(CheckoutError::DirtyWorktree);
+                }
+                continue;
+            };
+            let (parent, leaf) = parent_and_name(&root, path)?;
+            let identity =
+                entry_identity_for(&parent, &leaf, *mode)?.ok_or(CheckoutError::DirtyWorktree)?;
+            verify_file(
+                &parent,
+                &leaf,
+                identity,
+                &CheckoutFile {
+                    oid: *oid,
+                    mode: *mode,
+                    anchor_id: staged[path].anchor_id,
+                },
+            )?;
+        }
     }
     let mut entries = Vec::new();
     for path in old_tree
@@ -1845,11 +1870,13 @@ fn apply_intent(
                 || intent.target_ref.as_deref() != Some(session.source_ref.as_slice())
                 || session.conflicts.len() != session.resolved.len()
                 || session.conflicts.iter().any(|path| {
-                    target_files.get(path).is_none_or(|(oid, mode)| {
-                        previous_index
-                            .get(path)
-                            .is_none_or(|staged| staged.oid != *oid || staged.mode != *mode)
-                    })
+                    match (target_files.get(path), previous_index.get(path)) {
+                        (Some((oid, mode)), Some(staged)) => {
+                            staged.oid != *oid || staged.mode != *mode
+                        }
+                        (None, None) => false,
+                        _ => true,
+                    }
                 })
             {
                 return Err(CheckoutError::IncompatibleIntent);

@@ -773,7 +773,7 @@ pub(crate) fn create_pathwise_merge_commit(
     ours: Oid,
     theirs: Oid,
     identity: MergeIdentity<'_>,
-    resolutions: Option<&BTreeMap<Vec<u8>, GitIndexEntry>>,
+    resolutions: Option<&BTreeMap<Vec<u8>, Option<GitIndexEntry>>>,
 ) -> Result<Oid, HistoryError> {
     let temporary = tempfile::tempdir()?;
     let repository = Repository::init_bare(temporary.path())?;
@@ -813,12 +813,14 @@ pub(crate) fn create_pathwise_merge_commit(
             our_file
         } else {
             if let Some(entry) = resolutions.and_then(|entries| entries.get(path)) {
-                if entry.format_version != 1
-                    || !matches!(entry.mode, 0o100644 | 0o100755 | 0o120000)
-                {
-                    return Err(HistoryError::IncompatibleRecord);
+                if let Some(entry) = entry {
+                    if entry.format_version != 1
+                        || !matches!(entry.mode, 0o100644 | 0o100755 | 0o120000)
+                    {
+                        return Err(HistoryError::IncompatibleRecord);
+                    }
+                    merged.insert(path.clone(), (entry.oid, entry.mode));
                 }
-                merged.insert(path.clone(), (entry.oid, entry.mode));
                 used_resolutions.insert(path.clone());
                 continue;
             }
