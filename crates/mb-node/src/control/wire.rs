@@ -89,6 +89,10 @@ pub enum LocalRequest {
         repository_id: Uuid,
         name: String,
     },
+    GitPushBare {
+        repository_id: Uuid,
+        path: PathBuf,
+    },
     GitDiff {
         repository_id: Uuid,
         cached: bool,
@@ -175,6 +179,10 @@ pub enum LocalResponse {
     GitBranches(Vec<GitBranchInfo>),
     GitBranchCreated(GitBranchInfo),
     GitBranchSelected(GitBranchInfo),
+    GitPushed {
+        repository_id: Uuid,
+        oid: [u8; 20],
+    },
     GitDiff(GitDiff),
     GitStatus(GitStatus),
     Guild(Option<GuildSummary>),
@@ -370,6 +378,10 @@ mod tests {
                 repository_id,
                 name: "older".to_owned(),
             },
+            LocalRequest::GitPushBare {
+                repository_id,
+                path: PathBuf::from("/home/user/remote.git"),
+            },
             LocalRequest::GitDiff {
                 repository_id,
                 cached: true,
@@ -443,6 +455,10 @@ mod tests {
                 oid: [7; 20],
                 current: true,
             }),
+            LocalResponse::GitPushed {
+                repository_id,
+                oid: [7; 20],
+            },
             LocalResponse::GitDiff(GitDiff {
                 format_version: 1,
                 repository_id,

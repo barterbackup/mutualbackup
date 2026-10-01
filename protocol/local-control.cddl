@@ -34,6 +34,7 @@ local-request =
   / { "GitBranches": { repository_id: uuid-text } }
   / { "GitCreateBranch": { repository_id: uuid-text, name: tstr } }
   / { "GitSwitchBranch": { repository_id: uuid-text, name: tstr } }
+  / { "GitPushBare": { repository_id: uuid-text, path: tstr } }
   / { "GitDiff": { repository_id: uuid-text, cached: bool } }
   / { "GitStatus": { repository_id: uuid-text } }
   / "GuildStatus"
@@ -76,6 +77,7 @@ local-response =
   / { "GitBranches": [* git-branch-info] }
   / { "GitBranchCreated": git-branch-info }
   / { "GitBranchSelected": git-branch-info }
+  / { "GitPushed": { repository_id: uuid-text, oid: bytes20-array } }
   / { "GitDiff": git-diff }
   / { "GitStatus": git-status }
   / { "Guild": null / guild-summary }

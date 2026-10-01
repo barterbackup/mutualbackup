@@ -21,6 +21,8 @@ mod diff;
 mod head;
 #[cfg(target_os = "linux")]
 mod history;
+#[cfg(target_os = "linux")]
+mod interop;
 mod odb;
 #[cfg(target_os = "linux")]
 mod repository;
@@ -40,6 +42,8 @@ pub use history::{
     GitBranchInfo, GitCommitInfo, GitGraphBlobSource, GitGraphObject, GitGraphRef, GitGraphSource,
     GitLogEntry, HistoryError,
 };
+#[cfg(target_os = "linux")]
+pub use interop::GitInteropError;
 pub use odb::NativeOdb;
 #[cfg(target_os = "linux")]
 pub use repository::{GitRepository, RepositoryError};

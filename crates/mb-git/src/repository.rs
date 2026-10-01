@@ -22,6 +22,7 @@ use crate::history::{
     create_branch, export_graph_source, import_graph_backup, list_branches, log_history,
     switch_same_tree_branch,
 };
+use crate::interop::{GitInteropError, push_current_branch_to_bare};
 use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, remove_cached,
     resume_pending_stages, stage_file, stage_path_key, stage_symlink, staged_entry,
@@ -54,6 +55,8 @@ pub enum RepositoryError {
     Diff(#[from] DiffError),
     #[error("Git checkout error: {0}")]
     Checkout(#[from] CheckoutError),
+    #[error("Git interoperability error: {0}")]
+    Interop(#[from] GitInteropError),
     #[error("repository marker or catalog identity conflicts with this root")]
     Conflict,
     #[error("the Git repository is not initialized")]
@@ -376,6 +379,20 @@ impl GitRepository {
         Ok(export_graph_source(&self.catalog, self.repository_id)?)
     }
 
+    pub fn push_current_branch_to_bare(
+        &self,
+        destination: impl AsRef<Path>,
+    ) -> Result<Oid, RepositoryError> {
+        self.resume_checkout()?;
+        Ok(push_current_branch_to_bare(
+            &self.catalog,
+            self.repository_id,
+            &self.root,
+            destination.as_ref(),
+            &self.selected_branch()?,
+        )?)
+    }
+
     pub fn import_backup(
         &self,
         descriptor: &crate::GitBackupDescriptor,
@@ -522,6 +539,127 @@ mod tests {
             fs::read(unrelated_catalog.join("user-file")).unwrap(),
             b"must be preserved"
         );
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn local_bare_git_push_streams_exact_blobs_and_rejects_divergence() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-bare-push-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        let bare_root = run_root.join("remote.git");
+        fs::create_dir_all(&source_root).unwrap();
+        git2::Repository::init_bare(&bare_root).unwrap();
+        let bytes = vec![0x5a; 2 * 1024 * 1024];
+        fs::write(source_root.join("large"), &bytes).unwrap();
+        symlink("missing\r\npath", source_root.join("link")).unwrap();
+        let repo = GitRepository::init(&source_root, Uuid::new_v4(), &[52_u8; 32]).unwrap();
+        let large = repo.add_path("large").unwrap().unwrap();
+        let link = repo.add_path("link").unwrap().unwrap();
+        let first = repo
+            .commit("Test", "test@example.invalid", "first")
+            .unwrap();
+        let pushed = repo.push_current_branch_to_bare(&bare_root).unwrap();
+        assert_eq!(pushed.as_bytes(), first.oid);
+        assert_eq!(
+            repo.push_current_branch_to_bare(&bare_root).unwrap(),
+            pushed
+        );
+        assert!(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&bare_root)
+                .arg("gc")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            repo.push_current_branch_to_bare(&bare_root).unwrap(),
+            pushed
+        );
+        let remote = git2::Repository::open_bare(&bare_root).unwrap();
+        assert_eq!(
+            remote.find_reference("refs/heads/main").unwrap().target(),
+            Some(pushed)
+        );
+        assert_eq!(
+            remote
+                .find_commit(pushed)
+                .unwrap()
+                .tree()
+                .unwrap()
+                .get_name("link")
+                .unwrap()
+                .filemode(),
+            0o120000
+        );
+        let stock_blob = Command::new("git")
+            .arg("--git-dir")
+            .arg(&bare_root)
+            .arg("cat-file")
+            .arg("blob")
+            .arg(Oid::from_bytes(&link.oid).unwrap().to_string())
+            .output()
+            .unwrap();
+        assert!(stock_blob.status.success());
+        assert_eq!(stock_blob.stdout, b"missing\r\npath");
+        let stock_large = Command::new("git")
+            .arg("--git-dir")
+            .arg(&bare_root)
+            .arg("cat-file")
+            .arg("-s")
+            .arg(Oid::from_bytes(&large.oid).unwrap().to_string())
+            .output()
+            .unwrap();
+        assert!(stock_large.status.success());
+        assert_eq!(stock_large.stdout, b"2097152\n");
+        fs::write(source_root.join("large"), b"second\r\n").unwrap();
+        repo.add_path("large").unwrap();
+        let second = repo
+            .commit("Test", "test@example.invalid", "second")
+            .unwrap();
+        assert_eq!(
+            repo.push_current_branch_to_bare(&bare_root)
+                .unwrap()
+                .as_bytes(),
+            second.oid
+        );
+
+        let signature = git2::Signature::now("Remote", "remote@example.invalid").unwrap();
+        let base = remote.find_commit(pushed).unwrap();
+        let tree = base.tree().unwrap();
+        let divergent = remote
+            .commit(None, &signature, &signature, "diverged", &tree, &[&base])
+            .unwrap();
+        remote
+            .reference("refs/heads/main", divergent, true, "diverge")
+            .unwrap();
+        assert!(matches!(
+            repo.push_current_branch_to_bare(&bare_root),
+            Err(RepositoryError::Interop(
+                crate::GitInteropError::NonFastForward
+            ))
+        ));
+        assert_eq!(
+            remote.find_reference("refs/heads/main").unwrap().target(),
+            Some(divergent)
+        );
+        let graph = repo.export_graph_source().unwrap();
+        drop(repo);
+        drop(tree);
+        drop(base);
+        drop(remote);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
     }
 
     #[test]

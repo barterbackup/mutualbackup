@@ -458,6 +458,16 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitPushBare {
+            repository_id,
+            path,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_push_bare(repository_id, &path)
+                    .map(|oid| LocalResponse::GitPushed { repository_id, oid })
+            })
+            .await
+        }
         LocalRequest::GitDiff {
             repository_id,
             cached,

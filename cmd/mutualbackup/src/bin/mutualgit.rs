@@ -67,6 +67,8 @@ enum Command {
     Switch { name: String },
     /// Check out a branch using the same protected worktree transition.
     Checkout { name: String },
+    /// Push the current branch to an existing local bare Git repository.
+    Push { destination: PathBuf },
     /// Show raw-byte changes in the worktree or staged index.
     Diff {
         #[arg(long, alias = "staged")]
@@ -294,6 +296,35 @@ async fn main() -> Result<()> {
                 bail!("daemon selected a branch in another repository");
             }
             println!("Switched to branch '{}'", branch.name);
+        }
+        Command::Push { destination } => {
+            let (_, repository_id) = discover_repository(&working_directory)?;
+            let destination = working_directory
+                .join(destination)
+                .canonicalize()
+                .context("cannot resolve bare Git destination")?;
+            let LocalResponse::GitPushed {
+                repository_id: returned_id,
+                oid,
+            } = local_control_call(
+                &socket,
+                &LocalRequest::GitPushBare {
+                    repository_id,
+                    path: destination.clone(),
+                },
+            )
+            .await?
+            else {
+                bail!("daemon returned the wrong response to Git push");
+            };
+            if returned_id != repository_id {
+                bail!("daemon pushed another repository");
+            }
+            println!(
+                "Pushed {} to {}",
+                git2::Oid::from_bytes(&oid)?,
+                destination.display()
+            );
         }
         Command::Diff { cached } => {
             let (_, repository_id) = discover_repository(&working_directory)?;

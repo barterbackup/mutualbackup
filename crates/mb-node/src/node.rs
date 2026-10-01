@@ -1462,6 +1462,13 @@ impl Node {
             .map_err(Into::into)
     }
 
+    pub fn git_push_bare(&self, repository_id: Uuid, path: &Path) -> Result<[u8; 20]> {
+        let oid = self
+            .open_git_repository(repository_id)?
+            .push_current_branch_to_bare(path)?;
+        Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
+    }
+
     pub fn git_diff(&self, repository_id: Uuid, cached: bool) -> Result<GitDiff> {
         self.open_git_repository(repository_id)?
             .diff(cached)
@@ -15376,6 +15383,24 @@ pub(crate) mod tests {
         assert_eq!(status.head_oid, Some(second_commit.oid));
         assert!(!status.history_backed_up);
         assert!(status.changes.is_empty());
+        let bare_root = run_root.join("remote.git");
+        git2::Repository::init_bare(&bare_root).unwrap();
+        assert_eq!(
+            reopened
+                .git_push_bare(info.repository_id, &bare_root)
+                .unwrap(),
+            second_commit.oid
+        );
+        assert_eq!(
+            git2::Repository::open_bare(&bare_root)
+                .unwrap()
+                .find_reference("refs/heads/main")
+                .unwrap()
+                .target()
+                .unwrap()
+                .as_bytes(),
+            second_commit.oid
+        );
         let branches = reopened.git_branches(info.repository_id).unwrap();
         assert_eq!(branches.len(), 2);
         assert_eq!(branches[0].name, "main");
