@@ -26,6 +26,8 @@ mutualgit -C /absolute/path/to/source status
 The local binary supports branches, linked worktrees, exact-byte checkout,
 merge, staged reset, hard reset, worktree restore, diff, log, explicit commit pins,
 and prune.
+`mutualgit worktree list` reports the current branch of each ready worktree;
+an interrupted addition reports its reserved target branch.
 After deliberately removing a linked worktree directory, run
 `mutualgit worktree prune WORKTREE_ID` from the primary repository to release
 its branch ownership and index pins. The command refuses an existing path,

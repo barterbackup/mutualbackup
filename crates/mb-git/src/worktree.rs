@@ -70,6 +70,7 @@ pub struct GitWorktreeInfo {
     pub worktree_id: Uuid,
     pub path: PathBuf,
     pub root_id: NativeFileId,
+    /// Reserved target while preparing; the selected HEAD in ready views.
     pub target_branch: String,
     pub state: GitWorktreeState,
 }
@@ -154,9 +155,26 @@ pub(crate) fn list_worktrees(
         .map(|(key, bytes)| {
             let info: GitWorktreeInfo = decode_canonical(&bytes)?;
             validate(&info, repository_id, &key)?;
-            Ok(info)
+            ready_info_with_selected_branch(control, info)
         })
         .collect()
+}
+
+fn ready_info_with_selected_branch(
+    control: &ControlStore,
+    mut info: GitWorktreeInfo,
+) -> Result<GitWorktreeInfo, GitWorktreeError> {
+    if info.state == GitWorktreeState::Ready {
+        let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
+        if control
+            .get_record(&head_kind_for_scope(scope), b"branch")?
+            .is_none()
+        {
+            return Err(GitWorktreeError::Conflict);
+        }
+        info.target_branch = selected_branch_for_scope(control, scope)?;
+    }
+    Ok(info)
 }
 
 pub(crate) fn get_worktree(
@@ -169,7 +187,7 @@ pub(crate) fn get_worktree(
         .ok_or(GitWorktreeError::NotRegistered)?;
     let info: GitWorktreeInfo = decode_canonical(&bytes)?;
     validate(&info, repository_id, worktree_id.as_bytes())?;
-    Ok(info)
+    ready_info_with_selected_branch(control, info)
 }
 
 /// Retire only catalog state for an explicitly removed linked worktree.

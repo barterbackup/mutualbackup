@@ -2040,6 +2040,17 @@ mod tests {
         local
             .linked_switch_branch(linked.worktree_id, "base-copy")
             .unwrap();
+        assert_eq!(
+            local
+                .linked_worktree(linked.worktree_id)
+                .unwrap()
+                .target_branch,
+            "base-copy"
+        );
+        assert_eq!(
+            local.linked_worktrees().unwrap()[0].target_branch,
+            "base-copy"
+        );
         assert_eq!(fs::read(linked_root.join("tracked")).unwrap(), b"base\r\n");
         assert_eq!(
             local
@@ -2060,6 +2071,7 @@ mod tests {
         local
             .linked_switch_branch(linked.worktree_id, "topic")
             .unwrap();
+        assert_eq!(local.linked_worktrees().unwrap()[0].target_branch, "topic");
         assert_eq!(
             fs::read(linked_root.join("tracked")).unwrap(),
             b"linked edit\r\n\0"
