@@ -20,6 +20,9 @@ const AREA_MAGIC: &str = "mutualbackup-anchor-area-v1";
 const CAPTURE_MANIFEST_PREFIX: &str = ".mutualbackup-capture-manifest-v1-";
 const CAPTURE_LINK_POOL_PREFIX: &str = ".mutualbackup-capture-links-v1-";
 const FILE_ANCHOR_PAYLOAD: &str = "blob";
+pub const GIT_CATALOG_DIRECTORY: &str = ".mutualbackup";
+pub const GIT_CATALOG_MARKER_FILE: &str = "repository";
+const GIT_CATALOG_MARKER_MAGIC: &str = "mutualbackup-git-repository-v1\n";
 const MAX_CAPTURE_ENTRIES: usize = 8_192;
 const MAX_CAPTURE_EXTENTS: usize = 65_536;
 const MAX_CAPTURE_DEPTH: usize = 256;
@@ -212,6 +215,20 @@ impl PinnedDirectory {
         create_regular_file_at(&self.file, name, name)
     }
 
+    pub fn open_child_file(&self, name: impl AsRef<Path>) -> Result<Option<File>, AnchorError> {
+        let name = name.as_ref();
+        validate_single_component(name)?;
+        let pinned = match open_path_no_xdev_beneath(&self.file, name) {
+            Ok(pinned) => pinned,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if !pinned.metadata()?.is_file() {
+            return Err(AnchorError::UnsupportedObject(name.to_path_buf()));
+        }
+        Ok(Some(reopen_pinned_file(&pinned, false, name)?))
+    }
+
     pub fn entry_identity(
         &self,
         relative: impl AsRef<Path>,
@@ -346,6 +363,10 @@ impl PinnedDirectory {
         Err(unsupported_pinned_directory())
     }
 
+    pub fn open_child_file(&self, _name: impl AsRef<Path>) -> Result<Option<File>, AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
     pub fn entry_identity(
         &self,
         _relative: impl AsRef<Path>,
@@ -397,6 +418,59 @@ fn unsupported_pinned_directory() -> AnchorError {
         std::io::ErrorKind::Unsupported,
         "descriptor-relative directory access is implemented only on Linux",
     ))
+}
+
+/// A marker is necessary before the app-owned Git catalog is excluded from
+/// ordinary root capture. An unrelated user directory with the same name keeps
+/// its previous backup behavior.
+pub fn git_catalog_marker(root: impl AsRef<Path>) -> Result<Option<Uuid>, AnchorError> {
+    let root = PinnedDirectory::open(root)?;
+    git_catalog_marker_from_root(root.as_file())
+}
+
+pub fn git_catalog_marker_bytes(repository_id: Uuid) -> Vec<u8> {
+    format!("{GIT_CATALOG_MARKER_MAGIC}{repository_id}\n").into_bytes()
+}
+
+fn git_catalog_marker_from_root(root: &File) -> Result<Option<Uuid>, AnchorError> {
+    let catalog_name = Path::new(GIT_CATALOG_DIRECTORY);
+    let catalog = match open_path_no_xdev_beneath(root, catalog_name) {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !catalog.metadata()?.is_dir() {
+        return Ok(None);
+    }
+    let catalog = reopen_pinned_file(&catalog, true, catalog_name)?;
+    let marker_name = Path::new(GIT_CATALOG_MARKER_FILE);
+    let marker = match open_path_no_xdev_beneath(&catalog, marker_name) {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !marker.metadata()?.is_file() || marker.metadata()?.len() > 128 {
+        return Ok(None);
+    }
+    let mut marker = reopen_pinned_file(&marker, false, marker_name)?;
+    let mut bytes = Vec::new();
+    marker.read_to_end(&mut bytes)?;
+    let Some(identifier) = bytes
+        .strip_prefix(GIT_CATALOG_MARKER_MAGIC.as_bytes())
+        .and_then(|value| value.strip_suffix(b"\n"))
+    else {
+        return Ok(None);
+    };
+    let Ok(identifier) = std::str::from_utf8(identifier) else {
+        return Ok(None);
+    };
+    let Ok(repository_id) = Uuid::parse_str(identifier) else {
+        return Ok(None);
+    };
+    if repository_id.is_nil() || bytes != git_catalog_marker_bytes(repository_id) {
+        return Ok(None);
+    }
+    Ok(Some(repository_id))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1796,6 +1870,12 @@ impl DescriptorCapture<'_> {
                 .to_owned();
             if relative_string.len() > MAX_RELATIVE_PATH_BYTES {
                 return Err(AnchorError::CatalogTooLarge);
+            }
+            if depth == 0
+                && name.as_bytes() == GIT_CATALOG_DIRECTORY.as_bytes()
+                && git_catalog_marker_from_root(self.root_file)?.is_some()
+            {
+                continue;
             }
 
             let pinned = match open_path_no_xdev_beneath(directory, component) {
@@ -3516,6 +3596,57 @@ mod tests {
             Err(AnchorError::InvalidRoot)
         ));
         manifest.remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn root_capture_excludes_only_a_marked_git_catalog() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-catalog-capture-{}", Uuid::new_v4()));
+        let source_root = run_root.join("source");
+        let catalog = source_root.join(GIT_CATALOG_DIRECTORY);
+        fs::create_dir_all(&catalog).unwrap();
+        fs::write(source_root.join("tracked"), b"user bytes").unwrap();
+        fs::write(catalog.join("repository"), b"ordinary user data").unwrap();
+        let before = ReflinkAnchor::capture(&source_root).unwrap();
+        assert!(
+            before
+                .entries
+                .iter()
+                .any(|entry| entry_path(entry) == ".mutualbackup/repository")
+        );
+        before.remove().unwrap();
+
+        let repository_id = Uuid::new_v4();
+        fs::write(
+            catalog.join(GIT_CATALOG_MARKER_FILE),
+            git_catalog_marker_bytes(repository_id),
+        )
+        .unwrap();
+        fs::write(catalog.join("catalog.db"), b"private catalog bytes").unwrap();
+        assert_eq!(
+            git_catalog_marker(&source_root).unwrap(),
+            Some(repository_id)
+        );
+        let after = ReflinkAnchor::capture(&source_root).unwrap();
+        assert!(
+            after
+                .entries
+                .iter()
+                .any(|entry| entry_path(entry) == "tracked")
+        );
+        assert!(
+            after
+                .entries
+                .iter()
+                .all(|entry| !entry_path(entry).starts_with(".mutualbackup"))
+        );
+        after.remove().unwrap();
         fs::remove_dir_all(run_root).unwrap();
     }
 

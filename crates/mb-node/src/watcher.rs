@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use mb_store::filesystem_identity;
+use mb_store::{GIT_CATALOG_DIRECTORY, filesystem_identity, git_catalog_marker};
 use notify::event::{AccessKind, AccessMode};
 use notify::{EventKind, RecursiveMode, Watcher};
 
@@ -92,7 +93,11 @@ async fn watch_once(
             Ok(event) if !event_requires_reconciliation(&event.kind) => return,
             Ok(event) => {
                 for (root_id, root_path) in &watched_paths {
-                    if event.paths.iter().any(|path| path.starts_with(root_path)) {
+                    if event
+                        .paths
+                        .iter()
+                        .any(|path| watched_path_changes_source(root_path, path))
+                    {
                         let _ = sender.try_send(*root_id);
                     }
                 }
@@ -269,6 +274,17 @@ fn event_requires_reconciliation(kind: &EventKind) -> bool {
     )
 }
 
+fn watched_path_changes_source(root: &Path, path: &Path) -> bool {
+    if !path.starts_with(root) {
+        return false;
+    }
+    let catalog = root.join(GIT_CATALOG_DIRECTORY);
+    if path.starts_with(&catalog) && matches!(git_catalog_marker(root), Ok(Some(_))) {
+        return false;
+    }
+    true
+}
+
 fn open_watched_root(root: &ProtectedRoot) -> Result<(File, WatchedRootIdentity)> {
     use std::os::unix::fs::MetadataExt;
 
@@ -378,6 +394,23 @@ mod tests {
         assert!(event_requires_reconciliation(&EventKind::Modify(
             notify::event::ModifyKind::Any
         )));
+    }
+
+    #[test]
+    fn watcher_ignores_only_a_marked_git_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let catalog = root.join(GIT_CATALOG_DIRECTORY);
+        std::fs::create_dir_all(&catalog).unwrap();
+        let marker = catalog.join(mb_store::GIT_CATALOG_MARKER_FILE);
+        let catalog_change = catalog.join("catalog.db-wal");
+        assert!(watched_path_changes_source(&root, &catalog_change));
+        let repository_id = uuid::Uuid::new_v4();
+        std::fs::write(&marker, mb_store::git_catalog_marker_bytes(repository_id)).unwrap();
+        assert!(!watched_path_changes_source(&root, &catalog_change));
+        assert!(watched_path_changes_source(&root, &root.join("tracked")));
+        std::fs::write(&marker, b"not an application marker").unwrap();
+        assert!(watched_path_changes_source(&root, &catalog_change));
     }
 
     #[test]

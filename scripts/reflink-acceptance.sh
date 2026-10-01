@@ -13,6 +13,7 @@ fi
 
 cargo test -p mb-store anchor::tests::stable_locator_survives_parent_rename --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::single_file_reflink_anchor_preserves_staged_bytes_without_sibling_capture --locked -- --ignored --exact
+cargo test -p mb-store anchor::tests::root_capture_excludes_only_a_marked_git_catalog --locked -- --ignored --exact
 cargo test -p mb-git tests::git_blob_oid_hashes_exact_anchor_bytes_after_worktree_edit --locked -- --ignored --exact
 cargo test -p mb-git odb::tests::native_odb_reads_small_and_large_git_blobs_from_anchors --locked -- --ignored --exact
 cargo test -p mb-git stage::tests::stage_index_and_object_map_replay_after_capture_and_reopen --locked -- --ignored --exact
