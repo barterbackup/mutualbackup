@@ -55,6 +55,8 @@ enum Command {
     },
     /// List local branches or create one at the current commit.
     Branch { name: Option<String> },
+    /// Select a branch whose committed tree matches the current branch.
+    Switch { name: String },
     /// Show raw-byte changes in the worktree or staged index.
     Diff {
         #[arg(long, alias = "staged")]
@@ -233,6 +235,24 @@ async fn main() -> Result<()> {
                     println!("{} {}", if branch.current { '*' } else { ' ' }, branch.name);
                 }
             }
+        }
+        Command::Switch { name } => {
+            let (_, repository_id) = discover_repository(&working_directory)?;
+            let LocalResponse::GitBranchSelected(branch) = local_control_call(
+                &socket,
+                &LocalRequest::GitSwitchBranch {
+                    repository_id,
+                    name,
+                },
+            )
+            .await?
+            else {
+                bail!("daemon returned the wrong response to Git switch");
+            };
+            if branch.repository_id != repository_id || !branch.current {
+                bail!("daemon selected a branch in another repository");
+            }
+            println!("Switched to branch '{}'", branch.name);
         }
         Command::Diff { cached } => {
             let (_, repository_id) = discover_repository(&working_directory)?;

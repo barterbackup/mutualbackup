@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::head::{HeadError, selected_branch, selected_ref, store_selected_branch};
 use crate::stage::{
     GitIndexEntry, StageError, anchors_for_oid, has_pending_stages, index_kind, object_kind,
     stage_path_key, staged_entries,
@@ -40,6 +41,8 @@ pub enum HistoryError {
     Anchor(#[from] GitAnchorError),
     #[error("Git backup descriptor error: {0}")]
     Backup(#[from] GitBackupError),
+    #[error("Git HEAD record error: {0}")]
+    Head(#[from] HeadError),
     #[error("temporary metadata repository error: {0}")]
     Io(#[from] std::io::Error),
     #[error("an unfinished add must be resumed or abandoned before committing")]
@@ -58,6 +61,10 @@ pub enum HistoryError {
     BranchExists,
     #[error("the current branch has no commit to branch from")]
     NoHead,
+    #[error("the requested branch does not exist")]
+    BranchNotFound,
+    #[error("switching this branch requires a worktree checkout")]
+    CheckoutRequired,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -187,7 +194,11 @@ fn load_metadata(
 }
 
 fn head_oid(control: &ControlStore, repository_id: Uuid) -> Result<Option<Oid>, HistoryError> {
-    let Some(encoded) = control.get_record(&ref_kind(repository_id), MAIN_REF)? else {
+    let head = selected_ref(control, repository_id)?;
+    let Some(encoded) = control.get_record(&ref_kind(repository_id), &head)? else {
+        if head != MAIN_REF {
+            return Err(HistoryError::IncompatibleRecord);
+        }
         return Ok(None);
     };
     let record: RefRecord = decode_canonical(&encoded)?;
@@ -201,6 +212,7 @@ fn branch_records(
     control: &ControlStore,
     repository_id: Uuid,
 ) -> Result<Vec<GitBranchInfo>, HistoryError> {
+    let current = selected_ref(control, repository_id)?;
     let mut branches = Vec::new();
     for (name, encoded) in control.records(&ref_kind(repository_id))? {
         let full_name = std::str::from_utf8(&name).map_err(|_| HistoryError::IncompatibleRecord)?;
@@ -230,7 +242,7 @@ fn branch_records(
             repository_id,
             name: short_name.to_owned(),
             oid: record.oid,
-            current: name == MAIN_REF,
+            current: name == current,
         });
         if branches.len() > MAX_GRAPH_OBJECTS {
             return Err(HistoryError::GraphTooLarge);
@@ -300,8 +312,47 @@ pub fn create_branch(
     Ok(info)
 }
 
-/// Commit the staged snapshot to `main`. Branch creation is available, while
-/// checkout and per-worktree ref selection are added separately.
+/// Select a branch only when its tree matches the current worktree's committed
+/// tree. No file changes or index rewrites are needed in that case; the full
+/// checkout path handles branches with different trees separately.
+pub fn switch_same_tree_branch(
+    control: &ControlStore,
+    repository_id: Uuid,
+    name: &str,
+) -> Result<GitBranchInfo, HistoryError> {
+    if name.len() > 1024 || !Branch::name_is_valid(name)? {
+        return Err(HistoryError::InvalidBranch);
+    }
+    let target = branch_records(control, repository_id)?
+        .into_iter()
+        .find(|branch| branch.name == name)
+        .ok_or(HistoryError::BranchNotFound)?;
+    let current = head_oid(control, repository_id)?.ok_or(HistoryError::NoHead)?;
+    let temporary = tempfile::tempdir()?;
+    let repository = Repository::init_bare(temporary.path())?;
+    let odb = git2::Odb::new()?;
+    let _pack = odb.add_new_mempack_backend(1000)?;
+    repository.set_odb(&odb)?;
+    load_metadata(control, repository_id, &repository)?;
+    let current_tree = repository
+        .find_commit(current)
+        .map_err(|_| HistoryError::IncompatibleRecord)?
+        .tree_id();
+    let target_tree = repository
+        .find_commit(Oid::from_bytes(&target.oid)?)
+        .map_err(|_| HistoryError::IncompatibleRecord)?
+        .tree_id();
+    if current_tree != target_tree {
+        return Err(HistoryError::CheckoutRequired);
+    }
+    store_selected_branch(control, repository_id, name)?;
+    Ok(GitBranchInfo {
+        current: true,
+        ..target
+    })
+}
+
+/// Commit the staged snapshot to the selected branch.
 pub fn commit_index(
     control: &ControlStore,
     repository_id: Uuid,
@@ -332,6 +383,8 @@ pub fn commit_index(
     let _metadata_pack = native_odb.odb().add_new_mempack_backend(1000)?;
     repository.set_odb(native_odb.odb())?;
     load_metadata(control, repository_id, &repository)?;
+    let branch = selected_branch(control, repository_id)?;
+    let selected_ref = selected_ref(control, repository_id)?;
     let previous = head_oid(control, repository_id)?;
     let parent = match previous {
         Some(oid) => Some(
@@ -401,7 +454,7 @@ pub fn commit_index(
     ));
     published.push((
         ref_kind(repository_id),
-        MAIN_REF.to_vec(),
+        selected_ref,
         canonical_bytes(&RefRecord {
             format_version: 1,
             oid: commit_oid
@@ -423,7 +476,7 @@ pub fn commit_index(
             .try_into()
             .expect("SHA-1 Git object IDs contain 20 bytes"),
         parent_oid: previous.map(|oid| oid.as_bytes().try_into().expect("SHA-1 OID")),
-        branch: "main".to_owned(),
+        branch,
     })
 }
 

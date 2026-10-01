@@ -431,6 +431,16 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitSwitchBranch {
+            repository_id,
+            name,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_switch_branch(repository_id, &name)
+                    .map(LocalResponse::GitBranchSelected)
+            })
+            .await
+        }
         LocalRequest::GitDiff {
             repository_id,
             cached,

@@ -1434,6 +1434,12 @@ impl Node {
             .map_err(Into::into)
     }
 
+    pub fn git_switch_branch(&self, repository_id: Uuid, name: &str) -> Result<GitBranchInfo> {
+        self.open_git_repository(repository_id)?
+            .switch_same_tree_branch(name)
+            .map_err(Into::into)
+    }
+
     pub fn git_diff(&self, repository_id: Uuid, cached: bool) -> Result<GitDiff> {
         self.open_git_repository(repository_id)?
             .diff(cached)
@@ -15278,6 +15284,13 @@ pub(crate) mod tests {
         assert_eq!(older.oid, first_commit.oid);
         assert!(!older.current);
         assert!(
+            node.git_switch_branch(info.repository_id, "older")
+                .unwrap()
+                .current
+        );
+        assert_eq!(node.git_status(info.repository_id).unwrap().branch, "older");
+        node.git_switch_branch(info.repository_id, "main").unwrap();
+        assert!(
             node.git_create_branch(info.repository_id, "older/nested")
                 .is_err()
         );
@@ -15344,6 +15357,11 @@ pub(crate) mod tests {
         assert_eq!(branches[0].name, "main");
         assert!(branches[0].current);
         assert_eq!(branches[1], older);
+        assert!(
+            reopened
+                .git_switch_branch(info.repository_id, "older")
+                .is_err()
+        );
         let history = reopened.git_log(info.repository_id, 10).unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].oid, second_commit.oid);

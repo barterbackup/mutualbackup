@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::head::{HeadError, selected_branch, selected_ref};
 use crate::stage::{GitIndexEntry, StageError, pending_stage_paths, staged_entries};
 
 const METADATA_PREFIX: &str = "git-metadata-object-v1/";
@@ -31,6 +32,8 @@ pub enum StatusError {
     Database(#[from] DatabaseError),
     #[error("versioned history metadata error: {0}")]
     Model(#[from] ModelError),
+    #[error("Git HEAD record error: {0}")]
+    Head(#[from] HeadError),
     #[error("Git object error: {0}")]
     Git(#[from] git2::Error),
     #[error("working-tree or temporary repository error: {0}")]
@@ -85,7 +88,11 @@ struct RefRecord {
 
 fn head_oid(control: &ControlStore, repository_id: Uuid) -> Result<Option<Oid>, StatusError> {
     let kind = format!("{REF_PREFIX}{repository_id}");
-    let Some(encoded) = control.get_record(&kind, b"refs/heads/main")? else {
+    let reference = selected_ref(control, repository_id)?;
+    let Some(encoded) = control.get_record(&kind, &reference)? else {
+        if reference != b"refs/heads/main" {
+            return Err(StatusError::IncompatibleRecord);
+        }
         return Ok(None);
     };
     let record: RefRecord = decode_canonical(&encoded)?;
@@ -278,7 +285,7 @@ pub fn repository_status(
     Ok(GitStatus {
         format_version: 1,
         repository_id,
-        branch: "main".to_owned(),
+        branch: selected_branch(control, repository_id)?,
         head_oid: head.map(|oid| oid.as_bytes().try_into().expect("SHA-1 OID")),
         history_backed_up: false,
         changes,

@@ -81,6 +81,10 @@ pub enum LocalRequest {
         repository_id: Uuid,
         name: String,
     },
+    GitSwitchBranch {
+        repository_id: Uuid,
+        name: String,
+    },
     GitDiff {
         repository_id: Uuid,
         cached: bool,
@@ -159,6 +163,7 @@ pub enum LocalResponse {
     GitLog(Vec<GitLogEntry>),
     GitBranches(Vec<GitBranchInfo>),
     GitBranchCreated(GitBranchInfo),
+    GitBranchSelected(GitBranchInfo),
     GitDiff(GitDiff),
     GitStatus(GitStatus),
     Guild(Option<GuildSummary>),
@@ -346,6 +351,10 @@ mod tests {
                 repository_id,
                 name: "older".to_owned(),
             },
+            LocalRequest::GitSwitchBranch {
+                repository_id,
+                name: "older".to_owned(),
+            },
             LocalRequest::GitDiff {
                 repository_id,
                 cached: true,
@@ -406,6 +415,13 @@ mod tests {
                 name: "older".to_owned(),
                 oid: [7; 20],
                 current: false,
+            }),
+            LocalResponse::GitBranchSelected(GitBranchInfo {
+                format_version: 1,
+                repository_id,
+                name: "older".to_owned(),
+                oid: [7; 20],
+                current: true,
             }),
             LocalResponse::GitDiff(GitDiff {
                 format_version: 1,

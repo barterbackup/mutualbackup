@@ -16,6 +16,8 @@ mod backup;
 #[cfg(target_os = "linux")]
 mod diff;
 #[cfg(target_os = "linux")]
+mod head;
+#[cfg(target_os = "linux")]
 mod history;
 mod odb;
 #[cfg(target_os = "linux")]
@@ -27,6 +29,8 @@ mod status;
 pub use backup::{GitBackupBlob, GitBackupDescriptor, GitBackupError, GitDataExtent};
 #[cfg(target_os = "linux")]
 pub use diff::{DiffError, GitDiff};
+#[cfg(target_os = "linux")]
+pub use head::HeadError;
 #[cfg(target_os = "linux")]
 pub use history::{
     GitBranchInfo, GitCommitInfo, GitGraphBlobSource, GitGraphObject, GitGraphRef, GitGraphSource,

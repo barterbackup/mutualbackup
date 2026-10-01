@@ -18,6 +18,7 @@ use crate::diff::{DiffError, GitDiff, repository_diff};
 use crate::history::{
     GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, HistoryError, commit_index,
     create_branch, export_graph_source, import_graph_backup, list_branches, log_history,
+    switch_same_tree_branch,
 };
 use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, resume_pending_stages,
@@ -237,6 +238,14 @@ impl GitRepository {
 
     pub fn create_branch(&self, name: &str) -> Result<GitBranchInfo, RepositoryError> {
         Ok(create_branch(&self.catalog, self.repository_id, name)?)
+    }
+
+    pub fn switch_same_tree_branch(&self, name: &str) -> Result<GitBranchInfo, RepositoryError> {
+        Ok(switch_same_tree_branch(
+            &self.catalog,
+            self.repository_id,
+            name,
+        )?)
     }
 
     pub fn status(&self) -> Result<GitStatus, RepositoryError> {
@@ -582,6 +591,72 @@ mod tests {
         first_anchor[0].remove().unwrap();
         second_anchor[0].remove().unwrap();
         third_anchor[0].remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn selected_branch_survives_reopen_and_commits_only_to_its_ref() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-head-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("tracked"), b"first\r\nbytes\0").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [28_u8; 32];
+        let repo = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        repo.stage_file("tracked").unwrap();
+        let first = repo.commit("Author", "a@example.test", "first").unwrap();
+        repo.create_branch("topic").unwrap();
+        assert!(matches!(
+            repo.switch_same_tree_branch("missing"),
+            Err(RepositoryError::History(
+                crate::HistoryError::BranchNotFound
+            ))
+        ));
+        let selected = repo.switch_same_tree_branch("topic").unwrap();
+        assert!(selected.current);
+        assert_eq!(repo.status().unwrap().branch, "topic");
+        assert!(
+            repo.branches()
+                .unwrap()
+                .iter()
+                .any(|branch| { branch.name == "topic" && branch.current })
+        );
+        drop(repo);
+
+        let repo = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        assert_eq!(repo.status().unwrap().head_oid, Some(first.oid));
+        assert_eq!(repo.status().unwrap().branch, "topic");
+        fs::write(source_root.join("tracked"), b"second\nbytes").unwrap();
+        repo.stage_file("tracked").unwrap();
+        let second = repo.commit("Author", "a@example.test", "second").unwrap();
+        assert_eq!(second.branch, "topic");
+        assert_eq!(second.parent_oid, Some(first.oid));
+        assert_eq!(repo.log(10).unwrap()[0].oid, second.oid);
+        assert_eq!(repo.status().unwrap().head_oid, Some(second.oid));
+        let graph = repo.export_graph_source().unwrap();
+        assert_eq!(graph.refs.len(), 2);
+        assert!(graph.refs.iter().any(|reference| {
+            reference.name == b"refs/heads/main" && reference.oid == first.oid
+        }));
+        assert!(graph.refs.iter().any(|reference| {
+            reference.name == b"refs/heads/topic" && reference.oid == second.oid
+        }));
+        assert!(matches!(
+            repo.switch_same_tree_branch("main"),
+            Err(RepositoryError::History(
+                crate::HistoryError::CheckoutRequired
+            ))
+        ));
+        assert_eq!(repo.status().unwrap().branch, "topic");
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        drop(repo);
         fs::remove_dir_all(run_root).unwrap();
     }
 }
