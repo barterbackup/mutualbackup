@@ -37,6 +37,7 @@ local-request =
   / { "GitPushBare": { repository_id: uuid-text, path: tstr } }
   / { "GitFetchBare": { repository_id: uuid-text, path: tstr } }
   / { "GitPullBare": { repository_id: uuid-text, path: tstr } }
+  / { "GitMergeBranch": { repository_id: uuid-text, branch: tstr } }
   / { "GitDiff": { repository_id: uuid-text, cached: bool } }
   / { "GitStatus": { repository_id: uuid-text } }
   / "GuildStatus"
@@ -82,6 +83,7 @@ local-response =
   / { "GitPushed": { repository_id: uuid-text, oid: bytes20-array } }
   / { "GitFetched": { repository_id: uuid-text, branch_count: uint } }
   / { "GitPulled": { repository_id: uuid-text, oid: bytes20-array } }
+  / { "GitMerged": { repository_id: uuid-text, oid: bytes20-array } }
   / { "GitDiff": git-diff }
   / { "GitStatus": git-status }
   / { "Guild": null / guild-summary }

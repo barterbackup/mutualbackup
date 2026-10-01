@@ -1479,6 +1479,13 @@ impl Node {
         Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
     }
 
+    pub fn git_merge_branch(&self, repository_id: Uuid, branch: &str) -> Result<[u8; 20]> {
+        let oid = self
+            .open_git_repository(repository_id)?
+            .merge_branch(branch)?;
+        Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
+    }
+
     pub fn git_diff(&self, repository_id: Uuid, cached: bool) -> Result<GitDiff> {
         self.open_git_repository(repository_id)?
             .diff(cached)
@@ -15442,6 +15449,16 @@ pub(crate) mod tests {
         assert_eq!(
             reopened.git_status(info.repository_id).unwrap().branch,
             "older"
+        );
+        assert_eq!(
+            reopened
+                .git_merge_branch(info.repository_id, "main")
+                .unwrap(),
+            second_commit.oid
+        );
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"second\nbytes"
         );
         reopened
             .git_switch_branch(info.repository_id, "main")

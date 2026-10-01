@@ -101,6 +101,10 @@ pub enum LocalRequest {
         repository_id: Uuid,
         path: PathBuf,
     },
+    GitMergeBranch {
+        repository_id: Uuid,
+        branch: String,
+    },
     GitDiff {
         repository_id: Uuid,
         cached: bool,
@@ -196,6 +200,10 @@ pub enum LocalResponse {
         branch_count: u32,
     },
     GitPulled {
+        repository_id: Uuid,
+        oid: [u8; 20],
+    },
+    GitMerged {
         repository_id: Uuid,
         oid: [u8; 20],
     },
@@ -406,6 +414,10 @@ mod tests {
                 repository_id,
                 path: PathBuf::from("/home/user/remote.git"),
             },
+            LocalRequest::GitMergeBranch {
+                repository_id,
+                branch: "older".to_owned(),
+            },
             LocalRequest::GitDiff {
                 repository_id,
                 cached: true,
@@ -488,6 +500,10 @@ mod tests {
                 branch_count: 2,
             },
             LocalResponse::GitPulled {
+                repository_id,
+                oid: [7; 20],
+            },
+            LocalResponse::GitMerged {
                 repository_id,
                 oid: [7; 20],
             },

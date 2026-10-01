@@ -491,6 +491,16 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitMergeBranch {
+            repository_id,
+            branch,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_merge_branch(repository_id, &branch)
+                    .map(|oid| LocalResponse::GitMerged { repository_id, oid })
+            })
+            .await
+        }
         LocalRequest::GitDiff {
             repository_id,
             cached,

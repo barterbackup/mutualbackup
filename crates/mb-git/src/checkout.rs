@@ -142,6 +142,10 @@ pub enum CheckoutError {
     MissingRemoteBranch,
     #[error("the selected branch has diverged from origin; pull requires a fast-forward")]
     NonFastForward,
+    #[error("the requested merge branch does not exist")]
+    MissingMergeBranch,
+    #[error("the merge branches have diverged; an automatic merge commit is not yet supported")]
+    MergeCommitRequired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -182,8 +186,8 @@ struct CheckoutRemovedDirectory {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct CheckoutIntent {
     format_version: u16,
-    #[serde(default, skip_serializing_if = "is_false")]
     advance_ref: bool,
+    target_ref: Option<Vec<u8>>,
     repository_id: Uuid,
     old_branch: String,
     old_oid: [u8; 20],
@@ -203,6 +207,7 @@ struct CheckoutTarget<'a> {
     new_branch: &'a str,
     new_oid: Oid,
     advance_ref: bool,
+    target_ref: Option<&'a [u8]>,
 }
 
 /// Version 1 intents may remain on disk after an interrupted older checkout.
@@ -220,11 +225,48 @@ struct LegacyCheckoutIntent {
     entries: Vec<CheckoutEntry>,
 }
 
+/// Version 2 appended directory transitions after the version 1 fields.
+#[derive(Serialize, Deserialize)]
+struct LegacyCheckoutIntentV2 {
+    format_version: u16,
+    repository_id: Uuid,
+    old_branch: String,
+    old_oid: [u8; 20],
+    new_branch: String,
+    new_oid: [u8; 20],
+    staging_name: String,
+    staging_id: Option<NativeFileId>,
+    phase: Phase,
+    entries: Vec<CheckoutEntry>,
+    directories: Vec<CheckoutDirectory>,
+    removed_directories: Vec<CheckoutRemovedDirectory>,
+}
+
+/// Version 3 added a selected-ref advance for pulls. Version 4 adds the
+/// explicit source ref used by local fast-forward merges.
+#[derive(Serialize, Deserialize)]
+struct LegacyCheckoutIntentV3 {
+    format_version: u16,
+    advance_ref: bool,
+    repository_id: Uuid,
+    old_branch: String,
+    old_oid: [u8; 20],
+    new_branch: String,
+    new_oid: [u8; 20],
+    staging_name: String,
+    staging_id: Option<NativeFileId>,
+    phase: Phase,
+    entries: Vec<CheckoutEntry>,
+    directories: Vec<CheckoutDirectory>,
+    removed_directories: Vec<CheckoutRemovedDirectory>,
+}
+
 impl From<LegacyCheckoutIntent> for CheckoutIntent {
     fn from(legacy: LegacyCheckoutIntent) -> Self {
         Self {
             format_version: legacy.format_version,
             advance_ref: false,
+            target_ref: None,
             repository_id: legacy.repository_id,
             old_branch: legacy.old_branch,
             old_oid: legacy.old_oid,
@@ -240,8 +282,46 @@ impl From<LegacyCheckoutIntent> for CheckoutIntent {
     }
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
+impl From<LegacyCheckoutIntentV2> for CheckoutIntent {
+    fn from(legacy: LegacyCheckoutIntentV2) -> Self {
+        Self {
+            format_version: legacy.format_version,
+            advance_ref: false,
+            target_ref: None,
+            repository_id: legacy.repository_id,
+            old_branch: legacy.old_branch,
+            old_oid: legacy.old_oid,
+            new_branch: legacy.new_branch,
+            new_oid: legacy.new_oid,
+            staging_name: legacy.staging_name,
+            staging_id: legacy.staging_id,
+            phase: legacy.phase,
+            entries: legacy.entries,
+            directories: legacy.directories,
+            removed_directories: legacy.removed_directories,
+        }
+    }
+}
+
+impl From<LegacyCheckoutIntentV3> for CheckoutIntent {
+    fn from(legacy: LegacyCheckoutIntentV3) -> Self {
+        Self {
+            format_version: legacy.format_version,
+            advance_ref: legacy.advance_ref,
+            target_ref: None,
+            repository_id: legacy.repository_id,
+            old_branch: legacy.old_branch,
+            old_oid: legacy.old_oid,
+            new_branch: legacy.new_branch,
+            new_oid: legacy.new_oid,
+            staging_name: legacy.staging_name,
+            staging_id: legacy.staging_id,
+            phase: legacy.phase,
+            entries: legacy.entries,
+            directories: legacy.directories,
+            removed_directories: legacy.removed_directories,
+        }
+    }
 }
 
 fn intent_kind(repository_id: Uuid) -> String {
@@ -541,8 +621,17 @@ fn published_target_file(
 }
 
 fn validate_intent(intent: &CheckoutIntent, repository_id: Uuid) -> Result<(), CheckoutError> {
-    if !matches!(intent.format_version, 1..=3)
-        || (intent.format_version == 3) != intent.advance_ref
+    if !matches!(intent.format_version, 1..=4)
+        || (intent.format_version >= 3) != intent.advance_ref
+        || (intent.format_version == 4) != intent.target_ref.is_some()
+        || intent.target_ref.as_ref().is_some_and(|reference| {
+            let Ok(name) = std::str::from_utf8(reference) else {
+                return true;
+            };
+            reference.len() > "refs/heads/".len() + 1024
+                || !name.starts_with("refs/heads/")
+                || !git2::Reference::is_valid_name(name)
+        })
         || intent.advance_ref
             && (intent.old_branch != intent.new_branch || intent.old_oid == intent.new_oid)
         || intent.repository_id != repository_id
@@ -602,8 +691,8 @@ impl CheckoutEntry {
 
 fn encode_intent(intent: &CheckoutIntent) -> Result<Vec<u8>, CheckoutError> {
     validate_intent(intent, intent.repository_id)?;
-    if intent.format_version == 1 {
-        canonical_bytes(&LegacyCheckoutIntent {
+    match intent.format_version {
+        1 => canonical_bytes(&LegacyCheckoutIntent {
             format_version: intent.format_version,
             repository_id: intent.repository_id,
             old_branch: intent.old_branch.clone(),
@@ -615,9 +704,40 @@ fn encode_intent(intent: &CheckoutIntent) -> Result<Vec<u8>, CheckoutError> {
             phase: intent.phase,
             entries: intent.entries.clone(),
         })
-        .map_err(Into::into)
-    } else {
-        canonical_bytes(intent).map_err(Into::into)
+        .map_err(Into::into),
+        2 => canonical_bytes(&LegacyCheckoutIntentV2 {
+            format_version: intent.format_version,
+            repository_id: intent.repository_id,
+            old_branch: intent.old_branch.clone(),
+            old_oid: intent.old_oid,
+            new_branch: intent.new_branch.clone(),
+            new_oid: intent.new_oid,
+            staging_name: intent.staging_name.clone(),
+            staging_id: intent.staging_id,
+            phase: intent.phase,
+            entries: intent.entries.clone(),
+            directories: intent.directories.clone(),
+            removed_directories: intent.removed_directories.clone(),
+        })
+        .map_err(Into::into),
+        3 => canonical_bytes(&LegacyCheckoutIntentV3 {
+            format_version: intent.format_version,
+            advance_ref: intent.advance_ref,
+            repository_id: intent.repository_id,
+            old_branch: intent.old_branch.clone(),
+            old_oid: intent.old_oid,
+            new_branch: intent.new_branch.clone(),
+            new_oid: intent.new_oid,
+            staging_name: intent.staging_name.clone(),
+            staging_id: intent.staging_id,
+            phase: intent.phase,
+            entries: intent.entries.clone(),
+            directories: intent.directories.clone(),
+            removed_directories: intent.removed_directories.clone(),
+        })
+        .map_err(Into::into),
+        4 => canonical_bytes(intent).map_err(Into::into),
+        _ => Err(CheckoutError::IncompatibleIntent),
     }
 }
 
@@ -638,9 +758,15 @@ fn load_intent(
 }
 
 fn decode_intent(bytes: &[u8], repository_id: Uuid) -> Result<CheckoutIntent, CheckoutError> {
-    let intent: CheckoutIntent = match decode_canonical(bytes) {
-        Ok(intent) => intent,
-        Err(_) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntent>(bytes)?),
+    // Postcard uses a one-byte varint for these small version numbers. Inspect
+    // it before positional decoding; trying newer structs against old bytes
+    // can silently shift fields or drop directory transition records.
+    let intent = match bytes.first().copied() {
+        Some(1) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntent>(bytes)?),
+        Some(2) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntentV2>(bytes)?),
+        Some(3) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntentV3>(bytes)?),
+        Some(4) => decode_canonical::<CheckoutIntent>(bytes)?,
+        _ => return Err(CheckoutError::IncompatibleIntent),
     };
     validate_intent(&intent, repository_id)?;
     Ok(intent)
@@ -825,6 +951,7 @@ pub(crate) fn begin_switch(
             new_branch: name,
             new_oid: Oid::from_bytes(&target.oid)?,
             advance_ref: false,
+            target_ref: None,
         },
     )?;
     Ok(GitBranchInfo {
@@ -867,6 +994,51 @@ pub(crate) fn begin_pull(
             new_branch: &branch,
             new_oid: target,
             advance_ref: true,
+            target_ref: None,
+        },
+    )?;
+    Ok(target)
+}
+
+/// Move the selected branch to another local branch's commit when that commit
+/// descends from HEAD. Both refs remain native catalog records throughout.
+pub(crate) fn begin_merge_fast_forward(
+    control: &ControlStore,
+    repository_id: Uuid,
+    root_path: &Path,
+    catalog_dir: &PinnedDirectory,
+    branch: &str,
+) -> Result<Oid, CheckoutError> {
+    resume_pending_checkout(control, repository_id, root_path, catalog_dir)?;
+    if branch.len() > 1024 || !Branch::name_is_valid(branch)? {
+        return Err(HistoryError::InvalidBranch.into());
+    }
+    let selected = selected_branch(control, repository_id)?;
+    let local_ref = selected_ref(control, repository_id)?;
+    let source_ref = format!("refs/heads/{branch}");
+    let target = ref_oid(control, repository_id, source_ref.as_bytes())?
+        .ok_or(CheckoutError::MissingMergeBranch)?;
+    let old = ref_oid(control, repository_id, &local_ref)?;
+    if let Some(old) = old {
+        if old == target {
+            return Ok(target);
+        }
+        if !commit_descends_from(control, repository_id, target, old)? {
+            return Err(CheckoutError::MergeCommitRequired);
+        }
+    }
+    begin_checkout_to(
+        control,
+        repository_id,
+        root_path,
+        catalog_dir,
+        CheckoutTarget {
+            old_branch: &selected,
+            old_oid: old,
+            new_branch: &selected,
+            new_oid: target,
+            advance_ref: true,
+            target_ref: Some(source_ref.as_bytes()),
         },
     )?;
     Ok(target)
@@ -999,8 +1171,15 @@ fn begin_checkout_to(
         return Err(CheckoutError::IncompatibleIntent);
     }
     let mut intent = CheckoutIntent {
-        format_version: if target.advance_ref { 3 } else { 2 },
+        format_version: if target.target_ref.is_some() {
+            4
+        } else if target.advance_ref {
+            3
+        } else {
+            2
+        },
         advance_ref: target.advance_ref,
+        target_ref: target.target_ref.map(<[u8]>::to_vec),
         repository_id,
         old_branch: target.old_branch.to_owned(),
         old_oid: target
@@ -1141,6 +1320,10 @@ fn apply_intent(
         let (old_current, target_available) = if intent.advance_ref {
             let local_ref = format!("refs/heads/{}", intent.old_branch);
             let remote_ref = format!("refs/remotes/origin/{}", intent.new_branch);
+            let target_ref = intent
+                .target_ref
+                .as_deref()
+                .unwrap_or(remote_ref.as_bytes());
             let old = ref_oid(control, intent.repository_id, local_ref.as_bytes())?;
             let expected_old = if intent.old_oid == [0; 20] {
                 None
@@ -1150,7 +1333,7 @@ fn apply_intent(
             (
                 selected_branch(control, intent.repository_id)? == intent.old_branch
                     && old == expected_old,
-                ref_oid(control, intent.repository_id, remote_ref.as_bytes())?
+                ref_oid(control, intent.repository_id, target_ref)?
                     == Some(Oid::from_bytes(&intent.new_oid)?),
             )
         } else {
@@ -1448,12 +1631,62 @@ mod tests {
             staging_id: None,
             phase: Phase::Preparing,
             entries: Vec::new(),
-            directories: Vec::new(),
+            directories: vec![CheckoutDirectory {
+                path: b"nested".to_vec(),
+                staged_id: None,
+            }],
             removed_directories: Vec::new(),
         };
         let original = canonical_bytes(&previous).unwrap();
         let replayed = decode_intent(&original, repository_id).unwrap();
         assert!(!replayed.advance_ref);
+        assert!(replayed.target_ref.is_none());
+        assert_eq!(replayed.directories.len(), 1);
+        assert_eq!(encode_intent(&replayed).unwrap(), original);
+    }
+
+    #[test]
+    fn version_three_pull_intent_keeps_its_disk_format_during_replay() {
+        #[derive(Serialize)]
+        struct HistoricalVersionThree<'a> {
+            format_version: u16,
+            advance_ref: bool,
+            repository_id: Uuid,
+            old_branch: &'a str,
+            old_oid: [u8; 20],
+            new_branch: &'a str,
+            new_oid: [u8; 20],
+            staging_name: String,
+            staging_id: Option<NativeFileId>,
+            phase: Phase,
+            entries: Vec<CheckoutEntry>,
+            directories: Vec<CheckoutDirectory>,
+            removed_directories: Vec<CheckoutRemovedDirectory>,
+        }
+        let repository_id = Uuid::new_v4();
+        let previous = HistoricalVersionThree {
+            format_version: 3,
+            advance_ref: true,
+            repository_id,
+            old_branch: "main",
+            old_oid: [1; 20],
+            new_branch: "main",
+            new_oid: [2; 20],
+            staging_name: format!("checkout-{}", Uuid::new_v4()),
+            staging_id: None,
+            phase: Phase::Preparing,
+            entries: Vec::new(),
+            directories: vec![CheckoutDirectory {
+                path: b"nested".to_vec(),
+                staged_id: None,
+            }],
+            removed_directories: Vec::new(),
+        };
+        let original = canonical_bytes(&previous).unwrap();
+        let replayed = decode_intent(&original, repository_id).unwrap();
+        assert!(replayed.advance_ref);
+        assert!(replayed.target_ref.is_none());
+        assert_eq!(replayed.directories.len(), 1);
         assert_eq!(encode_intent(&replayed).unwrap(), original);
     }
 }

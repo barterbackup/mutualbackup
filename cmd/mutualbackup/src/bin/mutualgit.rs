@@ -73,6 +73,8 @@ enum Command {
     Fetch { source: PathBuf },
     /// Fetch and fast-forward the selected branch from a local bare repository.
     Pull { source: PathBuf },
+    /// Merge a local branch into the selected branch (fast-forward only for now).
+    Merge { branch: String },
     /// Show raw-byte changes in the worktree or staged index.
     Diff {
         #[arg(long, alias = "staged")]
@@ -380,6 +382,27 @@ async fn main() -> Result<()> {
                 git2::Oid::from_bytes(&oid)?,
                 source.display()
             );
+        }
+        Command::Merge { branch } => {
+            let (_, repository_id) = discover_repository(&working_directory)?;
+            let LocalResponse::GitMerged {
+                repository_id: returned_id,
+                oid,
+            } = local_control_call(
+                &socket,
+                &LocalRequest::GitMergeBranch {
+                    repository_id,
+                    branch: branch.clone(),
+                },
+            )
+            .await?
+            else {
+                bail!("daemon returned the wrong response to Git merge");
+            };
+            if returned_id != repository_id {
+                bail!("daemon merged another repository");
+            }
+            println!("Merged '{}' at {}", branch, git2::Oid::from_bytes(&oid)?);
         }
         Command::Diff { cached } => {
             let (_, repository_id) = discover_repository(&working_directory)?;
