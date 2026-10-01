@@ -19,6 +19,7 @@ const AREA_MARKER: &str = ".mutualbackup-anchor-area-v1";
 const AREA_MAGIC: &str = "mutualbackup-anchor-area-v1";
 const CAPTURE_MANIFEST_PREFIX: &str = ".mutualbackup-capture-manifest-v1-";
 const CAPTURE_LINK_POOL_PREFIX: &str = ".mutualbackup-capture-links-v1-";
+const FILE_ANCHOR_PAYLOAD: &str = "blob";
 const MAX_CAPTURE_ENTRIES: usize = 8_192;
 const MAX_CAPTURE_EXTENTS: usize = 65_536;
 const MAX_CAPTURE_DEPTH: usize = 256;
@@ -444,6 +445,79 @@ pub struct ReflinkCapturePlan {
     root_modified_nanos: u32,
 }
 
+/// A durable plan for capturing one regular file without walking its siblings.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReflinkFileCapturePlan {
+    format_version: u16,
+    root: ReflinkCapturePlan,
+    relative_path: PathBuf,
+    file_version: CaptureVersion,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileAnchorManifest {
+    pub format_version: u16,
+    pub anchor_id: Uuid,
+    pub area: StableAnchorAreaLocator,
+    pub source_root_hint: PathBuf,
+    pub source_relative_path: PathBuf,
+    pub logical_len: u64,
+    pub content_hash: [u8; 32],
+    source_version: CaptureVersion,
+}
+
+impl FileAnchorManifest {
+    pub fn file_locator(&self) -> StableAnchorFileLocator {
+        StableAnchorFileLocator {
+            area: self.area.clone(),
+            anchor_id: self.anchor_id,
+            relative_path: FILE_ANCHOR_PAYLOAD.to_owned(),
+        }
+    }
+
+    /// Verify the immutable anchor before giving its bytes to another format.
+    pub fn open_verified(&self) -> Result<File, AnchorError> {
+        if self.format_version != 1 {
+            return Err(AnchorError::InvalidRoot);
+        }
+        validate_relative(&self.source_relative_path)?;
+        let mut file = self.file_locator().open()?;
+        if file.metadata()?.len() != self.logical_len {
+            return Err(AnchorError::SourceChanged(
+                self.source_relative_path.clone(),
+            ));
+        }
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        if hasher.finalize().as_bytes() != &self.content_hash {
+            return Err(AnchorError::SourceChanged(
+                self.source_relative_path.clone(),
+            ));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        Ok(file)
+    }
+
+    pub fn remove(&self) -> Result<(), AnchorError> {
+        let area = resolve_anchor_area(&self.area)?;
+        let area_file = open_stable_anchor_area(&area, &self.area)?;
+        remove_directory_at(
+            &area_file,
+            &self.anchor_id.to_string(),
+            &area.join(self.anchor_id.to_string()),
+        )?;
+        area_file.sync_all()?;
+        Ok(())
+    }
+}
+
 impl ReflinkCapturePlan {
     pub fn source_root(&self) -> &Path {
         &self.source_root
@@ -842,6 +916,195 @@ impl ReflinkAnchor {
             &area_path.join(&link_pool_name),
         )?;
         run_before_anchor_area_sync_hook();
+        area_file.sync_all()?;
+        Ok(())
+    }
+
+    pub fn plan_file(
+        source_root: impl AsRef<Path>,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<ReflinkFileCapturePlan, AnchorError> {
+        let relative_path = relative_path.as_ref();
+        validate_relative(relative_path)?;
+        let root = Self::plan(source_root)?;
+        let root_file = open_source_root(&root.source_root)?;
+        let file = open_source_beneath(&root_file, relative_path, false)?;
+        let root_filesystem = filesystem_identity_for_file(&root_file)?;
+        let file_filesystem = filesystem_identity_for_file(&file)?;
+        if file_filesystem.stable_id != root_filesystem.stable_id
+            || file_filesystem.mount_id != root_filesystem.mount_id
+        {
+            return Err(AnchorError::NestedFilesystem(
+                root.source_root.join(relative_path),
+            ));
+        }
+        let file_version = capture_version(root_filesystem.stable_id, &file.metadata()?);
+        Ok(ReflinkFileCapturePlan {
+            format_version: 1,
+            root,
+            relative_path: relative_path.to_path_buf(),
+            file_version,
+        })
+    }
+
+    pub fn capture_file_plan(
+        plan: &ReflinkFileCapturePlan,
+    ) -> Result<FileAnchorManifest, AnchorError> {
+        if plan.format_version != 1 || plan.root.format_version != 1 {
+            return Err(AnchorError::InvalidRoot);
+        }
+        validate_relative(&plan.relative_path)?;
+        let area_path = resolve_anchor_area(&plan.root.area)?;
+        let area_file = open_stable_anchor_area(&area_path, &plan.root.area)?;
+        let staging_name = format!(".staging-{}", plan.root.anchor_id);
+        let anchor_name = plan.root.anchor_id.to_string();
+        let staging = area_path.join(&staging_name);
+        let anchor_root = area_path.join(&anchor_name);
+        match open_path_no_xdev_beneath(&area_file, Path::new(&anchor_name)) {
+            Ok(_) => return read_planned_file_manifest_at(&area_file, &area_path, plan),
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(_) => return Err(AnchorError::AnchorAreaCollision(anchor_root)),
+        }
+        remove_directory_at(&area_file, &staging_name, &staging)?;
+        area_file.sync_all()?;
+
+        let source_root = plan
+            .root
+            .source_root
+            .canonicalize()
+            .map_err(|_| AnchorError::InvalidRoot)?;
+        if source_root != plan.root.source_root {
+            return Err(AnchorError::InvalidRoot);
+        }
+        let root_file = open_source_root(&source_root)?;
+        let root_metadata = root_file.metadata()?;
+        let filesystem = filesystem_identity_for_file(&root_file)?;
+        if capture_version(filesystem.stable_id, &root_metadata) != plan.root.root_version {
+            return Err(AnchorError::SourceChanged(PathBuf::new()));
+        }
+        if filesystem.stable_id != plan.root.area.filesystem_id {
+            return Err(AnchorError::FilesystemChanged);
+        }
+        let source = open_source_beneath(&root_file, &plan.relative_path, false)?;
+        let source_filesystem = filesystem_identity_for_file(&source)?;
+        if source_filesystem.stable_id != filesystem.stable_id
+            || source_filesystem.mount_id != filesystem.mount_id
+        {
+            return Err(AnchorError::NestedFilesystem(
+                source_root.join(&plan.relative_path),
+            ));
+        }
+        let before = source.metadata()?;
+        if capture_version(filesystem.stable_id, &before) != plan.file_version {
+            return Err(AnchorError::SourceChanged(plan.relative_path.clone()));
+        }
+
+        let staging_file = create_private_directory_at(&area_file, &staging_name, &staging)?;
+        let result = (|| {
+            let mut captured = create_regular_file_at(
+                &staging_file,
+                FILE_ANCHOR_PAYLOAD,
+                &staging.join(FILE_ANCHOR_PAYLOAD),
+            )?;
+            reflink_file(&source, &captured).map_err(AnchorError::ReflinkUnavailable)?;
+            let after = source.metadata()?;
+            if !same_capture_version(&before, &after) || captured.metadata()?.len() != after.len() {
+                return Err(AnchorError::SourceChanged(plan.relative_path.clone()));
+            }
+            captured.seek(SeekFrom::Start(0))?;
+            let mut hasher = blake3::Hasher::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = captured.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            seal_anchor_file_handle(&captured)?;
+            let manifest = FileAnchorManifest {
+                format_version: 1,
+                anchor_id: plan.root.anchor_id,
+                area: plan.root.area.clone(),
+                source_root_hint: source_root.clone(),
+                source_relative_path: plan.relative_path.clone(),
+                logical_len: before.len(),
+                content_hash: *hasher.finalize().as_bytes(),
+                source_version: plan.file_version.clone(),
+            };
+            let manifest_name = capture_manifest_name(plan.root.anchor_id);
+            let mut manifest_file = create_regular_file_at(
+                &staging_file,
+                &manifest_name,
+                &staging.join(&manifest_name),
+            )?;
+            manifest_file.write_all(
+                &canonical_bytes(&manifest)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?,
+            )?;
+            manifest_file.sync_all()?;
+            seal_anchor_file_handle(&manifest_file)?;
+            staging_file.sync_all()?;
+            rename_no_replace_at(
+                &area_file,
+                Path::new(&staging_name),
+                &area_file,
+                Path::new(&anchor_name),
+            )?;
+            Ok::<_, AnchorError>(manifest)
+        })();
+        let manifest = match result {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let _ = remove_directory_at(&area_file, &staging_name, &staging);
+                let _ = area_file.sync_all();
+                return Err(error);
+            }
+        };
+        if let Err(error) = area_file.sync_all() {
+            let _ = remove_directory_at(&area_file, &anchor_name, &anchor_root);
+            let _ = area_file.sync_all();
+            return Err(error.into());
+        }
+        Ok(manifest)
+    }
+
+    pub fn reconcile_file_capture(plan: &ReflinkFileCapturePlan) -> Result<(), AnchorError> {
+        if plan.format_version != 1 || plan.root.format_version != 1 {
+            return Err(AnchorError::InvalidRoot);
+        }
+        let area_path = resolve_anchor_area(&plan.root.area)?;
+        let area_file = open_stable_anchor_area(&area_path, &plan.root.area)?;
+        let anchor_name = plan.root.anchor_id.to_string();
+        match open_path_no_xdev_beneath(&area_file, Path::new(&anchor_name)) {
+            Ok(_) => {
+                read_planned_file_manifest_at(&area_file, &area_path, plan)?;
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(_) => {
+                return Err(AnchorError::AnchorAreaCollision(
+                    area_path.join(anchor_name),
+                ));
+            }
+        }
+        let staging_name = format!(".staging-{}", plan.root.anchor_id);
+        remove_directory_at(&area_file, &staging_name, &area_path.join(&staging_name))?;
+        area_file.sync_all()?;
+        Ok(())
+    }
+
+    pub fn discard_file_capture(plan: &ReflinkFileCapturePlan) -> Result<(), AnchorError> {
+        if plan.format_version != 1 || plan.root.format_version != 1 {
+            return Err(AnchorError::InvalidRoot);
+        }
+        let area_path = resolve_anchor_area(&plan.root.area)?;
+        let area_file = open_stable_anchor_area(&area_path, &plan.root.area)?;
+        for name in [
+            format!(".staging-{}", plan.root.anchor_id),
+            plan.root.anchor_id.to_string(),
+        ] {
+            remove_directory_at(&area_file, &name, &area_path.join(&name))?;
+        }
         area_file.sync_all()?;
         Ok(())
     }
@@ -2622,6 +2885,45 @@ fn read_planned_manifest_at(
     Ok(manifest)
 }
 
+fn read_planned_file_manifest_at(
+    area: &File,
+    area_display: &Path,
+    plan: &ReflinkFileCapturePlan,
+) -> Result<FileAnchorManifest, AnchorError> {
+    let anchor_name = plan.root.anchor_id.to_string();
+    let anchor_root = area_display.join(&anchor_name);
+    let root = open_path_no_xdev_beneath(area, Path::new(&anchor_name))
+        .map_err(|_| AnchorError::AnchorAreaCollision(anchor_root.clone()))?;
+    if !root.metadata()?.is_dir() {
+        return Err(AnchorError::AnchorAreaCollision(anchor_root));
+    }
+    let root = reopen_pinned_file(&root, true, Path::new(&anchor_name))?;
+    let manifest_name = capture_manifest_name(plan.root.anchor_id);
+    let mut manifest_file = open_regular_file_at(
+        &root,
+        Path::new(&manifest_name),
+        &anchor_root.join(&manifest_name),
+    )?;
+    if manifest_file.metadata()?.len() > 64 * 1024 {
+        return Err(AnchorError::AnchorAreaCollision(anchor_root));
+    }
+    let mut encoded = Vec::new();
+    manifest_file.read_to_end(&mut encoded)?;
+    let manifest: FileAnchorManifest = decode_canonical(&encoded)
+        .map_err(|_| AnchorError::AnchorAreaCollision(anchor_root.clone()))?;
+    if manifest.format_version != 1
+        || manifest.anchor_id != plan.root.anchor_id
+        || manifest.area != plan.root.area
+        || manifest.source_root_hint != plan.root.source_root
+        || manifest.source_relative_path != plan.relative_path
+        || manifest.source_version != plan.file_version
+    {
+        return Err(AnchorError::AnchorAreaCollision(anchor_root));
+    }
+    manifest.open_verified()?;
+    Ok(manifest)
+}
+
 fn capture_manifest_name(anchor_id: Uuid) -> String {
     format!("{CAPTURE_MANIFEST_PREFIX}{anchor_id}")
 }
@@ -3096,6 +3398,82 @@ mod tests {
         assert!(validate_relative(Path::new("good/file")).is_ok());
         assert!(validate_relative(Path::new("../escape")).is_err());
         assert!(validate_relative(Path::new("/absolute")).is_err());
+        let temp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            ReflinkAnchor::plan_file(temp.path(), "../escape"),
+            Err(AnchorError::UnsafePath)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn single_file_reflink_anchor_preserves_staged_bytes_without_sibling_capture() {
+        use std::os::unix::fs::MetadataExt;
+
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("file-anchor-{}", Uuid::new_v4()));
+        let source_root = run_root.join("source");
+        fs::create_dir_all(source_root.join("nested")).unwrap();
+        let source = source_root.join("nested/payload");
+        fs::write(&source, b"staged\r\nbytes\0").unwrap();
+        fs::write(source_root.join("unrelated"), b"must not be captured").unwrap();
+        let plan =
+            crate::SourceFileCapturePlan::plan_reflink(&source_root, "nested/payload").unwrap();
+        let manifest = plan.capture().unwrap();
+        assert_eq!(manifest.logical_len, 14);
+        assert_eq!(manifest.source_relative_path, Path::new("nested/payload"));
+        assert_ne!(
+            source.metadata().unwrap().ino(),
+            manifest
+                .file_locator()
+                .open()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .ino()
+        );
+        let anchor_dir = manifest.area.path_hint.join(manifest.anchor_id.to_string());
+        let mut names = fs::read_dir(&anchor_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&FILE_ANCHOR_PAYLOAD.into()));
+        fs::write(&source, b"later edits").unwrap();
+        assert_eq!(
+            fs::read_to_string(source_root.join("unrelated")).unwrap(),
+            "must not be captured"
+        );
+        let mut captured = Vec::new();
+        manifest
+            .open_verified()
+            .unwrap()
+            .read_to_end(&mut captured)
+            .unwrap();
+        assert_eq!(captured, b"staged\r\nbytes\0");
+        assert_eq!(plan.capture().unwrap(), manifest);
+        plan.reconcile().unwrap();
+        let modified_plan =
+            crate::SourceFileCapturePlan::plan_reflink(&source_root, "nested/payload").unwrap();
+        fs::write(&source, b"changed after planning").unwrap();
+        assert!(matches!(
+            modified_plan.capture(),
+            Err(AnchorError::SourceChanged(_))
+        ));
+        modified_plan.discard().unwrap();
+        let mut invalid_format = manifest.clone();
+        invalid_format.format_version = 2;
+        assert!(matches!(
+            invalid_format.open_verified(),
+            Err(AnchorError::InvalidRoot)
+        ));
+        manifest.remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
     }
 
     #[test]

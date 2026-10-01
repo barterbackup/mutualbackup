@@ -9,7 +9,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AnchorError, ReflinkAnchor, ReflinkCapturePlan, StableAnchorManifest};
+use crate::{
+    AnchorError, FileAnchorManifest, ReflinkAnchor, ReflinkCapturePlan, ReflinkFileCapturePlan,
+    StableAnchorManifest,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SourceCapturePlan {
@@ -42,6 +45,40 @@ impl SourceCapturePlan {
     pub fn reconcile(&self) -> Result<(), AnchorError> {
         match self {
             Self::ReflinkV1(plan) => ReflinkAnchor::reconcile_capture(plan),
+        }
+    }
+}
+
+/// A separate durable operation from whole-root backup capture. Its anchor is
+/// pinned by the Git stage/object map, not by a signed source revision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SourceFileCapturePlan {
+    ReflinkV1(ReflinkFileCapturePlan),
+}
+
+impl SourceFileCapturePlan {
+    pub fn plan_reflink(
+        source_root: impl AsRef<Path>,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<Self, AnchorError> {
+        ReflinkAnchor::plan_file(source_root, relative_path).map(Self::ReflinkV1)
+    }
+
+    pub fn capture(&self) -> Result<FileAnchorManifest, AnchorError> {
+        match self {
+            Self::ReflinkV1(plan) => ReflinkAnchor::capture_file_plan(plan),
+        }
+    }
+
+    pub fn reconcile(&self) -> Result<(), AnchorError> {
+        match self {
+            Self::ReflinkV1(plan) => ReflinkAnchor::reconcile_file_capture(plan),
+        }
+    }
+
+    pub fn discard(&self) -> Result<(), AnchorError> {
+        match self {
+            Self::ReflinkV1(plan) => ReflinkAnchor::discard_file_capture(plan),
         }
     }
 }
