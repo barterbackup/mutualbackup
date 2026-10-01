@@ -205,9 +205,6 @@ pub(crate) fn prune_missing_worktree(
         .ok_or(GitWorktreeError::NotRegistered)?;
     let info: GitWorktreeInfo = decode_canonical(&encoded)?;
     validate(&info, repository_id, worktree_id.as_bytes())?;
-    if info.state != GitWorktreeState::Ready {
-        return Err(GitWorktreeError::PendingOperation);
-    }
     match fs::symlink_metadata(&info.path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Ok(_) => return Err(GitWorktreeError::StillPresent),
@@ -229,7 +226,26 @@ pub(crate) fn prune_missing_worktree(
     {
         return Err(GitWorktreeError::PendingOperation);
     }
-    let committed = committed_files_for_scope(control, scope)?;
+    let head_kind = head_kind_for_scope(scope);
+    let head_rows = control.records(&head_kind)?;
+    if head_rows.len() > 1
+        || head_rows.iter().any(|(key, _)| key != b"branch")
+        || (info.state == GitWorktreeState::Ready && head_rows.is_empty())
+    {
+        return Err(GitWorktreeError::Conflict);
+    }
+    if info.state == GitWorktreeState::Preparing && !head_rows.is_empty() {
+        let selected = selected_branch_for_scope(control, scope)?;
+        let unborn = format!("mutualbackup-init-{}", info.worktree_id);
+        if selected != unborn && selected != info.target_branch {
+            return Err(GitWorktreeError::Conflict);
+        }
+    }
+    let committed = if head_rows.is_empty() {
+        Default::default()
+    } else {
+        committed_files_for_scope(control, scope)?
+    };
     let staged = staged_entries_for_scope(control, scope)?;
     if !force
         && (staged.len() != committed.len()
@@ -241,18 +257,15 @@ pub(crate) fn prune_missing_worktree(
     {
         return Err(GitWorktreeError::StagedChanges);
     }
-    let head_kind = head_kind_for_scope(scope);
-    let head_rows = control.records(&head_kind)?;
-    if head_rows.len() != 1 || head_rows[0].0 != b"branch" {
-        return Err(GitWorktreeError::Conflict);
-    }
     let index_kind = index_kind_for_scope(scope);
     let mut deletions = control
         .records(&index_kind)?
         .into_iter()
         .map(|(key, _)| (index_kind.clone(), key))
         .collect::<Vec<_>>();
-    deletions.push((head_kind, b"branch".to_vec()));
+    if !head_rows.is_empty() {
+        deletions.push((head_kind, b"branch".to_vec()));
+    }
     control.put_records_and_retire_and_delete_if_value(
         &[],
         &deletions,

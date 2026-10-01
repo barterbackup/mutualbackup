@@ -2265,6 +2265,69 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn missing_preparing_worktree_without_checkout_can_release_branch() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-worktree-abandon-{}", Uuid::new_v4()));
+        let primary_root = run_root.join("primary");
+        let linked_root = run_root.join("linked");
+        fs::create_dir_all(&primary_root).unwrap();
+        fs::create_dir_all(&linked_root).unwrap();
+        fs::write(primary_root.join("tracked"), b"base\r\n").unwrap();
+        let repository_id = Uuid::new_v4();
+        let local = GitRepository::init(&primary_root, repository_id, &[120; 32]).unwrap();
+        local.stage_file("tracked").unwrap();
+        local.commit("Author", "a@example.test", "base").unwrap();
+        local.create_branch("topic").unwrap();
+
+        crate::worktree::set_after_registration_hook(Box::new(|| panic!("worktree crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local.add_linked_worktree(&linked_root, "topic").unwrap();
+        }));
+        assert!(interrupted.is_err());
+        let pending = local.linked_worktrees().unwrap().pop().unwrap();
+        assert_eq!(pending.state, crate::GitWorktreeState::Preparing);
+        fs::remove_dir(&linked_root).unwrap();
+        let scope = pending.scope().unwrap();
+        let checkout_kind = scope.local_kind(
+            "git-checkout-intent-v1/",
+            "git-worktree-checkout-intent-v1/",
+        );
+        local
+            .catalog
+            .put_record(&checkout_kind, b"active", b"test-only-pending")
+            .unwrap();
+        assert!(matches!(
+            local.prune_missing_linked_worktree(pending.worktree_id, true),
+            Err(RepositoryError::Worktree(
+                crate::GitWorktreeError::PendingOperation
+            ))
+        ));
+        local
+            .catalog
+            .delete_record(&checkout_kind, b"active")
+            .unwrap();
+        assert_eq!(
+            local
+                .prune_missing_linked_worktree(pending.worktree_id, false)
+                .unwrap(),
+            pending
+        );
+        assert!(local.linked_worktrees().unwrap().is_empty());
+        local.switch_branch("topic").unwrap();
+        assert_eq!(fs::read(primary_root.join("tracked")).unwrap(), b"base\r\n");
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn prune_waits_for_linked_stage_and_preserves_its_index_anchor() {
         let test_root = PathBuf::from(
             std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")

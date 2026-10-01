@@ -33,6 +33,8 @@ After deliberately removing a linked worktree directory, run
 its branch ownership and index pins. The command refuses an existing path,
 staged differences, or an unfinished add or checkout. Use `--force` to discard
 staged changes after removing the directory; pending operations still block it.
+An interrupted registration that has not started checkout can also be pruned
+after its directory is removed.
 It only forgets that worktree's local metadata; its branch and shared commits
 remain available. Run the separate history `prune` (or `gc`) command to reclaim
 anchors that no remaining ref or index needs.
