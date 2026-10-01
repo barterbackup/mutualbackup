@@ -113,6 +113,7 @@ enum Command {
     /// List explicitly pinned commit IDs.
     Pins,
     /// Delete unreachable Git metadata and native anchors after retention checks.
+    #[command(visible_alias = "gc")]
     Prune,
     /// Switch to a branch using exact-byte reflink checkout.
     Switch { name: String },

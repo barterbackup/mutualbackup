@@ -34,8 +34,8 @@ its branch ownership and index pins. The command refuses an existing path,
 staged differences, or an unfinished add or checkout. Use `--force` to discard
 staged changes after removing the directory; pending operations still block it.
 It only forgets that worktree's local metadata; its branch and shared commits
-remain available. Run the separate history `prune` command to reclaim anchors
-that no remaining ref or index needs.
+remain available. Run the separate history `prune` (or `gc`) command to reclaim
+anchors that no remaining ref or index needs.
 `mutualgit restore PATH` restores working files from the staged index without
 moving HEAD or changing that index; `mutualgit restore --staged PATH` resets
 the selected index paths from HEAD without changing working files. Use both
