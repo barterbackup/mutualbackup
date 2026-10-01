@@ -19,7 +19,7 @@ use crate::checkout::{
     continue_merge, resume_pending_checkout, resume_pending_checkout_for_scope,
 };
 use crate::diff::{DiffError, GitDiff, repository_diff, repository_diff_for_scope};
-use crate::fetch::{FetchError, fetch_bare};
+use crate::fetch::{FetchError, fetch_bare, import_pushed_branch};
 use crate::head::{HeadError, selected_branch};
 use crate::history::{
     GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, GitRemoteBranchInfo, HistoryError,
@@ -831,6 +831,26 @@ impl GitRepository {
             self.repository_id,
             &self.root,
             source.as_ref(),
+        )?)
+    }
+
+    pub fn receive_pushed_branch(
+        &self,
+        source_git_directory: impl AsRef<Path>,
+        target_branch: &str,
+        target_oid: [u8; 20],
+        expected_old: Option<[u8; 20]>,
+    ) -> Result<(), RepositoryError> {
+        self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
+        Ok(import_pushed_branch(
+            &self.catalog,
+            self.repository_id,
+            &self.root,
+            source_git_directory.as_ref(),
+            target_branch,
+            target_oid,
+            expected_old,
         )?)
     }
 

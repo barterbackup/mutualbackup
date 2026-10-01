@@ -724,6 +724,31 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitReceivePushedBranch {
+            repository_id,
+            source_root,
+            source_git_directory,
+            target_branch,
+            target_oid,
+            expected_old,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_receive_pushed_branch(
+                    repository_id,
+                    &source_root,
+                    &source_git_directory,
+                    &target_branch,
+                    target_oid,
+                    expected_old,
+                )?;
+                Ok(LocalResponse::GitPushReceived {
+                    repository_id,
+                    branch: target_branch,
+                    oid: target_oid,
+                })
+            })
+            .await
+        }
         LocalRequest::GitCreateBranchFrom {
             repository_id,
             name,

@@ -9,13 +9,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use mb_git::GitRepository;
+use mb_git::{FetchError, GitRepository, RepositoryError};
 use mb_node::{LocalRequest, LocalResponse};
 use uuid::Uuid;
 
 #[test]
 #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
-fn stock_git_fetches_from_native_anchors_through_local_helper() {
+fn stock_git_fetches_and_pushes_through_native_anchors() {
     let test_root = PathBuf::from(
         std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
             .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
@@ -94,6 +94,30 @@ fn stock_git_fetches_from_native_anchors_through_local_helper() {
                         object_count,
                     }
                 }
+                LocalRequest::GitReceivePushedBranch {
+                    repository_id: requested,
+                    source_root,
+                    source_git_directory,
+                    target_branch,
+                    target_oid,
+                    expected_old,
+                } => {
+                    assert_eq!(requested, repository_id);
+                    assert_eq!(source_root, server_root);
+                    repository
+                        .receive_pushed_branch(
+                            &source_git_directory,
+                            &target_branch,
+                            target_oid,
+                            expected_old,
+                        )
+                        .unwrap();
+                    LocalResponse::GitPushReceived {
+                        repository_id,
+                        branch: target_branch,
+                        oid: target_oid,
+                    }
+                }
                 _ => panic!("unexpected Git helper request"),
             };
             let response = serde_json::json!({
@@ -165,8 +189,6 @@ fn stock_git_fetches_from_native_anchors_through_local_helper() {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .unwrap();
-    stop.store(true, Ordering::Relaxed);
-    server.join().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -174,7 +196,196 @@ fn stock_git_fetches_from_native_anchors_through_local_helper() {
     );
     assert_eq!(fs::read(clone_root.join("tracked")).unwrap(), payload);
 
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&clone_root)
+        .args(["checkout", "-q", "-b", "topic"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let pushed_bytes = b"pushed\r\nraw\0bytes\xff";
+    fs::write(clone_root.join("tracked"), pushed_bytes).unwrap();
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&clone_root)
+        .args(["-c", "core.autocrlf=false", "add", "tracked"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&clone_root)
+        .args([
+            "-c",
+            "user.name=Stock",
+            "-c",
+            "user.email=stock@example.test",
+            "commit",
+            "-qm",
+            "pushed branch",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&clone_root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let pushed_oid = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&clone_root)
+        .args(["push"])
+        .arg(format!("mutualbackup::{}", source_root.display()))
+        .arg("refs/heads/topic:refs/heads/topic")
+        .env("PATH", &path)
+        .env("MUTUALBACKUP_CONTROL_SOCKET", &socket)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pushed_again = b"second push\nwith\0raw\r\n";
+    fs::write(clone_root.join("tracked"), pushed_again).unwrap();
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&clone_root)
+        .args(["-c", "core.autocrlf=false", "add", "tracked"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&clone_root)
+        .args([
+            "-c",
+            "user.name=Stock",
+            "-c",
+            "user.email=stock@example.test",
+            "commit",
+            "-qm",
+            "fast forward topic",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&clone_root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let fast_forward_oid = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+    assert_ne!(pushed_oid, fast_forward_oid);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&clone_root)
+        .args(["push"])
+        .arg(format!("mutualbackup::{}", source_root.display()))
+        .arg("refs/heads/topic:refs/heads/topic")
+        .env("PATH", &path)
+        .env("MUTUALBACKUP_CONTROL_SOCKET", &socket)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let roundtrip_root = run_root.join("roundtrip");
+    let output = Command::new("git")
+        .args(["-c", "core.autocrlf=false", "clone", "--no-tags"])
+        .arg(format!("mutualbackup::{}", source_root.display()))
+        .arg(&roundtrip_root)
+        .env("PATH", &path)
+        .env("MUTUALBACKUP_CONTROL_SOCKET", &socket)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&roundtrip_root)
+        .args(["checkout", "-q", "topic"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(roundtrip_root.join("tracked")).unwrap(),
+        pushed_again
+    );
+    stop.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+
     let repository = GitRepository::open(&source_root, repository_id, &key).unwrap();
+    assert_eq!(fs::read(source_root.join("tracked")).unwrap(), payload);
+    assert_eq!(
+        git2::Oid::from_bytes(
+            &repository
+                .branches()
+                .unwrap()
+                .into_iter()
+                .find(|branch| branch.name == "topic")
+                .unwrap()
+                .oid
+        )
+        .unwrap()
+        .to_string(),
+        fast_forward_oid
+    );
+    let main_oid = commit.oid;
+    let topic_oid = git2::Oid::from_str(&fast_forward_oid).unwrap();
+    assert!(matches!(
+        repository.receive_pushed_branch(
+            clone_root.join(".git"),
+            "main",
+            topic_oid.as_bytes().try_into().unwrap(),
+            Some(main_oid),
+        ),
+        Err(RepositoryError::Fetch(FetchError::CheckedOutBranch))
+    ));
+    assert!(matches!(
+        repository.receive_pushed_branch(
+            clone_root.join(".git"),
+            "topic",
+            main_oid,
+            Some(topic_oid.as_bytes().try_into().unwrap()),
+        ),
+        Err(RepositoryError::Fetch(FetchError::NonFastForward))
+    ));
+    assert_eq!(
+        repository
+            .branches()
+            .unwrap()
+            .into_iter()
+            .find(|branch| branch.name == "topic")
+            .unwrap()
+            .oid,
+        topic_oid.as_bytes()
+    );
+    repository.switch_branch("topic").unwrap();
+    assert_eq!(fs::read(source_root.join("tracked")).unwrap(), pushed_again);
     let graph = repository.export_graph_source().unwrap();
     drop(repository);
     for blob in graph.blobs {

@@ -1,6 +1,6 @@
-//! Stock Git fetch bridge for `mutualbackup::<absolute-repository-path>`.
-//! Git owns its destination object database; the daemon streams native anchor
-//! bytes directly into it without a persistent Git mirror on our side.
+//! Stock Git fetch/push bridge for `mutualbackup::<absolute-repository-path>`.
+//! Git owns its local object database; the daemon streams native anchor bytes
+//! in either direction without a persistent Git mirror on our side.
 
 use std::env;
 use std::io::{self, BufRead, Write};
@@ -105,6 +105,66 @@ fn validate_fetch(line: &str, branches: &[GitBranchInfo]) -> Result<()> {
     Ok(())
 }
 
+async fn receive_push(
+    line: &str,
+    socket: &Path,
+    repository_id: Uuid,
+    source_root: &Path,
+    source_git_directory: &Path,
+    advertised: &[GitBranchInfo],
+) -> Result<()> {
+    let specification = line
+        .strip_prefix("push ")
+        .context("unsupported Git remote-helper push command")?;
+    let (source, destination) = specification
+        .split_once(':')
+        .context("Git push needs a source and destination ref")?;
+    let branch = destination
+        .strip_prefix("refs/heads/")
+        .context("only local branch refs can receive stock Git pushes")?;
+    if source.is_empty()
+        || source.starts_with('+')
+        || branch.len() > 1024
+        || !git2::Branch::name_is_valid(branch)?
+    {
+        bail!("forced pushes and branch deletion are not supported");
+    }
+    let stock = git2::Repository::open(source_git_directory)?;
+    if stock.path().canonicalize()? != source_git_directory
+        || stock.object_format() != git2::ObjectFormat::Sha1
+    {
+        bail!("stock Git source is not an exact SHA-1 repository");
+    }
+    let oid = stock.revparse_single(source)?.peel_to_commit()?.id();
+    let expected_old = advertised
+        .iter()
+        .find(|entry| entry.name == branch)
+        .map(|entry| entry.oid);
+    let LocalResponse::GitPushReceived {
+        repository_id: returned_id,
+        branch: returned_branch,
+        oid: returned_oid,
+    } = local_control_call(
+        socket,
+        &LocalRequest::GitReceivePushedBranch {
+            repository_id,
+            source_root: source_root.to_path_buf(),
+            source_git_directory: source_git_directory.to_path_buf(),
+            target_branch: branch.to_owned(),
+            target_oid: oid.as_bytes().try_into().expect("SHA-1 OID"),
+            expected_old,
+        },
+    )
+    .await?
+    else {
+        bail!("daemon returned the wrong Git push response");
+    };
+    if returned_id != repository_id || returned_branch != branch || returned_oid != oid.as_bytes() {
+        bail!("daemon received another Git branch or object");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut arguments = env::args();
@@ -127,10 +187,10 @@ async fn main() -> Result<()> {
     while let Some(command) = read_line(&mut input)? {
         match command.as_str() {
             "capabilities" => {
-                output.write_all(b"fetch\n\n")?;
+                output.write_all(b"fetch\npush\n\n")?;
                 output.flush()?;
             }
-            "list" => {
+            "list" | "list for-push" => {
                 let LocalResponse::GitBranches(branches) =
                     local_control_call(&socket, &LocalRequest::GitBranches { repository_id })
                         .await?
@@ -184,6 +244,48 @@ async fn main() -> Result<()> {
                 };
                 if returned_id != repository_id {
                     bail!("daemon exported objects from another repository");
+                }
+                output.write_all(b"\n")?;
+                output.flush()?;
+            }
+            value if value.starts_with("push ") => {
+                let branches = advertised
+                    .as_ref()
+                    .context("Git requested a push before listing remote refs")?;
+                let mut commands = vec![value.to_owned()];
+                loop {
+                    let next = read_line(&mut input)?
+                        .context("Git closed an unfinished remote-helper push batch")?;
+                    if next.is_empty() {
+                        break;
+                    }
+                    if !next.starts_with("push ") {
+                        bail!("unsupported Git remote-helper push batch command");
+                    }
+                    commands.push(next);
+                }
+                for command in commands {
+                    let destination_ref = command
+                        .strip_prefix("push ")
+                        .and_then(|specification| specification.split_once(':'))
+                        .map(|(_, destination)| destination)
+                        .context("Git push needs a destination ref")?;
+                    match receive_push(
+                        &command,
+                        &socket,
+                        repository_id,
+                        &source_root,
+                        &destination,
+                        branches,
+                    )
+                    .await
+                    {
+                        Ok(_) => writeln!(output, "ok {destination_ref}")?,
+                        Err(error) => {
+                            let reason = format!("{error:#}").replace(['\n', '\r'], " ");
+                            writeln!(output, "error {destination_ref} {reason}")?;
+                        }
+                    }
                 }
                 output.write_all(b"\n")?;
                 output.flush()?;

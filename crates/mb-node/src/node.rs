@@ -1646,6 +1646,30 @@ impl Node {
             .map_err(Into::into)
     }
 
+    pub fn git_receive_pushed_branch(
+        &mut self,
+        repository_id: Uuid,
+        source_root: &Path,
+        source_git_directory: &Path,
+        target_branch: &str,
+        target_oid: [u8; 20],
+        expected_old: Option<[u8; 20]>,
+    ) -> Result<()> {
+        let repository = self.open_git_repository(repository_id)?;
+        if repository.root() != source_root {
+            anyhow::bail!("Git remote root differs from its enrolled repository");
+        }
+        self.mark_root_dirty(repository_id, "Git history changed by stock Git push")?;
+        repository
+            .receive_pushed_branch(
+                source_git_directory,
+                target_branch,
+                target_oid,
+                expected_old,
+            )
+            .map_err(Into::into)
+    }
+
     pub fn git_remote_branches(&self, repository_id: Uuid) -> Result<Vec<GitRemoteBranchInfo>> {
         self.open_git_repository(repository_id)?
             .remote_branches()

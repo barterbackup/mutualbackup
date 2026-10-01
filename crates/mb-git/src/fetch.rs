@@ -1,4 +1,4 @@
-//! Crash-replayable import from an existing local bare Git repository.
+//! Crash-replayable import from a local bare Git repository or stock Git push.
 //! Commit/tree metadata is bounded in the encrypted catalog. Blob payloads
 //! stream from raw Git objects directly into native immutable anchors.
 
@@ -19,9 +19,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::attributes::{GitAttributesError, MAX_ATTRIBUTES_BYTES, validate_attributes};
+use crate::head::{HeadError, linked_selected_branches, selected_branch};
 use crate::history::{
     GitGraphObject, GitGraphRef, HistoryError, MAX_GRAPH_METADATA_BYTES, MAX_GRAPH_OBJECTS,
-    fetched_ref_record, metadata_kind, object_record, ref_kind,
+    commit_descends_from, fetched_ref_record, metadata_kind, object_record, ref_kind, ref_oid,
 };
 use crate::interop::GitInteropError;
 use crate::stage::{StageError, anchors_for_oid, object_kind, stage_path_key};
@@ -30,6 +31,7 @@ use crate::{GitAnchorError, blob_oid_from_anchor};
 const FETCH_PREFIX: &str = "git-bare-fetch-intent-v1/";
 const BLOB_PREFIX: &str = "git-bare-fetch-blob-intent-v1/";
 const VERIFIED_PREFIX: &str = "git-bare-fetch-verified-v1/";
+const PUSH_PREFIX: &str = "git-stock-push-intent-v1/";
 const ACTIVE: &[u8] = b"active";
 
 #[derive(Debug, Error)]
@@ -48,11 +50,13 @@ pub enum FetchError {
     Stage(#[from] StageError),
     #[error("Git history error: {0}")]
     History(#[from] HistoryError),
+    #[error("Git HEAD error: {0}")]
+    Head(#[from] HeadError),
     #[error("encrypted catalog error: {0}")]
     Database(#[from] DatabaseError),
     #[error("versioned fetch intent error: {0}")]
     Model(#[from] ModelError),
-    #[error("source must be an existing SHA-1 bare Git repository outside this root")]
+    #[error("source must be an existing exact SHA-1 Git directory outside this root")]
     UnsupportedSource,
     #[error("Git attributes policy error: {0}")]
     Attributes(#[from] GitAttributesError),
@@ -62,6 +66,12 @@ pub enum FetchError {
     IncompatibleSource,
     #[error("the fetched Git graph exceeds the bounded metadata or object limit")]
     GraphTooLarge,
+    #[error("the requested push branch is selected by a worktree")]
+    CheckedOutBranch,
+    #[error("the advertised destination ref changed before the push")]
+    StalePush,
+    #[error("the pushed commit is not a descendant of the destination branch")]
+    NonFastForward,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -84,6 +94,14 @@ struct FetchIntent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct PushImportIntent {
+    format_version: u16,
+    target_branch: String,
+    expected_old: Option<[u8; 20]>,
+    fetch: FetchIntent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct BlobIntent {
     format_version: u16,
     repository_id: Uuid,
@@ -103,11 +121,16 @@ fn fetch_kind(repository_id: Uuid) -> String {
     format!("{FETCH_PREFIX}{repository_id}")
 }
 
+fn push_kind(repository_id: Uuid) -> String {
+    format!("{PUSH_PREFIX}{repository_id}")
+}
+
 pub(crate) fn has_pending_fetch(
     control: &ControlStore,
     repository_id: Uuid,
 ) -> Result<bool, FetchError> {
     Ok(!control.records(&fetch_kind(repository_id))?.is_empty()
+        || !control.records(&push_kind(repository_id))?.is_empty()
         || !control.records(&blob_kind(repository_id))?.is_empty()
         || !control
             .records_with_kind_prefix(&format!("{VERIFIED_PREFIX}{repository_id}/"))?
@@ -129,12 +152,23 @@ fn sha1(oid: Oid) -> [u8; 20] {
     oid.as_bytes().try_into().expect("SHA-1 repository")
 }
 
-fn source_repository(path: &Path, root: &Path) -> Result<Repository, FetchError> {
+fn source_repository(
+    path: &Path,
+    root: &Path,
+    format_version: u16,
+) -> Result<Repository, FetchError> {
     if path.starts_with(root) || path.canonicalize()? != path {
         return Err(FetchError::UnsupportedSource);
     }
-    let repo = Repository::open_bare(path)?;
-    if !repo.is_bare() || repo.object_format() != ObjectFormat::Sha1 {
+    let repo = match format_version {
+        1 => Repository::open_bare(path)?,
+        2 => Repository::open(path)?,
+        _ => return Err(FetchError::UnsupportedSource),
+    };
+    if (format_version == 1 && !repo.is_bare())
+        || repo.path().canonicalize()? != path
+        || repo.object_format() != ObjectFormat::Sha1
+    {
         return Err(FetchError::UnsupportedSource);
     }
     Ok(repo)
@@ -170,7 +204,6 @@ fn discover(
     source_path: PathBuf,
     source_root: PathBuf,
 ) -> Result<FetchIntent, FetchError> {
-    let odb = repo.odb()?;
     let mut refs = Vec::new();
     for reference in repo.references_glob("refs/heads/*")? {
         let reference = reference?;
@@ -195,6 +228,19 @@ fn discover(
         }
     }
     refs.sort_by(|left, right| left.name.cmp(&right.name));
+
+    discover_from_refs(repo, repository_id, source_path, source_root, refs, 1)
+}
+
+fn discover_from_refs(
+    repo: &Repository,
+    repository_id: Uuid,
+    source_path: PathBuf,
+    source_root: PathBuf,
+    refs: Vec<GitGraphRef>,
+    format_version: u16,
+) -> Result<FetchIntent, FetchError> {
+    let odb = repo.odb()?;
 
     let mut metadata_budget = refs.iter().map(|reference| reference.name.len() + 20).sum();
     let mut commits = refs
@@ -303,7 +349,7 @@ fn discover(
     let mut blobs = blobs.into_values().collect::<Vec<_>>();
     blobs.sort_by_key(|blob| blob.oid);
     Ok(FetchIntent {
-        format_version: 1,
+        format_version,
         fetch_id: Uuid::new_v4(),
         repository_id,
         source_path,
@@ -319,13 +365,14 @@ fn validate_intent(
     repository_id: Uuid,
     root: &Path,
 ) -> Result<(), FetchError> {
-    if intent.format_version != 1
+    if !matches!(intent.format_version, 1 | 2)
         || intent.fetch_id.is_nil()
         || intent.repository_id != repository_id
         || intent.source_root != root
         || !intent.source_path.is_absolute()
         || intent.source_path.starts_with(root)
         || intent.refs.len() + intent.objects.len() + intent.blobs.len() > MAX_GRAPH_OBJECTS
+        || intent.format_version == 2 && intent.refs.len() != 1
     {
         return Err(FetchError::IncompatibleSource);
     }
@@ -333,7 +380,12 @@ fn validate_intent(
     for reference in &intent.refs {
         let name =
             std::str::from_utf8(&reference.name).map_err(|_| FetchError::IncompatibleSource)?;
-        if !name.starts_with("refs/remotes/origin/") || !git2::Reference::is_valid_name(name) {
+        let prefix = if intent.format_version == 1 {
+            "refs/remotes/origin/"
+        } else {
+            "refs/heads/"
+        };
+        if !name.starts_with(prefix) || !git2::Reference::is_valid_name(name) {
             return Err(FetchError::IncompatibleSource);
         }
         bytes = bytes.saturating_add(reference.name.len() + 20);
@@ -480,7 +532,11 @@ fn import_blob(
     if encoded.is_none() {
         let existing = anchors_for_oid(control, intent.repository_id, oid)?;
         if !existing.is_empty() {
-            let source = source_repository(&intent.source_path, &intent.source_root)?;
+            let source = source_repository(
+                &intent.source_path,
+                &intent.source_root,
+                intent.format_version,
+            )?;
             let verified = verified_blob(blob, &existing)?;
             for anchor in &existing {
                 if !super::interop::matches_existing(
@@ -536,7 +592,11 @@ fn import_blob(
     let anchor = match state.plan.capture(std::io::empty()) {
         Ok(anchor) => anchor,
         Err(AnchorError::SourceChanged(_)) => {
-            source_repository(&intent.source_path, &intent.source_root)?;
+            source_repository(
+                &intent.source_path,
+                &intent.source_root,
+                intent.format_version,
+            )?;
             capture_raw_blob(&intent.source_path, oid, blob.logical_len, &state.plan)?
         }
         Err(error) => return Err(error.into()),
@@ -577,13 +637,21 @@ pub fn fetch_bare(
     source_root: &Path,
     source_path: &Path,
 ) -> Result<usize, FetchError> {
+    if control
+        .get_record(&push_kind(repository_id), ACTIVE)?
+        .is_some()
+    {
+        return Err(FetchError::PendingFetch);
+    }
     let kind = fetch_kind(repository_id);
     let (intent, encoded) = match control.get_record(&kind, ACTIVE)? {
         Some(bytes) => {
             let intent: FetchIntent = decode_canonical(&bytes)?;
             validate_intent(&intent, repository_id, source_root)?;
-            if source_path != intent.source_path
-                && source_path.canonicalize().ok().as_deref() != Some(intent.source_path.as_path())
+            if intent.format_version != 1
+                || source_path != intent.source_path
+                    && source_path.canonicalize().ok().as_deref()
+                        != Some(intent.source_path.as_path())
             {
                 return Err(FetchError::PendingFetch);
             }
@@ -591,7 +659,7 @@ pub fn fetch_bare(
         }
         None => {
             let canonical = source_path.canonicalize()?;
-            let repository = source_repository(&canonical, source_root)?;
+            let repository = source_repository(&canonical, source_root, 1)?;
             let intent = discover(
                 &repository,
                 repository_id,
@@ -640,6 +708,155 @@ pub fn fetch_bare(
     Ok(intent.refs.len())
 }
 
+/// Import one stock Git commit and publish a non-checked-out local branch only
+/// after every reachable object and native blob anchor is durable. The
+/// expected old ref is bound to the helper's advertisement. A persisted intent
+/// replays the same push after a daemon restart.
+pub(crate) fn import_pushed_branch(
+    control: &ControlStore,
+    repository_id: Uuid,
+    source_root: &Path,
+    source_path: &Path,
+    target_branch: &str,
+    target_oid: [u8; 20],
+    expected_old: Option<[u8; 20]>,
+) -> Result<(), FetchError> {
+    if target_branch.len() > 1024 || !git2::Branch::name_is_valid(target_branch)? {
+        return Err(FetchError::IncompatibleSource);
+    }
+    if control
+        .get_record(&fetch_kind(repository_id), ACTIVE)?
+        .is_some()
+    {
+        return Err(FetchError::PendingFetch);
+    }
+    let local_ref = format!("refs/heads/{target_branch}");
+    let kind = push_kind(repository_id);
+    let (intent, encoded) = match control.get_record(&kind, ACTIVE)? {
+        Some(bytes) => {
+            let pending: PushImportIntent = decode_canonical(&bytes)?;
+            validate_intent(&pending.fetch, repository_id, source_root)?;
+            if pending.format_version != 1
+                || pending.fetch.format_version != 2
+                || pending.target_branch != target_branch
+                || pending.expected_old != expected_old
+                || pending.fetch.refs.len() != 1
+                || pending.fetch.refs[0].name != local_ref.as_bytes()
+                || pending.fetch.refs[0].oid != target_oid
+                || source_path != pending.fetch.source_path
+                    && source_path.canonicalize().ok().as_deref()
+                        != Some(pending.fetch.source_path.as_path())
+            {
+                return Err(FetchError::PendingFetch);
+            }
+            (pending, bytes)
+        }
+        None => {
+            if selected_branch(control, repository_id)? == target_branch
+                || linked_selected_branches(control, repository_id)?
+                    .iter()
+                    .any(|branch| branch == target_branch)
+            {
+                return Err(FetchError::CheckedOutBranch);
+            }
+            if ref_oid(control, repository_id, local_ref.as_bytes())?.map(sha1) != expected_old {
+                return Err(FetchError::StalePush);
+            }
+            let canonical = source_path.canonicalize()?;
+            let repository = source_repository(&canonical, source_root, 2)?;
+            let fetch = discover_from_refs(
+                &repository,
+                repository_id,
+                canonical,
+                source_root.to_owned(),
+                vec![GitGraphRef {
+                    name: local_ref.as_bytes().to_vec(),
+                    oid: target_oid,
+                }],
+                2,
+            )?;
+            validate_intent(&fetch, repository_id, source_root)?;
+            let pending = PushImportIntent {
+                format_version: 1,
+                target_branch: target_branch.to_owned(),
+                expected_old,
+                fetch,
+            };
+            let bytes = canonical_bytes(&pending)?;
+            if !control.put_record_if_absent(&kind, ACTIVE, &bytes)? {
+                return Err(FetchError::PendingFetch);
+            }
+            (pending, bytes)
+        }
+    };
+    for blob in &intent.fetch.blobs {
+        import_blob(control, &intent.fetch, blob)?;
+    }
+    let metadata = intent
+        .fetch
+        .objects
+        .iter()
+        .map(|object| {
+            let kind = match object.kind {
+                1 => ObjectType::Commit,
+                2 => ObjectType::Tree,
+                _ => return Err(FetchError::IncompatibleSource),
+            };
+            Ok((
+                metadata_kind(repository_id),
+                object.oid.to_vec(),
+                object_record(kind, object.bytes.clone())?,
+            ))
+        })
+        .collect::<Result<Vec<_>, FetchError>>()?;
+    control.put_records_and_delete(&metadata, &[])?;
+    let new_oid = Oid::from_bytes(&target_oid)?;
+    let still_unselected = selected_branch(control, repository_id)? != target_branch
+        && !linked_selected_branches(control, repository_id)?
+            .iter()
+            .any(|branch| branch == target_branch);
+    let still_same =
+        ref_oid(control, repository_id, local_ref.as_bytes())?.map(sha1) == expected_old;
+    let fast_forward = expected_old
+        .map(|old| commit_descends_from(control, repository_id, new_oid, Oid::from_bytes(&old)?))
+        .transpose()?
+        .unwrap_or(true);
+    let deletions = intent
+        .fetch
+        .blobs
+        .iter()
+        .map(|blob| (verified_kind(&intent.fetch), blob.oid.to_vec()))
+        .collect::<Vec<_>>();
+    if !still_unselected || !still_same || !fast_forward {
+        control.put_records_and_retire_and_delete_if_value(
+            &[],
+            &deletions,
+            &kind,
+            ACTIVE,
+            &encoded,
+        )?;
+        return if !still_unselected {
+            Err(FetchError::CheckedOutBranch)
+        } else if !still_same {
+            Err(FetchError::StalePush)
+        } else {
+            Err(FetchError::NonFastForward)
+        };
+    }
+    control.put_records_and_retire_and_delete_if_value(
+        &[(
+            ref_kind(repository_id),
+            local_ref.into_bytes(),
+            fetched_ref_record(target_oid)?,
+        )],
+        &deletions,
+        &kind,
+        ACTIVE,
+        &encoded,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -686,6 +903,97 @@ mod tests {
             ),
             Err(FetchError::IncompatibleSource)
         ));
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn pushed_branch_replays_after_captured_stock_source_disappears() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-push-replay-{}", Uuid::new_v4()));
+        let root = run_root.join("work");
+        let stock_root = run_root.join("stock");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("tracked"), b"base\r\n").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [94_u8; 32];
+        let local = GitRepository::init(&root, repository_id, &key).unwrap();
+        local.stage_file("tracked").unwrap();
+        local.commit("Author", "a@example.test", "base").unwrap();
+        drop(local);
+
+        let stock = Repository::init(&stock_root).unwrap();
+        let payload = b"pushed\r\nraw\0bytes";
+        let blob = stock.blob(payload).unwrap();
+        let mut builder = stock.treebuilder(None).unwrap();
+        builder.insert("tracked", blob, 0o100644).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = stock.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Stock", "stock@example.test").unwrap();
+        let commit = stock
+            .commit(None, &signature, &signature, "topic", &tree, &[])
+            .unwrap();
+        drop(tree);
+        drop(builder);
+        let git_directory = stock.path().canonicalize().unwrap();
+        let fetch = discover_from_refs(
+            &stock,
+            repository_id,
+            git_directory.clone(),
+            root.clone(),
+            vec![GitGraphRef {
+                name: b"refs/heads/topic".to_vec(),
+                oid: sha1(commit),
+            }],
+            2,
+        )
+        .unwrap();
+        assert_eq!(fetch.blobs.len(), 1);
+        let pending = PushImportIntent {
+            format_version: 1,
+            target_branch: "topic".to_owned(),
+            expected_old: None,
+            fetch,
+        };
+        let database = root.join(GIT_CATALOG_DIRECTORY).join("catalog.db");
+        let control = ControlStore::open_existing_with_key(&database, &key).unwrap();
+        control
+            .put_record_if_absent(
+                &push_kind(repository_id),
+                ACTIVE,
+                &canonical_bytes(&pending).unwrap(),
+            )
+            .unwrap();
+        import_blob(&control, &pending.fetch, &pending.fetch.blobs[0]).unwrap();
+        assert!(has_pending_fetch(&control, repository_id).unwrap());
+        drop(control);
+        drop(stock);
+        fs::remove_dir_all(&stock_root).unwrap();
+
+        let control = ControlStore::open_existing_with_key(&database, &key).unwrap();
+        import_pushed_branch(
+            &control,
+            repository_id,
+            &root,
+            &git_directory,
+            "topic",
+            sha1(commit),
+            None,
+        )
+        .unwrap();
+        assert!(!has_pending_fetch(&control, repository_id).unwrap());
+        drop(control);
+        let local = GitRepository::open(&root, repository_id, &key).unwrap();
+        local.switch_branch("topic").unwrap();
+        assert_eq!(fs::read(root.join("tracked")).unwrap(), payload);
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
     }
 
     #[test]

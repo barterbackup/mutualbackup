@@ -1,4 +1,4 @@
-# Git-compatible local history and stock Git fetch
+# Git-compatible local history and stock Git interoperability
 
 `mutualgit` keeps its index, branches, commits, and worktree state in the
 app-owned `.mutualbackup` catalog. File bytes live in immutable native anchors;
@@ -18,23 +18,26 @@ merge, staged reset and restore, diff, log, explicit commit pins, and prune.
 not apply Git line-ending rules or content filters. A transforming
 `.gitattributes` rule is rejected before publishing staged bytes.
 
-Install `git-remote-mutualbackup` on `PATH` to fetch this history into a stock
-Git repository. The URL after `mutualbackup::` is the absolute path to the
+Install `git-remote-mutualbackup` on `PATH` to fetch from or push to this history
+with stock Git. The URL after `mutualbackup::` is the absolute path to the
 MutualBackup source root, not its `.mutualbackup` directory:
 
 ```sh
 git clone 'mutualbackup::/absolute/path/to/source' local-clone
 git -C another-repo fetch 'mutualbackup::/absolute/path/to/source' \
   refs/heads/main:refs/remotes/mutualbackup/main
+git -C another-repo push 'mutualbackup::/absolute/path/to/source' \
+  refs/heads/topic:refs/heads/topic
 ```
 
 The helper uses the same default local control socket as `mutualgit`. Set
 `MUTUALBACKUP_CONTROL_SOCKET=/path/to/socket` if the daemon uses another one.
 It streams verified native blob anchors into **stock Git's own** object
-database and leaves the MutualBackup repository without a Git payload mirror.
-Stock Git then owns those exported object copies. Its checkout may apply that
-client's attributes or configuration; the fetched Git blobs retain their raw
-object IDs and bytes. The remote helper currently advertises fetch only;
-stock Git push through this URL remains milestone 6 work. For now,
-`mutualgit push` and `mutualgit fetch` interoperate with existing local bare
-Git repositories.
+database on fetch and imports raw stock Git blobs into native anchors on push.
+The MutualBackup repository keeps no Git payload mirror. Stock Git owns its
+exported object copies; its checkout or staging may apply that client's
+attributes or configuration outside our control. The exchanged Git blobs retain
+their raw object IDs and bytes. Push accepts a new or fast-forward branch only
+when that branch is not checked out in a MutualBackup worktree; force pushes and
+branch deletion are unsupported. `mutualgit push` and `mutualgit fetch` also
+interoperate with existing local bare Git repositories.
