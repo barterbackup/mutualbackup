@@ -655,8 +655,10 @@ Proactive background repair comes later.
 - Introduce a versioned source-backend boundary between local capture/restore
   and the existing revision/sector pipeline. Its durable contract identifies
   immutable source bytes, metadata, source filesystem capabilities, restore
-  behavior, and reachability pins. Keep blocking filesystem work in bounded
-  workers and keep the signed guild protocol independent of backend choice.
+  behavior, and reachability pins. Every backend must capture and restore file
+  content byte-for-byte; a backend that cannot do so rejects the operation.
+  Keep blocking filesystem work in bounded workers and keep the signed guild
+  protocol independent of backend choice.
   The existing reflink root is the first implementation; Git history consumes
   that boundary, and guarded link-freeze/platform capture later implement it.
 - `init` associates each Git repository with a stable protected-root ID and
@@ -3073,10 +3075,11 @@ Milestone 5.
   regardless of inherited Git config or attributes. Force Git-library calls
   that touch blob or working-tree bytes onto raw-byte paths; never let a Git
   library's default checkout/filter behavior re-enable conversion, including
-  during merge, reset/restore, pull, and worktree creation. Import Git blob
-  bytes as raw file bytes and export the same bytes. Treat incoming blob bytes
-  as authoritative; do not try to reverse conversions already performed by
-  another client's worktree. Report explicit repository transforming rules
+  during merge (including `merge.renormalize`), reset/restore, pull, and
+  worktree creation. Import Git blob bytes as raw file bytes and export the same
+  bytes. Treat incoming blob bytes as authoritative; do not try to reverse
+  conversions already performed by another client's worktree. Report explicit
+  repository transforming rules
   before changing the index, refs, anchors, or worktree.
   Never run a configured filter command. Define safe support for Git file
   modes, symlinks, and path names rather than silently dropping them.
@@ -3112,10 +3115,11 @@ Milestone 5.
   to an eager full copy.
 - Close the Git phase with a local gate for exact-byte add/edit/commit/checkout
   and multi-worktree cases; mixed LF/CRLF, binary NUL, non-UTF-8 payloads, and
-  conversion-inducing system/global/repository `core.autocrlf`/`core.eol`
-  settings and `.gitattributes` rules for `text=auto`, `eol`, `filter`, `ident`,
-  and `working-tree-encoding` across add, merge, reset/restore, pull, worktree
-  checkout, import, and export; verify a configured filter is never executed
+  conversion-inducing system/global/repository `core.autocrlf`, `core.eol`,
+  and `merge.renormalize` settings and `.gitattributes` rules for `text=auto`,
+  `eol`, `filter`, `ident`, and `working-tree-encoding` across add, merge,
+  reset/restore, pull, worktree checkout, import, and export; verify a configured
+  filter is never executed
   and a rejected rule leaves index, refs, anchors, and worktree unchanged;
   sparse and large files; hard links, symlinks, modes, and unusual path names;
   dirty and untracked checkout safety; merge conflicts/abort; crash/reopen at stage,
