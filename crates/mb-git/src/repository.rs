@@ -489,6 +489,37 @@ mod tests {
         assert!(graph.blobs.iter().any(|blob| blob.oid == second_blob.oid));
         assert!(graph.objects.iter().any(|object| object.oid == first.oid));
         assert!(graph.objects.iter().any(|object| object.oid == second.oid));
+        let descriptor = crate::GitBackupDescriptor {
+            format_version: 1,
+            repository_id,
+            refs: graph.refs.clone(),
+            objects: graph.objects.clone(),
+            blobs: graph
+                .blobs
+                .iter()
+                .enumerate()
+                .map(|(index, blob)| crate::GitBackupBlob {
+                    oid: blob.oid,
+                    logical_len: blob.anchor.logical_len,
+                    data_extents: vec![crate::GitDataExtent {
+                        offset: 0,
+                        logical_len: blob.anchor.logical_len,
+                        sectors: vec![mb_core::SectorRef {
+                            id: [index as u8; 32],
+                            root: [index as u8; 32],
+                            logical_len: blob.anchor.logical_len as u32,
+                        }],
+                    }],
+                })
+                .collect(),
+        };
+        descriptor.validate().unwrap();
+        let mut missing_blob = descriptor.clone();
+        missing_blob.blobs.pop();
+        assert!(missing_blob.validate().is_err());
+        let mut wrong_object = descriptor;
+        wrong_object.objects[0].bytes.push(0);
+        assert!(wrong_object.validate().is_err());
         let first_anchor = repo
             .anchors_for_oid(Oid::from_bytes(&first_blob.oid).unwrap())
             .unwrap();

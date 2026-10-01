@@ -11,6 +11,8 @@ use mb_store::{AnchorError, FileAnchorManifest};
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
+mod backup;
+#[cfg(target_os = "linux")]
 mod history;
 mod odb;
 #[cfg(target_os = "linux")]
@@ -18,6 +20,8 @@ mod repository;
 mod stage;
 #[cfg(target_os = "linux")]
 mod status;
+#[cfg(target_os = "linux")]
+pub use backup::{GitBackupBlob, GitBackupDescriptor, GitBackupError, GitDataExtent};
 #[cfg(target_os = "linux")]
 pub use history::{
     GitCommitInfo, GitGraphBlobSource, GitGraphObject, GitGraphRef, GitGraphSource, GitLogEntry,
