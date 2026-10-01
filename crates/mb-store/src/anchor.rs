@@ -78,6 +78,8 @@ pub enum AnchorError {
     UnsafePath,
     #[error("unsupported Git worktree file mode")]
     UnsupportedGitMode,
+    #[error("the symlink target is empty, contains NUL, or exceeds the native bound")]
+    UnsupportedSymlinkTarget,
     #[error("a pinned file was replaced during a descriptor-relative move")]
     PinnedFileChanged,
     #[error("an unrecognized or unsafe source-anchor area already exists: {0}")]
@@ -138,6 +140,12 @@ pub enum CapturedEntry {
 pub struct NativeFileId {
     pub filesystem_id: u64,
     pub inode: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PinnedEntryKind {
+    RegularFile,
+    Symlink,
 }
 
 /// A directory capability used for descriptor-relative mutations of an owned
@@ -231,6 +239,164 @@ impl PinnedDirectory {
             return Err(AnchorError::UnsupportedObject(name.to_path_buf()));
         }
         Ok(Some(reopen_pinned_file(&pinned, false, name)?))
+    }
+
+    fn pin_child_symlink(&self, name: &Path) -> Result<Option<File>, AnchorError> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        validate_single_component(name)?;
+        let encoded =
+            CString::new(name.as_os_str().as_bytes()).map_err(|_| AnchorError::UnsafePath)?;
+        let descriptor = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                encoded.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(None);
+            }
+            return Err(error.into());
+        }
+        let pinned = unsafe { File::from_raw_fd(descriptor) };
+        if !pinned.metadata()?.file_type().is_symlink() {
+            return Err(AnchorError::UnsupportedObject(name.to_path_buf()));
+        }
+        Ok(Some(pinned))
+    }
+
+    /// Read the exact target bytes from a pinned symlink inode. The target is
+    /// never followed, including when it is absolute or points outside root.
+    pub fn read_child_symlink(
+        &self,
+        name: impl AsRef<Path>,
+    ) -> Result<Option<(Vec<u8>, NativeFileId)>, AnchorError> {
+        use std::os::fd::AsRawFd;
+
+        const MAX_TARGET: usize = 4095;
+        let name = name.as_ref();
+        let Some(pinned) = self.pin_child_symlink(name)? else {
+            return Ok(None);
+        };
+        let identity = native_file_id(self.filesystem_id, &pinned.metadata()?);
+        let mut target = vec![0_u8; MAX_TARGET + 1];
+        let read = unsafe {
+            libc::readlinkat(
+                pinned.as_raw_fd(),
+                c"".as_ptr(),
+                target.as_mut_ptr().cast::<libc::c_char>(),
+                target.len(),
+            )
+        };
+        if read < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if read as usize > MAX_TARGET {
+            return Err(AnchorError::UnsupportedSymlinkTarget);
+        }
+        target.truncate(read as usize);
+        if self.symlink_identity(name)? != Some(identity) {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        Ok(Some((target, identity)))
+    }
+
+    pub fn symlink_identity(
+        &self,
+        name: impl AsRef<Path>,
+    ) -> Result<Option<NativeFileId>, AnchorError> {
+        Ok(self
+            .pin_child_symlink(name.as_ref())?
+            .map(|pinned| pinned.metadata())
+            .transpose()?
+            .map(|metadata| native_file_id(self.filesystem_id, &metadata)))
+    }
+
+    fn child_identity_for_kind(
+        &self,
+        name: &Path,
+        kind: PinnedEntryKind,
+    ) -> Result<Option<NativeFileId>, AnchorError> {
+        match kind {
+            PinnedEntryKind::RegularFile => self.entry_identity(name, false),
+            PinnedEntryKind::Symlink => self.symlink_identity(name),
+        }
+    }
+
+    /// Publish a symlink without following its target or replacing a name.
+    /// The caller journals the intended bytes before invoking this mutation.
+    pub fn publish_symlink_child(
+        &self,
+        name: impl AsRef<Path>,
+        target: &[u8],
+    ) -> Result<NativeFileId, AnchorError> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        let name = name.as_ref();
+        validate_single_component(name)?;
+        if target.is_empty() || target.len() > 4095 {
+            return Err(AnchorError::UnsupportedSymlinkTarget);
+        }
+        let target = CString::new(target).map_err(|_| AnchorError::UnsupportedSymlinkTarget)?;
+        let encoded =
+            CString::new(name.as_os_str().as_bytes()).map_err(|_| AnchorError::UnsafePath)?;
+        if unsafe { libc::symlinkat(target.as_ptr(), self.file.as_raw_fd(), encoded.as_ptr()) } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let (actual, identity) = self
+            .read_child_symlink(name)?
+            .ok_or(AnchorError::PinnedFileChanged)?;
+        if actual != target.as_bytes() {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        self.sync_all()?;
+        Ok(identity)
+    }
+
+    pub fn move_child_symlink_no_replace(
+        &self,
+        source: impl AsRef<Path>,
+        expected: NativeFileId,
+        destination_parent: &Self,
+        destination: impl AsRef<Path>,
+    ) -> Result<(), AnchorError> {
+        let source = source.as_ref();
+        let destination = destination.as_ref();
+        if self.symlink_identity(source)? != Some(expected) {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        rename_no_replace_at(&self.file, source, &destination_parent.file, destination)?;
+        if destination_parent.symlink_identity(destination)? != Some(expected) {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        self.sync_all()?;
+        destination_parent.sync_all()
+    }
+
+    pub fn remove_child_symlink(
+        &self,
+        name: impl AsRef<Path>,
+        expected: NativeFileId,
+    ) -> Result<(), AnchorError> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        let name = name.as_ref();
+        if self.symlink_identity(name)? != Some(expected) {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        let encoded =
+            CString::new(name.as_os_str().as_bytes()).map_err(|_| AnchorError::UnsafePath)?;
+        if unsafe { libc::unlinkat(self.file.as_raw_fd(), encoded.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        self.sync_all()
     }
 
     pub fn entry_identity(
@@ -413,16 +579,37 @@ impl PinnedDirectory {
         other_name: impl AsRef<Path>,
         other_expected: NativeFileId,
     ) -> Result<(), AnchorError> {
+        self.exchange_child_entries(
+            name,
+            (expected, PinnedEntryKind::RegularFile),
+            other_parent,
+            other_name,
+            (other_expected, PinnedEntryKind::RegularFile),
+        )
+    }
+
+    /// Exchange pinned names even when their types differ. Only regular files
+    /// and symlinks are accepted; the latter are inspected without following.
+    pub fn exchange_child_entries(
+        &self,
+        name: impl AsRef<Path>,
+        expected: (NativeFileId, PinnedEntryKind),
+        other_parent: &Self,
+        other_name: impl AsRef<Path>,
+        other_expected: (NativeFileId, PinnedEntryKind),
+    ) -> Result<(), AnchorError> {
         let name = name.as_ref();
         let other_name = other_name.as_ref();
-        if self.entry_identity(name, false)? != Some(expected)
-            || other_parent.entry_identity(other_name, false)? != Some(other_expected)
+        let (expected, kind) = expected;
+        let (other_expected, other_kind) = other_expected;
+        if self.child_identity_for_kind(name, kind)? != Some(expected)
+            || other_parent.child_identity_for_kind(other_name, other_kind)? != Some(other_expected)
         {
             return Err(AnchorError::PinnedFileChanged);
         }
         exchange_at(&self.file, name, &other_parent.file, other_name)?;
-        if self.entry_identity(name, false)? != Some(other_expected)
-            || other_parent.entry_identity(other_name, false)? != Some(expected)
+        if self.child_identity_for_kind(name, other_kind)? != Some(other_expected)
+            || other_parent.child_identity_for_kind(other_name, kind)? != Some(expected)
         {
             return Err(AnchorError::PinnedFileChanged);
         }
@@ -531,6 +718,46 @@ impl PinnedDirectory {
         Err(unsupported_pinned_directory())
     }
 
+    pub fn read_child_symlink(
+        &self,
+        _name: impl AsRef<Path>,
+    ) -> Result<Option<(Vec<u8>, NativeFileId)>, AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn symlink_identity(
+        &self,
+        _name: impl AsRef<Path>,
+    ) -> Result<Option<NativeFileId>, AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn publish_symlink_child(
+        &self,
+        _name: impl AsRef<Path>,
+        _target: &[u8],
+    ) -> Result<NativeFileId, AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn move_child_symlink_no_replace(
+        &self,
+        _source: impl AsRef<Path>,
+        _expected: NativeFileId,
+        _destination_parent: &Self,
+        _destination: impl AsRef<Path>,
+    ) -> Result<(), AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn remove_child_symlink(
+        &self,
+        _name: impl AsRef<Path>,
+        _expected: NativeFileId,
+    ) -> Result<(), AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
     pub fn entry_identity(
         &self,
         _relative: impl AsRef<Path>,
@@ -592,6 +819,17 @@ impl PinnedDirectory {
         _other_parent: &Self,
         _other_name: impl AsRef<Path>,
         _other_expected: NativeFileId,
+    ) -> Result<(), AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn exchange_child_entries(
+        &self,
+        _name: impl AsRef<Path>,
+        _expected: (NativeFileId, PinnedEntryKind),
+        _other_parent: &Self,
+        _other_name: impl AsRef<Path>,
+        _other_expected: (NativeFileId, PinnedEntryKind),
     ) -> Result<(), AnchorError> {
         Err(unsupported_pinned_directory())
     }
@@ -3746,6 +3984,68 @@ mod tests {
             ReflinkAnchor::plan_file(temp.path(), "../escape"),
             Err(AnchorError::UnsafePath)
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_symlinks_preserve_raw_targets_without_following_them() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let work_path = temp.path().join("work");
+        let staging_path = temp.path().join("staging");
+        fs::create_dir(&work_path).unwrap();
+        fs::create_dir(&staging_path).unwrap();
+        let work = PinnedDirectory::open(&work_path).unwrap();
+        let staging = PinnedDirectory::open(&staging_path).unwrap();
+        let target = b"../outside-\xff";
+        assert!(work.read_child_symlink("linked").unwrap().is_none());
+        assert!(matches!(
+            work.publish_symlink_child("bad", b"inside\0outside"),
+            Err(AnchorError::UnsupportedSymlinkTarget)
+        ));
+        let identity = work.publish_symlink_child("linked", target).unwrap();
+        assert_eq!(
+            work.read_child_symlink("linked").unwrap(),
+            Some((target.to_vec(), identity))
+        );
+        assert_eq!(
+            fs::read_link(work_path.join("linked"))
+                .unwrap()
+                .as_os_str()
+                .as_bytes(),
+            target
+        );
+        assert!(work.open_child_file("linked").is_err());
+        assert!(work.publish_symlink_child("linked", target).is_err());
+        work.move_child_symlink_no_replace("linked", identity, &staging, "saved")
+            .unwrap();
+        assert!(work.read_child_symlink("linked").unwrap().is_none());
+        assert_eq!(
+            staging.read_child_symlink("saved").unwrap(),
+            Some((target.to_vec(), identity))
+        );
+        fs::write(work_path.join("regular"), b"regular bytes").unwrap();
+        let regular_id = work.entry_identity("regular", false).unwrap().unwrap();
+        work.exchange_child_entries(
+            "regular",
+            (regular_id, PinnedEntryKind::RegularFile),
+            &staging,
+            "saved",
+            (identity, PinnedEntryKind::Symlink),
+        )
+        .unwrap();
+        assert_eq!(
+            work.read_child_symlink("regular").unwrap(),
+            Some((target.to_vec(), identity))
+        );
+        assert_eq!(
+            fs::read(staging_path.join("saved")).unwrap(),
+            b"regular bytes"
+        );
+        work.remove_child_symlink("regular", identity).unwrap();
+        staging.remove_child_file("saved").unwrap();
+        assert!(staging.read_child_symlink("saved").unwrap().is_none());
     }
 
     #[cfg(target_os = "linux")]

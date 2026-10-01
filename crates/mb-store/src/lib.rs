@@ -11,10 +11,10 @@ mod source;
 pub use anchor::{
     AnchorAreaLocator, AnchorError, AnchorFileLocator, AnchorManifest, CapturedEntry,
     FileAnchorManifest, FileExtent, FilesystemIdentity, GIT_CATALOG_DIRECTORY,
-    GIT_CATALOG_MARKER_FILE, NativeFileId, PinnedDirectory, ReflinkAnchor, ReflinkCapturePlan,
-    ReflinkFileCapturePlan, StableAnchorAreaLocator, StableAnchorFileLocator, StableAnchorManifest,
-    directory_identity, filesystem_identity, git_catalog_marker, git_catalog_marker_bytes,
-    probe_reflink, remove_owned_directory_tree,
+    GIT_CATALOG_MARKER_FILE, NativeFileId, PinnedDirectory, PinnedEntryKind, ReflinkAnchor,
+    ReflinkCapturePlan, ReflinkFileCapturePlan, StableAnchorAreaLocator, StableAnchorFileLocator,
+    StableAnchorManifest, directory_identity, filesystem_identity, git_catalog_marker,
+    git_catalog_marker_bytes, probe_reflink, remove_owned_directory_tree,
 };
 pub use database::{
     CheckpointRow, ControlStore, DatabaseError, DatabaseShellResult, ObjectAttemptState,
