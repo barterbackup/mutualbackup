@@ -27,6 +27,10 @@ them as ADRs and test vectors before promising wire compatibility.
   are owner-local history represented in ordinary protected user data and
   metadata. Guild protocol authority remains the signed MutualBackup revision
   and checkpoint, and peers need no Git awareness.
+- The Git-compatible frontend preserves regular-file bytes exactly. Its
+  `add`/checkout path does not perform Git-style text or line-ending conversion,
+  even when the host's Git configuration enables it. This is a deliberate
+  compatibility policy for the local frontend and its source anchors.
 - Use a pinned SQLCipher/SQLite build as the common local storage engine, with
   per-page HMAC enabled. Keep control state separate from parity storage. The
   prototype instantiates one parity database; later, one database per configured
@@ -525,11 +529,15 @@ Milestone 6's Git-facing object format is separate from these signed protocol
 formats. A tracked regular file's Git blob is exactly the bytes captured at
 `add`: no CRLF or other end-of-line normalization, clean/smudge/process filter,
 `ident` expansion, or `working-tree-encoding` conversion on add, checkout,
-import, or export. Enforce this independently of global Git config and
-`.gitattributes`; reject an operation that requires an unsupported content
-transformation with a clear error instead of silently changing bytes. Git
-object IDs use the selected Git repository's canonical object framing and hash
-algorithm, computed by the Git library from the immutable captured bytes.
+import, or export. Do not use `core.autocrlf`, `core.eol`, `core.safecrlf`, or
+`text`, `eol`, `filter`, `ident`, and `working-tree-encoding` attributes to
+rewrite payloads. Enforce this independently of system, global, and repository
+Git config; reject an explicit repository rule that requests an unsupported
+content transformation before it can alter bytes. A `.gitattributes` file is
+itself ordinary tracked bytes, but it does not grant permission to transform
+other files. Git object IDs use the selected repository's canonical object
+framing and hash algorithm, computed by the Git library from the immutable
+captured bytes.
 Retain MutualBackup's independent content roots and signed revision authority.
 
 - **Prototype sector object:** fixed 64 KiB RS-level bytes, logical tail length,
@@ -3039,10 +3047,13 @@ Milestone 5.
   Never create a persistent second Git blob or pack copy of native payloads.
 - Disable all automatic content conversion in this binary, including CRLF/text
   handling, clean/smudge/process filters, `ident`, and working-tree encodings,
-  regardless of inherited Git config or attributes. Import Git blob bytes as
-  raw file bytes and export the same bytes; report unsupported transforming
-  rules before they can alter content. Define safe support for Git file modes,
-  symlinks, and path names rather than silently dropping them.
+  regardless of inherited Git config or attributes. Force Git-library calls
+  that touch blob or working-tree bytes onto raw-byte paths; never let a Git
+  library's default checkout/filter behavior re-enable conversion. Import Git
+  blob bytes as raw file bytes and export the same bytes; report explicit
+  repository transforming rules before they can alter content. Define safe
+  support for Git file modes, symlinks, and path names rather than silently
+  dropping them.
 - Protect the whole reachable Git commit graph and refs as owner-owned backed-up
   content, not just the currently checked-out tree. A signed MutualBackup
   revision/checkpoint is the protection boundary; seed-only recovery must
@@ -3072,7 +3083,9 @@ Milestone 5.
   must pass its complete capture/edit/restore probe; never fall back silently
   to an eager full copy.
 - Close the Git phase with a local gate for exact-byte add/edit/commit/checkout
-  and multi-worktree cases; conversion-inducing config/attributes; sparse and
+  and multi-worktree cases; mixed LF/CRLF, binary NUL, non-UTF-8 payloads, and
+  conversion-inducing `core.autocrlf`/`core.eol` settings and `.gitattributes`
+  across add, checkout, import, and export; sparse and
   large files; hard links, symlinks, modes, and unusual path names; dirty and
   untracked checkout safety; merge conflicts/abort; crash/reopen at stage,
   ref, checkout, switch, merge, worktree HEAD/index, import, prune, and backup
