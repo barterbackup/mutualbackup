@@ -32,6 +32,7 @@ local-request =
   / { "GitLog": { repository_id: uuid-text, limit: uint } }
   / { "GitBranches": { repository_id: uuid-text } }
   / { "GitCreateBranch": { repository_id: uuid-text, name: tstr } }
+  / { "GitDiff": { repository_id: uuid-text, cached: bool } }
   / { "GitStatus": { repository_id: uuid-text } }
   / "GuildStatus"
   / "GuildCreate"
@@ -70,6 +71,7 @@ local-response =
   / { "GitLog": [* git-log-entry] }
   / { "GitBranches": [* git-branch-info] }
   / { "GitBranchCreated": git-branch-info }
+  / { "GitDiff": git-diff }
   / { "GitStatus": git-status }
   / { "Guild": null / guild-summary }
   / { "GuildInvite": { token: tstr, expires_at_unix_seconds: uint } }
@@ -186,6 +188,13 @@ git-branch-info = {
   name: tstr,
   oid: bytes20-array,
   current: bool
+}
+
+git-diff = {
+  format_version: uint,
+  repository_id: uuid-text,
+  cached: bool,
+  patch: [* uint8]
 }
 
 git-status = {

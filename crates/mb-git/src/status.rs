@@ -21,7 +21,7 @@ use crate::stage::{GitIndexEntry, StageError, pending_stage_paths, staged_entrie
 const METADATA_PREFIX: &str = "git-metadata-object-v1/";
 const REF_PREFIX: &str = "git-ref-v1/";
 const MAX_STATUS_FILES: usize = 100_000;
-type TreeFiles = BTreeMap<Vec<u8>, ([u8; 20], u32)>;
+pub(crate) type TreeFiles = BTreeMap<Vec<u8>, ([u8; 20], u32)>;
 
 #[derive(Debug, Error)]
 pub enum StatusError {
@@ -155,6 +155,13 @@ fn head_files(
         }
     }
     Ok(files)
+}
+
+pub(crate) fn committed_files(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<TreeFiles, StatusError> {
+    head_files(control, repository_id, head_oid(control, repository_id)?)
 }
 
 fn worktree_change(

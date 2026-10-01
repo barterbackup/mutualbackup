@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -54,6 +55,11 @@ enum Command {
     },
     /// List local branches or create one at the current commit.
     Branch { name: Option<String> },
+    /// Show raw-byte changes in the worktree or staged index.
+    Diff {
+        #[arg(long, alias = "staged")]
+        cached: bool,
+    },
     /// Show staged, working-tree, and backup-protection state.
     Status,
 }
@@ -227,6 +233,24 @@ async fn main() -> Result<()> {
                     println!("{} {}", if branch.current { '*' } else { ' ' }, branch.name);
                 }
             }
+        }
+        Command::Diff { cached } => {
+            let (_, repository_id) = discover_repository(&working_directory)?;
+            let LocalResponse::GitDiff(diff) = local_control_call(
+                &socket,
+                &LocalRequest::GitDiff {
+                    repository_id,
+                    cached,
+                },
+            )
+            .await?
+            else {
+                bail!("daemon returned the wrong response to Git diff");
+            };
+            if diff.repository_id != repository_id || diff.cached != cached {
+                bail!("daemon returned a diff for another repository or comparison");
+            }
+            io::stdout().write_all(&diff.patch)?;
         }
         Command::Status => {
             let (_, repository_id) = discover_repository(&working_directory)?;

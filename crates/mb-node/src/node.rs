@@ -26,7 +26,7 @@ use mb_core::{
     open_recovery_record, packing_protected_root, replay_coding_transcript, seal_recovery_record,
     sector_root, sign_guild_event, sign_legacy_coding_add_binding, synthetic_filler_sector,
 };
-use mb_git::{GitBranchInfo, GitCommitInfo, GitLogEntry, GitRepository, GitStatus};
+use mb_git::{GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitRepository, GitStatus};
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
     VariableParityObject, filesystem_identity, probe_reflink,
@@ -1431,6 +1431,12 @@ impl Node {
     pub fn git_create_branch(&self, repository_id: Uuid, name: &str) -> Result<GitBranchInfo> {
         self.open_git_repository(repository_id)?
             .create_branch(name)
+            .map_err(Into::into)
+    }
+
+    pub fn git_diff(&self, repository_id: Uuid, cached: bool) -> Result<GitDiff> {
+        self.open_git_repository(repository_id)?
+            .diff(cached)
             .map_err(Into::into)
     }
 
@@ -15279,11 +15285,40 @@ pub(crate) mod tests {
 
         let mut reopened = Node::open(data.path(), seed).unwrap();
         fs::write(source_root.join("tracked"), b"second\nbytes").unwrap();
+        let unstaged = reopened.git_diff(info.repository_id, false).unwrap();
+        assert!(!unstaged.patch.is_empty());
+        assert!(
+            unstaged
+                .patch
+                .windows(b"Binary files".len())
+                .any(|part| part == b"Binary files")
+        );
+        assert!(
+            reopened
+                .git_diff(info.repository_id, true)
+                .unwrap()
+                .patch
+                .is_empty()
+        );
         let second = reopened
             .git_add(info.repository_id, Path::new("tracked"))
             .unwrap();
         assert_ne!(first.oid, second.oid);
         assert_eq!(second.repository_id, info.repository_id);
+        assert!(
+            reopened
+                .git_diff(info.repository_id, false)
+                .unwrap()
+                .patch
+                .is_empty()
+        );
+        assert!(
+            !reopened
+                .git_diff(info.repository_id, true)
+                .unwrap()
+                .patch
+                .is_empty()
+        );
         let second_commit = reopened
             .git_commit(
                 info.repository_id,
@@ -15293,6 +15328,13 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(second_commit.parent_oid, Some(first_commit.oid));
+        assert!(
+            reopened
+                .git_diff(info.repository_id, true)
+                .unwrap()
+                .patch
+                .is_empty()
+        );
         let status = reopened.git_status(info.repository_id).unwrap();
         assert_eq!(status.head_oid, Some(second_commit.oid));
         assert!(!status.history_backed_up);
@@ -15306,6 +15348,58 @@ pub(crate) mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].oid, second_commit.oid);
         assert_eq!(history[1].oid, first_commit.oid);
+        fs::write(source_root.join("text"), b"alpha\r\n").unwrap();
+        reopened
+            .git_add(info.repository_id, Path::new("text"))
+            .unwrap();
+        let added_text = reopened.git_diff(info.repository_id, true).unwrap();
+        assert!(
+            added_text
+                .patch
+                .windows(b"+alpha\r\n".len())
+                .any(|part| part == b"+alpha\r\n")
+        );
+        assert!(
+            reopened
+                .git_diff(info.repository_id, false)
+                .unwrap()
+                .patch
+                .is_empty()
+        );
+        let large_path = source_root.join("large");
+        File::create(&large_path)
+            .unwrap()
+            .set_len(17 * 1024 * 1024)
+            .unwrap();
+        reopened
+            .git_add(info.repository_id, Path::new("large"))
+            .unwrap();
+        reopened
+            .git_commit(
+                info.repository_id,
+                "Test Author",
+                "author@example.test",
+                "large",
+            )
+            .unwrap();
+        assert!(
+            reopened
+                .git_diff(info.repository_id, false)
+                .unwrap()
+                .patch
+                .is_empty()
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&large_path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mode_only = reopened.git_diff(info.repository_id, false).unwrap();
+        assert!(
+            mode_only
+                .patch
+                .windows(b"old mode 100644\nnew mode 100755\n".len())
+                .any(|part| { part == b"old mode 100644\nnew mode 100755\n" })
+        );
         assert!(source_root.join(".mutualbackup/catalog.db").exists());
         drop(reopened);
         fs::remove_dir_all(run_root).unwrap();

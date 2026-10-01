@@ -431,6 +431,16 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitDiff {
+            repository_id,
+            cached,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_diff(repository_id, cached)
+                    .map(LocalResponse::GitDiff)
+            })
+            .await
+        }
         LocalRequest::GitStatus { repository_id } => {
             blocking_node(node, move |node| {
                 node.git_status(repository_id).map(LocalResponse::GitStatus)

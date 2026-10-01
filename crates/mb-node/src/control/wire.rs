@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use mb_core::{NodeId, QuorumPolicy, Seed};
-use mb_git::{GitBranchInfo, GitCommitInfo, GitLogEntry, GitStatus};
+use mb_git::{GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitStatus};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -81,6 +81,10 @@ pub enum LocalRequest {
         repository_id: Uuid,
         name: String,
     },
+    GitDiff {
+        repository_id: Uuid,
+        cached: bool,
+    },
     GitStatus {
         repository_id: Uuid,
     },
@@ -155,6 +159,7 @@ pub enum LocalResponse {
     GitLog(Vec<GitLogEntry>),
     GitBranches(Vec<GitBranchInfo>),
     GitBranchCreated(GitBranchInfo),
+    GitDiff(GitDiff),
     GitStatus(GitStatus),
     Guild(Option<GuildSummary>),
     GuildInvite {
@@ -341,6 +346,10 @@ mod tests {
                 repository_id,
                 name: "older".to_owned(),
             },
+            LocalRequest::GitDiff {
+                repository_id,
+                cached: true,
+            },
             LocalRequest::GitStatus { repository_id },
         ] {
             let envelope = LocalRequestEnvelope {
@@ -397,6 +406,12 @@ mod tests {
                 name: "older".to_owned(),
                 oid: [7; 20],
                 current: false,
+            }),
+            LocalResponse::GitDiff(GitDiff {
+                format_version: 1,
+                repository_id,
+                cached: true,
+                patch: b"diff --git a/tracked b/tracked\n".to_vec(),
             }),
             LocalResponse::GitStatus(GitStatus {
                 format_version: 1,

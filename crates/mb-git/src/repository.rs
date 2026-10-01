@@ -14,6 +14,7 @@ use mb_store::{
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::diff::{DiffError, GitDiff, repository_diff};
 use crate::history::{
     GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, HistoryError, commit_index,
     create_branch, export_graph_source, import_graph_backup, list_branches, log_history,
@@ -44,6 +45,8 @@ pub enum RepositoryError {
     History(#[from] HistoryError),
     #[error("Git status error: {0}")]
     Status(#[from] StatusError),
+    #[error("Git diff error: {0}")]
+    Diff(#[from] DiffError),
     #[error("repository marker or catalog identity conflicts with this root")]
     Conflict,
     #[error("the Git repository is not initialized")]
@@ -241,6 +244,15 @@ impl GitRepository {
             &self.catalog,
             self.repository_id,
             &self.root,
+        )?)
+    }
+
+    pub fn diff(&self, cached: bool) -> Result<GitDiff, RepositoryError> {
+        Ok(repository_diff(
+            &self.catalog,
+            self.repository_id,
+            &self.root,
+            cached,
         )?)
     }
 
