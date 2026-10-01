@@ -634,6 +634,34 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitTags { repository_id } => {
+            blocking_node(node, move |node| {
+                node.git_tags(repository_id).map(LocalResponse::GitTags)
+            })
+            .await
+        }
+        LocalRequest::GitCreateTag {
+            repository_id,
+            worktree_id,
+            name,
+            start_point,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_create_tag(repository_id, worktree_id, &name, start_point.as_deref())
+                    .map(LocalResponse::GitTagCreated)
+            })
+            .await
+        }
+        LocalRequest::GitDeleteTag {
+            repository_id,
+            name,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_delete_tag(repository_id, &name)
+                    .map(LocalResponse::GitTagDeleted)
+            })
+            .await
+        }
         LocalRequest::GitRemoteBranches { repository_id } => {
             blocking_node(node, move |node| {
                 node.git_remote_branches(repository_id)

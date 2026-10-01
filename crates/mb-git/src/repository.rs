@@ -22,13 +22,13 @@ use crate::diff::{DiffError, GitDiff, repository_diff, repository_diff_for_scope
 use crate::fetch::{FetchError, fetch_bare, import_pushed_branch};
 use crate::head::{HeadError, selected_branch};
 use crate::history::{
-    GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, GitRemoteBranchInfo, HistoryError,
-    commit_index, commit_index_for_scope, create_branch, create_branch_for_scope,
-    create_branch_from, create_branch_from_for_scope, delete_branch, delete_branch_for_scope,
-    export_graph_source, import_graph_backup, list_branches, list_branches_for_scope,
-    list_commit_pins, list_remote_branches, log_history, log_history_for_scope, pin_commit,
-    reset_index_for_scope, switch_same_tree_branch, switch_same_tree_branch_for_scope,
-    unpin_commit,
+    GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, GitRemoteBranchInfo, GitTagInfo,
+    HistoryError, commit_index, commit_index_for_scope, create_branch, create_branch_for_scope,
+    create_branch_from, create_branch_from_for_scope, create_tag_for_scope, delete_branch,
+    delete_branch_for_scope, delete_tag, export_graph_source, import_graph_backup, list_branches,
+    list_branches_for_scope, list_commit_pins, list_remote_branches, list_tags, log_history,
+    log_history_for_scope, pin_commit, reset_index_for_scope, switch_same_tree_branch,
+    switch_same_tree_branch_for_scope, unpin_commit,
 };
 use crate::interop::{
     GitInteropError, export_graph_to_git_repository, push_current_branch_to_bare,
@@ -466,6 +466,22 @@ impl GitRepository {
         )?)
     }
 
+    pub fn linked_create_tag(
+        &self,
+        worktree_id: Uuid,
+        name: &str,
+        start_point: Option<&str>,
+    ) -> Result<GitTagInfo, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        self.ensure_no_merge_session()?;
+        Ok(create_tag_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+            name,
+            start_point,
+        )?)
+    }
+
     pub fn linked_diff(&self, worktree_id: Uuid, cached: bool) -> Result<GitDiff, RepositoryError> {
         let info = self.resume_linked_worktree(worktree_id)?;
         Ok(repository_diff_for_scope(
@@ -709,6 +725,32 @@ impl GitRepository {
             name,
             start_point,
         )?)
+    }
+
+    pub fn tags(&self) -> Result<Vec<GitTagInfo>, RepositoryError> {
+        self.resume_checkout()?;
+        Ok(list_tags(&self.catalog, self.repository_id)?)
+    }
+
+    pub fn create_tag(
+        &self,
+        name: &str,
+        start_point: Option<&str>,
+    ) -> Result<GitTagInfo, RepositoryError> {
+        self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
+        Ok(create_tag_for_scope(
+            &self.catalog,
+            crate::GitWorktreeScope::primary(self.repository_id),
+            name,
+            start_point,
+        )?)
+    }
+
+    pub fn delete_tag(&self, name: &str) -> Result<GitTagInfo, RepositoryError> {
+        self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
+        Ok(delete_tag(&self.catalog, self.repository_id, name)?)
     }
 
     pub fn delete_branch(&self, name: &str, force: bool) -> Result<GitBranchInfo, RepositoryError> {
@@ -1659,6 +1701,12 @@ mod tests {
             local.linked_log(linked.worktree_id, 1).unwrap()[0].oid,
             linked_commit.oid
         );
+        let linked_tag = local
+            .linked_create_tag(linked.worktree_id, "linked-v1", None)
+            .unwrap();
+        assert_eq!(linked_tag.oid, linked_commit.oid);
+        assert_eq!(local.tags().unwrap(), vec![linked_tag]);
+        local.delete_tag("linked-v1").unwrap();
         let copy = local
             .linked_create_branch(linked.worktree_id, "linked-copy")
             .unwrap();
@@ -2825,6 +2873,106 @@ mod tests {
         drop(builder);
         drop(stock);
         for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn lightweight_tag_preserves_unbranched_history_until_deleted() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-tag-retention-{}", Uuid::new_v4()));
+        let root = run_root.join("work");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("tracked"), b"base\r\n").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [101_u8; 32];
+        let local = GitRepository::init(&root, repository_id, &key).unwrap();
+        local.stage_file("tracked").unwrap();
+        let base = local.commit("Author", "a@example.test", "base").unwrap();
+        local.create_branch("topic").unwrap();
+        local.switch_branch("topic").unwrap();
+        fs::write(root.join("tracked"), b"tagged\nraw\0bytes").unwrap();
+        local.stage_file("tracked").unwrap();
+        let tagged = local.commit("Author", "a@example.test", "topic").unwrap();
+        let tag = local.create_tag("v1", None).unwrap();
+        assert_eq!(tag.oid, tagged.oid);
+        let alias = local.create_tag("alias", Some("v1")).unwrap();
+        assert_eq!(alias.oid, tag.oid);
+        local.delete_tag("alias").unwrap();
+        assert!(matches!(
+            local.create_tag("v1", None),
+            Err(RepositoryError::History(crate::HistoryError::TagExists))
+        ));
+        assert!(matches!(
+            local.create_tag("v1/sub", None),
+            Err(RepositoryError::History(crate::HistoryError::InvalidTag))
+        ));
+        local.switch_branch("main").unwrap();
+        local.delete_branch("topic", true).unwrap();
+        assert_eq!(local.tags().unwrap(), vec![tag.clone()]);
+        let graph = local.export_graph_source().unwrap();
+        assert!(
+            graph
+                .refs
+                .iter()
+                .any(|reference| reference.name == b"refs/tags/v1" && reference.oid == tagged.oid)
+        );
+        assert!(graph.objects.iter().any(|object| object.oid == tagged.oid));
+        let descriptor = crate::GitBackupDescriptor {
+            format_version: 2,
+            repository_id,
+            refs: graph.refs.clone(),
+            objects: graph.objects.clone(),
+            blobs: graph
+                .blobs
+                .iter()
+                .enumerate()
+                .map(|(index, blob)| crate::GitBackupBlob {
+                    oid: blob.oid,
+                    logical_len: blob.anchor.logical_len,
+                    data_extents: vec![crate::GitDataExtent {
+                        offset: 0,
+                        logical_len: blob.anchor.logical_len,
+                        sectors: vec![mb_core::SectorRef {
+                            id: [index as u8; 32],
+                            root: [index as u8; 32],
+                            logical_len: blob.anchor.logical_len as u32,
+                        }],
+                    }],
+                })
+                .collect(),
+            head_branch: "main".to_owned(),
+        };
+        descriptor.validate().unwrap();
+        assert_eq!(
+            local
+                .prune_unreachable(&crate::GitPruneRoots::default())
+                .unwrap()
+                .native_anchors_removed,
+            0
+        );
+        local.delete_tag("v1").unwrap();
+        assert!(matches!(
+            local.delete_tag("v1"),
+            Err(RepositoryError::History(crate::HistoryError::TagNotFound))
+        ));
+        assert!(
+            local
+                .prune_unreachable(&crate::GitPruneRoots::default())
+                .unwrap()
+                .native_anchors_removed
+                > 0
+        );
+        let current = local.export_graph_source().unwrap();
+        assert_eq!(current.refs.len(), 1);
+        assert_eq!(current.refs[0].oid, base.oid);
+        drop(local);
+        for blob in current.blobs {
             blob.anchor.remove().unwrap();
         }
         fs::remove_dir_all(run_root).unwrap();

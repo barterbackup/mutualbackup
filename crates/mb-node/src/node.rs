@@ -28,7 +28,7 @@ use mb_core::{
 };
 use mb_git::{
     GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitPruneReport, GitPruneRoots,
-    GitRemoteBranchInfo, GitRepository, GitStatus, GitWorktreeInfo,
+    GitRemoteBranchInfo, GitRepository, GitStatus, GitTagInfo, GitWorktreeInfo,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
@@ -1627,6 +1627,36 @@ impl Node {
     pub fn git_branches(&self, repository_id: Uuid) -> Result<Vec<GitBranchInfo>> {
         self.open_git_repository(repository_id)?
             .branches()
+            .map_err(Into::into)
+    }
+
+    pub fn git_tags(&self, repository_id: Uuid) -> Result<Vec<GitTagInfo>> {
+        self.open_git_repository(repository_id)?
+            .tags()
+            .map_err(Into::into)
+    }
+
+    pub fn git_create_tag(
+        &mut self,
+        repository_id: Uuid,
+        worktree_id: Option<Uuid>,
+        name: &str,
+        start_point: Option<&str>,
+    ) -> Result<GitTagInfo> {
+        self.mark_root_dirty(repository_id, "Git tag changed")?;
+        let repository = self.open_git_repository(repository_id)?;
+        match worktree_id {
+            Some(worktree_id) => repository
+                .linked_create_tag(worktree_id, name, start_point)
+                .map_err(Into::into),
+            None => repository.create_tag(name, start_point).map_err(Into::into),
+        }
+    }
+
+    pub fn git_delete_tag(&mut self, repository_id: Uuid, name: &str) -> Result<GitTagInfo> {
+        self.mark_root_dirty(repository_id, "Git tag changed")?;
+        self.open_git_repository(repository_id)?
+            .delete_tag(name)
             .map_err(Into::into)
     }
 

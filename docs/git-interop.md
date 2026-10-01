@@ -14,6 +14,10 @@ mutualgit -C /absolute/path/to/source status
 
 The local binary supports branches, linked worktrees, exact-byte checkout,
 merge, staged reset and restore, diff, log, explicit commit pins, and prune.
+`mutualgit tag` lists, creates, and deletes lightweight commit tags; these refs
+are included in encrypted history backups and keep their commits reachable
+until removed and pruned. Annotated tag objects and stock Git tag exchange are
+still pending.
 `mutualgit --help` gives the current command forms. Staging and checkout do
 not apply Git line-ending rules or content filters. A transforming
 `.gitattributes` rule is rejected before publishing staged bytes.

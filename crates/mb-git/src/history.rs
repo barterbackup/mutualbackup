@@ -38,6 +38,7 @@ const METADATA_PREFIX: &str = "git-metadata-object-v1/";
 const REF_PREFIX: &str = "git-ref-v1/";
 const MAIN_REF: &[u8] = b"refs/heads/main";
 const PIN_REF_PREFIX: &str = "refs/mutualbackup/pins/";
+const TAG_REF_PREFIX: &str = "refs/tags/";
 const MAX_AUTOMERGE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_GRAPH_OBJECTS: usize = 100_000;
 pub(crate) const MAX_GRAPH_METADATA_BYTES: usize = 64 * 1024 * 1024;
@@ -94,6 +95,12 @@ pub enum HistoryError {
     UnbornSelectedBranch,
     #[error("the requested commit pin does not exist")]
     PinNotFound,
+    #[error("the tag name is invalid or conflicts with another tag namespace")]
+    InvalidTag,
+    #[error("the tag already exists")]
+    TagExists,
+    #[error("the tag does not exist")]
+    TagNotFound,
     #[error("switching this branch requires a worktree checkout")]
     CheckoutRequired,
     #[error("the branches changed a path that cannot be merged automatically")]
@@ -135,6 +142,14 @@ pub struct GitBranchInfo {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GitRemoteBranchInfo {
+    pub format_version: u16,
+    pub repository_id: Uuid,
+    pub name: String,
+    pub oid: [u8; 20],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitTagInfo {
     pub format_version: u16,
     pub repository_id: Uuid,
     pub name: String,
@@ -479,6 +494,130 @@ pub fn unpin_commit(
     }
     control.delete_record_if_value(&ref_kind(repository_id), reference.as_bytes(), &encoded)?;
     Ok(())
+}
+
+fn checked_tag_name(name: &str) -> Result<String, HistoryError> {
+    let reference = format!("{TAG_REF_PREFIX}{name}");
+    if name.is_empty() || name.len() > 1024 || !git2::Reference::is_valid_name(&reference) {
+        return Err(HistoryError::InvalidTag);
+    }
+    Ok(reference)
+}
+
+pub fn list_tags(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<Vec<GitTagInfo>, HistoryError> {
+    let mut tags = Vec::new();
+    for (name, encoded) in control.records(&ref_kind(repository_id))? {
+        let Some(name) = name.strip_prefix(TAG_REF_PREFIX.as_bytes()) else {
+            continue;
+        };
+        let name = std::str::from_utf8(name).map_err(|_| HistoryError::IncompatibleRecord)?;
+        checked_tag_name(name).map_err(|_| HistoryError::IncompatibleRecord)?;
+        let record: RefRecord = decode_canonical(&encoded)?;
+        if record.format_version != 1 {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        checked_commit(control, repository_id, Oid::from_bytes(&record.oid)?)?;
+        tags.push(GitTagInfo {
+            format_version: 1,
+            repository_id,
+            name: name.to_owned(),
+            oid: record.oid,
+        });
+        if tags.len() > MAX_GRAPH_OBJECTS {
+            return Err(HistoryError::GraphTooLarge);
+        }
+    }
+    tags.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(tags)
+}
+
+fn tag_target(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    start_point: Option<&str>,
+) -> Result<Oid, HistoryError> {
+    let repository_id = scope.repository_id();
+    let target = match start_point {
+        None | Some("HEAD") => head_oid_for_scope(control, scope)?.ok_or(HistoryError::NoHead)?,
+        Some(value) if value.len() == 40 => Oid::from_str(value)?,
+        Some(value) => {
+            let reference = if value.starts_with("refs/") {
+                value.to_owned()
+            } else if let Some(remote) = value.strip_prefix("origin/") {
+                format!("refs/remotes/origin/{remote}")
+            } else {
+                format!("refs/heads/{value}")
+            };
+            match ref_oid(control, repository_id, reference.as_bytes())? {
+                Some(oid) => oid,
+                None if reference.starts_with("refs/heads/") => ref_oid(
+                    control,
+                    repository_id,
+                    format!("{TAG_REF_PREFIX}{value}").as_bytes(),
+                )?
+                .ok_or(HistoryError::StartPointNotFound)?,
+                None => return Err(HistoryError::StartPointNotFound),
+            }
+        }
+    };
+    checked_commit(control, repository_id, target)?;
+    Ok(target)
+}
+
+pub(crate) fn create_tag_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    name: &str,
+    start_point: Option<&str>,
+) -> Result<GitTagInfo, HistoryError> {
+    let repository_id = scope.repository_id();
+    let reference = checked_tag_name(name)?;
+    for existing in list_tags(control, repository_id)? {
+        if existing.name == name {
+            return Err(HistoryError::TagExists);
+        }
+        if existing.name.starts_with(&format!("{name}/"))
+            || name.starts_with(&format!("{}/", existing.name))
+        {
+            return Err(HistoryError::InvalidTag);
+        }
+    }
+    let target = tag_target(control, scope, start_point)?;
+    let info = GitTagInfo {
+        format_version: 1,
+        repository_id,
+        name: name.to_owned(),
+        oid: target.as_bytes().try_into().expect("SHA-1 OID"),
+    };
+    if !control.put_record_if_absent(
+        &ref_kind(repository_id),
+        reference.as_bytes(),
+        &fetched_ref_record(info.oid)?,
+    )? {
+        return Err(HistoryError::TagExists);
+    }
+    Ok(info)
+}
+
+pub fn delete_tag(
+    control: &ControlStore,
+    repository_id: Uuid,
+    name: &str,
+) -> Result<GitTagInfo, HistoryError> {
+    let reference = checked_tag_name(name)?;
+    let tag = list_tags(control, repository_id)?
+        .into_iter()
+        .find(|tag| tag.name == name)
+        .ok_or(HistoryError::TagNotFound)?;
+    control.delete_record_if_value(
+        &ref_kind(repository_id),
+        reference.as_bytes(),
+        &fetched_ref_record(tag.oid)?,
+    )?;
+    Ok(tag)
 }
 
 fn checked_commit(

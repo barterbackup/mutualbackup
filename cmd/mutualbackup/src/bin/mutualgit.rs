@@ -89,6 +89,13 @@ enum Command {
         name: Option<String>,
         start_point: Option<String>,
     },
+    /// List, create, or delete lightweight commit tags.
+    Tag {
+        #[arg(short = 'd', long = "delete")]
+        delete: bool,
+        name: Option<String>,
+        start_point: Option<String>,
+    },
     /// Keep a commit and its ancestors reachable from signed history backups.
     Pin { oid: String },
     /// Release an explicit commit pin; other refs and retained backups still apply.
@@ -533,6 +540,76 @@ async fn main() -> Result<()> {
                         }
                         println!("  remotes/{}", remote.name);
                     }
+                }
+            }
+        }
+        Command::Tag {
+            delete,
+            name,
+            start_point,
+        } => {
+            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
+            if let Some(name) = name {
+                if delete {
+                    if start_point.is_some() {
+                        bail!("tag deletion does not accept a start point");
+                    }
+                    let LocalResponse::GitTagDeleted(tag) = local_control_call(
+                        &socket,
+                        &LocalRequest::GitDeleteTag {
+                            repository_id,
+                            name: name.clone(),
+                        },
+                    )
+                    .await?
+                    else {
+                        bail!("daemon returned the wrong response to Git tag deletion");
+                    };
+                    if tag.repository_id != repository_id || tag.name != name {
+                        bail!("daemon deleted an unexpected Git tag");
+                    }
+                    println!(
+                        "Deleted tag {} (was {})",
+                        tag.name,
+                        git2::Oid::from_bytes(&tag.oid)?
+                    );
+                } else {
+                    let LocalResponse::GitTagCreated(tag) = local_control_call(
+                        &socket,
+                        &LocalRequest::GitCreateTag {
+                            repository_id,
+                            worktree_id,
+                            name: name.clone(),
+                            start_point,
+                        },
+                    )
+                    .await?
+                    else {
+                        bail!("daemon returned the wrong response to Git tag creation");
+                    };
+                    if tag.repository_id != repository_id || tag.name != name {
+                        bail!("daemon created an unexpected Git tag");
+                    }
+                    println!(
+                        "Created tag {} at {}",
+                        tag.name,
+                        git2::Oid::from_bytes(&tag.oid)?
+                    );
+                }
+            } else {
+                if delete || start_point.is_some() {
+                    bail!("a tag name is required");
+                }
+                let LocalResponse::GitTags(tags) =
+                    local_control_call(&socket, &LocalRequest::GitTags { repository_id }).await?
+                else {
+                    bail!("daemon returned the wrong response to Git tag listing");
+                };
+                for tag in tags {
+                    if tag.repository_id != repository_id || tag.format_version != 1 {
+                        bail!("daemon listed a tag from another repository");
+                    }
+                    println!("{}", tag.name);
                 }
             }
         }

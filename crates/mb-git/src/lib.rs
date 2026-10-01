@@ -53,7 +53,7 @@ pub use head::HeadError;
 #[cfg(target_os = "linux")]
 pub use history::{
     GitBranchInfo, GitCommitInfo, GitGraphBlobSource, GitGraphObject, GitGraphRef, GitGraphSource,
-    GitLogEntry, GitRemoteBranchInfo, HistoryError,
+    GitLogEntry, GitRemoteBranchInfo, GitTagInfo, HistoryError,
 };
 #[cfg(target_os = "linux")]
 pub use interop::GitInteropError;

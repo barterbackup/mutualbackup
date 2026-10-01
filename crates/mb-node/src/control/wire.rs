@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use mb_core::{NodeId, QuorumPolicy, Seed};
 use mb_git::{
     GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitPruneReport, GitRemoteBranchInfo,
-    GitStatus, GitWorktreeInfo,
+    GitStatus, GitTagInfo, GitWorktreeInfo,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -162,6 +162,19 @@ pub enum LocalRequest {
     },
     GitBranches {
         repository_id: Uuid,
+    },
+    GitTags {
+        repository_id: Uuid,
+    },
+    GitCreateTag {
+        repository_id: Uuid,
+        worktree_id: Option<Uuid>,
+        name: String,
+        start_point: Option<String>,
+    },
+    GitDeleteTag {
+        repository_id: Uuid,
+        name: String,
     },
     GitExportToGitRepository {
         repository_id: Uuid,
@@ -336,6 +349,9 @@ pub enum LocalResponse {
     GitCommitted(GitCommitInfo),
     GitLog(Vec<GitLogEntry>),
     GitBranches(Vec<GitBranchInfo>),
+    GitTags(Vec<GitTagInfo>),
+    GitTagCreated(GitTagInfo),
+    GitTagDeleted(GitTagInfo),
     GitObjectsExported {
         repository_id: Uuid,
         object_count: u32,
@@ -678,6 +694,17 @@ mod tests {
                 limit: 10,
             },
             LocalRequest::GitBranches { repository_id },
+            LocalRequest::GitTags { repository_id },
+            LocalRequest::GitCreateTag {
+                repository_id,
+                worktree_id: None,
+                name: "v1".to_owned(),
+                start_point: Some("main".to_owned()),
+            },
+            LocalRequest::GitDeleteTag {
+                repository_id,
+                name: "v1".to_owned(),
+            },
             LocalRequest::GitExportToGitRepository {
                 repository_id,
                 source_root: PathBuf::from("/tmp/source"),
@@ -869,6 +896,24 @@ mod tests {
                 oid: [7; 20],
                 current: true,
             }]),
+            LocalResponse::GitTags(vec![GitTagInfo {
+                format_version: 1,
+                repository_id,
+                name: "v1".to_owned(),
+                oid: [7; 20],
+            }]),
+            LocalResponse::GitTagCreated(GitTagInfo {
+                format_version: 1,
+                repository_id,
+                name: "v1".to_owned(),
+                oid: [7; 20],
+            }),
+            LocalResponse::GitTagDeleted(GitTagInfo {
+                format_version: 1,
+                repository_id,
+                name: "v1".to_owned(),
+                oid: [7; 20],
+            }),
             LocalResponse::GitObjectsExported {
                 repository_id,
                 object_count: 2,
