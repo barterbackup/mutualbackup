@@ -28,19 +28,13 @@ use crate::history::{
 };
 use crate::interop::GitInteropError;
 use crate::stage::{StageError, anchors_for_oid, object_kind, stage_path_key};
-use crate::{GitAnchorError, blob_oid_from_anchor};
+use crate::{GitAnchorError, NativeSource, blob_oid_from_anchor};
 
 const FETCH_PREFIX: &str = "git-bare-fetch-intent-v1/";
 const BLOB_PREFIX: &str = "git-bare-fetch-blob-intent-v1/";
 const VERIFIED_PREFIX: &str = "git-bare-fetch-verified-v1/";
 const PUSH_PREFIX: &str = "git-stock-push-intent-v1/";
 const ACTIVE: &[u8] = b"active";
-
-#[derive(Clone, Copy)]
-pub(crate) struct ImportTarget<'a> {
-    pub root: &'a Path,
-    pub backend: SourceBackendKind,
-}
 
 #[derive(Debug, Error)]
 pub enum FetchError {
@@ -852,7 +846,7 @@ fn check_fetched_tags(
 pub(crate) fn fetch_bare(
     control: &ControlStore,
     repository_id: Uuid,
-    target: ImportTarget<'_>,
+    target: NativeSource<'_>,
     source_path: &Path,
 ) -> Result<usize, FetchError> {
     if control
@@ -952,7 +946,7 @@ pub(crate) fn fetch_bare(
 pub(crate) fn import_pushed_branch(
     control: &ControlStore,
     repository_id: Uuid,
-    target: ImportTarget<'_>,
+    target: NativeSource<'_>,
     source_path: &Path,
     target_branch: &str,
     target_oid: [u8; 20],
@@ -973,7 +967,7 @@ pub(crate) fn import_pushed_branch(
 pub(crate) fn import_pushed_tag(
     control: &ControlStore,
     repository_id: Uuid,
-    target: ImportTarget<'_>,
+    target: NativeSource<'_>,
     source_path: &Path,
     target_tag: &str,
     target_oid: [u8; 20],
@@ -995,7 +989,7 @@ pub(crate) fn import_pushed_tag(
 fn import_pushed_ref(
     control: &ControlStore,
     repository_id: Uuid,
-    target: ImportTarget<'_>,
+    target: NativeSource<'_>,
     source_path: &Path,
     target_name: &str,
     target_oid: [u8; 20],
@@ -1366,7 +1360,7 @@ mod tests {
         import_pushed_branch(
             &control,
             repository_id,
-            ImportTarget {
+            NativeSource {
                 root: &root,
                 backend: SourceBackendKind::ReflinkV1,
             },
@@ -1472,7 +1466,7 @@ mod tests {
         import_pushed_tag(
             &control,
             repository_id,
-            ImportTarget {
+            NativeSource {
                 root: &root,
                 backend: SourceBackendKind::ReflinkV1,
             },

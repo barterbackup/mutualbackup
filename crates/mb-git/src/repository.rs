@@ -14,13 +14,14 @@ use mb_store::{
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::NativeSource;
 use crate::checkout::{
     CheckoutError, begin_hard_reset_for_scope, begin_merge_branch, begin_pull,
     begin_restore_for_scope, begin_switch, begin_switch_for_scope, continue_merge,
     resume_pending_checkout, resume_pending_checkout_for_scope,
 };
 use crate::diff::{DiffError, GitDiff, repository_diff, repository_diff_for_scope};
-use crate::fetch::{FetchError, ImportTarget, fetch_bare, import_pushed_branch, import_pushed_tag};
+use crate::fetch::{FetchError, fetch_bare, import_pushed_branch, import_pushed_tag};
 use crate::head::{HeadError, selected_branch, selected_branch_for_scope};
 use crate::history::{
     GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, GitRemoteBranchInfo, GitTagInfo,
@@ -222,6 +223,13 @@ impl GitRepository {
     pub fn with_source_backend(mut self, source_backend: SourceBackendKind) -> Self {
         self.source_backend = source_backend;
         self
+    }
+
+    fn native_source(&self) -> NativeSource<'_> {
+        NativeSource {
+            root: &self.root,
+            backend: self.source_backend,
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -1061,10 +1069,7 @@ impl GitRepository {
         Ok(fetch_bare(
             &self.catalog,
             self.repository_id,
-            ImportTarget {
-                root: &self.root,
-                backend: self.source_backend,
-            },
+            self.native_source(),
             source.as_ref(),
         )?)
     }
@@ -1081,10 +1086,7 @@ impl GitRepository {
         Ok(import_pushed_branch(
             &self.catalog,
             self.repository_id,
-            ImportTarget {
-                root: &self.root,
-                backend: self.source_backend,
-            },
+            self.native_source(),
             source_git_directory.as_ref(),
             target_branch,
             target_oid,
@@ -1104,10 +1106,7 @@ impl GitRepository {
         Ok(import_pushed_tag(
             &self.catalog,
             self.repository_id,
-            ImportTarget {
-                root: &self.root,
-                backend: self.source_backend,
-            },
+            self.native_source(),
             source_git_directory.as_ref(),
             target_tag,
             target_oid,
@@ -1126,7 +1125,7 @@ impl GitRepository {
         Ok(begin_pull(
             &self.catalog,
             self.repository_id,
-            &self.root,
+            self.native_source(),
             &self.directory,
             author_name,
             author_email,
@@ -1145,7 +1144,7 @@ impl GitRepository {
         Ok(begin_merge_branch(
             &self.catalog,
             self.repository_id,
-            &self.root,
+            self.native_source(),
             &self.directory,
             branch,
             author_name,
@@ -1159,7 +1158,7 @@ impl GitRepository {
         Ok(continue_merge(
             &self.catalog,
             self.repository_id,
-            &self.root,
+            self.native_source(),
             &self.directory,
         )?)
     }

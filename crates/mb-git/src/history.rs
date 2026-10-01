@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use git2::{Branch, Index, IndexEntry, IndexTime, ObjectType, Oid, Repository, Signature};
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
@@ -30,7 +30,7 @@ use crate::stage::{
 };
 use crate::status::{StatusError, TreeFiles, files_for_commit};
 use crate::{
-    GitAnchorError, GitBackupDescriptor, GitBackupError, GitWorktreeScope, NativeOdb,
+    GitAnchorError, GitBackupDescriptor, GitBackupError, GitWorktreeScope, NativeOdb, NativeSource,
     blob_oid_from_anchor,
 };
 
@@ -1234,7 +1234,7 @@ pub(crate) struct MergeIdentity<'a> {
 pub(crate) fn create_pathwise_merge_commit(
     control: &ControlStore,
     repository_id: Uuid,
-    root_path: &Path,
+    source: NativeSource<'_>,
     ours: Oid,
     theirs: Oid,
     identity: MergeIdentity<'_>,
@@ -1354,7 +1354,7 @@ pub(crate) fn create_pathwise_merge_commit(
         }
     }
     for (path, inputs, blob) in &generated {
-        capture_generated_blob(control, repository_id, root_path, path, *inputs, blob)?;
+        capture_generated_blob(control, repository_id, source, path, *inputs, blob)?;
     }
 
     let mut anchors = Vec::new();

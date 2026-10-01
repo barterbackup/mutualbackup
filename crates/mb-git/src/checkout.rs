@@ -39,7 +39,7 @@ use crate::stage::{
     stage_path_key, staged_entries, staged_entries_for_scope,
 };
 use crate::status::{StatusError, TreeFiles, files_for_commit, repository_status};
-use crate::{GitAnchorError, GitWorktreeScope, blob_oid_from_anchor};
+use crate::{GitAnchorError, GitWorktreeScope, NativeSource, blob_oid_from_anchor};
 
 const INTENT_PREFIX: &str = "git-checkout-intent-v1/";
 const WORKTREE_INTENT_PREFIX: &str = "git-worktree-checkout-intent-v1/";
@@ -1118,11 +1118,12 @@ pub(crate) fn begin_switch_for_scope(
 pub(crate) fn begin_pull(
     control: &ControlStore,
     repository_id: Uuid,
-    root_path: &Path,
+    source: NativeSource<'_>,
     catalog_dir: &PinnedDirectory,
     author_name: &str,
     author_email: &str,
 ) -> Result<Oid, CheckoutError> {
+    let root_path = source.root;
     resume_pending_checkout(control, repository_id, root_path, catalog_dir)?;
     let branch = selected_branch(control, repository_id)?;
     let remote_ref = format!("refs/remotes/origin/{branch}");
@@ -1142,7 +1143,7 @@ pub(crate) fn begin_pull(
             return begin_divergent_merge(
                 control,
                 repository_id,
-                root_path,
+                source,
                 catalog_dir,
                 DivergentMerge {
                     selected: &branch,
@@ -1180,12 +1181,13 @@ pub(crate) fn begin_pull(
 pub(crate) fn begin_merge_branch(
     control: &ControlStore,
     repository_id: Uuid,
-    root_path: &Path,
+    source: NativeSource<'_>,
     catalog_dir: &PinnedDirectory,
     branch: &str,
     author_name: &str,
     author_email: &str,
 ) -> Result<Oid, CheckoutError> {
+    let root_path = source.root;
     resume_pending_checkout(control, repository_id, root_path, catalog_dir)?;
     if branch.len() > 1024 || !Branch::name_is_valid(branch)? {
         return Err(HistoryError::InvalidBranch.into());
@@ -1208,7 +1210,7 @@ pub(crate) fn begin_merge_branch(
             return begin_divergent_merge(
                 control,
                 repository_id,
-                root_path,
+                source,
                 catalog_dir,
                 DivergentMerge {
                     selected: &selected,
@@ -1244,10 +1246,11 @@ pub(crate) fn begin_merge_branch(
 fn begin_divergent_merge(
     control: &ControlStore,
     repository_id: Uuid,
-    root_path: &Path,
+    source: NativeSource<'_>,
     catalog_dir: &PinnedDirectory,
     merge: DivergentMerge<'_>,
 ) -> Result<Oid, CheckoutError> {
+    let root_path = source.root;
     if merge.author_name.is_empty() || merge.author_email.is_empty() {
         return Err(CheckoutError::MissingMergeIdentity);
     }
@@ -1258,7 +1261,7 @@ fn begin_divergent_merge(
     let merged = match create_pathwise_merge_commit(
         control,
         repository_id,
-        root_path,
+        source,
         merge.old,
         merge.target,
         MergeIdentity {
@@ -1312,9 +1315,10 @@ fn begin_divergent_merge(
 pub(crate) fn continue_merge(
     control: &ControlStore,
     repository_id: Uuid,
-    root_path: &Path,
+    source: NativeSource<'_>,
     catalog_dir: &PinnedDirectory,
 ) -> Result<Oid, CheckoutError> {
+    let root_path = source.root;
     resume_pending_checkout(control, repository_id, root_path, catalog_dir)?;
     let (session, _) =
         load_merge_session(control, repository_id)?.ok_or(MergeBlobError::MissingSession)?;
@@ -1353,7 +1357,7 @@ pub(crate) fn continue_merge(
     let merged = create_pathwise_merge_commit(
         control,
         repository_id,
-        root_path,
+        source,
         ours,
         theirs,
         MergeIdentity {

@@ -11,7 +11,8 @@ restored through recovery records this binding on its first successful probe.
 New Git adds select a capture plan through that binding. An interrupted add
 replays its recorded plan, so a backend change cannot reinterpret its bytes.
 Fetched and pushed Git blobs likewise select a native import plan through the
-binding; an interrupted import replays its recorded plan.
+binding; an interrupted import replays its recorded plan. Automatic content
+merges use the same backend for their generated raw bytes.
 
 ```sh
 mutualgit init /absolute/path/to/source

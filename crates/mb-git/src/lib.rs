@@ -4,10 +4,12 @@
 //! native anchor is the payload store; libgit2 supplies the Git object ID.
 
 #[cfg(target_os = "linux")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use git2::{ObjectType, Oid};
 use mb_core::KeyMaterial;
+#[cfg(target_os = "linux")]
+use mb_store::SourceBackendKind;
 use mb_store::{AnchorError, FileAnchorManifest};
 use thiserror::Error;
 
@@ -74,6 +76,13 @@ pub use status::{GitChange, GitStatus, GitStatusChange, StatusError};
 #[cfg(target_os = "linux")]
 pub use worktree::{GitWorktreeError, GitWorktreeInfo, GitWorktreeState, linked_worktree_marker};
 pub use worktree_scope::GitWorktreeScope;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+pub(crate) struct NativeSource<'a> {
+    pub root: &'a Path,
+    pub backend: SourceBackendKind,
+}
 
 #[derive(Debug, Error)]
 pub enum GitAnchorError {

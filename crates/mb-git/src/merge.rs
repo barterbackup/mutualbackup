@@ -15,7 +15,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::stage::{StageError, anchors_for_oid, object_kind, stage_path_key};
-use crate::{GitAnchorError, NativeOdb, blob_oid_from_anchor};
+use crate::{GitAnchorError, NativeOdb, NativeSource, blob_oid_from_anchor};
 
 const INTENT_PREFIX: &str = "git-merge-blob-intent-v1/";
 const SESSION_PREFIX: &str = "git-merge-session-v1/";
@@ -364,7 +364,7 @@ fn run_after_merge_blob_capture_hook() {
 pub(crate) fn capture_generated_blob(
     control: &ControlStore,
     repository_id: Uuid,
-    root_path: &Path,
+    source: NativeSource<'_>,
     path: &[u8],
     inputs: MergeFileInputs,
     blob: &GeneratedBlob,
@@ -379,7 +379,9 @@ pub(crate) fn capture_generated_blob(
         inputs,
         result_oid: blob.oid.as_bytes().try_into().expect("SHA-1 OID"),
         result_mode: blob.mode,
-        plan: SourceBlobImportPlan::plan_direct(root_path, blob.bytes.len() as u64)?,
+        plan: source
+            .backend
+            .plan_blob_import(source.root, blob.bytes.len() as u64)?,
     };
     if !control.put_record_if_absent(
         &intent_kind(repository_id),
@@ -388,7 +390,7 @@ pub(crate) fn capture_generated_blob(
     )? {
         return Err(MergeBlobError::IncompatibleRecord);
     }
-    resume_pending_merge_blob(control, repository_id, root_path)
+    resume_pending_merge_blob(control, repository_id, source.root)
 }
 
 pub(crate) fn has_pending_merge_blob(
