@@ -1438,6 +1438,11 @@ impl Node {
         {
             anyhow::bail!("Git backup status checkpoint belongs to another guild");
         }
+        if checkpoint.checkpoint.format_version != 7 {
+            // Older checkpoints may certify a revision without a complete
+            // root-bound packing catalog for every Git history sector.
+            return Ok(status);
+        }
         let Some(revision) = checkpoint
             .checkpoint
             .revisions
