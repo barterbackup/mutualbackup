@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use git2::{ObjectType, Oid, Repository};
 use mb_core::{ModelError, decode_canonical};
-use mb_store::{ControlStore, DatabaseError};
+use mb_store::{AnchorError, ControlStore, DatabaseError, PinnedDirectory};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -26,6 +26,8 @@ pub(crate) type TreeFiles = BTreeMap<Vec<u8>, ([u8; 20], u32)>;
 
 #[derive(Debug, Error)]
 pub enum StatusError {
+    #[error("pinned worktree path error: {0}")]
+    Anchor(#[from] AnchorError),
     #[error("Git staging error: {0}")]
     Stage(#[from] StageError),
     #[error("encrypted catalog error: {0}")]
@@ -142,10 +144,12 @@ pub(crate) fn files_for_commit(
         for entry in tree.iter() {
             let mut path = prefix.clone();
             path.extend_from_slice(entry.name_bytes());
-            if entry.kind() == Some(ObjectType::Tree) {
+            if entry.kind() == Some(ObjectType::Tree) && entry.filemode() == 0o040000 {
                 path.push(b'/');
                 pending.push((path, entry.id()));
-            } else if entry.kind() == Some(ObjectType::Blob) {
+            } else if entry.kind() == Some(ObjectType::Blob)
+                && matches!(entry.filemode(), 0o100644 | 0o100755 | 0o120000)
+            {
                 files.insert(
                     path,
                     (
@@ -184,6 +188,28 @@ fn worktree_change(
         }
         Err(error) => return Err(error.into()),
     };
+    if staged.mode == 0o120000 {
+        if !metadata.file_type().is_symlink() {
+            return Ok(Some(GitChange::TypeChanged));
+        }
+        let relative = PathBuf::from(OsString::from_vec(path.to_vec()));
+        let root = PinnedDirectory::open(root)?;
+        let parent = relative.parent().ok_or(StatusError::IncompatibleRecord)?;
+        let directory = if parent.as_os_str().is_empty() {
+            root
+        } else {
+            root.open_descendant_directory(parent)?
+        };
+        let target = directory
+            .read_child_symlink(
+                relative
+                    .file_name()
+                    .ok_or(StatusError::IncompatibleRecord)?,
+            )?
+            .ok_or(StatusError::IncompatibleRecord)?;
+        let oid = Oid::hash_object(ObjectType::Blob, &target.0)?;
+        return Ok((oid.as_bytes() != staged.oid).then_some(GitChange::Modified));
+    }
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Ok(Some(GitChange::TypeChanged));
     }

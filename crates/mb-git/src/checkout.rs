@@ -1,9 +1,10 @@
-//! Crash-replayable checkout for regular files. The selected HEAD and index
+//! Crash-replayable checkout for files and symlinks. The selected HEAD and index
 //! change together only after every target file is durably in the worktree.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, Permissions};
+use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -11,7 +12,10 @@ use std::path::{Component, Path, PathBuf};
 
 use git2::{Branch, ObjectType, Oid};
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
-use mb_store::{AnchorError, ControlStore, DatabaseError, NativeFileId, PinnedDirectory};
+use mb_store::{
+    AnchorError, ControlStore, DatabaseError, FileAnchorManifest, NativeFileId, PinnedDirectory,
+    PinnedEntryKind,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -298,14 +302,119 @@ fn file_fingerprint(metadata: &Metadata) -> (u64, u64, u64, u32, i64, i64, i64, 
     )
 }
 
+fn entry_kind(mode: u32) -> Result<PinnedEntryKind, CheckoutError> {
+    match mode {
+        0o100644 | 0o100755 => Ok(PinnedEntryKind::RegularFile),
+        0o120000 => Ok(PinnedEntryKind::Symlink),
+        _ => Err(CheckoutError::UnsupportedTopology),
+    }
+}
+
+fn entry_identity_for(
+    parent: &PinnedDirectory,
+    name: &OsStr,
+    mode: u32,
+) -> Result<Option<NativeFileId>, CheckoutError> {
+    let result = match entry_kind(mode)? {
+        PinnedEntryKind::RegularFile => parent.entry_identity(name, false),
+        PinnedEntryKind::Symlink => parent.symlink_identity(name),
+    };
+    match result {
+        Ok(identity) => Ok(identity),
+        Err(AnchorError::UnsupportedObject(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn entry_exists(parent: &PinnedDirectory, name: &OsStr) -> Result<bool, CheckoutError> {
+    match parent.entry_identity(name, false) {
+        Ok(Some(_)) | Err(AnchorError::UnsupportedObject(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn move_entry(
+    source: &PinnedDirectory,
+    source_name: &OsStr,
+    identity: NativeFileId,
+    destination: &PinnedDirectory,
+    destination_name: &OsStr,
+    mode: u32,
+) -> Result<(), CheckoutError> {
+    match entry_kind(mode)? {
+        PinnedEntryKind::RegularFile => source.move_child_file_no_replace(
+            source_name,
+            identity,
+            destination,
+            destination_name,
+        )?,
+        PinnedEntryKind::Symlink => source.move_child_symlink_no_replace(
+            source_name,
+            identity,
+            destination,
+            destination_name,
+        )?,
+    }
+    Ok(())
+}
+
+fn remove_staged_entry(
+    staging: &PinnedDirectory,
+    name: &OsStr,
+    identity: NativeFileId,
+    mode: u32,
+) -> Result<(), CheckoutError> {
+    match entry_kind(mode)? {
+        PinnedEntryKind::RegularFile => staging.remove_child_file(name)?,
+        PinnedEntryKind::Symlink => staging.remove_child_symlink(name, identity)?,
+    }
+    Ok(())
+}
+
+fn publish_staged_target(
+    staging: &PinnedDirectory,
+    name: &OsStr,
+    anchor: &FileAnchorManifest,
+    mode: u32,
+) -> Result<(), CheckoutError> {
+    match entry_kind(mode)? {
+        PinnedEntryKind::RegularFile => staging.publish_reflink_child(name, anchor, mode)?,
+        PinnedEntryKind::Symlink => {
+            if anchor.logical_len == 0 || anchor.logical_len > 4095 {
+                return Err(CheckoutError::UnsupportedTopology);
+            }
+            let mut bytes = Vec::with_capacity(anchor.logical_len as usize);
+            anchor.open_verified()?.take(4096).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 != anchor.logical_len || bytes.contains(&0) {
+                return Err(CheckoutError::IncompatibleIntent);
+            }
+            staging.publish_symlink_child(name, &bytes)?;
+        }
+    }
+    Ok(())
+}
+
 fn verify_file(
     parent: &PinnedDirectory,
     name: &OsStr,
     identity: NativeFileId,
     expected: &CheckoutFile,
 ) -> Result<(), CheckoutError> {
-    if parent.entry_identity(name, false)? != Some(identity) {
+    if entry_identity_for(parent, name, expected.mode)? != Some(identity) {
         return Err(CheckoutError::DirtyWorktree);
+    }
+    if expected.mode == 0o120000 {
+        let (target, observed) = parent
+            .read_child_symlink(name)?
+            .ok_or(CheckoutError::DirtyWorktree)?;
+        if observed != identity
+            || Oid::hash_object(ObjectType::Blob, &target)?.as_bytes() != expected.oid
+            || entry_identity_for(parent, name, expected.mode)? != Some(identity)
+        {
+            return Err(CheckoutError::DirtyWorktree);
+        }
+        return Ok(());
     }
     let file: File = parent
         .open_child_file(name)?
@@ -323,7 +432,7 @@ fn verify_file(
     let oid = Oid::hash_file(ObjectType::Blob, descriptor)?;
     if oid.as_bytes() != expected.oid
         || file_fingerprint(&before) != file_fingerprint(&file.metadata()?)
-        || parent.entry_identity(name, false)? != Some(identity)
+        || entry_identity_for(parent, name, expected.mode)? != Some(identity)
     {
         return Err(CheckoutError::DirtyWorktree);
     }
@@ -357,7 +466,7 @@ fn apply_old_deletion(
         .ok_or(CheckoutError::IncompatibleIntent)?;
     let old_id = entry.old_id.ok_or(CheckoutError::IncompatibleIntent)?;
     let staged = stage_name(index);
-    match staging.entry_identity(&staged, false)? {
+    match entry_identity_for(staging, OsStr::new(&staged), old.mode)? {
         Some(identity) if identity == old_id => {
             verify_file(staging, OsStr::new(&staged), old_id, old)?;
             return Ok(());
@@ -366,11 +475,18 @@ fn apply_old_deletion(
         None => {}
     }
     let (parent, leaf) = parent_and_name(root, &entry.path)?;
-    if parent.entry_identity(&leaf, false)? != Some(old_id) {
+    if entry_identity_for(&parent, &leaf, old.mode)? != Some(old_id) {
         return Err(CheckoutError::DirtyWorktree);
     }
     verify_file(&parent, &leaf, old_id, old)?;
-    parent.move_child_file_no_replace(&leaf, old_id, staging, &staged)?;
+    move_entry(
+        &parent,
+        &leaf,
+        old_id,
+        staging,
+        OsStr::new(&staged),
+        old.mode,
+    )?;
     verify_file(staging, OsStr::new(&staged), old_id, old)?;
     Ok(())
 }
@@ -392,14 +508,13 @@ fn published_target_file(
         .ok_or(CheckoutError::IncompatibleIntent)?;
     let new_id = entry.new_id.ok_or(CheckoutError::IncompatibleIntent)?;
     let (parent, leaf) = parent_and_name(root, &entry.path)?;
-    match parent.entry_identity(&leaf, false) {
-        Ok(Some(identity)) if identity == new_id => {
+    match entry_identity_for(&parent, &leaf, target.mode)? {
+        Some(identity) if identity == new_id => {
             verify_file(&parent, &leaf, new_id, target)?;
             Ok(true)
         }
-        Ok(None) | Err(AnchorError::UnsupportedObject(_)) => Ok(false),
-        Ok(Some(_)) => Err(CheckoutError::DirtyWorktree),
-        Err(error) => Err(error.into()),
+        None => Ok(false),
+        Some(_) => Err(CheckoutError::DirtyWorktree),
     }
 }
 
@@ -698,13 +813,10 @@ pub(crate) fn begin_switch(
         return Err(CheckoutError::TooManyFiles);
     }
     for (path, (oid, mode)) in &old_tree {
-        if !matches!(mode, 0o100644 | 0o100755) {
-            return Err(CheckoutError::UnsupportedTopology);
-        }
+        entry_kind(*mode)?;
         let (parent, leaf) = parent_and_name(&root, path)?;
-        let identity = parent
-            .entry_identity(&leaf, false)?
-            .ok_or(CheckoutError::DirtyWorktree)?;
+        let identity =
+            entry_identity_for(&parent, &leaf, *mode)?.ok_or(CheckoutError::DirtyWorktree)?;
         verify_file(
             &parent,
             &leaf,
@@ -750,13 +862,16 @@ pub(crate) fn begin_switch(
                 .as_ref()
                 .ok_or(CheckoutError::IncompatibleIntent)?;
             Some(
-                parent
-                    .entry_identity(leaf, false)?
-                    .ok_or(CheckoutError::DirtyWorktree)?,
+                entry_identity_for(
+                    parent,
+                    leaf,
+                    old.ok_or(CheckoutError::IncompatibleIntent)?.1,
+                )?
+                .ok_or(CheckoutError::DirtyWorktree)?,
             )
         } else {
             if let Some((parent, leaf)) = &existing_parent
-                && parent.entry_identity(leaf, false)?.is_some()
+                && entry_exists(parent, leaf)?
             {
                 return Err(CheckoutError::DirtyWorktree);
             }
@@ -769,10 +884,8 @@ pub(crate) fn begin_switch(
         });
         let new_file = new
             .map(|(oid, mode)| {
-                if !matches!(mode, 0o100644 | 0o100755) {
-                    return Err(CheckoutError::UnsupportedTopology);
-                }
-                Ok(CheckoutFile {
+                entry_kind(*mode)?;
+                Ok::<_, CheckoutError>(CheckoutFile {
                     oid: *oid,
                     mode: *mode,
                     anchor_id: choose_anchor(
@@ -875,7 +988,7 @@ fn apply_intent(
                 continue;
             };
             let name = stage_name(index);
-            if let Some(identity) = staging.entry_identity(&name, false)? {
+            if let Some(identity) = entry_identity_for(&staging, OsStr::new(&name), target.mode)? {
                 verify_file(&staging, OsStr::new(&name), identity, target)?;
                 if entry.new_id.is_some_and(|recorded| recorded != identity) {
                     return Err(CheckoutError::IncompatibleIntent);
@@ -890,9 +1003,8 @@ fn apply_intent(
                         .into_iter()
                         .find(|anchor| anchor.anchor_id == target.anchor_id)
                         .ok_or(CheckoutError::MissingAnchor)?;
-                staging.publish_reflink_child(&name, &anchor, target.mode)?;
-                let identity = staging
-                    .entry_identity(&name, false)?
+                publish_staged_target(&staging, OsStr::new(&name), &anchor, target.mode)?;
+                let identity = entry_identity_for(&staging, OsStr::new(&name), target.mode)?
                     .ok_or(CheckoutError::IncompatibleIntent)?;
                 verify_file(&staging, OsStr::new(&name), identity, target)?;
                 entry.new_id = Some(identity);
@@ -1006,24 +1118,41 @@ fn apply_intent(
             }
             let (parent, leaf) = parent_and_name(root, &entry.path)?;
             let staged = stage_name(index);
-            let work_id = parent.entry_identity(&leaf, false)?;
-            let staged_id = staging.entry_identity(&staged, false)?;
             match (&entry.old, entry.old_id, &entry.new, entry.new_id) {
                 (Some(old), Some(old_id), Some(new), Some(new_id)) => {
-                    if work_id == Some(old_id) && staged_id == Some(new_id) {
+                    let work_old = entry_identity_for(&parent, &leaf, old.mode)?;
+                    let work_new = entry_identity_for(&parent, &leaf, new.mode)?;
+                    let staged_old = entry_identity_for(&staging, OsStr::new(&staged), old.mode)?;
+                    let staged_new = entry_identity_for(&staging, OsStr::new(&staged), new.mode)?;
+                    if work_old == Some(old_id) && staged_new == Some(new_id) {
                         verify_file(&parent, &leaf, old_id, old)?;
                         verify_file(&staging, OsStr::new(&staged), new_id, new)?;
-                        parent.exchange_child_files(&leaf, old_id, &staging, &staged, new_id)?;
-                    } else if work_id != Some(new_id) || staged_id != Some(old_id) {
+                        parent.exchange_child_entries(
+                            &leaf,
+                            (old_id, entry_kind(old.mode)?),
+                            &staging,
+                            &staged,
+                            (new_id, entry_kind(new.mode)?),
+                        )?;
+                    } else if work_new != Some(new_id) || staged_old != Some(old_id) {
                         return Err(CheckoutError::DirtyWorktree);
                     }
                     verify_file(&parent, &leaf, new_id, new)?;
                     verify_file(&staging, OsStr::new(&staged), old_id, old)?;
                 }
                 (None, None, Some(new), Some(new_id)) => {
-                    if work_id.is_none() && staged_id == Some(new_id) {
+                    let work_id = entry_identity_for(&parent, &leaf, new.mode)?;
+                    let staged_id = entry_identity_for(&staging, OsStr::new(&staged), new.mode)?;
+                    if !entry_exists(&parent, &leaf)? && staged_id == Some(new_id) {
                         verify_file(&staging, OsStr::new(&staged), new_id, new)?;
-                        staging.move_child_file_no_replace(&staged, new_id, &parent, &leaf)?;
+                        move_entry(
+                            &staging,
+                            OsStr::new(&staged),
+                            new_id,
+                            &parent,
+                            &leaf,
+                            new.mode,
+                        )?;
                     } else if work_id != Some(new_id) || staged_id.is_some() {
                         return Err(CheckoutError::DirtyWorktree);
                     }
@@ -1037,9 +1166,8 @@ fn apply_intent(
         // Verify every target path once more before changing the visible HEAD.
         for (path, (oid, mode)) in &target_files {
             let (parent, leaf) = parent_and_name(root, path)?;
-            let identity = parent
-                .entry_identity(&leaf, false)?
-                .ok_or(CheckoutError::DirtyWorktree)?;
+            let identity =
+                entry_identity_for(&parent, &leaf, *mode)?.ok_or(CheckoutError::DirtyWorktree)?;
             verify_file(
                 &parent,
                 &leaf,
@@ -1115,20 +1243,20 @@ fn apply_intent(
         }
         for (index, entry) in intent.entries.iter().enumerate() {
             let staged = stage_name(index);
-            if let Some(identity) = staging.entry_identity(&staged, false)? {
+            let Some(old) = &entry.old else {
+                if entry_exists(&staging, OsStr::new(&staged))? {
+                    return Err(CheckoutError::IncompatibleIntent);
+                }
+                continue;
+            };
+            if let Some(identity) = entry_identity_for(&staging, OsStr::new(&staged), old.mode)? {
                 if Some(identity) != entry.old_id {
                     return Err(CheckoutError::IncompatibleIntent);
                 }
-                verify_file(
-                    &staging,
-                    OsStr::new(&staged),
-                    identity,
-                    entry
-                        .old
-                        .as_ref()
-                        .ok_or(CheckoutError::IncompatibleIntent)?,
-                )?;
-                staging.remove_child_file(&staged)?;
+                verify_file(&staging, OsStr::new(&staged), identity, old)?;
+                remove_staged_entry(&staging, OsStr::new(&staged), identity, old.mode)?;
+            } else if entry_exists(&staging, OsStr::new(&staged))? {
+                return Err(CheckoutError::IncompatibleIntent);
             }
         }
         for directory in intent.removed_directories.iter().rev() {

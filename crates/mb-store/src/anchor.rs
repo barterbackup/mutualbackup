@@ -227,6 +227,57 @@ impl PinnedDirectory {
         create_regular_file_at(&self.file, name, name)
     }
 
+    /// Publish a small, fully synced regular file under a new name. This is
+    /// used for transient Git symlink-target bytes before reflink capture.
+    pub fn publish_small_bytes_child(
+        &self,
+        name: impl AsRef<Path>,
+        bytes: &[u8],
+    ) -> Result<NativeFileId, AnchorError> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        if bytes.is_empty() || bytes.len() > 4095 {
+            return Err(AnchorError::UnsupportedSymlinkTarget);
+        }
+        let name = name.as_ref();
+        validate_single_component(name)?;
+        let encoded =
+            CString::new(name.as_os_str().as_bytes()).map_err(|_| AnchorError::UnsafePath)?;
+        let descriptor = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        let identity = native_file_id(self.filesystem_id, &file.metadata()?);
+        if unsafe {
+            libc::linkat(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                self.file.as_raw_fd(),
+                encoded.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        self.sync_all()?;
+        if self.entry_identity(name, false)? != Some(identity) {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        Ok(identity)
+    }
+
     pub fn open_child_file(&self, name: impl AsRef<Path>) -> Result<Option<File>, AnchorError> {
         let name = name.as_ref();
         validate_single_component(name)?;
@@ -711,6 +762,14 @@ impl PinnedDirectory {
     }
 
     pub fn create_child_file(&self, _name: impl AsRef<Path>) -> Result<File, AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn publish_small_bytes_child(
+        &self,
+        _name: impl AsRef<Path>,
+        _bytes: &[u8],
+    ) -> Result<NativeFileId, AnchorError> {
         Err(unsupported_pinned_directory())
     }
 
@@ -3984,6 +4043,29 @@ mod tests {
             ReflinkAnchor::plan_file(temp.path(), "../escape"),
             Err(AnchorError::UnsafePath)
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_small_file_publication_preserves_exact_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = PinnedDirectory::open(temp.path()).unwrap();
+        let bytes = b"target-\xff\r\n\0";
+        let identity = directory
+            .publish_small_bytes_child("target", bytes)
+            .unwrap();
+        assert_eq!(fs::read(temp.path().join("target")).unwrap(), bytes);
+        assert_eq!(
+            directory.entry_identity("target", false).unwrap(),
+            Some(identity)
+        );
+        assert!(
+            directory
+                .publish_small_bytes_child("target", b"other")
+                .is_err()
+        );
+        assert_eq!(fs::read(temp.path().join("target")).unwrap(), bytes);
+        directory.remove_child_file("target").unwrap();
     }
 
     #[cfg(target_os = "linux")]

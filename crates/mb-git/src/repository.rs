@@ -24,7 +24,7 @@ use crate::history::{
 };
 use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, remove_cached,
-    resume_pending_stages, stage_file, stage_path_key, staged_entry,
+    resume_pending_stages, stage_file, stage_path_key, stage_symlink, staged_entry,
 };
 use crate::status::{GitStatus, StatusError, repository_status};
 
@@ -194,9 +194,8 @@ impl GitRepository {
         )?)
     }
 
-    /// Like `git add <path>`, capture a present regular file or stage the
-    /// deletion of a missing indexed path. A symlink or other unsupported
-    /// object is never mistaken for a deletion.
+    /// Like `git add <path>`, capture a present file or symlink, or stage the
+    /// deletion of a missing indexed path. Unsupported objects are not deletions.
     pub fn add_path(
         &self,
         relative_path: impl AsRef<Path>,
@@ -219,6 +218,20 @@ impl GitRepository {
             }
         }
         let name = relative.file_name().ok_or(StageError::UnsafePath)?;
+        let symlink = match parent.read_child_symlink(name) {
+            Ok(found) => found.is_some(),
+            Err(AnchorError::UnsupportedObject(_)) => false,
+            Err(error) => return Err(error.into()),
+        };
+        if symlink {
+            return Ok(Some(stage_symlink(
+                &self.catalog,
+                self.repository_id,
+                &self.root,
+                &self.directory,
+                relative,
+            )?));
+        }
         if parent.open_child_file(name)?.is_some() {
             Ok(Some(self.stage_file(relative)?))
         } else {
@@ -509,6 +522,127 @@ mod tests {
             fs::read(unrelated_catalog.join("user-file")).unwrap(),
             b"must be preserved"
         );
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn symlink_add_preserves_raw_target_bytes_and_commits_git_mode() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-symlink-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        fs::create_dir_all(&source_root).unwrap();
+        let target = std::ffi::OsStr::from_bytes(b"../outside-\xff\r\n");
+        symlink(target, source_root.join("linked")).unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [41_u8; 32];
+        let repo = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        let entry = repo.add_path("linked").unwrap().unwrap();
+        assert_eq!(entry.mode, 0o120000);
+        let oid = Oid::from_bytes(&entry.oid).unwrap();
+        assert_eq!(
+            oid,
+            Oid::hash_object(git2::ObjectType::Blob, target.as_bytes()).unwrap()
+        );
+        let anchors = repo.anchors_for_oid(oid).unwrap();
+        assert_eq!(anchors.len(), 1);
+        let mut anchor = anchors[0].open_verified().unwrap();
+        let mut actual = Vec::new();
+        anchor.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, target.as_bytes());
+        assert!(
+            repo.status()
+                .unwrap()
+                .changes
+                .iter()
+                .any(|change| { change.path == b"linked" && change.worktree.is_none() })
+        );
+        assert!(
+            repo.diff(true)
+                .unwrap()
+                .patch
+                .windows(6)
+                .any(|part| part == b"120000")
+        );
+        repo.commit("Test", "test@example.invalid", "add link")
+            .unwrap();
+        assert!(repo.status().unwrap().changes.is_empty());
+        repo.create_branch("topic").unwrap();
+        fs::remove_file(source_root.join("linked")).unwrap();
+        symlink("replacement", source_root.join("linked")).unwrap();
+        assert_eq!(
+            repo.status().unwrap().changes[0].worktree,
+            Some(crate::GitChange::Modified)
+        );
+        assert!(
+            repo.diff(false)
+                .unwrap()
+                .patch
+                .windows(11)
+                .any(|part| part == b"replacement")
+        );
+        let replacement = repo.add_path("linked").unwrap().unwrap();
+        repo.switch_branch("topic").unwrap();
+        repo.commit("Test", "test@example.invalid", "change link")
+            .unwrap();
+        repo.switch_branch("main").unwrap();
+        assert_eq!(fs::read_link(source_root.join("linked")).unwrap(), target);
+        assert!(repo.status().unwrap().changes.is_empty());
+        repo.switch_branch("topic").unwrap();
+        assert_eq!(
+            fs::read_link(source_root.join("linked")).unwrap(),
+            Path::new("replacement")
+        );
+        assert!(repo.status().unwrap().changes.is_empty());
+        fs::remove_file(source_root.join("linked")).unwrap();
+        fs::write(source_root.join("linked"), b"plain file\r\n").unwrap();
+        symlink("extra target", source_root.join("extra")).unwrap();
+        let regular = repo.add_path("linked").unwrap().unwrap();
+        let extra = repo.add_path("extra").unwrap().unwrap();
+        repo.commit("Test", "test@example.invalid", "change link to file")
+            .unwrap();
+        crate::checkout::set_after_checkout_file_hook(Box::new(|| panic!("simulated crash")));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                repo.switch_branch("main").unwrap();
+            }))
+            .is_err()
+        );
+        drop(repo);
+        let repo = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        assert_eq!(repo.selected_branch().unwrap(), "main");
+        assert_eq!(fs::read_link(source_root.join("linked")).unwrap(), target);
+        assert!(fs::symlink_metadata(source_root.join("extra")).is_err());
+        repo.switch_branch("topic").unwrap();
+        assert_eq!(
+            fs::read(source_root.join("linked")).unwrap(),
+            b"plain file\r\n"
+        );
+        assert_eq!(
+            fs::read_link(source_root.join("extra")).unwrap(),
+            Path::new("extra target")
+        );
+        assert!(repo.status().unwrap().changes.is_empty());
+        let replacement_anchors = repo
+            .anchors_for_oid(Oid::from_bytes(&replacement.oid).unwrap())
+            .unwrap();
+        let regular_anchors = repo
+            .anchors_for_oid(Oid::from_bytes(&regular.oid).unwrap())
+            .unwrap();
+        let extra_anchors = repo
+            .anchors_for_oid(Oid::from_bytes(&extra.oid).unwrap())
+            .unwrap();
+        drop(repo);
+        anchors[0].remove().unwrap();
+        replacement_anchors[0].remove().unwrap();
+        regular_anchors[0].remove().unwrap();
+        extra_anchors[0].remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
     }
 
     #[test]
@@ -1096,8 +1230,18 @@ mod tests {
         repo.switch_branch("empty").unwrap();
         fs::remove_file(source_root.join("nested/only")).unwrap();
         std::os::unix::fs::symlink("elsewhere", source_root.join("nested/only")).unwrap();
-        assert!(repo.add_path("nested/only").is_err());
-        assert!(repo.staged_entry("nested/only").unwrap().is_some());
+        let symlink_entry = repo.add_path("nested/only").unwrap().unwrap();
+        assert_eq!(symlink_entry.mode, 0o120000);
+        assert_eq!(
+            repo.staged_entry("nested/only").unwrap(),
+            Some(symlink_entry.clone())
+        );
+        let symlink_anchor = repo
+            .anchors_for_oid(Oid::from_bytes(&symlink_entry.oid).unwrap())
+            .unwrap()
+            .into_iter()
+            .find(|anchor| anchor.anchor_id == symlink_entry.anchor_id)
+            .unwrap();
         fs::remove_file(source_root.join("nested/only")).unwrap();
         fs::remove_dir(source_root.join("nested")).unwrap();
         assert!(repo.add_path("nested/only").unwrap().is_none());
@@ -1114,6 +1258,7 @@ mod tests {
         repo.switch_branch("empty").unwrap();
         assert!(!source_root.join("nested").exists());
         drop(repo);
+        symlink_anchor.remove().unwrap();
         for blob in graph.blobs {
             blob.anchor.remove().unwrap();
         }

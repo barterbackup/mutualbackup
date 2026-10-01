@@ -775,7 +775,7 @@ pub fn import_graph_backup(
                     let anchor = by_oid
                         .get(&item.id())
                         .ok_or(HistoryError::IncompatibleRecord)?;
-                    if !matches!(item.filemode(), 0o100644 | 0o100755) {
+                    if !matches!(item.filemode(), 0o100644 | 0o100755 | 0o120000) {
                         return Err(HistoryError::IncompatibleRecord);
                     }
                     records.push((

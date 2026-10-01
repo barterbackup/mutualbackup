@@ -185,9 +185,13 @@ impl GitBackupDescriptor {
                 .map_err(|_| GitBackupError::InvalidGraph)?;
             for entry in tree.iter() {
                 match entry.kind() {
-                    Some(ObjectType::Tree) => pending_trees.push(entry.id()),
+                    Some(ObjectType::Tree) if entry.filemode() == 0o040000 => {
+                        pending_trees.push(entry.id());
+                    }
                     Some(ObjectType::Blob) => {
-                        if !blob_ids.contains(&entry.id()) {
+                        if !matches!(entry.filemode(), 0o100644 | 0o100755 | 0o120000)
+                            || !blob_ids.contains(&entry.id())
+                        {
                             return Err(GitBackupError::InvalidGraph);
                         }
                         seen_blobs.insert(entry.id());

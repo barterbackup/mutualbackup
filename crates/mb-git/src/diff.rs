@@ -115,7 +115,28 @@ fn read_worktree(
             leaf = Some(name);
         }
     }
-    let Some(mut file) = parent.open_child_file(leaf.ok_or(StageError::UnsafePath)?)? else {
+    let leaf = leaf.ok_or(StageError::UnsafePath)?;
+    match parent.read_child_symlink(leaf) {
+        Ok(Some((bytes, _))) => {
+            let oid: [u8; 20] = Oid::hash_object(ObjectType::Blob, &bytes)?
+                .as_bytes()
+                .try_into()
+                .expect("SHA-1 OID");
+            return Ok(Some((
+                if oid == expected.oid {
+                    Vec::new()
+                } else {
+                    bytes
+                },
+                0o120000,
+                oid,
+            )));
+        }
+        Ok(None) => return Ok(None),
+        Err(AnchorError::UnsupportedObject(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let Some(mut file) = parent.open_child_file(leaf)? else {
         return Ok(None);
     };
     read_worktree_file(&mut file, expected).map(Some)
@@ -192,8 +213,8 @@ fn append_patch(
 ) -> Result<(), DiffError> {
     let old_mode = old.as_ref().map(|(_, mode, _)| *mode);
     let new_mode = new.as_ref().map(|(_, mode, _)| *mode);
-    if old_mode.is_some_and(|mode| !matches!(mode, 0o100644 | 0o100755))
-        || new_mode.is_some_and(|mode| !matches!(mode, 0o100644 | 0o100755))
+    if old_mode.is_some_and(|mode| !matches!(mode, 0o100644 | 0o100755 | 0o120000))
+        || new_mode.is_some_and(|mode| !matches!(mode, 0o100644 | 0o100755 | 0o120000))
     {
         return Err(DiffError::UnsupportedMode);
     }

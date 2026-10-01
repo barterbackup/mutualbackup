@@ -6,6 +6,7 @@
 //! and object-to-anchor mapping while retiring that intent.
 
 use std::ffi::OsStr;
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
@@ -13,7 +14,8 @@ use std::path::{Component, Path, PathBuf};
 use git2::Oid;
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
 use mb_store::{
-    AnchorError, ControlStore, DatabaseError, FileAnchorManifest, SourceFileCapturePlan,
+    AnchorError, ControlStore, DatabaseError, FileAnchorManifest, GIT_CATALOG_DIRECTORY,
+    NativeFileId, PinnedDirectory, SourceFileCapturePlan,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -23,6 +25,7 @@ use crate::{GitAnchorError, blob_oid_from_anchor};
 
 const MAX_STAGE_PATH_BYTES: usize = 4096;
 const INTENT_PREFIX: &str = "git-stage-intent-v1/";
+const SYMLINK_INTENT_PREFIX: &str = "git-symlink-stage-intent-v1/";
 const INDEX_PREFIX: &str = "git-index-entry-v1/";
 const OBJECT_PREFIX: &str = "git-object-anchor-v1/";
 
@@ -46,6 +49,8 @@ pub enum StageError {
     IncompatibleRecord,
     #[error("Git stage catalog paths currently require Linux byte paths")]
     UnsupportedPlatform,
+    #[error("staged symlink temporary file I/O failed: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -65,8 +70,27 @@ struct StageIntent {
     plan: SourceFileCapturePlan,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct SymlinkStageIntent {
+    format_version: u16,
+    repository_id: Uuid,
+    source_root: PathBuf,
+    root_id: NativeFileId,
+    catalog_id: NativeFileId,
+    relative_path: PathBuf,
+    source_id: NativeFileId,
+    target: Vec<u8>,
+    temp_name: String,
+    temp_id: Option<NativeFileId>,
+    plan: Option<SourceFileCapturePlan>,
+}
+
 fn intent_kind(repository_id: Uuid) -> String {
     format!("{INTENT_PREFIX}{repository_id}")
+}
+
+fn symlink_intent_kind(repository_id: Uuid) -> String {
+    format!("{SYMLINK_INTENT_PREFIX}{repository_id}")
 }
 
 pub(crate) fn index_kind(repository_id: Uuid) -> String {
@@ -128,6 +152,94 @@ fn decode_intent(
     Ok(intent)
 }
 
+fn read_symlink(
+    root: &PinnedDirectory,
+    relative_path: &Path,
+) -> Result<(Vec<u8>, NativeFileId), StageError> {
+    let parent_path = relative_path.parent().ok_or(StageError::UnsafePath)?;
+    let parent = if parent_path.as_os_str().is_empty() {
+        root.try_clone()?
+    } else {
+        root.open_descendant_directory(parent_path)?
+    };
+    parent
+        .read_child_symlink(relative_path.file_name().ok_or(StageError::UnsafePath)?)?
+        .ok_or_else(|| AnchorError::SourceChanged(relative_path.to_path_buf()).into())
+}
+
+fn decode_symlink_intent(
+    encoded: &[u8],
+    repository_id: Uuid,
+    path_key: &[u8],
+) -> Result<SymlinkStageIntent, StageError> {
+    let intent: SymlinkStageIntent = decode_canonical(encoded)?;
+    let temp_relative = PathBuf::from(GIT_CATALOG_DIRECTORY).join(&intent.temp_name);
+    if intent.format_version != 1
+        || intent.repository_id != repository_id
+        || stage_path_key(&intent.relative_path)? != path_key
+        || !intent.source_root.is_absolute()
+        || intent.target.is_empty()
+        || intent.target.len() > 4095
+        || intent.target.contains(&0)
+        || !intent.temp_name.starts_with("symlink-input-")
+        || Uuid::parse_str(&intent.temp_name["symlink-input-".len()..]).is_err()
+        || intent.plan.is_some() && intent.temp_id.is_none()
+        || intent.plan.as_ref().is_some_and(|plan| {
+            plan.source_root() != intent.source_root || plan.relative_path() != temp_relative
+        })
+    {
+        return Err(StageError::IncompatibleRecord);
+    }
+    Ok(intent)
+}
+
+fn symlink_catalog(intent: &SymlinkStageIntent) -> Result<PinnedDirectory, StageError> {
+    let root = PinnedDirectory::open(&intent.source_root)?;
+    if root.identity()? != intent.root_id {
+        return Err(StageError::IncompatibleRecord);
+    }
+    let catalog = root
+        .open_child_directory(GIT_CATALOG_DIRECTORY)?
+        .ok_or(StageError::IncompatibleRecord)?;
+    if catalog.identity()? != intent.catalog_id {
+        return Err(StageError::IncompatibleRecord);
+    }
+    Ok(catalog)
+}
+
+fn verify_temporary_symlink_bytes(
+    catalog: &PinnedDirectory,
+    intent: &SymlinkStageIntent,
+) -> Result<Option<NativeFileId>, StageError> {
+    let Some(mut file) = catalog.open_child_file(&intent.temp_name)? else {
+        return Ok(None);
+    };
+    if file.metadata()?.len() != intent.target.len() as u64 {
+        return Err(StageError::IncompatibleRecord);
+    }
+    let mut bytes = Vec::new();
+    file.by_ref().take(4096).read_to_end(&mut bytes)?;
+    if bytes != intent.target {
+        return Err(StageError::IncompatibleRecord);
+    }
+    Ok(catalog.entry_identity(&intent.temp_name, false)?)
+}
+
+fn save_symlink_intent(
+    control: &ControlStore,
+    key: &[u8],
+    before: &SymlinkStageIntent,
+    after: &SymlinkStageIntent,
+) -> Result<(), StageError> {
+    control.replace_record_if_value(
+        &symlink_intent_kind(before.repository_id),
+        key,
+        &canonical_bytes(before)?,
+        &canonical_bytes(after)?,
+    )?;
+    Ok(())
+}
+
 fn begin_stage(
     control: &ControlStore,
     repository_id: Uuid,
@@ -136,7 +248,11 @@ fn begin_stage(
 ) -> Result<(Vec<u8>, StageIntent), StageError> {
     let path_key = stage_path_key(relative_path)?;
     let kind = intent_kind(repository_id);
-    if control.get_record(&kind, &path_key)?.is_some() {
+    if control.get_record(&kind, &path_key)?.is_some()
+        || control
+            .get_record(&symlink_intent_kind(repository_id), &path_key)?
+            .is_some()
+    {
         return Err(StageError::PendingStage);
     }
     let plan = SourceFileCapturePlan::plan_reflink(source_root, relative_path)?;
@@ -157,6 +273,148 @@ fn begin_stage(
         return Err(StageError::PendingStage);
     }
     Ok((path_key, intent))
+}
+
+fn begin_symlink_stage(
+    control: &ControlStore,
+    repository_id: Uuid,
+    source_root: &Path,
+    catalog: &PinnedDirectory,
+    relative_path: &Path,
+) -> Result<(Vec<u8>, SymlinkStageIntent), StageError> {
+    let key = stage_path_key(relative_path)?;
+    if control
+        .get_record(&intent_kind(repository_id), &key)?
+        .is_some()
+        || control
+            .get_record(&symlink_intent_kind(repository_id), &key)?
+            .is_some()
+    {
+        return Err(StageError::PendingStage);
+    }
+    let root = PinnedDirectory::open(source_root)?;
+    let actual_catalog = root
+        .open_child_directory(GIT_CATALOG_DIRECTORY)?
+        .ok_or(StageError::IncompatibleRecord)?;
+    if actual_catalog.identity()? != catalog.identity()? {
+        return Err(StageError::IncompatibleRecord);
+    }
+    let (target, source_id) = read_symlink(&root, relative_path)?;
+    let intent = SymlinkStageIntent {
+        format_version: 1,
+        repository_id,
+        source_root: source_root.to_path_buf(),
+        root_id: root.identity()?,
+        catalog_id: catalog.identity()?,
+        relative_path: relative_path.to_path_buf(),
+        source_id,
+        target,
+        temp_name: format!("symlink-input-{}", Uuid::new_v4()),
+        temp_id: None,
+        plan: None,
+    };
+    if !control.put_record_if_absent(
+        &symlink_intent_kind(repository_id),
+        &key,
+        &canonical_bytes(&intent)?,
+    )? {
+        return Err(StageError::PendingStage);
+    }
+    Ok((key, intent))
+}
+
+fn finish_symlink_stage(
+    control: &ControlStore,
+    repository_id: Uuid,
+    key: &[u8],
+    mut intent: SymlinkStageIntent,
+) -> Result<GitIndexEntry, StageError> {
+    let kind = symlink_intent_kind(repository_id);
+    if control.get_record(&kind, key)?.as_deref() != Some(canonical_bytes(&intent)?.as_slice()) {
+        return Err(StageError::IncompatibleRecord);
+    }
+    let catalog = symlink_catalog(&intent)?;
+    let observed_temp = verify_temporary_symlink_bytes(&catalog, &intent)?;
+    if let (Some(expected), Some(observed)) = (intent.temp_id, observed_temp)
+        && expected != observed
+    {
+        return Err(StageError::IncompatibleRecord);
+    }
+    if intent.plan.is_none() {
+        let temp_id = match observed_temp {
+            Some(existing) => existing,
+            None if intent.temp_id.is_none() => {
+                catalog.publish_small_bytes_child(&intent.temp_name, &intent.target)?
+            }
+            None => return Err(StageError::IncompatibleRecord),
+        };
+        if intent.temp_id.is_none() {
+            let mut next = intent.clone();
+            next.temp_id = Some(temp_id);
+            save_symlink_intent(control, key, &intent, &next)?;
+            intent = next;
+        }
+        let plan = SourceFileCapturePlan::plan_reflink(
+            &intent.source_root,
+            PathBuf::from(GIT_CATALOG_DIRECTORY).join(&intent.temp_name),
+        )?;
+        let mut next = intent.clone();
+        next.plan = Some(plan);
+        save_symlink_intent(control, key, &intent, &next)?;
+        intent = next;
+    }
+    let plan = intent.plan.as_ref().ok_or(StageError::IncompatibleRecord)?;
+    let manifest = plan.capture()?;
+    let oid = blob_oid_from_anchor(&manifest)?;
+    plan.reconcile()?;
+    if let Some(observed) = verify_temporary_symlink_bytes(&catalog, &intent)? {
+        if Some(observed) != intent.temp_id {
+            return Err(StageError::IncompatibleRecord);
+        }
+        catalog.remove_child_file(&intent.temp_name)?;
+    }
+    let entry = GitIndexEntry {
+        format_version: 1,
+        oid: oid.as_bytes().try_into().expect("SHA-1 OID has 20 bytes"),
+        mode: 0o120000,
+        anchor_id: manifest.anchor_id,
+    };
+    control.put_records_and_retire_if_value(
+        &[
+            (
+                object_kind(repository_id, oid),
+                manifest.anchor_id.as_bytes().to_vec(),
+                canonical_bytes(&manifest)?,
+            ),
+            (
+                index_kind(repository_id),
+                key.to_vec(),
+                canonical_bytes(&entry)?,
+            ),
+        ],
+        &kind,
+        key,
+        &canonical_bytes(&intent)?,
+    )?;
+    Ok(entry)
+}
+
+/// Stage the target bytes of a symlink without following it.
+pub fn stage_symlink(
+    control: &ControlStore,
+    repository_id: Uuid,
+    source_root: impl AsRef<Path>,
+    catalog: &PinnedDirectory,
+    relative_path: impl AsRef<Path>,
+) -> Result<GitIndexEntry, StageError> {
+    let (key, intent) = begin_symlink_stage(
+        control,
+        repository_id,
+        source_root.as_ref(),
+        catalog,
+        relative_path.as_ref(),
+    )?;
+    finish_symlink_stage(control, repository_id, &key, intent)
 }
 
 fn finish_stage(
@@ -228,6 +486,9 @@ pub fn remove_cached(
     if control
         .get_record(&intent_kind(repository_id), &key)?
         .is_some()
+        || control
+            .get_record(&symlink_intent_kind(repository_id), &key)?
+            .is_some()
     {
         return Err(StageError::PendingStage);
     }
@@ -236,7 +497,7 @@ pub fn remove_cached(
         return Ok(false);
     };
     let entry: GitIndexEntry = decode_canonical(&encoded)?;
-    if entry.format_version != 1 || !matches!(entry.mode, 0o100644 | 0o100755) {
+    if entry.format_version != 1 || !matches!(entry.mode, 0o100644 | 0o100755 | 0o120000) {
         return Err(StageError::IncompatibleRecord);
     }
     control.delete_record_if_value(&kind, &key, &encoded)?;
@@ -254,6 +515,10 @@ pub fn resume_pending_stages(
         let intent = decode_intent(&encoded, repository_id, &key)?;
         resumed.push(finish_stage(control, repository_id, &key, &intent)?);
     }
+    for (key, encoded) in control.records(&symlink_intent_kind(repository_id))? {
+        let intent = decode_symlink_intent(&encoded, repository_id, &key)?;
+        resumed.push(finish_symlink_stage(control, repository_id, &key, intent)?);
+    }
     Ok(resumed)
 }
 
@@ -265,11 +530,27 @@ pub fn abandon_pending_stage(
 ) -> Result<bool, StageError> {
     let key = stage_path_key(relative_path.as_ref())?;
     let kind = intent_kind(repository_id);
+    if let Some(encoded) = control.get_record(&kind, &key)? {
+        let intent = decode_intent(&encoded, repository_id, &key)?;
+        intent.plan.discard()?;
+        control.delete_record_if_value(&kind, &key, &encoded)?;
+        return Ok(true);
+    }
+    let kind = symlink_intent_kind(repository_id);
     let Some(encoded) = control.get_record(&kind, &key)? else {
         return Ok(false);
     };
-    let intent = decode_intent(&encoded, repository_id, &key)?;
-    intent.plan.discard()?;
+    let intent = decode_symlink_intent(&encoded, repository_id, &key)?;
+    let catalog = symlink_catalog(&intent)?;
+    if let Some(plan) = &intent.plan {
+        plan.discard()?;
+    }
+    if let Some(observed) = verify_temporary_symlink_bytes(&catalog, &intent)? {
+        if intent.temp_id.is_some_and(|expected| expected != observed) {
+            return Err(StageError::IncompatibleRecord);
+        }
+        catalog.remove_child_file(&intent.temp_name)?;
+    }
     control.delete_record_if_value(&kind, &key, &encoded)?;
     Ok(true)
 }
@@ -284,7 +565,7 @@ pub fn staged_entry(
         return Ok(None);
     };
     let entry: GitIndexEntry = decode_canonical(&encoded)?;
-    if entry.format_version != 1 || !matches!(entry.mode, 0o100644 | 0o100755) {
+    if entry.format_version != 1 || !matches!(entry.mode, 0o100644 | 0o100755 | 0o120000) {
         return Err(StageError::IncompatibleRecord);
     }
     Ok(Some(entry))
@@ -309,7 +590,7 @@ pub fn staged_entries(
         #[cfg(not(unix))]
         return Err(StageError::UnsupportedPlatform);
         let entry: GitIndexEntry = decode_canonical(&encoded)?;
-        if entry.format_version != 1 || !matches!(entry.mode, 0o100644 | 0o100755) {
+        if entry.format_version != 1 || !matches!(entry.mode, 0o100644 | 0o100755 | 0o120000) {
             return Err(StageError::IncompatibleRecord);
         }
         entries.push((key, entry));
@@ -318,7 +599,10 @@ pub fn staged_entries(
 }
 
 pub fn has_pending_stages(control: &ControlStore, repository_id: Uuid) -> Result<bool, StageError> {
-    Ok(!control.records(&intent_kind(repository_id))?.is_empty())
+    Ok(!control.records(&intent_kind(repository_id))?.is_empty()
+        || !control
+            .records(&symlink_intent_kind(repository_id))?
+            .is_empty())
 }
 
 pub fn pending_stage_paths(
@@ -330,6 +614,11 @@ pub fn pending_stage_paths(
         decode_intent(&encoded, repository_id, &key)?;
         paths.push(key);
     }
+    for (key, encoded) in control.records(&symlink_intent_kind(repository_id))? {
+        decode_symlink_intent(&encoded, repository_id, &key)?;
+        paths.push(key);
+    }
+    paths.sort();
     Ok(paths)
 }
 
@@ -357,15 +646,79 @@ pub fn anchors_for_oid(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
     use std::{fs, path::PathBuf};
 
-    use mb_store::{AnchorError, ControlStore};
+    use mb_store::{
+        AnchorError, ControlStore, GIT_CATALOG_DIRECTORY, PinnedDirectory, SourceFileCapturePlan,
+    };
     use uuid::Uuid;
 
     use super::{
-        StageError, abandon_pending_stage, anchors_for_oid, begin_stage, resume_pending_stages,
-        stage_file, staged_entry,
+        StageError, abandon_pending_stage, anchors_for_oid, begin_stage, begin_symlink_stage,
+        resume_pending_stages, save_symlink_intent, stage_file, staged_entry,
     };
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn symlink_stage_replays_after_capture_and_temporary_input_removal() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-link-replay-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        let catalog_path = source_root.join(GIT_CATALOG_DIRECTORY);
+        fs::create_dir_all(&catalog_path).unwrap();
+        let catalog = PinnedDirectory::open(&catalog_path).unwrap();
+        let database = catalog_path.join("catalog.db");
+        let key = [44_u8; 32];
+        let repository_id = Uuid::new_v4();
+        symlink("old target", source_root.join("linked")).unwrap();
+        let control = ControlStore::open_with_key(&database, &key).unwrap();
+        let (path_key, initial) = begin_symlink_stage(
+            &control,
+            repository_id,
+            &source_root,
+            &catalog,
+            "linked".as_ref(),
+        )
+        .unwrap();
+        let temp_id = catalog
+            .publish_small_bytes_child(&initial.temp_name, &initial.target)
+            .unwrap();
+        let mut prepared = initial.clone();
+        prepared.temp_id = Some(temp_id);
+        save_symlink_intent(&control, &path_key, &initial, &prepared).unwrap();
+        let mut planned = prepared.clone();
+        planned.plan = Some(
+            SourceFileCapturePlan::plan_reflink(
+                &source_root,
+                PathBuf::from(GIT_CATALOG_DIRECTORY).join(&planned.temp_name),
+            )
+            .unwrap(),
+        );
+        save_symlink_intent(&control, &path_key, &prepared, &planned).unwrap();
+        let manifest = planned.plan.as_ref().unwrap().capture().unwrap();
+        catalog.remove_child_file(&planned.temp_name).unwrap();
+        fs::remove_file(source_root.join("linked")).unwrap();
+        drop(control);
+
+        let control = ControlStore::open_with_key(&database, &key).unwrap();
+        let resumed = resume_pending_stages(&control, repository_id).unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].mode, 0o120000);
+        assert_eq!(resumed[0].anchor_id, manifest.anchor_id);
+        assert!(
+            resume_pending_stages(&control, repository_id)
+                .unwrap()
+                .is_empty()
+        );
+        drop(control);
+        drop(catalog);
+        manifest.remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
