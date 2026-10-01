@@ -659,12 +659,12 @@ fn published_target_file(
 }
 
 fn validate_intent(intent: &CheckoutIntent, repository_id: Uuid) -> Result<(), CheckoutError> {
-    if !matches!(intent.format_version, 1..=7)
+    if !matches!(intent.format_version, 1..=8)
         || matches!(intent.format_version, 3 | 4 | 6) != intent.advance_ref
         || matches!(intent.format_version, 4 | 6) != intent.target_ref.is_some()
         || intent.format_version == 5
             && (intent.old_oid != [0; 20] || intent.old_branch == intent.new_branch)
-        || intent.format_version == 7
+        || matches!(intent.format_version, 7 | 8)
             && (intent.advance_ref
                 || intent.target_ref.is_some()
                 || intent.old_branch != intent.new_branch
@@ -786,7 +786,7 @@ fn encode_intent(intent: &CheckoutIntent) -> Result<Vec<u8>, CheckoutError> {
             removed_directories: intent.removed_directories.clone(),
         })
         .map_err(Into::into),
-        4..=7 => canonical_bytes(intent).map_err(Into::into),
+        4..=8 => canonical_bytes(intent).map_err(Into::into),
         _ => Err(CheckoutError::IncompatibleIntent),
     }
 }
@@ -853,7 +853,7 @@ fn decode_intent(bytes: &[u8], repository_id: Uuid) -> Result<CheckoutIntent, Ch
         Some(1) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntent>(bytes)?),
         Some(2) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntentV2>(bytes)?),
         Some(3) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntentV3>(bytes)?),
-        Some(4..=7) => decode_canonical::<CheckoutIntent>(bytes)?,
+        Some(4..=8) => decode_canonical::<CheckoutIntent>(bytes)?,
         _ => return Err(CheckoutError::IncompatibleIntent),
     };
     validate_intent(&intent, repository_id)?;
@@ -865,7 +865,7 @@ fn target_branch_is_current(
     scope: GitWorktreeScope,
     intent: &CheckoutIntent,
 ) -> Result<bool, CheckoutError> {
-    if intent.format_version == 7 {
+    if matches!(intent.format_version, 7 | 8) {
         let selected = selected_branch_for_scope(control, scope)?;
         let current = ref_oid(
             control,
@@ -1694,6 +1694,28 @@ pub(crate) fn begin_restore_for_scope(
     catalog_dir: &PinnedDirectory,
     paths: &[PathBuf],
 ) -> Result<u32, CheckoutError> {
+    begin_index_or_head_restore(control, scope, root_path, catalog_dir, paths, false)
+}
+
+/// Reset the whole working tree and index to the selected HEAD. One intent
+/// publishes the index only after all tracked working bytes have been placed.
+pub(crate) fn begin_hard_reset_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    root_path: &Path,
+    catalog_dir: &PinnedDirectory,
+) -> Result<u32, CheckoutError> {
+    begin_index_or_head_restore(control, scope, root_path, catalog_dir, &[], true)
+}
+
+fn begin_index_or_head_restore(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    root_path: &Path,
+    catalog_dir: &PinnedDirectory,
+    paths: &[PathBuf],
+    hard_reset: bool,
+) -> Result<u32, CheckoutError> {
     let repository_id = scope.repository_id();
     resume_pending_checkout_for_scope(control, scope, root_path, catalog_dir)?;
     if has_pending_stages_for_scope(control, scope)? {
@@ -1714,7 +1736,11 @@ pub(crate) fn begin_restore_for_scope(
         .chain(staged.keys())
         .cloned()
         .collect::<BTreeSet<_>>();
-    let mut selected = BTreeSet::new();
+    let mut selected = if hard_reset {
+        available.clone()
+    } else {
+        BTreeSet::new()
+    };
     for path in paths {
         let key = stage_path_key(path)?;
         let mut prefix = key.clone();
@@ -1741,15 +1767,27 @@ pub(crate) fn begin_restore_for_scope(
             old_tree.insert(path.clone(), (file.oid, file.mode));
             old_files.insert(path.clone(), (file, identity));
         }
-        if let Some(index) = staged.get(path) {
-            entry_kind(index.mode)?;
-            target_tree.insert(path.clone(), (index.oid, index.mode));
-            if is_attributes_path(path) && matches!(index.mode, 0o100644 | 0o100755) {
-                let anchor = anchors_for_oid(control, repository_id, Oid::from_bytes(&index.oid)?)?
-                    .into_iter()
-                    .find(|anchor| anchor.anchor_id == index.anchor_id)
-                    .ok_or(CheckoutError::MissingAnchor)?;
-                validate_anchor(&anchor)?;
+        let target = if hard_reset {
+            committed.get(path).copied()
+        } else {
+            staged.get(path).map(|index| (index.oid, index.mode))
+        };
+        if let Some((oid, mode)) = target {
+            entry_kind(mode)?;
+            target_tree.insert(path.clone(), (oid, mode));
+            if is_attributes_path(path) && matches!(mode, 0o100644 | 0o100755) {
+                let anchors = anchors_for_oid(control, repository_id, Oid::from_bytes(&oid)?)?;
+                let anchor = if hard_reset {
+                    anchors.first()
+                } else {
+                    anchors.iter().find(|anchor| {
+                        staged
+                            .get(path)
+                            .is_some_and(|index| index.anchor_id == anchor.anchor_id)
+                    })
+                }
+                .ok_or(CheckoutError::MissingAnchor)?;
+                validate_anchor(anchor)?;
             }
         }
     }
@@ -1775,9 +1813,9 @@ pub(crate) fn begin_restore_for_scope(
     let mut entries = Vec::new();
     for path in selected {
         let old = old_files.get(&path);
-        let new = staged.get(&path);
+        let new = target_tree.get(&path);
         if old.is_some_and(|(file, _)| {
-            new.is_some_and(|index| index.oid == file.oid && index.mode == file.mode)
+            new.is_some_and(|(oid, mode)| *oid == file.oid && *mode == file.mode)
         }) || old.is_none() && new.is_none()
         {
             continue;
@@ -1797,14 +1835,14 @@ pub(crate) fn begin_restore_for_scope(
             return Err(CheckoutError::DirtyWorktree);
         }
         let new_file = new
-            .map(|index| {
+            .map(|(oid, mode)| {
                 Ok::<_, CheckoutError>(CheckoutFile {
-                    oid: index.oid,
-                    mode: index.mode,
+                    oid: *oid,
+                    mode: *mode,
                     anchor_id: choose_anchor(
                         control,
                         repository_id,
-                        index.oid,
+                        *oid,
                         root.identity()?.filesystem_id,
                     )?,
                 })
@@ -1818,15 +1856,35 @@ pub(crate) fn begin_restore_for_scope(
             new_id: None,
         });
     }
-    if entries.is_empty() {
+    let index_changes = if hard_reset {
+        available
+            .iter()
+            .filter(|path| {
+                committed.get(*path).copied()
+                    != staged.get(*path).map(|entry| (entry.oid, entry.mode))
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    if entries.is_empty() && index_changes.is_empty() {
         return Ok(0);
     }
-    let changed = u32::try_from(entries.len()).map_err(|_| CheckoutError::TooManyFiles)?;
+    let changed = u32::try_from(
+        entries
+            .iter()
+            .map(|entry| &entry.path)
+            .chain(index_changes.iter())
+            .collect::<BTreeSet<_>>()
+            .len(),
+    )
+    .map_err(|_| CheckoutError::TooManyFiles)?;
     let oid = head
         .map(|oid| oid.as_bytes().try_into().expect("SHA-1 OID"))
         .unwrap_or([0; 20]);
     let mut intent = CheckoutIntent {
-        format_version: 7,
+        format_version: if hard_reset { 8 } else { 7 },
         advance_ref: false,
         target_ref: None,
         repository_id,
@@ -1984,7 +2042,7 @@ fn apply_intent(
             return Err(CheckoutError::BranchCheckedOutElsewhere);
         }
         let branches = list_branches_for_scope(control, scope)?;
-        let (old_current, target_available) = if intent.format_version == 7 {
+        let (old_current, target_available) = if matches!(intent.format_version, 7 | 8) {
             let current = target_branch_is_current(control, scope, intent)?;
             (current, current)
         } else if intent.advance_ref {
@@ -2059,6 +2117,14 @@ fn apply_intent(
                 }
             }
             files
+        } else if intent.format_version == 8 {
+            files_for_commit(
+                control,
+                intent.repository_id,
+                (intent.new_oid != [0; 20])
+                    .then(|| Oid::from_bytes(&intent.new_oid))
+                    .transpose()?,
+            )?
         } else {
             files_for_commit(
                 control,
@@ -2203,6 +2269,17 @@ fn apply_intent(
                             .ok_or(CheckoutError::IncompatibleIntent)?
                             .anchor_id
                     }
+                    None if intent.format_version == 8 => {
+                        let anchor =
+                            anchors_for_oid(control, intent.repository_id, Oid::from_bytes(oid)?)?
+                                .into_iter()
+                                .next()
+                                .ok_or(CheckoutError::MissingAnchor)?;
+                        if blob_oid_from_anchor(&anchor)?.as_bytes() != oid {
+                            return Err(CheckoutError::MissingAnchor);
+                        }
+                        anchor.anchor_id
+                    }
                     None => {
                         let staged = previous_index
                             .get(path)
@@ -2229,7 +2306,9 @@ fn apply_intent(
                     deletions.push((index_kind_for_scope(scope), path.clone()));
                 }
             }
-            records.push(selected_branch_record_for_scope(scope, &intent.new_branch)?);
+            if intent.format_version != 8 {
+                records.push(selected_branch_record_for_scope(scope, &intent.new_branch)?);
+            }
             if intent.advance_ref {
                 records.push((
                     ref_kind(intent.repository_id),

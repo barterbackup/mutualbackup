@@ -1518,6 +1518,12 @@ impl Node {
             .map_err(Into::into)
     }
 
+    pub fn git_worktree_hard_reset(&self, repository_id: Uuid, worktree_id: Uuid) -> Result<u32> {
+        self.open_git_repository(repository_id)?
+            .linked_hard_reset(worktree_id)
+            .map_err(Into::into)
+    }
+
     pub fn git_worktree_create_branch(
         &self,
         repository_id: Uuid,
@@ -1894,6 +1900,12 @@ impl Node {
     pub fn git_restore_worktree(&self, repository_id: Uuid, paths: &[PathBuf]) -> Result<u32> {
         self.open_git_repository(repository_id)?
             .restore_worktree(paths)
+            .map_err(Into::into)
+    }
+
+    pub fn git_hard_reset(&self, repository_id: Uuid) -> Result<u32> {
+        self.open_git_repository(repository_id)?
+            .hard_reset()
             .map_err(Into::into)
     }
 

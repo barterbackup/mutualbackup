@@ -116,6 +116,10 @@ pub enum LocalRequest {
         worktree_id: Uuid,
         paths: Vec<PathBuf>,
     },
+    GitWorktreeHardReset {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+    },
     GitWorktreeCreateBranch {
         repository_id: Uuid,
         worktree_id: Uuid,
@@ -243,6 +247,9 @@ pub enum LocalRequest {
     GitRestoreWorktree {
         repository_id: Uuid,
         paths: Vec<PathBuf>,
+    },
+    GitHardReset {
+        repository_id: Uuid,
     },
     GitCreateBranch {
         repository_id: Uuid,
@@ -393,6 +400,10 @@ pub enum LocalResponse {
         changed_paths: u32,
     },
     GitWorktreeRestored {
+        repository_id: Uuid,
+        changed_paths: u32,
+    },
+    GitHardResetCompleted {
         repository_id: Uuid,
         changed_paths: u32,
     },
@@ -671,6 +682,10 @@ mod tests {
                 worktree_id: Uuid::from_bytes([5; 16]),
                 paths: vec![PathBuf::from("tracked")],
             },
+            LocalRequest::GitWorktreeHardReset {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+            },
             LocalRequest::GitWorktreeCreateBranch {
                 repository_id,
                 worktree_id: Uuid::from_bytes([5; 16]),
@@ -842,6 +857,7 @@ mod tests {
                 repository_id,
                 paths: vec![PathBuf::from("tracked")],
             },
+            LocalRequest::GitHardReset { repository_id },
             LocalRequest::GitCreateBranch {
                 repository_id,
                 name: "older".to_owned(),
@@ -993,6 +1009,10 @@ mod tests {
             LocalResponse::GitWorktreeRestored {
                 repository_id,
                 changed_paths: 1,
+            },
+            LocalResponse::GitHardResetCompleted {
+                repository_id,
+                changed_paths: 2,
             },
             LocalResponse::GitPendingAddAbandoned { abandoned: true },
             LocalResponse::GitCommitted(GitCommitInfo {

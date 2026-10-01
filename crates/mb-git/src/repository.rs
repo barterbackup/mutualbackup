@@ -15,9 +15,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::checkout::{
-    CheckoutError, begin_merge_branch, begin_pull, begin_restore_for_scope, begin_switch,
-    begin_switch_for_scope, continue_merge, resume_pending_checkout,
-    resume_pending_checkout_for_scope,
+    CheckoutError, begin_hard_reset_for_scope, begin_merge_branch, begin_pull,
+    begin_restore_for_scope, begin_switch, begin_switch_for_scope, continue_merge,
+    resume_pending_checkout, resume_pending_checkout_for_scope,
 };
 use crate::diff::{DiffError, GitDiff, repository_diff, repository_diff_for_scope};
 use crate::fetch::{FetchError, fetch_bare, import_pushed_branch, import_pushed_tag};
@@ -439,6 +439,17 @@ impl GitRepository {
         )?)
     }
 
+    pub fn linked_hard_reset(&self, worktree_id: Uuid) -> Result<u32, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        self.ensure_no_merge_session()?;
+        Ok(begin_hard_reset_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+            &info.path,
+            &self.directory,
+        )?)
+    }
+
     pub fn linked_create_branch(
         &self,
         worktree_id: Uuid,
@@ -756,6 +767,17 @@ impl GitRepository {
             &self.root,
             &self.directory,
             paths,
+        )?)
+    }
+
+    pub fn hard_reset(&self) -> Result<u32, RepositoryError> {
+        self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
+        Ok(begin_hard_reset_for_scope(
+            &self.catalog,
+            crate::GitWorktreeScope::primary(self.repository_id),
+            &self.root,
+            &self.directory,
         )?)
     }
 
@@ -4510,6 +4532,23 @@ mod tests {
             .oid,
             staged.oid
         );
+        assert_eq!(repo.linked_hard_reset(linked.worktree_id).unwrap(), 1);
+        assert_eq!(
+            fs::read(linked_root.join("tracked")).unwrap(),
+            b"primary\r\n\0"
+        );
+        assert_eq!(
+            crate::stage::staged_entries_for_scope(&repo.catalog, linked.scope().unwrap()).unwrap()
+                [0]
+            .1
+            .oid,
+            first.oid
+        );
+        assert_eq!(
+            fs::read(primary_root.join("tracked")).unwrap(),
+            b"primary\r\n\0"
+        );
+        assert_eq!(repo.status().unwrap().head_oid, Some(base.oid));
         let mut anchors = std::collections::BTreeMap::new();
         for oid in [first.oid, staged.oid] {
             for anchor in repo
@@ -4619,6 +4658,179 @@ mod tests {
         }
         drop(repo);
         for anchor in anchors.into_values() {
+            anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn hard_reset_replays_worktree_before_index_and_preserves_untracked_files() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-hard-reset-{}", Uuid::new_v4()));
+        let root = run_root.join("work");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("tracked"), b"base\r\n\0bytes").unwrap();
+        std::os::unix::fs::symlink("old\nlink", root.join("link")).unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [97_u8; 32];
+        let repo = GitRepository::init(&root, repository_id, &key).unwrap();
+        let original = repo.stage_file("tracked").unwrap();
+        let link = repo.add_path("link").unwrap().unwrap();
+        let commit = repo.commit("Author", "a@example.test", "base").unwrap();
+
+        fs::write(root.join("tracked"), b"staged edit").unwrap();
+        let staged = repo.stage_file("tracked").unwrap();
+        fs::write(root.join("new-staged"), b"new staged bytes").unwrap();
+        let added = repo.stage_file("new-staged").unwrap();
+        fs::write(root.join("tracked"), b"dirty after stage").unwrap();
+        fs::remove_file(root.join("link")).unwrap();
+        std::os::unix::fs::symlink("dirty link", root.join("link")).unwrap();
+        fs::write(root.join("untracked"), b"must survive").unwrap();
+        crate::checkout::set_after_checkout_file_hook(Box::new(|| panic!("hard reset crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repo.hard_reset().unwrap();
+        }));
+        assert!(interrupted.is_err());
+        assert_eq!(
+            crate::stage::staged_entries_for_scope(
+                &repo.catalog,
+                crate::GitWorktreeScope::primary(repository_id),
+            )
+            .unwrap()
+            .into_iter()
+            .find(|(path, _)| path == b"tracked")
+            .unwrap()
+            .1
+            .oid,
+            staged.oid
+        );
+        drop(repo);
+
+        let repo = GitRepository::open(&root, repository_id, &key).unwrap();
+        assert_eq!(fs::read(root.join("tracked")).unwrap(), b"base\r\n\0bytes");
+
+        assert_eq!(
+            fs::read_link(root.join("link"))
+                .unwrap()
+                .as_os_str()
+                .as_bytes(),
+            b"old\nlink"
+        );
+        assert!(!root.join("new-staged").exists());
+        assert_eq!(fs::read(root.join("untracked")).unwrap(), b"must survive");
+        assert_eq!(
+            repo.staged_entry("tracked").unwrap().unwrap().oid,
+            original.oid
+        );
+        assert!(repo.staged_entry("new-staged").unwrap().is_none());
+        assert_eq!(repo.status().unwrap().head_oid, Some(commit.oid));
+        assert_eq!(repo.hard_reset().unwrap(), 0);
+
+        fs::write(root.join("tracked"), b"another staged value").unwrap();
+        let cleanup_stage = repo.stage_file("tracked").unwrap();
+        fs::write(root.join("tracked"), b"another dirty value").unwrap();
+        crate::checkout::set_after_checkout_commit_hook(Box::new(|| {
+            panic!("hard reset cleanup crash")
+        }));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repo.hard_reset().unwrap();
+        }));
+        assert!(interrupted.is_err());
+        assert_eq!(
+            crate::stage::staged_entries_for_scope(
+                &repo.catalog,
+                crate::GitWorktreeScope::primary(repository_id),
+            )
+            .unwrap()
+            .into_iter()
+            .find(|(path, _)| path == b"tracked")
+            .unwrap()
+            .1
+            .oid,
+            original.oid
+        );
+        drop(repo);
+        let repo = GitRepository::open(&root, repository_id, &key).unwrap();
+        assert_eq!(fs::read(root.join("tracked")).unwrap(), b"base\r\n\0bytes");
+
+        fs::write(root.join("tracked"), b"another staged edit").unwrap();
+        let index_only = repo.stage_file("tracked").unwrap();
+        fs::write(root.join("tracked"), b"base\r\n\0bytes").unwrap();
+        assert_eq!(repo.hard_reset().unwrap(), 1);
+        assert_eq!(
+            repo.staged_entry("tracked").unwrap().unwrap().oid,
+            original.oid
+        );
+        assert_eq!(fs::read(root.join("tracked")).unwrap(), b"base\r\n\0bytes");
+
+        fs::remove_file(root.join("tracked")).unwrap();
+        fs::create_dir(root.join("tracked")).unwrap();
+        fs::write(root.join("tracked/untracked-child"), b"must survive reset").unwrap();
+        assert!(matches!(
+            repo.hard_reset(),
+            Err(RepositoryError::Checkout(
+                crate::CheckoutError::DirtyWorktree
+            ))
+        ));
+        assert_eq!(
+            fs::read(root.join("tracked/untracked-child")).unwrap(),
+            b"must survive reset"
+        );
+        assert_eq!(repo.status().unwrap().head_oid, Some(commit.oid));
+
+        let mut anchors = std::collections::BTreeMap::new();
+        for oid in [
+            original.oid,
+            link.oid,
+            staged.oid,
+            added.oid,
+            cleanup_stage.oid,
+            index_only.oid,
+        ] {
+            for anchor in repo
+                .anchors_for_oid(Oid::from_bytes(&oid).unwrap())
+                .unwrap()
+            {
+                anchors.insert(anchor.anchor_id, anchor);
+            }
+        }
+        drop(repo);
+        for anchor in anchors.into_values() {
+            anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn hard_reset_on_unborn_head_removes_staged_additions() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-unborn-reset-{}", Uuid::new_v4()));
+        let root = run_root.join("work");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("staged"), b"raw\r\n\0bytes").unwrap();
+        fs::write(root.join("untracked"), b"keep").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [98_u8; 32];
+        let repo = GitRepository::init(&root, repository_id, &key).unwrap();
+        let staged = repo.stage_file("staged").unwrap();
+        assert_eq!(repo.hard_reset().unwrap(), 1);
+        assert!(!root.join("staged").exists());
+        assert!(repo.staged_entry("staged").unwrap().is_none());
+        assert_eq!(repo.status().unwrap().head_oid, None);
+        assert_eq!(fs::read(root.join("untracked")).unwrap(), b"keep");
+        let anchors = repo
+            .anchors_for_oid(Oid::from_bytes(&staged.oid).unwrap())
+            .unwrap();
+        drop(repo);
+        for anchor in anchors {
             anchor.remove().unwrap();
         }
         fs::remove_dir_all(run_root).unwrap();

@@ -52,8 +52,12 @@ enum Command {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
-    /// Reset the whole index or selected paths to HEAD without changing files.
-    Reset { paths: Vec<PathBuf> },
+    /// Reset index paths, or reset both the index and tracked working files.
+    Reset {
+        #[arg(long)]
+        hard: bool,
+        paths: Vec<PathBuf>,
+    },
     /// Restore selected paths from the index, HEAD, or both.
     Restore {
         #[arg(long)]
@@ -349,8 +353,15 @@ async fn main() -> Result<()> {
                 println!("removed {} from index", relative.display());
             }
         }
-        Command::Reset { paths } => {
-            reset_index(&socket, &working_directory, paths).await?;
+        Command::Reset { hard, paths } => {
+            if hard {
+                if !paths.is_empty() {
+                    bail!("`reset --hard` resets the whole worktree and takes no paths");
+                }
+                hard_reset(&socket, &working_directory).await?;
+            } else {
+                reset_index(&socket, &working_directory, paths).await?;
+            }
         }
         Command::Restore {
             staged,
@@ -1126,6 +1137,29 @@ async fn restore_worktree(
         bail!("daemon restored another repository's worktree");
     }
     println!("Restored {changed_paths} working path(s) from the index");
+    Ok(())
+}
+
+async fn hard_reset(socket: &Path, working_directory: &Path) -> Result<()> {
+    let (_, repository_id, worktree_id) = discover_location(working_directory)?;
+    let request = match worktree_id {
+        Some(worktree_id) => LocalRequest::GitWorktreeHardReset {
+            repository_id,
+            worktree_id,
+        },
+        None => LocalRequest::GitHardReset { repository_id },
+    };
+    let LocalResponse::GitHardResetCompleted {
+        repository_id: returned_id,
+        changed_paths,
+    } = local_control_call(socket, &request).await?
+    else {
+        bail!("daemon returned the wrong response to Git hard reset");
+    };
+    if returned_id != repository_id {
+        bail!("daemon reset another repository's worktree");
+    }
+    println!("Reset {changed_paths} tracked path(s) to HEAD");
     Ok(())
 }
 
