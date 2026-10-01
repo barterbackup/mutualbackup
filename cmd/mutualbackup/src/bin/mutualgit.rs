@@ -75,6 +75,12 @@ enum Command {
         name: Option<String>,
         start_point: Option<String>,
     },
+    /// Keep a commit and its ancestors reachable from signed history backups.
+    Pin { oid: String },
+    /// Release an explicit commit pin; other refs and retained backups still apply.
+    Unpin { oid: String },
+    /// List explicitly pinned commit IDs.
+    Pins,
     /// Switch to a branch using exact-byte reflink checkout.
     Switch { name: String },
     /// Check out a branch using the same protected worktree transition.
@@ -105,6 +111,7 @@ async fn main() -> Result<()> {
         .canonicalize()
         .context("cannot resolve working directory")?;
     let socket = cli.socket.unwrap_or_else(default_control_socket);
+    let pin_action = matches!(&cli.command, Command::Pin { .. });
     match cli.command {
         Command::Init { directory } => {
             let root = directory
@@ -357,6 +364,49 @@ async fn main() -> Result<()> {
                         println!("  remotes/{}", remote.name);
                     }
                 }
+            }
+        }
+        Command::Pin { oid } | Command::Unpin { oid } => {
+            let (_, repository_id) = discover_repository(&working_directory)?;
+            let oid: [u8; 20] = git2::Oid::from_str(&oid)?.as_bytes().try_into()?;
+            let pinned = pin_action;
+            let request = if pinned {
+                LocalRequest::GitPinCommit { repository_id, oid }
+            } else {
+                LocalRequest::GitUnpinCommit { repository_id, oid }
+            };
+            let LocalResponse::GitCommitPinChanged {
+                repository_id: changed_repository,
+                oid: changed_oid,
+                pinned: changed_pinned,
+            } = local_control_call(&socket, &request).await?
+            else {
+                bail!("daemon returned the wrong response to Git pin change");
+            };
+            if changed_repository != repository_id || changed_oid != oid || changed_pinned != pinned
+            {
+                bail!("daemon changed an unexpected Git commit pin");
+            }
+            println!(
+                "{} {}",
+                if pinned { "Pinned" } else { "Unpinned" },
+                git2::Oid::from_bytes(&oid)?
+            );
+        }
+        Command::Pins => {
+            let (_, repository_id) = discover_repository(&working_directory)?;
+            let LocalResponse::GitCommitPins {
+                repository_id: listed_repository,
+                oids,
+            } = local_control_call(&socket, &LocalRequest::GitCommitPins { repository_id }).await?
+            else {
+                bail!("daemon returned the wrong response to Git pin listing");
+            };
+            if listed_repository != repository_id {
+                bail!("daemon listed pins from another repository");
+            }
+            for oid in oids {
+                println!("{}", git2::Oid::from_bytes(&oid)?);
             }
         }
         Command::Switch { name } | Command::Checkout { name } => {

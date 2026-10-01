@@ -27,6 +27,7 @@ use crate::{GitAnchorError, GitBackupDescriptor, GitBackupError, NativeOdb, blob
 const METADATA_PREFIX: &str = "git-metadata-object-v1/";
 const REF_PREFIX: &str = "git-ref-v1/";
 const MAIN_REF: &[u8] = b"refs/heads/main";
+const PIN_REF_PREFIX: &str = "refs/mutualbackup/pins/";
 pub(crate) const MAX_GRAPH_OBJECTS: usize = 100_000;
 pub(crate) const MAX_GRAPH_METADATA_BYTES: usize = 64 * 1024 * 1024;
 
@@ -72,6 +73,8 @@ pub enum HistoryError {
     StartPointNotFound,
     #[error("the selected unborn branch needs checkout before its ref can be created")]
     UnbornSelectedBranch,
+    #[error("the requested commit pin does not exist")]
+    PinNotFound,
     #[error("switching this branch requires a worktree checkout")]
     CheckoutRequired,
 }
@@ -352,6 +355,72 @@ pub fn list_remote_branches(
     }
     result.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(result)
+}
+
+/// Explicit protection pins are ordinary Git refs, so the existing graph
+/// export and signed backup descriptor include their complete ancestry.
+pub fn list_commit_pins(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<Vec<[u8; 20]>, HistoryError> {
+    let mut pins = Vec::new();
+    for (name, encoded) in control.records(&ref_kind(repository_id))? {
+        let Some(suffix) = name.strip_prefix(PIN_REF_PREFIX.as_bytes()) else {
+            continue;
+        };
+        let text = std::str::from_utf8(suffix).map_err(|_| HistoryError::IncompatibleRecord)?;
+        let oid = Oid::from_str(text).map_err(|_| HistoryError::IncompatibleRecord)?;
+        if suffix.len() != 40 || text != oid.to_string() {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        let record: RefRecord = decode_canonical(&encoded)?;
+        if record.format_version != 1 || record.oid != oid.as_bytes() {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        checked_commit(control, repository_id, oid)?;
+        pins.push(record.oid);
+        if pins.len() > MAX_GRAPH_OBJECTS {
+            return Err(HistoryError::GraphTooLarge);
+        }
+    }
+    pins.sort();
+    Ok(pins)
+}
+
+pub fn pin_commit(
+    control: &ControlStore,
+    repository_id: Uuid,
+    oid: Oid,
+) -> Result<(), HistoryError> {
+    checked_commit(control, repository_id, oid)?;
+    let reference = format!("{PIN_REF_PREFIX}{oid}");
+    let encoded = fetched_ref_record(oid.as_bytes().try_into().expect("SHA-1 OID"))?;
+    if !control.put_record_if_absent(&ref_kind(repository_id), reference.as_bytes(), &encoded)?
+        && control
+            .get_record(&ref_kind(repository_id), reference.as_bytes())?
+            .as_deref()
+            != Some(encoded.as_slice())
+    {
+        return Err(HistoryError::IncompatibleRecord);
+    }
+    Ok(())
+}
+
+pub fn unpin_commit(
+    control: &ControlStore,
+    repository_id: Uuid,
+    oid: Oid,
+) -> Result<(), HistoryError> {
+    let reference = format!("{PIN_REF_PREFIX}{oid}");
+    let encoded = fetched_ref_record(oid.as_bytes().try_into().expect("SHA-1 OID"))?;
+    if control
+        .get_record(&ref_kind(repository_id), reference.as_bytes())?
+        .is_none()
+    {
+        return Err(HistoryError::PinNotFound);
+    }
+    control.delete_record_if_value(&ref_kind(repository_id), reference.as_bytes(), &encoded)?;
+    Ok(())
 }
 
 fn checked_commit(

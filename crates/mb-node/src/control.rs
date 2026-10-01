@@ -445,6 +445,40 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitCommitPins { repository_id } => {
+            blocking_node(node, move |node| {
+                node.git_commit_pins(repository_id)
+                    .map(|oids| LocalResponse::GitCommitPins {
+                        repository_id,
+                        oids,
+                    })
+            })
+            .await
+        }
+        LocalRequest::GitPinCommit { repository_id, oid } => {
+            blocking_node(node, move |node| {
+                node.git_pin_commit(repository_id, oid).map(|()| {
+                    LocalResponse::GitCommitPinChanged {
+                        repository_id,
+                        oid,
+                        pinned: true,
+                    }
+                })
+            })
+            .await
+        }
+        LocalRequest::GitUnpinCommit { repository_id, oid } => {
+            blocking_node(node, move |node| {
+                node.git_unpin_commit(repository_id, oid).map(|()| {
+                    LocalResponse::GitCommitPinChanged {
+                        repository_id,
+                        oid,
+                        pinned: false,
+                    }
+                })
+            })
+            .await
+        }
         LocalRequest::GitCreateBranch {
             repository_id,
             name,

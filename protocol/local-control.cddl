@@ -33,6 +33,9 @@ local-request =
   / { "GitLog": { repository_id: uuid-text, limit: uint } }
   / { "GitBranches": { repository_id: uuid-text } }
   / { "GitRemoteBranches": { repository_id: uuid-text } }
+  / { "GitCommitPins": { repository_id: uuid-text } }
+  / { "GitPinCommit": { repository_id: uuid-text, oid: bytes20-array } }
+  / { "GitUnpinCommit": { repository_id: uuid-text, oid: bytes20-array } }
   / { "GitCreateBranch": { repository_id: uuid-text, name: tstr } }
   / { "GitCreateBranchFrom": { repository_id: uuid-text, name: tstr, start_point: tstr } }
   / { "GitDeleteBranch": { repository_id: uuid-text, name: tstr, force: bool } }
@@ -82,6 +85,8 @@ local-response =
   / { "GitLog": [* git-log-entry] }
   / { "GitBranches": [* git-branch-info] }
   / { "GitRemoteBranches": [* git-remote-branch-info] }
+  / { "GitCommitPins": { repository_id: uuid-text, oids: [* bytes20-array] } }
+  / { "GitCommitPinChanged": { repository_id: uuid-text, oid: bytes20-array, pinned: bool } }
   / { "GitBranchCreated": git-branch-info }
   / { "GitBranchDeleted": git-branch-info }
   / { "GitBranchSelected": git-branch-info }

@@ -700,6 +700,11 @@ Proactive background repair comes later.
   must distinguish local history from guild-protected, seed-recoverable history.
   Recovery reconstructs the Git graph, refs, object map, and checked-out view
   from authenticated backup data without a cached local catalog.
+- Represent explicit commit protection pins as namespaced Git refs so graph
+  export, signed backup, and recovery retain their ancestry without another
+  object format. Removing a branch or pin only changes reachability; physical
+  deletion waits for the prune/GC gate and every retained revision. The local
+  frontend has no implicit reflog protection until a durable reflog is defined.
 
 ### Deferred source backends and platform work
 
@@ -3074,7 +3079,9 @@ Milestone 5.
 - Define Git-facing history expiry and prune/GC over refs, index, worktrees,
   retained signed revisions, explicit protection pins, and in-flight work.
   Deletion must release unreachable native anchors and trigger existing remote
-  cleanup; it must never collect an object still needed for recovery. Report
+  cleanup; it must never collect an object still needed for recovery. Include
+  `pin`, `unpin`, and pin listing in the local command set, and document that
+  the current frontend has no implicit reflog retention. Report
   reclaimable logical bytes separately from physically freed shared extents.
 - Then implement the already planned guarded link-freeze backend, including its
   atomic sparse private-copy transition when the user needs to edit the

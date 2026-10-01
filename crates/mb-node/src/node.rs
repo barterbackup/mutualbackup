@@ -1459,6 +1459,24 @@ impl Node {
             .map_err(Into::into)
     }
 
+    pub fn git_commit_pins(&self, repository_id: Uuid) -> Result<Vec<[u8; 20]>> {
+        self.open_git_repository(repository_id)?
+            .commit_pins()
+            .map_err(Into::into)
+    }
+
+    pub fn git_pin_commit(&self, repository_id: Uuid, oid: [u8; 20]) -> Result<()> {
+        self.open_git_repository(repository_id)?
+            .pin_commit(git2::Oid::from_bytes(&oid)?)
+            .map_err(Into::into)
+    }
+
+    pub fn git_unpin_commit(&self, repository_id: Uuid, oid: [u8; 20]) -> Result<()> {
+        self.open_git_repository(repository_id)?
+            .unpin_commit(git2::Oid::from_bytes(&oid)?)
+            .map_err(Into::into)
+    }
+
     pub fn git_create_branch(&self, repository_id: Uuid, name: &str) -> Result<GitBranchInfo> {
         self.open_git_repository(repository_id)?
             .create_branch(name)
@@ -15359,6 +15377,15 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(first_commit.parent_oid, None);
+        node.git_pin_commit(info.repository_id, first_commit.oid)
+            .unwrap();
+        assert_eq!(
+            node.git_commit_pins(info.repository_id).unwrap(),
+            vec![first_commit.oid]
+        );
+        node.git_unpin_commit(info.repository_id, first_commit.oid)
+            .unwrap();
+        assert!(node.git_commit_pins(info.repository_id).unwrap().is_empty());
         let older = node.git_create_branch(info.repository_id, "older").unwrap();
         assert_eq!(older.oid, first_commit.oid);
         assert!(!older.current);

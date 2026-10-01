@@ -84,6 +84,17 @@ pub enum LocalRequest {
     GitRemoteBranches {
         repository_id: Uuid,
     },
+    GitCommitPins {
+        repository_id: Uuid,
+    },
+    GitPinCommit {
+        repository_id: Uuid,
+        oid: [u8; 20],
+    },
+    GitUnpinCommit {
+        repository_id: Uuid,
+        oid: [u8; 20],
+    },
     GitCreateBranch {
         repository_id: Uuid,
         name: String,
@@ -203,6 +214,15 @@ pub enum LocalResponse {
     GitLog(Vec<GitLogEntry>),
     GitBranches(Vec<GitBranchInfo>),
     GitRemoteBranches(Vec<GitRemoteBranchInfo>),
+    GitCommitPins {
+        repository_id: Uuid,
+        oids: Vec<[u8; 20]>,
+    },
+    GitCommitPinChanged {
+        repository_id: Uuid,
+        oid: [u8; 20],
+        pinned: bool,
+    },
     GitBranchCreated(GitBranchInfo),
     GitBranchDeleted(GitBranchInfo),
     GitBranchSelected(GitBranchInfo),
@@ -410,6 +430,15 @@ mod tests {
             },
             LocalRequest::GitBranches { repository_id },
             LocalRequest::GitRemoteBranches { repository_id },
+            LocalRequest::GitCommitPins { repository_id },
+            LocalRequest::GitPinCommit {
+                repository_id,
+                oid: [7; 20],
+            },
+            LocalRequest::GitUnpinCommit {
+                repository_id,
+                oid: [7; 20],
+            },
             LocalRequest::GitCreateBranch {
                 repository_id,
                 name: "older".to_owned(),
@@ -509,6 +538,15 @@ mod tests {
                 name: "origin/topic".to_owned(),
                 oid: [7; 20],
             }]),
+            LocalResponse::GitCommitPins {
+                repository_id,
+                oids: vec![[7; 20]],
+            },
+            LocalResponse::GitCommitPinChanged {
+                repository_id,
+                oid: [7; 20],
+                pinned: true,
+            },
             LocalResponse::GitBranchCreated(GitBranchInfo {
                 format_version: 1,
                 repository_id,

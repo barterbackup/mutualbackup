@@ -23,7 +23,8 @@ use crate::head::{HeadError, selected_branch};
 use crate::history::{
     GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, GitRemoteBranchInfo, HistoryError,
     commit_index, create_branch, create_branch_from, delete_branch, export_graph_source,
-    import_graph_backup, list_branches, list_remote_branches, log_history, switch_same_tree_branch,
+    import_graph_backup, list_branches, list_commit_pins, list_remote_branches, log_history,
+    pin_commit, switch_same_tree_branch, unpin_commit,
 };
 use crate::interop::{GitInteropError, push_current_branch_to_bare};
 use crate::stage::{
@@ -329,6 +330,21 @@ impl GitRepository {
     pub fn remote_branches(&self) -> Result<Vec<GitRemoteBranchInfo>, RepositoryError> {
         self.resume_checkout()?;
         Ok(list_remote_branches(&self.catalog, self.repository_id)?)
+    }
+
+    pub fn commit_pins(&self) -> Result<Vec<[u8; 20]>, RepositoryError> {
+        self.resume_checkout()?;
+        Ok(list_commit_pins(&self.catalog, self.repository_id)?)
+    }
+
+    pub fn pin_commit(&self, oid: Oid) -> Result<(), RepositoryError> {
+        self.resume_checkout()?;
+        Ok(pin_commit(&self.catalog, self.repository_id, oid)?)
+    }
+
+    pub fn unpin_commit(&self, oid: Oid) -> Result<(), RepositoryError> {
+        self.resume_checkout()?;
+        Ok(unpin_commit(&self.catalog, self.repository_id, oid)?)
     }
 
     pub fn selected_branch(&self) -> Result<String, RepositoryError> {
@@ -790,7 +806,7 @@ mod tests {
         local.switch_branch("topic").unwrap();
         fs::write(source_root.join("tracked"), b"topic divergent").unwrap();
         local.stage_file("tracked").unwrap();
-        local
+        let topic_divergent = local
             .commit("Author", "a@example.test", "topic divergent")
             .unwrap();
         local.switch_branch("main").unwrap();
@@ -816,10 +832,27 @@ mod tests {
             ))
         ));
         assert_eq!(local.branches().unwrap().len(), 2);
+        let pin_oid = Oid::from_bytes(&topic_divergent.oid).unwrap();
+        local.pin_commit(pin_oid).unwrap();
+        local.pin_commit(pin_oid).unwrap();
+        assert_eq!(local.commit_pins().unwrap(), vec![topic_divergent.oid]);
         let merged = local.create_branch("merged").unwrap();
         assert_eq!(local.delete_branch("merged", false).unwrap(), merged);
         let deleted = local.delete_branch("topic", true).unwrap();
         assert_eq!(deleted.name, "topic");
+        let pinned_graph = local.export_graph_source().unwrap();
+        assert_eq!(pinned_graph.refs.len(), 2);
+        assert!(pinned_graph.refs.iter().any(|reference| {
+            reference.name == format!("refs/mutualbackup/pins/{pin_oid}").as_bytes()
+                && reference.oid == topic_divergent.oid
+        }));
+        assert!(
+            pinned_graph
+                .objects
+                .iter()
+                .any(|object| object.oid == topic_divergent.oid)
+        );
+        assert!(pinned_graph.blobs.len() > 1);
         assert!(matches!(
             local.merge_branch("topic"),
             Err(RepositoryError::Checkout(
@@ -827,6 +860,15 @@ mod tests {
             ))
         ));
         assert_eq!(local.branches().unwrap().len(), 1);
+        drop(local);
+        let local = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        assert_eq!(local.commit_pins().unwrap(), vec![topic_divergent.oid]);
+        local.unpin_commit(pin_oid).unwrap();
+        assert!(local.commit_pins().unwrap().is_empty());
+        assert!(matches!(
+            local.unpin_commit(pin_oid),
+            Err(RepositoryError::History(crate::HistoryError::PinNotFound))
+        ));
         assert_eq!(base.parent_oid, None);
         let graph = local.export_graph_source().unwrap();
         assert_eq!(graph.refs.len(), 1);
