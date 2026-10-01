@@ -1019,6 +1019,204 @@ pub struct ReflinkFileCapturePlan {
     file_version: CaptureVersion,
 }
 
+/// Durable direct import of bytes supplied by an external object source.
+/// The payload is written once into the native anchor area; no second local
+/// Git blob file is required. A published anchor can be recovered without
+/// reopening the external source after a crash.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImportedBlobCapturePlan {
+    format_version: u16,
+    root: ReflinkCapturePlan,
+    logical_len: u64,
+}
+
+impl ImportedBlobCapturePlan {
+    pub fn plan(source_root: impl AsRef<Path>, logical_len: u64) -> Result<Self, AnchorError> {
+        Ok(Self {
+            format_version: 1,
+            root: ReflinkAnchor::plan(source_root)?,
+            logical_len,
+        })
+    }
+
+    pub fn source_root(&self) -> &Path {
+        self.root.source_root()
+    }
+
+    pub fn logical_len(&self) -> u64 {
+        self.logical_len
+    }
+
+    pub fn anchor_id(&self) -> Uuid {
+        self.root.anchor_id
+    }
+
+    fn synthetic_source_path(&self) -> PathBuf {
+        PathBuf::from(GIT_CATALOG_DIRECTORY).join(format!("git-import-{}", self.anchor_id()))
+    }
+
+    fn synthetic_source_version(&self) -> CaptureVersion {
+        CaptureVersion {
+            filesystem_id: self.root.area.filesystem_id,
+            inode: 0,
+            logical_len: self.logical_len,
+            modified_secs: 0,
+            modified_nanos: 0,
+            changed_secs: 0,
+            changed_nanos: 0,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn capture(&self, mut source: impl Read) -> Result<FileAnchorManifest, AnchorError> {
+        if self.format_version != 1 || self.root.format_version != 1 {
+            return Err(AnchorError::InvalidRoot);
+        }
+        let area_path = resolve_anchor_area(&self.root.area)?;
+        let area = open_stable_anchor_area(&area_path, &self.root.area)?;
+        let anchor_name = self.anchor_id().to_string();
+        let staging_name = format!(".staging-{}", self.anchor_id());
+        let anchor_path = area_path.join(&anchor_name);
+        let staging_path = area_path.join(&staging_name);
+        match open_path_no_xdev_beneath(&area, Path::new(&anchor_name)) {
+            Ok(_) => return read_imported_blob_manifest_at(&area, &area_path, self),
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(_) => return Err(AnchorError::AnchorAreaCollision(anchor_path)),
+        }
+        remove_directory_at(&area, &staging_name, &staging_path)?;
+        area.sync_all()?;
+        let root_path = self
+            .root
+            .source_root
+            .canonicalize()
+            .map_err(|_| AnchorError::InvalidRoot)?;
+        if root_path != self.root.source_root {
+            return Err(AnchorError::InvalidRoot);
+        }
+        let root = open_source_root(&root_path)?;
+        let identity = filesystem_identity_for_file(&root)?;
+        if identity.stable_id != self.root.area.filesystem_id
+            || capture_version(identity.stable_id, &root.metadata()?).inode
+                != self.root.root_version.inode
+        {
+            return Err(AnchorError::FilesystemChanged);
+        }
+        let staging = create_private_directory_at(&area, &staging_name, &staging_path)?;
+        let result = (|| {
+            let mut payload = create_regular_file_at(
+                &staging,
+                FILE_ANCHOR_PAYLOAD,
+                &staging_path.join(FILE_ANCHOR_PAYLOAD),
+            )?;
+            let mut hasher = blake3::Hasher::new();
+            let mut remaining = self.logical_len;
+            let mut buffer = [0_u8; 64 * 1024];
+            while remaining != 0 {
+                let limit = usize::try_from(remaining.min(buffer.len() as u64))
+                    .expect("bounded import chunk fits usize");
+                let read = source.read(&mut buffer[..limit])?;
+                if read == 0 {
+                    return Err(AnchorError::SourceChanged(self.synthetic_source_path()));
+                }
+                payload.write_all(&buffer[..read])?;
+                hasher.update(&buffer[..read]);
+                remaining -= read as u64;
+            }
+            if source.read(&mut buffer[..1])? != 0 {
+                return Err(AnchorError::SourceChanged(self.synthetic_source_path()));
+            }
+            payload.sync_all()?;
+            seal_anchor_file_handle(&payload)?;
+            let manifest = FileAnchorManifest {
+                format_version: 1,
+                anchor_id: self.anchor_id(),
+                area: self.root.area.clone(),
+                source_root_hint: self.root.source_root.clone(),
+                source_relative_path: self.synthetic_source_path(),
+                logical_len: self.logical_len,
+                content_hash: *hasher.finalize().as_bytes(),
+                source_version: self.synthetic_source_version(),
+            };
+            let manifest_name = capture_manifest_name(self.anchor_id());
+            let mut file = create_regular_file_at(
+                &staging,
+                &manifest_name,
+                &staging_path.join(&manifest_name),
+            )?;
+            file.write_all(
+                &canonical_bytes(&manifest)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?,
+            )?;
+            file.sync_all()?;
+            seal_anchor_file_handle(&file)?;
+            staging.sync_all()?;
+            rename_no_replace_at(
+                &area,
+                Path::new(&staging_name),
+                &area,
+                Path::new(&anchor_name),
+            )?;
+            Ok::<_, AnchorError>(manifest)
+        })();
+        let manifest = match result {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let _ = remove_directory_at(&area, &staging_name, &staging_path);
+                let _ = area.sync_all();
+                return Err(error);
+            }
+        };
+        if let Err(error) = area.sync_all() {
+            let _ = remove_directory_at(&area, &anchor_name, &anchor_path);
+            let _ = area.sync_all();
+            return Err(error.into());
+        }
+        Ok(manifest)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn reconcile(&self) -> Result<(), AnchorError> {
+        if self.format_version != 1 || self.root.format_version != 1 {
+            return Err(AnchorError::InvalidRoot);
+        }
+        let area_path = resolve_anchor_area(&self.root.area)?;
+        let area = open_stable_anchor_area(&area_path, &self.root.area)?;
+        let anchor_name = self.anchor_id().to_string();
+        match open_path_no_xdev_beneath(&area, Path::new(&anchor_name)) {
+            Ok(_) => {
+                read_imported_blob_manifest_at(&area, &area_path, self)?;
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(_) => {
+                return Err(AnchorError::AnchorAreaCollision(
+                    area_path.join(anchor_name),
+                ));
+            }
+        }
+        let staging_name = format!(".staging-{}", self.anchor_id());
+        remove_directory_at(&area, &staging_name, &area_path.join(&staging_name))?;
+        area.sync_all()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn discard(&self) -> Result<(), AnchorError> {
+        if self.format_version != 1 || self.root.format_version != 1 {
+            return Err(AnchorError::InvalidRoot);
+        }
+        let area_path = resolve_anchor_area(&self.root.area)?;
+        let area = open_stable_anchor_area(&area_path, &self.root.area)?;
+        for name in [
+            format!(".staging-{}", self.anchor_id()),
+            self.anchor_id().to_string(),
+        ] {
+            remove_directory_at(&area, &name, &area_path.join(&name))?;
+        }
+        area.sync_all()?;
+        Ok(())
+    }
+}
+
 impl ReflinkFileCapturePlan {
     pub fn relative_path(&self) -> &Path {
         &self.relative_path
@@ -3564,6 +3762,47 @@ fn read_planned_file_manifest_at(
     Ok(manifest)
 }
 
+#[cfg(target_os = "linux")]
+fn read_imported_blob_manifest_at(
+    area: &File,
+    area_display: &Path,
+    plan: &ImportedBlobCapturePlan,
+) -> Result<FileAnchorManifest, AnchorError> {
+    let anchor_name = plan.anchor_id().to_string();
+    let anchor_root = area_display.join(&anchor_name);
+    let root = open_path_no_xdev_beneath(area, Path::new(&anchor_name))
+        .map_err(|_| AnchorError::AnchorAreaCollision(anchor_root.clone()))?;
+    if !root.metadata()?.is_dir() {
+        return Err(AnchorError::AnchorAreaCollision(anchor_root));
+    }
+    let root = reopen_pinned_file(&root, true, Path::new(&anchor_name))?;
+    let manifest_name = capture_manifest_name(plan.anchor_id());
+    let mut file = open_regular_file_at(
+        &root,
+        Path::new(&manifest_name),
+        &anchor_root.join(&manifest_name),
+    )?;
+    if file.metadata()?.len() > 64 * 1024 {
+        return Err(AnchorError::AnchorAreaCollision(anchor_root));
+    }
+    let mut encoded = Vec::new();
+    file.read_to_end(&mut encoded)?;
+    let manifest: FileAnchorManifest = decode_canonical(&encoded)
+        .map_err(|_| AnchorError::AnchorAreaCollision(anchor_root.clone()))?;
+    if manifest.format_version != 1
+        || manifest.anchor_id != plan.anchor_id()
+        || manifest.area != plan.root.area
+        || manifest.source_root_hint != plan.root.source_root
+        || manifest.source_relative_path != plan.synthetic_source_path()
+        || manifest.logical_len != plan.logical_len
+        || manifest.source_version != plan.synthetic_source_version()
+    {
+        return Err(AnchorError::AnchorAreaCollision(anchor_root));
+    }
+    manifest.open_verified()?;
+    Ok(manifest)
+}
+
 fn capture_manifest_name(anchor_id: Uuid) -> String {
     format!("{CAPTURE_MANIFEST_PREFIX}{anchor_id}")
 }
@@ -4128,6 +4367,46 @@ mod tests {
         work.remove_child_symlink("regular", identity).unwrap();
         staging.remove_child_file("saved").unwrap();
         assert!(staging.read_child_symlink("saved").unwrap().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn direct_blob_import_is_exact_and_replays_without_its_input_stream() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("import-blob-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        fs::create_dir_all(&source_root).unwrap();
+        let bytes = [b"Git\r\nbytes\0".as_slice(), &vec![0x5a; 2 * 1024 * 1024]].concat();
+        let plan =
+            crate::SourceBlobImportPlan::plan_direct(&source_root, bytes.len() as u64).unwrap();
+        let plan: crate::SourceBlobImportPlan =
+            decode_canonical(&canonical_bytes(&plan).unwrap()).unwrap();
+        assert!(matches!(
+            plan.capture(&bytes[..bytes.len() - 1]),
+            Err(AnchorError::SourceChanged(_))
+        ));
+        assert!(matches!(
+            plan.capture([bytes.as_slice(), b"extra"].concat().as_slice()),
+            Err(AnchorError::SourceChanged(_))
+        ));
+        let manifest = plan.capture(bytes.as_slice()).unwrap();
+        assert_eq!(manifest.logical_len, bytes.len() as u64);
+        assert_eq!(manifest.content_hash, *blake3::hash(&bytes).as_bytes());
+        let mut restored = Vec::new();
+        manifest
+            .open_verified()
+            .unwrap()
+            .read_to_end(&mut restored)
+            .unwrap();
+        assert_eq!(restored, bytes);
+        assert_eq!(plan.capture(std::io::empty()).unwrap(), manifest);
+        plan.reconcile().unwrap();
+        plan.discard().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
     }
 
     #[cfg(target_os = "linux")]
