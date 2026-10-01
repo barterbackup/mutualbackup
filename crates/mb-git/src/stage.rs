@@ -22,12 +22,15 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::attributes::{is_attributes_path, validate_anchor, validate_worktree_path};
-use crate::{GitAnchorError, blob_oid_from_anchor};
+use crate::{GitAnchorError, GitWorktreeScope, blob_oid_from_anchor};
 
 const MAX_STAGE_PATH_BYTES: usize = 4096;
 const INTENT_PREFIX: &str = "git-stage-intent-v1/";
 const SYMLINK_INTENT_PREFIX: &str = "git-symlink-stage-intent-v1/";
 const INDEX_PREFIX: &str = "git-index-entry-v1/";
+const WORKTREE_STAGE_INTENT_PREFIX: &str = "git-worktree-stage-intent-v1/";
+const WORKTREE_SYMLINK_INTENT_PREFIX: &str = "git-worktree-symlink-stage-intent-v1/";
+const WORKTREE_INDEX_PREFIX: &str = "git-worktree-index-entry-v1/";
 const OBJECT_PREFIX: &str = "git-object-anchor-v1/";
 
 #[derive(Debug, Error)]
@@ -89,15 +92,27 @@ struct SymlinkStageIntent {
 }
 
 fn intent_kind(repository_id: Uuid) -> String {
-    format!("{INTENT_PREFIX}{repository_id}")
+    intent_kind_for_scope(GitWorktreeScope::primary(repository_id))
+}
+
+fn intent_kind_for_scope(scope: GitWorktreeScope) -> String {
+    scope.local_kind(INTENT_PREFIX, WORKTREE_STAGE_INTENT_PREFIX)
 }
 
 fn symlink_intent_kind(repository_id: Uuid) -> String {
-    format!("{SYMLINK_INTENT_PREFIX}{repository_id}")
+    symlink_intent_kind_for_scope(GitWorktreeScope::primary(repository_id))
+}
+
+fn symlink_intent_kind_for_scope(scope: GitWorktreeScope) -> String {
+    scope.local_kind(SYMLINK_INTENT_PREFIX, WORKTREE_SYMLINK_INTENT_PREFIX)
 }
 
 pub(crate) fn index_kind(repository_id: Uuid) -> String {
-    format!("{INDEX_PREFIX}{repository_id}")
+    index_kind_for_scope(GitWorktreeScope::primary(repository_id))
+}
+
+pub(crate) fn index_kind_for_scope(scope: GitWorktreeScope) -> String {
+    scope.local_kind(INDEX_PREFIX, WORKTREE_INDEX_PREFIX)
 }
 
 pub(crate) fn object_kind(repository_id: Uuid, oid: Oid) -> String {
@@ -247,17 +262,32 @@ fn save_symlink_intent(
     Ok(())
 }
 
+#[cfg(test)]
 fn begin_stage(
     control: &ControlStore,
     repository_id: Uuid,
     source_root: &Path,
     relative_path: &Path,
 ) -> Result<(Vec<u8>, StageIntent), StageError> {
+    begin_stage_for_scope(
+        control,
+        GitWorktreeScope::primary(repository_id),
+        source_root,
+        relative_path,
+    )
+}
+
+fn begin_stage_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    source_root: &Path,
+    relative_path: &Path,
+) -> Result<(Vec<u8>, StageIntent), StageError> {
     let path_key = stage_path_key(relative_path)?;
-    let kind = intent_kind(repository_id);
+    let kind = intent_kind_for_scope(scope);
     if control.get_record(&kind, &path_key)?.is_some()
         || control
-            .get_record(&symlink_intent_kind(repository_id), &path_key)?
+            .get_record(&symlink_intent_kind_for_scope(scope), &path_key)?
             .is_some()
     {
         return Err(StageError::PendingStage);
@@ -271,7 +301,7 @@ fn begin_stage(
     };
     let intent = StageIntent {
         format_version: 1,
-        repository_id,
+        repository_id: scope.repository_id(),
         relative_path: relative_path.to_path_buf(),
         git_mode: mode,
         plan,
@@ -427,13 +457,13 @@ pub fn stage_symlink(
     finish_symlink_stage(control, repository_id, &key, intent)
 }
 
-fn finish_stage(
+fn finish_stage_for_scope(
     control: &ControlStore,
-    repository_id: Uuid,
+    scope: GitWorktreeScope,
     path_key: &[u8],
     intent: &StageIntent,
 ) -> Result<GitIndexEntry, StageError> {
-    let kind = intent_kind(repository_id);
+    let kind = intent_kind_for_scope(scope);
     let expected = canonical_bytes(intent)?;
     if control.get_record(&kind, path_key)?.as_deref() != Some(expected.as_slice()) {
         return Err(StageError::IncompatibleRecord);
@@ -458,12 +488,12 @@ fn finish_stage(
     control.put_records_and_retire_if_value(
         &[
             (
-                object_kind(repository_id, oid),
+                object_kind(scope.repository_id(), oid),
                 manifest.anchor_id.as_bytes().to_vec(),
                 canonical_bytes(&manifest)?,
             ),
             (
-                index_kind(repository_id),
+                index_kind_for_scope(scope),
                 path_key.to_vec(),
                 canonical_bytes(&entry)?,
             ),
@@ -483,13 +513,25 @@ pub fn stage_file(
     source_root: impl AsRef<Path>,
     relative_path: impl AsRef<Path>,
 ) -> Result<GitIndexEntry, StageError> {
-    let (key, intent) = begin_stage(
+    stage_file_for_scope(
         control,
-        repository_id,
-        source_root.as_ref(),
-        relative_path.as_ref(),
-    )?;
-    finish_stage(control, repository_id, &key, &intent)
+        GitWorktreeScope::primary(repository_id),
+        source_root,
+        relative_path,
+    )
+}
+
+/// Capture a regular file for one worktree while publishing its blob anchor
+/// into the repository's shared object map.
+pub(crate) fn stage_file_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    source_root: impl AsRef<Path>,
+    relative_path: impl AsRef<Path>,
+) -> Result<GitIndexEntry, StageError> {
+    let (key, intent) =
+        begin_stage_for_scope(control, scope, source_root.as_ref(), relative_path.as_ref())?;
+    finish_stage_for_scope(control, scope, &key, &intent)
 }
 
 /// Remove a path from the staged index while leaving its working file alone,
@@ -528,14 +570,29 @@ pub fn resume_pending_stages(
     control: &ControlStore,
     repository_id: Uuid,
 ) -> Result<Vec<GitIndexEntry>, StageError> {
+    resume_pending_stages_for_scope(control, GitWorktreeScope::primary(repository_id))
+}
+
+pub(crate) fn resume_pending_stages_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+) -> Result<Vec<GitIndexEntry>, StageError> {
     let mut resumed = Vec::new();
-    for (key, encoded) in control.records(&intent_kind(repository_id))? {
-        let intent = decode_intent(&encoded, repository_id, &key)?;
-        resumed.push(finish_stage(control, repository_id, &key, &intent)?);
+    for (key, encoded) in control.records(&intent_kind_for_scope(scope))? {
+        let intent = decode_intent(&encoded, scope.repository_id(), &key)?;
+        resumed.push(finish_stage_for_scope(control, scope, &key, &intent)?);
     }
-    for (key, encoded) in control.records(&symlink_intent_kind(repository_id))? {
-        let intent = decode_symlink_intent(&encoded, repository_id, &key)?;
-        resumed.push(finish_symlink_stage(control, repository_id, &key, intent)?);
+    for (key, encoded) in control.records(&symlink_intent_kind_for_scope(scope))? {
+        if scope.worktree_id() != scope.repository_id() {
+            return Err(StageError::IncompatibleRecord);
+        }
+        let intent = decode_symlink_intent(&encoded, scope.repository_id(), &key)?;
+        resumed.push(finish_symlink_stage(
+            control,
+            scope.repository_id(),
+            &key,
+            intent,
+        )?);
     }
     Ok(resumed)
 }
@@ -578,8 +635,20 @@ pub fn staged_entry(
     repository_id: Uuid,
     relative_path: impl AsRef<Path>,
 ) -> Result<Option<GitIndexEntry>, StageError> {
+    staged_entry_for_scope(
+        control,
+        GitWorktreeScope::primary(repository_id),
+        relative_path,
+    )
+}
+
+pub(crate) fn staged_entry_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    relative_path: impl AsRef<Path>,
+) -> Result<Option<GitIndexEntry>, StageError> {
     let key = stage_path_key(relative_path.as_ref())?;
-    let Some(encoded) = control.get_record(&index_kind(repository_id), &key)? else {
+    let Some(encoded) = control.get_record(&index_kind_for_scope(scope), &key)? else {
         return Ok(None);
     };
     let entry: GitIndexEntry = decode_canonical(&encoded)?;
@@ -596,8 +665,15 @@ pub fn staged_entries(
     control: &ControlStore,
     repository_id: Uuid,
 ) -> Result<Vec<(Vec<u8>, GitIndexEntry)>, StageError> {
+    staged_entries_for_scope(control, GitWorktreeScope::primary(repository_id))
+}
+
+pub(crate) fn staged_entries_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+) -> Result<Vec<(Vec<u8>, GitIndexEntry)>, StageError> {
     let mut entries = Vec::new();
-    for (key, encoded) in control.records(&index_kind(repository_id))? {
+    for (key, encoded) in control.records(&index_kind_for_scope(scope))? {
         #[cfg(unix)]
         {
             let path = PathBuf::from(std::ffi::OsString::from_vec(key.clone()));
@@ -617,9 +693,16 @@ pub fn staged_entries(
 }
 
 pub fn has_pending_stages(control: &ControlStore, repository_id: Uuid) -> Result<bool, StageError> {
-    Ok(!control.records(&intent_kind(repository_id))?.is_empty()
+    has_pending_stages_for_scope(control, GitWorktreeScope::primary(repository_id))
+}
+
+pub(crate) fn has_pending_stages_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+) -> Result<bool, StageError> {
+    Ok(!control.records(&intent_kind_for_scope(scope))?.is_empty()
         || !control
-            .records(&symlink_intent_kind(repository_id))?
+            .records(&symlink_intent_kind_for_scope(scope))?
             .is_empty())
 }
 
@@ -627,13 +710,20 @@ pub fn pending_stage_paths(
     control: &ControlStore,
     repository_id: Uuid,
 ) -> Result<Vec<Vec<u8>>, StageError> {
+    pending_stage_paths_for_scope(control, GitWorktreeScope::primary(repository_id))
+}
+
+pub(crate) fn pending_stage_paths_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+) -> Result<Vec<Vec<u8>>, StageError> {
     let mut paths = Vec::new();
-    for (key, encoded) in control.records(&intent_kind(repository_id))? {
-        decode_intent(&encoded, repository_id, &key)?;
+    for (key, encoded) in control.records(&intent_kind_for_scope(scope))? {
+        decode_intent(&encoded, scope.repository_id(), &key)?;
         paths.push(key);
     }
-    for (key, encoded) in control.records(&symlink_intent_kind(repository_id))? {
-        decode_symlink_intent(&encoded, repository_id, &key)?;
+    for (key, encoded) in control.records(&symlink_intent_kind_for_scope(scope))? {
+        decode_symlink_intent(&encoded, scope.repository_id(), &key)?;
         paths.push(key);
     }
     paths.sort();
@@ -665,17 +755,24 @@ pub fn anchors_for_oid(
 mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
+    use git2::Oid;
     use mb_store::{
         AnchorError, ControlStore, GIT_CATALOG_DIRECTORY, PinnedDirectory, SourceFileCapturePlan,
     };
     use uuid::Uuid;
 
     use super::{
-        StageError, abandon_pending_stage, anchors_for_oid, begin_stage, begin_symlink_stage,
-        resume_pending_stages, save_symlink_intent, stage_file, staged_entry,
+        StageError, abandon_pending_stage, anchors_for_oid, begin_stage, begin_stage_for_scope,
+        begin_symlink_stage, has_pending_stages, pending_stage_paths_for_scope,
+        resume_pending_stages, resume_pending_stages_for_scope, save_symlink_intent, stage_file,
+        staged_entries_for_scope, staged_entry, staged_entry_for_scope,
     };
+    use crate::GitWorktreeScope;
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
@@ -735,6 +832,77 @@ mod tests {
         drop(control);
         drop(catalog);
         manifest.remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn linked_worktree_stage_replays_without_overwriting_primary_index() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-scoped-stage-{}", Uuid::new_v4()));
+        let primary_root = run_root.join("primary");
+        let linked_root = run_root.join("linked");
+        fs::create_dir_all(&primary_root).unwrap();
+        fs::create_dir_all(&linked_root).unwrap();
+        fs::write(primary_root.join("tracked"), b"primary\r\n").unwrap();
+        fs::write(linked_root.join("tracked"), b"linked\n\0").unwrap();
+        let repository_id = Uuid::new_v4();
+        let scope = GitWorktreeScope::linked(repository_id, Uuid::new_v4()).unwrap();
+        let database = run_root.join("catalog.db");
+        let key = [62_u8; 32];
+        let control = ControlStore::open_with_key(&database, &key).unwrap();
+        let primary = stage_file(&control, repository_id, &primary_root, "tracked").unwrap();
+        let (path, intent) =
+            begin_stage_for_scope(&control, scope, &linked_root, Path::new("tracked")).unwrap();
+        let linked_anchor = intent.plan.capture().unwrap();
+        assert_eq!(
+            pending_stage_paths_for_scope(&control, scope).unwrap(),
+            vec![path]
+        );
+        assert!(!has_pending_stages(&control, repository_id).unwrap());
+        drop(control);
+
+        let control = ControlStore::open_with_key(&database, &key).unwrap();
+        let resumed = resume_pending_stages_for_scope(&control, scope).unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].anchor_id, linked_anchor.anchor_id);
+        assert_ne!(resumed[0].oid, primary.oid);
+        assert_eq!(
+            staged_entry(&control, repository_id, "tracked").unwrap(),
+            Some(primary.clone())
+        );
+        assert_eq!(
+            staged_entry_for_scope(&control, scope, "tracked").unwrap(),
+            Some(resumed[0].clone())
+        );
+        assert_eq!(staged_entries_for_scope(&control, scope).unwrap().len(), 1);
+        assert!(
+            resume_pending_stages_for_scope(&control, scope)
+                .unwrap()
+                .is_empty()
+        );
+        let primary_anchor = anchors_for_oid(
+            &control,
+            repository_id,
+            Oid::from_bytes(&primary.oid).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(primary_anchor.len(), 1);
+        assert_eq!(
+            anchors_for_oid(
+                &control,
+                repository_id,
+                Oid::from_bytes(&resumed[0].oid).unwrap()
+            )
+            .unwrap(),
+            vec![linked_anchor.clone()]
+        );
+        drop(control);
+        primary_anchor[0].remove().unwrap();
+        linked_anchor.remove().unwrap();
         fs::remove_dir_all(run_root).unwrap();
     }
 

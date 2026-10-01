@@ -36,6 +36,7 @@ mod repository;
 mod stage;
 #[cfg(target_os = "linux")]
 mod status;
+mod worktree_scope;
 pub use attributes::GitAttributesError;
 #[cfg(target_os = "linux")]
 pub use backup::{GitBackupBlob, GitBackupDescriptor, GitBackupError, GitDataExtent};
@@ -68,6 +69,7 @@ pub use stage::{
 };
 #[cfg(target_os = "linux")]
 pub use status::{GitChange, GitStatus, GitStatusChange, StatusError};
+pub use worktree_scope::GitWorktreeScope;
 
 #[derive(Debug, Error)]
 pub enum GitAnchorError {
