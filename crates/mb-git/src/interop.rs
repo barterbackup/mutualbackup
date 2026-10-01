@@ -2,6 +2,7 @@
 //! Git repository owns its own object storage; this source repository does not
 //! create a second persistent blob store.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -10,7 +11,7 @@ use git2::{ObjectFormat, ObjectType, Oid, Repository};
 use thiserror::Error;
 
 use crate::GitAnchorError;
-use crate::history::{GitGraphSource, HistoryError, export_graph_source};
+use crate::history::{GitBranchInfo, GitGraphSource, HistoryError, export_graph_source};
 use mb_store::{ControlStore, FileAnchorManifest};
 use uuid::Uuid;
 
@@ -24,9 +25,7 @@ pub enum GitInteropError {
     Git(#[from] git2::Error),
     #[error("Git object streaming failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error(
-        "the destination must be an existing SHA-1 bare Git repository outside this source root"
-    )]
+    #[error("the destination must be an existing SHA-1 Git repository outside this source root")]
     UnsupportedDestination,
     #[error("the current branch has no committed head")]
     NoHead,
@@ -38,6 +37,8 @@ pub enum GitInteropError {
     ObjectConflict,
     #[error("the exported graph contains an incompatible object or reference")]
     IncompatibleGraph,
+    #[error("Git refs changed since the remote helper advertised them")]
+    StaleAdvertisement,
 }
 
 fn object_type(kind: u8) -> Result<ObjectType, GitInteropError> {
@@ -209,6 +210,60 @@ fn export_objects(destination: &Repository, graph: &GitGraphSource) -> Result<()
         )?;
     }
     Ok(())
+}
+
+/// Write the advertised graph into an existing stock Git object database.
+/// The stock Git caller owns these objects; this repository keeps only native
+/// anchors and does not create a Git-format payload mirror.
+pub(crate) fn export_graph_to_git_repository(
+    control: &ControlStore,
+    repository_id: Uuid,
+    source_root: &Path,
+    destination_path: &Path,
+    advertised: &[GitBranchInfo],
+) -> Result<u32, GitInteropError> {
+    let destination_path = destination_path.canonicalize()?;
+    if destination_path.starts_with(source_root) {
+        return Err(GitInteropError::UnsupportedDestination);
+    }
+    let destination = Repository::open(&destination_path)?;
+    if destination.path().canonicalize()? != destination_path
+        || destination.object_format() != ObjectFormat::Sha1
+    {
+        return Err(GitInteropError::UnsupportedDestination);
+    }
+    let graph = export_graph_source(control, repository_id)?;
+    if graph.format_version != 1 || graph.repository_id != repository_id {
+        return Err(GitInteropError::IncompatibleGraph);
+    }
+    let actual = graph
+        .refs
+        .iter()
+        .filter_map(|reference| {
+            reference
+                .name
+                .strip_prefix(b"refs/heads/")
+                .map(|name| (name.to_vec(), reference.oid))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut expected = BTreeMap::new();
+    for branch in advertised {
+        if branch.format_version != 1
+            || branch.repository_id != repository_id
+            || !git2::Branch::name_is_valid(&branch.name)?
+            || expected
+                .insert(branch.name.as_bytes().to_vec(), branch.oid)
+                .is_some()
+        {
+            return Err(GitInteropError::StaleAdvertisement);
+        }
+    }
+    if actual != expected {
+        return Err(GitInteropError::StaleAdvertisement);
+    }
+    export_objects(&destination, &graph)?;
+    u32::try_from(graph.blobs.len() + graph.objects.len())
+        .map_err(|_| GitInteropError::IncompatibleGraph)
 }
 
 fn source_descends_from(

@@ -1,0 +1,184 @@
+#![cfg(target_os = "linux")]
+
+use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixListener;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use mb_git::GitRepository;
+use mb_node::{LocalRequest, LocalResponse};
+use uuid::Uuid;
+
+#[test]
+#[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+fn stock_git_fetches_from_native_anchors_through_local_helper() {
+    let test_root = PathBuf::from(
+        std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+            .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+    );
+    let run_root = test_root.join(format!("git-remote-helper-{}", Uuid::new_v4()));
+    let source_root = run_root.join("source");
+    let stock_root = run_root.join("stock");
+    fs::create_dir_all(&source_root).unwrap();
+    fs::create_dir_all(&stock_root).unwrap();
+    let payload = b"exact\r\nbytes\0\xff\n";
+    fs::write(source_root.join("tracked"), payload).unwrap();
+    let repository_id = Uuid::new_v4();
+    let key = [91_u8; 32];
+    let repository = GitRepository::init(&source_root, repository_id, &key).unwrap();
+    let staged = repository.stage_file("tracked").unwrap();
+    let commit = repository
+        .commit("Author", "a@example.test", "stock Git fetch")
+        .unwrap();
+    drop(repository);
+    let output = Command::new("git")
+        .args(["init", "-q"])
+        .arg(&stock_root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let socket = run_root.join("control.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = stop.clone();
+    let server_root = source_root.clone();
+    let server = std::thread::spawn(move || {
+        let repository = GitRepository::open(&server_root, repository_id, &key).unwrap();
+        while !server_stop.load(Ordering::Relaxed) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("local test socket failed: {error}"),
+            };
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut request = vec![0_u8; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut request).unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&request).unwrap();
+            let request_id = envelope["request_id"].clone();
+            let request: LocalRequest =
+                serde_json::from_value(envelope["request"].clone()).unwrap();
+            let response = match request {
+                LocalRequest::GitBranches {
+                    repository_id: requested,
+                } => {
+                    assert_eq!(requested, repository_id);
+                    LocalResponse::GitBranches(repository.branches().unwrap())
+                }
+                LocalRequest::GitExportToGitRepository {
+                    repository_id: requested,
+                    source_root,
+                    destination,
+                    advertised,
+                } => {
+                    assert_eq!(requested, repository_id);
+                    assert_eq!(source_root, server_root);
+                    let object_count = repository
+                        .export_to_git_repository(&destination, &advertised)
+                        .unwrap();
+                    LocalResponse::GitObjectsExported {
+                        repository_id,
+                        object_count,
+                    }
+                }
+                _ => panic!("unexpected Git helper request"),
+            };
+            let response = serde_json::json!({
+                "format_version": 2,
+                "request_id": request_id,
+                "result": { "Ok": response },
+            });
+            let bytes = serde_json::to_vec(&response).unwrap();
+            stream
+                .write_all(&(bytes.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&bytes).unwrap();
+        }
+    });
+
+    let helper = PathBuf::from(env!("CARGO_BIN_EXE_git-remote-mutualbackup"));
+    let path = format!(
+        "{}:{}",
+        helper.parent().unwrap().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&stock_root)
+        .args(["fetch", "--no-tags"])
+        .arg(format!("mutualbackup::{}", source_root.display()))
+        .arg("refs/heads/main:refs/remotes/mb/main")
+        .env("PATH", &path)
+        .env("MUTUALBACKUP_CONTROL_SOCKET", &socket)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&stock_root)
+        .args([
+            "cat-file",
+            "blob",
+            &git2::Oid::from_bytes(&staged.oid).unwrap().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, payload);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&stock_root)
+        .args(["rev-parse", "refs/remotes/mb/main"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        git2::Oid::from_bytes(&commit.oid).unwrap().to_string()
+    );
+
+    let clone_root = run_root.join("clone");
+    let output = Command::new("git")
+        .args(["-c", "core.autocrlf=false", "clone", "--no-tags"])
+        .arg(format!("mutualbackup::{}", source_root.display()))
+        .arg(&clone_root)
+        .env("PATH", &path)
+        .env("MUTUALBACKUP_CONTROL_SOCKET", &socket)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    stop.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(clone_root.join("tracked")).unwrap(), payload);
+
+    let repository = GitRepository::open(&source_root, repository_id, &key).unwrap();
+    let graph = repository.export_graph_source().unwrap();
+    drop(repository);
+    for blob in graph.blobs {
+        blob.anchor.remove().unwrap();
+    }
+    fs::remove_dir_all(run_root).unwrap();
+}

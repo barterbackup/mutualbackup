@@ -163,6 +163,12 @@ pub enum LocalRequest {
     GitBranches {
         repository_id: Uuid,
     },
+    GitExportToGitRepository {
+        repository_id: Uuid,
+        source_root: PathBuf,
+        destination: PathBuf,
+        advertised: Vec<GitBranchInfo>,
+    },
     GitRemoteBranches {
         repository_id: Uuid,
     },
@@ -322,6 +328,10 @@ pub enum LocalResponse {
     GitCommitted(GitCommitInfo),
     GitLog(Vec<GitLogEntry>),
     GitBranches(Vec<GitBranchInfo>),
+    GitObjectsExported {
+        repository_id: Uuid,
+        object_count: u32,
+    },
     GitRemoteBranches(Vec<GitRemoteBranchInfo>),
     GitCommitPins {
         repository_id: Uuid,
@@ -655,6 +665,18 @@ mod tests {
                 limit: 10,
             },
             LocalRequest::GitBranches { repository_id },
+            LocalRequest::GitExportToGitRepository {
+                repository_id,
+                source_root: PathBuf::from("/tmp/source"),
+                destination: PathBuf::from("/tmp/stock-git/.git"),
+                advertised: vec![GitBranchInfo {
+                    format_version: 1,
+                    repository_id,
+                    name: "main".to_owned(),
+                    oid: [3; 20],
+                    current: true,
+                }],
+            },
             LocalRequest::GitRemoteBranches { repository_id },
             LocalRequest::GitCommitPins { repository_id },
             LocalRequest::GitPinCommit {
@@ -826,6 +848,10 @@ mod tests {
                 oid: [7; 20],
                 current: true,
             }]),
+            LocalResponse::GitObjectsExported {
+                repository_id,
+                object_count: 2,
+            },
             LocalResponse::GitRemoteBranches(vec![GitRemoteBranchInfo {
                 format_version: 1,
                 repository_id,

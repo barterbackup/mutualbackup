@@ -48,6 +48,7 @@ local-request =
   / { "GitCommit": { repository_id: uuid-text, author_name: tstr, author_email: tstr, message: tstr } }
   / { "GitLog": { repository_id: uuid-text, limit: uint } }
   / { "GitBranches": { repository_id: uuid-text } }
+  / { "GitExportToGitRepository": { repository_id: uuid-text, source_root: tstr, destination: tstr, advertised: [* git-branch-info] } }
   / { "GitRemoteBranches": { repository_id: uuid-text } }
   / { "GitCommitPins": { repository_id: uuid-text } }
   / { "GitPinCommit": { repository_id: uuid-text, oid: bytes20-array } }
@@ -107,6 +108,7 @@ local-response =
   / { "GitCommitted": git-commit-info }
   / { "GitLog": [* git-log-entry] }
   / { "GitBranches": [* git-branch-info] }
+  / { "GitObjectsExported": { repository_id: uuid-text, object_count: uint } }
   / { "GitRemoteBranches": [* git-remote-branch-info] }
   / { "GitCommitPins": { repository_id: uuid-text, oids: [* bytes20-array] } }
   / { "GitCommitPinChanged": { repository_id: uuid-text, oid: bytes20-array, pinned: bool } }

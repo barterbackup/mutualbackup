@@ -30,7 +30,9 @@ use crate::history::{
     reset_index_for_scope, switch_same_tree_branch, switch_same_tree_branch_for_scope,
     unpin_commit,
 };
-use crate::interop::{GitInteropError, push_current_branch_to_bare};
+use crate::interop::{
+    GitInteropError, export_graph_to_git_repository, push_current_branch_to_bare,
+};
 use crate::merge::{
     MergeBlobError, has_merge_session, load_merge_session, mark_merge_resolved,
     resume_pending_merge_blob, session_key, session_kind, unmark_merge_resolved,
@@ -775,6 +777,21 @@ impl GitRepository {
     pub fn export_graph_source(&self) -> Result<GitGraphSource, RepositoryError> {
         self.resume_checkout()?;
         Ok(export_graph_source(&self.catalog, self.repository_id)?)
+    }
+
+    pub fn export_to_git_repository(
+        &self,
+        destination: impl AsRef<Path>,
+        advertised: &[GitBranchInfo],
+    ) -> Result<u32, RepositoryError> {
+        self.resume_checkout()?;
+        Ok(export_graph_to_git_repository(
+            &self.catalog,
+            self.repository_id,
+            &self.root,
+            destination.as_ref(),
+            advertised,
+        )?)
     }
 
     /// The daemon supplies signed-revision pins after checking in-flight work.
@@ -2737,6 +2754,82 @@ mod tests {
         drop(tree);
         drop(builder);
         drop(remote);
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn exports_advertised_graph_into_stock_git_without_a_local_payload_mirror() {
+        use std::process::Command;
+
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-helper-export-{}", Uuid::new_v4()));
+        let source_root = run_root.join("source");
+        let stock_root = run_root.join("stock");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&stock_root).unwrap();
+        let mut bytes = vec![0_u8; 2 * 1024 * 1024 + 17];
+        bytes[..7].copy_from_slice(b"raw\r\n\0\xff");
+        let tail_start = bytes.len() - 5;
+        bytes[tail_start..].copy_from_slice(b"tail\n");
+        fs::write(source_root.join("tracked"), &bytes).unwrap();
+        let repository_id = Uuid::new_v4();
+        let local = GitRepository::init(&source_root, repository_id, &[93_u8; 32]).unwrap();
+        let staged = local.stage_file("tracked").unwrap();
+        let committed = local.commit("Author", "a@example.test", "initial").unwrap();
+        let stock = git2::Repository::init(&stock_root).unwrap();
+        let mut stale = local.branches().unwrap();
+        stale[0].oid = [0; 20];
+        assert!(
+            local
+                .export_to_git_repository(stock.path(), &stale)
+                .is_err()
+        );
+        assert!(
+            !stock
+                .odb()
+                .unwrap()
+                .exists(Oid::from_bytes(&staged.oid).unwrap())
+        );
+        let advertised = local.branches().unwrap();
+        assert_eq!(
+            local
+                .export_to_git_repository(stock.path(), &advertised)
+                .unwrap(),
+            3
+        );
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&stock_root)
+            .args([
+                "cat-file",
+                "blob",
+                &Oid::from_bytes(&staged.oid).unwrap().to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, bytes);
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&stock_root)
+            .args([
+                "update-ref",
+                "refs/heads/imported",
+                &Oid::from_bytes(&committed.oid).unwrap().to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let graph = local.export_graph_source().unwrap();
+        drop(stock);
+        drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
         fs::remove_dir_all(run_root).unwrap();
     }
 

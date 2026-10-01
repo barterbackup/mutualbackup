@@ -704,6 +704,26 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitExportToGitRepository {
+            repository_id,
+            source_root,
+            destination,
+            advertised,
+        } => {
+            blocking_node(node, move |node| {
+                let object_count = node.git_export_to_git_repository(
+                    repository_id,
+                    &source_root,
+                    &destination,
+                    &advertised,
+                )?;
+                Ok(LocalResponse::GitObjectsExported {
+                    repository_id,
+                    object_count,
+                })
+            })
+            .await
+        }
         LocalRequest::GitCreateBranchFrom {
             repository_id,
             name,

@@ -1630,6 +1630,22 @@ impl Node {
             .map_err(Into::into)
     }
 
+    pub fn git_export_to_git_repository(
+        &self,
+        repository_id: Uuid,
+        source_root: &Path,
+        destination: &Path,
+        advertised: &[GitBranchInfo],
+    ) -> Result<u32> {
+        let repository = self.open_git_repository(repository_id)?;
+        if repository.root() != source_root {
+            anyhow::bail!("Git remote root differs from its enrolled repository");
+        }
+        repository
+            .export_to_git_repository(destination, advertised)
+            .map_err(Into::into)
+    }
+
     pub fn git_remote_branches(&self, repository_id: Uuid) -> Result<Vec<GitRemoteBranchInfo>> {
         self.open_git_repository(repository_id)?
             .remote_branches()

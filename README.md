@@ -18,6 +18,12 @@ packing remain later work. Do not entrust unique data to this prototype.
   source anchors, peer network, DHT publication, watcher, and durable jobs.
 - `mutualbackup` is the local control and offline bootstrap CLI. Run
   `mutualbackup --help` and its subcommand help for the complete interface.
+- `mutualgit` provides Git-compatible local history over native anchors.
+- `git-remote-mutualbackup` lets stock Git fetch or clone from a local
+  MutualBackup repository through its unlocked daemon.
+
+The current Git commands, storage behavior, and fetch bridge are described in
+[`docs/git-interop.md`](docs/git-interop.md).
 
 For a no-build, step-by-step walkthrough using the packaged Linux binaries,
 including a five-daemon lab and recovery-string-only recovery, see
