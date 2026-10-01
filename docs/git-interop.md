@@ -4,6 +4,10 @@
 app-owned `.mutualbackup` catalog. File bytes live in immutable native anchors;
 the repository does not keep a second `.git/objects` payload store. The daemon
 must be running and unlocked for its commands.
+Each enrolled root records a versioned local source backend and the mount that
+passed its capture probe. After a remount, the daemon repeats that probe before
+using the root; an unavailable backend leaves the root unavailable. A root
+restored through recovery records this binding on its first successful probe.
 
 ```sh
 mutualgit init /absolute/path/to/source

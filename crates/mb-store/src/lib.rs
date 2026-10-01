@@ -22,6 +22,9 @@ pub use database::{
     ObjectAttemptState, ParityObject, ParityScrubReport, ParityStore, ProtocolRecordRow,
     VariableParityObject,
 };
-pub use source::{SourceBlobImportPlan, SourceCapturePlan, SourceFileCapturePlan};
+pub use source::{
+    SourceBackendBinding, SourceBackendKind, SourceBlobImportPlan, SourceCapturePlan,
+    SourceFileCapturePlan,
+};
 
 pub const SCHEMA_VERSION: u32 = 9;

@@ -22,8 +22,8 @@ use mb_git::{
 use mb_store::ReflinkAnchor;
 use mb_store::{
     AnchorFileLocator, CapturedEntry, ControlStore, FileExtent, NativeFileId, PinnedDirectory,
-    ReflinkCapturePlan, SourceCapturePlan, SourceFileCapturePlan, StableAnchorFileLocator,
-    git_catalog_marker,
+    ReflinkCapturePlan, SourceBackendKind, SourceCapturePlan, SourceFileCapturePlan,
+    StableAnchorFileLocator, git_catalog_marker,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -681,6 +681,7 @@ pub(crate) fn prepare_revision(
     source_root: &Path,
     sequence: u64,
     revision_id: Option<Uuid>,
+    source_backend: SourceBackendKind,
     writer: WriterCredentials<'_>,
 ) -> Result<SignedRecord<UserRevision>> {
     let writer_epoch = writer.epoch;
@@ -757,8 +758,9 @@ pub(crate) fn prepare_revision(
                 parent,
                 captured_change_sequence,
                 requested_source: source_root.to_path_buf(),
-                plan: SourceCapturePlan::plan_reflink(source_root)
-                    .context("plan reflink source anchor")?,
+                plan: source_backend
+                    .plan_root(source_root)
+                    .context("plan source anchor")?,
             };
             let bytes = canonical_bytes(&intent)?;
             control.put_record("capture-intent", revision_id.as_bytes(), &bytes)?;
@@ -4307,6 +4309,7 @@ mod metadata_compatibility_tests {
             &source,
             1,
             None,
+            SourceBackendKind::ReflinkV1,
             WriterCredentials {
                 epoch: 1,
                 secret: &[93; 32],
@@ -4550,6 +4553,7 @@ mod metadata_compatibility_tests {
             &source,
             1,
             None,
+            SourceBackendKind::ReflinkV1,
             WriterCredentials {
                 epoch: 1,
                 secret: &[213; 32],
@@ -4672,6 +4676,7 @@ mod metadata_compatibility_tests {
             &source,
             1,
             Some(revision_id),
+            SourceBackendKind::ReflinkV1,
             WriterCredentials {
                 epoch: 1,
                 secret: &[17; 32],
@@ -4695,6 +4700,7 @@ mod metadata_compatibility_tests {
             &source,
             1,
             Some(revision_id),
+            SourceBackendKind::ReflinkV1,
             WriterCredentials {
                 epoch: 1,
                 secret: &[17; 32],
@@ -4862,6 +4868,7 @@ mod metadata_compatibility_tests {
             &source,
             1,
             None,
+            SourceBackendKind::ReflinkV1,
             WriterCredentials {
                 epoch: 1,
                 secret: &[18; 32],
@@ -4977,6 +4984,7 @@ mod metadata_compatibility_tests {
             &source,
             1,
             None,
+            SourceBackendKind::ReflinkV1,
             WriterCredentials {
                 epoch: 1,
                 secret: &[19; 32],

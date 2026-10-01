@@ -13,8 +13,78 @@ use uuid::Uuid;
 
 use crate::{
     AnchorError, FileAnchorManifest, ImportedBlobCapturePlan, ReflinkAnchor, ReflinkCapturePlan,
-    ReflinkFileCapturePlan, StableAnchorManifest,
+    ReflinkFileCapturePlan, StableAnchorManifest, probe_reflink,
 };
+
+/// Local source capabilities never enter a signed peer record. Version 1
+/// means byte-exact sparse reflink capture, native metadata, reflink checkout,
+/// and reachability through catalogued immutable native anchors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SourceBackendKind {
+    ReflinkV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceBackendBinding {
+    pub format_version: u16,
+    pub contract_version: u16,
+    pub root_id: Uuid,
+    pub backend: SourceBackendKind,
+    pub filesystem_id: u64,
+    pub root_inode: u64,
+    pub mount_id: u64,
+}
+
+impl SourceBackendBinding {
+    pub fn reflink_v1(root_id: Uuid, filesystem_id: u64, root_inode: u64, mount_id: u64) -> Self {
+        Self {
+            format_version: 1,
+            contract_version: 1,
+            root_id,
+            backend: SourceBackendKind::ReflinkV1,
+            filesystem_id,
+            root_inode,
+            mount_id,
+        }
+    }
+
+    pub fn is_supported_for(&self, root_id: Uuid, filesystem_id: u64, root_inode: u64) -> bool {
+        self.format_version == 1
+            && self.contract_version == 1
+            && self.root_id == root_id
+            && self.backend == SourceBackendKind::ReflinkV1
+            && self.filesystem_id == filesystem_id
+            && self.root_inode == root_inode
+            && self.mount_id != 0
+    }
+}
+
+impl SourceBackendKind {
+    pub fn probe(self, source_root: impl AsRef<Path>) -> Result<(), AnchorError> {
+        match self {
+            Self::ReflinkV1 => probe_reflink(source_root),
+        }
+    }
+
+    pub fn plan_root(
+        self,
+        source_root: impl AsRef<Path>,
+    ) -> Result<SourceCapturePlan, AnchorError> {
+        match self {
+            Self::ReflinkV1 => SourceCapturePlan::plan_reflink(source_root),
+        }
+    }
+
+    pub fn plan_file(
+        self,
+        source_root: impl AsRef<Path>,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<SourceFileCapturePlan, AnchorError> {
+        match self {
+            Self::ReflinkV1 => SourceFileCapturePlan::plan_reflink(source_root, relative_path),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SourceCapturePlan {

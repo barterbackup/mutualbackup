@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,7 +33,7 @@ use mb_git::{
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
-    VariableParityObject, filesystem_identity, probe_reflink,
+    SourceBackendBinding, SourceBackendKind, VariableParityObject, filesystem_identity,
 };
 use rand::RngCore;
 use uuid::Uuid;
@@ -1314,6 +1315,50 @@ impl Node {
             .context("protected root is not registered")
     }
 
+    fn source_backend_for_root(
+        &self,
+        root: &ProtectedRoot,
+        filesystem: mb_store::FilesystemIdentity,
+    ) -> Result<SourceBackendBinding> {
+        let expected = SourceBackendBinding::reflink_v1(
+            root.root_id,
+            filesystem.stable_id,
+            root.root_inode,
+            filesystem.mount_id,
+        );
+        let existing = self
+            .control
+            .get_record("source-backend", root.root_id.as_bytes())?
+            .map(|bytes| decode_canonical::<SourceBackendBinding>(&bytes))
+            .transpose()?;
+        if let Some(binding) = &existing {
+            if !binding.is_supported_for(root.root_id, filesystem.stable_id, root.root_inode) {
+                anyhow::bail!("protected root has an incompatible source backend binding");
+            }
+            if binding.mount_id == filesystem.mount_id {
+                return Ok(binding.clone());
+            }
+        }
+        SourceBackendKind::ReflinkV1
+            .probe(&root.path)
+            .context("protected root failed the reflink COW probe")?;
+        if filesystem_identity(&root.path)? != filesystem {
+            anyhow::bail!("protected root mount changed during backend probe");
+        }
+        let encoded = canonical_bytes(&expected)?;
+        if existing.is_some() {
+            self.control
+                .put_record("source-backend", root.root_id.as_bytes(), &encoded)?;
+        } else if !self.control.put_record_if_absent(
+            "source-backend",
+            root.root_id.as_bytes(),
+            &encoded,
+        )? {
+            anyhow::bail!("protected root backend binding changed concurrently");
+        }
+        Ok(expected)
+    }
+
     pub fn add_protected_root(&mut self, source_root: &Path) -> Result<ProtectedRoot> {
         self.register_protected_root(source_root, None, true, true)
     }
@@ -1377,12 +1422,14 @@ impl Node {
         };
         #[cfg(not(unix))]
         let root_inode = 0;
+        let filesystem = filesystem_identity(&root.path)?;
         if !metadata.is_dir()
             || metadata.file_type().is_symlink()
-            || !root.matches_identity(filesystem_identity(&root.path)?, root_inode)
+            || !root.matches_identity(filesystem, root_inode)
         {
             anyhow::bail!("protected Git root identity changed");
         }
+        self.source_backend_for_root(&root, filesystem)?;
         let key = self.git_catalog_key(repository_id);
         let repository = GitRepository::open(&root.path, repository_id, &key)?;
         Ok(repository)
@@ -2122,6 +2169,9 @@ impl Node {
                 && configured.filesystem_id == filesystem.stable_id
                 && configured.root_inode == root_inode
             {
+                if probe_source {
+                    self.source_backend_for_root(configured, filesystem)?;
+                }
                 return Ok(configured.clone());
             }
             anyhow::bail!("protected root identity conflicts with an existing root");
@@ -2132,7 +2182,12 @@ impl Node {
         }
 
         if probe_source {
-            probe_reflink(&source_root).context("protected root failed the reflink COW probe")?;
+            SourceBackendKind::ReflinkV1
+                .probe(&source_root)
+                .context("protected root failed the reflink COW probe")?;
+            if filesystem_identity(&source_root)? != filesystem {
+                anyhow::bail!("protected root mount changed during backend probe");
+            }
         }
         if configured
             .iter()
@@ -2150,11 +2205,25 @@ impl Node {
             filesystem_id: filesystem.stable_id,
             root_inode,
         };
-        self.control.put_record(
-            "protected-root",
-            root.root_id.as_bytes(),
-            &canonical_bytes(&root)?,
-        )?;
+        let mut records = vec![(
+            "protected-root".to_owned(),
+            root.root_id.as_bytes().to_vec(),
+            canonical_bytes(&root)?,
+        )];
+        if probe_source {
+            let backend = SourceBackendBinding::reflink_v1(
+                root.root_id,
+                filesystem.stable_id,
+                root.root_inode,
+                filesystem.mount_id,
+            );
+            records.push((
+                "source-backend".to_owned(),
+                root.root_id.as_bytes().to_vec(),
+                canonical_bytes(&backend)?,
+            ));
+        }
+        self.control.put_records_and_delete(&records, &[])?;
         if initially_dirty {
             self.mark_root_dirty(root.root_id, "protected root has not been backed up")?;
         } else {
@@ -4458,6 +4527,7 @@ impl Node {
         {
             anyhow::bail!("protected root identity changed");
         }
+        self.source_backend_for_root(&root, current_filesystem)?;
         let local_head = self
             .control
             .get_record(
@@ -4946,6 +5016,19 @@ impl Node {
         sequence: u64,
         operation_id: Option<[u8; 16]>,
     ) -> Result<SignedRecord<UserRevision>> {
+        let root = self.protected_root_by_id(protected_root_id)?;
+        if source_root.canonicalize()? != root.path {
+            anyhow::bail!("source path does not match the protected root");
+        }
+        let metadata = fs::symlink_metadata(&root.path)?;
+        let filesystem = filesystem_identity(&root.path)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || !root.matches_identity(filesystem, metadata.ino())
+        {
+            anyhow::bail!("protected root identity changed");
+        }
+        let backend = self.source_backend_for_root(&root, filesystem)?;
         let captured_change_sequence = self
             .root_dirty_state(protected_root_id)?
             .filter(|state| state.dirty)
@@ -4959,6 +5042,7 @@ impl Node {
             source_root,
             sequence,
             operation_id.map(Uuid::from_bytes),
+            backend.backend,
             WriterCredentials {
                 epoch: writer.epoch,
                 secret: &writer.secret_key,
@@ -16283,6 +16367,7 @@ pub(crate) mod tests {
             &source_root,
             1,
             None,
+            SourceBackendKind::ReflinkV1,
             WriterCredentials {
                 epoch: 1,
                 secret: &[85; 32],
@@ -23406,8 +23491,11 @@ pub(crate) mod tests {
         let mut node = Node::open(run_root.join("node"), Seed::from_bytes([220; 32])).unwrap();
         let guild_id = [221; 32];
         let checkpoint_hash = [222; 32];
+        let root_id = Uuid::from_bytes([1; 16]);
+        node.register_protected_root(&source, Some(root_id), true, true)
+            .unwrap();
         let revision = node
-            .prepare_revision(guild_id, Uuid::from_bytes([1; 16]), &source, 1, None)
+            .prepare_revision(guild_id, root_id, &source, 1, None)
             .unwrap();
         assert!(!revision.value.data_sectors.is_empty());
         let manifest: mb_store::StableAnchorManifest = decode_canonical(
@@ -23900,5 +23988,91 @@ pub(crate) mod tests {
             Some(stale_record)
         );
         assert_eq!(node.active_recovery_attempt().unwrap(), Some(active));
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn source_backend_binding_reprobes_and_migrates() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("source-binding-{}", Uuid::new_v4()));
+        let source = run_root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let mut node = Node::open(run_root.join("node"), Seed::from_bytes([240; 32])).unwrap();
+        let info = node.git_init(&source).unwrap();
+        let key = info.repository_id.as_bytes();
+        let decode_binding = |node: &Node| -> SourceBackendBinding {
+            decode_canonical(
+                &node
+                    .control
+                    .get_record("source-backend", key)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let initial = decode_binding(&node);
+        let filesystem = filesystem_identity(&source).unwrap();
+        assert!(initial.is_supported_for(
+            info.repository_id,
+            filesystem.stable_id,
+            fs::metadata(&source).unwrap().ino(),
+        ));
+        assert_eq!(initial.mount_id, filesystem.mount_id);
+
+        let mut remounted = initial.clone();
+        remounted.mount_id = if initial.mount_id == u64::MAX {
+            initial.mount_id - 1
+        } else {
+            initial.mount_id + 1
+        };
+        node.control
+            .put_record("source-backend", key, &canonical_bytes(&remounted).unwrap())
+            .unwrap();
+        node.git_status(info.repository_id).unwrap();
+        assert_eq!(decode_binding(&node), initial);
+
+        node.control.delete_record("source-backend", key).unwrap();
+        node.git_status(info.repository_id).unwrap();
+        assert_eq!(decode_binding(&node), initial);
+
+        let mut incompatible = initial.clone();
+        incompatible.contract_version = 2;
+        let bytes = canonical_bytes(&incompatible).unwrap();
+        node.control
+            .put_record("source-backend", key, &bytes)
+            .unwrap();
+        assert!(node.git_status(info.repository_id).is_err());
+        assert_eq!(
+            node.control.get_record("source-backend", key).unwrap(),
+            Some(bytes)
+        );
+
+        let recovered_source = run_root.join("recovered-source");
+        fs::create_dir(&recovered_source).unwrap();
+        let recovered = node
+            .register_protected_root(&recovered_source, None, false, false)
+            .unwrap();
+        let recovered_key = recovered.root_id.as_bytes();
+        assert_eq!(
+            node.control
+                .get_record("source-backend", recovered_key)
+                .unwrap(),
+            None
+        );
+        let recovered_filesystem = filesystem_identity(&recovered_source).unwrap();
+        let binding = node
+            .source_backend_for_root(&recovered, recovered_filesystem)
+            .unwrap();
+        assert_eq!(
+            node.control
+                .get_record("source-backend", recovered_key)
+                .unwrap(),
+            Some(canonical_bytes(&binding).unwrap())
+        );
+        drop(node);
+        fs::remove_dir_all(run_root).unwrap();
     }
 }

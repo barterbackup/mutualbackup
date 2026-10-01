@@ -1085,8 +1085,10 @@ the next milestone's detailed scope.
 
 **Current position:** Milestones 0 through 5 have passed. The final Milestone 5
 gate passed on exact committed source `53ec2ec`; its earlier review and gate
-records below are historical. Milestone 6 is next, with Git-compatible local
-history added ahead of the already planned source-backend and platform work.
+records below are historical. Milestone 6 is underway: the Git-compatible
+local-history and interoperability slices are being built ahead of the already
+planned source-backend and platform work. The byte-exact Git policy above and
+the complete Milestone 6 gates below remain requirements for closure.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
@@ -3049,6 +3051,13 @@ Milestone 5.
   retained revisions, and bounded storage/network amplification.
 
 ### Milestone 6 — Git-compatible local history, then additional source backends and platforms
+
+The Git pivot adds local history and interoperability to this milestone; its
+original source-backend and platform deliverables remain required. Review each
+completed Git command against the byte-exact policy and crash/recovery gates
+below, then continue through graph protection, two-way ordinary-Git exchange,
+and physical reclamation before closing the guarded link-freeze and platform
+backend gates. A command being present does not by itself close its slice.
 
 - First extract and version the source-backend boundary from section 4 without
   changing the existing signed peer format. Prove a custom object-store adapter
