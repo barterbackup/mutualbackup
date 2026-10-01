@@ -10,6 +10,9 @@ use git2::{ObjectType, Oid};
 use mb_store::{AnchorError, FileAnchorManifest};
 use thiserror::Error;
 
+mod odb;
+pub use odb::NativeOdb;
+
 #[derive(Debug, Error)]
 pub enum GitAnchorError {
     #[error("native anchor failed verification: {0}")]
@@ -18,6 +21,8 @@ pub enum GitAnchorError {
     Git(#[from] git2::Error),
     #[error("Git anchor hashing requires a Linux pinned-file descriptor")]
     UnsupportedPlatform,
+    #[error("different native content was assigned the same Git object ID")]
+    OidCollision,
 }
 
 /// Hash exact captured bytes as a SHA-1 Git blob without applying Git filters.
