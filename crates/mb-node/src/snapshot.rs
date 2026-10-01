@@ -14,9 +14,11 @@ use mb_core::{
     V1_MAX_CODING_GROUPS, V1_SECTOR_SIZE, canonical_bytes, crypt_sector, decode_canonical,
     encrypted_sector, make_content_sector_id, merkle_commit, sector_root,
 };
+#[cfg(test)]
+use mb_store::ReflinkAnchor;
 use mb_store::{
     AnchorFileLocator, CapturedEntry, ControlStore, FileExtent, NativeFileId, PinnedDirectory,
-    ReflinkAnchor, ReflinkCapturePlan, StableAnchorFileLocator,
+    ReflinkCapturePlan, SourceCapturePlan, StableAnchorFileLocator,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -228,6 +230,18 @@ struct CaptureIntent {
     parent: Option<[u8; 32]>,
     captured_change_sequence: Option<u64>,
     requested_source: PathBuf,
+    plan: SourceCapturePlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct LegacyCaptureIntentV2 {
+    format_version: u16,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    sequence: u64,
+    parent: Option<[u8; 32]>,
+    captured_change_sequence: Option<u64>,
+    requested_source: PathBuf,
     plan: ReflinkCapturePlan,
 }
 
@@ -248,38 +262,91 @@ struct RecoveryAnchorIntent {
     guild_id: [u8; 32],
     revision_id: Uuid,
     source_root: PathBuf,
+    plan: SourceCapturePlan,
+    replaced_anchor: Option<mb_store::StableAnchorManifest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct LegacyRecoveryAnchorIntentV1 {
+    format_version: u16,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    source_root: PathBuf,
     plan: ReflinkCapturePlan,
     replaced_anchor: Option<mb_store::StableAnchorManifest>,
 }
 
+fn decode_capture_intent(bytes: &[u8]) -> Result<(CaptureIntent, bool)> {
+    if let Ok(intent) = decode_canonical::<CaptureIntent>(bytes)
+        && intent.format_version == 3
+    {
+        return Ok((intent, false));
+    }
+    if let Ok(legacy) = decode_canonical::<LegacyCaptureIntentV2>(bytes)
+        && legacy.format_version == 2
+    {
+        return Ok((
+            CaptureIntent {
+                format_version: 3,
+                guild_id: legacy.guild_id,
+                revision_id: legacy.revision_id,
+                sequence: legacy.sequence,
+                parent: legacy.parent,
+                captured_change_sequence: legacy.captured_change_sequence,
+                requested_source: legacy.requested_source,
+                plan: SourceCapturePlan::ReflinkV1(legacy.plan),
+            },
+            true,
+        ));
+    }
+    let legacy: LegacyCaptureIntentV1 = decode_canonical(bytes)
+        .context("pending source capture is undecodable in every supported format")?;
+    if legacy.format_version != 1 {
+        bail!("pending source capture has an unsupported version");
+    }
+    Ok((
+        CaptureIntent {
+            format_version: 3,
+            guild_id: legacy.guild_id,
+            revision_id: legacy.revision_id,
+            sequence: legacy.sequence,
+            parent: legacy.parent,
+            captured_change_sequence: None,
+            requested_source: legacy.requested_source,
+            plan: SourceCapturePlan::ReflinkV1(legacy.plan),
+        },
+        true,
+    ))
+}
+
+fn decode_recovery_anchor_intent(bytes: &[u8]) -> Result<(RecoveryAnchorIntent, bool)> {
+    if let Ok(intent) = decode_canonical::<RecoveryAnchorIntent>(bytes)
+        && intent.format_version == 2
+    {
+        return Ok((intent, false));
+    }
+    let legacy: LegacyRecoveryAnchorIntentV1 =
+        decode_canonical(bytes).context("pending recovered-anchor capture is undecodable")?;
+    if legacy.format_version != 1 {
+        bail!("pending recovered-anchor capture has an unsupported version");
+    }
+    Ok((
+        RecoveryAnchorIntent {
+            format_version: 2,
+            guild_id: legacy.guild_id,
+            revision_id: legacy.revision_id,
+            source_root: legacy.source_root,
+            plan: SourceCapturePlan::ReflinkV1(legacy.plan),
+            replaced_anchor: legacy.replaced_anchor,
+        },
+        true,
+    ))
+}
+
 pub(crate) fn reconcile_pending_captures(control: &ControlStore) -> Result<()> {
     for (record_id, bytes) in control.records("capture-intent")? {
-        let (intent, migrated) = match decode_canonical::<CaptureIntent>(&bytes) {
-            Ok(intent) => (intent, false),
-            Err(current_error) => {
-                let legacy: LegacyCaptureIntentV1 =
-                    decode_canonical(&bytes).with_context(|| {
-                        format!("pending source capture is undecodable: {current_error}")
-                    })?;
-                if legacy.format_version != 1 {
-                    bail!("pending source capture has an unsupported version");
-                }
-                (
-                    CaptureIntent {
-                        format_version: 2,
-                        guild_id: legacy.guild_id,
-                        revision_id: legacy.revision_id,
-                        sequence: legacy.sequence,
-                        parent: legacy.parent,
-                        captured_change_sequence: None,
-                        requested_source: legacy.requested_source,
-                        plan: legacy.plan,
-                    },
-                    true,
-                )
-            }
-        };
-        if intent.format_version != 2 || record_id.as_slice() != intent.revision_id.as_bytes() {
+        let (intent, migrated) = decode_capture_intent(&bytes)?;
+        if record_id.as_slice() != intent.revision_id.as_bytes() {
             bail!("pending source capture is inconsistent");
         }
         if migrated {
@@ -287,14 +354,21 @@ pub(crate) fn reconcile_pending_captures(control: &ControlStore) -> Result<()> {
         }
         // An offline source volume must not prevent unrelated guilds from
         // starting. The exact plan remains durable for a later explicit retry.
-        let _ = ReflinkAnchor::reconcile_capture(&intent.plan);
+        let _ = intent.plan.reconcile();
     }
     for (record_id, bytes) in control.records(RECOVERY_ANCHOR_INTENT_KIND)? {
-        let intent: RecoveryAnchorIntent = decode_canonical(&bytes)?;
-        if intent.format_version != 1 || record_id.as_slice() != intent.revision_id.as_bytes() {
+        let (intent, migrated) = decode_recovery_anchor_intent(&bytes)?;
+        if record_id.as_slice() != intent.revision_id.as_bytes() {
             bail!("pending recovered-anchor capture is inconsistent");
         }
-        let _ = ReflinkAnchor::reconcile_capture(&intent.plan);
+        if migrated {
+            control.put_record(
+                RECOVERY_ANCHOR_INTENT_KIND,
+                &record_id,
+                &canonical_bytes(&intent)?,
+            )?;
+        }
+        let _ = intent.plan.reconcile();
     }
     reconcile_anchor_retirements(control)?;
     Ok(())
@@ -340,14 +414,13 @@ pub(crate) fn abandon_recovered_anchor_capture(
     else {
         return Ok(());
     };
-    let intent: RecoveryAnchorIntent = decode_canonical(&bytes)?;
-    if intent.format_version != 1
-        || intent.guild_id != guild_id
-        || intent.revision_id != revision_id
-    {
+    let (intent, _) = decode_recovery_anchor_intent(&bytes)?;
+    if intent.guild_id != guild_id || intent.revision_id != revision_id {
         bail!("pending recovered-anchor capture conflicts with the recovery job");
     }
-    ReflinkAnchor::discard_capture(&intent.plan)
+    intent
+        .plan
+        .discard()
         .context("discard recovered-anchor capture whose restored source was lost")?;
     if !control.delete_record(RECOVERY_ANCHOR_INTENT_KIND, revision_id.as_bytes())? {
         bail!("pending recovered-anchor capture disappeared");
@@ -437,40 +510,49 @@ pub(crate) fn prepare_revision(
         None if sequence == 1 => None,
         None => bail!("the first local revision must have sequence one"),
     };
-    let (intent, intent_bytes) =
-        match control.get_record("capture-intent", revision_id.as_bytes())? {
-            Some(bytes) => {
-                let intent: CaptureIntent = decode_canonical(&bytes)?;
-                if intent.format_version != 2
-                    || intent.guild_id != guild_id
-                    || intent.revision_id != revision_id
-                    || intent.sequence != sequence
-                    || intent.parent != parent
-                    || intent.requested_source != source_root
-                {
-                    bail!("pending source capture conflicts with the retried operation");
-                }
+    let (intent, intent_bytes) = match control
+        .get_record("capture-intent", revision_id.as_bytes())?
+    {
+        Some(bytes) => {
+            let (intent, migrated) = decode_capture_intent(&bytes)?;
+            if intent.guild_id != guild_id
+                || intent.revision_id != revision_id
+                || intent.sequence != sequence
+                || intent.parent != parent
+                || intent.requested_source != source_root
+            {
+                bail!("pending source capture conflicts with the retried operation");
+            }
+            if migrated {
+                let migrated_bytes = canonical_bytes(&intent)?;
+                control.put_record("capture-intent", revision_id.as_bytes(), &migrated_bytes)?;
+                (intent, migrated_bytes)
+            } else {
                 (intent, bytes)
             }
-            None => {
-                let intent = CaptureIntent {
-                    format_version: 2,
-                    guild_id,
-                    revision_id,
-                    sequence,
-                    parent,
-                    captured_change_sequence,
-                    requested_source: source_root.to_path_buf(),
-                    plan: ReflinkAnchor::plan(source_root).context("plan reflink source anchor")?,
-                };
-                let bytes = canonical_bytes(&intent)?;
-                control.put_record("capture-intent", revision_id.as_bytes(), &bytes)?;
-                (intent, bytes)
-            }
-        };
+        }
+        None => {
+            let intent = CaptureIntent {
+                format_version: 3,
+                guild_id,
+                revision_id,
+                sequence,
+                parent,
+                captured_change_sequence,
+                requested_source: source_root.to_path_buf(),
+                plan: SourceCapturePlan::plan_reflink(source_root)
+                    .context("plan reflink source anchor")?,
+            };
+            let bytes = canonical_bytes(&intent)?;
+            control.put_record("capture-intent", revision_id.as_bytes(), &bytes)?;
+            (intent, bytes)
+        }
+    };
     let result = (|| {
         let mut anchor = PendingAnchor {
-            manifest: ReflinkAnchor::capture_plan(&intent.plan)
+            manifest: intent
+                .plan
+                .capture()
                 .context("capture reflink source anchor")?,
             committed: false,
         };
@@ -716,7 +798,9 @@ pub(crate) fn prepare_revision(
     match result {
         Ok(revision) => Ok(revision),
         Err(error) => {
-            ReflinkAnchor::discard_capture(&intent.plan)
+            intent
+                .plan
+                .discard()
                 .context("discard failed reflink source capture")?;
             control
                 .abandon_capture_intent(revision_id.as_bytes(), &intent_bytes)
@@ -967,14 +1051,13 @@ pub(crate) fn reanchor_recovered_revision(
             RECOVERY_ANCHOR_INTENT_KIND,
             revision.value.revision_id.as_bytes(),
         )? {
-            let intent: RecoveryAnchorIntent = decode_canonical(&bytes)?;
-            if intent.format_version != 1
-                || intent.guild_id != guild_id
-                || intent.revision_id != revision.value.revision_id
-            {
+            let (intent, _) = decode_recovery_anchor_intent(&bytes)?;
+            if intent.guild_id != guild_id || intent.revision_id != revision.value.revision_id {
                 bail!("pending recovered-anchor capture conflicts with the revision");
             }
-            ReflinkAnchor::discard_capture(&intent.plan)
+            intent
+                .plan
+                .discard()
                 .context("discard redundant recovered-anchor capture")?;
             if !control.delete_record(
                 RECOVERY_ANCHOR_INTENT_KIND,
@@ -995,22 +1078,31 @@ pub(crate) fn reanchor_recovered_revision(
         revision.value.revision_id.as_bytes(),
     )? {
         Some(bytes) => {
-            let intent: RecoveryAnchorIntent = decode_canonical(&bytes)?;
-            if intent.format_version != 1
-                || intent.guild_id != guild_id
+            let (intent, migrated) = decode_recovery_anchor_intent(&bytes)?;
+            if intent.guild_id != guild_id
                 || intent.revision_id != revision.value.revision_id
                 || intent.source_root != canonical_source
                 || intent.replaced_anchor != old_manifest
             {
                 bail!("pending recovered-anchor capture conflicts with the revision");
             }
-            (intent, bytes)
+            if migrated {
+                let migrated_bytes = canonical_bytes(&intent)?;
+                control.put_record(
+                    RECOVERY_ANCHOR_INTENT_KIND,
+                    revision.value.revision_id.as_bytes(),
+                    &migrated_bytes,
+                )?;
+                (intent, migrated_bytes)
+            } else {
+                (intent, bytes)
+            }
         }
         None => {
-            let plan =
-                ReflinkAnchor::plan(&canonical_source).context("plan recovered source anchor")?;
+            let plan = SourceCapturePlan::plan_reflink(&canonical_source)
+                .context("plan recovered source anchor")?;
             let intent = RecoveryAnchorIntent {
-                format_version: 1,
+                format_version: 2,
                 guild_id,
                 revision_id: revision.value.revision_id,
                 source_root: canonical_source,
@@ -1027,7 +1119,9 @@ pub(crate) fn reanchor_recovered_revision(
         }
     };
     let mut anchor = PendingAnchor {
-        manifest: ReflinkAnchor::capture_plan(&intent.plan)
+        manifest: intent
+            .plan
+            .capture()
             .context("capture recovered source anchor")?,
         committed: false,
     };
@@ -3590,10 +3684,84 @@ mod metadata_compatibility_tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(migrated.format_version, 2);
+        assert_eq!(migrated.format_version, 3);
         assert_eq!(migrated.revision_id, revision_id);
         assert_eq!(migrated.requested_source, source);
         assert_eq!(migrated.captured_change_sequence, None);
+        assert!(matches!(migrated.plan, SourceCapturePlan::ReflinkV1(_)));
+        drop(control);
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn version_two_capture_and_recovery_intents_migrate_to_source_backend() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("source-backend-v1-{}", Uuid::new_v4()));
+        let source = run_root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("payload"), b"pending capture").unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([54; 32]));
+        let control = ControlStore::open(run_root.join("control.db"), &keys).unwrap();
+        let revision_id = Uuid::from_bytes([55; 16]);
+        let recovery_revision_id = Uuid::from_bytes([56; 16]);
+        let plan = ReflinkAnchor::plan(&source).unwrap();
+        let legacy_capture = LegacyCaptureIntentV2 {
+            format_version: 2,
+            guild_id: [57; 32],
+            revision_id,
+            sequence: 1,
+            parent: None,
+            captured_change_sequence: Some(9),
+            requested_source: source.clone(),
+            plan: plan.clone(),
+        };
+        let legacy_recovery = LegacyRecoveryAnchorIntentV1 {
+            format_version: 1,
+            guild_id: [57; 32],
+            revision_id: recovery_revision_id,
+            source_root: source.clone(),
+            plan,
+            replaced_anchor: None,
+        };
+        control
+            .put_record(
+                "capture-intent",
+                revision_id.as_bytes(),
+                &canonical_bytes(&legacy_capture).unwrap(),
+            )
+            .unwrap();
+        control
+            .put_record(
+                RECOVERY_ANCHOR_INTENT_KIND,
+                recovery_revision_id.as_bytes(),
+                &canonical_bytes(&legacy_recovery).unwrap(),
+            )
+            .unwrap();
+
+        reconcile_pending_captures(&control).unwrap();
+
+        let capture_bytes = control
+            .get_record("capture-intent", revision_id.as_bytes())
+            .unwrap()
+            .unwrap();
+        let (capture, capture_migrated) = decode_capture_intent(&capture_bytes).unwrap();
+        assert!(!capture_migrated);
+        assert_eq!(capture.format_version, 3);
+        assert_eq!(capture.captured_change_sequence, Some(9));
+        assert_eq!(capture.plan.source_root(), source);
+        let recovery_bytes = control
+            .get_record(RECOVERY_ANCHOR_INTENT_KIND, recovery_revision_id.as_bytes())
+            .unwrap()
+            .unwrap();
+        let (recovery, recovery_migrated) = decode_recovery_anchor_intent(&recovery_bytes).unwrap();
+        assert!(!recovery_migrated);
+        assert_eq!(recovery.format_version, 2);
+        assert_eq!(recovery.plan.source_root(), source);
         drop(control);
         fs::remove_dir_all(run_root).unwrap();
     }

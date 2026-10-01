@@ -6,6 +6,7 @@
 
 mod anchor;
 mod database;
+mod source;
 
 pub use anchor::{
     AnchorAreaLocator, AnchorError, AnchorFileLocator, AnchorManifest, CapturedEntry, FileExtent,
@@ -17,5 +18,6 @@ pub use database::{
     CheckpointRow, ControlStore, DatabaseError, DatabaseShellResult, ObjectAttemptState,
     ParityObject, ParityScrubReport, ParityStore, ProtocolRecordRow, VariableParityObject,
 };
+pub use source::SourceCapturePlan;
 
 pub const SCHEMA_VERSION: u32 = 9;
