@@ -43,6 +43,11 @@ enum Command {
         #[arg(long)]
         author_email: Option<String>,
     },
+    /// Show commits reachable from the current local branch.
+    Log {
+        #[arg(short = 'n', long = "max-count", default_value_t = 10)]
+        limit: u32,
+    },
 }
 
 #[tokio::main]
@@ -124,6 +129,33 @@ async fn main() -> Result<()> {
                 commit.branch,
                 git2::Oid::from_bytes(&commit.oid)?
             );
+        }
+        Command::Log { limit } => {
+            let (_, repository_id) = discover_repository(&working_directory)?;
+            let LocalResponse::GitLog(commits) = local_control_call(
+                &socket,
+                &LocalRequest::GitLog {
+                    repository_id,
+                    limit,
+                },
+            )
+            .await?
+            else {
+                bail!("daemon returned the wrong response to Git log");
+            };
+            for commit in commits {
+                println!("commit {}", git2::Oid::from_bytes(&commit.oid)?);
+                println!(
+                    "Author: {} <{}>",
+                    String::from_utf8_lossy(&commit.author_name),
+                    String::from_utf8_lossy(&commit.author_email)
+                );
+                println!();
+                for line in String::from_utf8_lossy(&commit.message).lines() {
+                    println!("    {line}");
+                }
+                println!();
+            }
         }
     }
     Ok(())

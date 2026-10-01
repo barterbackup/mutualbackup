@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use mb_core::{NodeId, QuorumPolicy, Seed};
-use mb_git::GitCommitInfo;
+use mb_git::{GitCommitInfo, GitLogEntry};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -65,6 +65,10 @@ pub enum LocalRequest {
         author_name: String,
         author_email: String,
         message: String,
+    },
+    GitLog {
+        repository_id: Uuid,
+        limit: u32,
     },
     GuildStatus,
     GuildCreate,
@@ -131,6 +135,7 @@ pub enum LocalResponse {
     GitRepositoryInitialized(GitRepositoryInfo),
     GitFileStaged(GitStagedFile),
     GitCommitted(GitCommitInfo),
+    GitLog(Vec<GitLogEntry>),
     Guild(Option<GuildSummary>),
     GuildInvite {
         token: String,
@@ -303,6 +308,10 @@ mod tests {
                 author_email: "author@example.test".to_owned(),
                 message: "first".to_owned(),
             },
+            LocalRequest::GitLog {
+                repository_id,
+                limit: 10,
+            },
         ] {
             let envelope = LocalRequestEnvelope {
                 format_version: LOCAL_WIRE_FORMAT_VERSION,
@@ -336,6 +345,14 @@ mod tests {
                 parent_oid: None,
                 branch: "main".to_owned(),
             }),
+            LocalResponse::GitLog(vec![GitLogEntry {
+                oid: [7; 20],
+                tree_oid: [8; 20],
+                parent_oids: vec![[6; 20]],
+                author_name: b"Test Author".to_vec(),
+                author_email: b"author@example.test".to_vec(),
+                message: b"first\n".to_vec(),
+            }]),
         ] {
             let envelope = LocalResponseEnvelope {
                 format_version: LOCAL_WIRE_FORMAT_VERSION,

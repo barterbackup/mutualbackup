@@ -28,6 +28,7 @@ local-request =
   / { "GitInit": { path: tstr } }
   / { "GitAdd": { repository_id: uuid-text, path: tstr } }
   / { "GitCommit": { repository_id: uuid-text, author_name: tstr, author_email: tstr, message: tstr } }
+  / { "GitLog": { repository_id: uuid-text, limit: uint } }
   / "GuildStatus"
   / "GuildCreate"
   / "GuildInvite"
@@ -61,6 +62,7 @@ local-response =
   / { "GitRepositoryInitialized": git-repository-info }
   / { "GitFileStaged": git-staged-file }
   / { "GitCommitted": git-commit-info }
+  / { "GitLog": [* git-log-entry] }
   / { "Guild": null / guild-summary }
   / { "GuildInvite": { token: tstr, expires_at_unix_seconds: uint } }
   / { "GuildEventCommitted": { sequence: uint, event_hash: bytes32-array } }
@@ -159,6 +161,15 @@ git-commit-info = {
   tree_oid: bytes20-array,
   parent_oid: null / bytes20-array,
   branch: tstr
+}
+
+git-log-entry = {
+  oid: bytes20-array,
+  tree_oid: bytes20-array,
+  parent_oids: [* bytes20-array],
+  author_name: [* uint8],
+  author_email: [* uint8],
+  message: [* uint8]
 }
 
 p2p-status = {

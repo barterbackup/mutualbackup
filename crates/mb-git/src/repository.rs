@@ -14,7 +14,7 @@ use mb_store::{
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::history::{GitCommitInfo, HistoryError, commit_index};
+use crate::history::{GitCommitInfo, GitLogEntry, HistoryError, commit_index, log_history};
 use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, resume_pending_stages,
     stage_file, staged_entry,
@@ -216,6 +216,10 @@ impl GitRepository {
             author_email,
             message,
         )?)
+    }
+
+    pub fn log(&self, limit: usize) -> Result<Vec<GitLogEntry>, RepositoryError> {
+        Ok(log_history(&self.catalog, self.repository_id, limit)?)
     }
 
     pub fn catalog_directory_identity(&self) -> Result<mb_store::NativeFileId, RepositoryError> {
@@ -425,6 +429,12 @@ mod tests {
             .unwrap();
         assert_eq!(second.parent_oid, Some(first.oid));
         assert_ne!(second.tree_oid, first.tree_oid);
+        let history = repo.log(10).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].oid, second.oid);
+        assert_eq!(history[0].parent_oids, vec![first.oid]);
+        assert_eq!(history[0].message, b"second");
+        assert_eq!(history[1].oid, first.oid);
         let first_anchor = repo
             .anchors_for_oid(Oid::from_bytes(&first_blob.oid).unwrap())
             .unwrap();

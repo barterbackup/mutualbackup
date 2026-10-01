@@ -52,6 +52,16 @@ pub struct GitCommitInfo {
     pub branch: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitLogEntry {
+    pub oid: [u8; 20],
+    pub tree_oid: [u8; 20],
+    pub parent_oids: Vec<[u8; 20]>,
+    pub author_name: Vec<u8>,
+    pub author_email: Vec<u8>,
+    pub message: Vec<u8>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct MetadataObject {
     format_version: u16,
@@ -254,4 +264,69 @@ pub fn commit_index(
         parent_oid: previous.map(|oid| oid.as_bytes().try_into().expect("SHA-1 OID")),
         branch: "main".to_owned(),
     })
+}
+
+/// Read reachable commits through libgit2 after verifying the catalog's raw
+/// object bytes against their IDs. Parent traversal handles merge commits
+/// even though merge creation is not yet exposed by this frontend.
+pub fn log_history(
+    control: &ControlStore,
+    repository_id: Uuid,
+    limit: usize,
+) -> Result<Vec<GitLogEntry>, HistoryError> {
+    if limit == 0 || limit > 1000 {
+        return Err(HistoryError::IncompatibleRecord);
+    }
+    let Some(head) = head_oid(control, repository_id)? else {
+        return Ok(Vec::new());
+    };
+    let temporary = tempfile::tempdir()?;
+    let repository = Repository::init_bare(temporary.path())?;
+    let odb = git2::Odb::new()?;
+    let _pack = odb.add_new_mempack_backend(1000)?;
+    repository.set_odb(&odb)?;
+    load_metadata(control, repository_id, &repository)?;
+    let mut pending = vec![head];
+    let mut visited = HashSet::new();
+    let mut result = Vec::new();
+    while let Some(oid) = pending.pop() {
+        if !visited.insert(oid) {
+            continue;
+        }
+        let commit = repository
+            .find_commit(oid)
+            .map_err(|_| HistoryError::IncompatibleRecord)?;
+        let parents = commit
+            .parent_ids()
+            .map(|parent| {
+                parent
+                    .as_bytes()
+                    .try_into()
+                    .expect("SHA-1 Git object IDs contain 20 bytes")
+            })
+            .collect();
+        let author = commit.author();
+        result.push(GitLogEntry {
+            oid: oid
+                .as_bytes()
+                .try_into()
+                .expect("SHA-1 Git object IDs contain 20 bytes"),
+            tree_oid: commit
+                .tree_id()
+                .as_bytes()
+                .try_into()
+                .expect("SHA-1 Git object IDs contain 20 bytes"),
+            parent_oids: parents,
+            author_name: author.name_bytes().to_vec(),
+            author_email: author.email_bytes().to_vec(),
+            message: commit.message_bytes().to_vec(),
+        });
+        if result.len() >= limit {
+            break;
+        }
+        for parent in commit.parent_ids().rev() {
+            pending.push(parent);
+        }
+    }
+    Ok(result)
 }

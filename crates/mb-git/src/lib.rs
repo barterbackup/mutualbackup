@@ -17,7 +17,7 @@ mod odb;
 mod repository;
 mod stage;
 #[cfg(target_os = "linux")]
-pub use history::{GitCommitInfo, HistoryError};
+pub use history::{GitCommitInfo, GitLogEntry, HistoryError};
 pub use odb::NativeOdb;
 #[cfg(target_os = "linux")]
 pub use repository::{GitRepository, RepositoryError};

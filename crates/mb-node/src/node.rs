@@ -26,7 +26,7 @@ use mb_core::{
     open_recovery_record, packing_protected_root, replay_coding_transcript, seal_recovery_record,
     sector_root, sign_guild_event, sign_legacy_coding_add_binding, synthetic_filler_sector,
 };
-use mb_git::{GitCommitInfo, GitRepository};
+use mb_git::{GitCommitInfo, GitLogEntry, GitRepository};
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
     VariableParityObject, filesystem_identity, probe_reflink,
@@ -1410,6 +1410,12 @@ impl Node {
         let repository = self.open_git_repository(repository_id)?;
         repository.resume_pending_stages()?;
         Ok(repository.commit(author_name, author_email, message)?)
+    }
+
+    pub fn git_log(&self, repository_id: Uuid, limit: usize) -> Result<Vec<GitLogEntry>> {
+        self.open_git_repository(repository_id)?
+            .log(limit)
+            .map_err(Into::into)
     }
 
     fn register_protected_root(
@@ -15163,6 +15169,10 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(second_commit.parent_oid, Some(first_commit.oid));
+        let history = reopened.git_log(info.repository_id, 10).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].oid, second_commit.oid);
+        assert_eq!(history[1].oid, first_commit.oid);
         assert!(source_root.join(".mutualbackup/catalog.db").exists());
         drop(reopened);
         fs::remove_dir_all(run_root).unwrap();
