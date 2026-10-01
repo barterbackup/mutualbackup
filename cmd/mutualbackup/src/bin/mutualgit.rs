@@ -197,8 +197,12 @@ async fn main() -> Result<()> {
                 bail!("daemon returned the wrong response to Git status");
             };
             println!("On branch {}", status.branch);
-            if !status.history_backed_up && status.head_oid.is_some() {
-                println!("Local commits are awaiting a signed backup");
+            if status.head_oid.is_some() {
+                if status.history_backed_up {
+                    println!("Local history is protected by a signed backup");
+                } else {
+                    println!("Local commits are awaiting a signed backup");
+                }
             }
             for change in status.changes {
                 println!(
