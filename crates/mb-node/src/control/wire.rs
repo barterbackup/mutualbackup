@@ -257,6 +257,12 @@ pub enum LocalRequest {
         repository_id: Uuid,
         path: PathBuf,
     },
+    GitPushBranchBare {
+        repository_id: Uuid,
+        path: PathBuf,
+        source_branch: String,
+        target_branch: String,
+    },
     GitPushTagBare {
         repository_id: Uuid,
         path: PathBuf,
@@ -830,6 +836,12 @@ mod tests {
             LocalRequest::GitPushBare {
                 repository_id,
                 path: PathBuf::from("/home/user/remote.git"),
+            },
+            LocalRequest::GitPushBranchBare {
+                repository_id,
+                path: PathBuf::from("/home/user/remote.git"),
+                source_branch: "topic".to_owned(),
+                target_branch: "review/topic".to_owned(),
             },
             LocalRequest::GitPushTagBare {
                 repository_id,

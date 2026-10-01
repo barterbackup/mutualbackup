@@ -1915,6 +1915,19 @@ impl Node {
         Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
     }
 
+    pub fn git_push_branch_bare(
+        &self,
+        repository_id: Uuid,
+        path: &Path,
+        source_branch: &str,
+        target_branch: &str,
+    ) -> Result<[u8; 20]> {
+        let oid = self
+            .open_git_repository(repository_id)?
+            .push_branch_to_bare(path, source_branch, target_branch)?;
+        Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
+    }
+
     pub fn git_push_tag_bare(
         &self,
         repository_id: Uuid,

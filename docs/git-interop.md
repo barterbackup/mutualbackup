@@ -21,6 +21,9 @@ in encrypted history backups and keep their commits reachable until removed
 and pruned. Stock Git can fetch and push either tag form through the remote
 helper. Native `mutualgit push` can send a tag to an existing local bare Git
 repository with `mutualgit push /path/to/bare.git refs/tags/release`. Native
+branch pushes also accept `mutualgit push /path/to/bare.git topic:review/topic`
+or full `refs/heads/` names; they can send a branch that is not checked out.
+The destination branch must be new or advance by fast-forward. Native
 `mutualgit fetch /path/to/git-repository` imports branches and tags together;
 `mutualgit pull` fetches those refs before merging the selected branch. An
 existing local tag may be fetched again at the same object ID, but a remote

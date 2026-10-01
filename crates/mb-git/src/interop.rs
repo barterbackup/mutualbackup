@@ -29,7 +29,7 @@ pub enum GitInteropError {
     Io(#[from] std::io::Error),
     #[error("the destination must be an existing SHA-1 Git repository outside this source root")]
     UnsupportedDestination,
-    #[error("the current branch has no committed head")]
+    #[error("the requested local branch has no committed head")]
     NoHead,
     #[error("the destination branch has diverged; a force push is not supported")]
     NonFastForward,
@@ -335,6 +335,30 @@ pub fn push_current_branch_to_bare(
     destination_path: &Path,
     branch: &str,
 ) -> Result<Oid, GitInteropError> {
+    push_branch_to_bare(
+        control,
+        repository_id,
+        source_root,
+        destination_path,
+        branch,
+        branch,
+    )
+}
+
+/// Push one local branch to a chosen bare Git branch, preserving the ordinary
+/// fast-forward rule even when the source and destination names differ.
+pub fn push_branch_to_bare(
+    control: &ControlStore,
+    repository_id: Uuid,
+    source_root: &Path,
+    destination_path: &Path,
+    source_branch: &str,
+    target_branch: &str,
+) -> Result<Oid, GitInteropError> {
+    if !git2::Branch::name_is_valid(source_branch)? || !git2::Branch::name_is_valid(target_branch)?
+    {
+        return Err(GitInteropError::IncompatibleGraph);
+    }
     let destination_path = destination_path.canonicalize()?;
     if destination_path.starts_with(source_root) {
         return Err(GitInteropError::UnsupportedDestination);
@@ -347,11 +371,12 @@ pub fn push_current_branch_to_bare(
     if !matches!(graph.format_version, 1 | 2) || graph.repository_id != repository_id {
         return Err(GitInteropError::IncompatibleGraph);
     }
-    let reference_name = format!("refs/heads/{branch}");
+    let source_ref = format!("refs/heads/{source_branch}");
+    let reference_name = format!("refs/heads/{target_branch}");
     let selected = graph
         .refs
         .iter()
-        .find(|reference| reference.name == reference_name.as_bytes())
+        .find(|reference| reference.name == source_ref.as_bytes())
         .ok_or(GitInteropError::NoHead)?;
     let target = Oid::from_bytes(&selected.oid)?;
     let previous = match destination.find_reference(&reference_name) {

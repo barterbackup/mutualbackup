@@ -32,7 +32,8 @@ use crate::history::{
     unpin_commit,
 };
 use crate::interop::{
-    GitInteropError, export_graph_to_git_repository, push_current_branch_to_bare, push_tag_to_bare,
+    GitInteropError, export_graph_to_git_repository, push_branch_to_bare,
+    push_current_branch_to_bare, push_tag_to_bare,
 };
 use crate::merge::{
     MergeBlobError, has_merge_session, load_merge_session, mark_merge_resolved,
@@ -922,6 +923,23 @@ impl GitRepository {
             &self.root,
             destination.as_ref(),
             &self.selected_branch()?,
+        )?)
+    }
+
+    pub fn push_branch_to_bare(
+        &self,
+        destination: impl AsRef<Path>,
+        source_branch: &str,
+        target_branch: &str,
+    ) -> Result<Oid, RepositoryError> {
+        self.resume_checkout()?;
+        Ok(push_branch_to_bare(
+            &self.catalog,
+            self.repository_id,
+            &self.root,
+            destination.as_ref(),
+            source_branch,
+            target_branch,
         )?)
     }
 
@@ -3362,6 +3380,11 @@ mod tests {
         let pushed = repo.push_current_branch_to_bare(&bare_root).unwrap();
         assert_eq!(pushed.as_bytes(), first.oid);
         assert_eq!(
+            repo.push_branch_to_bare(&bare_root, "main", "review/main")
+                .unwrap(),
+            pushed
+        );
+        assert_eq!(
             repo.push_current_branch_to_bare(&bare_root).unwrap(),
             pushed
         );
@@ -3425,6 +3448,28 @@ mod tests {
                 .as_bytes(),
             second.oid
         );
+        assert_eq!(
+            repo.push_branch_to_bare(&bare_root, "main", "review/main")
+                .unwrap()
+                .as_bytes(),
+            second.oid
+        );
+        repo.create_branch("topic").unwrap();
+        assert_eq!(
+            repo.push_branch_to_bare(&bare_root, "topic", "review/topic")
+                .unwrap()
+                .as_bytes(),
+            second.oid
+        );
+        assert_eq!(
+            remote
+                .find_reference("refs/heads/review/topic")
+                .unwrap()
+                .target()
+                .unwrap()
+                .as_bytes(),
+            second.oid
+        );
 
         let signature = git2::Signature::now("Remote", "remote@example.invalid").unwrap();
         let base = remote.find_commit(pushed).unwrap();
@@ -3443,6 +3488,22 @@ mod tests {
         ));
         assert_eq!(
             remote.find_reference("refs/heads/main").unwrap().target(),
+            Some(divergent)
+        );
+        remote
+            .reference("refs/heads/review/main", divergent, true, "diverge")
+            .unwrap();
+        assert!(matches!(
+            repo.push_branch_to_bare(&bare_root, "topic", "review/main"),
+            Err(RepositoryError::Interop(
+                crate::GitInteropError::NonFastForward
+            ))
+        ));
+        assert_eq!(
+            remote
+                .find_reference("refs/heads/review/main")
+                .unwrap()
+                .target(),
             Some(divergent)
         );
         let graph = repo.export_graph_source().unwrap();

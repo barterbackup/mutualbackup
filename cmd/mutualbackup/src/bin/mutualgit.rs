@@ -112,13 +112,13 @@ enum Command {
     Switch { name: String },
     /// Check out a branch using the same protected worktree transition.
     Checkout { name: String },
-    /// Push the current branch or a tag to an existing local bare Git repository.
+    /// Push the current branch, a named branch, or a tag to a local bare Git repository.
     Push {
         destination: PathBuf,
-        /// Optional refs/tags/NAME to push a tag instead of the current branch.
+        /// Optional BRANCH[:BRANCH], refs/heads/SRC:refs/heads/DST, or refs/tags/NAME.
         refspec: Option<String>,
     },
-    /// Fetch branches from an existing local Git repository.
+    /// Fetch branches and tags from an existing local Git repository.
     Fetch { source: PathBuf },
     /// Fetch and merge the selected branch from a local Git repository.
     Pull {
@@ -729,20 +729,18 @@ async fn main() -> Result<()> {
                 .join(destination)
                 .canonicalize()
                 .context("cannot resolve bare Git destination")?;
-            let tag_name = refspec
-                .as_deref()
-                .map(|value| {
-                    value
-                        .strip_prefix("refs/tags/")
-                        .filter(|name| !name.is_empty())
-                        .context("push refspec must be refs/tags/NAME")
-                })
-                .transpose()?;
-            let request = match tag_name {
-                Some(name) => LocalRequest::GitPushTagBare {
+            let parsed = refspec.as_deref().map(parse_push_refspec).transpose()?;
+            let request = match &parsed {
+                Some(PushRefspec::Tag(name)) => LocalRequest::GitPushTagBare {
                     repository_id,
                     path: destination.clone(),
                     name: name.to_owned(),
+                },
+                Some(PushRefspec::Branch { source, target }) => LocalRequest::GitPushBranchBare {
+                    repository_id,
+                    path: destination.clone(),
+                    source_branch: source.to_owned(),
+                    target_branch: target.to_owned(),
                 },
                 None => LocalRequest::GitPushBare {
                     repository_id,
@@ -759,18 +757,22 @@ async fn main() -> Result<()> {
             if returned_id != repository_id {
                 bail!("daemon pushed another repository");
             }
-            if let Some(name) = tag_name {
-                println!(
+            match parsed {
+                Some(PushRefspec::Tag(name)) => println!(
                     "Pushed tag {name} ({}) to {}",
                     git2::Oid::from_bytes(&oid)?,
                     destination.display()
-                );
-            } else {
-                println!(
+                ),
+                Some(PushRefspec::Branch { source, target }) => println!(
+                    "Pushed {source} to {target} ({}) in {}",
+                    git2::Oid::from_bytes(&oid)?,
+                    destination.display()
+                ),
+                None => println!(
                     "Pushed {} to {}",
                     git2::Oid::from_bytes(&oid)?,
                     destination.display()
-                );
+                ),
             }
         }
         Command::Fetch { source } => {
@@ -1107,6 +1109,41 @@ fn relative_for_add(root: &Path, working_directory: &Path, path: &Path) -> Resul
     Ok(parts.iter().collect())
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum PushRefspec {
+    Branch { source: String, target: String },
+    Tag(String),
+}
+
+fn parse_push_refspec(value: &str) -> Result<PushRefspec> {
+    if value.starts_with('+') {
+        bail!("force push is not supported");
+    }
+    let (source, target) = value.split_once(':').unwrap_or((value, value));
+    if source.is_empty() || target.is_empty() || target.contains(':') {
+        bail!("push refspec must name one source and destination ref");
+    }
+    if let Some(name) = source.strip_prefix("refs/tags/") {
+        if name.is_empty() || target != source || !git2::Reference::is_valid_name(source) {
+            bail!("tag push must use the same refs/tags/NAME on both sides");
+        }
+        return Ok(PushRefspec::Tag(name.to_owned()));
+    }
+    let source = source.strip_prefix("refs/heads/").unwrap_or(source);
+    let target = target.strip_prefix("refs/heads/").unwrap_or(target);
+    if source.starts_with("refs/")
+        || target.starts_with("refs/")
+        || !git2::Branch::name_is_valid(source)?
+        || !git2::Branch::name_is_valid(target)?
+    {
+        bail!("push refspec must name valid local and destination branches");
+    }
+    Ok(PushRefspec::Branch {
+        source: source.to_owned(),
+        target: target.to_owned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1126,6 +1163,39 @@ mod tests {
         assert!(relative_for_add(root, subdir, Path::new("../../escape")).is_err());
         assert!(relative_for_add(root, subdir, Path::new("/outside")).is_err());
         assert_eq!(display_path(b"bad\xff\nname"), "bad\\xff\\nname");
+    }
+
+    #[test]
+    fn push_refspecs_keep_branch_and_tag_namespaces_separate() {
+        assert_eq!(
+            parse_push_refspec("topic:review/topic").unwrap(),
+            PushRefspec::Branch {
+                source: "topic".to_owned(),
+                target: "review/topic".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_push_refspec("refs/heads/topic:refs/heads/review/topic").unwrap(),
+            PushRefspec::Branch {
+                source: "topic".to_owned(),
+                target: "review/topic".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_push_refspec("refs/tags/release").unwrap(),
+            PushRefspec::Tag("release".to_owned())
+        );
+        for unsupported in [
+            "+topic:main",
+            "topic:",
+            ":main",
+            "topic:refs/tags/release",
+            "refs/tags/release:refs/tags/other",
+            "refs/remotes/origin/topic:main",
+            "topic:main:extra",
+        ] {
+            assert!(parse_push_refspec(unsupported).is_err(), "{unsupported}");
+        }
     }
 
     #[test]
