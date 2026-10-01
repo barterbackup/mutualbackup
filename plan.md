@@ -33,7 +33,9 @@ them as ADRs and test vectors before promising wire compatibility.
   staging, history, checkout, merge, and interoperability with ordinary Git;
   Git-compatible object IDs describe the bytes actually retained in native
   anchors. Treat Git's automatic conversion settings as disabled in our binary,
-  including when opening an existing repository or importing a commit.
+  including when opening an existing repository or importing a commit. `add`
+  hashes the immutable captured bytes, and checkout writes the stored blob
+  bytes unchanged; no clean/smudge step is part of either operation.
 - Use a pinned SQLCipher/SQLite build as the common local storage engine, with
   per-page HMAC enabled. Keep control state separate from parity storage. The
   prototype instantiates one parity database; later, one database per configured
@@ -3062,8 +3064,10 @@ Milestone 5.
   that touch blob or working-tree bytes onto raw-byte paths; never let a Git
   library's default checkout/filter behavior re-enable conversion, including
   during merge, reset/restore, pull, and worktree creation. Import Git blob
-  bytes as raw file bytes and export the same bytes; report explicit repository
-  transforming rules before changing the index, refs, anchors, or worktree.
+  bytes as raw file bytes and export the same bytes. Treat incoming blob bytes
+  as authoritative; do not try to reverse conversions already performed by
+  another client's worktree. Report explicit repository transforming rules
+  before changing the index, refs, anchors, or worktree.
   Never run a configured filter command. Define safe support for Git file
   modes, symlinks, and path names rather than silently dropping them.
 - Protect the whole reachable Git commit graph and refs as owner-owned backed-up
