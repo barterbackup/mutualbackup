@@ -20,7 +20,7 @@ use crate::checkout::{
     resume_pending_checkout, resume_pending_checkout_for_scope,
 };
 use crate::diff::{DiffError, GitDiff, repository_diff, repository_diff_for_scope};
-use crate::fetch::{FetchError, fetch_bare, import_pushed_branch, import_pushed_tag};
+use crate::fetch::{FetchError, ImportTarget, fetch_bare, import_pushed_branch, import_pushed_tag};
 use crate::head::{HeadError, selected_branch, selected_branch_for_scope};
 use crate::history::{
     GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, GitRemoteBranchInfo, GitTagInfo,
@@ -1061,7 +1061,10 @@ impl GitRepository {
         Ok(fetch_bare(
             &self.catalog,
             self.repository_id,
-            &self.root,
+            ImportTarget {
+                root: &self.root,
+                backend: self.source_backend,
+            },
             source.as_ref(),
         )?)
     }
@@ -1078,7 +1081,10 @@ impl GitRepository {
         Ok(import_pushed_branch(
             &self.catalog,
             self.repository_id,
-            &self.root,
+            ImportTarget {
+                root: &self.root,
+                backend: self.source_backend,
+            },
             source_git_directory.as_ref(),
             target_branch,
             target_oid,
@@ -1098,7 +1104,10 @@ impl GitRepository {
         Ok(import_pushed_tag(
             &self.catalog,
             self.repository_id,
-            &self.root,
+            ImportTarget {
+                root: &self.root,
+                backend: self.source_backend,
+            },
             source_git_directory.as_ref(),
             target_tag,
             target_oid,

@@ -17,8 +17,9 @@ use crate::{
 };
 
 /// Local source capabilities never enter a signed peer record. Version 1
-/// means byte-exact sparse reflink capture, native metadata, reflink checkout,
-/// and reachability through catalogued immutable native anchors.
+/// means byte-exact sparse reflink capture, direct raw-byte imports, native
+/// metadata, reflink checkout, and reachability through catalogued immutable
+/// native anchors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SourceBackendKind {
     ReflinkV1,
@@ -82,6 +83,16 @@ impl SourceBackendKind {
     ) -> Result<SourceFileCapturePlan, AnchorError> {
         match self {
             Self::ReflinkV1 => SourceFileCapturePlan::plan_reflink(source_root, relative_path),
+        }
+    }
+
+    pub fn plan_blob_import(
+        self,
+        source_root: impl AsRef<Path>,
+        logical_len: u64,
+    ) -> Result<SourceBlobImportPlan, AnchorError> {
+        match self {
+            Self::ReflinkV1 => SourceBlobImportPlan::plan_direct(source_root, logical_len),
         }
     }
 }

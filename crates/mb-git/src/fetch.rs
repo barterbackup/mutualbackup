@@ -12,7 +12,8 @@ use std::process::{Command, Stdio};
 use git2::{ObjectFormat, ObjectType, Oid, Repository};
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
 use mb_store::{
-    AnchorError, ControlStore, DatabaseError, FileAnchorManifest, SourceBlobImportPlan,
+    AnchorError, ControlStore, DatabaseError, FileAnchorManifest, SourceBackendKind,
+    SourceBlobImportPlan,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -34,6 +35,12 @@ const BLOB_PREFIX: &str = "git-bare-fetch-blob-intent-v1/";
 const VERIFIED_PREFIX: &str = "git-bare-fetch-verified-v1/";
 const PUSH_PREFIX: &str = "git-stock-push-intent-v1/";
 const ACTIVE: &[u8] = b"active";
+
+#[derive(Clone, Copy)]
+pub(crate) struct ImportTarget<'a> {
+    pub root: &'a Path,
+    pub backend: SourceBackendKind,
+}
 
 #[derive(Debug, Error)]
 pub enum FetchError {
@@ -681,6 +688,7 @@ fn import_blob(
     control: &ControlStore,
     intent: &FetchIntent,
     blob: &FetchedBlob,
+    source_backend: SourceBackendKind,
 ) -> Result<(), FetchError> {
     let oid = Oid::from_bytes(&blob.oid)?;
     let kind = blob_kind(intent.repository_id);
@@ -738,7 +746,7 @@ fn import_blob(
                 repository_id: intent.repository_id,
                 oid: blob.oid,
                 logical_len: blob.logical_len,
-                plan: SourceBlobImportPlan::plan_direct(&intent.source_root, blob.logical_len)?,
+                plan: source_backend.plan_blob_import(&intent.source_root, blob.logical_len)?,
             };
             let bytes = canonical_bytes(&state)?;
             if !control.put_record_if_absent(&kind, &blob.oid, &bytes)? {
@@ -841,10 +849,10 @@ fn check_fetched_tags(
 /// `refs/tags/*`. The selected local branch, index and worktree are unchanged.
 /// Blob imports are replayable; refs become visible only after every required
 /// native anchor has been published. Historical branch-only intents still replay.
-pub fn fetch_bare(
+pub(crate) fn fetch_bare(
     control: &ControlStore,
     repository_id: Uuid,
-    source_root: &Path,
+    target: ImportTarget<'_>,
     source_path: &Path,
 ) -> Result<usize, FetchError> {
     if control
@@ -857,7 +865,7 @@ pub fn fetch_bare(
     let (intent, encoded) = match control.get_record(&kind, ACTIVE)? {
         Some(bytes) => {
             let intent: FetchIntent = decode_canonical(&bytes)?;
-            validate_intent(&intent, repository_id, source_root)?;
+            validate_intent(&intent, repository_id, target.root)?;
             if !matches!(intent.format_version, 1 | 3 | 5 | 6)
                 || source_path != intent.source_path
                     && source_path.canonicalize().ok().as_deref()
@@ -871,15 +879,15 @@ pub fn fetch_bare(
             let canonical = source_path.canonicalize()?;
             let candidate = Repository::open(&canonical)?;
             let format_version = if candidate.is_bare() { 5 } else { 6 };
-            let repository = source_repository(&canonical, source_root, format_version)?;
+            let repository = source_repository(&canonical, target.root, format_version)?;
             let intent = discover(
                 &repository,
                 repository_id,
                 canonical,
-                source_root.to_owned(),
+                target.root.to_owned(),
                 format_version,
             )?;
-            validate_intent(&intent, repository_id, source_root)?;
+            validate_intent(&intent, repository_id, target.root)?;
             check_fetched_tags(control, repository_id, &intent)?;
             let bytes = canonical_bytes(&intent)?;
             if !control.put_record_if_absent(&kind, ACTIVE, &bytes)? {
@@ -889,7 +897,7 @@ pub fn fetch_bare(
         }
     };
     for blob in &intent.blobs {
-        import_blob(control, &intent, blob)?;
+        import_blob(control, &intent, blob, target.backend)?;
     }
     let mut records = Vec::with_capacity(intent.objects.len() + intent.refs.len());
     for object in &intent.objects {
@@ -944,7 +952,7 @@ pub fn fetch_bare(
 pub(crate) fn import_pushed_branch(
     control: &ControlStore,
     repository_id: Uuid,
-    source_root: &Path,
+    target: ImportTarget<'_>,
     source_path: &Path,
     target_branch: &str,
     target_oid: [u8; 20],
@@ -953,7 +961,7 @@ pub(crate) fn import_pushed_branch(
     import_pushed_ref(
         control,
         repository_id,
-        source_root,
+        target,
         source_path,
         target_branch,
         target_oid,
@@ -965,7 +973,7 @@ pub(crate) fn import_pushed_branch(
 pub(crate) fn import_pushed_tag(
     control: &ControlStore,
     repository_id: Uuid,
-    source_root: &Path,
+    target: ImportTarget<'_>,
     source_path: &Path,
     target_tag: &str,
     target_oid: [u8; 20],
@@ -974,7 +982,7 @@ pub(crate) fn import_pushed_tag(
     import_pushed_ref(
         control,
         repository_id,
-        source_root,
+        target,
         source_path,
         target_tag,
         target_oid,
@@ -987,7 +995,7 @@ pub(crate) fn import_pushed_tag(
 fn import_pushed_ref(
     control: &ControlStore,
     repository_id: Uuid,
-    source_root: &Path,
+    target: ImportTarget<'_>,
     source_path: &Path,
     target_name: &str,
     target_oid: [u8; 20],
@@ -1016,7 +1024,7 @@ fn import_pushed_ref(
     let (intent, encoded) = match control.get_record(&kind, ACTIVE)? {
         Some(bytes) => {
             let pending: PushImportIntent = decode_canonical(&bytes)?;
-            validate_intent(&pending.fetch, repository_id, source_root)?;
+            validate_intent(&pending.fetch, repository_id, target.root)?;
             if pending.format_version != if is_tag { 2 } else { 1 }
                 || pending.fetch.format_version != if is_tag { 4 } else { 2 }
                 || pending.target_branch != target_name
@@ -1049,19 +1057,19 @@ fn import_pushed_ref(
             }
             let canonical = source_path.canonicalize()?;
             let fetch_version = if is_tag { 4 } else { 2 };
-            let repository = source_repository(&canonical, source_root, fetch_version)?;
+            let repository = source_repository(&canonical, target.root, fetch_version)?;
             let fetch = discover_from_refs(
                 &repository,
                 repository_id,
                 canonical,
-                source_root.to_owned(),
+                target.root.to_owned(),
                 vec![GitGraphRef {
                     name: local_ref.as_bytes().to_vec(),
                     oid: target_oid,
                 }],
                 fetch_version,
             )?;
-            validate_intent(&fetch, repository_id, source_root)?;
+            validate_intent(&fetch, repository_id, target.root)?;
             let pending = PushImportIntent {
                 format_version: if is_tag { 2 } else { 1 },
                 target_branch: target_name.to_owned(),
@@ -1076,7 +1084,7 @@ fn import_pushed_ref(
         }
     };
     for blob in &intent.fetch.blobs {
-        import_blob(control, &intent.fetch, blob)?;
+        import_blob(control, &intent.fetch, blob, target.backend)?;
     }
     let metadata = intent
         .fetch
@@ -1342,7 +1350,13 @@ mod tests {
                 &canonical_bytes(&pending).unwrap(),
             )
             .unwrap();
-        import_blob(&control, &pending.fetch, &pending.fetch.blobs[0]).unwrap();
+        import_blob(
+            &control,
+            &pending.fetch,
+            &pending.fetch.blobs[0],
+            SourceBackendKind::ReflinkV1,
+        )
+        .unwrap();
         assert!(has_pending_fetch(&control, repository_id).unwrap());
         drop(control);
         drop(stock);
@@ -1352,7 +1366,10 @@ mod tests {
         import_pushed_branch(
             &control,
             repository_id,
-            &root,
+            ImportTarget {
+                root: &root,
+                backend: SourceBackendKind::ReflinkV1,
+            },
             &git_directory,
             "topic",
             sha1(commit),
@@ -1439,7 +1456,13 @@ mod tests {
                 &canonical_bytes(&pending).unwrap(),
             )
             .unwrap();
-        import_blob(&control, &pending.fetch, &pending.fetch.blobs[0]).unwrap();
+        import_blob(
+            &control,
+            &pending.fetch,
+            &pending.fetch.blobs[0],
+            SourceBackendKind::ReflinkV1,
+        )
+        .unwrap();
         assert!(has_pending_fetch(&control, repository_id).unwrap());
         drop(control);
         drop(stock);
@@ -1449,7 +1472,10 @@ mod tests {
         import_pushed_tag(
             &control,
             repository_id,
-            &root,
+            ImportTarget {
+                root: &root,
+                backend: SourceBackendKind::ReflinkV1,
+            },
             &git_directory,
             "release",
             sha1(tag),
@@ -1551,7 +1577,13 @@ mod tests {
                 &canonical_bytes(&intent).unwrap(),
             )
             .unwrap();
-        import_blob(&control, &intent, &intent.blobs[0]).unwrap();
+        import_blob(
+            &control,
+            &intent,
+            &intent.blobs[0],
+            SourceBackendKind::ReflinkV1,
+        )
+        .unwrap();
         assert_eq!(control.records(&verified_kind(&intent)).unwrap().len(), 1);
         let blob = &intent.blobs[1];
         let plan = SourceBlobImportPlan::plan_direct(&root, blob.logical_len).unwrap();
@@ -1654,7 +1686,13 @@ mod tests {
                 &canonical_bytes(&intent).unwrap(),
             )
             .unwrap();
-        import_blob(&control, &intent, &intent.blobs[0]).unwrap();
+        import_blob(
+            &control,
+            &intent,
+            &intent.blobs[0],
+            SourceBackendKind::ReflinkV1,
+        )
+        .unwrap();
         drop(control);
         drop(tree);
         drop(builder);
