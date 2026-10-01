@@ -29,8 +29,10 @@ them as ADRs and test vectors before promising wire compatibility.
   and checkpoint, and peers need no Git awareness.
 - The Git-compatible frontend preserves tracked file bytes exactly. No command
   automatically fixes line endings or applies another content conversion, even
-  when the host's Git configuration enables one. This policy covers local
-  staging, history, checkout, merge, and interoperability with ordinary Git;
+  when the host's Git configuration enables one. Git clean filters can run
+  arbitrary transformations; disabling CRLF normalization alone is insufficient.
+  This policy covers local staging, history, checkout, merge, and
+  interoperability with ordinary Git;
   Git-compatible object IDs describe the bytes actually retained in native
   anchors. Treat Git's automatic conversion settings as disabled in our binary,
   including when opening an existing repository or importing a commit. `add`
@@ -3103,7 +3105,8 @@ Milestone 5.
 - Close the Git phase with a local gate for exact-byte add/edit/commit/checkout
   and multi-worktree cases; mixed LF/CRLF, binary NUL, non-UTF-8 payloads, and
   conversion-inducing system/global/repository `core.autocrlf`/`core.eol`
-  settings and `.gitattributes` across add, merge, reset/restore, pull, worktree
+  settings and `.gitattributes` rules for `text=auto`, `eol`, `filter`, `ident`,
+  and `working-tree-encoding` across add, merge, reset/restore, pull, worktree
   checkout, import, and export; verify a configured filter is never executed
   and a rejected rule leaves index, refs, anchors, and worktree unchanged;
   sparse and large files; hard links, symlinks, modes, and unusual path names;
