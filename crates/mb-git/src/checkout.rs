@@ -56,6 +56,8 @@ thread_local! {
         std::cell::RefCell::new(None);
     static AFTER_CHECKOUT_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static AFTER_MISSING_CHECKOUT_STAGING_REMOVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
@@ -76,6 +78,20 @@ pub(crate) fn set_after_directory_cleanup_hook(hook: Box<dyn FnOnce()>) {
 #[cfg(test)]
 pub(crate) fn set_after_checkout_commit_hook(hook: Box<dyn FnOnce()>) {
     AFTER_CHECKOUT_COMMIT.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_missing_checkout_staging_remove_hook(hook: Box<dyn FnOnce()>) {
+    AFTER_MISSING_CHECKOUT_STAGING_REMOVE.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+fn run_after_missing_checkout_staging_remove_hook() {
+    #[cfg(test)]
+    AFTER_MISSING_CHECKOUT_STAGING_REMOVE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
 }
 
 fn run_after_checkout_file_hook() {
@@ -373,6 +389,53 @@ pub(crate) fn has_pending_checkout_for_scope(
     Ok(control
         .get_record(&intent_kind_for_scope(scope), INTENT_KEY)?
         .is_some())
+}
+
+/// Discard only an interrupted initial checkout for a missing linked worktree.
+/// Format 5 starts with an unborn HEAD, so its private staging directory holds
+/// no pre-existing working bytes. A crash after directory removal can replay
+/// this operation because the exact intent remains until the final deletion.
+pub(crate) fn abandon_missing_initial_checkout_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    root_id: NativeFileId,
+    target_branch: &str,
+    catalog: &PinnedDirectory,
+) -> Result<bool, CheckoutError> {
+    if scope.worktree_id() == scope.repository_id() {
+        return Err(CheckoutError::IncompatibleIntent);
+    }
+    let kind = intent_kind_for_scope(scope);
+    let Some(encoded) = control.get_record(&kind, INTENT_KEY)? else {
+        return Ok(false);
+    };
+    let linked: LinkedCheckoutIntent = decode_canonical(&encoded)?;
+    let intent = &linked.checkout;
+    let unborn = format!("mutualbackup-init-{}", scope.worktree_id());
+    if linked.format_version != 1
+        || linked.worktree_id != scope.worktree_id()
+        || linked.root_id != root_id
+        || validate_intent(intent, scope.repository_id()).is_err()
+        || intent.format_version != 5
+        || intent.old_branch != unborn
+        || intent.new_branch != target_branch
+        || intent.old_oid != [0; 20]
+        || intent.entries.iter().any(|entry| entry.old.is_some())
+        || !intent.removed_directories.is_empty()
+    {
+        return Err(CheckoutError::IncompatibleIntent);
+    }
+    if let Some(staging) = catalog.open_child_directory(&intent.staging_name)? {
+        let actual = staging.identity()?;
+        if intent.staging_id.is_some_and(|expected| expected != actual) {
+            return Err(CheckoutError::IncompatibleIntent);
+        }
+        catalog.remove_child_directory(&intent.staging_name, actual)?;
+        catalog.sync_all()?;
+    }
+    run_after_missing_checkout_staging_remove_hook();
+    control.delete_record_if_value(&kind, INTENT_KEY, &encoded)?;
+    Ok(true)
 }
 
 fn stage_name(index: usize) -> String {

@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use crate::GitWorktreeScope;
 use crate::checkout::{
-    CheckoutError, begin_switch_for_scope, has_pending_checkout_for_scope,
-    resume_pending_checkout_for_scope,
+    CheckoutError, abandon_missing_initial_checkout_for_scope, begin_switch_for_scope,
+    has_pending_checkout_for_scope, resume_pending_checkout_for_scope,
 };
 use crate::head::{
     HeadError, branch_selected_elsewhere, head_kind_for_scope, selected_branch_for_scope,
@@ -198,6 +198,7 @@ pub(crate) fn prune_missing_worktree(
     repository_id: Uuid,
     worktree_id: Uuid,
     force: bool,
+    catalog: &PinnedDirectory,
 ) -> Result<GitWorktreeInfo, GitWorktreeError> {
     let kind = record_kind(repository_id);
     let encoded = control
@@ -221,9 +222,11 @@ pub(crate) fn prune_missing_worktree(
         return Err(GitWorktreeError::StillPresent);
     }
     let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
-    if has_pending_stages_for_scope(control, scope)?
-        || has_pending_checkout_for_scope(control, scope)?
-    {
+    if has_pending_stages_for_scope(control, scope)? {
+        return Err(GitWorktreeError::PendingOperation);
+    }
+    let pending_checkout = has_pending_checkout_for_scope(control, scope)?;
+    if pending_checkout && (!force || info.state != GitWorktreeState::Preparing) {
         return Err(GitWorktreeError::PendingOperation);
     }
     let head_kind = head_kind_for_scope(scope);
@@ -234,14 +237,16 @@ pub(crate) fn prune_missing_worktree(
     {
         return Err(GitWorktreeError::Conflict);
     }
+    let mut unborn_head = false;
     if info.state == GitWorktreeState::Preparing && !head_rows.is_empty() {
         let selected = selected_branch_for_scope(control, scope)?;
         let unborn = format!("mutualbackup-init-{}", info.worktree_id);
         if selected != unborn && selected != info.target_branch {
             return Err(GitWorktreeError::Conflict);
         }
+        unborn_head = selected == unborn;
     }
-    let committed = if head_rows.is_empty() {
+    let committed = if head_rows.is_empty() || unborn_head {
         Default::default()
     } else {
         committed_files_for_scope(control, scope)?
@@ -265,6 +270,15 @@ pub(crate) fn prune_missing_worktree(
         .collect::<Vec<_>>();
     if !head_rows.is_empty() {
         deletions.push((head_kind, b"branch".to_vec()));
+    }
+    if pending_checkout {
+        abandon_missing_initial_checkout_for_scope(
+            control,
+            scope,
+            info.root_id,
+            &info.target_branch,
+            catalog,
+        )?;
     }
     control.put_records_and_retire_and_delete_if_value(
         &[],

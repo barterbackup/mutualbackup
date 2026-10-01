@@ -32,9 +32,11 @@ After deliberately removing a linked worktree directory, run
 `mutualgit worktree prune WORKTREE_ID` from the primary repository to release
 its branch ownership and index pins. The command refuses an existing path,
 staged differences, or an unfinished add or checkout. Use `--force` to discard
-staged changes after removing the directory; pending operations still block it.
-An interrupted registration that has not started checkout can also be pruned
-after its directory is removed.
+staged changes after removing the directory. `--force` can also discard an
+interrupted initial checkout and its private staging directory after that
+worktree directory is gone; pending file adds and later checkouts still block it.
+An interrupted registration that has not started checkout can be pruned without
+`--force` after its directory is removed.
 It only forgets that worktree's local metadata; its branch and shared commits
 remain available. Run the separate history `prune` (or `gc`) command to reclaim
 anchors that no remaining ref or index needs.
