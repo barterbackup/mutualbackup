@@ -31,7 +31,7 @@ struct Cli {
 enum Command {
     /// Enroll this directory as a protected Git-compatible repository.
     Init { directory: Option<PathBuf> },
-    /// Create, list, or resume linked worktrees of this repository.
+    /// Create, list, resume, or prune linked worktrees of this repository.
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
@@ -163,6 +163,13 @@ enum WorktreeCommand {
     List,
     /// Finish an interrupted linked-worktree checkout.
     Resume { worktree_id: Uuid },
+    /// Forget the registration of a clean linked worktree whose directory was removed.
+    Prune {
+        worktree_id: Uuid,
+        /// Discard staged index changes after the worktree directory was removed.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[tokio::main]
@@ -258,6 +265,24 @@ async fn main() -> Result<()> {
                         info.state,
                         info.path.display()
                     );
+                }
+                WorktreeCommand::Prune { worktree_id, force } => {
+                    let LocalResponse::GitWorktreePruned(info) = local_control_call(
+                        &socket,
+                        &LocalRequest::GitWorktreePrune {
+                            repository_id,
+                            worktree_id,
+                            force,
+                        },
+                    )
+                    .await?
+                    else {
+                        bail!("daemon returned the wrong response to worktree prune");
+                    };
+                    if info.repository_id != repository_id || info.worktree_id != worktree_id {
+                        bail!("daemon pruned another worktree");
+                    }
+                    println!("Pruned worktree {} at {}", worktree_id, info.path.display());
                 }
             }
         }

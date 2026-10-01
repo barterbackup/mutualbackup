@@ -52,7 +52,8 @@ use crate::stage::{
 };
 use crate::status::{GitStatus, StatusError, repository_status, repository_status_for_scope};
 use crate::worktree::{
-    GitWorktreeError, GitWorktreeInfo, add_worktree, get_worktree, list_worktrees, resume_worktree,
+    GitWorktreeError, GitWorktreeInfo, add_worktree, get_worktree, list_worktrees,
+    prune_missing_worktree, resume_worktree,
 };
 
 const INITIALIZATION_INTENT: &str = "repository-intent";
@@ -291,6 +292,21 @@ impl GitRepository {
             &self.catalog,
             self.repository_id,
             worktree_id,
+        )?)
+    }
+
+    pub fn prune_missing_linked_worktree(
+        &self,
+        worktree_id: Uuid,
+        force: bool,
+    ) -> Result<GitWorktreeInfo, RepositoryError> {
+        self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
+        Ok(prune_missing_worktree(
+            &self.catalog,
+            self.repository_id,
+            worktree_id,
+            force,
         )?)
     }
 
@@ -2055,6 +2071,116 @@ mod tests {
         let graph = local.export_graph_source().unwrap();
         drop(local);
         drop(remote);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn removed_linked_worktree_releases_ownership_only_after_index_is_clean() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-worktree-prune-{}", Uuid::new_v4()));
+        let primary_root = run_root.join("primary");
+        let linked_root = run_root.join("linked");
+        fs::create_dir_all(&primary_root).unwrap();
+        fs::create_dir_all(&linked_root).unwrap();
+        fs::write(primary_root.join("tracked"), b"base\r\n").unwrap();
+        let repository_id = Uuid::new_v4();
+        let local = GitRepository::init(&primary_root, repository_id, &[119; 32]).unwrap();
+        local.stage_file("tracked").unwrap();
+        local.commit("Author", "a@example.test", "base").unwrap();
+        local.create_branch("topic").unwrap();
+        let linked = local.add_linked_worktree(&linked_root, "topic").unwrap();
+        assert!(matches!(
+            local.prune_missing_linked_worktree(linked.worktree_id, false),
+            Err(RepositoryError::Worktree(
+                crate::GitWorktreeError::StillPresent
+            ))
+        ));
+
+        fs::write(linked_root.join("tracked"), b"staged-only\n").unwrap();
+        let staged = local
+            .linked_add_path(linked.worktree_id, "tracked")
+            .unwrap()
+            .unwrap();
+        let staged_anchor = crate::stage::anchors_for_oid(
+            &local.catalog,
+            repository_id,
+            Oid::from_bytes(&staged.oid).unwrap(),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|anchor| anchor.anchor_id == staged.anchor_id)
+        .unwrap();
+        fs::remove_dir_all(&linked_root).unwrap();
+        assert!(matches!(
+            local.prune_missing_linked_worktree(linked.worktree_id, false),
+            Err(RepositoryError::Worktree(
+                crate::GitWorktreeError::StagedChanges
+            ))
+        ));
+        assert!(matches!(
+            local.switch_branch("topic"),
+            Err(RepositoryError::History(
+                crate::HistoryError::BranchCheckedOutElsewhere
+            ))
+        ));
+
+        let scope = linked.scope().unwrap();
+        let pending_kind =
+            scope.local_kind("git-stage-intent-v1/", "git-worktree-stage-intent-v1/");
+        local
+            .catalog
+            .put_record(&pending_kind, b"pending", b"test-only-pending")
+            .unwrap();
+        assert!(matches!(
+            local.prune_missing_linked_worktree(linked.worktree_id, true),
+            Err(RepositoryError::Worktree(
+                crate::GitWorktreeError::PendingOperation
+            ))
+        ));
+        local
+            .catalog
+            .delete_record(&pending_kind, b"pending")
+            .unwrap();
+        assert_eq!(
+            local
+                .prune_missing_linked_worktree(linked.worktree_id, true)
+                .unwrap(),
+            linked
+        );
+        assert!(local.linked_worktrees().unwrap().is_empty());
+        assert!(
+            local
+                .catalog
+                .records(&crate::head::head_kind_for_scope(scope))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            local
+                .catalog
+                .records(&crate::stage::index_kind_for_scope(scope))
+                .unwrap()
+                .is_empty()
+        );
+        local.switch_branch("topic").unwrap();
+        assert_eq!(fs::read(primary_root.join("tracked")).unwrap(), b"base\r\n");
+        assert_eq!(
+            local
+                .prune_unreachable(&crate::GitPruneRoots::default())
+                .unwrap()
+                .native_anchors_removed,
+            1
+        );
+        assert!(staged_anchor.open_verified().is_err());
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
         for blob in graph.blobs {
             blob.anchor.remove().unwrap();
         }

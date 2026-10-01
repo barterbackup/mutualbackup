@@ -361,6 +361,11 @@ pub enum LocalRequest {
         revision_id: Option<Uuid>,
         target: PathBuf,
     },
+    GitWorktreePrune {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        force: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -478,6 +483,7 @@ pub enum LocalResponse {
     Recovered(DhtRecoveryResult),
     Snapshots(Vec<SnapshotInfo>),
     SnapshotRestored(SnapshotInfo),
+    GitWorktreePruned(GitWorktreeInfo),
 }
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -636,6 +642,11 @@ mod tests {
             LocalRequest::GitWorktreeResume {
                 repository_id,
                 worktree_id: Uuid::from_bytes([5; 16]),
+            },
+            LocalRequest::GitWorktreePrune {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                force: true,
             },
             LocalRequest::GitWorktreeStatus {
                 repository_id,
@@ -978,6 +989,18 @@ mod tests {
                 path: PathBuf::from("/home/user/work"),
             }),
             LocalResponse::GitWorktreeRegistered(GitWorktreeInfo {
+                format_version: 1,
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                path: PathBuf::from("/home/user/linked"),
+                root_id: mb_store::NativeFileId {
+                    filesystem_id: 1,
+                    inode: 2,
+                },
+                target_branch: "topic".to_owned(),
+                state: mb_git::GitWorktreeState::Ready,
+            }),
+            LocalResponse::GitWorktreePruned(GitWorktreeInfo {
                 format_version: 1,
                 repository_id,
                 worktree_id: Uuid::from_bytes([5; 16]),

@@ -26,6 +26,14 @@ mutualgit -C /absolute/path/to/source status
 The local binary supports branches, linked worktrees, exact-byte checkout,
 merge, staged reset, hard reset, worktree restore, diff, log, explicit commit pins,
 and prune.
+After deliberately removing a linked worktree directory, run
+`mutualgit worktree prune WORKTREE_ID` from the primary repository to release
+its branch ownership and index pins. The command refuses an existing path,
+staged differences, or an unfinished add or checkout. Use `--force` to discard
+staged changes after removing the directory; pending operations still block it.
+It only forgets that worktree's local metadata; its branch and shared commits
+remain available. Run the separate history `prune` command to reclaim anchors
+that no remaining ref or index needs.
 `mutualgit restore PATH` restores working files from the staged index without
 moving HEAD or changing that index; `mutualgit restore --staged PATH` resets
 the selected index paths from HEAD without changing working files. Use both

@@ -18,13 +18,19 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::GitWorktreeScope;
-use crate::checkout::{CheckoutError, begin_switch_for_scope, resume_pending_checkout_for_scope};
+use crate::checkout::{
+    CheckoutError, begin_switch_for_scope, has_pending_checkout_for_scope,
+    resume_pending_checkout_for_scope,
+};
 use crate::head::{
-    HeadError, branch_selected_elsewhere, selected_branch_for_scope,
+    HeadError, branch_selected_elsewhere, head_kind_for_scope, selected_branch_for_scope,
     store_selected_branch_for_scope,
 };
 use crate::history::{HistoryError, list_branches_for_scope};
-use crate::status::{StatusError, repository_status_for_scope};
+use crate::stage::{
+    StageError, has_pending_stages_for_scope, index_kind_for_scope, staged_entries_for_scope,
+};
+use crate::status::{StatusError, committed_files_for_scope, repository_status_for_scope};
 
 const RECORD_PREFIX: &str = "git-linked-worktree-v1/";
 const MARKER_NAME: &str = "worktree";
@@ -92,6 +98,8 @@ pub enum GitWorktreeError {
     Checkout(#[from] CheckoutError),
     #[error("Git worktree status failed: {0}")]
     Status(#[from] StatusError),
+    #[error("Git worktree index failed: {0}")]
+    Stage(#[from] StageError),
     #[error("the linked worktree path, identity, or marker conflicts with its registration")]
     Conflict,
     #[error("a linked worktree must start in an empty directory on the primary filesystem")]
@@ -102,6 +110,12 @@ pub enum GitWorktreeError {
     NotRegistered,
     #[error("too many linked worktrees are registered")]
     TooManyWorktrees,
+    #[error("the linked worktree still exists; remove its files before pruning its registration")]
+    StillPresent,
+    #[error("the linked worktree has staged content that differs from its selected HEAD")]
+    StagedChanges,
+    #[error("the linked worktree has an unfinished add or checkout")]
+    PendingOperation,
 }
 
 pub(crate) fn record_kind(repository_id: Uuid) -> String {
@@ -155,6 +169,79 @@ pub(crate) fn get_worktree(
         .ok_or(GitWorktreeError::NotRegistered)?;
     let info: GitWorktreeInfo = decode_canonical(&bytes)?;
     validate(&info, repository_id, worktree_id.as_bytes())?;
+    Ok(info)
+}
+
+/// Retire only catalog state for an explicitly removed linked worktree.
+/// The exact registration, HEAD, and index are deleted in one transaction so
+/// an interruption cannot free branch ownership while keeping stale pins.
+pub(crate) fn prune_missing_worktree(
+    control: &ControlStore,
+    repository_id: Uuid,
+    worktree_id: Uuid,
+    force: bool,
+) -> Result<GitWorktreeInfo, GitWorktreeError> {
+    let kind = record_kind(repository_id);
+    let encoded = control
+        .get_record(&kind, worktree_id.as_bytes())?
+        .ok_or(GitWorktreeError::NotRegistered)?;
+    let info: GitWorktreeInfo = decode_canonical(&encoded)?;
+    validate(&info, repository_id, worktree_id.as_bytes())?;
+    if info.state != GitWorktreeState::Ready {
+        return Err(GitWorktreeError::PendingOperation);
+    }
+    match fs::symlink_metadata(&info.path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err(GitWorktreeError::StillPresent),
+        Err(error) => return Err(error.into()),
+    }
+    let parent = PinnedDirectory::open(info.path.parent().ok_or(GitWorktreeError::Conflict)?)?;
+    if parent
+        .entry_identity(
+            info.path.file_name().ok_or(GitWorktreeError::Conflict)?,
+            true,
+        )?
+        .is_some()
+    {
+        return Err(GitWorktreeError::StillPresent);
+    }
+    let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
+    if has_pending_stages_for_scope(control, scope)?
+        || has_pending_checkout_for_scope(control, scope)?
+    {
+        return Err(GitWorktreeError::PendingOperation);
+    }
+    let committed = committed_files_for_scope(control, scope)?;
+    let staged = staged_entries_for_scope(control, scope)?;
+    if !force
+        && (staged.len() != committed.len()
+            || staged.iter().any(|(path, entry)| {
+                committed
+                    .get(path)
+                    .is_none_or(|(oid, mode)| entry.oid != *oid || entry.mode != *mode)
+            }))
+    {
+        return Err(GitWorktreeError::StagedChanges);
+    }
+    let head_kind = head_kind_for_scope(scope);
+    let head_rows = control.records(&head_kind)?;
+    if head_rows.len() != 1 || head_rows[0].0 != b"branch" {
+        return Err(GitWorktreeError::Conflict);
+    }
+    let index_kind = index_kind_for_scope(scope);
+    let mut deletions = control
+        .records(&index_kind)?
+        .into_iter()
+        .map(|(key, _)| (index_kind.clone(), key))
+        .collect::<Vec<_>>();
+    deletions.push((head_kind, b"branch".to_vec()));
+    control.put_records_and_retire_and_delete_if_value(
+        &[],
+        &deletions,
+        &kind,
+        worktree_id.as_bytes(),
+        &encoded,
+    )?;
     Ok(info)
 }
 

@@ -400,6 +400,17 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitWorktreePrune {
+            repository_id,
+            worktree_id,
+            force,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_prune_missing_worktree(repository_id, worktree_id, force)
+                    .map(LocalResponse::GitWorktreePruned)
+            })
+            .await
+        }
         LocalRequest::GitWorktreeStatus {
             repository_id,
             worktree_id,

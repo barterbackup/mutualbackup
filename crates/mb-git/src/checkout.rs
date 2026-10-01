@@ -366,6 +366,15 @@ fn intent_kind_for_scope(scope: GitWorktreeScope) -> String {
     scope.local_kind(INTENT_PREFIX, WORKTREE_INTENT_PREFIX)
 }
 
+pub(crate) fn has_pending_checkout_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+) -> Result<bool, CheckoutError> {
+    Ok(control
+        .get_record(&intent_kind_for_scope(scope), INTENT_KEY)?
+        .is_some())
+}
+
 fn stage_name(index: usize) -> String {
     format!("file-{index:08x}")
 }

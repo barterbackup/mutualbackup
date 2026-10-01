@@ -29,6 +29,7 @@ local-request =
   / { "GitWorktreeAdd": { repository_id: uuid-text, path: tstr, branch: tstr } }
   / { "GitWorktrees": { repository_id: uuid-text } }
   / { "GitWorktreeResume": { repository_id: uuid-text, worktree_id: uuid-text } }
+  / { "GitWorktreePrune": { repository_id: uuid-text, worktree_id: uuid-text, force: bool } }
   / { "GitWorktreeStatus": { repository_id: uuid-text, worktree_id: uuid-text } }
   / { "GitWorktreeAddPath": { repository_id: uuid-text, worktree_id: uuid-text, path: tstr } }
   / { "GitWorktreeRemoveCached": { repository_id: uuid-text, worktree_id: uuid-text, path: tstr } }
@@ -113,6 +114,7 @@ local-response =
   / { "RootAdded": protected-root }
   / { "GitRepositoryInitialized": git-repository-info }
   / { "GitWorktreeRegistered": git-worktree-info }
+  / { "GitWorktreePruned": git-worktree-info }
   / { "GitWorktrees": [* git-worktree-info] }
   / { "GitFileStaged": git-staged-file }
   / { "GitDeletionStaged": { repository_id: uuid-text, path: tstr } }

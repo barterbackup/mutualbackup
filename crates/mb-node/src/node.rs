@@ -1465,6 +1465,17 @@ impl Node {
             .map_err(Into::into)
     }
 
+    pub fn git_prune_missing_worktree(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        force: bool,
+    ) -> Result<GitWorktreeInfo> {
+        self.open_git_repository(repository_id)?
+            .prune_missing_linked_worktree(worktree_id, force)
+            .map_err(Into::into)
+    }
+
     pub fn git_worktree_status(&self, repository_id: Uuid, worktree_id: Uuid) -> Result<GitStatus> {
         self.open_git_repository(repository_id)?
             .linked_status(worktree_id)
