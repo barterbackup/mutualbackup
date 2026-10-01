@@ -28,7 +28,7 @@ use mb_core::{
 };
 use mb_git::{
     GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitPruneReport, GitPruneRoots,
-    GitRemoteBranchInfo, GitRepository, GitStatus,
+    GitRemoteBranchInfo, GitRepository, GitStatus, GitWorktreeInfo,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
@@ -1386,6 +1386,39 @@ impl Node {
         let key = self.git_catalog_key(repository_id);
         let repository = GitRepository::open(&root.path, repository_id, &key)?;
         Ok(repository)
+    }
+
+    pub fn git_add_worktree(
+        &self,
+        repository_id: Uuid,
+        path: &Path,
+        branch: &str,
+    ) -> Result<GitWorktreeInfo> {
+        self.open_git_repository(repository_id)?
+            .add_linked_worktree(path, branch)
+            .map_err(Into::into)
+    }
+
+    pub fn git_worktrees(&self, repository_id: Uuid) -> Result<Vec<GitWorktreeInfo>> {
+        self.open_git_repository(repository_id)?
+            .linked_worktrees()
+            .map_err(Into::into)
+    }
+
+    pub fn git_resume_worktree(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+    ) -> Result<GitWorktreeInfo> {
+        self.open_git_repository(repository_id)?
+            .resume_linked_worktree(worktree_id)
+            .map_err(Into::into)
+    }
+
+    pub fn git_worktree_status(&self, repository_id: Uuid, worktree_id: Uuid) -> Result<GitStatus> {
+        self.open_git_repository(repository_id)?
+            .linked_status(worktree_id)
+            .map_err(Into::into)
     }
 
     pub fn git_add(&mut self, repository_id: Uuid, path: &Path) -> Result<GitStagedFile> {
@@ -15725,6 +15758,71 @@ pub(crate) mod tests {
         assert_eq!(prune.format_version, 1);
         assert_eq!(prune.physical_bytes_reclaimed, None);
         drop(reopened);
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn git_linked_worktree_registration_survives_daemon_reopen() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-node-worktree-{}", Uuid::new_v4()));
+        let primary_root = run_root.join("primary");
+        let linked_root = run_root.join("linked");
+        fs::create_dir_all(&primary_root).unwrap();
+        fs::create_dir_all(&linked_root).unwrap();
+        fs::write(primary_root.join("tracked"), b"exact\r\n\0bytes").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([232; 32]);
+        let mut node = Node::open(data.path(), seed.clone()).unwrap();
+        let repository = node.git_init(&primary_root).unwrap();
+        node.git_add(repository.repository_id, Path::new("tracked"))
+            .unwrap();
+        node.git_commit(
+            repository.repository_id,
+            "Test Author",
+            "author@example.test",
+            "base",
+        )
+        .unwrap();
+        node.git_create_branch(repository.repository_id, "topic")
+            .unwrap();
+        let linked = node
+            .git_add_worktree(repository.repository_id, &linked_root, "topic")
+            .unwrap();
+        assert_eq!(
+            node.git_worktrees(repository.repository_id).unwrap(),
+            vec![linked.clone()]
+        );
+        drop(node);
+
+        let reopened = Node::open(data.path(), seed).unwrap();
+        assert_eq!(
+            reopened
+                .git_resume_worktree(repository.repository_id, linked.worktree_id)
+                .unwrap(),
+            linked
+        );
+        assert_eq!(
+            fs::read(linked_root.join("tracked")).unwrap(),
+            b"exact\r\n\0bytes"
+        );
+        let status = reopened
+            .git_worktree_status(repository.repository_id, linked.worktree_id)
+            .unwrap();
+        assert_eq!(status.branch, "topic");
+        assert!(status.changes.is_empty());
+        let graph = reopened
+            .open_git_repository(repository.repository_id)
+            .unwrap()
+            .export_graph_source()
+            .unwrap();
+        drop(reopened);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
         fs::remove_dir_all(run_root).unwrap();
     }
 

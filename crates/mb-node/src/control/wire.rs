@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use mb_core::{NodeId, QuorumPolicy, Seed};
 use mb_git::{
     GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitPruneReport, GitRemoteBranchInfo,
-    GitStatus,
+    GitStatus, GitWorktreeInfo,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -58,6 +58,22 @@ pub enum LocalRequest {
     },
     GitInit {
         path: PathBuf,
+    },
+    GitWorktreeAdd {
+        repository_id: Uuid,
+        path: PathBuf,
+        branch: String,
+    },
+    GitWorktrees {
+        repository_id: Uuid,
+    },
+    GitWorktreeResume {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+    },
+    GitWorktreeStatus {
+        repository_id: Uuid,
+        worktree_id: Uuid,
     },
     GitAdd {
         repository_id: Uuid,
@@ -219,6 +235,8 @@ pub enum LocalResponse {
     GuildAudited(GuildAuditReport),
     RootAdded(ProtectedRoot),
     GitRepositoryInitialized(GitRepositoryInfo),
+    GitWorktreeRegistered(GitWorktreeInfo),
+    GitWorktrees(Vec<GitWorktreeInfo>),
     GitFileStaged(GitStagedFile),
     GitDeletionStaged {
         repository_id: Uuid,
@@ -430,6 +448,20 @@ mod tests {
             LocalRequest::GitInit {
                 path: PathBuf::from("/home/user/work"),
             },
+            LocalRequest::GitWorktreeAdd {
+                repository_id,
+                path: PathBuf::from("/home/user/linked"),
+                branch: "topic".to_owned(),
+            },
+            LocalRequest::GitWorktrees { repository_id },
+            LocalRequest::GitWorktreeResume {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+            },
+            LocalRequest::GitWorktreeStatus {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+            },
             LocalRequest::GitAdd {
                 repository_id,
                 path: PathBuf::from("folder/file"),
@@ -567,6 +599,19 @@ mod tests {
                 repository_id,
                 path: PathBuf::from("/home/user/work"),
             }),
+            LocalResponse::GitWorktreeRegistered(GitWorktreeInfo {
+                format_version: 1,
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                path: PathBuf::from("/home/user/linked"),
+                root_id: mb_store::NativeFileId {
+                    filesystem_id: 1,
+                    inode: 2,
+                },
+                target_branch: "topic".to_owned(),
+                state: mb_git::GitWorktreeState::Ready,
+            }),
+            LocalResponse::GitWorktrees(vec![]),
             LocalResponse::GitFileStaged(GitStagedFile {
                 format_version: 1,
                 repository_id,

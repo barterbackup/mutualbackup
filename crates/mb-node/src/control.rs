@@ -372,6 +372,44 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitWorktreeAdd {
+            repository_id,
+            path,
+            branch,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_add_worktree(repository_id, &path, &branch)
+                    .map(LocalResponse::GitWorktreeRegistered)
+            })
+            .await
+        }
+        LocalRequest::GitWorktrees { repository_id } => {
+            blocking_node(node, move |node| {
+                node.git_worktrees(repository_id)
+                    .map(LocalResponse::GitWorktrees)
+            })
+            .await
+        }
+        LocalRequest::GitWorktreeResume {
+            repository_id,
+            worktree_id,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_resume_worktree(repository_id, worktree_id)
+                    .map(LocalResponse::GitWorktreeRegistered)
+            })
+            .await
+        }
+        LocalRequest::GitWorktreeStatus {
+            repository_id,
+            worktree_id,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_status(repository_id, worktree_id)
+                    .map(LocalResponse::GitStatus)
+            })
+            .await
+        }
         LocalRequest::GitAdd {
             repository_id,
             path,

@@ -39,7 +39,7 @@ use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, pending_stage_paths,
     remove_cached, resume_pending_stages, stage_file, stage_path_key, stage_symlink, staged_entry,
 };
-use crate::status::{GitStatus, StatusError, repository_status};
+use crate::status::{GitStatus, StatusError, repository_status, repository_status_for_scope};
 use crate::worktree::{
     GitWorktreeError, GitWorktreeInfo, add_worktree, get_worktree, list_worktrees, resume_worktree,
 };
@@ -245,7 +245,18 @@ impl GitRepository {
             &self.catalog,
             self.repository_id,
             worktree_id,
+            &self.root,
             &self.directory,
+        )?)
+    }
+
+    pub fn linked_status(&self, worktree_id: Uuid) -> Result<GitStatus, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
+        Ok(repository_status_for_scope(
+            &self.catalog,
+            scope,
+            &info.path,
         )?)
     }
 
@@ -1281,6 +1292,10 @@ mod tests {
 
         let linked = local.add_linked_worktree(&linked_root, "topic").unwrap();
         assert_eq!(linked.state, crate::GitWorktreeState::Ready);
+        assert_eq!(
+            crate::linked_worktree_marker(&linked_root).unwrap(),
+            linked.scope()
+        );
         assert_eq!(linked.target_branch, "topic");
         assert_eq!(local.linked_worktrees().unwrap(), vec![linked.clone()]);
         assert_eq!(

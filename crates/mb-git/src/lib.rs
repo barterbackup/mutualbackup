@@ -72,7 +72,7 @@ pub use stage::{
 #[cfg(target_os = "linux")]
 pub use status::{GitChange, GitStatus, GitStatusChange, StatusError};
 #[cfg(target_os = "linux")]
-pub use worktree::{GitWorktreeError, GitWorktreeInfo, GitWorktreeState};
+pub use worktree::{GitWorktreeError, GitWorktreeInfo, GitWorktreeState, linked_worktree_marker};
 pub use worktree_scope::GitWorktreeScope;
 
 #[derive(Debug, Error)]

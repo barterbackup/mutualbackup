@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use mb_git::GitChange;
+use mb_git::{GitChange, linked_worktree_marker};
 use mb_node::{LocalRequest, LocalResponse, local_control_call};
 use mb_store::git_catalog_marker;
 use mutualbackup::default_control_socket;
@@ -31,6 +31,11 @@ struct Cli {
 enum Command {
     /// Enroll this directory as a protected Git-compatible repository.
     Init { directory: Option<PathBuf> },
+    /// Create, list, or resume linked worktrees of this repository.
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
+    },
     /// Stage exact file or symlink bytes, or a tracked path's deletion.
     Add {
         /// Discard an unfinished add after its captured source changed.
@@ -120,6 +125,16 @@ enum Command {
     Status,
 }
 
+#[derive(Debug, Subcommand)]
+enum WorktreeCommand {
+    /// Check out a branch into an existing empty directory on the same filesystem.
+    Add { path: PathBuf, branch: String },
+    /// List the registered linked worktrees, including interrupted additions.
+    List,
+    /// Finish an interrupted linked-worktree checkout.
+    Resume { worktree_id: Uuid },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -145,6 +160,76 @@ async fn main() -> Result<()> {
                 info.repository_id,
                 info.path.display()
             );
+        }
+        Command::Worktree { command } => {
+            let (_, repository_id) = discover_repository(&working_directory)?;
+            match command {
+                WorktreeCommand::Add { path, branch } => {
+                    let destination = working_directory.join(path);
+                    let LocalResponse::GitWorktreeRegistered(info) = local_control_call(
+                        &socket,
+                        &LocalRequest::GitWorktreeAdd {
+                            repository_id,
+                            path: destination,
+                            branch,
+                        },
+                    )
+                    .await?
+                    else {
+                        bail!("daemon returned the wrong response to worktree add");
+                    };
+                    if info.repository_id != repository_id {
+                        bail!("daemon registered a worktree in another repository");
+                    }
+                    println!(
+                        "Added worktree {} at {}",
+                        info.worktree_id,
+                        info.path.display()
+                    );
+                }
+                WorktreeCommand::List => {
+                    let LocalResponse::GitWorktrees(worktrees) =
+                        local_control_call(&socket, &LocalRequest::GitWorktrees { repository_id })
+                            .await?
+                    else {
+                        bail!("daemon returned the wrong response to worktree list");
+                    };
+                    for info in worktrees {
+                        if info.repository_id != repository_id {
+                            bail!("daemon listed a worktree in another repository");
+                        }
+                        println!(
+                            "{} {} {} {:?}",
+                            info.worktree_id,
+                            info.path.display(),
+                            info.target_branch,
+                            info.state
+                        );
+                    }
+                }
+                WorktreeCommand::Resume { worktree_id } => {
+                    let LocalResponse::GitWorktreeRegistered(info) = local_control_call(
+                        &socket,
+                        &LocalRequest::GitWorktreeResume {
+                            repository_id,
+                            worktree_id,
+                        },
+                    )
+                    .await?
+                    else {
+                        bail!("daemon returned the wrong response to worktree resume");
+                    };
+                    if info.repository_id != repository_id || info.worktree_id != worktree_id {
+                        bail!("daemon resumed another worktree");
+                    }
+                    println!(
+                        "Worktree {} {:?} at {}",
+                        worktree_id,
+                        info.state,
+                        info.path.display()
+                    );
+                }
+            }
         }
         Command::Add {
             abort_pending,
@@ -651,12 +736,21 @@ async fn main() -> Result<()> {
             io::stdout().write_all(&diff.patch)?;
         }
         Command::Status => {
-            let (_, repository_id) = discover_repository(&working_directory)?;
-            let LocalResponse::GitStatus(status) =
-                local_control_call(&socket, &LocalRequest::GitStatus { repository_id }).await?
+            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
+            let request = match worktree_id {
+                Some(worktree_id) => LocalRequest::GitWorktreeStatus {
+                    repository_id,
+                    worktree_id,
+                },
+                None => LocalRequest::GitStatus { repository_id },
+            };
+            let LocalResponse::GitStatus(status) = local_control_call(&socket, &request).await?
             else {
                 bail!("daemon returned the wrong response to Git status");
             };
+            if status.repository_id != repository_id {
+                bail!("daemon returned status for another repository");
+            }
             println!("On branch {}", status.branch);
             if status.head_oid.is_some() {
                 if status.history_backed_up {
@@ -733,9 +827,24 @@ fn optional_author_field(environment: &str, config_key: &str) -> Result<Option<S
 }
 
 fn discover_repository(start: &Path) -> Result<(PathBuf, Uuid)> {
+    let (root, repository_id, worktree_id) = discover_location(start)?;
+    if worktree_id.is_some() {
+        bail!("this command is not yet supported in a linked worktree");
+    }
+    Ok((root, repository_id))
+}
+
+fn discover_location(start: &Path) -> Result<(PathBuf, Uuid, Option<Uuid>)> {
     for directory in start.ancestors() {
+        if let Some(scope) = linked_worktree_marker(directory)? {
+            return Ok((
+                directory.to_path_buf(),
+                scope.repository_id(),
+                Some(scope.worktree_id()),
+            ));
+        }
         if let Some(repository_id) = git_catalog_marker(directory)? {
-            return Ok((directory.to_path_buf(), repository_id));
+            return Ok((directory.to_path_buf(), repository_id, None));
         }
     }
     bail!("no initialized MutualBackup Git repository contains this directory")
@@ -790,5 +899,30 @@ mod tests {
         assert!(relative_for_add(root, subdir, Path::new("../../escape")).is_err());
         assert!(relative_for_add(root, subdir, Path::new("/outside")).is_err());
         assert_eq!(display_path(b"bad\xff\nname"), "bad\\xff\\nname");
+    }
+
+    #[test]
+    fn linked_marker_discovers_status_scope_without_routing_other_commands_to_primary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("linked");
+        let nested = root.join("nested");
+        let metadata = root.join(".mutualbackup");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(&metadata).unwrap();
+        std::fs::set_permissions(&metadata, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let repository_id = Uuid::new_v4();
+        let worktree_id = Uuid::new_v4();
+        std::fs::write(
+            metadata.join("worktree"),
+            format!("mutualbackup-git-worktree-v1\n{repository_id}\n{worktree_id}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            discover_location(&nested).unwrap(),
+            (root, repository_id, Some(worktree_id))
+        );
+        assert!(discover_repository(&nested).is_err());
     }
 }

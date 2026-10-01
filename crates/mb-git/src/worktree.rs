@@ -219,19 +219,31 @@ pub(crate) fn add_worktree(
         return Err(GitWorktreeError::Conflict);
     }
     run_after_registration_hook();
-    resume_worktree(control, repository_id, info.worktree_id, catalog)
+    resume_worktree(
+        control,
+        repository_id,
+        info.worktree_id,
+        primary_root,
+        catalog,
+    )
 }
 
 pub(crate) fn resume_worktree(
     control: &ControlStore,
     repository_id: Uuid,
     worktree_id: Uuid,
+    primary_root: &Path,
     catalog: &PinnedDirectory,
 ) -> Result<GitWorktreeInfo, GitWorktreeError> {
     let info = get_worktree(control, repository_id, worktree_id)?;
     let canonical = info.path.canonicalize()?;
     let root = PinnedDirectory::open(&info.path)?;
-    if canonical != info.path || root.identity()? != info.root_id {
+    if canonical != info.path
+        || root.identity()? != info.root_id
+        || info.path.starts_with(primary_root)
+        || primary_root.starts_with(&info.path)
+        || info.root_id.filesystem_id != catalog.identity()?.filesystem_id
+    {
         return Err(GitWorktreeError::Conflict);
     }
     if info.state == GitWorktreeState::Ready {
@@ -278,12 +290,58 @@ pub(crate) fn resume_worktree(
     Ok(ready)
 }
 
+fn marker_bytes_for_ids(repository_id: Uuid, worktree_id: Uuid) -> Vec<u8> {
+    format!("{MARKER_MAGIC}{repository_id}\n{worktree_id}\n").into_bytes()
+}
+
 fn marker_bytes(info: &GitWorktreeInfo) -> Vec<u8> {
-    format!(
-        "{MARKER_MAGIC}{}\n{}\n",
-        info.repository_id, info.worktree_id
-    )
-    .into_bytes()
+    marker_bytes_for_ids(info.repository_id, info.worktree_id)
+}
+
+/// Discover a linked root without opening the encrypted primary catalog. The
+/// daemon still checks the catalog registration and pinned root identity before
+/// serving any operation for the returned scope.
+pub fn linked_worktree_marker(
+    root_path: impl AsRef<Path>,
+) -> Result<Option<GitWorktreeScope>, GitWorktreeError> {
+    let root = PinnedDirectory::open(root_path)?;
+    let Some(directory) = root.open_child_directory(GIT_CATALOG_DIRECTORY)? else {
+        return Ok(None);
+    };
+    let Some(mut file) = directory.open_child_file(MARKER_NAME)? else {
+        return Ok(None);
+    };
+    let metadata = directory.as_file().metadata()?;
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+        || file.metadata()?.len() > 128
+    {
+        return Err(GitWorktreeError::Conflict);
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let value = bytes
+        .strip_prefix(MARKER_MAGIC.as_bytes())
+        .ok_or(GitWorktreeError::Conflict)?;
+    let newline = value
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or(GitWorktreeError::Conflict)?;
+    let repository_id = &value[..newline];
+    let worktree_id = value[newline + 1..]
+        .strip_suffix(b"\n")
+        .ok_or(GitWorktreeError::Conflict)?;
+    let repository_id =
+        std::str::from_utf8(repository_id).map_err(|_| GitWorktreeError::Conflict)?;
+    let worktree_id = std::str::from_utf8(worktree_id).map_err(|_| GitWorktreeError::Conflict)?;
+    let repository_id = Uuid::parse_str(repository_id).map_err(|_| GitWorktreeError::Conflict)?;
+    let worktree_id = Uuid::parse_str(worktree_id).map_err(|_| GitWorktreeError::Conflict)?;
+    let scope =
+        GitWorktreeScope::linked(repository_id, worktree_id).ok_or(GitWorktreeError::Conflict)?;
+    if bytes != marker_bytes_for_ids(repository_id, worktree_id) {
+        return Err(GitWorktreeError::Conflict);
+    }
+    Ok(Some(scope))
 }
 
 fn verify_marker(root: &PinnedDirectory, info: &GitWorktreeInfo) -> Result<(), GitWorktreeError> {
