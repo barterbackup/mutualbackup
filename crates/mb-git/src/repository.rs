@@ -23,8 +23,8 @@ use crate::history::{
     switch_same_tree_branch,
 };
 use crate::stage::{
-    GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, resume_pending_stages,
-    stage_file, staged_entry,
+    GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, remove_cached,
+    resume_pending_stages, stage_file, staged_entry,
 };
 use crate::status::{GitStatus, StatusError, repository_status};
 
@@ -190,6 +190,15 @@ impl GitRepository {
             &self.catalog,
             self.repository_id,
             &self.root,
+            relative_path,
+        )?)
+    }
+
+    pub fn remove_cached(&self, relative_path: impl AsRef<Path>) -> Result<bool, RepositoryError> {
+        self.resume_checkout()?;
+        Ok(remove_cached(
+            &self.catalog,
+            self.repository_id,
             relative_path,
         )?)
     }
@@ -943,6 +952,120 @@ mod tests {
         fs::remove_file(source_root.join("new/deep/file")).unwrap();
         fs::remove_file(source_root.join("new/deep/keep")).unwrap();
         drop(resumed);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn file_directory_checkout_preserves_untracked_children_and_replays() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-checkout-topology-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("shape"), b"flat\r\nbytes\0").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [33_u8; 32];
+        let repo = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        repo.stage_file("shape").unwrap();
+        repo.commit("Author", "a@example.test", "flat").unwrap();
+        repo.create_branch("topic").unwrap();
+        repo.switch_branch("topic").unwrap();
+        assert!(repo.remove_cached("shape").unwrap());
+        assert!(!repo.remove_cached("shape").unwrap());
+        assert_eq!(
+            fs::read(source_root.join("shape")).unwrap(),
+            b"flat\r\nbytes\0"
+        );
+        fs::remove_file(source_root.join("shape")).unwrap();
+        fs::create_dir_all(source_root.join("shape/nested")).unwrap();
+        fs::write(source_root.join("shape/nested/file"), b"deep\nbytes\0").unwrap();
+        repo.stage_file("shape/nested/file").unwrap();
+        repo.commit("Author", "a@example.test", "nested").unwrap();
+        let graph = repo.export_graph_source().unwrap();
+
+        fs::write(source_root.join("shape/nested/keep"), b"untracked").unwrap();
+        assert!(matches!(
+            repo.switch_branch("main"),
+            Err(RepositoryError::Checkout(
+                crate::CheckoutError::DirtyWorktree
+            ))
+        ));
+        assert_eq!(repo.status().unwrap().branch, "topic");
+        assert_eq!(
+            fs::read(source_root.join("shape/nested/keep")).unwrap(),
+            b"untracked"
+        );
+        fs::remove_file(source_root.join("shape/nested/keep")).unwrap();
+        crate::checkout::set_after_checkout_file_hook(Box::new(|| panic!("topology crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repo.switch_branch("main").unwrap();
+        }));
+        assert!(interrupted.is_err());
+        drop(repo);
+        let repo = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        assert_eq!(repo.status().unwrap().branch, "main");
+        assert_eq!(
+            fs::read(source_root.join("shape")).unwrap(),
+            b"flat\r\nbytes\0"
+        );
+
+        crate::checkout::set_after_checkout_file_hook(Box::new(|| panic!("topology crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repo.switch_branch("topic").unwrap();
+        }));
+        assert!(interrupted.is_err());
+        drop(repo);
+        let resumed = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        assert_eq!(resumed.status().unwrap().branch, "topic");
+        assert_eq!(
+            fs::read(source_root.join("shape/nested/file")).unwrap(),
+            b"deep\nbytes\0"
+        );
+        drop(resumed);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn cached_removal_can_commit_an_empty_tree_and_restore_the_old_branch() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-empty-tree-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("only"), b"only\r\nfile\0").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [34_u8; 32];
+        let repo = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        repo.stage_file("only").unwrap();
+        let first = repo.commit("Author", "a@example.test", "first").unwrap();
+        repo.create_branch("empty").unwrap();
+        repo.switch_branch("empty").unwrap();
+        assert!(repo.remove_cached("only").unwrap());
+        fs::remove_file(source_root.join("only")).unwrap();
+        let empty = repo.commit("Author", "a@example.test", "empty").unwrap();
+        assert_eq!(empty.parent_oid, Some(first.oid));
+        assert!(repo.status().unwrap().changes.is_empty());
+        let graph = repo.export_graph_source().unwrap();
+        repo.switch_branch("main").unwrap();
+        assert_eq!(
+            fs::read(source_root.join("only")).unwrap(),
+            b"only\r\nfile\0"
+        );
+        repo.switch_branch("empty").unwrap();
+        assert!(!source_root.join("only").exists());
+        drop(repo);
         for blob in graph.blobs {
             blob.anchor.remove().unwrap();
         }

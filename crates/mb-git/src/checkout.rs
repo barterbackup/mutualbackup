@@ -271,8 +271,10 @@ fn parent_and_name_if_exists(
         let Component::Normal(name) = component else {
             return Err(CheckoutError::UnsupportedTopology);
         };
-        let Some(next) = directory.open_child_directory(name)? else {
-            return Ok(None);
+        let next = match directory.open_child_directory(name) {
+            Ok(Some(next)) => next,
+            Ok(None) | Err(AnchorError::UnsupportedObject(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
         };
         directory = next;
     }
@@ -341,6 +343,64 @@ fn verify_staged_directory(
         return Err(CheckoutError::IncompatibleIntent);
     }
     Ok(directory.identity()?)
+}
+
+fn apply_old_deletion(
+    root: &PinnedDirectory,
+    staging: &PinnedDirectory,
+    index: usize,
+    entry: &CheckoutEntry,
+) -> Result<(), CheckoutError> {
+    let old = entry
+        .old
+        .as_ref()
+        .ok_or(CheckoutError::IncompatibleIntent)?;
+    let old_id = entry.old_id.ok_or(CheckoutError::IncompatibleIntent)?;
+    let staged = stage_name(index);
+    match staging.entry_identity(&staged, false)? {
+        Some(identity) if identity == old_id => {
+            verify_file(staging, OsStr::new(&staged), old_id, old)?;
+            return Ok(());
+        }
+        Some(_) => return Err(CheckoutError::IncompatibleIntent),
+        None => {}
+    }
+    let (parent, leaf) = parent_and_name(root, &entry.path)?;
+    if parent.entry_identity(&leaf, false)? != Some(old_id) {
+        return Err(CheckoutError::DirtyWorktree);
+    }
+    verify_file(&parent, &leaf, old_id, old)?;
+    parent.move_child_file_no_replace(&leaf, old_id, staging, &staged)?;
+    verify_file(staging, OsStr::new(&staged), old_id, old)?;
+    Ok(())
+}
+
+fn path_at_or_below(path: &[u8], ancestor: &[u8]) -> bool {
+    path == ancestor
+        || path
+            .strip_prefix(ancestor)
+            .is_some_and(|tail| tail.starts_with(b"/"))
+}
+
+fn published_target_file(
+    root: &PinnedDirectory,
+    entry: &CheckoutEntry,
+) -> Result<bool, CheckoutError> {
+    let target = entry
+        .new
+        .as_ref()
+        .ok_or(CheckoutError::IncompatibleIntent)?;
+    let new_id = entry.new_id.ok_or(CheckoutError::IncompatibleIntent)?;
+    let (parent, leaf) = parent_and_name(root, &entry.path)?;
+    match parent.entry_identity(&leaf, false) {
+        Ok(Some(identity)) if identity == new_id => {
+            verify_file(&parent, &leaf, new_id, target)?;
+            Ok(true)
+        }
+        Ok(None) | Err(AnchorError::UnsupportedObject(_)) => Ok(false),
+        Ok(Some(_)) => Err(CheckoutError::DirtyWorktree),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn validate_intent(intent: &CheckoutIntent, repository_id: Uuid) -> Result<(), CheckoutError> {
@@ -466,15 +526,6 @@ fn index_matches_tree(staged: &BTreeMap<Vec<u8>, GitIndexEntry>, tree: &TreeFile
         })
 }
 
-fn conflicting_topology(old: &TreeFiles, new: &TreeFiles) -> bool {
-    fn has_ancestor(path: &[u8], other: &TreeFiles) -> bool {
-        path.iter()
-            .enumerate()
-            .any(|(index, byte)| *byte == b'/' && other.contains_key(&path[..index]))
-    }
-    old.keys().any(|path| has_ancestor(path, new)) || new.keys().any(|path| has_ancestor(path, old))
-}
-
 fn parent_directory_paths(tree: &TreeFiles) -> Result<BTreeSet<Vec<u8>>, CheckoutError> {
     let mut parents = BTreeSet::new();
     for path in tree.keys() {
@@ -493,6 +544,40 @@ fn parent_directory_paths(tree: &TreeFiles) -> Result<BTreeSet<Vec<u8>>, Checkou
         }
     }
     Ok(parents)
+}
+
+fn preflight_blocking_directories(
+    root: &PinnedDirectory,
+    old: &TreeFiles,
+    new: &TreeFiles,
+    old_directories: &BTreeSet<Vec<u8>>,
+) -> Result<(), CheckoutError> {
+    for target_path in new.keys().filter(|path| old_directories.contains(*path)) {
+        let mut stack = vec![(
+            target_path.clone(),
+            root.open_descendant_directory(relative_path(target_path)?)?,
+        )];
+        while let Some((prefix, directory)) = stack.pop() {
+            for child in fs::read_dir(directory.descriptor_path())? {
+                let name = child?.file_name();
+                let mut path = prefix.clone();
+                path.push(b'/');
+                path.extend_from_slice(name.as_bytes());
+                if old.contains_key(&path) {
+                    continue;
+                }
+                if !old_directories.contains(&path) {
+                    return Err(CheckoutError::DirtyWorktree);
+                }
+                let next = directory
+                    .open_child_directory(&name)
+                    .map_err(|_| CheckoutError::DirtyWorktree)?
+                    .ok_or(CheckoutError::DirtyWorktree)?;
+                stack.push((path, next));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn obsolete_directories(
@@ -517,6 +602,7 @@ fn obsolete_directories(
 
 fn missing_target_directories(
     root: &PinnedDirectory,
+    old: &TreeFiles,
     target: &TreeFiles,
 ) -> Result<Vec<CheckoutDirectory>, CheckoutError> {
     let mut missing = BTreeSet::new();
@@ -533,6 +619,9 @@ fn missing_target_directories(
                 return Err(CheckoutError::UnsupportedTopology);
             };
             prefix.push(name);
+            if old.contains_key(prefix.as_os_str().as_bytes()) {
+                current = None;
+            }
             if let Some(directory) = &current {
                 current = directory
                     .open_child_directory(name)
@@ -590,9 +679,6 @@ pub(crate) fn begin_switch(
         .ok_or(HistoryError::BranchNotFound)?;
     let old_tree = committed_files(control, repository_id)?;
     let new_tree = files_for_commit(control, repository_id, Some(Oid::from_bytes(&target.oid)?))?;
-    if conflicting_topology(&old_tree, &new_tree) {
-        return Err(CheckoutError::UnsupportedTopology);
-    }
     let staged = staged_entries(control, repository_id)?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
@@ -600,7 +686,9 @@ pub(crate) fn begin_switch(
         return Err(CheckoutError::DirtyWorktree);
     }
     let root = PinnedDirectory::open(root_path)?;
-    let directories = missing_target_directories(&root, &new_tree)?;
+    let old_directory_paths = parent_directory_paths(&old_tree)?;
+    preflight_blocking_directories(&root, &old_tree, &new_tree, &old_directory_paths)?;
+    let directories = missing_target_directories(&root, &old_tree, &new_tree)?;
     let removed_directories = obsolete_directories(&root, &old_tree, &new_tree)?;
     let missing_directory_paths = directories
         .iter()
@@ -649,6 +737,10 @@ pub(crate) fn begin_switch(
                 .as_bytes(),
         );
         let existing_parent = if missing_parent {
+            None
+        } else if old_directory_paths.contains(&path) {
+            // A tracked directory occupies the destination until its old
+            // children have been moved into private staging.
             None
         } else {
             Some(parent_and_name(&root, &path)?)
@@ -851,6 +943,47 @@ fn apply_intent(
         {
             return Err(CheckoutError::IncompatibleIntent);
         }
+        let target_files = files_for_commit(
+            control,
+            intent.repository_id,
+            Some(Oid::from_bytes(&intent.new_oid)?),
+        )?;
+        for (index, entry) in intent.entries.iter().enumerate() {
+            if entry.new.is_none() {
+                apply_old_deletion(root, &staging, index, entry)?;
+                run_after_checkout_file_hook();
+            }
+        }
+        for path in target_files.keys().filter(|path| {
+            intent
+                .removed_directories
+                .iter()
+                .any(|dir| dir.path == **path)
+        }) {
+            let entry = intent
+                .entries
+                .iter()
+                .find(|entry| entry.path == *path)
+                .ok_or(CheckoutError::IncompatibleIntent)?;
+            if published_target_file(root, entry)? {
+                continue;
+            }
+            for directory in intent
+                .removed_directories
+                .iter()
+                .rev()
+                .filter(|directory| path_at_or_below(&directory.path, path))
+            {
+                if let Some((parent, leaf)) = parent_and_name_if_exists(root, &directory.path)?
+                    && !parent.remove_empty_child_directory(&leaf, directory.old_id)?
+                {
+                    match parent.open_child_directory(&leaf) {
+                        Ok(None) => {}
+                        _ => return Err(CheckoutError::DirtyWorktree),
+                    }
+                }
+            }
+        }
         for (index, directory) in intent.directories.iter().enumerate() {
             let (parent, leaf) = parent_and_name(root, &directory.path)?;
             let staged = directory_stage_name(index);
@@ -868,6 +1001,9 @@ fn apply_intent(
             run_after_checkout_directory_hook();
         }
         for (index, entry) in intent.entries.iter().enumerate() {
+            if entry.new.is_none() {
+                continue;
+            }
             let (parent, leaf) = parent_and_name(root, &entry.path)?;
             let staged = stage_name(index);
             let work_id = parent.entry_identity(&leaf, false)?;
@@ -882,15 +1018,6 @@ fn apply_intent(
                         return Err(CheckoutError::DirtyWorktree);
                     }
                     verify_file(&parent, &leaf, new_id, new)?;
-                    verify_file(&staging, OsStr::new(&staged), old_id, old)?;
-                }
-                (Some(old), Some(old_id), None, None) => {
-                    if work_id == Some(old_id) && staged_id.is_none() {
-                        verify_file(&parent, &leaf, old_id, old)?;
-                        parent.move_child_file_no_replace(&leaf, old_id, &staging, &staged)?;
-                    } else if work_id.is_some() || staged_id != Some(old_id) {
-                        return Err(CheckoutError::DirtyWorktree);
-                    }
                     verify_file(&staging, OsStr::new(&staged), old_id, old)?;
                 }
                 (None, None, Some(new), Some(new_id)) => {
@@ -908,11 +1035,6 @@ fn apply_intent(
         }
         // The target refs remain immutable while the daemon owns this intent.
         // Verify every target path once more before changing the visible HEAD.
-        let target_files = files_for_commit(
-            control,
-            intent.repository_id,
-            Some(Oid::from_bytes(&intent.new_oid)?),
-        )?;
         for (path, (oid, mode)) in &target_files {
             let (parent, leaf) = parent_and_name(root, path)?;
             let identity = parent

@@ -39,6 +39,14 @@ enum Command {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
+    /// Remove paths from the staged index while keeping working files.
+    Rm {
+        /// Required until worktree-removing `rm` is implemented.
+        #[arg(long)]
+        cached: bool,
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
     /// Commit the staged snapshot to the current local branch.
     Commit {
         #[arg(short = 'm', long)]
@@ -136,6 +144,30 @@ async fn main() -> Result<()> {
                     bail!("daemon staged a file for another repository");
                 }
                 println!("staged {} {} (local)", staged.oid, staged.path.display());
+            }
+        }
+        Command::Rm { cached, paths } => {
+            if !cached {
+                bail!("only `rm --cached` is supported; worktree files were not removed");
+            }
+            let (root, repository_id) = discover_repository(&working_directory)?;
+            for path in paths {
+                let relative = relative_for_add(&root, &working_directory, &path)?;
+                let LocalResponse::GitCachedPathRemoved { removed } = local_control_call(
+                    &socket,
+                    &LocalRequest::GitRemoveCached {
+                        repository_id,
+                        path: relative.clone(),
+                    },
+                )
+                .await?
+                else {
+                    bail!("daemon returned the wrong response to Git index removal");
+                };
+                if !removed {
+                    bail!("{} is not staged in the index", relative.display());
+                }
+                println!("removed {} from index", relative.display());
             }
         }
         Command::Commit {

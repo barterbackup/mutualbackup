@@ -214,6 +214,33 @@ pub fn stage_file(
     finish_stage(control, repository_id, &key, &intent)
 }
 
+/// Remove a path from the staged index while leaving its working file alone,
+/// matching Git's `rm --cached` behavior. The catalog delete is atomic; old
+/// immutable anchors stay available to commits on other branches.
+pub fn remove_cached(
+    control: &ControlStore,
+    repository_id: Uuid,
+    relative_path: impl AsRef<Path>,
+) -> Result<bool, StageError> {
+    let key = stage_path_key(relative_path.as_ref())?;
+    if control
+        .get_record(&intent_kind(repository_id), &key)?
+        .is_some()
+    {
+        return Err(StageError::PendingStage);
+    }
+    let kind = index_kind(repository_id);
+    let Some(encoded) = control.get_record(&kind, &key)? else {
+        return Ok(false);
+    };
+    let entry: GitIndexEntry = decode_canonical(&encoded)?;
+    if entry.format_version != 1 || !matches!(entry.mode, 0o100644 | 0o100755) {
+        return Err(StageError::IncompatibleRecord);
+    }
+    control.delete_record_if_value(&kind, &key, &encoded)?;
+    Ok(true)
+}
+
 /// Finish all pending adds after a daemon restart. A changed source with no
 /// captured anchor remains pending for explicit abandonment by the owner.
 pub fn resume_pending_stages(

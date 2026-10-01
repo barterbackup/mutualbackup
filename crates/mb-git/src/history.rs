@@ -50,8 +50,6 @@ pub enum HistoryError {
     Io(#[from] std::io::Error),
     #[error("an unfinished add must be resumed or abandoned before committing")]
     PendingStage,
-    #[error("no staged files are available to commit")]
-    EmptyIndex,
     #[error("the staged tree is identical to HEAD")]
     UnchangedTree,
     #[error("the history catalog contains an incompatible or corrupt object")]
@@ -367,9 +365,6 @@ pub fn commit_index(
         return Err(HistoryError::PendingStage);
     }
     let staged = staged_entries(control, repository_id)?;
-    if staged.is_empty() {
-        return Err(HistoryError::EmptyIndex);
-    }
     let mut anchors = Vec::new();
     for (_, entry) in &staged {
         let oid = Oid::from_bytes(&entry.oid)?;

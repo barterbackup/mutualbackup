@@ -45,7 +45,8 @@ pub use odb::NativeOdb;
 pub use repository::{GitRepository, RepositoryError};
 pub use stage::{
     GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, has_pending_stages,
-    pending_stage_paths, resume_pending_stages, stage_file, staged_entries, staged_entry,
+    pending_stage_paths, remove_cached, resume_pending_stages, stage_file, staged_entries,
+    staged_entry,
 };
 #[cfg(target_os = "linux")]
 pub use status::{GitChange, GitStatus, GitStatusChange, StatusError};

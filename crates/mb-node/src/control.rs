@@ -382,6 +382,16 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitRemoveCached {
+            repository_id,
+            path,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_remove_cached(repository_id, &path)
+                    .map(|removed| LocalResponse::GitCachedPathRemoved { removed })
+            })
+            .await
+        }
         LocalRequest::GitAbandonPendingAdd {
             repository_id,
             path,

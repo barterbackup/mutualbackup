@@ -1398,6 +1398,12 @@ impl Node {
         })
     }
 
+    pub fn git_remove_cached(&self, repository_id: Uuid, path: &Path) -> Result<bool> {
+        Ok(self
+            .open_git_repository(repository_id)?
+            .remove_cached(path)?)
+    }
+
     pub fn git_abandon_pending_add(&self, repository_id: Uuid, path: &Path) -> Result<bool> {
         Ok(self
             .open_git_repository(repository_id)?
