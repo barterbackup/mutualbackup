@@ -18,7 +18,8 @@ merge, staged reset and restore, diff, log, explicit commit pins, and prune.
 `mutualgit tag -a -m 'release notes' NAME [START-POINT]` to create an annotated
 commit tag with the configured committer identity. Both tag forms are included
 in encrypted history backups and keep their commits reachable until removed
-and pruned. Stock Git tag exchange is still pending.
+and pruned. Stock Git can fetch either tag form through the remote helper;
+stock Git tag pushes and `mutualgit fetch` of tags are still pending.
 `mutualgit --help` gives the current command forms. Staging and checkout do
 not apply Git line-ending rules or content filters. A transforming
 `.gitattributes` rule is rejected before publishing staged bytes.
@@ -31,6 +32,8 @@ MutualBackup source root, not its `.mutualbackup` directory:
 git clone 'mutualbackup::/absolute/path/to/source' local-clone
 git -C another-repo fetch 'mutualbackup::/absolute/path/to/source' \
   refs/heads/main:refs/remotes/mutualbackup/main
+git -C another-repo fetch 'mutualbackup::/absolute/path/to/source' \
+  refs/tags/release:refs/tags/release
 git -C another-repo push 'mutualbackup::/absolute/path/to/source' \
   refs/heads/topic:refs/heads/topic
 ```

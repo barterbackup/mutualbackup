@@ -11,7 +11,9 @@ use git2::{ObjectFormat, ObjectType, Oid, Repository};
 use thiserror::Error;
 
 use crate::GitAnchorError;
-use crate::history::{GitBranchInfo, GitGraphSource, HistoryError, export_graph_source};
+use crate::history::{
+    GitBranchInfo, GitGraphSource, GitTagInfo, HistoryError, export_graph_source,
+};
 use mb_store::{ControlStore, FileAnchorManifest};
 use uuid::Uuid;
 
@@ -223,6 +225,7 @@ pub(crate) fn export_graph_to_git_repository(
     source_root: &Path,
     destination_path: &Path,
     advertised: &[GitBranchInfo],
+    advertised_tags: Option<&[GitTagInfo]>,
 ) -> Result<u32, GitInteropError> {
     let destination_path = destination_path.canonicalize()?;
     if destination_path.starts_with(source_root) {
@@ -262,6 +265,34 @@ pub(crate) fn export_graph_to_git_repository(
     }
     if actual != expected {
         return Err(GitInteropError::StaleAdvertisement);
+    }
+    if let Some(advertised_tags) = advertised_tags {
+        let actual_tags = graph
+            .refs
+            .iter()
+            .filter_map(|reference| {
+                reference
+                    .name
+                    .strip_prefix(b"refs/tags/")
+                    .map(|name| (name.to_vec(), reference.oid))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut expected_tags = BTreeMap::new();
+        for tag in advertised_tags {
+            let reference = format!("refs/tags/{}", tag.name);
+            if tag.format_version != 1
+                || tag.repository_id != repository_id
+                || !git2::Reference::is_valid_name(&reference)
+                || expected_tags
+                    .insert(tag.name.as_bytes().to_vec(), tag.oid)
+                    .is_some()
+            {
+                return Err(GitInteropError::StaleAdvertisement);
+            }
+        }
+        if actual_tags != expected_tags {
+            return Err(GitInteropError::StaleAdvertisement);
+        }
     }
     export_objects(&destination, &graph)?;
     u32::try_from(graph.blobs.len() + graph.objects.len())

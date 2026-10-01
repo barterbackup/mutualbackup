@@ -191,6 +191,13 @@ pub enum LocalRequest {
         destination: PathBuf,
         advertised: Vec<GitBranchInfo>,
     },
+    GitExportToGitRepositoryV2 {
+        repository_id: Uuid,
+        source_root: PathBuf,
+        destination: PathBuf,
+        advertised_branches: Vec<GitBranchInfo>,
+        advertised_tags: Vec<GitTagInfo>,
+    },
     GitReceivePushedBranch {
         repository_id: Uuid,
         source_root: PathBuf,
@@ -733,6 +740,24 @@ mod tests {
                     name: "main".to_owned(),
                     oid: [3; 20],
                     current: true,
+                }],
+            },
+            LocalRequest::GitExportToGitRepositoryV2 {
+                repository_id,
+                source_root: PathBuf::from("/tmp/source"),
+                destination: PathBuf::from("/tmp/stock-git/.git"),
+                advertised_branches: vec![GitBranchInfo {
+                    format_version: 1,
+                    repository_id,
+                    name: "main".to_owned(),
+                    oid: [3; 20],
+                    current: true,
+                }],
+                advertised_tags: vec![GitTagInfo {
+                    format_version: 1,
+                    repository_id,
+                    name: "release".to_owned(),
+                    oid: [4; 20],
                 }],
             },
             LocalRequest::GitReceivePushedBranch {

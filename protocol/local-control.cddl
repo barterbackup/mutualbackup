@@ -53,6 +53,7 @@ local-request =
   / { "GitCreateAnnotatedTag": { repository_id: uuid-text, worktree_id: null / uuid-text, name: tstr, start_point: null / tstr, tagger_name: tstr, tagger_email: tstr, message: tstr } }
   / { "GitDeleteTag": { repository_id: uuid-text, name: tstr } }
   / { "GitExportToGitRepository": { repository_id: uuid-text, source_root: tstr, destination: tstr, advertised: [* git-branch-info] } }
+  / { "GitExportToGitRepositoryV2": { repository_id: uuid-text, source_root: tstr, destination: tstr, advertised_branches: [* git-branch-info], advertised_tags: [* git-tag-info] } }
   / { "GitReceivePushedBranch": { repository_id: uuid-text, source_root: tstr, source_git_directory: tstr, target_branch: tstr, target_oid: bytes20-array, expected_old: null / bytes20-array } }
   / { "GitRemoteBranches": { repository_id: uuid-text } }
   / { "GitCommitPins": { repository_id: uuid-text } }

@@ -775,6 +775,28 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitExportToGitRepositoryV2 {
+            repository_id,
+            source_root,
+            destination,
+            advertised_branches,
+            advertised_tags,
+        } => {
+            blocking_node(node, move |node| {
+                let object_count = node.git_export_to_git_repository_with_tags(
+                    repository_id,
+                    &source_root,
+                    &destination,
+                    &advertised_branches,
+                    &advertised_tags,
+                )?;
+                Ok(LocalResponse::GitObjectsExported {
+                    repository_id,
+                    object_count,
+                })
+            })
+            .await
+        }
         LocalRequest::GitReceivePushedBranch {
             repository_id,
             source_root,

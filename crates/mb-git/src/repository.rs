@@ -877,6 +877,24 @@ impl GitRepository {
             &self.root,
             destination.as_ref(),
             advertised,
+            None,
+        )?)
+    }
+
+    pub fn export_to_git_repository_with_tags(
+        &self,
+        destination: impl AsRef<Path>,
+        advertised_branches: &[GitBranchInfo],
+        advertised_tags: &[GitTagInfo],
+    ) -> Result<u32, RepositoryError> {
+        self.resume_checkout()?;
+        Ok(export_graph_to_git_repository(
+            &self.catalog,
+            self.repository_id,
+            &self.root,
+            destination.as_ref(),
+            advertised_branches,
+            Some(advertised_tags),
         )?)
     }
 

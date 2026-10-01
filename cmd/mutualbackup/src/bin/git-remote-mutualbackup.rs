@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use git2::Oid;
-use mb_git::GitBranchInfo;
+use mb_git::{GitBranchInfo, GitTagInfo};
 use mb_node::{LocalRequest, LocalResponse, local_control_call};
 use mb_store::git_catalog_marker;
 use mutualbackup::default_control_socket;
@@ -88,7 +88,27 @@ fn validate_branches(branches: &[GitBranchInfo], repository_id: Uuid) -> Result<
     Ok(())
 }
 
-fn validate_fetch(line: &str, branches: &[GitBranchInfo]) -> Result<()> {
+fn validate_tags(tags: &[GitTagInfo], repository_id: Uuid) -> Result<()> {
+    if tags.len() > MAX_ADVERTISED_REFS
+        || tags.iter().map(|tag| tag.name.len()).sum::<usize>() > MAX_ADVERTISED_NAME_BYTES
+    {
+        bail!("too many Git tags to advertise through the local helper");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for tag in tags {
+        let reference = format!("refs/tags/{}", tag.name);
+        if tag.format_version != 1
+            || tag.repository_id != repository_id
+            || !git2::Reference::is_valid_name(&reference)
+            || !seen.insert(&tag.name)
+        {
+            bail!("daemon returned an incompatible Git tag advertisement");
+        }
+    }
+    Ok(())
+}
+
+fn validate_fetch(line: &str, branches: &[GitBranchInfo], tags: &[GitTagInfo]) -> Result<()> {
     let mut fields = line.split(' ');
     let (Some("fetch"), Some(oid), Some(name), None) =
         (fields.next(), fields.next(), fields.next(), fields.next())
@@ -96,10 +116,13 @@ fn validate_fetch(line: &str, branches: &[GitBranchInfo]) -> Result<()> {
         bail!("unsupported Git remote-helper fetch command");
     };
     let oid = Oid::from_str(oid)?;
-    if !branches
+    let branch_match = branches.iter().any(|branch| {
+        name == format!("refs/heads/{}", branch.name) && branch.oid == oid.as_bytes()
+    });
+    let tag_match = tags
         .iter()
-        .any(|branch| name == format!("refs/heads/{}", branch.name) && branch.oid == oid.as_bytes())
-    {
+        .any(|tag| name == format!("refs/tags/{}", tag.name) && tag.oid == oid.as_bytes());
+    if !branch_match && !tag_match {
         bail!("Git requested a ref that was not advertised");
     }
     Ok(())
@@ -183,7 +206,7 @@ async fn main() -> Result<()> {
     let mut input = stdin.lock();
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    let mut advertised: Option<Vec<GitBranchInfo>> = None;
+    let mut advertised: Option<(Vec<GitBranchInfo>, Vec<GitTagInfo>)> = None;
     while let Some(command) = read_line(&mut input)? {
         match command.as_str() {
             "capabilities" => {
@@ -198,6 +221,19 @@ async fn main() -> Result<()> {
                     bail!("daemon returned the wrong Git branch response");
                 };
                 validate_branches(&branches, repository_id)?;
+                let LocalResponse::GitTags(tags) =
+                    local_control_call(&socket, &LocalRequest::GitTags { repository_id }).await?
+                else {
+                    bail!("daemon returned the wrong Git tag response");
+                };
+                validate_tags(&tags, repository_id)?;
+                if branches.len() + tags.len() > MAX_ADVERTISED_REFS
+                    || branches.iter().map(|item| item.name.len()).sum::<usize>()
+                        + tags.iter().map(|item| item.name.len()).sum::<usize>()
+                        > MAX_ADVERTISED_NAME_BYTES
+                {
+                    bail!("too many Git refs to advertise through the local helper");
+                }
                 for branch in &branches {
                     writeln!(
                         output,
@@ -206,36 +242,45 @@ async fn main() -> Result<()> {
                         branch.name
                     )?;
                 }
+                for tag in &tags {
+                    writeln!(
+                        output,
+                        "{} refs/tags/{}",
+                        Oid::from_bytes(&tag.oid)?,
+                        tag.name
+                    )?;
+                }
                 if let Some(current) = branches.iter().find(|branch| branch.current) {
                     writeln!(output, "@refs/heads/{} HEAD", current.name)?;
                 }
                 output.write_all(b"\n")?;
                 output.flush()?;
-                advertised = Some(branches);
+                advertised = Some((branches, tags));
             }
             value if value.starts_with("fetch ") => {
-                let branches = advertised
+                let (branches, tags) = advertised
                     .as_ref()
                     .context("Git requested objects before listing remote refs")?;
-                validate_fetch(value, branches)?;
+                validate_fetch(value, branches, tags)?;
                 loop {
                     let next = read_line(&mut input)?
                         .context("Git closed an unfinished remote-helper fetch batch")?;
                     if next.is_empty() {
                         break;
                     }
-                    validate_fetch(&next, branches)?;
+                    validate_fetch(&next, branches, tags)?;
                 }
                 let LocalResponse::GitObjectsExported {
                     repository_id: returned_id,
                     ..
                 } = local_control_call(
                     &socket,
-                    &LocalRequest::GitExportToGitRepository {
+                    &LocalRequest::GitExportToGitRepositoryV2 {
                         repository_id,
                         source_root: source_root.clone(),
                         destination: destination.clone(),
-                        advertised: branches.clone(),
+                        advertised_branches: branches.clone(),
+                        advertised_tags: tags.clone(),
                     },
                 )
                 .await?
@@ -249,7 +294,7 @@ async fn main() -> Result<()> {
                 output.flush()?;
             }
             value if value.starts_with("push ") => {
-                let branches = advertised
+                let (branches, _) = advertised
                     .as_ref()
                     .context("Git requested a push before listing remote refs")?;
                 let mut commands = vec![value.to_owned()];
@@ -314,15 +359,38 @@ mod tests {
         validate_fetch(
             &format!("fetch {oid} refs/heads/topic"),
             std::slice::from_ref(&branch),
+            &[],
         )
         .unwrap();
         assert!(
             validate_fetch(
                 &format!("fetch {oid} refs/heads/main"),
-                std::slice::from_ref(&branch)
+                std::slice::from_ref(&branch),
+                &[],
             )
             .is_err()
         );
-        assert!(validate_fetch("fetch bad refs/heads/topic", &[branch]).is_err());
+        assert!(validate_fetch("fetch bad refs/heads/topic", &[branch], &[]).is_err());
+        let tag = GitTagInfo {
+            format_version: 1,
+            repository_id: Uuid::new_v4(),
+            name: "release".to_owned(),
+            oid: [9; 20],
+        };
+        let tag_oid = Oid::from_bytes(&tag.oid).unwrap();
+        validate_fetch(
+            &format!("fetch {tag_oid} refs/tags/release"),
+            &[],
+            std::slice::from_ref(&tag),
+        )
+        .unwrap();
+        assert!(
+            validate_fetch(
+                &format!("fetch {tag_oid} refs/tags/other"),
+                &[],
+                std::slice::from_ref(&tag),
+            )
+            .is_err()
+        );
     }
 }

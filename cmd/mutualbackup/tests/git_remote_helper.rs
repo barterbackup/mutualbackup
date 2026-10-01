@@ -34,6 +34,16 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
     let commit = repository
         .commit("Author", "a@example.test", "stock Git fetch")
         .unwrap();
+    let lightweight_tag = repository.create_tag("lightweight", None).unwrap();
+    let annotated_tag = repository
+        .create_annotated_tag(
+            "annotated",
+            None,
+            "Tagger",
+            "tagger@example.test",
+            "release notes\r\n",
+        )
+        .unwrap();
     drop(repository);
     let output = Command::new("git")
         .args(["init", "-q"])
@@ -78,6 +88,12 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
                     assert_eq!(requested, repository_id);
                     Ok(LocalResponse::GitBranches(repository.branches().unwrap()))
                 }
+                LocalRequest::GitTags {
+                    repository_id: requested,
+                } => {
+                    assert_eq!(requested, repository_id);
+                    Ok(LocalResponse::GitTags(repository.tags().unwrap()))
+                }
                 LocalRequest::GitExportToGitRepository {
                     repository_id: requested,
                     source_root,
@@ -88,6 +104,27 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
                     assert_eq!(source_root, server_root);
                     let object_count = repository
                         .export_to_git_repository(&destination, &advertised)
+                        .unwrap();
+                    Ok(LocalResponse::GitObjectsExported {
+                        repository_id,
+                        object_count,
+                    })
+                }
+                LocalRequest::GitExportToGitRepositoryV2 {
+                    repository_id: requested,
+                    source_root,
+                    destination,
+                    advertised_branches,
+                    advertised_tags,
+                } => {
+                    assert_eq!(requested, repository_id);
+                    assert_eq!(source_root, server_root);
+                    let object_count = repository
+                        .export_to_git_repository_with_tags(
+                            &destination,
+                            &advertised_branches,
+                            &advertised_tags,
+                        )
                         .unwrap();
                     Ok(LocalResponse::GitObjectsExported {
                         repository_id,
@@ -176,6 +213,43 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
         git2::Oid::from_bytes(&commit.oid).unwrap().to_string()
+    );
+    for tag in [&lightweight_tag, &annotated_tag] {
+        let reference = format!("refs/tags/{}", tag.name);
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&stock_root)
+            .args(["fetch", "--no-tags"])
+            .arg(format!("mutualbackup::{}", source_root.display()))
+            .arg(format!("{reference}:{reference}"))
+            .env("PATH", &path)
+            .env("MUTUALBACKUP_CONTROL_SOCKET", &socket)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stock = git2::Repository::open(&stock_root).unwrap();
+        assert_eq!(
+            stock
+                .find_reference(&reference)
+                .unwrap()
+                .target()
+                .unwrap()
+                .as_bytes(),
+            tag.oid
+        );
+    }
+    let stock = git2::Repository::open(&stock_root).unwrap();
+    assert_eq!(
+        stock
+            .find_tag(git2::Oid::from_bytes(&annotated_tag.oid).unwrap())
+            .unwrap()
+            .target_id()
+            .as_bytes(),
+        commit.oid
     );
 
     let clone_root = run_root.join("clone");

@@ -1706,6 +1706,23 @@ impl Node {
             .map_err(Into::into)
     }
 
+    pub fn git_export_to_git_repository_with_tags(
+        &self,
+        repository_id: Uuid,
+        source_root: &Path,
+        destination: &Path,
+        advertised_branches: &[GitBranchInfo],
+        advertised_tags: &[GitTagInfo],
+    ) -> Result<u32> {
+        let repository = self.open_git_repository(repository_id)?;
+        if repository.root() != source_root {
+            anyhow::bail!("Git remote root differs from its enrolled repository");
+        }
+        repository
+            .export_to_git_repository_with_tags(destination, advertised_branches, advertised_tags)
+            .map_err(Into::into)
+    }
+
     pub fn git_receive_pushed_branch(
         &mut self,
         repository_id: Uuid,
