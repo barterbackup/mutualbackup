@@ -20,6 +20,7 @@ cargo test -p mb-git stage::tests::stage_index_and_object_map_replay_after_captu
 cargo test -p mb-git repository::tests::repository_catalog_stays_outside_ordinary_source_capture --locked -- --ignored --exact
 cargo test -p mb-git repository::tests::local_commits_preserve_exact_staged_blobs_and_parentage --locked -- --ignored --exact
 cargo test -p mb-node node::tests::git_repository_init_and_add_survive_daemon_reopen --locked -- --ignored --exact
+cargo test -p mb-node snapshot::metadata_compatibility_tests::git_history_enters_encrypted_revision_sectors_without_changing_root_restore --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::nested_btrfs_subvolumes_are_rejected_before_and_during_capture --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::capture_walk_remains_bound_to_the_open_root --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::capture_walk_enumerates_a_descendant_through_its_pinned_descriptor --locked -- --ignored --exact

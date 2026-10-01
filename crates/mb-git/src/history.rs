@@ -3,6 +3,9 @@
 //! enter that repository or a Git object directory.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
 
 use git2::{Index, IndexEntry, IndexTime, ObjectType, Oid, Repository, Signature};
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
@@ -11,8 +14,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::stage::{StageError, anchors_for_oid, has_pending_stages, staged_entries};
-use crate::{GitAnchorError, NativeOdb};
+use crate::stage::{
+    GitIndexEntry, StageError, anchors_for_oid, has_pending_stages, index_kind, object_kind,
+    stage_path_key, staged_entries,
+};
+use crate::{GitAnchorError, GitBackupDescriptor, GitBackupError, NativeOdb, blob_oid_from_anchor};
 
 const METADATA_PREFIX: &str = "git-metadata-object-v1/";
 const REF_PREFIX: &str = "git-ref-v1/";
@@ -32,6 +38,8 @@ pub enum HistoryError {
     Git(#[from] git2::Error),
     #[error("native Git object backend error: {0}")]
     Anchor(#[from] GitAnchorError),
+    #[error("Git backup descriptor error: {0}")]
+    Backup(#[from] GitBackupError),
     #[error("temporary metadata repository error: {0}")]
     Io(#[from] std::io::Error),
     #[error("an unfinished add must be resumed or abandoned before committing")]
@@ -79,13 +87,13 @@ pub struct GitGraphObject {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GitGraphBlobSource {
     pub oid: [u8; 20],
     pub anchor: FileAnchorManifest,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GitGraphSource {
     pub format_version: u16,
     pub repository_id: Uuid,
@@ -496,4 +504,120 @@ pub fn export_graph_source(
         objects,
         blobs,
     })
+}
+
+/// Rebuild an empty local catalog from a signed Git descriptor and already
+/// captured native blob anchors. The object map, committed metadata, refs,
+/// and a clean HEAD index become visible in one encrypted SQL transaction.
+pub fn import_graph_backup(
+    control: &ControlStore,
+    repository_id: Uuid,
+    descriptor: &GitBackupDescriptor,
+    anchors: &[FileAnchorManifest],
+) -> Result<(), HistoryError> {
+    if descriptor.repository_id != repository_id {
+        return Err(HistoryError::IncompatibleRecord);
+    }
+    descriptor.validate()?;
+    for kind in [
+        metadata_kind(repository_id),
+        ref_kind(repository_id),
+        index_kind(repository_id),
+    ] {
+        if !control.records(&kind)?.is_empty() {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+    }
+    let mut by_oid = HashMap::new();
+    for anchor in anchors {
+        let oid = blob_oid_from_anchor(anchor)?;
+        if by_oid.insert(oid, anchor).is_some() {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+    }
+    if by_oid.len() != descriptor.blobs.len() {
+        return Err(HistoryError::IncompatibleRecord);
+    }
+    let mut records = Vec::new();
+    for blob in &descriptor.blobs {
+        let oid = Oid::from_bytes(&blob.oid)?;
+        let anchor = by_oid.get(&oid).ok_or(HistoryError::IncompatibleRecord)?;
+        if anchor.logical_len != blob.logical_len {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        records.push((
+            object_kind(repository_id, oid),
+            anchor.anchor_id.as_bytes().to_vec(),
+            canonical_bytes(*anchor)?,
+        ));
+    }
+    let temporary = tempfile::tempdir()?;
+    let repository = Repository::init_bare(temporary.path())?;
+    let odb = git2::Odb::new()?;
+    let _pack = odb.add_new_mempack_backend(1000)?;
+    repository.set_odb(&odb)?;
+    for object in &descriptor.objects {
+        let kind = object_type(object.kind).ok_or(HistoryError::IncompatibleRecord)?;
+        let oid = Oid::from_bytes(&object.oid)?;
+        if odb.write(kind, &object.bytes)? != oid {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        records.push((
+            metadata_kind(repository_id),
+            object.oid.to_vec(),
+            object_record(kind, object.bytes.clone())?,
+        ));
+    }
+    for reference in &descriptor.refs {
+        records.push((
+            ref_kind(repository_id),
+            reference.name.clone(),
+            canonical_bytes(&RefRecord {
+                format_version: 1,
+                oid: reference.oid,
+            })?,
+        ));
+    }
+    if let Some(main) = descriptor
+        .refs
+        .iter()
+        .find(|reference| reference.name == MAIN_REF)
+    {
+        let commit = repository.find_commit(Oid::from_bytes(&main.oid)?)?;
+        let mut trees = vec![(Vec::<u8>::new(), commit.tree_id())];
+        while let Some((prefix, oid)) = trees.pop() {
+            let tree = repository.find_tree(oid)?;
+            for item in tree.iter() {
+                let mut path = prefix.clone();
+                path.extend_from_slice(item.name_bytes());
+                if item.kind() == Some(ObjectType::Tree) {
+                    path.push(b'/');
+                    trees.push((path, item.id()));
+                } else if item.kind() == Some(ObjectType::Blob) {
+                    let relative = PathBuf::from(OsString::from_vec(path.clone()));
+                    stage_path_key(&relative)?;
+                    let anchor = by_oid
+                        .get(&item.id())
+                        .ok_or(HistoryError::IncompatibleRecord)?;
+                    if !matches!(item.filemode(), 0o100644 | 0o100755) {
+                        return Err(HistoryError::IncompatibleRecord);
+                    }
+                    records.push((
+                        index_kind(repository_id),
+                        path,
+                        canonical_bytes(&GitIndexEntry {
+                            format_version: 1,
+                            oid: item.id().as_bytes().try_into().expect("SHA-1 OID"),
+                            mode: item.filemode() as u32,
+                            anchor_id: anchor.anchor_id,
+                        })?,
+                    ));
+                } else {
+                    return Err(HistoryError::IncompatibleRecord);
+                }
+            }
+        }
+    }
+    control.put_records_and_delete(&records, &[])?;
+    Ok(())
 }

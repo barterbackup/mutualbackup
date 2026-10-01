@@ -3945,6 +3945,7 @@ dependencies = [
  "filetime",
  "fs2",
  "futures",
+ "git2",
  "hex",
  "libc",
  "libp2p",

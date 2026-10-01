@@ -67,15 +67,15 @@ fn intent_kind(repository_id: Uuid) -> String {
     format!("{INTENT_PREFIX}{repository_id}")
 }
 
-fn index_kind(repository_id: Uuid) -> String {
+pub(crate) fn index_kind(repository_id: Uuid) -> String {
     format!("{INDEX_PREFIX}{repository_id}")
 }
 
-fn object_kind(repository_id: Uuid, oid: Oid) -> String {
+pub(crate) fn object_kind(repository_id: Uuid, oid: Oid) -> String {
     format!("{OBJECT_PREFIX}{repository_id}/{oid}")
 }
 
-fn stage_path_key(path: &Path) -> Result<Vec<u8>, StageError> {
+pub(crate) fn stage_path_key(path: &Path) -> Result<Vec<u8>, StageError> {
     if path.as_os_str().is_empty()
         || path.is_absolute()
         || path

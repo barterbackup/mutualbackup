@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::history::{
     GitCommitInfo, GitGraphSource, GitLogEntry, HistoryError, commit_index, export_graph_source,
-    log_history,
+    import_graph_backup, log_history,
 };
 use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, resume_pending_stages,
@@ -238,6 +238,19 @@ impl GitRepository {
 
     pub fn export_graph_source(&self) -> Result<GitGraphSource, RepositoryError> {
         Ok(export_graph_source(&self.catalog, self.repository_id)?)
+    }
+
+    pub fn import_backup(
+        &self,
+        descriptor: &crate::GitBackupDescriptor,
+        anchors: &[FileAnchorManifest],
+    ) -> Result<(), RepositoryError> {
+        Ok(import_graph_backup(
+            &self.catalog,
+            self.repository_id,
+            descriptor,
+            anchors,
+        )?)
     }
 
     pub fn catalog_directory_identity(&self) -> Result<mb_store::NativeFileId, RepositoryError> {

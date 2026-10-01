@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use git2::{ObjectType, Oid};
+use mb_core::KeyMaterial;
 use mb_store::{AnchorError, FileAnchorManifest};
 use thiserror::Error;
 
@@ -47,6 +48,12 @@ pub enum GitAnchorError {
     UnsupportedPlatform,
     #[error("different native content was assigned the same Git object ID")]
     OidCollision,
+}
+
+pub fn catalog_key(keys: &KeyMaterial, repository_id: uuid::Uuid) -> [u8; 32] {
+    let mut database_id = b"git-catalog-v1/".to_vec();
+    database_id.extend_from_slice(repository_id.as_bytes());
+    keys.database_key(&database_id)
 }
 
 /// Hash exact captured bytes as a SHA-1 Git blob without applying Git filters.

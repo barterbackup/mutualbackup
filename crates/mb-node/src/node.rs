@@ -42,7 +42,7 @@ use crate::snapshot::{
     prepare_revision, publish_owned_restore, reanchor_recovered_revision,
     reconcile_pending_captures, recovered_recipe_is_stable, render_sector,
     restore_revision_from_source, restore_signed_root_metadata_at, resume_restore_publication,
-    retire_revision_anchor, revision_head_id,
+    retire_revision_anchor, revision_git_backup, revision_head_id,
 };
 use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open_control_store};
 
@@ -1316,9 +1316,7 @@ impl Node {
     }
 
     fn git_catalog_key(&self, repository_id: Uuid) -> [u8; 32] {
-        let mut database_id = b"git-catalog-v1/".to_vec();
-        database_id.extend_from_slice(repository_id.as_bytes());
-        self.keys.database_key(&database_id)
+        mb_git::catalog_key(&self.keys, repository_id)
     }
 
     pub fn git_init(&mut self, source_root: &Path) -> Result<GitRepositoryInfo> {
@@ -12364,6 +12362,47 @@ impl Node {
             false,
             false,
         )?;
+        let git_backup = if revision.value.metadata_sectors.is_empty() {
+            None
+        } else {
+            revision_git_backup(&self.control, &self.keys, job.guild_id, revision)?
+        };
+        let marker = mb_store::git_catalog_marker(&job.target)?;
+        match (git_backup, marker) {
+            (Some(descriptor), Some(repository_id))
+                if repository_id == revision.value.protected_root_id
+                    && descriptor.repository_id == repository_id =>
+            {
+                let key = self.git_catalog_key(repository_id);
+                let protected_root = self.protected_root_by_id(repository_id)?;
+                let repository = GitRepository::open(&protected_root.path, repository_id, &key)?;
+                if repository.id() != repository_id {
+                    anyhow::bail!("recovered Git catalog identity changed");
+                }
+                let info = GitRepositoryInfo {
+                    format_version: 1,
+                    repository_id,
+                    path: protected_root.path,
+                };
+                let encoded = canonical_bytes(&info)?;
+                if let Some(existing) = self
+                    .control
+                    .get_record("git-repository", repository_id.as_bytes())?
+                {
+                    if existing != encoded {
+                        anyhow::bail!("recovered Git registration conflicts with local state");
+                    }
+                } else {
+                    self.control.put_record_if_absent(
+                        "git-repository",
+                        repository_id.as_bytes(),
+                        &encoded,
+                    )?;
+                }
+            }
+            (None, None) => {}
+            _ => anyhow::bail!("recovered Git catalog does not match signed history metadata"),
+        }
         job.state = RecoveryJobState::Complete;
         self.control
             .complete_recovery_attempt(checkpoint_hash, &canonical_bytes(job)?)?;

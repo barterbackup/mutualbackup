@@ -14,11 +14,13 @@ use mb_core::{
     V1_MAX_CODING_GROUPS, V1_SECTOR_SIZE, canonical_bytes, crypt_sector, decode_canonical,
     encrypted_sector, make_content_sector_id, merkle_commit, sector_root,
 };
+use mb_git::{GitBackupBlob, GitBackupDescriptor, GitDataExtent, GitGraphSource, GitRepository};
 #[cfg(test)]
 use mb_store::ReflinkAnchor;
 use mb_store::{
     AnchorFileLocator, CapturedEntry, ControlStore, FileExtent, NativeFileId, PinnedDirectory,
-    ReflinkCapturePlan, SourceCapturePlan, StableAnchorFileLocator,
+    ReflinkCapturePlan, SourceCapturePlan, SourceFileCapturePlan, StableAnchorFileLocator,
+    git_catalog_marker,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -30,6 +32,7 @@ const ANCHOR_RETIREMENT_KIND: &str = "anchor-retirement";
 const MAX_METADATA_SECTORS: usize = V1_MAX_CATALOG_BYTES.div_ceil(V1_SECTOR_SIZE);
 const MAX_DATA_SECTORS: usize = V1_MAX_CODING_GROUPS - MAX_METADATA_SECTORS;
 const RESTORE_JOB_KIND: &str = "restore-job";
+const GIT_GRAPH_INTENT_KIND: &str = "git-graph-intent-v1";
 
 #[cfg(test)]
 type RestoreRenameHook = Box<dyn FnOnce() -> Result<()>>;
@@ -93,6 +96,25 @@ pub struct PrivateMetadata {
     pub root_modified_secs: i64,
     pub root_modified_nanos: u32,
     pub entries: Vec<PrivateEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GitPrivateMetadataV4 {
+    format_version: u16,
+    root_mode: u32,
+    root_modified_secs: i64,
+    root_modified_nanos: u32,
+    entries: Vec<PrivateEntry>,
+    git: GitBackupDescriptor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GitGraphIntent {
+    format_version: u16,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    protected_root_id: Uuid,
+    graph: GitGraphSource,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -319,6 +341,65 @@ fn decode_capture_intent(bytes: &[u8]) -> Result<(CaptureIntent, bool)> {
     ))
 }
 
+fn prepare_git_graph_intent(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    protected_root_id: Uuid,
+    source_root: &Path,
+) -> Result<Option<GitGraphSource>> {
+    let registration = control.get_record("git-repository", protected_root_id.as_bytes())?;
+    let existing = control.get_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes())?;
+    let Some(registration) = registration else {
+        if existing.is_some() || git_catalog_marker(source_root)?.is_some() {
+            bail!(
+                "Git catalog marker or backup intent has no matching protected-root registration"
+            );
+        }
+        return Ok(None);
+    };
+    let info: crate::control::GitRepositoryInfo = decode_canonical(&registration)?;
+    if info.format_version != 1
+        || info.repository_id != protected_root_id
+        || info.path != source_root
+        || git_catalog_marker(source_root)? != Some(protected_root_id)
+    {
+        bail!("protected Git root registration or marker changed before backup");
+    }
+    if let Some(encoded) = existing {
+        let intent: GitGraphIntent = decode_canonical(&encoded)?;
+        if intent.format_version != 1
+            || intent.guild_id != guild_id
+            || intent.revision_id != revision_id
+            || intent.protected_root_id != protected_root_id
+            || intent.graph.repository_id != protected_root_id
+            || intent.graph.format_version != 1
+        {
+            bail!("pending Git graph backup conflicts with the source revision");
+        }
+        return Ok(Some(intent.graph));
+    }
+    let catalog_key = mb_git::catalog_key(keys, protected_root_id);
+    let graph =
+        GitRepository::open(source_root, protected_root_id, &catalog_key)?.export_graph_source()?;
+    let intent = GitGraphIntent {
+        format_version: 1,
+        guild_id,
+        revision_id,
+        protected_root_id,
+        graph: graph.clone(),
+    };
+    if !control.put_record_if_absent(
+        GIT_GRAPH_INTENT_KIND,
+        revision_id.as_bytes(),
+        &canonical_bytes(&intent)?,
+    )? {
+        bail!("Git graph backup intent changed during source capture");
+    }
+    Ok(Some(graph))
+}
+
 fn decode_recovery_anchor_intent(bytes: &[u8]) -> Result<(RecoveryAnchorIntent, bool)> {
     if let Ok(intent) = decode_canonical::<RecoveryAnchorIntent>(bytes)
         && intent.format_version == 2
@@ -355,6 +436,18 @@ pub(crate) fn reconcile_pending_captures(control: &ControlStore) -> Result<()> {
         // An offline source volume must not prevent unrelated guilds from
         // starting. The exact plan remains durable for a later explicit retry.
         let _ = intent.plan.reconcile();
+    }
+    for (record_id, bytes) in control.records(GIT_GRAPH_INTENT_KIND)? {
+        let intent: GitGraphIntent = decode_canonical(&bytes)?;
+        if intent.format_version != 1 || record_id.as_slice() != intent.revision_id.as_bytes() {
+            bail!("pending Git graph backup intent is inconsistent");
+        }
+        if control
+            .get_record("capture-intent", intent.revision_id.as_bytes())?
+            .is_none()
+        {
+            control.delete_record(GIT_GRAPH_INTENT_KIND, &record_id)?;
+        }
     }
     for (record_id, bytes) in control.records(RECOVERY_ANCHOR_INTENT_KIND)? {
         let (intent, migrated) = decode_recovery_anchor_intent(&bytes)?;
@@ -548,6 +641,14 @@ pub(crate) fn prepare_revision(
             (intent, bytes)
         }
     };
+    let git_graph = prepare_git_graph_intent(
+        control,
+        keys,
+        guild_id,
+        revision_id,
+        protected_root_id,
+        source_root,
+    )?;
     let result = (|| {
         let mut anchor = PendingAnchor {
             manifest: intent
@@ -695,14 +796,35 @@ pub(crate) fn prepare_revision(
             }
         }
 
-        let metadata = PrivateMetadata {
-            format_version: 3,
-            root_mode: anchor.manifest.root_mode,
-            root_modified_secs: anchor.manifest.root_modified_secs,
-            root_modified_nanos: anchor.manifest.root_modified_nanos,
-            entries: private_entries,
+        let metadata_bytes = if let Some(graph) = git_graph.clone() {
+            let git = prepare_git_backup_descriptor(
+                &mut recipe_records,
+                &mut data_references,
+                keys,
+                guild_id,
+                protected_root_id,
+                &content_id_key,
+                &mut ordinal,
+                &mut sector_commitments,
+                graph,
+            )?;
+            canonical_bytes(&GitPrivateMetadataV4 {
+                format_version: 4,
+                root_mode: anchor.manifest.root_mode,
+                root_modified_secs: anchor.manifest.root_modified_secs,
+                root_modified_nanos: anchor.manifest.root_modified_nanos,
+                entries: private_entries,
+                git,
+            })?
+        } else {
+            canonical_bytes(&PrivateMetadata {
+                format_version: 3,
+                root_mode: anchor.manifest.root_mode,
+                root_modified_secs: anchor.manifest.root_modified_secs,
+                root_modified_nanos: anchor.manifest.root_modified_nanos,
+                entries: private_entries,
+            })?
         };
-        let metadata_bytes = canonical_bytes(&metadata)?;
         if metadata_bytes.is_empty() || metadata_bytes.len() > V1_MAX_CATALOG_BYTES {
             bail!("private metadata exceeds the v1 bounded-object limit");
         }
@@ -793,6 +915,11 @@ pub(crate) fn prepare_revision(
         }
         control.finalize_capture_records(revision_id.as_bytes(), &records)?;
         anchor.commit();
+        if git_graph.is_some() {
+            // A crash here leaves a harmless intent; startup reconciliation
+            // retires it after observing the committed revision.
+            let _ = control.delete_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes());
+        }
         Ok(revision)
     })();
     match result {
@@ -805,6 +932,9 @@ pub(crate) fn prepare_revision(
             control
                 .abandon_capture_intent(revision_id.as_bytes(), &intent_bytes)
                 .context("retire failed source-capture intent")?;
+            if git_graph.is_some() {
+                let _ = control.delete_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes());
+            }
             Err(error)
         }
     }
@@ -876,6 +1006,83 @@ fn prepare_sparse_file(
         });
     }
     Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_git_backup_descriptor(
+    recipe_records: &mut Vec<RecordWrite>,
+    data_references: &mut Vec<SectorRef>,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    protected_root_id: Uuid,
+    content_id_key: &[u8; 32],
+    ordinal: &mut u64,
+    sector_commitments: &mut BTreeMap<SectorId, MerkleCommitment>,
+    graph: GitGraphSource,
+) -> Result<GitBackupDescriptor> {
+    let encryption_key = keys.guild_data_key(&guild_id);
+    let mut blobs = Vec::with_capacity(graph.blobs.len());
+    for blob in graph.blobs {
+        let mut file = blob.anchor.open_verified()?;
+        let locator = blob.anchor.file_locator();
+        let mut sectors = Vec::new();
+        let mut offset = 0_u64;
+        while offset < blob.anchor.logical_len {
+            let logical_len =
+                (blob.anchor.logical_len - offset).min(V1_SECTOR_SIZE as u64) as usize;
+            let mut plaintext = vec![0_u8; logical_len];
+            file.read_exact(&mut plaintext)?;
+            let id = make_content_sector_id(
+                content_id_key,
+                keys.node_id(),
+                guild_id,
+                protected_root_id,
+                SectorPurpose::Data,
+                &plaintext,
+            )?;
+            *ordinal = ordinal
+                .checked_add(1)
+                .context("too many Git blob sectors")?;
+            let (reference, ciphertext) = encrypted_sector(&encryption_key, id, &plaintext)?;
+            sector_commitments.insert(id, merkle_commit(&ciphertext)?);
+            push_data_reference(data_references, reference.clone())?;
+            sectors.push(reference.clone());
+            queue_recipe(
+                recipe_records,
+                LocalSectorRecipe {
+                    guild_id,
+                    reference,
+                    source: LocalPlaintextSource::StableAnchorFile {
+                        locator: locator.clone(),
+                        offset,
+                    },
+                },
+            )?;
+            offset += logical_len as u64;
+        }
+        blobs.push(GitBackupBlob {
+            oid: blob.oid,
+            logical_len: blob.anchor.logical_len,
+            data_extents: if blob.anchor.logical_len == 0 {
+                Vec::new()
+            } else {
+                vec![GitDataExtent {
+                    offset: 0,
+                    logical_len: blob.anchor.logical_len,
+                    sectors,
+                }]
+            },
+        });
+    }
+    let descriptor = GitBackupDescriptor {
+        format_version: 1,
+        repository_id: graph.repository_id,
+        refs: graph.refs,
+        objects: graph.objects,
+        blobs,
+    };
+    descriptor.validate()?;
+    Ok(descriptor)
 }
 
 fn validate_file_extents(
@@ -1039,13 +1246,34 @@ pub(crate) fn reanchor_recovered_revision(
         return Ok(());
     }
     reconcile_anchor_retirements(control)?;
-    let metadata = load_private_metadata(control, keys, guild_id, revision)?;
+    let (metadata, git_backup) = load_private_metadata_with_git(control, keys, guild_id, revision)?;
+    let git_repository = if let Some(descriptor) = git_backup.as_ref() {
+        if descriptor.repository_id != revision.value.protected_root_id {
+            bail!("recovered Git history belongs to another protected root");
+        }
+        let key = mb_git::catalog_key(keys, descriptor.repository_id);
+        Some(GitRepository::open(
+            restored_root,
+            descriptor.repository_id,
+            &key,
+        )?)
+    } else {
+        None
+    };
     let existing = control.get_record("anchor-manifest", revision.value.revision_id.as_bytes())?;
     let old_manifest = existing
         .as_deref()
         .and_then(|bytes| decode_canonical::<mb_store::StableAnchorManifest>(bytes).ok());
     if let Some(manifest) = old_manifest.as_ref()
-        && let Ok(records) = recovered_anchor_records(keys, guild_id, revision, &metadata, manifest)
+        && let Ok(records) = recovered_anchor_records(
+            keys,
+            guild_id,
+            revision,
+            &metadata,
+            manifest,
+            git_backup.as_ref(),
+            git_repository.as_ref(),
+        )
     {
         if let Some(bytes) = control.get_record(
             RECOVERY_ANCHOR_INTENT_KIND,
@@ -1130,8 +1358,15 @@ pub(crate) fn reanchor_recovered_revision(
         anchor.commit();
         bail!("injected interruption after recovered-anchor capture");
     }
-    let mut records =
-        recovered_anchor_records(keys, guild_id, revision, &metadata, &anchor.manifest)?;
+    let mut records = recovered_anchor_records(
+        keys,
+        guild_id,
+        revision,
+        &metadata,
+        &anchor.manifest,
+        git_backup.as_ref(),
+        git_repository.as_ref(),
+    )?;
     if let Some(old) = intent.replaced_anchor.as_ref()
         && old.anchor_id != anchor.manifest.anchor_id
     {
@@ -1159,12 +1394,22 @@ fn recovered_anchor_records(
     revision: &SignedRecord<UserRevision>,
     metadata: &PrivateMetadata,
     manifest: &mb_store::StableAnchorManifest,
+    git_backup: Option<&GitBackupDescriptor>,
+    git_repository: Option<&GitRepository>,
 ) -> Result<Vec<RecordWrite>> {
     if manifest.format_version != 2 {
         bail!("unsupported recovered anchor manifest version");
     }
     validate_recovered_manifest(metadata, manifest)?;
-    let mut records = recovered_anchor_recipes(keys, guild_id, revision, metadata, manifest)?;
+    let mut records = recovered_anchor_recipes(
+        keys,
+        guild_id,
+        revision,
+        metadata,
+        manifest,
+        git_backup,
+        git_repository,
+    )?;
     records.push((
         ANCHOR_AREA_LOCATION_KIND.to_owned(),
         manifest.area.area_id.as_bytes().to_vec(),
@@ -1184,6 +1429,15 @@ fn load_private_metadata(
     guild_id: [u8; 32],
     revision: &SignedRecord<UserRevision>,
 ) -> Result<PrivateMetadata> {
+    Ok(load_private_metadata_with_git(control, keys, guild_id, revision)?.0)
+}
+
+fn load_private_metadata_with_git(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+) -> Result<(PrivateMetadata, Option<GitBackupDescriptor>)> {
     let encryption_key = keys.guild_data_key(&guild_id);
     let mut metadata_bytes = Vec::with_capacity(checked_metadata_length(revision)?);
     for reference in &revision.value.metadata_sectors {
@@ -1193,10 +1447,26 @@ fn load_private_metadata(
             &mut |sector_id| render_sector(control, keys, sector_id, Some(&guild_id)),
         )?);
     }
-    decode_private_metadata(&metadata_bytes)
+    decode_private_metadata_with_git(&metadata_bytes)
 }
 
+pub(crate) fn revision_git_backup(
+    control: &ControlStore,
+    keys: &KeyMaterial,
+    guild_id: [u8; 32],
+    revision: &SignedRecord<UserRevision>,
+) -> Result<Option<GitBackupDescriptor>> {
+    Ok(load_private_metadata_with_git(control, keys, guild_id, revision)?.1)
+}
+
+#[cfg(test)]
 fn decode_private_metadata(bytes: &[u8]) -> Result<PrivateMetadata> {
+    Ok(decode_private_metadata_with_git(bytes)?.0)
+}
+
+fn decode_private_metadata_with_git(
+    bytes: &[u8],
+) -> Result<(PrivateMetadata, Option<GitBackupDescriptor>)> {
     let (format_version, _) =
         postcard::take_from_bytes::<u16>(bytes).context("decode private metadata version")?;
     match format_version {
@@ -1215,9 +1485,26 @@ fn decode_private_metadata(bytes: &[u8]) -> Result<PrivateMetadata> {
             {
                 bail!("version-1 private metadata contains a later entry variant");
             }
-            Ok(metadata)
+            Ok((metadata, None))
         }
-        2 => decode_v2_private_metadata(bytes),
+        2 => Ok((decode_v2_private_metadata(bytes)?, None)),
+        4 => {
+            let metadata: GitPrivateMetadataV4 = decode_canonical(bytes)?;
+            if metadata.format_version != 4 {
+                bail!("Git private metadata has the wrong version");
+            }
+            metadata.git.validate()?;
+            Ok((
+                PrivateMetadata {
+                    format_version: 4,
+                    root_mode: metadata.root_mode,
+                    root_modified_secs: metadata.root_modified_secs,
+                    root_modified_nanos: metadata.root_modified_nanos,
+                    entries: metadata.entries,
+                },
+                Some(metadata.git),
+            ))
+        }
         _ => bail!("unsupported private metadata version"),
     }
 }
@@ -1576,6 +1863,8 @@ fn recovered_anchor_recipes(
     revision: &SignedRecord<UserRevision>,
     metadata: &PrivateMetadata,
     manifest: &mb_store::StableAnchorManifest,
+    git_backup: Option<&GitBackupDescriptor>,
+    git_repository: Option<&GitRepository>,
 ) -> Result<Vec<RecordWrite>> {
     let encryption_key = keys.guild_data_key(&guild_id);
     let mut by_id = BTreeMap::<SectorId, LocalSectorRecipe>::new();
@@ -1638,6 +1927,59 @@ fn recovered_anchor_recipes(
                 bail!("signed extent does not match its sector lengths");
             }
         }
+    }
+    match (git_backup, git_repository) {
+        (Some(descriptor), Some(repository)) => {
+            for blob in &descriptor.blobs {
+                let oid = git2::Oid::from_bytes(&blob.oid)?;
+                let anchor = repository
+                    .anchors_for_oid(oid)?
+                    .into_iter()
+                    .find(|anchor| anchor.logical_len == blob.logical_len)
+                    .context("recovered Git blob has no matching native anchor")?;
+                let locator = anchor.file_locator();
+                let mut file = anchor.open_verified()?;
+                for extent in &blob.data_extents {
+                    let mut offset = extent.offset;
+                    let mut covered = 0_u64;
+                    for reference in &extent.sectors {
+                        file.seek(SeekFrom::Start(offset))?;
+                        let mut plaintext = vec![0_u8; reference.logical_len as usize];
+                        file.read_exact(&mut plaintext)?;
+                        let (actual, _) =
+                            encrypted_sector(&encryption_key, reference.id, &plaintext)?;
+                        if actual != *reference {
+                            bail!("recovered Git blob differs from its signed data sector");
+                        }
+                        let recipe = LocalSectorRecipe {
+                            guild_id,
+                            reference: reference.clone(),
+                            source: LocalPlaintextSource::StableAnchorFile {
+                                locator: locator.clone(),
+                                offset,
+                            },
+                        };
+                        if by_id
+                            .insert(reference.id, recipe.clone())
+                            .is_some_and(|previous| previous.reference != recipe.reference)
+                        {
+                            bail!("one Git sector ID has conflicting signed references");
+                        }
+                        offset = offset
+                            .checked_add(reference.logical_len as u64)
+                            .context("recovered Git blob sector range overflow")?;
+                        covered = covered
+                            .checked_add(reference.logical_len as u64)
+                            .context("recovered Git extent length overflow")?;
+                    }
+                    if covered != extent.logical_len {
+                        bail!("recovered Git extent differs from its signed length");
+                    }
+                }
+            }
+        }
+        (None, None) => {}
+        _ => bail!("Git backup descriptor and recovered catalog disagree"),
     }
     let expected = revision
         .value
@@ -2230,15 +2572,88 @@ where
             load_ciphertext,
         )?);
     }
-    let metadata = decode_private_metadata(&metadata_bytes)?;
-
+    let (metadata, git) = decode_private_metadata_with_git(&metadata_bytes)?;
     restore_entries(
         staging,
         &metadata,
         &encryption_key,
         load_ciphertext,
-        apply_root_metadata,
-    )
+        apply_root_metadata && git.is_none(),
+    )?;
+    if let Some(descriptor) = git {
+        if descriptor.repository_id != revision.value.protected_root_id {
+            bail!("Git backup belongs to another protected root");
+        }
+        restore_git_backup_at(keys, staging, &descriptor, &encryption_key, load_ciphertext)?;
+        if apply_root_metadata {
+            set_metadata_durable(
+                staging.as_file(),
+                metadata.root_mode,
+                metadata.root_modified_secs,
+                metadata.root_modified_nanos,
+            )?;
+        } else {
+            staging.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_git_backup_at<F>(
+    keys: &KeyMaterial,
+    staging: &PinnedDirectory,
+    descriptor: &GitBackupDescriptor,
+    encryption_key: &[u8; 32],
+    load_ciphertext: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&SectorId) -> Result<Vec<u8>>,
+{
+    descriptor.validate()?;
+    let root = staging.descriptor_path();
+    let catalog_key = mb_git::catalog_key(keys, descriptor.repository_id);
+    let repository = GitRepository::init(&root, descriptor.repository_id, &catalog_key)?;
+    let mut anchors = Vec::with_capacity(descriptor.blobs.len());
+    let result = (|| {
+        for blob in &descriptor.blobs {
+            let temporary_name = format!(".mutualbackup-recovered-blob-{}", Uuid::new_v4());
+            let mut file = staging.create_child_file(&temporary_name)?;
+            file.set_len(blob.logical_len)?;
+            for extent in &blob.data_extents {
+                file.seek(SeekFrom::Start(extent.offset))?;
+                let mut written = 0_u64;
+                for reference in &extent.sectors {
+                    let plaintext = decrypt_reference(encryption_key, reference, load_ciphertext)?;
+                    file.write_all(&plaintext)?;
+                    written = written
+                        .checked_add(plaintext.len() as u64)
+                        .context("Git recovered extent length overflow")?;
+                }
+                if written != extent.logical_len {
+                    bail!("Git recovered extent does not match signed sector lengths");
+                }
+            }
+            file.sync_all()?;
+            drop(file);
+            let plan = SourceFileCapturePlan::plan_reflink(&root, &temporary_name)?;
+            let anchor = plan.capture()?;
+            let actual_oid = mb_git::blob_oid_from_anchor(&anchor);
+            anchors.push(anchor);
+            if actual_oid?.as_bytes() != blob.oid {
+                bail!("recovered Git blob bytes do not match their signed object ID");
+            }
+            staging.remove_child_file(&temporary_name)?;
+            staging.sync_all()?;
+        }
+        repository.import_backup(descriptor, &anchors)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        for anchor in &anchors {
+            let _ = anchor.remove();
+        }
+    }
+    result
 }
 
 fn pinned_restore_parent(target: &Path) -> Result<(PathBuf, String, PinnedDirectory)> {
@@ -3566,6 +3981,160 @@ mod metadata_compatibility_tests {
             "cannot remove recovery-test bind mount: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn git_history_enters_encrypted_revision_sectors_without_changing_root_restore() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-revision-{}", Uuid::new_v4()));
+        let source = run_root.join("source");
+        let restored = run_root.join("restored");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("tracked"), b"first\r\nbytes\0").unwrap();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([91; 32]));
+        let root_id = Uuid::new_v4();
+        let repo =
+            GitRepository::init(&source, root_id, &mb_git::catalog_key(&keys, root_id)).unwrap();
+        let first_blob = repo.stage_file("tracked").unwrap();
+        let first_commit = repo.commit("Author", "a@example.test", "first").unwrap();
+        fs::write(source.join("tracked"), b"second\nbytes").unwrap();
+        let second_blob = repo.stage_file("tracked").unwrap();
+        let second_commit = repo.commit("Author", "a@example.test", "second").unwrap();
+        let graph = repo.export_graph_source().unwrap();
+        drop(repo);
+
+        let mut control = ControlStore::open(run_root.join("control.db"), &keys).unwrap();
+        control
+            .put_record(
+                "git-repository",
+                root_id.as_bytes(),
+                &canonical_bytes(&crate::control::GitRepositoryInfo {
+                    format_version: 1,
+                    repository_id: root_id,
+                    path: source.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let guild_id = [92; 32];
+        let revision = prepare_revision(
+            &mut control,
+            &keys,
+            guild_id,
+            root_id,
+            &source,
+            1,
+            None,
+            WriterCredentials {
+                epoch: 1,
+                secret: &[93; 32],
+                captured_change_sequence: None,
+            },
+        )
+        .unwrap();
+        let mut encoded = Vec::new();
+        for reference in &revision.value.metadata_sectors {
+            encoded.extend(
+                decrypt_reference(&keys.guild_data_key(&guild_id), reference, &mut |id| {
+                    render_sector(&control, &keys, id, Some(&guild_id))
+                })
+                .unwrap(),
+            );
+        }
+        let metadata: GitPrivateMetadataV4 = decode_canonical(&encoded).unwrap();
+        assert_eq!(metadata.format_version, 4);
+        metadata.git.validate().unwrap();
+        assert_eq!(metadata.git.refs[0].oid, second_commit.oid);
+        assert!(
+            metadata
+                .git
+                .objects
+                .iter()
+                .any(|item| item.oid == first_commit.oid)
+        );
+        assert!(
+            metadata
+                .git
+                .blobs
+                .iter()
+                .any(|item| item.oid == first_blob.oid)
+        );
+        assert!(
+            metadata
+                .git
+                .blobs
+                .iter()
+                .any(|item| item.oid == second_blob.oid)
+        );
+        assert!(
+            control
+                .get_record(GIT_GRAPH_INTENT_KIND, revision.value.revision_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        restore_revision_from_source(&control, &keys, guild_id, &revision, &restored, |id| {
+            render_sector(&control, &keys, id, Some(&guild_id))
+        })
+        .unwrap();
+        assert_eq!(
+            fs::read(restored.join("tracked")).unwrap(),
+            b"second\nbytes"
+        );
+        let recovered_repo =
+            GitRepository::open(&restored, root_id, &mb_git::catalog_key(&keys, root_id)).unwrap();
+        let recovered_history = recovered_repo.log(10).unwrap();
+        assert_eq!(recovered_history.len(), 2);
+        assert_eq!(recovered_history[0].oid, second_commit.oid);
+        assert_eq!(recovered_history[1].oid, first_commit.oid);
+        assert!(recovered_repo.status().unwrap().changes.is_empty());
+        let recovered_graph = recovered_repo.export_graph_source().unwrap();
+        assert_eq!(recovered_graph.blobs.len(), 2);
+        drop(recovered_repo);
+        let manifest: mb_store::StableAnchorManifest = decode_canonical(
+            &control
+                .get_record("anchor-manifest", revision.value.revision_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        manifest.remove().unwrap();
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(&source).unwrap();
+        reanchor_recovered_revision(&mut control, &keys, guild_id, &revision, &restored).unwrap();
+        let first_backup_blob = metadata
+            .git
+            .blobs
+            .iter()
+            .find(|item| item.oid == first_blob.oid)
+            .unwrap();
+        let historical_sector = &first_backup_blob.data_extents[0].sectors[0];
+        let restored_historical = decrypt_reference(
+            &keys.guild_data_key(&guild_id),
+            historical_sector,
+            &mut |id| render_sector(&control, &keys, id, Some(&guild_id)),
+        )
+        .unwrap();
+        assert_eq!(restored_historical, b"first\r\nbytes\0");
+        let recovered_manifest: mb_store::StableAnchorManifest = decode_canonical(
+            &control
+                .get_record("anchor-manifest", revision.value.revision_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        recovered_manifest.remove().unwrap();
+        for blob in recovered_graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        drop(control);
+        fs::remove_dir_all(run_root).unwrap();
     }
 
     #[cfg(target_os = "linux")]
