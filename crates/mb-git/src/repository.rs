@@ -1037,7 +1037,7 @@ mod tests {
         let key = [99_u8; 32];
         let local = GitRepository::init(&primary_root, repository_id, &key).unwrap();
         local.stage_file("tracked").unwrap();
-        local.commit("Author", "a@example.test", "base").unwrap();
+        let base = local.commit("Author", "a@example.test", "base").unwrap();
         local.create_branch("topic").unwrap();
         let scope = crate::GitWorktreeScope::linked(repository_id, Uuid::new_v4()).unwrap();
         crate::head::store_selected_branch_for_scope(&local.catalog, scope, "topic").unwrap();
@@ -1081,6 +1081,25 @@ mod tests {
                 .any(|w| w == b"+linked")
         );
         assert!(local.diff(true).unwrap().patch.is_empty());
+
+        let linked_commit = crate::history::commit_index_for_scope(
+            &local.catalog,
+            scope,
+            "Author",
+            "a@example.test",
+            "linked commit",
+        )
+        .unwrap();
+        assert_eq!(linked_commit.branch, "topic");
+        assert_eq!(linked_commit.parent_oid, Some(base.oid));
+        assert_eq!(
+            crate::status::repository_status_for_scope(&local.catalog, scope, &linked_root)
+                .unwrap()
+                .head_oid,
+            Some(linked_commit.oid)
+        );
+        assert_eq!(local.status().unwrap().head_oid, Some(base.oid));
+        assert!(local.status().unwrap().changes.is_empty());
 
         let primary = local.staged_entry("tracked").unwrap().unwrap();
         let mut anchors = std::collections::BTreeMap::new();

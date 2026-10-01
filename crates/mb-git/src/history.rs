@@ -16,19 +16,22 @@ use uuid::Uuid;
 
 use crate::attributes::{is_attributes_path, validate_anchor, validate_attributes};
 use crate::head::{
-    HeadError, head_kind, selected_branch, selected_branch_record, selected_ref,
-    store_selected_branch,
+    HeadError, head_kind, selected_branch, selected_branch_for_scope, selected_branch_record,
+    selected_ref, selected_ref_for_scope, store_selected_branch,
 };
 use crate::merge::{
     GeneratedBlob, MergeBlobError, MergeFileInput, MergeFileInputs, capture_generated_blob,
     merge_file_bytes,
 };
 use crate::stage::{
-    GitIndexEntry, StageError, anchors_for_oid, has_pending_stages, index_kind, object_kind,
-    stage_path_key, staged_entries,
+    GitIndexEntry, StageError, anchors_for_oid, has_pending_stages_for_scope, index_kind,
+    object_kind, stage_path_key, staged_entries_for_scope,
 };
 use crate::status::{StatusError, TreeFiles, files_for_commit};
-use crate::{GitAnchorError, GitBackupDescriptor, GitBackupError, NativeOdb, blob_oid_from_anchor};
+use crate::{
+    GitAnchorError, GitBackupDescriptor, GitBackupError, GitWorktreeScope, NativeOdb,
+    blob_oid_from_anchor,
+};
 
 const METADATA_PREFIX: &str = "git-metadata-object-v1/";
 const REF_PREFIX: &str = "git-ref-v1/";
@@ -293,7 +296,15 @@ pub(crate) fn verified_metadata_ids(
 }
 
 fn head_oid(control: &ControlStore, repository_id: Uuid) -> Result<Option<Oid>, HistoryError> {
-    let head = selected_ref(control, repository_id)?;
+    head_oid_for_scope(control, GitWorktreeScope::primary(repository_id))
+}
+
+fn head_oid_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+) -> Result<Option<Oid>, HistoryError> {
+    let repository_id = scope.repository_id();
+    let head = selected_ref_for_scope(control, scope)?;
     let Some(encoded) = control.get_record(&ref_kind(repository_id), &head)? else {
         if head != MAIN_REF {
             return Err(HistoryError::IncompatibleRecord);
@@ -643,10 +654,27 @@ pub fn commit_index(
     author_email: &str,
     message: &str,
 ) -> Result<GitCommitInfo, HistoryError> {
-    if has_pending_stages(control, repository_id)? {
+    commit_index_for_scope(
+        control,
+        GitWorktreeScope::primary(repository_id),
+        author_name,
+        author_email,
+        message,
+    )
+}
+
+pub(crate) fn commit_index_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    author_name: &str,
+    author_email: &str,
+    message: &str,
+) -> Result<GitCommitInfo, HistoryError> {
+    let repository_id = scope.repository_id();
+    if has_pending_stages_for_scope(control, scope)? {
         return Err(HistoryError::PendingStage);
     }
-    let staged = staged_entries(control, repository_id)?;
+    let staged = staged_entries_for_scope(control, scope)?;
     let mut anchors = Vec::new();
     for (path, entry) in &staged {
         let oid = Oid::from_bytes(&entry.oid)?;
@@ -666,9 +694,9 @@ pub fn commit_index(
     let _metadata_pack = native_odb.odb().add_new_mempack_backend(1000)?;
     repository.set_odb(native_odb.odb())?;
     load_metadata(control, repository_id, &repository)?;
-    let branch = selected_branch(control, repository_id)?;
-    let selected_ref = selected_ref(control, repository_id)?;
-    let previous = head_oid(control, repository_id)?;
+    let branch = selected_branch_for_scope(control, scope)?;
+    let selected_ref = selected_ref_for_scope(control, scope)?;
+    let previous = head_oid_for_scope(control, scope)?;
     let parent = match previous {
         Some(oid) => Some(
             repository
