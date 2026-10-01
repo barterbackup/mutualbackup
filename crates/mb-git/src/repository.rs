@@ -14,7 +14,7 @@ use mb_store::{
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::checkout::{CheckoutError, begin_switch, resume_pending_checkout};
+use crate::checkout::{CheckoutError, begin_pull, begin_switch, resume_pending_checkout};
 use crate::diff::{DiffError, GitDiff, repository_diff};
 use crate::fetch::{FetchError, fetch_bare};
 use crate::head::{HeadError, selected_branch};
@@ -408,6 +408,18 @@ impl GitRepository {
         )?)
     }
 
+    /// Fetch origin and fast-forward the selected branch through the same
+    /// crash-replayable, dirty-worktree-safe transition as branch checkout.
+    pub fn pull_bare(&self, source: impl AsRef<Path>) -> Result<Oid, RepositoryError> {
+        self.fetch_bare(source)?;
+        Ok(begin_pull(
+            &self.catalog,
+            self.repository_id,
+            &self.root,
+            &self.directory,
+        )?)
+    }
+
     pub fn import_backup(
         &self,
         descriptor: &crate::GitBackupDescriptor,
@@ -554,6 +566,198 @@ mod tests {
             fs::read(unrelated_catalog.join("user-file")).unwrap(),
             b"must be preserved"
         );
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn bare_git_pull_fast_forwards_exact_bytes_and_replays_checkout() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-bare-pull-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        let bare_root = run_root.join("remote.git");
+        fs::create_dir_all(&source_root).unwrap();
+        let remote = git2::Repository::init_bare(&bare_root).unwrap();
+        let signature = git2::Signature::now("Remote", "remote@example.invalid").unwrap();
+        let first_blob = remote.blob(b"first\r\nbytes\0").unwrap();
+        let mut first_builder = remote.treebuilder(None).unwrap();
+        first_builder
+            .insert("tracked", first_blob, 0o100644)
+            .unwrap();
+        let first_tree = remote.find_tree(first_builder.write().unwrap()).unwrap();
+        let first = remote
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "first",
+                &first_tree,
+                &[],
+            )
+            .unwrap();
+
+        let repository_id = Uuid::new_v4();
+        let key = [89_u8; 32];
+        let local = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        fs::write(source_root.join("tracked"), b"untracked collision").unwrap();
+        assert!(matches!(
+            local.pull_bare(&bare_root),
+            Err(RepositoryError::Checkout(
+                crate::CheckoutError::DirtyWorktree
+            ))
+        ));
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"untracked collision"
+        );
+        assert!(local.status().unwrap().head_oid.is_none());
+        fs::remove_file(source_root.join("tracked")).unwrap();
+        assert_eq!(local.pull_bare(&bare_root).unwrap(), first);
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"first\r\nbytes\0"
+        );
+        assert_eq!(
+            local.status().unwrap().head_oid.unwrap().as_slice(),
+            first.as_bytes()
+        );
+        assert_eq!(local.pull_bare(&bare_root).unwrap(), first);
+
+        let second_blob = remote.blob(b"second\nbytes\r\n").unwrap();
+        let link_blob = remote.blob(b"missing\r\npath").unwrap();
+        let mut second_builder = remote.treebuilder(None).unwrap();
+        second_builder
+            .insert("tracked", second_blob, 0o100755)
+            .unwrap();
+        second_builder.insert("link", link_blob, 0o120000).unwrap();
+        let second_tree = remote.find_tree(second_builder.write().unwrap()).unwrap();
+        let first_commit = remote.find_commit(first).unwrap();
+        let second = remote
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "second",
+                &second_tree,
+                &[&first_commit],
+            )
+            .unwrap();
+        fs::write(source_root.join("tracked"), b"dirty local bytes").unwrap();
+        assert!(matches!(
+            local.pull_bare(&bare_root),
+            Err(RepositoryError::Checkout(
+                crate::CheckoutError::DirtyWorktree
+            ))
+        ));
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"dirty local bytes"
+        );
+        assert_eq!(
+            local.status().unwrap().head_oid.unwrap().as_slice(),
+            first.as_bytes()
+        );
+        fs::write(source_root.join("tracked"), b"first\r\nbytes\0").unwrap();
+        crate::checkout::set_after_checkout_file_hook(Box::new(|| panic!("pull crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local.pull_bare(&bare_root).unwrap();
+        }));
+        assert!(interrupted.is_err());
+        drop(local);
+        let local = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        assert_eq!(
+            local.status().unwrap().head_oid.unwrap().as_slice(),
+            second.as_bytes()
+        );
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"second\nbytes\r\n"
+        );
+        assert_eq!(
+            fs::read_link(source_root.join("link"))
+                .unwrap()
+                .as_os_str()
+                .as_bytes(),
+            b"missing\r\npath"
+        );
+
+        let second_commit = remote.find_commit(second).unwrap();
+        let third = remote
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "same tree",
+                &second_tree,
+                &[&second_commit],
+            )
+            .unwrap();
+        crate::checkout::set_after_checkout_commit_hook(Box::new(|| panic!("pull commit crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local.pull_bare(&bare_root).unwrap();
+        }));
+        assert!(interrupted.is_err());
+        drop(local);
+        let local = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        assert_eq!(
+            local.status().unwrap().head_oid.unwrap().as_slice(),
+            third.as_bytes()
+        );
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"second\nbytes\r\n"
+        );
+
+        let fourth_blob = remote.blob(b"remote fourth").unwrap();
+        let mut fourth_builder = remote.treebuilder(None).unwrap();
+        fourth_builder
+            .insert("tracked", fourth_blob, 0o100644)
+            .unwrap();
+        let fourth_tree = remote.find_tree(fourth_builder.write().unwrap()).unwrap();
+        let third_commit = remote.find_commit(third).unwrap();
+        remote
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "fourth",
+                &fourth_tree,
+                &[&third_commit],
+            )
+            .unwrap();
+        fs::write(source_root.join("tracked"), b"local third").unwrap();
+        local.stage_file("tracked").unwrap();
+        local
+            .commit("Local", "local@example.invalid", "local third")
+            .unwrap();
+        assert!(matches!(
+            local.pull_bare(&bare_root),
+            Err(RepositoryError::Checkout(
+                crate::CheckoutError::NonFastForward
+            ))
+        ));
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"local third"
+        );
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        drop(fourth_tree);
+        drop(fourth_builder);
+        drop(third_commit);
+        drop(second_commit);
+        drop(second_tree);
+        drop(second_builder);
+        drop(first_commit);
+        drop(first_tree);
+        drop(first_builder);
+        drop(remote);
+        fs::remove_dir_all(run_root).unwrap();
     }
 
     #[test]

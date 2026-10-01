@@ -97,6 +97,10 @@ pub enum LocalRequest {
         repository_id: Uuid,
         path: PathBuf,
     },
+    GitPullBare {
+        repository_id: Uuid,
+        path: PathBuf,
+    },
     GitDiff {
         repository_id: Uuid,
         cached: bool,
@@ -190,6 +194,10 @@ pub enum LocalResponse {
     GitFetched {
         repository_id: Uuid,
         branch_count: u32,
+    },
+    GitPulled {
+        repository_id: Uuid,
+        oid: [u8; 20],
     },
     GitDiff(GitDiff),
     GitStatus(GitStatus),
@@ -394,6 +402,10 @@ mod tests {
                 repository_id,
                 path: PathBuf::from("/home/user/remote.git"),
             },
+            LocalRequest::GitPullBare {
+                repository_id,
+                path: PathBuf::from("/home/user/remote.git"),
+            },
             LocalRequest::GitDiff {
                 repository_id,
                 cached: true,
@@ -474,6 +486,10 @@ mod tests {
             LocalResponse::GitFetched {
                 repository_id,
                 branch_count: 2,
+            },
+            LocalResponse::GitPulled {
+                repository_id,
+                oid: [7; 20],
             },
             LocalResponse::GitDiff(GitDiff {
                 format_version: 1,

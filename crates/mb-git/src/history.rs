@@ -177,6 +177,45 @@ pub(crate) fn fetched_ref_record(oid: [u8; 20]) -> Result<Vec<u8>, HistoryError>
     })?)
 }
 
+pub(crate) fn ref_oid(
+    control: &ControlStore,
+    repository_id: Uuid,
+    name: &[u8],
+) -> Result<Option<Oid>, HistoryError> {
+    let Some(encoded) = control.get_record(&ref_kind(repository_id), name)? else {
+        return Ok(None);
+    };
+    let record: RefRecord = decode_canonical(&encoded)?;
+    if record.format_version != 1 {
+        return Err(HistoryError::IncompatibleRecord);
+    }
+    Ok(Some(Oid::from_bytes(&record.oid)?))
+}
+
+pub(crate) fn commit_descends_from(
+    control: &ControlStore,
+    repository_id: Uuid,
+    descendant: Oid,
+    ancestor: Oid,
+) -> Result<bool, HistoryError> {
+    if descendant == ancestor {
+        return Ok(true);
+    }
+    let temporary = tempfile::tempdir()?;
+    let repository = Repository::init_bare(temporary.path())?;
+    let odb = git2::Odb::new()?;
+    let _pack = odb.add_new_mempack_backend(1000)?;
+    repository.set_odb(&odb)?;
+    load_metadata(control, repository_id, &repository)?;
+    repository
+        .find_commit(descendant)
+        .map_err(|_| HistoryError::IncompatibleRecord)?;
+    repository
+        .find_commit(ancestor)
+        .map_err(|_| HistoryError::IncompatibleRecord)?;
+    Ok(repository.graph_descendant_of(descendant, ancestor)?)
+}
+
 fn load_metadata(
     control: &ControlStore,
     repository_id: Uuid,

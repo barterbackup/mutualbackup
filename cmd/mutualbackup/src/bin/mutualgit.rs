@@ -71,6 +71,8 @@ enum Command {
     Push { destination: PathBuf },
     /// Fetch branches from an existing local bare Git repository.
     Fetch { source: PathBuf },
+    /// Fetch and fast-forward the selected branch from a local bare repository.
+    Pull { source: PathBuf },
     /// Show raw-byte changes in the worktree or staged index.
     Diff {
         #[arg(long, alias = "staged")]
@@ -350,6 +352,32 @@ async fn main() -> Result<()> {
             }
             println!(
                 "Fetched {branch_count} branch(es) from {}",
+                source.display()
+            );
+        }
+        Command::Pull { source } => {
+            let (_, repository_id) = discover_repository(&working_directory)?;
+            let source = working_directory.join(source);
+            let LocalResponse::GitPulled {
+                repository_id: returned_id,
+                oid,
+            } = local_control_call(
+                &socket,
+                &LocalRequest::GitPullBare {
+                    repository_id,
+                    path: source.clone(),
+                },
+            )
+            .await?
+            else {
+                bail!("daemon returned the wrong response to Git pull");
+            };
+            if returned_id != repository_id {
+                bail!("daemon pulled another repository");
+            }
+            println!(
+                "Pulled {} from {}",
+                git2::Oid::from_bytes(&oid)?,
                 source.display()
             );
         }

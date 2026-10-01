@@ -20,13 +20,16 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::head::{HeadError, selected_branch, selected_branch_record};
-use crate::history::{GitBranchInfo, HistoryError, list_branches};
+use crate::head::{HeadError, selected_branch, selected_branch_record, selected_ref};
+use crate::history::{
+    GitBranchInfo, HistoryError, commit_descends_from, fetched_ref_record, list_branches, ref_kind,
+    ref_oid,
+};
 use crate::stage::{
     GitIndexEntry, StageError, anchors_for_oid, has_pending_stages, index_kind, stage_path_key,
     staged_entries,
 };
-use crate::status::{StatusError, TreeFiles, committed_files, files_for_commit};
+use crate::status::{StatusError, TreeFiles, files_for_commit};
 use crate::{GitAnchorError, blob_oid_from_anchor};
 
 const INTENT_PREFIX: &str = "git-checkout-intent-v1/";
@@ -135,6 +138,10 @@ pub enum CheckoutError {
     MissingAnchor,
     #[error("the checkout contains too many changed files")]
     TooManyFiles,
+    #[error("the selected branch has no matching origin branch to pull")]
+    MissingRemoteBranch,
+    #[error("the selected branch has diverged from origin; pull requires a fast-forward")]
+    NonFastForward,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -175,6 +182,8 @@ struct CheckoutRemovedDirectory {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct CheckoutIntent {
     format_version: u16,
+    #[serde(default, skip_serializing_if = "is_false")]
+    advance_ref: bool,
     repository_id: Uuid,
     old_branch: String,
     old_oid: [u8; 20],
@@ -186,6 +195,14 @@ struct CheckoutIntent {
     entries: Vec<CheckoutEntry>,
     directories: Vec<CheckoutDirectory>,
     removed_directories: Vec<CheckoutRemovedDirectory>,
+}
+
+struct CheckoutTarget<'a> {
+    old_branch: &'a str,
+    old_oid: Option<Oid>,
+    new_branch: &'a str,
+    new_oid: Oid,
+    advance_ref: bool,
 }
 
 /// Version 1 intents may remain on disk after an interrupted older checkout.
@@ -207,6 +224,7 @@ impl From<LegacyCheckoutIntent> for CheckoutIntent {
     fn from(legacy: LegacyCheckoutIntent) -> Self {
         Self {
             format_version: legacy.format_version,
+            advance_ref: false,
             repository_id: legacy.repository_id,
             old_branch: legacy.old_branch,
             old_oid: legacy.old_oid,
@@ -220,6 +238,10 @@ impl From<LegacyCheckoutIntent> for CheckoutIntent {
             removed_directories: Vec::new(),
         }
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn intent_kind(repository_id: Uuid) -> String {
@@ -519,7 +541,10 @@ fn published_target_file(
 }
 
 fn validate_intent(intent: &CheckoutIntent, repository_id: Uuid) -> Result<(), CheckoutError> {
-    if !matches!(intent.format_version, 1 | 2)
+    if !matches!(intent.format_version, 1..=3)
+        || (intent.format_version == 3) != intent.advance_ref
+        || intent.advance_ref
+            && (intent.old_branch != intent.new_branch || intent.old_oid == intent.new_oid)
         || intent.repository_id != repository_id
         || intent.entries.len() > MAX_CHECKOUT_FILES
         || intent.directories.len() > MAX_CHECKOUT_FILES
@@ -780,9 +805,6 @@ pub(crate) fn begin_switch(
     name: &str,
 ) -> Result<GitBranchInfo, CheckoutError> {
     resume_pending_checkout(control, repository_id, root_path, catalog_dir)?;
-    if has_pending_stages(control, repository_id)? {
-        return Err(CheckoutError::DirtyWorktree);
-    }
     let branches = list_branches(control, repository_id)?;
     let current = branches
         .iter()
@@ -792,8 +814,76 @@ pub(crate) fn begin_switch(
         .iter()
         .find(|branch| branch.name == name)
         .ok_or(HistoryError::BranchNotFound)?;
-    let old_tree = committed_files(control, repository_id)?;
-    let new_tree = files_for_commit(control, repository_id, Some(Oid::from_bytes(&target.oid)?))?;
+    begin_checkout_to(
+        control,
+        repository_id,
+        root_path,
+        catalog_dir,
+        CheckoutTarget {
+            old_branch: &current.name,
+            old_oid: Some(Oid::from_bytes(&current.oid)?),
+            new_branch: name,
+            new_oid: Oid::from_bytes(&target.oid)?,
+            advance_ref: false,
+        },
+    )?;
+    Ok(GitBranchInfo {
+        current: true,
+        ..target.clone()
+    })
+}
+
+/// Advance the selected branch only when origin contains its current commit.
+/// The target ref and all blob anchors must already have been fetched.
+pub(crate) fn begin_pull(
+    control: &ControlStore,
+    repository_id: Uuid,
+    root_path: &Path,
+    catalog_dir: &PinnedDirectory,
+) -> Result<Oid, CheckoutError> {
+    resume_pending_checkout(control, repository_id, root_path, catalog_dir)?;
+    let branch = selected_branch(control, repository_id)?;
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+    let target = ref_oid(control, repository_id, remote_ref.as_bytes())?
+        .ok_or(CheckoutError::MissingRemoteBranch)?;
+    let local_ref = selected_ref(control, repository_id)?;
+    let old = ref_oid(control, repository_id, &local_ref)?;
+    if let Some(old) = old {
+        if old == target {
+            return Ok(target);
+        }
+        if !commit_descends_from(control, repository_id, target, old)? {
+            return Err(CheckoutError::NonFastForward);
+        }
+    }
+    begin_checkout_to(
+        control,
+        repository_id,
+        root_path,
+        catalog_dir,
+        CheckoutTarget {
+            old_branch: &branch,
+            old_oid: old,
+            new_branch: &branch,
+            new_oid: target,
+            advance_ref: true,
+        },
+    )?;
+    Ok(target)
+}
+
+fn begin_checkout_to(
+    control: &ControlStore,
+    repository_id: Uuid,
+    root_path: &Path,
+    catalog_dir: &PinnedDirectory,
+    target: CheckoutTarget<'_>,
+) -> Result<(), CheckoutError> {
+    if has_pending_stages(control, repository_id)? {
+        return Err(CheckoutError::DirtyWorktree);
+    }
+    let old_tree = files_for_commit(control, repository_id, target.old_oid)?;
+    let new_tree = files_for_commit(control, repository_id, Some(target.new_oid))?;
     let staged = staged_entries(control, repository_id)?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
@@ -905,16 +995,20 @@ pub(crate) fn begin_switch(
             new_id: None,
         });
     }
-    if entries.is_empty() {
+    if entries.is_empty() && !target.advance_ref {
         return Err(CheckoutError::IncompatibleIntent);
     }
     let mut intent = CheckoutIntent {
-        format_version: 2,
+        format_version: if target.advance_ref { 3 } else { 2 },
+        advance_ref: target.advance_ref,
         repository_id,
-        old_branch: selected_branch(control, repository_id)?,
-        old_oid: current.oid,
-        new_branch: name.to_owned(),
-        new_oid: target.oid,
+        old_branch: target.old_branch.to_owned(),
+        old_oid: target
+            .old_oid
+            .map(|oid| oid.as_bytes().try_into().expect("SHA-1 OID"))
+            .unwrap_or([0; 20]),
+        new_branch: target.new_branch.to_owned(),
+        new_oid: target.new_oid.as_bytes().try_into().expect("SHA-1 OID"),
         staging_name: format!("checkout-{}", Uuid::new_v4()),
         staging_id: None,
         phase: Phase::Preparing,
@@ -931,10 +1025,7 @@ pub(crate) fn begin_switch(
         return Err(CheckoutError::IncompatibleIntent);
     }
     apply_intent(control, &mut intent, &root, catalog_dir)?;
-    Ok(GitBranchInfo {
-        current: true,
-        ..target.clone()
-    })
+    Ok(())
 }
 
 pub(crate) fn resume_pending_checkout(
@@ -1047,12 +1138,34 @@ fn apply_intent(
     }
     if intent.phase == Phase::Applying {
         let branches = list_branches(control, intent.repository_id)?;
-        if !branches.iter().any(|branch| {
-            branch.current && branch.name == intent.old_branch && branch.oid == intent.old_oid
-        }) || !branches
-            .iter()
-            .any(|branch| branch.name == intent.new_branch && branch.oid == intent.new_oid)
-        {
+        let (old_current, target_available) = if intent.advance_ref {
+            let local_ref = format!("refs/heads/{}", intent.old_branch);
+            let remote_ref = format!("refs/remotes/origin/{}", intent.new_branch);
+            let old = ref_oid(control, intent.repository_id, local_ref.as_bytes())?;
+            let expected_old = if intent.old_oid == [0; 20] {
+                None
+            } else {
+                Some(Oid::from_bytes(&intent.old_oid)?)
+            };
+            (
+                selected_branch(control, intent.repository_id)? == intent.old_branch
+                    && old == expected_old,
+                ref_oid(control, intent.repository_id, remote_ref.as_bytes())?
+                    == Some(Oid::from_bytes(&intent.new_oid)?),
+            )
+        } else {
+            (
+                branches.iter().any(|branch| {
+                    branch.current
+                        && branch.name == intent.old_branch
+                        && branch.oid == intent.old_oid
+                }),
+                branches
+                    .iter()
+                    .any(|branch| branch.name == intent.new_branch && branch.oid == intent.new_oid),
+            )
+        };
+        if !old_current || !target_available {
             return Err(CheckoutError::IncompatibleIntent);
         }
         let target_files = files_for_commit(
@@ -1220,6 +1333,13 @@ fn apply_intent(
             intent.repository_id,
             &intent.new_branch,
         )?);
+        if intent.advance_ref {
+            records.push((
+                ref_kind(intent.repository_id),
+                format!("refs/heads/{}", intent.new_branch).into_bytes(),
+                fetched_ref_record(intent.new_oid)?,
+            ));
+        }
         intent.phase = Phase::Cleanup;
         records.push((
             intent_kind(intent.repository_id),
@@ -1296,6 +1416,44 @@ mod tests {
         assert_eq!(replayed.format_version, 1);
         assert!(replayed.directories.is_empty());
         assert!(replayed.removed_directories.is_empty());
+        assert_eq!(encode_intent(&replayed).unwrap(), original);
+    }
+
+    #[test]
+    fn version_two_checkout_intent_keeps_its_disk_format_during_replay() {
+        #[derive(Serialize)]
+        struct HistoricalVersionTwo<'a> {
+            format_version: u16,
+            repository_id: Uuid,
+            old_branch: &'a str,
+            old_oid: [u8; 20],
+            new_branch: &'a str,
+            new_oid: [u8; 20],
+            staging_name: String,
+            staging_id: Option<NativeFileId>,
+            phase: Phase,
+            entries: Vec<CheckoutEntry>,
+            directories: Vec<CheckoutDirectory>,
+            removed_directories: Vec<CheckoutRemovedDirectory>,
+        }
+        let repository_id = Uuid::new_v4();
+        let previous = HistoricalVersionTwo {
+            format_version: 2,
+            repository_id,
+            old_branch: "main",
+            old_oid: [1; 20],
+            new_branch: "topic",
+            new_oid: [2; 20],
+            staging_name: format!("checkout-{}", Uuid::new_v4()),
+            staging_id: None,
+            phase: Phase::Preparing,
+            entries: Vec::new(),
+            directories: Vec::new(),
+            removed_directories: Vec::new(),
+        };
+        let original = canonical_bytes(&previous).unwrap();
+        let replayed = decode_intent(&original, repository_id).unwrap();
+        assert!(!replayed.advance_ref);
         assert_eq!(encode_intent(&replayed).unwrap(), original);
     }
 }
