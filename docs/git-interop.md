@@ -20,8 +20,12 @@ commit tag with the configured committer identity. Both tag forms are included
 in encrypted history backups and keep their commits reachable until removed
 and pruned. Stock Git can fetch and push either tag form through the remote
 helper. Native `mutualgit push` can send a tag to an existing local bare Git
-repository with `mutualgit push /path/to/bare.git refs/tags/release`; native tag
-fetch remains pending.
+repository with `mutualgit push /path/to/bare.git refs/tags/release`. Native
+`mutualgit fetch /path/to/git-repository` imports branches and tags together;
+`mutualgit pull` fetches those refs before merging the selected branch. An
+existing local tag may be fetched again at the same object ID, but a remote
+rewrite or tag namespace conflict rejects the entire fetch without moving any
+refs.
 `mutualgit --help` gives the current command forms. Staging and checkout do
 not apply Git line-ending rules or content filters. A transforming
 `.gitattributes` rule is rejected before publishing staged bytes.

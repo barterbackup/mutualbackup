@@ -794,7 +794,7 @@ async fn main() -> Result<()> {
                 bail!("daemon fetched another repository");
             }
             println!(
-                "Fetched {branch_count} branch(es) from {}",
+                "Fetched {branch_count} branch(es) and available tags from {}",
                 source.display()
             );
         }

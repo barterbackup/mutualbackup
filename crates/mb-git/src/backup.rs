@@ -60,7 +60,7 @@ impl GitBackupDescriptor {
     /// Validate the full Git DAG and each blob's sector geometry before this
     /// descriptor can be placed in a signed revision or accepted on recovery.
     pub fn validate(&self) -> Result<(), GitBackupError> {
-        if !matches!(self.format_version, 1..=3)
+        if !matches!(self.format_version, 1..=4)
             || self.repository_id.is_nil()
             || self.refs.len() > MAX_OBJECTS
             || self.objects.len() > MAX_OBJECTS
@@ -85,7 +85,7 @@ impl GitBackupDescriptor {
             let kind = match object.kind {
                 1 => ObjectType::Commit,
                 2 => ObjectType::Tree,
-                3 if self.format_version == 3 => ObjectType::Tag,
+                3 if self.format_version >= 3 => ObjectType::Tag,
                 _ => return Err(GitBackupError::InvalidGraph),
             };
             let oid = Oid::hash_object(kind, &object.bytes)?;
@@ -185,7 +185,7 @@ impl GitBackupDescriptor {
         }) {
             return Err(GitBackupError::InvalidGraph);
         }
-        if self.format_version >= 2
+        if matches!(self.format_version, 2 | 3)
             && !self.refs.is_empty()
             && !ref_names.contains(format!("refs/heads/{}", self.head_branch).as_bytes())
         {
@@ -312,6 +312,12 @@ mod tests {
         let mut orphan = descriptor.clone();
         orphan.refs.pop();
         assert!(orphan.validate().is_err());
+        let mut unborn = descriptor;
+        unborn.format_version = 4;
+        unborn.refs.remove(0);
+        unborn.validate().unwrap();
+        unborn.format_version = 3;
+        assert!(unborn.validate().is_err());
     }
 
     #[test]

@@ -940,8 +940,9 @@ impl GitRepository {
         )?)
     }
 
-    /// Import remote branches without changing the selected HEAD, index, or
-    /// working tree. Interrupted imports resume from the durable fetch intent.
+    /// Import remote branches and tags without changing the selected HEAD,
+    /// index, or working tree. Interrupted imports resume from the durable
+    /// fetch intent. The result counts remote branches only.
     pub fn fetch_bare(&self, source: impl AsRef<Path>) -> Result<usize, RepositoryError> {
         self.resume_checkout()?;
         self.ensure_no_merge_session()?;

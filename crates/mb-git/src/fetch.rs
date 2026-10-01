@@ -2,7 +2,7 @@
 //! Commit/tree/tag metadata is bounded in the encrypted catalog. Blob payloads
 //! stream from raw Git objects directly into native immutable anchors.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{BufReader, Read, Write};
 use std::os::unix::ffi::OsStringExt;
@@ -165,21 +165,21 @@ fn source_repository(
         return Err(FetchError::UnsupportedSource);
     }
     let repo = match format_version {
-        1 => Repository::open_bare(path)?,
-        2..=4 => Repository::open(path)?,
+        1 | 5 => Repository::open_bare(path)?,
+        2..=4 | 6 => Repository::open(path)?,
         _ => return Err(FetchError::UnsupportedSource),
     };
     let git_directory = repo.path().canonicalize()?;
     if git_directory.starts_with(root) {
         return Err(FetchError::UnsupportedSource);
     }
-    let exact_location = if format_version == 3 {
+    let exact_location = if matches!(format_version, 3 | 6) {
         !repo.is_bare()
             && repo
                 .workdir()
                 .is_some_and(|workdir| workdir.canonicalize().ok().as_deref() == Some(path))
     } else {
-        (format_version != 1 || repo.is_bare()) && git_directory == path
+        (!matches!(format_version, 1 | 5) || repo.is_bare()) && git_directory == path
     };
     if !exact_location || repo.object_format() != ObjectFormat::Sha1 {
         return Err(FetchError::UnsupportedSource);
@@ -241,6 +241,25 @@ fn discover(
             return Err(FetchError::GraphTooLarge);
         }
     }
+    if matches!(format_version, 5 | 6) {
+        for reference in repo.references_glob("refs/tags/*")? {
+            let reference = reference?;
+            let name = reference.name()?.to_owned();
+            let tag = name
+                .strip_prefix("refs/tags/")
+                .ok_or(FetchError::IncompatibleSource)?;
+            if tag.is_empty() || tag.len() > 1024 || !git2::Reference::is_valid_name(&name) {
+                return Err(FetchError::IncompatibleSource);
+            }
+            refs.push(GitGraphRef {
+                name: name.into_bytes(),
+                oid: sha1(reference.target().ok_or(FetchError::IncompatibleSource)?),
+            });
+            if refs.len() > MAX_GRAPH_OBJECTS {
+                return Err(FetchError::GraphTooLarge);
+            }
+        }
+    }
     refs.sort_by(|left, right| left.name.cmp(&right.name));
 
     discover_from_refs(
@@ -285,7 +304,7 @@ fn discover_from_refs(
                     commits.push(oid);
                     break;
                 }
-                Some(ObjectType::Tag) if format_version == 4 && tag_name.is_some() => {
+                Some(ObjectType::Tag) if matches!(format_version, 4..=6) && tag_name.is_some() => {
                     let tag = object
                         .into_tag()
                         .map_err(|_| FetchError::IncompatibleSource)?;
@@ -440,7 +459,7 @@ fn validate_intent(
     repository_id: Uuid,
     root: &Path,
 ) -> Result<(), FetchError> {
-    if !matches!(intent.format_version, 1..=4)
+    if !matches!(intent.format_version, 1..=6)
         || intent.fetch_id.is_nil()
         || intent.repository_id != repository_id
         || intent.source_root != root
@@ -452,24 +471,37 @@ fn validate_intent(
         return Err(FetchError::IncompatibleSource);
     }
     let mut bytes = 0_usize;
+    let mut ref_names = HashSet::new();
     for reference in &intent.refs {
         let name =
             std::str::from_utf8(&reference.name).map_err(|_| FetchError::IncompatibleSource)?;
-        let prefix = match intent.format_version {
-            2 => "refs/heads/",
-            4 => "refs/tags/",
-            _ => "refs/remotes/origin/",
+        let valid_namespace = match intent.format_version {
+            2 => name.starts_with("refs/heads/"),
+            4 => name.starts_with("refs/tags/"),
+            5 | 6 => name.starts_with("refs/remotes/origin/") || name.starts_with("refs/tags/"),
+            _ => name.starts_with("refs/remotes/origin/"),
         };
-        if !name.starts_with(prefix) || !git2::Reference::is_valid_name(name) {
+        if !valid_namespace
+            || !git2::Reference::is_valid_name(name)
+            || name.len() > 2048
+            || !ref_names.insert(reference.name.as_slice())
+        {
             return Err(FetchError::IncompatibleSource);
         }
         bytes = bytes.saturating_add(reference.name.len() + 20);
+    }
+    if ref_names.iter().any(|name| {
+        name.iter()
+            .enumerate()
+            .any(|(index, byte)| *byte == b'/' && ref_names.contains(&name[..index]))
+    }) {
+        return Err(FetchError::IncompatibleSource);
     }
     for object in &intent.objects {
         let kind = match object.kind {
             1 => ObjectType::Commit,
             2 => ObjectType::Tree,
-            3 if intent.format_version == 4 => ObjectType::Tag,
+            3 if matches!(intent.format_version, 4..=6) => ObjectType::Tag,
             _ => return Err(FetchError::IncompatibleSource),
         };
         if Oid::hash_object(kind, &object.bytes)? != Oid::from_bytes(&object.oid)? {
@@ -480,7 +512,7 @@ fn validate_intent(
     if bytes > MAX_GRAPH_METADATA_BYTES {
         return Err(FetchError::GraphTooLarge);
     }
-    if intent.format_version == 4 {
+    if matches!(intent.format_version, 4..=6) {
         let temporary = tempfile::tempdir()?;
         let repository = Repository::init_bare(temporary.path())?;
         let odb = git2::Odb::new()?;
@@ -499,36 +531,36 @@ fn validate_intent(
                 return Err(FetchError::IncompatibleSource);
             }
         }
-        let reference = &intent.refs[0];
-        let tag_name = reference
-            .name
-            .strip_prefix(b"refs/tags/")
-            .ok_or(FetchError::IncompatibleSource)?;
-        let mut oid = Oid::from_bytes(&reference.oid)?;
         let mut seen_tags = HashSet::new();
-        loop {
-            match kinds.get(&oid) {
-                Some(ObjectType::Commit) => break,
-                Some(ObjectType::Tag) => {
-                    if !seen_tags.insert(oid) || seen_tags.len() > MAX_GRAPH_OBJECTS {
-                        return Err(FetchError::IncompatibleSource);
+        for reference in &intent.refs {
+            let mut oid = Oid::from_bytes(&reference.oid)?;
+            let tag_name = reference.name.strip_prefix(b"refs/tags/");
+            let mut chain = HashSet::new();
+            loop {
+                match kinds.get(&oid) {
+                    Some(ObjectType::Commit) => break,
+                    Some(ObjectType::Tag) if tag_name.is_some() => {
+                        if !chain.insert(oid) || chain.len() > MAX_GRAPH_OBJECTS {
+                            return Err(FetchError::IncompatibleSource);
+                        }
+                        let tag = repository
+                            .find_tag(oid)
+                            .map_err(|_| FetchError::IncompatibleSource)?;
+                        if chain.len() == 1 && tag.name_bytes() != tag_name.unwrap() {
+                            return Err(FetchError::IncompatibleSource);
+                        }
+                        if !matches!(
+                            tag.target_type(),
+                            Some(ObjectType::Commit | ObjectType::Tag)
+                        ) || kinds.get(&tag.target_id()) != tag.target_type().as_ref()
+                        {
+                            return Err(FetchError::IncompatibleSource);
+                        }
+                        seen_tags.insert(oid);
+                        oid = tag.target_id();
                     }
-                    let tag = repository
-                        .find_tag(oid)
-                        .map_err(|_| FetchError::IncompatibleSource)?;
-                    if seen_tags.len() == 1 && tag.name_bytes() != tag_name {
-                        return Err(FetchError::IncompatibleSource);
-                    }
-                    if !matches!(
-                        tag.target_type(),
-                        Some(ObjectType::Commit | ObjectType::Tag)
-                    ) || kinds.get(&tag.target_id()) != tag.target_type().as_ref()
-                    {
-                        return Err(FetchError::IncompatibleSource);
-                    }
-                    oid = tag.target_id();
+                    _ => return Err(FetchError::IncompatibleSource),
                 }
-                _ => return Err(FetchError::IncompatibleSource),
             }
         }
         if seen_tags.len()
@@ -764,9 +796,51 @@ fn import_blob(
     Ok(())
 }
 
-/// Fetch every local Git source branch into `refs/remotes/origin/*`. The selected local
-/// branch, index and worktree are unchanged. Blob imports are replayable; refs
-/// become visible only when every required native anchor has been published.
+fn check_fetched_tags(
+    control: &ControlStore,
+    repository_id: Uuid,
+    intent: &FetchIntent,
+) -> Result<(), FetchError> {
+    if !intent
+        .refs
+        .iter()
+        .any(|reference| reference.name.starts_with(b"refs/tags/"))
+    {
+        return Ok(());
+    }
+    let existing = list_tags(control, repository_id)?
+        .into_iter()
+        .map(|tag| (tag.name, tag.oid))
+        .collect::<BTreeMap<_, _>>();
+    for reference in &intent.refs {
+        let Some(name) = reference.name.strip_prefix(b"refs/tags/") else {
+            continue;
+        };
+        let name = std::str::from_utf8(name).map_err(|_| FetchError::IncompatibleSource)?;
+        if existing.get(name).is_some_and(|oid| *oid != reference.oid) {
+            return Err(FetchError::TagExists);
+        }
+        for (index, byte) in name.as_bytes().iter().enumerate() {
+            if *byte == b'/' && existing.contains_key(&name[..index]) {
+                return Err(FetchError::TagExists);
+            }
+        }
+        let prefix = format!("{name}/");
+        if existing
+            .range(prefix.clone()..)
+            .next()
+            .is_some_and(|(candidate, _)| candidate.starts_with(&prefix))
+        {
+            return Err(FetchError::TagExists);
+        }
+    }
+    Ok(())
+}
+
+/// Fetch source branches into `refs/remotes/origin/*` and tags into
+/// `refs/tags/*`. The selected local branch, index and worktree are unchanged.
+/// Blob imports are replayable; refs become visible only after every required
+/// native anchor has been published. Historical branch-only intents still replay.
 pub fn fetch_bare(
     control: &ControlStore,
     repository_id: Uuid,
@@ -784,7 +858,7 @@ pub fn fetch_bare(
         Some(bytes) => {
             let intent: FetchIntent = decode_canonical(&bytes)?;
             validate_intent(&intent, repository_id, source_root)?;
-            if !matches!(intent.format_version, 1 | 3)
+            if !matches!(intent.format_version, 1 | 3 | 5 | 6)
                 || source_path != intent.source_path
                     && source_path.canonicalize().ok().as_deref()
                         != Some(intent.source_path.as_path())
@@ -796,7 +870,7 @@ pub fn fetch_bare(
         None => {
             let canonical = source_path.canonicalize()?;
             let candidate = Repository::open(&canonical)?;
-            let format_version = if candidate.is_bare() { 1 } else { 3 };
+            let format_version = if candidate.is_bare() { 5 } else { 6 };
             let repository = source_repository(&canonical, source_root, format_version)?;
             let intent = discover(
                 &repository,
@@ -806,6 +880,7 @@ pub fn fetch_bare(
                 format_version,
             )?;
             validate_intent(&intent, repository_id, source_root)?;
+            check_fetched_tags(control, repository_id, &intent)?;
             let bytes = canonical_bytes(&intent)?;
             if !control.put_record_if_absent(&kind, ACTIVE, &bytes)? {
                 return Err(FetchError::PendingFetch);
@@ -821,6 +896,7 @@ pub fn fetch_bare(
         let kind = match object.kind {
             1 => ObjectType::Commit,
             2 => ObjectType::Tree,
+            3 if matches!(intent.format_version, 5 | 6) => ObjectType::Tag,
             _ => return Err(FetchError::IncompatibleSource),
         };
         records.push((
@@ -841,10 +917,24 @@ pub fn fetch_bare(
         .iter()
         .map(|blob| (verified_kind(&intent), blob.oid.to_vec()))
         .collect::<Vec<_>>();
+    if let Err(error) = check_fetched_tags(control, repository_id, &intent) {
+        control.put_records_and_retire_and_delete_if_value(
+            &[],
+            &deletions,
+            &kind,
+            ACTIVE,
+            &encoded,
+        )?;
+        return Err(error);
+    }
     control.put_records_and_retire_and_delete_if_value(
         &records, &deletions, &kind, ACTIVE, &encoded,
     )?;
-    Ok(intent.refs.len())
+    Ok(intent
+        .refs
+        .iter()
+        .filter(|reference| reference.name.starts_with(b"refs/remotes/origin/"))
+        .count())
 }
 
 /// Import one stock Git commit and publish a non-checked-out local branch only
@@ -1430,6 +1520,16 @@ mod tests {
                 &[&parent],
             )
             .unwrap();
+        let object = remote
+            .find_object(commit, Some(ObjectType::Commit))
+            .unwrap();
+        let tag = remote
+            .tag_annotation_create("release", &object, &signature, "release\r\n")
+            .unwrap();
+        remote
+            .reference("refs/tags/release", tag, false, "annotated tag")
+            .unwrap();
+        drop(object);
         drop(second_tree);
         drop(parent);
         drop(builder);
@@ -1440,8 +1540,10 @@ mod tests {
         let catalog_path = root.join(GIT_CATALOG_DIRECTORY).join("catalog.db");
         let control = ControlStore::open_existing_with_key(&catalog_path, &key).unwrap();
         let intent =
-            discover(&remote, repository_id, remote_path.clone(), root.clone(), 1).unwrap();
+            discover(&remote, repository_id, remote_path.clone(), root.clone(), 5).unwrap();
         assert_eq!(intent.blobs.len(), 2);
+        assert_eq!(intent.refs.len(), 2);
+        assert!(intent.objects.iter().any(|object| object.kind == 3));
         control
             .put_record_if_absent(
                 &fetch_kind(repository_id),
@@ -1481,7 +1583,13 @@ mod tests {
         let local = GitRepository::open(&root, repository_id, &key).unwrap();
         assert_eq!(local.fetch_bare(&remote_path).unwrap(), 1);
         let graph = local.export_graph_source().unwrap();
-        assert_eq!(graph.refs[0].oid.as_slice(), commit.as_bytes());
+        assert_eq!(graph.format_version, 2);
+        assert!(graph.refs.iter().any(|reference| {
+            reference.name == b"refs/remotes/origin/main" && reference.oid == sha1(commit)
+        }));
+        assert!(graph.refs.iter().any(|reference| {
+            reference.name == b"refs/tags/release" && reference.oid == sha1(tag)
+        }));
         assert_eq!(graph.blobs.len(), 2);
         assert!(
             graph
@@ -1527,14 +1635,18 @@ mod tests {
                 &[],
             )
             .unwrap();
+        stock
+            .reference("refs/tags/raw", commit, false, "lightweight tag")
+            .unwrap();
         let repository_id = Uuid::new_v4();
         let key = [100_u8; 32];
         let local = GitRepository::init(&root, repository_id, &key).unwrap();
         drop(local);
         let catalog_path = root.join(GIT_CATALOG_DIRECTORY).join("catalog.db");
         let control = ControlStore::open_existing_with_key(&catalog_path, &key).unwrap();
-        let intent = discover(&stock, repository_id, stock_root.clone(), root.clone(), 3).unwrap();
+        let intent = discover(&stock, repository_id, stock_root.clone(), root.clone(), 6).unwrap();
         assert_eq!(intent.blobs.len(), 1);
+        assert_eq!(intent.refs.len(), 2);
         control
             .put_record_if_absent(
                 &fetch_kind(repository_id),
@@ -1552,7 +1664,12 @@ mod tests {
         let local = GitRepository::open(&root, repository_id, &key).unwrap();
         assert_eq!(local.fetch_bare(&stock_root).unwrap(), 1);
         let graph = local.export_graph_source().unwrap();
-        assert_eq!(graph.refs[0].oid.as_slice(), commit.as_bytes());
+        assert!(graph.refs.iter().any(|reference| {
+            reference.name == b"refs/remotes/origin/main" && reference.oid == sha1(commit)
+        }));
+        assert!(graph.refs.iter().any(|reference| {
+            reference.name == b"refs/tags/raw" && reference.oid == sha1(commit)
+        }));
         let mut recovered = Vec::new();
         graph.blobs[0]
             .anchor
@@ -1565,6 +1682,149 @@ mod tests {
         for item in graph.blobs {
             item.anchor.remove().unwrap();
         }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn fetch_imports_tag_only_history_and_rejects_tag_rewrites_atomically() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-tag-fetch-{}", Uuid::new_v4()));
+        let root = run_root.join("work");
+        let remote_path = run_root.join("remote.git");
+        fs::create_dir_all(&root).unwrap();
+        let (remote, main) = make_remote(&remote_path, b"main\r\nbytes", 0o100644);
+        let payload = b"tag-only\r\nraw\0bytes";
+        let blob = remote.blob(payload).unwrap();
+        let mut builder = remote.treebuilder(None).unwrap();
+        builder.insert("tracked", blob, 0o100644).unwrap();
+        let tree = remote.find_tree(builder.write().unwrap()).unwrap();
+        let signature = git2::Signature::now("Remote", "remote@example.invalid").unwrap();
+        let tagged_commit = remote
+            .commit(None, &signature, &signature, "tag-only", &tree, &[])
+            .unwrap();
+        let target = remote
+            .find_object(tagged_commit, Some(ObjectType::Commit))
+            .unwrap();
+        let tag = remote
+            .tag_annotation_create("release", &target, &signature, "release\r\n")
+            .unwrap();
+        remote
+            .reference("refs/tags/release", tag, false, "annotated tag")
+            .unwrap();
+        remote
+            .reference("refs/tags/main", main, false, "lightweight tag")
+            .unwrap();
+        drop(target);
+        drop(tree);
+        drop(builder);
+
+        let repository_id = Uuid::new_v4();
+        let key = [111_u8; 32];
+        let local = GitRepository::init(&root, repository_id, &key).unwrap();
+        assert_eq!(local.fetch_bare(&remote_path).unwrap(), 1);
+        assert_eq!(local.selected_branch().unwrap(), "main");
+        assert!(local.branches().unwrap().is_empty());
+        assert!(!root.join("tracked").exists());
+        assert_eq!(local.tags().unwrap().len(), 2);
+        let graph = local.export_graph_source().unwrap();
+        assert_eq!(graph.format_version, 2);
+        assert_eq!(graph.refs.len(), 3);
+        assert!(
+            graph
+                .objects
+                .iter()
+                .any(|object| object.kind == 1 && object.oid == sha1(tagged_commit))
+        );
+        let fetched = graph
+            .blobs
+            .iter()
+            .find(|item| item.oid == sha1(blob))
+            .unwrap();
+        let mut bytes = Vec::new();
+        fetched
+            .anchor
+            .open_verified()
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, payload);
+        let descriptor = crate::GitBackupDescriptor {
+            format_version: 4,
+            repository_id,
+            refs: graph.refs.clone(),
+            objects: graph.objects.clone(),
+            blobs: graph
+                .blobs
+                .iter()
+                .enumerate()
+                .map(|(index, blob)| crate::GitBackupBlob {
+                    oid: blob.oid,
+                    logical_len: blob.anchor.logical_len,
+                    data_extents: vec![crate::GitDataExtent {
+                        offset: 0,
+                        logical_len: blob.anchor.logical_len,
+                        sectors: vec![mb_core::SectorRef {
+                            id: [index as u8; 32],
+                            root: [index as u8; 32],
+                            logical_len: blob.anchor.logical_len as u32,
+                        }],
+                    }],
+                })
+                .collect(),
+            head_branch: "main".to_owned(),
+        };
+        descriptor.validate().unwrap();
+        let recovered_root = run_root.join("recovered");
+        fs::create_dir_all(&recovered_root).unwrap();
+        let recovered = GitRepository::init(&recovered_root, repository_id, &key).unwrap();
+        recovered
+            .import_backup(
+                &descriptor,
+                &graph
+                    .blobs
+                    .iter()
+                    .map(|blob| blob.anchor.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        assert_eq!(recovered.export_graph_source().unwrap(), graph);
+        assert!(recovered.branches().unwrap().is_empty());
+        assert_eq!(recovered.selected_branch().unwrap(), "main");
+        drop(recovered);
+        drop(local);
+
+        remote
+            .reference("refs/heads/main", tagged_commit, true, "advance branch")
+            .unwrap();
+        remote
+            .reference("refs/tags/release", main, true, "rewrite tag")
+            .unwrap();
+        let local = GitRepository::open(&root, repository_id, &key).unwrap();
+        assert!(matches!(
+            local.fetch_bare(&remote_path),
+            Err(crate::RepositoryError::Fetch(FetchError::TagExists))
+        ));
+        assert_eq!(local.remote_branches().unwrap()[0].oid, sha1(main));
+        assert_eq!(
+            local
+                .tags()
+                .unwrap()
+                .iter()
+                .find(|item| item.name == "release")
+                .unwrap()
+                .oid,
+            sha1(tag)
+        );
+        assert_eq!(local.export_graph_source().unwrap(), graph);
+        drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        drop(remote);
         fs::remove_dir_all(run_root).unwrap();
     }
 }

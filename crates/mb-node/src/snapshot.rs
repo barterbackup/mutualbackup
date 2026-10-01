@@ -467,18 +467,8 @@ fn validate_git_graph_intent(intent: &GitGraphIntent) -> Result<()> {
     {
         bail!("pending Git graph backup has an unsupported version");
     }
-    let head_ref = format!("refs/heads/{}", intent.head_branch);
-    if intent.graph.refs.is_empty() {
-        if intent.head_branch != "main" {
-            bail!("unborn Git backup has an invalid selected branch");
-        }
-    } else if !intent
-        .graph
-        .refs
-        .iter()
-        .any(|reference| reference.name == head_ref.as_bytes())
-    {
-        bail!("selected Git branch is absent from the backed-up graph");
+    if intent.graph.refs.is_empty() && intent.head_branch != "main" {
+        bail!("unborn Git backup has an invalid selected branch");
     }
     Ok(())
 }
@@ -1212,8 +1202,20 @@ fn prepare_git_backup_descriptor(
             },
         });
     }
+    let selected_ref = format!("refs/heads/{head_branch}");
+    let selected_is_present = graph
+        .refs
+        .iter()
+        .any(|reference| reference.name == selected_ref.as_bytes());
+    let descriptor_version = if !graph.refs.is_empty() && !selected_is_present {
+        4
+    } else if graph.format_version == 2 {
+        3
+    } else {
+        2
+    };
     let descriptor = GitBackupDescriptor {
-        format_version: if graph.format_version == 2 { 3 } else { 2 },
+        format_version: descriptor_version,
         repository_id: graph.repository_id,
         refs: graph.refs,
         objects: graph.objects,
@@ -1646,7 +1648,7 @@ fn decode_private_metadata_with_git(
         }
         5 => {
             let metadata: GitPrivateMetadataV5 = decode_canonical(bytes)?;
-            if metadata.format_version != 5 || !matches!(metadata.git.format_version, 2 | 3) {
+            if metadata.format_version != 5 || !matches!(metadata.git.format_version, 2..=4) {
                 bail!("Git private metadata has the wrong version");
             }
             metadata.git.validate()?;
@@ -3386,6 +3388,89 @@ mod metadata_compatibility_tests {
         let mut invalid = current;
         invalid.head_branch = "missing".to_owned();
         assert!(decode_git_graph_intent(&canonical_bytes(&invalid).unwrap()).is_err());
+    }
+
+    #[test]
+    fn unborn_head_with_fetched_refs_uses_recoverable_git_descriptor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = git2::Repository::init_bare(temporary.path()).unwrap();
+        let tree_oid = repository.treebuilder(None).unwrap().write().unwrap();
+        let tree = repository.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Stock", "stock@example.test").unwrap();
+        let commit_oid = repository
+            .commit(None, &signature, &signature, "base", &tree, &[])
+            .unwrap();
+        let commit = repository
+            .find_object(commit_oid, Some(git2::ObjectType::Commit))
+            .unwrap();
+        let tag_oid = repository
+            .tag_annotation_create("release", &commit, &signature, "release")
+            .unwrap();
+        let odb = repository.odb().unwrap();
+        let object = |kind, oid: git2::Oid| GitGraphObject {
+            kind,
+            oid: oid.as_bytes().try_into().unwrap(),
+            bytes: odb.read(oid).unwrap().data().to_vec(),
+        };
+        let repository_id = Uuid::new_v4();
+        let graph = GitGraphSource {
+            format_version: 2,
+            repository_id,
+            refs: vec![
+                GitGraphRef {
+                    name: b"refs/remotes/origin/main".to_vec(),
+                    oid: commit_oid.as_bytes().try_into().unwrap(),
+                },
+                GitGraphRef {
+                    name: b"refs/tags/release".to_vec(),
+                    oid: tag_oid.as_bytes().try_into().unwrap(),
+                },
+            ],
+            objects: vec![
+                object(1, commit_oid),
+                object(2, tree_oid),
+                object(3, tag_oid),
+            ],
+            blobs: Vec::new(),
+        };
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([207; 32]));
+        let descriptor = prepare_git_backup_descriptor(
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &keys,
+            [31; 32],
+            repository_id,
+            &[33; 32],
+            &mut 0,
+            &mut BTreeMap::new(),
+            GitGraphIntent {
+                format_version: 2,
+                guild_id: [31; 32],
+                revision_id: Uuid::new_v4(),
+                protected_root_id: repository_id,
+                graph,
+                head_branch: "main".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(descriptor.format_version, 4);
+        assert!(
+            descriptor
+                .refs
+                .iter()
+                .all(|reference| reference.name.as_slice() != b"refs/heads/main")
+        );
+        let encoded = canonical_bytes(&GitPrivateMetadataV5 {
+            format_version: 5,
+            root_mode: 0o755,
+            root_modified_secs: 0,
+            root_modified_nanos: 0,
+            entries: Vec::new(),
+            git: descriptor.clone(),
+        })
+        .unwrap();
+        let (_, recovered) = decode_private_metadata_with_git(&encoded).unwrap();
+        assert_eq!(recovered, Some(descriptor));
     }
 
     fn restore_fixture(
