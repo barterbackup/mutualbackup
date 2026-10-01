@@ -21,23 +21,27 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::attributes::{is_attributes_path, validate_anchor};
-use crate::head::{HeadError, selected_branch, selected_branch_record, selected_ref};
+use crate::head::{
+    HeadError, branch_selected_elsewhere, selected_branch, selected_branch_for_scope,
+    selected_branch_record_for_scope, selected_ref, selected_ref_for_scope,
+};
 use crate::history::{
     GitBranchInfo, HistoryError, MergeIdentity, commit_descends_from, create_pathwise_merge_commit,
-    fetched_ref_record, list_branches, merge_commit_parents, ref_kind, ref_oid,
+    fetched_ref_record, list_branches_for_scope, merge_commit_parents, ref_kind, ref_oid,
 };
 use crate::merge::{
     MergeBlobError, MergeSession, load_merge_session, session_key, session_kind,
     store_merge_session,
 };
 use crate::stage::{
-    GitIndexEntry, StageError, anchors_for_oid, has_pending_stages, index_kind, stage_path_key,
-    staged_entries,
+    GitIndexEntry, StageError, anchors_for_oid, has_pending_stages_for_scope, index_kind_for_scope,
+    stage_path_key, staged_entries, staged_entries_for_scope,
 };
 use crate::status::{StatusError, TreeFiles, files_for_commit, repository_status};
-use crate::{GitAnchorError, blob_oid_from_anchor};
+use crate::{GitAnchorError, GitWorktreeScope, blob_oid_from_anchor};
 
 const INTENT_PREFIX: &str = "git-checkout-intent-v1/";
+const WORKTREE_INTENT_PREFIX: &str = "git-worktree-checkout-intent-v1/";
 const INTENT_KEY: &[u8] = b"active";
 const MAX_CHECKOUT_FILES: usize = 8_192;
 
@@ -151,6 +155,8 @@ pub enum CheckoutError {
     MissingRemoteBranch,
     #[error("the requested merge branch does not exist")]
     MissingMergeBranch,
+    #[error("the Git branch is selected by another worktree")]
+    BranchCheckedOutElsewhere,
     #[error("a divergent merge or pull needs an author name and email")]
     MissingMergeIdentity,
     #[error("merge needs resolution for paths: {0:?}")]
@@ -208,6 +214,16 @@ struct CheckoutIntent {
     entries: Vec<CheckoutEntry>,
     directories: Vec<CheckoutDirectory>,
     removed_directories: Vec<CheckoutRemovedDirectory>,
+}
+
+/// Linked worktrees use a separate namespace and bind each replayable intent
+/// to its worktree ID. The primary worktree keeps the historical disk format.
+#[derive(Serialize, Deserialize)]
+struct LinkedCheckoutIntent {
+    format_version: u16,
+    worktree_id: Uuid,
+    root_id: NativeFileId,
+    checkout: CheckoutIntent,
 }
 
 struct CheckoutTarget<'a> {
@@ -345,8 +361,8 @@ impl From<LegacyCheckoutIntentV3> for CheckoutIntent {
     }
 }
 
-fn intent_kind(repository_id: Uuid) -> String {
-    format!("{INTENT_PREFIX}{repository_id}")
+fn intent_kind_for_scope(scope: GitWorktreeScope) -> String {
+    scope.local_kind(INTENT_PREFIX, WORKTREE_INTENT_PREFIX)
 }
 
 fn stage_name(index: usize) -> String {
@@ -769,20 +785,58 @@ fn encode_intent(intent: &CheckoutIntent) -> Result<Vec<u8>, CheckoutError> {
     }
 }
 
-fn save_intent(control: &ControlStore, intent: &CheckoutIntent) -> Result<(), CheckoutError> {
+fn encode_intent_for_scope(
+    scope: GitWorktreeScope,
+    root_id: NativeFileId,
+    intent: &CheckoutIntent,
+) -> Result<Vec<u8>, CheckoutError> {
+    if scope.repository_id() != intent.repository_id {
+        return Err(CheckoutError::IncompatibleIntent);
+    }
     let encoded = encode_intent(intent)?;
-    control.put_record(&intent_kind(intent.repository_id), INTENT_KEY, &encoded)?;
+    if scope.worktree_id() == scope.repository_id() {
+        Ok(encoded)
+    } else {
+        Ok(canonical_bytes(&LinkedCheckoutIntent {
+            format_version: 1,
+            worktree_id: scope.worktree_id(),
+            root_id,
+            checkout: intent.clone(),
+        })?)
+    }
+}
+
+fn save_intent(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    root_id: NativeFileId,
+    intent: &CheckoutIntent,
+) -> Result<(), CheckoutError> {
+    let encoded = encode_intent_for_scope(scope, root_id, intent)?;
+    control.put_record(&intent_kind_for_scope(scope), INTENT_KEY, &encoded)?;
     Ok(())
 }
 
 fn load_intent(
     control: &ControlStore,
-    repository_id: Uuid,
+    scope: GitWorktreeScope,
+    root_id: NativeFileId,
 ) -> Result<Option<CheckoutIntent>, CheckoutError> {
-    let Some(bytes) = control.get_record(&intent_kind(repository_id), INTENT_KEY)? else {
+    let Some(bytes) = control.get_record(&intent_kind_for_scope(scope), INTENT_KEY)? else {
         return Ok(None);
     };
-    Ok(Some(decode_intent(&bytes, repository_id)?))
+    if scope.worktree_id() == scope.repository_id() {
+        return Ok(Some(decode_intent(&bytes, scope.repository_id())?));
+    }
+    let linked: LinkedCheckoutIntent = decode_canonical(&bytes)?;
+    if linked.format_version != 1
+        || linked.worktree_id != scope.worktree_id()
+        || linked.root_id != root_id
+    {
+        return Err(CheckoutError::IncompatibleIntent);
+    }
+    validate_intent(&linked.checkout, scope.repository_id())?;
+    Ok(Some(linked.checkout))
 }
 
 fn decode_intent(bytes: &[u8], repository_id: Uuid) -> Result<CheckoutIntent, CheckoutError> {
@@ -802,9 +856,10 @@ fn decode_intent(bytes: &[u8], repository_id: Uuid) -> Result<CheckoutIntent, Ch
 
 fn target_branch_is_current(
     control: &ControlStore,
+    scope: GitWorktreeScope,
     intent: &CheckoutIntent,
 ) -> Result<bool, CheckoutError> {
-    Ok(list_branches(control, intent.repository_id)?
+    Ok(list_branches_for_scope(control, scope)?
         .iter()
         .any(|branch| {
             branch.current && branch.name == intent.new_branch && branch.oid == intent.new_oid
@@ -978,15 +1033,35 @@ pub(crate) fn begin_switch(
     catalog_dir: &PinnedDirectory,
     name: &str,
 ) -> Result<GitBranchInfo, CheckoutError> {
-    resume_pending_checkout(control, repository_id, root_path, catalog_dir)?;
-    let branches = list_branches(control, repository_id)?;
+    begin_switch_for_scope(
+        control,
+        GitWorktreeScope::primary(repository_id),
+        root_path,
+        catalog_dir,
+        name,
+    )
+}
+
+pub(crate) fn begin_switch_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    root_path: &Path,
+    catalog_dir: &PinnedDirectory,
+    name: &str,
+) -> Result<GitBranchInfo, CheckoutError> {
+    let repository_id = scope.repository_id();
+    resume_pending_checkout_for_scope(control, scope, root_path, catalog_dir)?;
+    if branch_selected_elsewhere(control, scope, name)? {
+        return Err(CheckoutError::BranchCheckedOutElsewhere);
+    }
+    let branches = list_branches_for_scope(control, scope)?;
     let current = branches.iter().find(|branch| branch.current);
-    let old_branch = selected_branch(control, repository_id)?;
+    let old_branch = selected_branch_for_scope(control, scope)?;
     if current.is_none()
         && ref_oid(
             control,
             repository_id,
-            &selected_ref(control, repository_id)?,
+            &selected_ref_for_scope(control, scope)?,
         )?
         .is_some()
     {
@@ -996,9 +1071,9 @@ pub(crate) fn begin_switch(
         .iter()
         .find(|branch| branch.name == name)
         .ok_or(HistoryError::BranchNotFound)?;
-    begin_checkout_to(
+    begin_checkout_to_for_scope(
         control,
-        repository_id,
+        scope,
         root_path,
         catalog_dir,
         CheckoutTarget {
@@ -1296,6 +1371,23 @@ fn begin_checkout_to(
     catalog_dir: &PinnedDirectory,
     target: CheckoutTarget<'_>,
 ) -> Result<(), CheckoutError> {
+    begin_checkout_to_for_scope(
+        control,
+        GitWorktreeScope::primary(repository_id),
+        root_path,
+        catalog_dir,
+        target,
+    )
+}
+
+fn begin_checkout_to_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    root_path: &Path,
+    catalog_dir: &PinnedDirectory,
+    target: CheckoutTarget<'_>,
+) -> Result<(), CheckoutError> {
+    let repository_id = scope.repository_id();
     if target.merge_commit {
         let old = target.old_oid.ok_or(CheckoutError::IncompatibleIntent)?;
         let source_ref = target.target_ref.ok_or(CheckoutError::IncompatibleIntent)?;
@@ -1304,7 +1396,7 @@ fn begin_checkout_to(
             return Err(CheckoutError::IncompatibleIntent);
         }
     }
-    if has_pending_stages(control, repository_id)? {
+    if has_pending_stages_for_scope(control, scope)? {
         return Err(CheckoutError::DirtyWorktree);
     }
     let old_tree = files_for_commit(control, repository_id, target.old_oid)?;
@@ -1318,7 +1410,7 @@ fn begin_checkout_to(
             validate_anchor(&anchor)?;
         }
     }
-    let staged = staged_entries(control, repository_id)?
+    let staged = staged_entries_for_scope(control, scope)?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     if !index_matches_checkout(&staged, &old_tree, &new_tree, target.resolved_paths) {
@@ -1512,13 +1604,13 @@ fn begin_checkout_to(
     };
     validate_intent(&intent, repository_id)?;
     if !control.put_record_if_absent(
-        &intent_kind(repository_id),
+        &intent_kind_for_scope(scope),
         INTENT_KEY,
-        &encode_intent(&intent)?,
+        &encode_intent_for_scope(scope, root.identity()?, &intent)?,
     )? {
         return Err(CheckoutError::IncompatibleIntent);
     }
-    apply_intent(control, &mut intent, &root, catalog_dir)?;
+    apply_intent(control, scope, &mut intent, &root, catalog_dir)?;
     Ok(())
 }
 
@@ -1528,19 +1620,37 @@ pub(crate) fn resume_pending_checkout(
     root_path: &Path,
     catalog_dir: &PinnedDirectory,
 ) -> Result<(), CheckoutError> {
-    let Some(mut intent) = load_intent(control, repository_id)? else {
+    resume_pending_checkout_for_scope(
+        control,
+        GitWorktreeScope::primary(repository_id),
+        root_path,
+        catalog_dir,
+    )
+}
+
+pub(crate) fn resume_pending_checkout_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    root_path: &Path,
+    catalog_dir: &PinnedDirectory,
+) -> Result<(), CheckoutError> {
+    let root = PinnedDirectory::open(root_path)?;
+    let Some(mut intent) = load_intent(control, scope, root.identity()?)? else {
         return Ok(());
     };
-    let root = PinnedDirectory::open(root_path)?;
-    apply_intent(control, &mut intent, &root, catalog_dir)
+    apply_intent(control, scope, &mut intent, &root, catalog_dir)
 }
 
 fn apply_intent(
     control: &ControlStore,
+    scope: GitWorktreeScope,
     intent: &mut CheckoutIntent,
     root: &PinnedDirectory,
     catalog: &PinnedDirectory,
 ) -> Result<(), CheckoutError> {
+    if intent.repository_id != scope.repository_id() {
+        return Err(CheckoutError::IncompatibleIntent);
+    }
     let staging = match catalog.open_child_directory(&intent.staging_name)? {
         Some(staging) => staging,
         None if intent.staging_id.is_none() && intent.phase == Phase::Preparing => {
@@ -1549,10 +1659,10 @@ fn apply_intent(
             staging
         }
         None if intent.phase == Phase::Cleanup => {
-            if !target_branch_is_current(control, intent)? {
+            if !target_branch_is_current(control, scope, intent)? {
                 return Err(CheckoutError::IncompatibleIntent);
             }
-            control.delete_record(&intent_kind(intent.repository_id), INTENT_KEY)?;
+            control.delete_record(&intent_kind_for_scope(scope), INTENT_KEY)?;
             return Ok(());
         }
         None => return Err(CheckoutError::IncompatibleIntent),
@@ -1564,7 +1674,7 @@ fn apply_intent(
         }
     } else {
         intent.staging_id = Some(staging_id);
-        save_intent(control, intent)?;
+        save_intent(control, scope, root.identity()?, intent)?;
     }
     if intent.phase == Phase::Preparing {
         for index in 0..intent.entries.len() {
@@ -1594,7 +1704,7 @@ fn apply_intent(
                 verify_file(&staging, OsStr::new(&name), identity, target)?;
                 entry.new_id = Some(identity);
             }
-            save_intent(control, intent)?;
+            save_intent(control, scope, root.identity()?, intent)?;
         }
         for index in 0..intent.directories.len() {
             let directory = &mut intent.directories[index];
@@ -1625,13 +1735,16 @@ fn apply_intent(
                 return Err(CheckoutError::IncompatibleIntent);
             }
             directory.staged_id = Some(identity);
-            save_intent(control, intent)?;
+            save_intent(control, scope, root.identity()?, intent)?;
         }
         intent.phase = Phase::Applying;
-        save_intent(control, intent)?;
+        save_intent(control, scope, root.identity()?, intent)?;
     }
     if intent.phase == Phase::Applying {
-        let branches = list_branches(control, intent.repository_id)?;
+        if branch_selected_elsewhere(control, scope, &intent.new_branch)? {
+            return Err(CheckoutError::BranchCheckedOutElsewhere);
+        }
+        let branches = list_branches_for_scope(control, scope)?;
         let (old_current, target_available) = if intent.advance_ref {
             let local_ref = format!("refs/heads/{}", intent.old_branch);
             let remote_ref = format!("refs/remotes/origin/{}", intent.new_branch);
@@ -1659,14 +1772,14 @@ fn apply_intent(
                 Oid::from_bytes(&intent.new_oid)?
             };
             (
-                selected_branch(control, intent.repository_id)? == intent.old_branch
+                selected_branch_for_scope(control, scope)? == intent.old_branch
                     && old == expected_old,
                 ref_oid(control, intent.repository_id, target_ref)? == Some(expected_target),
             )
         } else if intent.format_version == 5 {
             let old_ref = format!("refs/heads/{}", intent.old_branch);
             (
-                selected_branch(control, intent.repository_id)? == intent.old_branch
+                selected_branch_for_scope(control, scope)? == intent.old_branch
                     && ref_oid(control, intent.repository_id, old_ref.as_bytes())?.is_none(),
                 branches
                     .iter()
@@ -1813,7 +1926,7 @@ fn apply_intent(
         }
         let mut records = Vec::new();
         let mut deletions = Vec::new();
-        let previous_index = staged_entries(control, intent.repository_id)?
+        let previous_index = staged_entries_for_scope(control, scope)?
             .into_iter()
             .collect::<BTreeMap<_, _>>();
         for (path, (oid, mode)) in &target_files {
@@ -1836,7 +1949,7 @@ fn apply_intent(
                 }
             };
             records.push((
-                index_kind(intent.repository_id),
+                index_kind_for_scope(scope),
                 path.clone(),
                 canonical_bytes(&GitIndexEntry {
                     format_version: 1,
@@ -1848,13 +1961,10 @@ fn apply_intent(
         }
         for path in previous_index.keys() {
             if !target_files.contains_key(path) {
-                deletions.push((index_kind(intent.repository_id), path.clone()));
+                deletions.push((index_kind_for_scope(scope), path.clone()));
             }
         }
-        records.push(selected_branch_record(
-            intent.repository_id,
-            &intent.new_branch,
-        )?);
+        records.push(selected_branch_record_for_scope(scope, &intent.new_branch)?);
         if intent.advance_ref {
             records.push((
                 ref_kind(intent.repository_id),
@@ -1864,11 +1974,16 @@ fn apply_intent(
         }
         intent.phase = Phase::Cleanup;
         records.push((
-            intent_kind(intent.repository_id),
+            intent_kind_for_scope(scope),
             INTENT_KEY.to_vec(),
-            encode_intent(intent)?,
+            encode_intent_for_scope(scope, root.identity()?, intent)?,
         ));
-        if let Some((session, encoded)) = load_merge_session(control, intent.repository_id)? {
+        let merge_session = if scope.worktree_id() == scope.repository_id() {
+            load_merge_session(control, intent.repository_id)?
+        } else {
+            None
+        };
+        if let Some((session, encoded)) = merge_session {
             let (first, second) = merge_commit_parents(
                 control,
                 intent.repository_id,
@@ -1906,7 +2021,7 @@ fn apply_intent(
         run_after_checkout_commit_hook();
     }
     if intent.phase == Phase::Cleanup {
-        if !target_branch_is_current(control, intent)? {
+        if !target_branch_is_current(control, scope, intent)? {
             return Err(CheckoutError::IncompatibleIntent);
         }
         for (index, _) in intent.directories.iter().enumerate() {
@@ -1943,7 +2058,7 @@ fn apply_intent(
         }
         catalog.remove_child_directory(&intent.staging_name, staging_id)?;
         catalog.sync_all()?;
-        control.delete_record(&intent_kind(intent.repository_id), INTENT_KEY)?;
+        control.delete_record(&intent_kind_for_scope(scope), INTENT_KEY)?;
     }
     Ok(())
 }

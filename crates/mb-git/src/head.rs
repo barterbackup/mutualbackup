@@ -84,6 +84,16 @@ pub(crate) fn linked_selected_branches(
     control: &ControlStore,
     repository_id: Uuid,
 ) -> Result<Vec<String>, HeadError> {
+    Ok(linked_selected_branches_with_scope(control, repository_id)?
+        .into_iter()
+        .map(|(_, branch)| branch)
+        .collect())
+}
+
+fn linked_selected_branches_with_scope(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<Vec<(GitWorktreeScope, String)>, HeadError> {
     let prefix = format!("{WORKTREE_HEAD_PREFIX}{repository_id}/");
     let mut branches = Vec::new();
     for (kind, key, _) in control.records_with_kind_prefix(&prefix)? {
@@ -96,9 +106,26 @@ pub(crate) fn linked_selected_branches(
         if suffix != worktree_id.to_string() || key != HEAD_KEY {
             return Err(HeadError::IncompatibleRecord);
         }
-        branches.push(selected_branch_for_scope(control, scope)?);
+        branches.push((scope, selected_branch_for_scope(control, scope)?));
     }
     Ok(branches)
+}
+
+pub(crate) fn branch_selected_elsewhere(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    name: &str,
+) -> Result<bool, HeadError> {
+    if scope.worktree_id() != scope.repository_id()
+        && selected_branch(control, scope.repository_id())? == name
+    {
+        return Ok(true);
+    }
+    Ok(
+        linked_selected_branches_with_scope(control, scope.repository_id())?
+            .iter()
+            .any(|(other, branch)| *other != scope && branch == name),
+    )
 }
 
 #[cfg(test)]

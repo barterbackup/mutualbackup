@@ -1049,6 +1049,16 @@ mod tests {
         assert!(linked_status.changes.is_empty());
         assert_eq!(local.status().unwrap().branch, "main");
         assert!(local.status().unwrap().changes.is_empty());
+        assert!(matches!(
+            crate::checkout::begin_switch_for_scope(
+                &local.catalog,
+                scope,
+                &linked_root,
+                &local.directory,
+                "main",
+            ),
+            Err(crate::CheckoutError::BranchCheckedOutElsewhere)
+        ));
 
         fs::write(linked_root.join("tracked"), b"linked\nbytes\n").unwrap();
         let linked_status =
@@ -1113,6 +1123,69 @@ mod tests {
             local.delete_branch("topic", true),
             Err(RepositoryError::History(crate::HistoryError::CurrentBranch))
         ));
+        local.create_branch_from("base-copy", "main").unwrap();
+        crate::checkout::begin_switch_for_scope(
+            &local.catalog,
+            scope,
+            &linked_root,
+            &local.directory,
+            "base-copy",
+        )
+        .unwrap();
+        assert_eq!(fs::read(linked_root.join("tracked")).unwrap(), b"base\r\n");
+        let linked_status =
+            crate::status::repository_status_for_scope(&local.catalog, scope, &linked_root)
+                .unwrap();
+        assert_eq!(linked_status.branch, "base-copy");
+        assert_eq!(linked_status.head_oid, Some(base.oid));
+        assert!(linked_status.changes.is_empty());
+        assert_eq!(local.status().unwrap().branch, "main");
+        assert_eq!(fs::read(primary_root.join("tracked")).unwrap(), b"base\r\n");
+        assert!(matches!(
+            local.switch_branch("base-copy"),
+            Err(RepositoryError::History(
+                crate::HistoryError::BranchCheckedOutElsewhere
+            ))
+        ));
+
+        crate::checkout::set_after_checkout_file_hook(Box::new(|| panic!("linked checkout crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::checkout::begin_switch_for_scope(
+                &local.catalog,
+                scope,
+                &linked_root,
+                &local.directory,
+                "topic",
+            )
+            .unwrap();
+        }));
+        assert!(interrupted.is_err());
+        drop(local);
+        let local = GitRepository::open(&primary_root, repository_id, &key).unwrap();
+        let wrong_root = run_root.join("wrong-linked-root");
+        fs::create_dir(&wrong_root).unwrap();
+        assert!(matches!(
+            crate::checkout::resume_pending_checkout_for_scope(
+                &local.catalog,
+                scope,
+                &wrong_root,
+                &local.directory,
+            ),
+            Err(crate::CheckoutError::IncompatibleIntent)
+        ));
+        crate::checkout::resume_pending_checkout_for_scope(
+            &local.catalog,
+            scope,
+            &linked_root,
+            &local.directory,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(linked_root.join("tracked")).unwrap(),
+            b"linked\nbytes\n"
+        );
+        assert_eq!(local.status().unwrap().branch, "main");
+        assert_eq!(fs::read(primary_root.join("tracked")).unwrap(), b"base\r\n");
 
         let primary = local.staged_entry("tracked").unwrap().unwrap();
         let mut anchors = std::collections::BTreeMap::new();

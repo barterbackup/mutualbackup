@@ -16,8 +16,9 @@ use uuid::Uuid;
 
 use crate::attributes::{is_attributes_path, validate_anchor, validate_attributes};
 use crate::head::{
-    HeadError, head_kind, linked_selected_branches, selected_branch, selected_branch_for_scope,
-    selected_branch_record, selected_ref_for_scope, store_selected_branch_for_scope,
+    HeadError, branch_selected_elsewhere, head_kind, linked_selected_branches, selected_branch,
+    selected_branch_for_scope, selected_branch_record, selected_ref_for_scope,
+    store_selected_branch_for_scope,
 };
 use crate::merge::{
     GeneratedBlob, MergeBlobError, MergeFileInput, MergeFileInputs, capture_generated_blob,
@@ -79,6 +80,8 @@ pub enum HistoryError {
     BranchExists,
     #[error("the selected branch cannot be deleted")]
     CurrentBranch,
+    #[error("the Git branch is selected by another worktree")]
+    BranchCheckedOutElsewhere,
     #[error("the branch is not merged into the selected branch")]
     BranchNotMerged,
     #[error("the current branch has no commit to branch from")]
@@ -377,6 +380,13 @@ pub fn list_branches(
     branch_records(control, repository_id)
 }
 
+pub(crate) fn list_branches_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+) -> Result<Vec<GitBranchInfo>, HistoryError> {
+    branch_records_for_scope(control, scope)
+}
+
 pub fn list_remote_branches(
     control: &ControlStore,
     repository_id: Uuid,
@@ -638,6 +648,9 @@ pub(crate) fn switch_same_tree_branch_for_scope(
     if name.len() > 1024 || !Branch::name_is_valid(name)? {
         return Err(HistoryError::InvalidBranch);
     }
+    if branch_selected_elsewhere(control, scope, name)? {
+        return Err(HistoryError::BranchCheckedOutElsewhere);
+    }
     let target = branch_records_for_scope(control, scope)?
         .into_iter()
         .find(|branch| branch.name == name)
@@ -692,6 +705,9 @@ pub(crate) fn commit_index_for_scope(
     message: &str,
 ) -> Result<GitCommitInfo, HistoryError> {
     let repository_id = scope.repository_id();
+    if branch_selected_elsewhere(control, scope, &selected_branch_for_scope(control, scope)?)? {
+        return Err(HistoryError::BranchCheckedOutElsewhere);
+    }
     if has_pending_stages_for_scope(control, scope)? {
         return Err(HistoryError::PendingStage);
     }
