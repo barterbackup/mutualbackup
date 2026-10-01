@@ -61,8 +61,14 @@ enum Command {
         #[arg(short = 'n', long = "max-count", default_value_t = 10)]
         limit: u32,
     },
-    /// List local branches or create one at the current commit.
-    Branch { name: Option<String> },
+    /// List branches or create one at HEAD or an explicit start point.
+    Branch {
+        /// Include fetched remote-tracking branches in the listing.
+        #[arg(short = 'a', long)]
+        all: bool,
+        name: Option<String>,
+        start_point: Option<String>,
+    },
     /// Switch to a branch using exact-byte reflink checkout.
     Switch { name: String },
     /// Check out a branch using the same protected worktree transition.
@@ -248,17 +254,29 @@ async fn main() -> Result<()> {
                 println!();
             }
         }
-        Command::Branch { name } => {
+        Command::Branch {
+            all,
+            name,
+            start_point,
+        } => {
             let (_, repository_id) = discover_repository(&working_directory)?;
             if let Some(name) = name {
-                let LocalResponse::GitBranchCreated(branch) = local_control_call(
-                    &socket,
-                    &LocalRequest::GitCreateBranch {
+                if all {
+                    bail!("branch -a lists refs; omit -a when creating a branch");
+                }
+                let request = match start_point {
+                    Some(start_point) => LocalRequest::GitCreateBranchFrom {
+                        repository_id,
+                        name,
+                        start_point,
+                    },
+                    None => LocalRequest::GitCreateBranch {
                         repository_id,
                         name,
                     },
-                )
-                .await?
+                };
+                let LocalResponse::GitBranchCreated(branch) =
+                    local_control_call(&socket, &request).await?
                 else {
                     bail!("daemon returned the wrong response to Git branch creation");
                 };
@@ -271,6 +289,9 @@ async fn main() -> Result<()> {
                     git2::Oid::from_bytes(&branch.oid)?
                 );
             } else {
+                if start_point.is_some() {
+                    bail!("a branch name is required before a start point");
+                }
                 let LocalResponse::GitBranches(branches) =
                     local_control_call(&socket, &LocalRequest::GitBranches { repository_id })
                         .await?
@@ -282,6 +303,22 @@ async fn main() -> Result<()> {
                         bail!("daemon listed a branch from another repository");
                     }
                     println!("{} {}", if branch.current { '*' } else { ' ' }, branch.name);
+                }
+                if all {
+                    let LocalResponse::GitRemoteBranches(remotes) = local_control_call(
+                        &socket,
+                        &LocalRequest::GitRemoteBranches { repository_id },
+                    )
+                    .await?
+                    else {
+                        bail!("daemon returned the wrong response to remote branch listing");
+                    };
+                    for remote in remotes {
+                        if remote.repository_id != repository_id || remote.format_version != 1 {
+                            bail!("daemon listed a remote branch from another repository");
+                        }
+                        println!("  remotes/{}", remote.name);
+                    }
                 }
             }
         }

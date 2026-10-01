@@ -26,7 +26,10 @@ use mb_core::{
     open_recovery_record, packing_protected_root, replay_coding_transcript, seal_recovery_record,
     sector_root, sign_guild_event, sign_legacy_coding_add_binding, synthetic_filler_sector,
 };
-use mb_git::{GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitRepository, GitStatus};
+use mb_git::{
+    GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitRemoteBranchInfo, GitRepository,
+    GitStatus,
+};
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
     VariableParityObject, filesystem_identity, probe_reflink,
@@ -1450,9 +1453,26 @@ impl Node {
             .map_err(Into::into)
     }
 
+    pub fn git_remote_branches(&self, repository_id: Uuid) -> Result<Vec<GitRemoteBranchInfo>> {
+        self.open_git_repository(repository_id)?
+            .remote_branches()
+            .map_err(Into::into)
+    }
+
     pub fn git_create_branch(&self, repository_id: Uuid, name: &str) -> Result<GitBranchInfo> {
         self.open_git_repository(repository_id)?
             .create_branch(name)
+            .map_err(Into::into)
+    }
+
+    pub fn git_create_branch_from(
+        &self,
+        repository_id: Uuid,
+        name: &str,
+        start_point: &str,
+    ) -> Result<GitBranchInfo> {
+        self.open_git_repository(repository_id)?
+            .create_branch_from(name, start_point)
             .map_err(Into::into)
     }
 
@@ -15439,6 +15459,17 @@ pub(crate) mod tests {
         assert_eq!(branches[0].name, "main");
         assert!(branches[0].current);
         assert_eq!(branches[1], older);
+        let remote_branches = reopened.git_remote_branches(info.repository_id).unwrap();
+        assert_eq!(remote_branches.len(), 1);
+        assert_eq!(remote_branches[0].name, "origin/main");
+        assert_eq!(remote_branches[0].oid, second_commit.oid);
+        assert_eq!(
+            reopened
+                .git_create_branch_from(info.repository_id, "from-origin", "origin/main")
+                .unwrap()
+                .oid,
+            second_commit.oid
+        );
         reopened
             .git_switch_branch(info.repository_id, "older")
             .unwrap();

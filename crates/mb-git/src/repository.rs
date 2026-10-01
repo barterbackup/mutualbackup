@@ -21,9 +21,9 @@ use crate::diff::{DiffError, GitDiff, repository_diff};
 use crate::fetch::{FetchError, fetch_bare};
 use crate::head::{HeadError, selected_branch};
 use crate::history::{
-    GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, HistoryError, commit_index,
-    create_branch, export_graph_source, import_graph_backup, list_branches, log_history,
-    switch_same_tree_branch,
+    GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, GitRemoteBranchInfo, HistoryError,
+    commit_index, create_branch, create_branch_from, export_graph_source, import_graph_backup,
+    list_branches, list_remote_branches, log_history, switch_same_tree_branch,
 };
 use crate::interop::{GitInteropError, push_current_branch_to_bare};
 use crate::stage::{
@@ -326,6 +326,11 @@ impl GitRepository {
         Ok(list_branches(&self.catalog, self.repository_id)?)
     }
 
+    pub fn remote_branches(&self) -> Result<Vec<GitRemoteBranchInfo>, RepositoryError> {
+        self.resume_checkout()?;
+        Ok(list_remote_branches(&self.catalog, self.repository_id)?)
+    }
+
     pub fn selected_branch(&self) -> Result<String, RepositoryError> {
         self.resume_checkout()?;
         Ok(selected_branch(&self.catalog, self.repository_id)?)
@@ -336,11 +341,25 @@ impl GitRepository {
         Ok(create_branch(&self.catalog, self.repository_id, name)?)
     }
 
+    pub fn create_branch_from(
+        &self,
+        name: &str,
+        start_point: &str,
+    ) -> Result<GitBranchInfo, RepositoryError> {
+        self.resume_checkout()?;
+        Ok(create_branch_from(
+            &self.catalog,
+            self.repository_id,
+            name,
+            start_point,
+        )?)
+    }
+
     pub fn switch_branch(&self, name: &str) -> Result<GitBranchInfo, RepositoryError> {
         self.resume_checkout()?;
         match switch_same_tree_branch(&self.catalog, self.repository_id, name) {
             Ok(info) => Ok(info),
-            Err(HistoryError::CheckoutRequired) => Ok(begin_switch(
+            Err(HistoryError::CheckoutRequired | HistoryError::NoHead) => Ok(begin_switch(
                 &self.catalog,
                 self.repository_id,
                 &self.root,
@@ -581,6 +600,107 @@ mod tests {
             fs::read(unrelated_catalog.join("user-file")).unwrap(),
             b"must be preserved"
         );
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn fetched_non_main_branch_can_be_created_and_checked_out_from_unborn_head() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-remote-branch-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        let bare_root = run_root.join("remote.git");
+        fs::create_dir_all(source_root.join("dir")).unwrap();
+        let remote = git2::Repository::init_bare(&bare_root).unwrap();
+        let file = remote.blob(b"raw\r\nbytes\0").unwrap();
+        let link = remote.blob(b"dir/tracked").unwrap();
+        let mut nested_builder = remote.treebuilder(None).unwrap();
+        nested_builder.insert("tracked", file, 0o100644).unwrap();
+        let nested_oid = nested_builder.write().unwrap();
+        let mut root_builder = remote.treebuilder(None).unwrap();
+        root_builder.insert("dir", nested_oid, 0o040000).unwrap();
+        root_builder.insert("link", link, 0o120000).unwrap();
+        let tree = remote.find_tree(root_builder.write().unwrap()).unwrap();
+        let signature = git2::Signature::now("Remote", "remote@example.invalid").unwrap();
+        let commit = remote
+            .commit(
+                Some("refs/heads/topic"),
+                &signature,
+                &signature,
+                "topic",
+                &tree,
+                &[],
+            )
+            .unwrap();
+
+        let repository_id = Uuid::new_v4();
+        let key = [93_u8; 32];
+        let local = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        assert_eq!(local.fetch_bare(&bare_root).unwrap(), 1);
+        assert!(local.branches().unwrap().is_empty());
+        let remotes = local.remote_branches().unwrap();
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].name, "origin/topic");
+        assert_eq!(remotes[0].oid.as_slice(), commit.as_bytes());
+        assert!(matches!(
+            local.create_branch_from("main", "origin/topic"),
+            Err(RepositoryError::History(
+                crate::HistoryError::UnbornSelectedBranch
+            ))
+        ));
+        let created = local.create_branch_from("topic", "origin/topic").unwrap();
+        assert_eq!(created.oid.as_slice(), commit.as_bytes());
+        assert!(!created.current);
+        assert_eq!(local.selected_branch().unwrap(), "main");
+
+        fs::write(source_root.join("dir/tracked"), b"untracked collision").unwrap();
+        assert!(matches!(
+            local.switch_branch("topic"),
+            Err(RepositoryError::Checkout(
+                crate::CheckoutError::DirtyWorktree
+            ))
+        ));
+        assert_eq!(
+            fs::read(source_root.join("dir/tracked")).unwrap(),
+            b"untracked collision"
+        );
+        assert_eq!(local.selected_branch().unwrap(), "main");
+        fs::remove_file(source_root.join("dir/tracked")).unwrap();
+        crate::checkout::set_after_checkout_file_hook(Box::new(|| panic!("unborn switch crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local.switch_branch("topic").unwrap();
+        }));
+        assert!(interrupted.is_err());
+        drop(local);
+        let local = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        assert_eq!(local.selected_branch().unwrap(), "topic");
+        assert_eq!(
+            local.status().unwrap().head_oid.unwrap().as_slice(),
+            commit.as_bytes()
+        );
+        assert_eq!(
+            fs::read(source_root.join("dir/tracked")).unwrap(),
+            b"raw\r\nbytes\0"
+        );
+        assert_eq!(
+            fs::read_link(source_root.join("link"))
+                .unwrap()
+                .as_os_str()
+                .as_bytes(),
+            b"dir/tracked"
+        );
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        drop(tree);
+        drop(root_builder);
+        drop(nested_builder);
+        drop(remote);
+        fs::remove_dir_all(run_root).unwrap();
     }
 
     #[test]

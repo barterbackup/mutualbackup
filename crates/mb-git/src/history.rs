@@ -64,6 +64,10 @@ pub enum HistoryError {
     NoHead,
     #[error("the requested branch does not exist")]
     BranchNotFound,
+    #[error("the requested branch start point does not exist")]
+    StartPointNotFound,
+    #[error("the selected unborn branch needs checkout before its ref can be created")]
+    UnbornSelectedBranch,
     #[error("switching this branch requires a worktree checkout")]
     CheckoutRequired,
 }
@@ -95,6 +99,14 @@ pub struct GitBranchInfo {
     pub name: String,
     pub oid: [u8; 20],
     pub current: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitRemoteBranchInfo {
+    pub format_version: u16,
+    pub repository_id: Uuid,
+    pub name: String,
+    pub oid: [u8; 20],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -306,12 +318,101 @@ pub fn list_branches(
     branch_records(control, repository_id)
 }
 
+pub fn list_remote_branches(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<Vec<GitRemoteBranchInfo>, HistoryError> {
+    let mut result = Vec::new();
+    for (name, encoded) in control.records(&ref_kind(repository_id))? {
+        let name = std::str::from_utf8(&name).map_err(|_| HistoryError::IncompatibleRecord)?;
+        let Some(branch) = name.strip_prefix("refs/remotes/origin/") else {
+            continue;
+        };
+        if branch.len() > 1024 || !Branch::name_is_valid(branch)? {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        let record: RefRecord = decode_canonical(&encoded)?;
+        if record.format_version != 1 {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        checked_commit(control, repository_id, Oid::from_bytes(&record.oid)?)?;
+        result.push(GitRemoteBranchInfo {
+            format_version: 1,
+            repository_id,
+            name: format!("origin/{branch}"),
+            oid: record.oid,
+        });
+        if result.len() > MAX_GRAPH_OBJECTS {
+            return Err(HistoryError::GraphTooLarge);
+        }
+    }
+    result.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(result)
+}
+
+fn checked_commit(
+    control: &ControlStore,
+    repository_id: Uuid,
+    oid: Oid,
+) -> Result<(), HistoryError> {
+    let encoded = control
+        .get_record(&metadata_kind(repository_id), oid.as_bytes())?
+        .ok_or(HistoryError::IncompatibleRecord)?;
+    let object: MetadataObject = decode_canonical(&encoded)?;
+    if object.format_version != 1
+        || object.kind != object_code(ObjectType::Commit)?
+        || Oid::hash_object(ObjectType::Commit, &object.bytes)? != oid
+    {
+        return Err(HistoryError::IncompatibleRecord);
+    }
+    Ok(())
+}
+
 /// Create a ref at the current commit without copying any Git blob payload.
 /// The daemon serializes this with commits and other catalog mutations.
 pub fn create_branch(
     control: &ControlStore,
     repository_id: Uuid,
     name: &str,
+) -> Result<GitBranchInfo, HistoryError> {
+    let oid = head_oid(control, repository_id)?.ok_or(HistoryError::NoHead)?;
+    create_branch_at(control, repository_id, name, oid)
+}
+
+/// Create a local branch from a fetched `origin/<branch>` or another local
+/// branch without materializing a second Git blob store.
+pub fn create_branch_from(
+    control: &ControlStore,
+    repository_id: Uuid,
+    name: &str,
+    start_point: &str,
+) -> Result<GitBranchInfo, HistoryError> {
+    let source = if let Some(remote) = start_point.strip_prefix("origin/") {
+        if remote.len() > 1024 || !Branch::name_is_valid(remote)? {
+            return Err(HistoryError::InvalidBranch);
+        }
+        format!("refs/remotes/origin/{remote}")
+    } else {
+        if start_point.len() > 1024 || !Branch::name_is_valid(start_point)? {
+            return Err(HistoryError::InvalidBranch);
+        }
+        format!("refs/heads/{start_point}")
+    };
+    let oid = ref_oid(control, repository_id, source.as_bytes())?
+        .ok_or(HistoryError::StartPointNotFound)?;
+    if name == selected_branch(control, repository_id)?
+        && head_oid(control, repository_id)?.is_none()
+    {
+        return Err(HistoryError::UnbornSelectedBranch);
+    }
+    create_branch_at(control, repository_id, name, oid)
+}
+
+fn create_branch_at(
+    control: &ControlStore,
+    repository_id: Uuid,
+    name: &str,
+    oid: Oid,
 ) -> Result<GitBranchInfo, HistoryError> {
     if name.len() > 1024 || !Branch::name_is_valid(name)? {
         return Err(HistoryError::InvalidBranch);
@@ -328,17 +429,7 @@ pub fn create_branch(
             return Err(HistoryError::InvalidBranch);
         }
     }
-    let oid = head_oid(control, repository_id)?.ok_or(HistoryError::NoHead)?;
-    let encoded = control
-        .get_record(&metadata_kind(repository_id), oid.as_bytes())?
-        .ok_or(HistoryError::IncompatibleRecord)?;
-    let object: MetadataObject = decode_canonical(&encoded)?;
-    if object.format_version != 1
-        || object.kind != object_code(ObjectType::Commit)?
-        || Oid::hash_object(ObjectType::Commit, &object.bytes)? != oid
-    {
-        return Err(HistoryError::IncompatibleRecord);
-    }
+    checked_commit(control, repository_id, oid)?;
     let info = GitBranchInfo {
         format_version: 1,
         repository_id,

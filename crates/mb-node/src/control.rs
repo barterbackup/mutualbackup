@@ -438,12 +438,30 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitRemoteBranches { repository_id } => {
+            blocking_node(node, move |node| {
+                node.git_remote_branches(repository_id)
+                    .map(LocalResponse::GitRemoteBranches)
+            })
+            .await
+        }
         LocalRequest::GitCreateBranch {
             repository_id,
             name,
         } => {
             blocking_node(node, move |node| {
                 node.git_create_branch(repository_id, &name)
+                    .map(LocalResponse::GitBranchCreated)
+            })
+            .await
+        }
+        LocalRequest::GitCreateBranchFrom {
+            repository_id,
+            name,
+            start_point,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_create_branch_from(repository_id, &name, &start_point)
                     .map(LocalResponse::GitBranchCreated)
             })
             .await

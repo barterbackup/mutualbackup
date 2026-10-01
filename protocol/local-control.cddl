@@ -32,7 +32,9 @@ local-request =
   / { "GitCommit": { repository_id: uuid-text, author_name: tstr, author_email: tstr, message: tstr } }
   / { "GitLog": { repository_id: uuid-text, limit: uint } }
   / { "GitBranches": { repository_id: uuid-text } }
+  / { "GitRemoteBranches": { repository_id: uuid-text } }
   / { "GitCreateBranch": { repository_id: uuid-text, name: tstr } }
+  / { "GitCreateBranchFrom": { repository_id: uuid-text, name: tstr, start_point: tstr } }
   / { "GitSwitchBranch": { repository_id: uuid-text, name: tstr } }
   / { "GitPushBare": { repository_id: uuid-text, path: tstr } }
   / { "GitFetchBare": { repository_id: uuid-text, path: tstr } }
@@ -78,6 +80,7 @@ local-response =
   / { "GitCommitted": git-commit-info }
   / { "GitLog": [* git-log-entry] }
   / { "GitBranches": [* git-branch-info] }
+  / { "GitRemoteBranches": [* git-remote-branch-info] }
   / { "GitBranchCreated": git-branch-info }
   / { "GitBranchSelected": git-branch-info }
   / { "GitPushed": { repository_id: uuid-text, oid: bytes20-array } }
@@ -201,6 +204,13 @@ git-branch-info = {
   name: tstr,
   oid: bytes20-array,
   current: bool
+}
+
+git-remote-branch-info = {
+  format_version: uint,
+  repository_id: uuid-text,
+  name: tstr,
+  oid: bytes20-array
 }
 
 git-diff = {

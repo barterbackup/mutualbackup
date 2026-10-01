@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use mb_core::{NodeId, QuorumPolicy, Seed};
-use mb_git::{GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitStatus};
+use mb_git::{GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitRemoteBranchInfo, GitStatus};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -81,9 +81,17 @@ pub enum LocalRequest {
     GitBranches {
         repository_id: Uuid,
     },
+    GitRemoteBranches {
+        repository_id: Uuid,
+    },
     GitCreateBranch {
         repository_id: Uuid,
         name: String,
+    },
+    GitCreateBranchFrom {
+        repository_id: Uuid,
+        name: String,
+        start_point: String,
     },
     GitSwitchBranch {
         repository_id: Uuid,
@@ -189,6 +197,7 @@ pub enum LocalResponse {
     GitCommitted(GitCommitInfo),
     GitLog(Vec<GitLogEntry>),
     GitBranches(Vec<GitBranchInfo>),
+    GitRemoteBranches(Vec<GitRemoteBranchInfo>),
     GitBranchCreated(GitBranchInfo),
     GitBranchSelected(GitBranchInfo),
     GitPushed {
@@ -394,9 +403,15 @@ mod tests {
                 limit: 10,
             },
             LocalRequest::GitBranches { repository_id },
+            LocalRequest::GitRemoteBranches { repository_id },
             LocalRequest::GitCreateBranch {
                 repository_id,
                 name: "older".to_owned(),
+            },
+            LocalRequest::GitCreateBranchFrom {
+                repository_id,
+                name: "topic".to_owned(),
+                start_point: "origin/topic".to_owned(),
             },
             LocalRequest::GitSwitchBranch {
                 repository_id,
@@ -476,6 +491,12 @@ mod tests {
                 name: "main".to_owned(),
                 oid: [7; 20],
                 current: true,
+            }]),
+            LocalResponse::GitRemoteBranches(vec![GitRemoteBranchInfo {
+                format_version: 1,
+                repository_id,
+                name: "origin/topic".to_owned(),
+                oid: [7; 20],
             }]),
             LocalResponse::GitBranchCreated(GitBranchInfo {
                 format_version: 1,

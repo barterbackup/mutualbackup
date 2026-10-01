@@ -621,9 +621,11 @@ fn published_target_file(
 }
 
 fn validate_intent(intent: &CheckoutIntent, repository_id: Uuid) -> Result<(), CheckoutError> {
-    if !matches!(intent.format_version, 1..=4)
-        || (intent.format_version >= 3) != intent.advance_ref
+    if !matches!(intent.format_version, 1..=5)
+        || matches!(intent.format_version, 3 | 4) != intent.advance_ref
         || (intent.format_version == 4) != intent.target_ref.is_some()
+        || intent.format_version == 5
+            && (intent.old_oid != [0; 20] || intent.old_branch == intent.new_branch)
         || intent.target_ref.as_ref().is_some_and(|reference| {
             let Ok(name) = std::str::from_utf8(reference) else {
                 return true;
@@ -736,7 +738,7 @@ fn encode_intent(intent: &CheckoutIntent) -> Result<Vec<u8>, CheckoutError> {
             removed_directories: intent.removed_directories.clone(),
         })
         .map_err(Into::into),
-        4 => canonical_bytes(intent).map_err(Into::into),
+        4 | 5 => canonical_bytes(intent).map_err(Into::into),
         _ => Err(CheckoutError::IncompatibleIntent),
     }
 }
@@ -765,7 +767,7 @@ fn decode_intent(bytes: &[u8], repository_id: Uuid) -> Result<CheckoutIntent, Ch
         Some(1) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntent>(bytes)?),
         Some(2) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntentV2>(bytes)?),
         Some(3) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntentV3>(bytes)?),
-        Some(4) => decode_canonical::<CheckoutIntent>(bytes)?,
+        Some(4 | 5) => decode_canonical::<CheckoutIntent>(bytes)?,
         _ => return Err(CheckoutError::IncompatibleIntent),
     };
     validate_intent(&intent, repository_id)?;
@@ -932,10 +934,18 @@ pub(crate) fn begin_switch(
 ) -> Result<GitBranchInfo, CheckoutError> {
     resume_pending_checkout(control, repository_id, root_path, catalog_dir)?;
     let branches = list_branches(control, repository_id)?;
-    let current = branches
-        .iter()
-        .find(|branch| branch.current)
-        .ok_or(CheckoutError::IncompatibleIntent)?;
+    let current = branches.iter().find(|branch| branch.current);
+    let old_branch = selected_branch(control, repository_id)?;
+    if current.is_none()
+        && ref_oid(
+            control,
+            repository_id,
+            &selected_ref(control, repository_id)?,
+        )?
+        .is_some()
+    {
+        return Err(CheckoutError::IncompatibleIntent);
+    }
     let target = branches
         .iter()
         .find(|branch| branch.name == name)
@@ -946,8 +956,10 @@ pub(crate) fn begin_switch(
         root_path,
         catalog_dir,
         CheckoutTarget {
-            old_branch: &current.name,
-            old_oid: Some(Oid::from_bytes(&current.oid)?),
+            old_branch: &old_branch,
+            old_oid: current
+                .map(|branch| Oid::from_bytes(&branch.oid))
+                .transpose()?,
             new_branch: name,
             new_oid: Oid::from_bytes(&target.oid)?,
             advance_ref: false,
@@ -1167,7 +1179,7 @@ fn begin_checkout_to(
             new_id: None,
         });
     }
-    if entries.is_empty() && !target.advance_ref {
+    if entries.is_empty() && !target.advance_ref && target.old_oid.is_some() {
         return Err(CheckoutError::IncompatibleIntent);
     }
     let mut intent = CheckoutIntent {
@@ -1175,6 +1187,8 @@ fn begin_checkout_to(
             4
         } else if target.advance_ref {
             3
+        } else if target.old_oid.is_none() {
+            5
         } else {
             2
         },
@@ -1335,6 +1349,15 @@ fn apply_intent(
                     && old == expected_old,
                 ref_oid(control, intent.repository_id, target_ref)?
                     == Some(Oid::from_bytes(&intent.new_oid)?),
+            )
+        } else if intent.format_version == 5 {
+            let old_ref = format!("refs/heads/{}", intent.old_branch);
+            (
+                selected_branch(control, intent.repository_id)? == intent.old_branch
+                    && ref_oid(control, intent.repository_id, old_ref.as_bytes())?.is_none(),
+                branches
+                    .iter()
+                    .any(|branch| branch.name == intent.new_branch && branch.oid == intent.new_oid),
             )
         } else {
             (
