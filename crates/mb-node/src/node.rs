@@ -1496,6 +1496,17 @@ impl Node {
             .map_err(Into::into)
     }
 
+    pub fn git_worktree_reset_index(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        paths: &[PathBuf],
+    ) -> Result<u32> {
+        self.open_git_repository(repository_id)?
+            .linked_reset_index(worktree_id, paths)
+            .map_err(Into::into)
+    }
+
     pub fn git_worktree_create_branch(
         &self,
         repository_id: Uuid,
@@ -1724,6 +1735,12 @@ impl Node {
     pub fn git_create_branch(&self, repository_id: Uuid, name: &str) -> Result<GitBranchInfo> {
         self.open_git_repository(repository_id)?
             .create_branch(name)
+            .map_err(Into::into)
+    }
+
+    pub fn git_reset_index(&self, repository_id: Uuid, paths: &[PathBuf]) -> Result<u32> {
+        self.open_git_repository(repository_id)?
+            .reset_index(paths)
             .map_err(Into::into)
     }
 

@@ -106,6 +106,11 @@ pub enum LocalRequest {
         repository_id: Uuid,
         worktree_id: Uuid,
     },
+    GitWorktreeResetIndex {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        paths: Vec<PathBuf>,
+    },
     GitWorktreeCreateBranch {
         repository_id: Uuid,
         worktree_id: Uuid,
@@ -174,6 +179,10 @@ pub enum LocalRequest {
     },
     GitPrune {
         repository_id: Uuid,
+    },
+    GitResetIndex {
+        repository_id: Uuid,
+        paths: Vec<PathBuf>,
     },
     GitCreateBranch {
         repository_id: Uuid,
@@ -302,6 +311,10 @@ pub enum LocalResponse {
     },
     GitCachedPathRemoved {
         removed: bool,
+    },
+    GitIndexReset {
+        repository_id: Uuid,
+        changed_paths: u32,
     },
     GitPendingAddAbandoned {
         abandoned: bool,
@@ -551,6 +564,11 @@ mod tests {
                 repository_id,
                 worktree_id: Uuid::from_bytes([5; 16]),
             },
+            LocalRequest::GitWorktreeResetIndex {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                paths: vec![PathBuf::from("tracked")],
+            },
             LocalRequest::GitWorktreeCreateBranch {
                 repository_id,
                 worktree_id: Uuid::from_bytes([5; 16]),
@@ -648,6 +666,10 @@ mod tests {
                 oid: [7; 20],
             },
             LocalRequest::GitPrune { repository_id },
+            LocalRequest::GitResetIndex {
+                repository_id,
+                paths: Vec::new(),
+            },
             LocalRequest::GitCreateBranch {
                 repository_id,
                 name: "older".to_owned(),
@@ -776,6 +798,10 @@ mod tests {
                 path: PathBuf::from("folder/file"),
             },
             LocalResponse::GitCachedPathRemoved { removed: true },
+            LocalResponse::GitIndexReset {
+                repository_id,
+                changed_paths: 2,
+            },
             LocalResponse::GitPendingAddAbandoned { abandoned: true },
             LocalResponse::GitCommitted(GitCommitInfo {
                 format_version: 1,

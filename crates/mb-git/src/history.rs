@@ -26,7 +26,7 @@ use crate::merge::{
 };
 use crate::stage::{
     GitIndexEntry, StageError, anchors_for_oid, has_pending_stages_for_scope, index_kind,
-    object_kind, stage_path_key, staged_entries_for_scope,
+    index_kind_for_scope, object_kind, stage_path_key, staged_entries_for_scope,
 };
 use crate::status::{StatusError, TreeFiles, files_for_commit};
 use crate::{
@@ -497,6 +497,88 @@ fn checked_commit(
         return Err(HistoryError::IncompatibleRecord);
     }
     Ok(())
+}
+
+/// Replace selected index entries with the current HEAD tree in one catalog
+/// transaction. An empty path list resets the whole index; working files and
+/// the selected ref are untouched. The daemon serializes this with commits.
+pub(crate) fn reset_index_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    paths: &[PathBuf],
+) -> Result<u32, HistoryError> {
+    if has_pending_stages_for_scope(control, scope)? {
+        return Err(HistoryError::PendingStage);
+    }
+    let head = files_for_commit(
+        control,
+        scope.repository_id(),
+        head_oid_for_scope(control, scope)?,
+    )?;
+    let staged = staged_entries_for_scope(control, scope)?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let available = head
+        .keys()
+        .chain(staged.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let selected = if paths.is_empty() {
+        available
+    } else {
+        let mut selected = BTreeSet::new();
+        for path in paths {
+            let key = stage_path_key(path)?;
+            let mut directory_prefix = key.clone();
+            directory_prefix.push(b'/');
+            let matches = available
+                .iter()
+                .filter(|candidate| *candidate == &key || candidate.starts_with(&directory_prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                return Err(StageError::MissingUntrackedPath.into());
+            }
+            selected.extend(matches);
+        }
+        selected
+    };
+    let kind = index_kind_for_scope(scope);
+    let mut replacements = Vec::new();
+    let mut deletions = Vec::new();
+    for path in selected {
+        match (head.get(&path), staged.get(&path)) {
+            (Some(&(oid, mode)), previous) => {
+                if previous.is_some_and(|entry| entry.oid == oid && entry.mode == mode) {
+                    continue;
+                }
+                let oid = Oid::from_bytes(&oid)?;
+                let anchors = anchors_for_oid(control, scope.repository_id(), oid)?;
+                let anchor_id = anchors
+                    .first()
+                    .ok_or(HistoryError::IncompatibleRecord)?
+                    .anchor_id;
+                replacements.push((
+                    kind.clone(),
+                    path,
+                    canonical_bytes(&GitIndexEntry {
+                        format_version: 1,
+                        oid: oid.as_bytes().try_into().expect("SHA-1 OID"),
+                        mode,
+                        anchor_id,
+                    })?,
+                ));
+            }
+            (None, Some(_)) => deletions.push((kind.clone(), path)),
+            (None, None) => return Err(HistoryError::IncompatibleRecord),
+        }
+    }
+    let changed = u32::try_from(replacements.len() + deletions.len())
+        .map_err(|_| HistoryError::IncompatibleRecord)?;
+    if changed != 0 {
+        control.put_records_and_delete(&replacements, &deletions)?;
+    }
+    Ok(changed)
 }
 
 /// Create a ref at the current commit without copying any Git blob payload.

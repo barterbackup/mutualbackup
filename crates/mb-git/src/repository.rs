@@ -27,7 +27,8 @@ use crate::history::{
     create_branch_from, create_branch_from_for_scope, delete_branch, delete_branch_for_scope,
     export_graph_source, import_graph_backup, list_branches, list_branches_for_scope,
     list_commit_pins, list_remote_branches, log_history, log_history_for_scope, pin_commit,
-    switch_same_tree_branch, switch_same_tree_branch_for_scope, unpin_commit,
+    reset_index_for_scope, switch_same_tree_branch, switch_same_tree_branch_for_scope,
+    unpin_commit,
 };
 use crate::interop::{GitInteropError, push_current_branch_to_bare};
 use crate::merge::{
@@ -403,6 +404,20 @@ impl GitRepository {
         )?)
     }
 
+    pub fn linked_reset_index(
+        &self,
+        worktree_id: Uuid,
+        paths: &[PathBuf],
+    ) -> Result<u32, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        self.ensure_no_merge_session()?;
+        Ok(reset_index_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+            paths,
+        )?)
+    }
+
     pub fn linked_create_branch(
         &self,
         worktree_id: Uuid,
@@ -661,6 +676,16 @@ impl GitRepository {
     pub fn selected_branch(&self) -> Result<String, RepositoryError> {
         self.resume_checkout()?;
         Ok(selected_branch(&self.catalog, self.repository_id)?)
+    }
+
+    pub fn reset_index(&self, paths: &[PathBuf]) -> Result<u32, RepositoryError> {
+        self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
+        Ok(reset_index_for_scope(
+            &self.catalog,
+            crate::GitWorktreeScope::primary(self.repository_id),
+            paths,
+        )?)
     }
 
     pub fn create_branch(&self, name: &str) -> Result<GitBranchInfo, RepositoryError> {
@@ -1555,6 +1580,28 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        assert_eq!(
+            local
+                .linked_reset_index(linked.worktree_id, &[PathBuf::from("tracked")])
+                .unwrap(),
+            1
+        );
+        let status = local.linked_status(linked.worktree_id).unwrap();
+        assert!(status.changes.iter().any(|change| {
+            change.path == b"tracked"
+                && change.staged.is_none()
+                && change.worktree == Some(crate::GitChange::Modified)
+        }));
+        assert!(status.changes.iter().any(|change| {
+            change.path == b"symbolic" && change.staged == Some(crate::GitChange::Added)
+        }));
+        assert_eq!(
+            fs::read(linked_root.join("tracked")).unwrap(),
+            b"linked edit\r\n\0"
+        );
+        local
+            .linked_add_path(linked.worktree_id, "tracked")
+            .unwrap();
         assert!(
             !local
                 .linked_diff(linked.worktree_id, true)
@@ -3022,6 +3069,19 @@ mod tests {
         );
         assert_eq!(after_first.untracked, vec![b"untracked".to_vec()]);
         assert!(!after_first.history_backed_up);
+        assert!(repo.remove_cached("nested/tracked").unwrap());
+        assert_eq!(repo.reset_index(&[PathBuf::from("nested")]).unwrap(), 1);
+        assert_eq!(
+            repo.staged_entry("nested/tracked").unwrap().unwrap().oid,
+            first_blob.oid
+        );
+        assert_eq!(
+            fs::read(source_root.join("nested/tracked")).unwrap(),
+            b"second\nbytes"
+        );
+        assert!(repo.remove_cached("nested/tracked").unwrap());
+        assert_eq!(repo.reset_index(&[]).unwrap(), 1);
+        assert_eq!(repo.reset_index(&[]).unwrap(), 0);
         let second_blob = repo.stage_file("nested/tracked").unwrap();
         assert_ne!(first_blob.oid, second_blob.oid);
         let before_second = repo.status().unwrap();

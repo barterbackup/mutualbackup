@@ -52,6 +52,15 @@ enum Command {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
+    /// Reset the whole index or selected paths to HEAD without changing files.
+    Reset { paths: Vec<PathBuf> },
+    /// Restore selected index paths from HEAD; worktree restore is not yet supported.
+    Restore {
+        #[arg(long)]
+        staged: bool,
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
     /// Commit the staged snapshot to the current local branch.
     Commit {
         #[arg(short = 'm', long)]
@@ -322,6 +331,15 @@ async fn main() -> Result<()> {
                 }
                 println!("removed {} from index", relative.display());
             }
+        }
+        Command::Reset { paths } => {
+            reset_index(&socket, &working_directory, paths).await?;
+        }
+        Command::Restore { staged, paths } => {
+            if !staged {
+                bail!("only `restore --staged` is supported");
+            }
+            reset_index(&socket, &working_directory, paths).await?;
         }
         Command::Commit {
             message,
@@ -905,6 +923,37 @@ fn discover_location(start: &Path) -> Result<(PathBuf, Uuid, Option<Uuid>)> {
         }
     }
     bail!("no initialized MutualBackup Git repository contains this directory")
+}
+
+async fn reset_index(socket: &Path, working_directory: &Path, paths: Vec<PathBuf>) -> Result<()> {
+    let (root, repository_id, worktree_id) = discover_location(working_directory)?;
+    let paths = paths
+        .iter()
+        .map(|path| relative_for_add(&root, working_directory, path))
+        .collect::<Result<Vec<_>>>()?;
+    let request = match worktree_id {
+        Some(worktree_id) => LocalRequest::GitWorktreeResetIndex {
+            repository_id,
+            worktree_id,
+            paths,
+        },
+        None => LocalRequest::GitResetIndex {
+            repository_id,
+            paths,
+        },
+    };
+    let LocalResponse::GitIndexReset {
+        repository_id: returned_id,
+        changed_paths,
+    } = local_control_call(socket, &request).await?
+    else {
+        bail!("daemon returned the wrong response to Git index reset");
+    };
+    if returned_id != repository_id {
+        bail!("daemon reset another repository's index");
+    }
+    println!("Reset {changed_paths} staged path(s) to HEAD");
+    Ok(())
 }
 
 fn relative_for_add(root: &Path, working_directory: &Path, path: &Path) -> Result<PathBuf> {

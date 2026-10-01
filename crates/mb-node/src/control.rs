@@ -491,6 +491,21 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitWorktreeResetIndex {
+            repository_id,
+            worktree_id,
+            paths,
+        } => {
+            blocking_node(node, move |node| {
+                let changed_paths =
+                    node.git_worktree_reset_index(repository_id, worktree_id, &paths)?;
+                Ok(LocalResponse::GitIndexReset {
+                    repository_id,
+                    changed_paths,
+                })
+            })
+            .await
+        }
         LocalRequest::GitWorktreeCreateBranch {
             repository_id,
             worktree_id,
@@ -663,6 +678,19 @@ async fn handle_request(
         LocalRequest::GitPrune { repository_id } => {
             blocking_node(node, move |node| {
                 node.git_prune(repository_id).map(LocalResponse::GitPruned)
+            })
+            .await
+        }
+        LocalRequest::GitResetIndex {
+            repository_id,
+            paths,
+        } => {
+            blocking_node(node, move |node| {
+                let changed_paths = node.git_reset_index(repository_id, &paths)?;
+                Ok(LocalResponse::GitIndexReset {
+                    repository_id,
+                    changed_paths,
+                })
             })
             .await
         }
