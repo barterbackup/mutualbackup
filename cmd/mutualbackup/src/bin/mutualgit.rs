@@ -61,11 +61,17 @@ enum Command {
         #[arg(short = 'n', long = "max-count", default_value_t = 10)]
         limit: u32,
     },
-    /// List branches or create one at HEAD or an explicit start point.
+    /// List, create, or delete local branches.
     Branch {
         /// Include fetched remote-tracking branches in the listing.
         #[arg(short = 'a', long)]
         all: bool,
+        /// Delete a branch only if its tip is merged into the selected branch.
+        #[arg(short = 'd', long = "delete", conflicts_with = "force_delete")]
+        delete: bool,
+        /// Delete an unmerged branch; protected history still follows retention policy.
+        #[arg(short = 'D', long = "force-delete")]
+        force_delete: bool,
         name: Option<String>,
         start_point: Option<String>,
     },
@@ -256,13 +262,41 @@ async fn main() -> Result<()> {
         }
         Command::Branch {
             all,
+            delete,
+            force_delete,
             name,
             start_point,
         } => {
             let (_, repository_id) = discover_repository(&working_directory)?;
             if let Some(name) = name {
                 if all {
-                    bail!("branch -a lists refs; omit -a when creating a branch");
+                    bail!("branch -a lists refs; omit -a when changing a branch");
+                }
+                if delete || force_delete {
+                    if start_point.is_some() {
+                        bail!("branch deletion does not accept a start point");
+                    }
+                    let LocalResponse::GitBranchDeleted(branch) = local_control_call(
+                        &socket,
+                        &LocalRequest::GitDeleteBranch {
+                            repository_id,
+                            name,
+                            force: force_delete,
+                        },
+                    )
+                    .await?
+                    else {
+                        bail!("daemon returned the wrong response to Git branch deletion");
+                    };
+                    if branch.repository_id != repository_id || branch.current {
+                        bail!("daemon deleted an unexpected Git branch");
+                    }
+                    println!(
+                        "Deleted branch {} (was {})",
+                        branch.name,
+                        git2::Oid::from_bytes(&branch.oid)?
+                    );
+                    return Ok(());
                 }
                 let request = match start_point {
                     Some(start_point) => LocalRequest::GitCreateBranchFrom {
@@ -289,6 +323,9 @@ async fn main() -> Result<()> {
                     git2::Oid::from_bytes(&branch.oid)?
                 );
             } else {
+                if delete || force_delete {
+                    bail!("a branch name is required for deletion");
+                }
                 if start_point.is_some() {
                     bail!("a branch name is required before a start point");
                 }

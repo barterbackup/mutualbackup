@@ -60,6 +60,10 @@ pub enum HistoryError {
     InvalidBranch,
     #[error("the branch already exists")]
     BranchExists,
+    #[error("the selected branch cannot be deleted")]
+    CurrentBranch,
+    #[error("the branch is not merged into the selected branch")]
+    BranchNotMerged,
     #[error("the current branch has no commit to branch from")]
     NoHead,
     #[error("the requested branch does not exist")]
@@ -406,6 +410,45 @@ pub fn create_branch_from(
         return Err(HistoryError::UnbornSelectedBranch);
     }
     create_branch_at(control, repository_id, name, oid)
+}
+
+/// Remove a local branch ref. Ordinary deletion requires its tip to be
+/// reachable from the selected branch; forced deletion leaves its objects for
+/// the later reachability-based history collector.
+pub fn delete_branch(
+    control: &ControlStore,
+    repository_id: Uuid,
+    name: &str,
+    force: bool,
+) -> Result<GitBranchInfo, HistoryError> {
+    if name.len() > 1024 || !Branch::name_is_valid(name)? {
+        return Err(HistoryError::InvalidBranch);
+    }
+    if selected_branch(control, repository_id)? == name {
+        return Err(HistoryError::CurrentBranch);
+    }
+    let branch = branch_records(control, repository_id)?
+        .into_iter()
+        .find(|branch| branch.name == name)
+        .ok_or(HistoryError::BranchNotFound)?;
+    if !force {
+        let head = head_oid(control, repository_id)?;
+        let target = Oid::from_bytes(&branch.oid)?;
+        if !head
+            .map(|oid| commit_descends_from(control, repository_id, oid, target))
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Err(HistoryError::BranchNotMerged);
+        }
+    }
+    let reference = format!("refs/heads/{name}");
+    control.delete_record_if_value(
+        &ref_kind(repository_id),
+        reference.as_bytes(),
+        &fetched_ref_record(branch.oid)?,
+    )?;
+    Ok(branch)
 }
 
 fn create_branch_at(

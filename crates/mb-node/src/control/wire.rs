@@ -93,6 +93,11 @@ pub enum LocalRequest {
         name: String,
         start_point: String,
     },
+    GitDeleteBranch {
+        repository_id: Uuid,
+        name: String,
+        force: bool,
+    },
     GitSwitchBranch {
         repository_id: Uuid,
         name: String,
@@ -199,6 +204,7 @@ pub enum LocalResponse {
     GitBranches(Vec<GitBranchInfo>),
     GitRemoteBranches(Vec<GitRemoteBranchInfo>),
     GitBranchCreated(GitBranchInfo),
+    GitBranchDeleted(GitBranchInfo),
     GitBranchSelected(GitBranchInfo),
     GitPushed {
         repository_id: Uuid,
@@ -413,6 +419,11 @@ mod tests {
                 name: "topic".to_owned(),
                 start_point: "origin/topic".to_owned(),
             },
+            LocalRequest::GitDeleteBranch {
+                repository_id,
+                name: "older".to_owned(),
+                force: false,
+            },
             LocalRequest::GitSwitchBranch {
                 repository_id,
                 name: "older".to_owned(),
@@ -499,6 +510,13 @@ mod tests {
                 oid: [7; 20],
             }]),
             LocalResponse::GitBranchCreated(GitBranchInfo {
+                format_version: 1,
+                repository_id,
+                name: "older".to_owned(),
+                oid: [7; 20],
+                current: false,
+            }),
+            LocalResponse::GitBranchDeleted(GitBranchInfo {
                 format_version: 1,
                 repository_id,
                 name: "older".to_owned(),

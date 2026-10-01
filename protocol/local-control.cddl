@@ -35,6 +35,7 @@ local-request =
   / { "GitRemoteBranches": { repository_id: uuid-text } }
   / { "GitCreateBranch": { repository_id: uuid-text, name: tstr } }
   / { "GitCreateBranchFrom": { repository_id: uuid-text, name: tstr, start_point: tstr } }
+  / { "GitDeleteBranch": { repository_id: uuid-text, name: tstr, force: bool } }
   / { "GitSwitchBranch": { repository_id: uuid-text, name: tstr } }
   / { "GitPushBare": { repository_id: uuid-text, path: tstr } }
   / { "GitFetchBare": { repository_id: uuid-text, path: tstr } }
@@ -82,6 +83,7 @@ local-response =
   / { "GitBranches": [* git-branch-info] }
   / { "GitRemoteBranches": [* git-remote-branch-info] }
   / { "GitBranchCreated": git-branch-info }
+  / { "GitBranchDeleted": git-branch-info }
   / { "GitBranchSelected": git-branch-info }
   / { "GitPushed": { repository_id: uuid-text, oid: bytes20-array } }
   / { "GitFetched": { repository_id: uuid-text, branch_count: uint } }

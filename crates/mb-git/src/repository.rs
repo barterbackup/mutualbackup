@@ -22,8 +22,8 @@ use crate::fetch::{FetchError, fetch_bare};
 use crate::head::{HeadError, selected_branch};
 use crate::history::{
     GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, GitRemoteBranchInfo, HistoryError,
-    commit_index, create_branch, create_branch_from, export_graph_source, import_graph_backup,
-    list_branches, list_remote_branches, log_history, switch_same_tree_branch,
+    commit_index, create_branch, create_branch_from, delete_branch, export_graph_source,
+    import_graph_backup, list_branches, list_remote_branches, log_history, switch_same_tree_branch,
 };
 use crate::interop::{GitInteropError, push_current_branch_to_bare};
 use crate::stage::{
@@ -352,6 +352,16 @@ impl GitRepository {
             self.repository_id,
             name,
             start_point,
+        )?)
+    }
+
+    pub fn delete_branch(&self, name: &str, force: bool) -> Result<GitBranchInfo, RepositoryError> {
+        self.resume_checkout()?;
+        Ok(delete_branch(
+            &self.catalog,
+            self.repository_id,
+            name,
+            force,
         )?)
     }
 
@@ -795,8 +805,31 @@ mod tests {
             fs::read(source_root.join("tracked")).unwrap(),
             b"main divergent"
         );
+        assert!(matches!(
+            local.delete_branch("main", true),
+            Err(RepositoryError::History(crate::HistoryError::CurrentBranch))
+        ));
+        assert!(matches!(
+            local.delete_branch("topic", false),
+            Err(RepositoryError::History(
+                crate::HistoryError::BranchNotMerged
+            ))
+        ));
+        assert_eq!(local.branches().unwrap().len(), 2);
+        let merged = local.create_branch("merged").unwrap();
+        assert_eq!(local.delete_branch("merged", false).unwrap(), merged);
+        let deleted = local.delete_branch("topic", true).unwrap();
+        assert_eq!(deleted.name, "topic");
+        assert!(matches!(
+            local.merge_branch("topic"),
+            Err(RepositoryError::Checkout(
+                crate::CheckoutError::MissingMergeBranch
+            ))
+        ));
+        assert_eq!(local.branches().unwrap().len(), 1);
         assert_eq!(base.parent_oid, None);
         let graph = local.export_graph_source().unwrap();
+        assert_eq!(graph.refs.len(), 1);
         drop(local);
         for blob in graph.blobs {
             blob.anchor.remove().unwrap();

@@ -466,6 +466,17 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitDeleteBranch {
+            repository_id,
+            name,
+            force,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_delete_branch(repository_id, &name, force)
+                    .map(LocalResponse::GitBranchDeleted)
+            })
+            .await
+        }
         LocalRequest::GitSwitchBranch {
             repository_id,
             name,

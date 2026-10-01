@@ -1476,6 +1476,17 @@ impl Node {
             .map_err(Into::into)
     }
 
+    pub fn git_delete_branch(
+        &self,
+        repository_id: Uuid,
+        name: &str,
+        force: bool,
+    ) -> Result<GitBranchInfo> {
+        self.open_git_repository(repository_id)?
+            .delete_branch(name, force)
+            .map_err(Into::into)
+    }
+
     pub fn git_switch_branch(&self, repository_id: Uuid, name: &str) -> Result<GitBranchInfo> {
         self.open_git_repository(repository_id)?
             .switch_branch(name)
@@ -15466,6 +15477,13 @@ pub(crate) mod tests {
         assert_eq!(
             reopened
                 .git_create_branch_from(info.repository_id, "from-origin", "origin/main")
+                .unwrap()
+                .oid,
+            second_commit.oid
+        );
+        assert_eq!(
+            reopened
+                .git_delete_branch(info.repository_id, "from-origin", false)
                 .unwrap()
                 .oid,
             second_commit.oid
