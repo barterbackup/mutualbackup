@@ -101,6 +101,7 @@ pub(crate) fn linked_selected_branches(
     Ok(branches)
 }
 
+#[cfg(test)]
 pub(crate) fn store_selected_branch(
     control: &ControlStore,
     repository_id: Uuid,

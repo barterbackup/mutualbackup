@@ -1100,6 +1100,15 @@ mod tests {
         );
         assert_eq!(local.status().unwrap().head_oid, Some(base.oid));
         assert!(local.status().unwrap().changes.is_empty());
+        assert_eq!(
+            crate::history::log_history_for_scope(&local.catalog, scope, 2)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.oid)
+                .collect::<Vec<_>>(),
+            vec![linked_commit.oid, base.oid]
+        );
+        assert_eq!(local.log(2).unwrap()[0].oid, base.oid);
         assert!(matches!(
             local.delete_branch("topic", true),
             Err(RepositoryError::History(crate::HistoryError::CurrentBranch))

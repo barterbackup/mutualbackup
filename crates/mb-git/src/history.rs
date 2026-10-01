@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::attributes::{is_attributes_path, validate_anchor, validate_attributes};
 use crate::head::{
     HeadError, head_kind, linked_selected_branches, selected_branch, selected_branch_for_scope,
-    selected_branch_record, selected_ref, selected_ref_for_scope, store_selected_branch,
+    selected_branch_record, selected_ref_for_scope, store_selected_branch_for_scope,
 };
 use crate::merge::{
     GeneratedBlob, MergeBlobError, MergeFileInput, MergeFileInputs, capture_generated_blob,
@@ -322,7 +322,15 @@ fn branch_records(
     control: &ControlStore,
     repository_id: Uuid,
 ) -> Result<Vec<GitBranchInfo>, HistoryError> {
-    let current = selected_ref(control, repository_id)?;
+    branch_records_for_scope(control, GitWorktreeScope::primary(repository_id))
+}
+
+fn branch_records_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+) -> Result<Vec<GitBranchInfo>, HistoryError> {
+    let repository_id = scope.repository_id();
+    let current = selected_ref_for_scope(control, scope)?;
     let mut branches = Vec::new();
     for (name, encoded) in control.records(&ref_kind(repository_id))? {
         let full_name = std::str::from_utf8(&name).map_err(|_| HistoryError::IncompatibleRecord)?;
@@ -618,14 +626,23 @@ pub fn switch_same_tree_branch(
     repository_id: Uuid,
     name: &str,
 ) -> Result<GitBranchInfo, HistoryError> {
+    switch_same_tree_branch_for_scope(control, GitWorktreeScope::primary(repository_id), name)
+}
+
+pub(crate) fn switch_same_tree_branch_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    name: &str,
+) -> Result<GitBranchInfo, HistoryError> {
+    let repository_id = scope.repository_id();
     if name.len() > 1024 || !Branch::name_is_valid(name)? {
         return Err(HistoryError::InvalidBranch);
     }
-    let target = branch_records(control, repository_id)?
+    let target = branch_records_for_scope(control, scope)?
         .into_iter()
         .find(|branch| branch.name == name)
         .ok_or(HistoryError::BranchNotFound)?;
-    let current = head_oid(control, repository_id)?.ok_or(HistoryError::NoHead)?;
+    let current = head_oid_for_scope(control, scope)?.ok_or(HistoryError::NoHead)?;
     let temporary = tempfile::tempdir()?;
     let repository = Repository::init_bare(temporary.path())?;
     let odb = git2::Odb::new()?;
@@ -643,7 +660,7 @@ pub fn switch_same_tree_branch(
     if current_tree != target_tree {
         return Err(HistoryError::CheckoutRequired);
     }
-    store_selected_branch(control, repository_id, name)?;
+    store_selected_branch_for_scope(control, scope, name)?;
     Ok(GitBranchInfo {
         current: true,
         ..target
@@ -1042,10 +1059,19 @@ pub fn log_history(
     repository_id: Uuid,
     limit: usize,
 ) -> Result<Vec<GitLogEntry>, HistoryError> {
+    log_history_for_scope(control, GitWorktreeScope::primary(repository_id), limit)
+}
+
+pub(crate) fn log_history_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    limit: usize,
+) -> Result<Vec<GitLogEntry>, HistoryError> {
+    let repository_id = scope.repository_id();
     if limit == 0 || limit > 1000 {
         return Err(HistoryError::IncompatibleRecord);
     }
-    let Some(head) = head_oid(control, repository_id)? else {
+    let Some(head) = head_oid_for_scope(control, scope)? else {
         return Ok(Vec::new());
     };
     let temporary = tempfile::tempdir()?;
