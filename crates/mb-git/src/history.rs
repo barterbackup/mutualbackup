@@ -2,7 +2,7 @@
 //! canonical objects in a disposable metadata-only repository; file blobs never
 //! enter that repository or a Git object directory.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
@@ -22,6 +22,7 @@ use crate::stage::{
     GitIndexEntry, StageError, anchors_for_oid, has_pending_stages, index_kind, object_kind,
     stage_path_key, staged_entries,
 };
+use crate::status::{StatusError, TreeFiles, files_for_commit};
 use crate::{GitAnchorError, GitBackupDescriptor, GitBackupError, NativeOdb, blob_oid_from_anchor};
 
 const METADATA_PREFIX: &str = "git-metadata-object-v1/";
@@ -47,6 +48,8 @@ pub enum HistoryError {
     Backup(#[from] GitBackupError),
     #[error("Git HEAD record error: {0}")]
     Head(#[from] HeadError),
+    #[error("Git tree read error: {0}")]
+    Status(#[from] StatusError),
     #[error("temporary metadata repository error: {0}")]
     Io(#[from] std::io::Error),
     #[error("an unfinished add must be resumed or abandoned before committing")]
@@ -77,6 +80,10 @@ pub enum HistoryError {
     PinNotFound,
     #[error("switching this branch requires a worktree checkout")]
     CheckoutRequired,
+    #[error("both branches changed the same path; content merge is not yet supported")]
+    ContentMergeRequired,
+    #[error("the branches have no unique common ancestor")]
+    AmbiguousMergeBase,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -741,9 +748,172 @@ pub fn commit_index(
     })
 }
 
+/// Create a two-parent commit when every changed path can be selected from an
+/// existing parent without synthesizing new blob bytes. The commit and trees
+/// are durable but unreachable until checkout publishes the selected ref.
+pub(crate) fn create_pathwise_merge_commit(
+    control: &ControlStore,
+    repository_id: Uuid,
+    ours: Oid,
+    theirs: Oid,
+    author_name: &str,
+    author_email: &str,
+    message: &str,
+) -> Result<Oid, HistoryError> {
+    let temporary = tempfile::tempdir()?;
+    let repository = Repository::init_bare(temporary.path())?;
+    let metadata_odb = git2::Odb::new()?;
+    let _metadata_pack = metadata_odb.add_new_mempack_backend(1000)?;
+    repository.set_odb(&metadata_odb)?;
+    load_metadata(control, repository_id, &repository)?;
+    let bases = repository
+        .merge_bases(ours, theirs)
+        .map_err(|_| HistoryError::AmbiguousMergeBase)?;
+    if bases.len() != 1 {
+        return Err(HistoryError::AmbiguousMergeBase);
+    }
+    let base = bases.first().ok_or(HistoryError::AmbiguousMergeBase)?;
+    let base_files = files_for_commit(control, repository_id, Some(*base))?;
+    let our_files = files_for_commit(control, repository_id, Some(ours))?;
+    let their_files = files_for_commit(control, repository_id, Some(theirs))?;
+    let paths = base_files
+        .keys()
+        .chain(our_files.keys())
+        .chain(their_files.keys())
+        .collect::<BTreeSet<_>>();
+    let mut merged = TreeFiles::new();
+    for path in paths {
+        let base_file = base_files.get(path);
+        let our_file = our_files.get(path);
+        let their_file = their_files.get(path);
+        let chosen = if our_file == their_file {
+            our_file
+        } else if our_file == base_file {
+            their_file
+        } else if their_file == base_file {
+            our_file
+        } else {
+            return Err(HistoryError::ContentMergeRequired);
+        };
+        if let Some(file) = chosen {
+            merged.insert(path.clone(), *file);
+        }
+    }
+    for path in merged.keys() {
+        for (index, byte) in path.iter().enumerate() {
+            if *byte == b'/' && merged.contains_key(&path[..index]) {
+                return Err(HistoryError::ContentMergeRequired);
+            }
+        }
+    }
+
+    let mut anchors = Vec::new();
+    for (oid, _) in merged.values() {
+        let anchor = anchors_for_oid(control, repository_id, Oid::from_bytes(oid)?)?
+            .into_iter()
+            .next()
+            .ok_or(HistoryError::IncompatibleRecord)?;
+        anchors.push(anchor);
+    }
+    let native_odb = NativeOdb::from_anchors(anchors)?;
+    let _metadata_pack = native_odb.odb().add_new_mempack_backend(1000)?;
+    repository.set_odb(native_odb.odb())?;
+    load_metadata(control, repository_id, &repository)?;
+    let mut index = Index::new()?;
+    for (path, (oid, mode)) in merged {
+        index.add(&IndexEntry {
+            ctime: IndexTime::new(0, 0),
+            mtime: IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id: Oid::from_bytes(&oid)?,
+            flags: 0,
+            flags_extended: 0,
+            path,
+        })?;
+    }
+    let tree_oid = index.write_tree_to(&repository)?;
+    let root_tree = repository.find_tree(tree_oid)?;
+    let our_commit = repository
+        .find_commit(ours)
+        .map_err(|_| HistoryError::IncompatibleRecord)?;
+    let their_commit = repository
+        .find_commit(theirs)
+        .map_err(|_| HistoryError::IncompatibleRecord)?;
+    let signature = Signature::now(author_name, author_email)?;
+    let commit_bytes = repository
+        .commit_create_buffer(
+            &signature,
+            &signature,
+            message,
+            &root_tree,
+            &[&our_commit, &their_commit],
+        )?
+        .to_vec();
+    let commit_oid = Oid::hash_object(ObjectType::Commit, &commit_bytes)?;
+    let odb = repository.odb()?;
+    let mut pending = vec![tree_oid];
+    let mut seen = HashSet::new();
+    let mut published = Vec::new();
+    while let Some(oid) = pending.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        let tree = repository.find_tree(oid)?;
+        for entry in tree.iter() {
+            if entry.kind() == Some(ObjectType::Tree) {
+                pending.push(entry.id());
+            }
+        }
+        published.push((
+            metadata_kind(repository_id),
+            oid.as_bytes().to_vec(),
+            object_record(ObjectType::Tree, odb.read(oid)?.data().to_vec())?,
+        ));
+    }
+    published.push((
+        metadata_kind(repository_id),
+        commit_oid.as_bytes().to_vec(),
+        object_record(ObjectType::Commit, commit_bytes)?,
+    ));
+    for (kind, key, value) in &published {
+        if control
+            .get_record(kind, key)?
+            .is_some_and(|existing| existing != *value)
+        {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+    }
+    control.put_records_and_delete(&published, &[])?;
+    Ok(commit_oid)
+}
+
+pub(crate) fn merge_commit_parents(
+    control: &ControlStore,
+    repository_id: Uuid,
+    oid: Oid,
+) -> Result<(Oid, Oid), HistoryError> {
+    let temporary = tempfile::tempdir()?;
+    let repository = Repository::init_bare(temporary.path())?;
+    let odb = git2::Odb::new()?;
+    let _pack = odb.add_new_mempack_backend(1000)?;
+    repository.set_odb(&odb)?;
+    load_metadata(control, repository_id, &repository)?;
+    let commit = repository
+        .find_commit(oid)
+        .map_err(|_| HistoryError::IncompatibleRecord)?;
+    if commit.parent_count() != 2 {
+        return Err(HistoryError::IncompatibleRecord);
+    }
+    Ok((commit.parent_id(0)?, commit.parent_id(1)?))
+}
+
 /// Read reachable commits through libgit2 after verifying the catalog's raw
-/// object bytes against their IDs. Parent traversal handles merge commits
-/// even though merge creation is not yet exposed by this frontend.
+/// object bytes against their IDs. Parent traversal includes merge commits.
 pub fn log_history(
     control: &ControlStore,
     repository_id: Uuid,

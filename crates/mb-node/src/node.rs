@@ -1606,10 +1606,18 @@ impl Node {
         Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
     }
 
-    pub fn git_merge_branch(&self, repository_id: Uuid, branch: &str) -> Result<[u8; 20]> {
-        let oid = self
-            .open_git_repository(repository_id)?
-            .merge_branch(branch)?;
+    pub fn git_merge_branch(
+        &self,
+        repository_id: Uuid,
+        branch: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<[u8; 20]> {
+        let oid = self.open_git_repository(repository_id)?.merge_branch(
+            branch,
+            author_name,
+            author_email,
+        )?;
         Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
     }
 
@@ -15606,7 +15614,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             reopened
-                .git_merge_branch(info.repository_id, "main")
+                .git_merge_branch(info.repository_id, "main", "Author", "a@example.test")
                 .unwrap(),
             second_commit.oid
         );

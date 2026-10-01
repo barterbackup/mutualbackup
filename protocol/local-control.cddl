@@ -44,7 +44,7 @@ local-request =
   / { "GitPushBare": { repository_id: uuid-text, path: tstr } }
   / { "GitFetchBare": { repository_id: uuid-text, path: tstr } }
   / { "GitPullBare": { repository_id: uuid-text, path: tstr } }
-  / { "GitMergeBranch": { repository_id: uuid-text, branch: tstr } }
+  / { "GitMergeBranch": { repository_id: uuid-text, branch: tstr, ? author_name: tstr, ? author_email: tstr } }
   / { "GitDiff": { repository_id: uuid-text, cached: bool } }
   / { "GitStatus": { repository_id: uuid-text } }
   / "GuildStatus"

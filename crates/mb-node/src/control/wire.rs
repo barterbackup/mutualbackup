@@ -134,6 +134,10 @@ pub enum LocalRequest {
     GitMergeBranch {
         repository_id: Uuid,
         branch: String,
+        #[serde(default)]
+        author_name: String,
+        #[serde(default)]
+        author_email: String,
     },
     GitDiff {
         repository_id: Uuid,
@@ -480,6 +484,8 @@ mod tests {
             LocalRequest::GitMergeBranch {
                 repository_id,
                 branch: "older".to_owned(),
+                author_name: "Author".to_owned(),
+                author_email: "a@example.test".to_owned(),
             },
             LocalRequest::GitDiff {
                 repository_id,
@@ -498,6 +504,26 @@ mod tests {
                 serde_json::from_str(&encoded).unwrap();
             assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
         }
+        let older_merge = serde_json::json!({
+            "format_version": LOCAL_WIRE_FORMAT_VERSION,
+            "request_id": vec![9_u8; 16],
+            "request": { "GitMergeBranch": {
+                "repository_id": repository_id,
+                "branch": "older"
+            }}
+        });
+        let older_merge = serde_json::to_string(&older_merge).unwrap();
+        cddl_cat::validate_json_str("local-request-envelope", SCHEMA, &older_merge).unwrap();
+        let decoded: LocalRequestEnvelope<LocalRequest> =
+            serde_json::from_str(&older_merge).unwrap();
+        assert!(matches!(
+            decoded.request,
+            LocalRequest::GitMergeBranch {
+                author_name,
+                author_email,
+                ..
+            } if author_name.is_empty() && author_email.is_empty()
+        ));
         for response in [
             LocalResponse::GitRepositoryInitialized(GitRepositoryInfo {
                 format_version: 1,

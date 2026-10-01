@@ -93,8 +93,14 @@ enum Command {
     Fetch { source: PathBuf },
     /// Fetch and fast-forward the selected branch from a local bare repository.
     Pull { source: PathBuf },
-    /// Merge a local branch into the selected branch (fast-forward only for now).
-    Merge { branch: String },
+    /// Merge a local branch into the selected branch.
+    Merge {
+        branch: String,
+        #[arg(long)]
+        author_name: Option<String>,
+        #[arg(long)]
+        author_email: Option<String>,
+    },
     /// Show raw-byte changes in the worktree or staged index.
     Diff {
         #[arg(long, alias = "staged")]
@@ -530,8 +536,22 @@ async fn main() -> Result<()> {
                 source.display()
             );
         }
-        Command::Merge { branch } => {
+        Command::Merge {
+            branch,
+            author_name,
+            author_email,
+        } => {
             let (_, repository_id) = discover_repository(&working_directory)?;
+            let author_name = match author_name {
+                Some(value) => value,
+                None => optional_author_field("GIT_AUTHOR_NAME", "user.name")?.unwrap_or_default(),
+            };
+            let author_email = match author_email {
+                Some(value) => value,
+                None => {
+                    optional_author_field("GIT_AUTHOR_EMAIL", "user.email")?.unwrap_or_default()
+                }
+            };
             let LocalResponse::GitMerged {
                 repository_id: returned_id,
                 oid,
@@ -540,6 +560,8 @@ async fn main() -> Result<()> {
                 &LocalRequest::GitMergeBranch {
                     repository_id,
                     branch: branch.clone(),
+                    author_name,
+                    author_email,
                 },
             )
             .await?
@@ -630,6 +652,19 @@ fn author_field(environment: &str, config_key: &str) -> Result<String> {
     git2::Config::open_default()?
         .get_string(config_key)
         .with_context(|| format!("set {environment} or Git {config_key} before committing"))
+}
+
+fn optional_author_field(environment: &str, config_key: &str) -> Result<Option<String>> {
+    if let Some(value) = std::env::var_os(environment) {
+        return Ok(Some(value.into_string().map_err(|_| {
+            anyhow::anyhow!("{environment} is not valid UTF-8")
+        })?));
+    }
+    match git2::Config::open_default()?.get_string(config_key) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn discover_repository(start: &Path) -> Result<(PathBuf, Uuid)> {

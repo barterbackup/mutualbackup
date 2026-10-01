@@ -15,7 +15,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::checkout::{
-    CheckoutError, begin_merge_fast_forward, begin_pull, begin_switch, resume_pending_checkout,
+    CheckoutError, begin_merge_branch, begin_pull, begin_switch, resume_pending_checkout,
 };
 use crate::diff::{DiffError, GitDiff, repository_diff};
 use crate::fetch::{FetchError, fetch_bare};
@@ -487,16 +487,22 @@ impl GitRepository {
         )?)
     }
 
-    /// Merge a local branch by fast-forwarding the selected branch. Divergent
-    /// branches are rejected until the durable merge-commit path is available.
-    pub fn merge_branch(&self, branch: &str) -> Result<Oid, RepositoryError> {
+    /// Merge a local branch, publishing a two-parent commit for disjoint paths.
+    pub fn merge_branch(
+        &self,
+        branch: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<Oid, RepositoryError> {
         self.resume_checkout()?;
-        Ok(begin_merge_fast_forward(
+        Ok(begin_merge_branch(
             &self.catalog,
             self.repository_id,
             &self.root,
             &self.directory,
             branch,
+            author_name,
+            author_email,
         )?)
     }
 
@@ -751,6 +757,106 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn disjoint_branch_merge_replays_two_parent_commit_without_copying_blobs() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-disjoint-merge-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        let bare_root = run_root.join("remote.git");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("left"), b"left\r\nbase\0").unwrap();
+        fs::write(source_root.join("right"), b"right\nbase\0").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [94_u8; 32];
+        let local = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        local.stage_file("left").unwrap();
+        local.stage_file("right").unwrap();
+        local.commit("Author", "a@example.test", "base").unwrap();
+        local.create_branch("topic").unwrap();
+        local.switch_branch("topic").unwrap();
+        fs::write(source_root.join("right"), b"right\r\nnew\0").unwrap();
+        local.stage_file("right").unwrap();
+        let topic = local.commit("Author", "a@example.test", "topic").unwrap();
+        local.switch_branch("main").unwrap();
+        fs::write(source_root.join("left"), b"left\nnew\0").unwrap();
+        local.stage_file("left").unwrap();
+        let main = local.commit("Author", "a@example.test", "main").unwrap();
+        let before = local.export_graph_source().unwrap();
+        let blob_count = before.blobs.len();
+
+        crate::checkout::set_after_checkout_file_hook(Box::new(|| panic!("merge crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local
+                .merge_branch("topic", "Author", "a@example.test")
+                .unwrap();
+        }));
+        assert!(interrupted.is_err());
+        assert_eq!(
+            crate::history::ref_oid(&local.catalog, repository_id, b"refs/heads/main").unwrap(),
+            Some(Oid::from_bytes(&main.oid).unwrap())
+        );
+        drop(local);
+        let local = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        let merged = local.status().unwrap().head_oid.unwrap();
+        assert_ne!(merged, main.oid);
+        assert_ne!(merged, topic.oid);
+        assert_eq!(fs::read(source_root.join("left")).unwrap(), b"left\nnew\0");
+        assert_eq!(
+            fs::read(source_root.join("right")).unwrap(),
+            b"right\r\nnew\0"
+        );
+        assert_eq!(
+            local.log(1).unwrap()[0].parent_oids,
+            vec![main.oid, topic.oid]
+        );
+        assert_eq!(
+            crate::history::ref_oid(&local.catalog, repository_id, b"refs/heads/topic").unwrap(),
+            Some(Oid::from_bytes(&topic.oid).unwrap())
+        );
+        assert_eq!(local.export_graph_source().unwrap().blobs.len(), blob_count);
+        assert_eq!(
+            local
+                .merge_branch("topic", "Author", "a@example.test")
+                .unwrap()
+                .as_bytes(),
+            merged
+        );
+        git2::Repository::init_bare(&bare_root).unwrap();
+        local.push_current_branch_to_bare(&bare_root).unwrap();
+        let remote = git2::Repository::open_bare(&bare_root).unwrap();
+        let remote_commit = remote
+            .find_commit(Oid::from_bytes(&merged).unwrap())
+            .unwrap();
+        assert_eq!(remote_commit.parent_id(0).unwrap().as_bytes(), main.oid);
+        assert_eq!(remote_commit.parent_id(1).unwrap().as_bytes(), topic.oid);
+        assert_eq!(
+            remote
+                .find_blob(
+                    remote_commit
+                        .tree()
+                        .unwrap()
+                        .get_name("right")
+                        .unwrap()
+                        .id()
+                )
+                .unwrap()
+                .content(),
+            b"right\r\nnew\0"
+        );
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
+        drop(remote_commit);
+        drop(remote);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn local_branch_merge_fast_forwards_and_replays_without_moving_source_ref() {
         let test_root = PathBuf::from(
             std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
@@ -775,7 +881,7 @@ mod tests {
 
         fs::write(source_root.join("tracked"), b"dirty local bytes").unwrap();
         assert!(matches!(
-            local.merge_branch("topic"),
+            local.merge_branch("topic", "Author", "a@example.test"),
             Err(RepositoryError::Checkout(
                 crate::CheckoutError::DirtyWorktree
             ))
@@ -789,7 +895,9 @@ mod tests {
 
         crate::checkout::set_after_checkout_file_hook(Box::new(|| panic!("merge crash")));
         let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            local.merge_branch("topic").unwrap();
+            local
+                .merge_branch("topic", "Author", "a@example.test")
+                .unwrap();
         }));
         assert!(interrupted.is_err());
         assert_eq!(
@@ -806,7 +914,10 @@ mod tests {
             fs::read(source_root.join("tracked")).unwrap(),
             b"topic\nbytes\0"
         );
-        assert_eq!(local.merge_branch("topic").unwrap().as_bytes(), topic.oid);
+        assert_eq!(
+            local.merge_branch("topic", "", "").unwrap().as_bytes(),
+            topic.oid
+        );
         let branches = local.branches().unwrap();
         assert_eq!(branches.len(), 2);
         assert!(branches.iter().any(|branch| {
@@ -831,10 +942,16 @@ mod tests {
             .unwrap();
         local.switch_branch("main").unwrap();
         assert!(matches!(
-            local.merge_branch("topic"),
+            local.merge_branch("topic", "", ""),
             Err(RepositoryError::Checkout(
-                crate::CheckoutError::MergeCommitRequired
+                crate::CheckoutError::MissingMergeIdentity
             ))
+        ));
+        assert!(matches!(
+            local.merge_branch("topic", "Author", "a@example.test"),
+            Err(RepositoryError::Checkout(crate::CheckoutError::History(
+                crate::HistoryError::ContentMergeRequired
+            )))
         ));
         assert_eq!(local.status().unwrap().head_oid, Some(main.oid));
         assert_eq!(
@@ -874,7 +991,7 @@ mod tests {
         );
         assert!(pinned_graph.blobs.len() > 1);
         assert!(matches!(
-            local.merge_branch("topic"),
+            local.merge_branch("topic", "Author", "a@example.test"),
             Err(RepositoryError::Checkout(
                 crate::CheckoutError::MissingMergeBranch
             ))

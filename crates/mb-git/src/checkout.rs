@@ -22,14 +22,14 @@ use uuid::Uuid;
 
 use crate::head::{HeadError, selected_branch, selected_branch_record, selected_ref};
 use crate::history::{
-    GitBranchInfo, HistoryError, commit_descends_from, fetched_ref_record, list_branches, ref_kind,
-    ref_oid,
+    GitBranchInfo, HistoryError, commit_descends_from, create_pathwise_merge_commit,
+    fetched_ref_record, list_branches, merge_commit_parents, ref_kind, ref_oid,
 };
 use crate::stage::{
     GitIndexEntry, StageError, anchors_for_oid, has_pending_stages, index_kind, stage_path_key,
     staged_entries,
 };
-use crate::status::{StatusError, TreeFiles, files_for_commit};
+use crate::status::{StatusError, TreeFiles, files_for_commit, repository_status};
 use crate::{GitAnchorError, blob_oid_from_anchor};
 
 const INTENT_PREFIX: &str = "git-checkout-intent-v1/";
@@ -144,8 +144,8 @@ pub enum CheckoutError {
     NonFastForward,
     #[error("the requested merge branch does not exist")]
     MissingMergeBranch,
-    #[error("the merge branches have diverged; an automatic merge commit is not yet supported")]
-    MergeCommitRequired,
+    #[error("a divergent merge needs an author name and email")]
+    MissingMergeIdentity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -208,6 +208,7 @@ struct CheckoutTarget<'a> {
     new_oid: Oid,
     advance_ref: bool,
     target_ref: Option<&'a [u8]>,
+    merge_commit: bool,
 }
 
 /// Version 1 intents may remain on disk after an interrupted older checkout.
@@ -621,9 +622,9 @@ fn published_target_file(
 }
 
 fn validate_intent(intent: &CheckoutIntent, repository_id: Uuid) -> Result<(), CheckoutError> {
-    if !matches!(intent.format_version, 1..=5)
-        || matches!(intent.format_version, 3 | 4) != intent.advance_ref
-        || (intent.format_version == 4) != intent.target_ref.is_some()
+    if !matches!(intent.format_version, 1..=6)
+        || matches!(intent.format_version, 3 | 4 | 6) != intent.advance_ref
+        || matches!(intent.format_version, 4 | 6) != intent.target_ref.is_some()
         || intent.format_version == 5
             && (intent.old_oid != [0; 20] || intent.old_branch == intent.new_branch)
         || intent.target_ref.as_ref().is_some_and(|reference| {
@@ -738,7 +739,7 @@ fn encode_intent(intent: &CheckoutIntent) -> Result<Vec<u8>, CheckoutError> {
             removed_directories: intent.removed_directories.clone(),
         })
         .map_err(Into::into),
-        4 | 5 => canonical_bytes(intent).map_err(Into::into),
+        4..=6 => canonical_bytes(intent).map_err(Into::into),
         _ => Err(CheckoutError::IncompatibleIntent),
     }
 }
@@ -767,7 +768,7 @@ fn decode_intent(bytes: &[u8], repository_id: Uuid) -> Result<CheckoutIntent, Ch
         Some(1) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntent>(bytes)?),
         Some(2) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntentV2>(bytes)?),
         Some(3) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntentV3>(bytes)?),
-        Some(4 | 5) => decode_canonical::<CheckoutIntent>(bytes)?,
+        Some(4..=6) => decode_canonical::<CheckoutIntent>(bytes)?,
         _ => return Err(CheckoutError::IncompatibleIntent),
     };
     validate_intent(&intent, repository_id)?;
@@ -964,6 +965,7 @@ pub(crate) fn begin_switch(
             new_oid: Oid::from_bytes(&target.oid)?,
             advance_ref: false,
             target_ref: None,
+            merge_commit: false,
         },
     )?;
     Ok(GitBranchInfo {
@@ -1007,19 +1009,22 @@ pub(crate) fn begin_pull(
             new_oid: target,
             advance_ref: true,
             target_ref: None,
+            merge_commit: false,
         },
     )?;
     Ok(target)
 }
 
-/// Move the selected branch to another local branch's commit when that commit
-/// descends from HEAD. Both refs remain native catalog records throughout.
-pub(crate) fn begin_merge_fast_forward(
+/// Merge a local branch. Existing, disjoint-path blobs can form a two-parent
+/// commit without new payloads; checkout publishes it with a replayable intent.
+pub(crate) fn begin_merge_branch(
     control: &ControlStore,
     repository_id: Uuid,
     root_path: &Path,
     catalog_dir: &PinnedDirectory,
     branch: &str,
+    author_name: &str,
+    author_email: &str,
 ) -> Result<Oid, CheckoutError> {
     resume_pending_checkout(control, repository_id, root_path, catalog_dir)?;
     if branch.len() > 1024 || !Branch::name_is_valid(branch)? {
@@ -1036,7 +1041,42 @@ pub(crate) fn begin_merge_fast_forward(
             return Ok(target);
         }
         if !commit_descends_from(control, repository_id, target, old)? {
-            return Err(CheckoutError::MergeCommitRequired);
+            if commit_descends_from(control, repository_id, old, target)? {
+                return Ok(old);
+            }
+            if author_name.is_empty() || author_email.is_empty() {
+                return Err(CheckoutError::MissingMergeIdentity);
+            }
+            let status = repository_status(control, repository_id, root_path)?;
+            if !status.changes.is_empty() || !status.pending_adds.is_empty() {
+                return Err(CheckoutError::DirtyWorktree);
+            }
+            let message = format!("Merge branch '{branch}'");
+            let merged = create_pathwise_merge_commit(
+                control,
+                repository_id,
+                old,
+                target,
+                author_name,
+                author_email,
+                &message,
+            )?;
+            begin_checkout_to(
+                control,
+                repository_id,
+                root_path,
+                catalog_dir,
+                CheckoutTarget {
+                    old_branch: &selected,
+                    old_oid: Some(old),
+                    new_branch: &selected,
+                    new_oid: merged,
+                    advance_ref: true,
+                    target_ref: Some(source_ref.as_bytes()),
+                    merge_commit: true,
+                },
+            )?;
+            return Ok(merged);
         }
     }
     begin_checkout_to(
@@ -1051,6 +1091,7 @@ pub(crate) fn begin_merge_fast_forward(
             new_oid: target,
             advance_ref: true,
             target_ref: Some(source_ref.as_bytes()),
+            merge_commit: false,
         },
     )?;
     Ok(target)
@@ -1063,6 +1104,14 @@ fn begin_checkout_to(
     catalog_dir: &PinnedDirectory,
     target: CheckoutTarget<'_>,
 ) -> Result<(), CheckoutError> {
+    if target.merge_commit {
+        let old = target.old_oid.ok_or(CheckoutError::IncompatibleIntent)?;
+        let source_ref = target.target_ref.ok_or(CheckoutError::IncompatibleIntent)?;
+        let (first, second) = merge_commit_parents(control, repository_id, target.new_oid)?;
+        if first != old || ref_oid(control, repository_id, source_ref)? != Some(second) {
+            return Err(CheckoutError::IncompatibleIntent);
+        }
+    }
     if has_pending_stages(control, repository_id)? {
         return Err(CheckoutError::DirtyWorktree);
     }
@@ -1183,7 +1232,9 @@ fn begin_checkout_to(
         return Err(CheckoutError::IncompatibleIntent);
     }
     let mut intent = CheckoutIntent {
-        format_version: if target.target_ref.is_some() {
+        format_version: if target.merge_commit {
+            6
+        } else if target.target_ref.is_some() {
             4
         } else if target.advance_ref {
             3
@@ -1344,11 +1395,23 @@ fn apply_intent(
             } else {
                 Some(Oid::from_bytes(&intent.old_oid)?)
             };
+            let expected_target = if intent.format_version == 6 {
+                let (first, second) = merge_commit_parents(
+                    control,
+                    intent.repository_id,
+                    Oid::from_bytes(&intent.new_oid)?,
+                )?;
+                if Some(first) != expected_old {
+                    return Err(CheckoutError::IncompatibleIntent);
+                }
+                second
+            } else {
+                Oid::from_bytes(&intent.new_oid)?
+            };
             (
                 selected_branch(control, intent.repository_id)? == intent.old_branch
                     && old == expected_old,
-                ref_oid(control, intent.repository_id, target_ref)?
-                    == Some(Oid::from_bytes(&intent.new_oid)?),
+                ref_oid(control, intent.repository_id, target_ref)? == Some(expected_target),
             )
         } else if intent.format_version == 5 {
             let old_ref = format!("refs/heads/{}", intent.old_branch);

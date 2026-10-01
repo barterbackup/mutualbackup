@@ -563,9 +563,11 @@ async fn handle_request(
         LocalRequest::GitMergeBranch {
             repository_id,
             branch,
+            author_name,
+            author_email,
         } => {
             blocking_node(node, move |node| {
-                node.git_merge_branch(repository_id, &branch)
+                node.git_merge_branch(repository_id, &branch, &author_name, &author_email)
                     .map(|oid| LocalResponse::GitMerged { repository_id, oid })
             })
             .await
