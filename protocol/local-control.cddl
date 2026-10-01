@@ -29,6 +29,7 @@ local-request =
   / { "GitAdd": { repository_id: uuid-text, path: tstr } }
   / { "GitCommit": { repository_id: uuid-text, author_name: tstr, author_email: tstr, message: tstr } }
   / { "GitLog": { repository_id: uuid-text, limit: uint } }
+  / { "GitStatus": { repository_id: uuid-text } }
   / "GuildStatus"
   / "GuildCreate"
   / "GuildInvite"
@@ -63,6 +64,7 @@ local-response =
   / { "GitFileStaged": git-staged-file }
   / { "GitCommitted": git-commit-info }
   / { "GitLog": [* git-log-entry] }
+  / { "GitStatus": git-status }
   / { "Guild": null / guild-summary }
   / { "GuildInvite": { token: tstr, expires_at_unix_seconds: uint } }
   / { "GuildEventCommitted": { sequence: uint, event_hash: bytes32-array } }
@@ -171,6 +173,25 @@ git-log-entry = {
   author_email: [* uint8],
   message: [* uint8]
 }
+
+git-status = {
+  format_version: uint,
+  repository_id: uuid-text,
+  branch: tstr,
+  head_oid: null / bytes20-array,
+  history_backed_up: bool,
+  changes: [* git-status-change],
+  untracked: [* [* uint8]],
+  pending_adds: [* [* uint8]]
+}
+
+git-status-change = {
+  path: [* uint8],
+  staged: null / git-change,
+  worktree: null / git-change
+}
+
+git-change = "Added" / "Modified" / "Deleted" / "TypeChanged"
 
 p2p-status = {
   peer_id: tstr,

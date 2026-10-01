@@ -404,6 +404,12 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitStatus { repository_id } => {
+            blocking_node(node, move |node| {
+                node.git_status(repository_id).map(LocalResponse::GitStatus)
+            })
+            .await
+        }
         LocalRequest::GuildStatus => {
             blocking_node(node, |node| node.guild_summary().map(LocalResponse::Guild)).await
         }

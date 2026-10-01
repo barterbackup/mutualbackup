@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use mb_core::{NodeId, QuorumPolicy, Seed};
-use mb_git::{GitCommitInfo, GitLogEntry};
+use mb_git::{GitCommitInfo, GitLogEntry, GitStatus};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -70,6 +70,9 @@ pub enum LocalRequest {
         repository_id: Uuid,
         limit: u32,
     },
+    GitStatus {
+        repository_id: Uuid,
+    },
     GuildStatus,
     GuildCreate,
     GuildInvite,
@@ -136,6 +139,7 @@ pub enum LocalResponse {
     GitFileStaged(GitStagedFile),
     GitCommitted(GitCommitInfo),
     GitLog(Vec<GitLogEntry>),
+    GitStatus(GitStatus),
     Guild(Option<GuildSummary>),
     GuildInvite {
         token: String,
@@ -312,6 +316,7 @@ mod tests {
                 repository_id,
                 limit: 10,
             },
+            LocalRequest::GitStatus { repository_id },
         ] {
             let envelope = LocalRequestEnvelope {
                 format_version: LOCAL_WIRE_FORMAT_VERSION,
@@ -353,6 +358,20 @@ mod tests {
                 author_email: b"author@example.test".to_vec(),
                 message: b"first\n".to_vec(),
             }]),
+            LocalResponse::GitStatus(GitStatus {
+                format_version: 1,
+                repository_id,
+                branch: "main".to_owned(),
+                head_oid: Some([7; 20]),
+                history_backed_up: false,
+                changes: vec![mb_git::GitStatusChange {
+                    path: b"tracked".to_vec(),
+                    staged: Some(mb_git::GitChange::Modified),
+                    worktree: None,
+                }],
+                untracked: vec![b"new".to_vec()],
+                pending_adds: vec![],
+            }),
         ] {
             let envelope = LocalResponseEnvelope {
                 format_version: LOCAL_WIRE_FORMAT_VERSION,

@@ -292,6 +292,18 @@ pub fn has_pending_stages(control: &ControlStore, repository_id: Uuid) -> Result
     Ok(!control.records(&intent_kind(repository_id))?.is_empty())
 }
 
+pub fn pending_stage_paths(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<Vec<Vec<u8>>, StageError> {
+    let mut paths = Vec::new();
+    for (key, encoded) in control.records(&intent_kind(repository_id))? {
+        decode_intent(&encoded, repository_id, &key)?;
+        paths.push(key);
+    }
+    Ok(paths)
+}
+
 /// Resolve all physical anchors for a Git blob ID, verifying both the native
 /// content root and the Git object ID before the caller reads them.
 pub fn anchors_for_oid(

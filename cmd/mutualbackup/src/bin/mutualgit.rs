@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use mb_git::GitChange;
 use mb_node::{LocalRequest, LocalResponse, local_control_call};
 use mb_store::git_catalog_marker;
 use mutualbackup::default_control_socket;
@@ -48,6 +49,8 @@ enum Command {
         #[arg(short = 'n', long = "max-count", default_value_t = 10)]
         limit: u32,
     },
+    /// Show staged, working-tree, and backup-protection state.
+    Status,
 }
 
 #[tokio::main]
@@ -157,8 +160,52 @@ async fn main() -> Result<()> {
                 println!();
             }
         }
+        Command::Status => {
+            let (_, repository_id) = discover_repository(&working_directory)?;
+            let LocalResponse::GitStatus(status) =
+                local_control_call(&socket, &LocalRequest::GitStatus { repository_id }).await?
+            else {
+                bail!("daemon returned the wrong response to Git status");
+            };
+            println!("On branch {}", status.branch);
+            if !status.history_backed_up && status.head_oid.is_some() {
+                println!("Local commits are awaiting a signed backup");
+            }
+            for change in status.changes {
+                println!(
+                    "{}{} {}",
+                    change_code(change.staged),
+                    change_code(change.worktree),
+                    display_path(&change.path)
+                );
+            }
+            for path in status.untracked {
+                println!("?? {}", display_path(&path));
+            }
+            for path in status.pending_adds {
+                println!("pending add {}", display_path(&path));
+            }
+        }
     }
     Ok(())
+}
+
+fn display_path(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .flat_map(|byte| std::ascii::escape_default(*byte))
+        .map(char::from)
+        .collect()
+}
+
+fn change_code(change: Option<GitChange>) -> char {
+    match change {
+        Some(GitChange::Added) => 'A',
+        Some(GitChange::Modified) => 'M',
+        Some(GitChange::Deleted) => 'D',
+        Some(GitChange::TypeChanged) => 'T',
+        None => ' ',
+    }
 }
 
 fn author_field(environment: &str, config_key: &str) -> Result<String> {
@@ -229,5 +276,6 @@ mod tests {
         );
         assert!(relative_for_add(root, subdir, Path::new("../../escape")).is_err());
         assert!(relative_for_add(root, subdir, Path::new("/outside")).is_err());
+        assert_eq!(display_path(b"bad\xff\nname"), "bad\\xff\\nname");
     }
 }

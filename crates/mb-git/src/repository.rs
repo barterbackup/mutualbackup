@@ -19,6 +19,7 @@ use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, resume_pending_stages,
     stage_file, staged_entry,
 };
+use crate::status::{GitStatus, StatusError, repository_status};
 
 const INITIALIZATION_INTENT: &str = "repository-intent";
 const INITIALIZATION_MAGIC: &str = "mutualbackup-git-repository-init-v1\n";
@@ -38,6 +39,8 @@ pub enum RepositoryError {
     Stage(#[from] StageError),
     #[error("Git history error: {0}")]
     History(#[from] HistoryError),
+    #[error("Git status error: {0}")]
+    Status(#[from] StatusError),
     #[error("repository marker or catalog identity conflicts with this root")]
     Conflict,
     #[error("the Git repository is not initialized")]
@@ -220,6 +223,14 @@ impl GitRepository {
 
     pub fn log(&self, limit: usize) -> Result<Vec<GitLogEntry>, RepositoryError> {
         Ok(log_history(&self.catalog, self.repository_id, limit)?)
+    }
+
+    pub fn status(&self) -> Result<GitStatus, RepositoryError> {
+        Ok(repository_status(
+            &self.catalog,
+            self.repository_id,
+            &self.root,
+        )?)
     }
 
     pub fn catalog_directory_identity(&self) -> Result<mb_store::NativeFileId, RepositoryError> {
@@ -409,7 +420,18 @@ mod tests {
         let key = [23_u8; 32];
         let repo = GitRepository::init(&source_root, repository_id, &key).unwrap();
         let first_blob = repo.stage_file("nested/tracked").unwrap();
+        let before_commit = repo.status().unwrap();
+        assert_eq!(before_commit.changes.len(), 1);
+        assert_eq!(
+            before_commit.changes[0].staged,
+            Some(crate::GitChange::Added)
+        );
+        assert_eq!(before_commit.changes[0].worktree, None);
         fs::write(source_root.join("nested/tracked"), b"second\nbytes").unwrap();
+        assert_eq!(
+            repo.status().unwrap().changes[0].worktree,
+            Some(crate::GitChange::Modified)
+        );
         let first = repo
             .commit("Test Author", "author@example.test", "first")
             .unwrap();
@@ -422,8 +444,24 @@ mod tests {
         drop(repo);
 
         let repo = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        fs::write(source_root.join("untracked"), b"new").unwrap();
+        let after_first = repo.status().unwrap();
+        assert!(
+            after_first
+                .changes
+                .iter()
+                .any(|change| change.worktree == Some(crate::GitChange::Modified))
+        );
+        assert_eq!(after_first.untracked, vec![b"untracked".to_vec()]);
+        assert!(!after_first.history_backed_up);
         let second_blob = repo.stage_file("nested/tracked").unwrap();
         assert_ne!(first_blob.oid, second_blob.oid);
+        let before_second = repo.status().unwrap();
+        assert_eq!(
+            before_second.changes[0].staged,
+            Some(crate::GitChange::Modified)
+        );
+        assert_eq!(before_second.changes[0].worktree, None);
         let second = repo
             .commit("Test Author", "author@example.test", "second")
             .unwrap();
