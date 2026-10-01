@@ -1,0 +1,374 @@
+//! App-owned Git repository marker and encrypted local catalog lifecycle.
+
+use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+use git2::Oid;
+use mb_store::{
+    AnchorError, ControlStore, DatabaseError, FileAnchorManifest, GIT_CATALOG_DIRECTORY,
+    GIT_CATALOG_MARKER_FILE, PinnedDirectory, git_catalog_marker_bytes,
+};
+use thiserror::Error;
+use uuid::Uuid;
+
+use crate::stage::{
+    GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, resume_pending_stages,
+    stage_file, staged_entry,
+};
+
+const INITIALIZATION_INTENT: &str = "repository-intent";
+const INITIALIZATION_MAGIC: &str = "mutualbackup-git-repository-init-v1\n";
+const CATALOG_DATABASE: &str = "catalog.db";
+const TEMP_MARKER_PREFIX: &str = ".repository-staging-";
+const MAX_MARKER_BYTES: u64 = 128;
+
+#[derive(Debug, Error)]
+pub enum RepositoryError {
+    #[error("repository filesystem error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("repository path or anchor error: {0}")]
+    Anchor(#[from] AnchorError),
+    #[error("encrypted Git catalog error: {0}")]
+    Database(#[from] DatabaseError),
+    #[error("Git stage error: {0}")]
+    Stage(#[from] StageError),
+    #[error("repository marker or catalog identity conflicts with this root")]
+    Conflict,
+    #[error("the Git repository is not initialized")]
+    NotInitialized,
+}
+
+/// The daemon owns this handle while serving an operation. The catalog field
+/// drops before the pinned directory, keeping SQLite's `/proc/self/fd` parent
+/// valid until its database connection has closed.
+pub struct GitRepository {
+    catalog: ControlStore,
+    directory: PinnedDirectory,
+    root: PathBuf,
+    repository_id: Uuid,
+}
+
+impl GitRepository {
+    pub fn init(
+        source_root: impl AsRef<Path>,
+        repository_id: Uuid,
+        catalog_key: &[u8; 32],
+    ) -> Result<Self, RepositoryError> {
+        if repository_id.is_nil() {
+            return Err(RepositoryError::Conflict);
+        }
+        let root = source_root.as_ref().canonicalize()?;
+        let root_dir = PinnedDirectory::open(&root)?;
+        let directory = match root_dir.open_child_directory(GIT_CATALOG_DIRECTORY)? {
+            Some(existing) => existing,
+            None => {
+                let created = root_dir.create_child_directory(GIT_CATALOG_DIRECTORY)?;
+                root_dir.sync_all()?;
+                created
+            }
+        };
+        require_private_catalog(&directory)?;
+        let ready = read_marker(&directory, GIT_CATALOG_MARKER_FILE)?;
+        let ready_bytes = git_catalog_marker_bytes(repository_id);
+        if let Some(existing) = ready {
+            if existing != ready_bytes {
+                return Err(RepositoryError::Conflict);
+            }
+            if let Some(intent) = read_marker(&directory, INITIALIZATION_INTENT)? {
+                if intent != initialization_intent_bytes(repository_id) {
+                    return Err(RepositoryError::Conflict);
+                }
+                directory.remove_child_file(INITIALIZATION_INTENT)?;
+                directory.sync_all()?;
+            }
+            cleanup_staged_markers(&directory)?;
+            return Self::open_from_pinned(root, repository_id, directory, catalog_key);
+        }
+
+        let intent_bytes = initialization_intent_bytes(repository_id);
+        match read_marker(&directory, INITIALIZATION_INTENT)? {
+            Some(existing) if existing == intent_bytes => cleanup_staged_markers(&directory)?,
+            Some(_) => return Err(RepositoryError::Conflict),
+            None => {
+                require_empty_or_staged_marker_directory(&directory)?;
+                publish_marker(&directory, INITIALIZATION_INTENT, &intent_bytes)?;
+            }
+        }
+
+        let path = directory.descriptor_path().join(CATALOG_DATABASE);
+        let catalog = ControlStore::open_with_key(&path, catalog_key)?;
+        directory.sync_all()?;
+        publish_marker(&directory, GIT_CATALOG_MARKER_FILE, &ready_bytes)?;
+        directory.remove_child_file(INITIALIZATION_INTENT)?;
+        directory.sync_all()?;
+        Ok(Self {
+            catalog,
+            directory,
+            root,
+            repository_id,
+        })
+    }
+
+    pub fn open(
+        source_root: impl AsRef<Path>,
+        repository_id: Uuid,
+        catalog_key: &[u8; 32],
+    ) -> Result<Self, RepositoryError> {
+        if repository_id.is_nil() {
+            return Err(RepositoryError::Conflict);
+        }
+        let root = source_root.as_ref().canonicalize()?;
+        let root_dir = PinnedDirectory::open(&root)?;
+        let directory = root_dir
+            .open_child_directory(GIT_CATALOG_DIRECTORY)?
+            .ok_or(RepositoryError::NotInitialized)?;
+        Self::open_from_pinned(root, repository_id, directory, catalog_key)
+    }
+
+    fn open_from_pinned(
+        root: PathBuf,
+        repository_id: Uuid,
+        directory: PinnedDirectory,
+        catalog_key: &[u8; 32],
+    ) -> Result<Self, RepositoryError> {
+        require_private_catalog(&directory)?;
+        let ready = read_marker(&directory, GIT_CATALOG_MARKER_FILE)?
+            .ok_or(RepositoryError::NotInitialized)?;
+        if ready != git_catalog_marker_bytes(repository_id) {
+            return Err(RepositoryError::Conflict);
+        }
+        let path = directory.descriptor_path().join(CATALOG_DATABASE);
+        let catalog = ControlStore::open_existing_with_key(&path, catalog_key)?;
+        Ok(Self {
+            catalog,
+            directory,
+            root,
+            repository_id,
+        })
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.repository_id
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn stage_file(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<GitIndexEntry, RepositoryError> {
+        Ok(stage_file(
+            &self.catalog,
+            self.repository_id,
+            &self.root,
+            relative_path,
+        )?)
+    }
+
+    pub fn resume_pending_stages(&self) -> Result<Vec<GitIndexEntry>, RepositoryError> {
+        Ok(resume_pending_stages(&self.catalog, self.repository_id)?)
+    }
+
+    pub fn abandon_pending_stage(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<bool, RepositoryError> {
+        Ok(abandon_pending_stage(
+            &self.catalog,
+            self.repository_id,
+            relative_path,
+        )?)
+    }
+
+    pub fn staged_entry(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<Option<GitIndexEntry>, RepositoryError> {
+        Ok(staged_entry(
+            &self.catalog,
+            self.repository_id,
+            relative_path,
+        )?)
+    }
+
+    pub fn anchors_for_oid(&self, oid: Oid) -> Result<Vec<FileAnchorManifest>, RepositoryError> {
+        Ok(anchors_for_oid(&self.catalog, self.repository_id, oid)?)
+    }
+
+    pub fn catalog_directory_identity(&self) -> Result<mb_store::NativeFileId, RepositoryError> {
+        Ok(self.directory.identity()?)
+    }
+}
+
+fn require_private_catalog(directory: &PinnedDirectory) -> Result<(), RepositoryError> {
+    let metadata = directory.as_file().metadata()?;
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(RepositoryError::Conflict);
+    }
+    Ok(())
+}
+
+fn initialization_intent_bytes(repository_id: Uuid) -> Vec<u8> {
+    format!("{INITIALIZATION_MAGIC}{repository_id}\n").into_bytes()
+}
+
+fn read_marker(
+    directory: &PinnedDirectory,
+    name: &str,
+) -> Result<Option<Vec<u8>>, RepositoryError> {
+    let Some(mut file) = directory.open_child_file(name)? else {
+        return Ok(None);
+    };
+    if file.metadata()?.len() > MAX_MARKER_BYTES {
+        return Err(RepositoryError::Conflict);
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+fn cleanup_staged_markers(directory: &PinnedDirectory) -> Result<(), RepositoryError> {
+    for entry in fs::read_dir(directory.descriptor_path())? {
+        let name = entry?.file_name();
+        if name.as_bytes().starts_with(TEMP_MARKER_PREFIX.as_bytes()) {
+            directory.remove_child_file(&name)?;
+        }
+    }
+    directory.sync_all()?;
+    Ok(())
+}
+
+fn require_empty_or_staged_marker_directory(
+    directory: &PinnedDirectory,
+) -> Result<(), RepositoryError> {
+    for entry in fs::read_dir(directory.descriptor_path())? {
+        let name = entry?.file_name();
+        if name.as_bytes().starts_with(TEMP_MARKER_PREFIX.as_bytes()) {
+            directory.remove_child_file(&name)?;
+        } else {
+            return Err(RepositoryError::Conflict);
+        }
+    }
+    directory.sync_all()?;
+    Ok(())
+}
+
+fn publish_marker(
+    directory: &PinnedDirectory,
+    final_name: &str,
+    bytes: &[u8],
+) -> Result<(), RepositoryError> {
+    let temporary_name = format!("{TEMP_MARKER_PREFIX}{}", Uuid::new_v4());
+    let mut file = directory.create_child_file(&temporary_name)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    directory.rename_child_no_replace(&temporary_name, final_name)?;
+    directory.sync_all()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use mb_store::{GIT_CATALOG_DIRECTORY, git_catalog_marker};
+
+    use super::*;
+
+    #[test]
+    fn repository_init_reopens_and_refuses_missing_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [9_u8; 32];
+        let repo = GitRepository::init(&root, repository_id, &key).unwrap();
+        assert_eq!(repo.id(), repository_id);
+        assert_eq!(git_catalog_marker(&root).unwrap(), Some(repository_id));
+        assert_eq!(
+            repo.catalog_directory_identity().unwrap().filesystem_id,
+            mb_store::filesystem_identity(&root).unwrap().stable_id
+        );
+        drop(repo);
+        let repo = GitRepository::open(&root, repository_id, &key).unwrap();
+        assert_eq!(repo.root(), root);
+        drop(repo);
+        let catalog = root.join(GIT_CATALOG_DIRECTORY);
+        fs::remove_file(catalog.join(CATALOG_DATABASE)).unwrap();
+        assert!(GitRepository::open(&root, repository_id, &key).is_err());
+        assert!(GitRepository::init(&root, repository_id, &key).is_err());
+    }
+
+    #[test]
+    fn interrupted_initialization_resumes_only_its_owned_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let catalog = root.join(GIT_CATALOG_DIRECTORY);
+        fs::create_dir_all(&catalog).unwrap();
+        fs::set_permissions(&catalog, fs::Permissions::from_mode(0o700)).unwrap();
+        let repository_id = Uuid::new_v4();
+        fs::write(
+            catalog.join(INITIALIZATION_INTENT),
+            initialization_intent_bytes(repository_id),
+        )
+        .unwrap();
+        let repo = GitRepository::init(&root, repository_id, &[7_u8; 32]).unwrap();
+        assert_eq!(repo.id(), repository_id);
+        assert!(!catalog.join(INITIALIZATION_INTENT).exists());
+        drop(repo);
+
+        let unrelated = temp.path().join("unrelated");
+        let unrelated_catalog = unrelated.join(GIT_CATALOG_DIRECTORY);
+        fs::create_dir_all(&unrelated_catalog).unwrap();
+        fs::set_permissions(&unrelated_catalog, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(unrelated_catalog.join("user-file"), b"must be preserved").unwrap();
+        assert!(GitRepository::init(&unrelated, Uuid::new_v4(), &[8_u8; 32]).is_err());
+        assert_eq!(
+            fs::read(unrelated_catalog.join("user-file")).unwrap(),
+            b"must be preserved"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn repository_catalog_stays_outside_ordinary_source_capture() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-repository-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("tracked"), b"line\r\nbytes\0").unwrap();
+        let repository_id = Uuid::new_v4();
+        let repo = GitRepository::init(&source_root, repository_id, &[17_u8; 32]).unwrap();
+        let entry = repo.stage_file("tracked").unwrap();
+        let oid = Oid::from_bytes(&entry.oid).unwrap();
+        let anchors = repo.anchors_for_oid(oid).unwrap();
+        let backup = mb_store::ReflinkAnchor::capture(&source_root).unwrap();
+        let paths = backup
+            .entries
+            .iter()
+            .map(|entry| match entry {
+                mb_store::CapturedEntry::Directory { path, .. }
+                | mb_store::CapturedEntry::File { path, .. }
+                | mb_store::CapturedEntry::FileV2 { path, .. } => path.as_str(),
+            })
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"tracked"));
+        assert!(
+            paths
+                .iter()
+                .all(|path| !path.starts_with(GIT_CATALOG_DIRECTORY))
+        );
+        backup.remove().unwrap();
+        drop(repo);
+        anchors[0].remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+}

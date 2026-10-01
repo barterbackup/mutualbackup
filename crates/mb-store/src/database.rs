@@ -73,6 +73,25 @@ impl ControlStore {
         })
     }
 
+    /// Open a catalog that must already exist. Recovery must never mistake a
+    /// missing or truncated database for a new empty repository.
+    pub fn open_existing_with_key(
+        path: impl AsRef<Path>,
+        database_key: &[u8; 32],
+    ) -> Result<Self, DatabaseError> {
+        let path = path.as_ref();
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(DatabaseError::IncompatibleSchema);
+        }
+        let mut connection = open_encrypted_existing(path, database_key)?;
+        initialize_or_validate_control(&mut connection)?;
+        Ok(Self {
+            connection,
+            path: path.to_path_buf(),
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

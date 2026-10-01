@@ -11,8 +11,12 @@ use mb_store::{AnchorError, FileAnchorManifest};
 use thiserror::Error;
 
 mod odb;
+#[cfg(target_os = "linux")]
+mod repository;
 mod stage;
 pub use odb::NativeOdb;
+#[cfg(target_os = "linux")]
+pub use repository::{GitRepository, RepositoryError};
 pub use stage::{
     GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, resume_pending_stages,
     stage_file, staged_entry,

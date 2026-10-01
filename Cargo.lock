@@ -3921,10 +3921,12 @@ name = "mb-git"
 version = "0.1.0"
 dependencies = [
  "git2",
+ "libc",
  "libgit2-sys",
  "mb-core",
  "mb-store",
  "serde",
+ "tempfile",
  "thiserror 2.0.20",
  "uuid",
 ]
