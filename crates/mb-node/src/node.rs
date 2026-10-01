@@ -1398,6 +1398,22 @@ impl Node {
         })
     }
 
+    pub fn git_add_path(
+        &mut self,
+        repository_id: Uuid,
+        path: &Path,
+    ) -> Result<Option<GitStagedFile>> {
+        let repository = self.open_git_repository(repository_id)?;
+        repository.resume_pending_stages()?;
+        Ok(repository.add_path(path)?.map(|entry| GitStagedFile {
+            format_version: 1,
+            repository_id,
+            path: path.to_path_buf(),
+            oid: hex::encode(entry.oid),
+            mode: entry.mode,
+        }))
+    }
+
     pub fn git_remove_cached(&self, repository_id: Uuid, path: &Path) -> Result<bool> {
         Ok(self
             .open_git_repository(repository_id)?
@@ -15270,7 +15286,8 @@ pub(crate) mod tests {
             node.git_init(&source_root).unwrap().repository_id
         );
         let first = node
-            .git_add(info.repository_id, Path::new("tracked"))
+            .git_add_path(info.repository_id, Path::new("tracked"))
+            .unwrap()
             .unwrap();
         assert_eq!(first.mode, 0o100644);
         assert!(
@@ -15437,6 +15454,22 @@ pub(crate) mod tests {
                 .patch
                 .windows(b"old mode 100644\nnew mode 100755\n".len())
                 .any(|part| { part == b"old mode 100644\nnew mode 100755\n" })
+        );
+        fs::remove_file(source_root.join("text")).unwrap();
+        assert!(
+            reopened
+                .git_add_path(info.repository_id, Path::new("text"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reopened
+                .git_status(info.repository_id)
+                .unwrap()
+                .changes
+                .iter()
+                .any(|change| change.path == b"text"
+                    && change.staged == Some(mb_git::GitChange::Deleted))
         );
         assert!(source_root.join(".mutualbackup/catalog.db").exists());
         drop(reopened);

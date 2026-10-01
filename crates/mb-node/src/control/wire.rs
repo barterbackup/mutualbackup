@@ -160,6 +160,10 @@ pub enum LocalResponse {
     RootAdded(ProtectedRoot),
     GitRepositoryInitialized(GitRepositoryInfo),
     GitFileStaged(GitStagedFile),
+    GitDeletionStaged {
+        repository_id: Uuid,
+        path: PathBuf,
+    },
     GitCachedPathRemoved {
         removed: bool,
     },
@@ -396,6 +400,10 @@ mod tests {
                 oid: "81b2d75d7f1e1b71438019a1128f25986bebd588".to_owned(),
                 mode: 0o100644,
             }),
+            LocalResponse::GitDeletionStaged {
+                repository_id,
+                path: PathBuf::from("folder/file"),
+            },
             LocalResponse::GitCachedPathRemoved { removed: true },
             LocalResponse::GitPendingAddAbandoned { abandoned: true },
             LocalResponse::GitCommitted(GitCommitInfo {

@@ -377,8 +377,15 @@ async fn handle_request(
             path,
         } => {
             blocking_node(node, move |node| {
-                node.git_add(repository_id, &path)
-                    .map(LocalResponse::GitFileStaged)
+                node.git_add_path(repository_id, &path).map(|result| {
+                    result.map_or(
+                        LocalResponse::GitDeletionStaged {
+                            repository_id,
+                            path: path.clone(),
+                        },
+                        LocalResponse::GitFileStaged,
+                    )
+                })
             })
             .await
         }

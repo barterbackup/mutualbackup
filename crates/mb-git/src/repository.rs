@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use git2::Oid;
 use mb_store::{
@@ -24,7 +24,7 @@ use crate::history::{
 };
 use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, remove_cached,
-    resume_pending_stages, stage_file, staged_entry,
+    resume_pending_stages, stage_file, stage_path_key, staged_entry,
 };
 use crate::status::{GitStatus, StatusError, repository_status};
 
@@ -192,6 +192,48 @@ impl GitRepository {
             &self.root,
             relative_path,
         )?)
+    }
+
+    /// Like `git add <path>`, capture a present regular file or stage the
+    /// deletion of a missing indexed path. A symlink or other unsupported
+    /// object is never mistaken for a deletion.
+    pub fn add_path(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<Option<GitIndexEntry>, RepositoryError> {
+        self.resume_checkout()?;
+        let relative = relative_path.as_ref();
+        stage_path_key(relative)?;
+        let mut parent = PinnedDirectory::open(&self.root)?;
+        for component in relative
+            .parent()
+            .ok_or(StageError::UnsafePath)?
+            .components()
+        {
+            let Component::Normal(name) = component else {
+                return Err(StageError::UnsafePath.into());
+            };
+            match parent.open_child_directory(name)? {
+                Some(next) => parent = next,
+                None => return self.stage_missing_path(relative),
+            }
+        }
+        let name = relative.file_name().ok_or(StageError::UnsafePath)?;
+        if parent.open_child_file(name)?.is_some() {
+            Ok(Some(self.stage_file(relative)?))
+        } else {
+            self.stage_missing_path(relative)
+        }
+    }
+
+    fn stage_missing_path(
+        &self,
+        relative: &Path,
+    ) -> Result<Option<GitIndexEntry>, RepositoryError> {
+        if !self.remove_cached(relative)? {
+            return Err(StageError::MissingUntrackedPath.into());
+        }
+        Ok(None)
     }
 
     pub fn remove_cached(&self, relative_path: impl AsRef<Path>) -> Result<bool, RepositoryError> {
@@ -1036,35 +1078,41 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
-    fn cached_removal_can_commit_an_empty_tree_and_restore_the_old_branch() {
+    fn deleted_path_add_can_commit_an_empty_tree_and_restore_the_old_branch() {
         let test_root = PathBuf::from(
             std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
                 .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
         );
         let run_root = test_root.join(format!("git-empty-tree-{}", Uuid::new_v4()));
         let source_root = run_root.join("work");
-        fs::create_dir_all(&source_root).unwrap();
-        fs::write(source_root.join("only"), b"only\r\nfile\0").unwrap();
+        fs::create_dir_all(source_root.join("nested")).unwrap();
+        fs::write(source_root.join("nested/only"), b"only\r\nfile\0").unwrap();
         let repository_id = Uuid::new_v4();
         let key = [34_u8; 32];
         let repo = GitRepository::init(&source_root, repository_id, &key).unwrap();
-        repo.stage_file("only").unwrap();
+        repo.stage_file("nested/only").unwrap();
         let first = repo.commit("Author", "a@example.test", "first").unwrap();
         repo.create_branch("empty").unwrap();
         repo.switch_branch("empty").unwrap();
-        assert!(repo.remove_cached("only").unwrap());
-        fs::remove_file(source_root.join("only")).unwrap();
+        fs::remove_file(source_root.join("nested/only")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", source_root.join("nested/only")).unwrap();
+        assert!(repo.add_path("nested/only").is_err());
+        assert!(repo.staged_entry("nested/only").unwrap().is_some());
+        fs::remove_file(source_root.join("nested/only")).unwrap();
+        fs::remove_dir(source_root.join("nested")).unwrap();
+        assert!(repo.add_path("nested/only").unwrap().is_none());
+        assert!(repo.add_path("never-tracked").is_err());
         let empty = repo.commit("Author", "a@example.test", "empty").unwrap();
         assert_eq!(empty.parent_oid, Some(first.oid));
         assert!(repo.status().unwrap().changes.is_empty());
         let graph = repo.export_graph_source().unwrap();
         repo.switch_branch("main").unwrap();
         assert_eq!(
-            fs::read(source_root.join("only")).unwrap(),
+            fs::read(source_root.join("nested/only")).unwrap(),
             b"only\r\nfile\0"
         );
         repo.switch_branch("empty").unwrap();
-        assert!(!source_root.join("only").exists());
+        assert!(!source_root.join("nested").exists());
         drop(repo);
         for blob in graph.blobs {
             blob.anchor.remove().unwrap();

@@ -38,6 +38,8 @@ pub enum StageError {
     Model(#[from] ModelError),
     #[error("a pending add already owns this path; replay or abandon it first")]
     PendingStage,
+    #[error("the missing path is not staged in the index")]
+    MissingUntrackedPath,
     #[error("the staged path is unsafe, reserved, or exceeds the local path bound")]
     UnsafePath,
     #[error("the stage intent or index record is incompatible or corrupt")]

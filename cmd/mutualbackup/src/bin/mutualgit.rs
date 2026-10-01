@@ -31,7 +31,7 @@ struct Cli {
 enum Command {
     /// Enroll this directory as a protected Git-compatible repository.
     Init { directory: Option<PathBuf> },
-    /// Stage exact regular-file bytes in native reflink anchors.
+    /// Stage exact regular-file bytes or a tracked file's deletion.
     Add {
         /// Discard an unfinished add after its captured source changed.
         #[arg(long)]
@@ -129,21 +129,28 @@ async fn main() -> Result<()> {
                     );
                     continue;
                 }
-                let LocalResponse::GitFileStaged(staged) = local_control_call(
+                let response = local_control_call(
                     &socket,
                     &LocalRequest::GitAdd {
                         repository_id,
-                        path: relative,
+                        path: relative.clone(),
                     },
                 )
-                .await?
-                else {
-                    bail!("daemon returned the wrong response to Git add");
-                };
-                if staged.repository_id != repository_id {
-                    bail!("daemon staged a file for another repository");
+                .await?;
+                match response {
+                    LocalResponse::GitFileStaged(staged)
+                        if staged.repository_id == repository_id && staged.path == relative =>
+                    {
+                        println!("staged {} {} (local)", staged.oid, staged.path.display());
+                    }
+                    LocalResponse::GitDeletionStaged {
+                        repository_id: returned_id,
+                        path,
+                    } if returned_id == repository_id && path == relative => {
+                        println!("staged deletion of {} (local)", path.display());
+                    }
+                    _ => bail!("daemon returned the wrong response to Git add"),
                 }
-                println!("staged {} {} (local)", staged.oid, staged.path.display());
             }
         }
         Command::Rm { cached, paths } => {
