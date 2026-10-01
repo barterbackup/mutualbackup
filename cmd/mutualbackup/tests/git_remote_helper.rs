@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use mb_git::{FetchError, GitRepository, RepositoryError};
-use mb_node::{LocalRequest, LocalResponse};
+use mb_node::{LocalRequest, LocalResponse, WireError};
 use uuid::Uuid;
 
 #[test]
@@ -71,12 +71,12 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
             let request_id = envelope["request_id"].clone();
             let request: LocalRequest =
                 serde_json::from_value(envelope["request"].clone()).unwrap();
-            let response = match request {
+            let response: Result<LocalResponse, WireError> = match request {
                 LocalRequest::GitBranches {
                     repository_id: requested,
                 } => {
                     assert_eq!(requested, repository_id);
-                    LocalResponse::GitBranches(repository.branches().unwrap())
+                    Ok(LocalResponse::GitBranches(repository.branches().unwrap()))
                 }
                 LocalRequest::GitExportToGitRepository {
                     repository_id: requested,
@@ -89,10 +89,10 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
                     let object_count = repository
                         .export_to_git_repository(&destination, &advertised)
                         .unwrap();
-                    LocalResponse::GitObjectsExported {
+                    Ok(LocalResponse::GitObjectsExported {
                         repository_id,
                         object_count,
-                    }
+                    })
                 }
                 LocalRequest::GitReceivePushedBranch {
                     repository_id: requested,
@@ -111,19 +111,19 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
                             target_oid,
                             expected_old,
                         )
-                        .unwrap();
-                    LocalResponse::GitPushReceived {
-                        repository_id,
-                        branch: target_branch,
-                        oid: target_oid,
-                    }
+                        .map(|()| LocalResponse::GitPushReceived {
+                            repository_id,
+                            branch: target_branch,
+                            oid: target_oid,
+                        })
+                        .map_err(WireError::operation)
                 }
                 _ => panic!("unexpected Git helper request"),
             };
             let response = serde_json::json!({
                 "format_version": 2,
                 "request_id": request_id,
-                "result": { "Ok": response },
+                "result": response,
             });
             let bytes = serde_json::to_vec(&response).unwrap();
             stream
@@ -335,11 +335,37 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
         fs::read(roundtrip_root.join("tracked")).unwrap(),
         pushed_again
     );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&clone_root)
+        .args(["push"])
+        .arg(format!("mutualbackup::{}", source_root.display()))
+        .arg("refs/heads/topic:refs/heads/main")
+        .env("PATH", &path)
+        .env("MUTUALBACKUP_CONTROL_SOCKET", &socket)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("selected by a worktree"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     stop.store(true, Ordering::Relaxed);
     server.join().unwrap();
 
     let repository = GitRepository::open(&source_root, repository_id, &key).unwrap();
     assert_eq!(fs::read(source_root.join("tracked")).unwrap(), payload);
+    assert_eq!(
+        repository
+            .branches()
+            .unwrap()
+            .into_iter()
+            .find(|branch| branch.name == "main")
+            .unwrap()
+            .oid,
+        commit.oid
+    );
     assert_eq!(
         git2::Oid::from_bytes(
             &repository
