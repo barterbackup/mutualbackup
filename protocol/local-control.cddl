@@ -27,6 +27,7 @@ local-request =
   / { "AddRoot": { path: tstr } }
   / { "GitInit": { path: tstr } }
   / { "GitAdd": { repository_id: uuid-text, path: tstr } }
+  / { "GitAbandonPendingAdd": { repository_id: uuid-text, path: tstr } }
   / { "GitCommit": { repository_id: uuid-text, author_name: tstr, author_email: tstr, message: tstr } }
   / { "GitLog": { repository_id: uuid-text, limit: uint } }
   / { "GitStatus": { repository_id: uuid-text } }
@@ -62,6 +63,7 @@ local-response =
   / { "RootAdded": protected-root }
   / { "GitRepositoryInitialized": git-repository-info }
   / { "GitFileStaged": git-staged-file }
+  / { "GitPendingAddAbandoned": { abandoned: bool } }
   / { "GitCommitted": git-commit-info }
   / { "GitLog": [* git-log-entry] }
   / { "GitStatus": git-status }

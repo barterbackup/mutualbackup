@@ -32,6 +32,9 @@ enum Command {
     Init { directory: Option<PathBuf> },
     /// Stage exact regular-file bytes in native reflink anchors.
     Add {
+        /// Discard an unfinished add after its captured source changed.
+        #[arg(long)]
+        abort_pending: bool,
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
@@ -78,10 +81,36 @@ async fn main() -> Result<()> {
                 info.path.display()
             );
         }
-        Command::Add { paths } => {
+        Command::Add {
+            abort_pending,
+            paths,
+        } => {
             let (root, repository_id) = discover_repository(&working_directory)?;
             for path in paths {
                 let relative = relative_for_add(&root, &working_directory, &path)?;
+                if abort_pending {
+                    let LocalResponse::GitPendingAddAbandoned { abandoned } = local_control_call(
+                        &socket,
+                        &LocalRequest::GitAbandonPendingAdd {
+                            repository_id,
+                            path: relative.clone(),
+                        },
+                    )
+                    .await?
+                    else {
+                        bail!("daemon returned the wrong response to pending add abort");
+                    };
+                    println!(
+                        "{} {}",
+                        if abandoned {
+                            "abandoned"
+                        } else {
+                            "no pending add for"
+                        },
+                        relative.display()
+                    );
+                    continue;
+                }
                 let LocalResponse::GitFileStaged(staged) = local_control_call(
                     &socket,
                     &LocalRequest::GitAdd {

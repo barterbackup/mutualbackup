@@ -1400,6 +1400,12 @@ impl Node {
         })
     }
 
+    pub fn git_abandon_pending_add(&self, repository_id: Uuid, path: &Path) -> Result<bool> {
+        Ok(self
+            .open_git_repository(repository_id)?
+            .abandon_pending_stage(path)?)
+    }
+
     pub fn git_commit(
         &mut self,
         repository_id: Uuid,
@@ -15148,6 +15154,11 @@ pub(crate) mod tests {
             .git_add(info.repository_id, Path::new("tracked"))
             .unwrap();
         assert_eq!(first.mode, 0o100644);
+        assert!(
+            !node
+                .git_abandon_pending_add(info.repository_id, Path::new("tracked"))
+                .unwrap()
+        );
         let first_commit = node
             .git_commit(
                 info.repository_id,

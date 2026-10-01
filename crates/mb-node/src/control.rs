@@ -382,6 +382,16 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitAbandonPendingAdd {
+            repository_id,
+            path,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_abandon_pending_add(repository_id, &path)
+                    .map(|abandoned| LocalResponse::GitPendingAddAbandoned { abandoned })
+            })
+            .await
+        }
         LocalRequest::GitCommit {
             repository_id,
             author_name,
