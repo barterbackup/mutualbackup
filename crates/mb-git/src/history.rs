@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::head::{HeadError, selected_branch, selected_ref, store_selected_branch};
+use crate::head::{
+    HeadError, head_kind, selected_branch, selected_branch_record, selected_ref,
+    store_selected_branch,
+};
 use crate::stage::{
     GitIndexEntry, StageError, anchors_for_oid, has_pending_stages, index_kind, object_kind,
     stage_path_key, staged_entries,
@@ -693,6 +696,7 @@ pub fn import_graph_backup(
         metadata_kind(repository_id),
         ref_kind(repository_id),
         index_kind(repository_id),
+        head_kind(repository_id),
     ] {
         if !control.records(&kind)?.is_empty() {
             return Err(HistoryError::IncompatibleRecord);
@@ -748,12 +752,19 @@ pub fn import_graph_backup(
             })?,
         ));
     }
-    if let Some(main) = descriptor
+    if descriptor.format_version == 2 {
+        records.push(selected_branch_record(
+            repository_id,
+            &descriptor.head_branch,
+        )?);
+    }
+    let head_ref = format!("refs/heads/{}", descriptor.head_branch);
+    if let Some(head) = descriptor
         .refs
         .iter()
-        .find(|reference| reference.name == MAIN_REF)
+        .find(|reference| reference.name == head_ref.as_bytes())
     {
-        let commit = repository.find_commit(Oid::from_bytes(&main.oid)?)?;
+        let commit = repository.find_commit(Oid::from_bytes(&head.oid)?)?;
         let mut trees = vec![(Vec::<u8>::new(), commit.tree_id())];
         while let Some((prefix, oid)) = trees.pop() {
             let tree = repository.find_tree(oid)?;

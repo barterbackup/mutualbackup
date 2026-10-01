@@ -29,7 +29,7 @@ struct HeadRecord {
     branch: String,
 }
 
-fn head_kind(repository_id: Uuid) -> String {
+pub(crate) fn head_kind(repository_id: Uuid) -> String {
     format!("{HEAD_PREFIX}{repository_id}")
 }
 
@@ -62,16 +62,24 @@ pub(crate) fn store_selected_branch(
     repository_id: Uuid,
     branch: &str,
 ) -> Result<(), HeadError> {
+    let (kind, key, bytes) = selected_branch_record(repository_id, branch)?;
+    control.put_record(&kind, &key, &bytes)?;
+    Ok(())
+}
+
+pub(crate) fn selected_branch_record(
+    repository_id: Uuid,
+    branch: &str,
+) -> Result<(String, Vec<u8>, Vec<u8>), HeadError> {
     if branch.len() > 1024 || !Branch::name_is_valid(branch)? {
         return Err(HeadError::IncompatibleRecord);
     }
-    control.put_record(
-        &head_kind(repository_id),
-        HEAD_KEY,
-        &canonical_bytes(&HeadRecord {
+    Ok((
+        head_kind(repository_id),
+        HEAD_KEY.to_vec(),
+        canonical_bytes(&HeadRecord {
             format_version: 1,
             branch: branch.to_owned(),
         })?,
-    )?;
-    Ok(())
+    ))
 }

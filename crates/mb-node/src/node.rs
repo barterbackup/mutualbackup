@@ -1488,6 +1488,7 @@ impl Node {
         };
         let graph = repository.export_graph_source()?;
         status.history_backed_up = backup.repository_id == repository_id
+            && backup.head_branch == status.branch
             && backup.refs == graph.refs
             && backup.objects == graph.objects
             && backup.blobs.len() == graph.blobs.len()

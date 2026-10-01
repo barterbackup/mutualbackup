@@ -49,17 +49,21 @@ pub struct GitBackupDescriptor {
     pub refs: Vec<GitGraphRef>,
     pub objects: Vec<GitGraphObject>,
     pub blobs: Vec<GitBackupBlob>,
+    pub head_branch: String,
 }
 
 impl GitBackupDescriptor {
     /// Validate the full Git DAG and each blob's sector geometry before this
     /// descriptor can be placed in a signed revision or accepted on recovery.
     pub fn validate(&self) -> Result<(), GitBackupError> {
-        if self.format_version != 1
+        if !matches!(self.format_version, 1 | 2)
             || self.repository_id.is_nil()
             || self.refs.len() > MAX_OBJECTS
             || self.objects.len() > MAX_OBJECTS
             || self.blobs.len() > MAX_OBJECTS
+            || self.head_branch.len() > 1024
+            || !Branch::name_is_valid(&self.head_branch)?
+            || (self.format_version == 1 && self.head_branch != "main")
         {
             return Err(GitBackupError::InvalidGraph);
         }
@@ -141,6 +145,15 @@ impl GitBackupDescriptor {
                 .enumerate()
                 .any(|(index, byte)| *byte == b'/' && ref_names.contains(&name[..index]))
         }) {
+            return Err(GitBackupError::InvalidGraph);
+        }
+        if self.format_version == 2
+            && !self.refs.is_empty()
+            && !ref_names.contains(format!("refs/heads/{}", self.head_branch).as_bytes())
+        {
+            return Err(GitBackupError::InvalidGraph);
+        }
+        if self.format_version == 2 && self.refs.is_empty() && self.head_branch != "main" {
             return Err(GitBackupError::InvalidGraph);
         }
         let mut seen_commits = HashSet::new();

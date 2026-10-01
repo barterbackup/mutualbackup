@@ -15,6 +15,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::diff::{DiffError, GitDiff, repository_diff};
+use crate::head::{HeadError, selected_branch};
 use crate::history::{
     GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, HistoryError, commit_index,
     create_branch, export_graph_source, import_graph_backup, list_branches, log_history,
@@ -44,6 +45,8 @@ pub enum RepositoryError {
     Stage(#[from] StageError),
     #[error("Git history error: {0}")]
     History(#[from] HistoryError),
+    #[error("Git HEAD record error: {0}")]
+    Head(#[from] HeadError),
     #[error("Git status error: {0}")]
     Status(#[from] StatusError),
     #[error("Git diff error: {0}")]
@@ -234,6 +237,10 @@ impl GitRepository {
 
     pub fn branches(&self) -> Result<Vec<GitBranchInfo>, RepositoryError> {
         Ok(list_branches(&self.catalog, self.repository_id)?)
+    }
+
+    pub fn selected_branch(&self) -> Result<String, RepositoryError> {
+        Ok(selected_branch(&self.catalog, self.repository_id)?)
     }
 
     pub fn create_branch(&self, name: &str) -> Result<GitBranchInfo, RepositoryError> {
@@ -532,7 +539,7 @@ mod tests {
         assert!(graph.objects.iter().any(|object| object.oid == first.oid));
         assert!(graph.objects.iter().any(|object| object.oid == second.oid));
         let descriptor = crate::GitBackupDescriptor {
-            format_version: 1,
+            format_version: 2,
             repository_id,
             refs: graph.refs.clone(),
             objects: graph.objects.clone(),
@@ -554,8 +561,12 @@ mod tests {
                     }],
                 })
                 .collect(),
+            head_branch: "main".to_owned(),
         };
         descriptor.validate().unwrap();
+        let mut missing_head = descriptor.clone();
+        missing_head.head_branch = "missing".to_owned();
+        assert!(missing_head.validate().is_err());
         let mut missing_blob = descriptor.clone();
         missing_blob.blobs.pop();
         assert!(missing_blob.validate().is_err());

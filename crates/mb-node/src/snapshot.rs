@@ -14,7 +14,10 @@ use mb_core::{
     V1_MAX_CODING_GROUPS, V1_SECTOR_SIZE, canonical_bytes, crypt_sector, decode_canonical,
     encrypted_sector, make_content_sector_id, merkle_commit, sector_root,
 };
-use mb_git::{GitBackupBlob, GitBackupDescriptor, GitDataExtent, GitGraphSource, GitRepository};
+use mb_git::{
+    GitBackupBlob, GitBackupDescriptor, GitDataExtent, GitGraphObject, GitGraphRef, GitGraphSource,
+    GitRepository,
+};
 #[cfg(test)]
 use mb_store::ReflinkAnchor;
 use mb_store::{
@@ -105,7 +108,53 @@ struct GitPrivateMetadataV4 {
     root_modified_secs: i64,
     root_modified_nanos: u32,
     entries: Vec<PrivateEntry>,
+    git: LegacyGitBackupDescriptorV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct LegacyGitBackupDescriptorV1 {
+    format_version: u16,
+    repository_id: Uuid,
+    refs: Vec<GitGraphRef>,
+    objects: Vec<GitGraphObject>,
+    blobs: Vec<GitBackupBlob>,
+}
+
+impl LegacyGitBackupDescriptorV1 {
+    fn into_current(self) -> Result<GitBackupDescriptor> {
+        if self.format_version != 1 {
+            bail!("historical Git backup descriptor has the wrong version");
+        }
+        let descriptor = GitBackupDescriptor {
+            format_version: 1,
+            repository_id: self.repository_id,
+            refs: self.refs,
+            objects: self.objects,
+            blobs: self.blobs,
+            head_branch: "main".to_owned(),
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GitPrivateMetadataV5 {
+    format_version: u16,
+    root_mode: u32,
+    root_modified_secs: i64,
+    root_modified_nanos: u32,
+    entries: Vec<PrivateEntry>,
     git: GitBackupDescriptor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct LegacyGitGraphIntentV1 {
+    format_version: u16,
+    guild_id: [u8; 32],
+    revision_id: Uuid,
+    protected_root_id: Uuid,
+    graph: GitGraphSource,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -115,6 +164,7 @@ struct GitGraphIntent {
     revision_id: Uuid,
     protected_root_id: Uuid,
     graph: GitGraphSource,
+    head_branch: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -348,7 +398,7 @@ fn prepare_git_graph_intent(
     revision_id: Uuid,
     protected_root_id: Uuid,
     source_root: &Path,
-) -> Result<Option<GitGraphSource>> {
+) -> Result<Option<GitGraphIntent>> {
     let registration = control.get_record("git-repository", protected_root_id.as_bytes())?;
     let existing = control.get_record(GIT_GRAPH_INTENT_KIND, revision_id.as_bytes())?;
     let Some(registration) = registration else {
@@ -368,9 +418,8 @@ fn prepare_git_graph_intent(
         bail!("protected Git root registration or marker changed before backup");
     }
     if let Some(encoded) = existing {
-        let intent: GitGraphIntent = decode_canonical(&encoded)?;
-        if intent.format_version != 1
-            || intent.guild_id != guild_id
+        let (intent, migrated) = decode_git_graph_intent(&encoded)?;
+        if intent.guild_id != guild_id
             || intent.revision_id != revision_id
             || intent.protected_root_id != protected_root_id
             || intent.graph.repository_id != protected_root_id
@@ -378,18 +427,28 @@ fn prepare_git_graph_intent(
         {
             bail!("pending Git graph backup conflicts with the source revision");
         }
-        return Ok(Some(intent.graph));
+        if migrated {
+            control.put_record(
+                GIT_GRAPH_INTENT_KIND,
+                revision_id.as_bytes(),
+                &canonical_bytes(&intent)?,
+            )?;
+        }
+        return Ok(Some(intent));
     }
     let catalog_key = mb_git::catalog_key(keys, protected_root_id);
-    let graph =
-        GitRepository::open(source_root, protected_root_id, &catalog_key)?.export_graph_source()?;
+    let repository = GitRepository::open(source_root, protected_root_id, &catalog_key)?;
+    let graph = repository.export_graph_source()?;
+    let head_branch = repository.selected_branch()?;
     let intent = GitGraphIntent {
-        format_version: 1,
+        format_version: 2,
         guild_id,
         revision_id,
         protected_root_id,
-        graph: graph.clone(),
+        graph,
+        head_branch,
     };
+    validate_git_graph_intent(&intent)?;
     if !control.put_record_if_absent(
         GIT_GRAPH_INTENT_KIND,
         revision_id.as_bytes(),
@@ -397,7 +456,51 @@ fn prepare_git_graph_intent(
     )? {
         bail!("Git graph backup intent changed during source capture");
     }
-    Ok(Some(graph))
+    Ok(Some(intent))
+}
+
+fn validate_git_graph_intent(intent: &GitGraphIntent) -> Result<()> {
+    if intent.format_version != 2 || intent.graph.format_version != 1 {
+        bail!("pending Git graph backup has an unsupported version");
+    }
+    let head_ref = format!("refs/heads/{}", intent.head_branch);
+    if intent.graph.refs.is_empty() {
+        if intent.head_branch != "main" {
+            bail!("unborn Git backup has an invalid selected branch");
+        }
+    } else if !intent
+        .graph
+        .refs
+        .iter()
+        .any(|reference| reference.name == head_ref.as_bytes())
+    {
+        bail!("selected Git branch is absent from the backed-up graph");
+    }
+    Ok(())
+}
+
+fn decode_git_graph_intent(bytes: &[u8]) -> Result<(GitGraphIntent, bool)> {
+    let (version, _) = postcard::take_from_bytes::<u16>(bytes)?;
+    let (intent, migrated) = match version {
+        1 => {
+            let legacy: LegacyGitGraphIntentV1 = decode_canonical(bytes)?;
+            (
+                GitGraphIntent {
+                    format_version: 2,
+                    guild_id: legacy.guild_id,
+                    revision_id: legacy.revision_id,
+                    protected_root_id: legacy.protected_root_id,
+                    graph: legacy.graph,
+                    head_branch: "main".to_owned(),
+                },
+                true,
+            )
+        }
+        2 => (decode_canonical(bytes)?, false),
+        _ => bail!("pending Git graph backup intent has an unsupported version"),
+    };
+    validate_git_graph_intent(&intent)?;
+    Ok((intent, migrated))
 }
 
 fn decode_recovery_anchor_intent(bytes: &[u8]) -> Result<(RecoveryAnchorIntent, bool)> {
@@ -438,9 +541,16 @@ pub(crate) fn reconcile_pending_captures(control: &ControlStore) -> Result<()> {
         let _ = intent.plan.reconcile();
     }
     for (record_id, bytes) in control.records(GIT_GRAPH_INTENT_KIND)? {
-        let intent: GitGraphIntent = decode_canonical(&bytes)?;
-        if intent.format_version != 1 || record_id.as_slice() != intent.revision_id.as_bytes() {
+        let (intent, migrated) = decode_git_graph_intent(&bytes)?;
+        if record_id.as_slice() != intent.revision_id.as_bytes() {
             bail!("pending Git graph backup intent is inconsistent");
+        }
+        if migrated {
+            control.put_record(
+                GIT_GRAPH_INTENT_KIND,
+                &record_id,
+                &canonical_bytes(&intent)?,
+            )?;
         }
         if control
             .get_record("capture-intent", intent.revision_id.as_bytes())?
@@ -808,8 +918,8 @@ pub(crate) fn prepare_revision(
                 &mut sector_commitments,
                 graph,
             )?;
-            canonical_bytes(&GitPrivateMetadataV4 {
-                format_version: 4,
+            canonical_bytes(&GitPrivateMetadataV5 {
+                format_version: 5,
                 root_mode: anchor.manifest.root_mode,
                 root_modified_secs: anchor.manifest.root_modified_secs,
                 root_modified_nanos: anchor.manifest.root_modified_nanos,
@@ -1018,9 +1128,13 @@ fn prepare_git_backup_descriptor(
     content_id_key: &[u8; 32],
     ordinal: &mut u64,
     sector_commitments: &mut BTreeMap<SectorId, MerkleCommitment>,
-    graph: GitGraphSource,
+    source: GitGraphIntent,
 ) -> Result<GitBackupDescriptor> {
     let encryption_key = keys.guild_data_key(&guild_id);
+    validate_git_graph_intent(&source)?;
+    let GitGraphIntent {
+        graph, head_branch, ..
+    } = source;
     let mut blobs = Vec::with_capacity(graph.blobs.len());
     for blob in graph.blobs {
         let mut file = blob.anchor.open_verified()?;
@@ -1075,11 +1189,12 @@ fn prepare_git_backup_descriptor(
         });
     }
     let descriptor = GitBackupDescriptor {
-        format_version: 1,
+        format_version: 2,
         repository_id: graph.repository_id,
         refs: graph.refs,
         objects: graph.objects,
         blobs,
+        head_branch,
     };
     descriptor.validate()?;
     Ok(descriptor)
@@ -1493,10 +1608,27 @@ fn decode_private_metadata_with_git(
             if metadata.format_version != 4 {
                 bail!("Git private metadata has the wrong version");
             }
-            metadata.git.validate()?;
+            let descriptor = metadata.git.into_current()?;
             Ok((
                 PrivateMetadata {
                     format_version: 4,
+                    root_mode: metadata.root_mode,
+                    root_modified_secs: metadata.root_modified_secs,
+                    root_modified_nanos: metadata.root_modified_nanos,
+                    entries: metadata.entries,
+                },
+                Some(descriptor),
+            ))
+        }
+        5 => {
+            let metadata: GitPrivateMetadataV5 = decode_canonical(bytes)?;
+            if metadata.format_version != 5 || metadata.git.format_version != 2 {
+                bail!("Git private metadata has the wrong version");
+            }
+            metadata.git.validate()?;
+            Ok((
+                PrivateMetadata {
+                    format_version: 5,
                     root_mode: metadata.root_mode,
                     root_modified_secs: metadata.root_modified_secs,
                     root_modified_nanos: metadata.root_modified_nanos,
@@ -3202,6 +3334,36 @@ fn hex_id(id: &[u8; 32]) -> String {
 mod metadata_compatibility_tests {
     use super::*;
 
+    #[test]
+    fn historical_git_graph_intent_migrates_with_main_head() {
+        let repository_id = Uuid::new_v4();
+        let legacy = LegacyGitGraphIntentV1 {
+            format_version: 1,
+            guild_id: [17; 32],
+            revision_id: Uuid::new_v4(),
+            protected_root_id: repository_id,
+            graph: GitGraphSource {
+                format_version: 1,
+                repository_id,
+                refs: Vec::new(),
+                objects: Vec::new(),
+                blobs: Vec::new(),
+            },
+        };
+        let (current, migrated) =
+            decode_git_graph_intent(&canonical_bytes(&legacy).unwrap()).unwrap();
+        assert!(migrated);
+        assert_eq!(current.format_version, 2);
+        assert_eq!(current.head_branch, "main");
+        let (reopened, migrated) =
+            decode_git_graph_intent(&canonical_bytes(&current).unwrap()).unwrap();
+        assert!(!migrated);
+        assert_eq!(reopened, current);
+        let mut invalid = current;
+        invalid.head_branch = "missing".to_owned();
+        assert!(decode_git_graph_intent(&canonical_bytes(&invalid).unwrap()).is_err());
+    }
+
     fn restore_fixture(
         keys: &KeyMaterial,
         guild_id: [u8; 32],
@@ -4007,6 +4169,7 @@ mod metadata_compatibility_tests {
         assert_eq!(old_branch.oid, first_commit.oid);
         assert!(repo.create_branch("older").is_err());
         assert!(repo.create_branch("older/nested").is_err());
+        repo.switch_same_tree_branch("older").unwrap();
         fs::write(source.join("tracked"), b"second\nbytes").unwrap();
         let second_blob = repo.stage_file("tracked").unwrap();
         let second_commit = repo.commit("Author", "a@example.test", "second").unwrap();
@@ -4051,9 +4214,29 @@ mod metadata_compatibility_tests {
                 .unwrap(),
             );
         }
-        let metadata: GitPrivateMetadataV4 = decode_canonical(&encoded).unwrap();
-        assert_eq!(metadata.format_version, 4);
+        let metadata: GitPrivateMetadataV5 = decode_canonical(&encoded).unwrap();
+        assert_eq!(metadata.format_version, 5);
+        assert_eq!(metadata.git.format_version, 2);
+        assert_eq!(metadata.git.head_branch, "older");
         metadata.git.validate().unwrap();
+        let historical = GitPrivateMetadataV4 {
+            format_version: 4,
+            root_mode: metadata.root_mode,
+            root_modified_secs: metadata.root_modified_secs,
+            root_modified_nanos: metadata.root_modified_nanos,
+            entries: metadata.entries.clone(),
+            git: LegacyGitBackupDescriptorV1 {
+                format_version: 1,
+                repository_id: metadata.git.repository_id,
+                refs: metadata.git.refs.clone(),
+                objects: metadata.git.objects.clone(),
+                blobs: metadata.git.blobs.clone(),
+            },
+        };
+        let (historical_metadata, historical_git) =
+            decode_private_metadata_with_git(&canonical_bytes(&historical).unwrap()).unwrap();
+        assert_eq!(historical_metadata.format_version, 4);
+        assert_eq!(historical_git.unwrap().head_branch, "main");
         let mut conflicting_refs = metadata.git.clone();
         conflicting_refs.refs.push(mb_git::GitGraphRef {
             name: b"refs/heads/older.foo".to_vec(),
@@ -4065,10 +4248,10 @@ mod metadata_compatibility_tests {
         });
         assert!(conflicting_refs.validate().is_err());
         assert!(metadata.git.refs.iter().any(|reference| {
-            reference.name == b"refs/heads/main" && reference.oid == second_commit.oid
+            reference.name == b"refs/heads/main" && reference.oid == first_commit.oid
         }));
         assert!(metadata.git.refs.iter().any(|reference| {
-            reference.name == b"refs/heads/older" && reference.oid == first_commit.oid
+            reference.name == b"refs/heads/older" && reference.oid == second_commit.oid
         }));
         assert!(
             metadata
@@ -4111,6 +4294,11 @@ mod metadata_compatibility_tests {
         assert_eq!(recovered_history.len(), 2);
         assert_eq!(recovered_history[0].oid, second_commit.oid);
         assert_eq!(recovered_history[1].oid, first_commit.oid);
+        assert_eq!(recovered_repo.status().unwrap().branch, "older");
+        assert_eq!(
+            recovered_repo.status().unwrap().head_oid,
+            Some(second_commit.oid)
+        );
         assert_eq!(
             recovered_repo
                 .branches()
@@ -4119,7 +4307,7 @@ mod metadata_compatibility_tests {
                 .find(|branch| branch.name == "older")
                 .unwrap()
                 .oid,
-            first_commit.oid
+            second_commit.oid
         );
         assert!(recovered_repo.status().unwrap().changes.is_empty());
         let recovered_graph = recovered_repo.export_graph_source().unwrap();
