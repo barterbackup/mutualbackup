@@ -31,8 +31,9 @@ them as ADRs and test vectors before promising wire compatibility.
   automatically fixes line endings or applies another content conversion, even
   when the host's Git configuration enables one. Git clean filters can run
   arbitrary transformations; disabling CRLF normalization alone is insufficient.
-  This policy covers local staging, history, checkout, merge, and
-  interoperability with ordinary Git;
+  Do not offer a compatibility flag, `--renormalize` equivalent, or per-command
+  override that enables such conversion in our binary. This policy covers local
+  staging, history, checkout, merge, and interoperability with ordinary Git.
   Git-compatible object IDs describe the bytes actually retained in native
   anchors. Treat Git's automatic conversion settings as disabled in our binary,
   including when opening an existing repository or importing a commit. `add`
@@ -3089,8 +3090,9 @@ backend gates. A command being present does not by itself close its slice.
   that touch blob or working-tree bytes onto raw-byte paths; never let a Git
   library's default checkout/filter behavior re-enable conversion, including
   during merge (including `merge.renormalize`), reset/restore, pull, and
-  worktree creation. Import Git blob bytes as raw file bytes and export the same
-  bytes. Treat incoming blob bytes as authoritative; do not try to reverse
+  worktree creation. Reject any command option that requests renormalization
+  or a content filter. Import Git blob bytes as raw file bytes and export the
+  same bytes. Treat incoming blob bytes as authoritative; do not try to reverse
   conversions already performed by another client's worktree. Report explicit
   repository transforming rules
   before changing the index, refs, anchors, or worktree.
@@ -3134,8 +3136,9 @@ backend gates. A command being present does not by itself close its slice.
   `core.eol`, and `merge.renormalize` settings and `.gitattributes` rules for `text=auto`,
   `eol`, `filter`, `ident`, and `working-tree-encoding` across add, merge,
   reset/restore, pull, worktree checkout, import, and export; verify a configured
-  filter is never executed
-  and a rejected rule leaves index, refs, anchors, and worktree unchanged;
+  filter is never executed; verify renormalization/filter-enabling command
+  options and transforming rules are rejected without changing index, refs,
+  anchors, or worktree;
   sparse and large files; hard links, symlinks, modes, and unusual path names;
   dirty and untracked checkout safety; merge conflicts/abort; crash/reopen at stage,
   ref, checkout, switch, merge, worktree HEAD/index, import, prune, and backup
