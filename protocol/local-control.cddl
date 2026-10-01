@@ -67,6 +67,7 @@ local-request =
   / { "GitDeleteBranch": { repository_id: uuid-text, name: tstr, force: bool } }
   / { "GitSwitchBranch": { repository_id: uuid-text, name: tstr } }
   / { "GitPushBare": { repository_id: uuid-text, path: tstr } }
+  / { "GitPushTagBare": { repository_id: uuid-text, path: tstr, name: tstr } }
   / { "GitFetchBare": { repository_id: uuid-text, path: tstr } }
   / { "GitPullBare": { repository_id: uuid-text, path: tstr, ? author_name: tstr, ? author_email: tstr } }
   / { "GitMergeBranch": { repository_id: uuid-text, branch: tstr, ? author_name: tstr, ? author_email: tstr } }

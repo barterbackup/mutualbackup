@@ -32,7 +32,7 @@ use crate::history::{
     unpin_commit,
 };
 use crate::interop::{
-    GitInteropError, export_graph_to_git_repository, push_current_branch_to_bare,
+    GitInteropError, export_graph_to_git_repository, push_current_branch_to_bare, push_tag_to_bare,
 };
 use crate::merge::{
     MergeBlobError, has_merge_session, load_merge_session, mark_merge_resolved,
@@ -922,6 +922,21 @@ impl GitRepository {
             &self.root,
             destination.as_ref(),
             &self.selected_branch()?,
+        )?)
+    }
+
+    pub fn push_tag_to_bare(
+        &self,
+        destination: impl AsRef<Path>,
+        name: &str,
+    ) -> Result<Oid, RepositoryError> {
+        self.resume_checkout()?;
+        Ok(push_tag_to_bare(
+            &self.catalog,
+            self.repository_id,
+            &self.root,
+            destination.as_ref(),
+            name,
         )?)
     }
 
@@ -3031,6 +3046,21 @@ mod tests {
             head_branch: "main".to_owned(),
         };
         descriptor.validate().unwrap();
+        let bare_root = run_root.join("stock.git");
+        let stock = git2::Repository::init_bare(&bare_root).unwrap();
+        assert_eq!(
+            local.push_tag_to_bare(&bare_root, "v1").unwrap().as_bytes(),
+            tag.oid
+        );
+        assert_eq!(
+            stock
+                .find_reference("refs/tags/v1")
+                .unwrap()
+                .target()
+                .unwrap()
+                .as_bytes(),
+            tag.oid
+        );
         assert_eq!(
             local
                 .prune_unreachable(&crate::GitPruneRoots::default())
@@ -3159,6 +3189,50 @@ mod tests {
                 .target_id()
                 .as_bytes(),
             tagged.oid
+        );
+        let main_oid = local
+            .branches()
+            .unwrap()
+            .into_iter()
+            .find(|branch| branch.name == "main")
+            .unwrap()
+            .oid;
+        let mut conflicting = stock
+            .reference(
+                "refs/tags/release",
+                git2::Oid::from_bytes(&main_oid).unwrap(),
+                false,
+                "conflicting tag",
+            )
+            .unwrap();
+        assert!(matches!(
+            local.push_tag_to_bare(&bare_root, "release"),
+            Err(RepositoryError::Interop(crate::GitInteropError::TagExists))
+        ));
+        assert_eq!(conflicting.target().unwrap().as_bytes(), main_oid);
+        conflicting.delete().unwrap();
+        assert_eq!(
+            local
+                .push_tag_to_bare(&bare_root, "release")
+                .unwrap()
+                .as_bytes(),
+            tag.oid
+        );
+        assert_eq!(
+            local
+                .push_tag_to_bare(&bare_root, "release")
+                .unwrap()
+                .as_bytes(),
+            tag.oid
+        );
+        assert_eq!(
+            stock
+                .find_reference("refs/tags/release")
+                .unwrap()
+                .target()
+                .unwrap()
+                .as_bytes(),
+            tag.oid
         );
         assert_eq!(
             local

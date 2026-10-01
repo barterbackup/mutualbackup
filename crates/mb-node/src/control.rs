@@ -889,6 +889,17 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitPushTagBare {
+            repository_id,
+            path,
+            name,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_push_tag_bare(repository_id, &path, &name)
+                    .map(|oid| LocalResponse::GitPushed { repository_id, oid })
+            })
+            .await
+        }
         LocalRequest::GitFetchBare {
             repository_id,
             path,

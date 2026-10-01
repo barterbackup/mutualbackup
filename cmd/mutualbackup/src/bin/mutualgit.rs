@@ -112,8 +112,12 @@ enum Command {
     Switch { name: String },
     /// Check out a branch using the same protected worktree transition.
     Checkout { name: String },
-    /// Push the current branch to an existing local bare Git repository.
-    Push { destination: PathBuf },
+    /// Push the current branch or a tag to an existing local bare Git repository.
+    Push {
+        destination: PathBuf,
+        /// Optional refs/tags/NAME to push a tag instead of the current branch.
+        refspec: Option<String>,
+    },
     /// Fetch branches from an existing local Git repository.
     Fetch { source: PathBuf },
     /// Fetch and merge the selected branch from a local Git repository.
@@ -716,34 +720,58 @@ async fn main() -> Result<()> {
             }
             println!("Switched to branch '{}'", branch.name);
         }
-        Command::Push { destination } => {
+        Command::Push {
+            destination,
+            refspec,
+        } => {
             let (_, repository_id) = discover_repository(&working_directory)?;
             let destination = working_directory
                 .join(destination)
                 .canonicalize()
                 .context("cannot resolve bare Git destination")?;
-            let LocalResponse::GitPushed {
-                repository_id: returned_id,
-                oid,
-            } = local_control_call(
-                &socket,
-                &LocalRequest::GitPushBare {
+            let tag_name = refspec
+                .as_deref()
+                .map(|value| {
+                    value
+                        .strip_prefix("refs/tags/")
+                        .filter(|name| !name.is_empty())
+                        .context("push refspec must be refs/tags/NAME")
+                })
+                .transpose()?;
+            let request = match tag_name {
+                Some(name) => LocalRequest::GitPushTagBare {
+                    repository_id,
+                    path: destination.clone(),
+                    name: name.to_owned(),
+                },
+                None => LocalRequest::GitPushBare {
                     repository_id,
                     path: destination.clone(),
                 },
-            )
-            .await?
+            };
+            let LocalResponse::GitPushed {
+                repository_id: returned_id,
+                oid,
+            } = local_control_call(&socket, &request).await?
             else {
                 bail!("daemon returned the wrong response to Git push");
             };
             if returned_id != repository_id {
                 bail!("daemon pushed another repository");
             }
-            println!(
-                "Pushed {} to {}",
-                git2::Oid::from_bytes(&oid)?,
-                destination.display()
-            );
+            if let Some(name) = tag_name {
+                println!(
+                    "Pushed tag {name} ({}) to {}",
+                    git2::Oid::from_bytes(&oid)?,
+                    destination.display()
+                );
+            } else {
+                println!(
+                    "Pushed {} to {}",
+                    git2::Oid::from_bytes(&oid)?,
+                    destination.display()
+                );
+            }
         }
         Command::Fetch { source } => {
             let (_, repository_id) = discover_repository(&working_directory)?;

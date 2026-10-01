@@ -1915,6 +1915,18 @@ impl Node {
         Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
     }
 
+    pub fn git_push_tag_bare(
+        &self,
+        repository_id: Uuid,
+        path: &Path,
+        name: &str,
+    ) -> Result<[u8; 20]> {
+        let oid = self
+            .open_git_repository(repository_id)?
+            .push_tag_to_bare(path, name)?;
+        Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
+    }
+
     pub fn git_fetch_bare(&self, repository_id: Uuid, path: &Path) -> Result<u32> {
         let count = self.open_git_repository(repository_id)?.fetch_bare(path)?;
         Ok(u32::try_from(count).expect("bounded Git ref count"))

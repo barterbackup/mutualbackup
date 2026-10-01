@@ -33,6 +33,10 @@ pub enum GitInteropError {
     NoHead,
     #[error("the destination branch has diverged; a force push is not supported")]
     NonFastForward,
+    #[error("the destination tag exists at another object; moving a tag is not supported")]
+    TagExists,
+    #[error("the requested local tag does not exist")]
+    TagNotFound,
     #[error(
         "the destination contains an object ID with different bytes or cannot stream it for verification"
     )]
@@ -376,6 +380,58 @@ pub fn push_current_branch_to_bare(
         destination.reference_matching(&reference_name, target, true, old, "mutualgit push")?;
     } else {
         destination.reference(&reference_name, target, false, "mutualgit push")?;
+    }
+    Ok(target)
+}
+
+/// Export a reachable native tag graph and create its stock Git ref. Existing
+/// tags may be verified and repeated, but never moved or deleted here.
+pub fn push_tag_to_bare(
+    control: &ControlStore,
+    repository_id: Uuid,
+    source_root: &Path,
+    destination_path: &Path,
+    name: &str,
+) -> Result<Oid, GitInteropError> {
+    let reference_name = format!("refs/tags/{name}");
+    if name.is_empty() || name.len() > 1024 || !git2::Reference::is_valid_name(&reference_name) {
+        return Err(GitInteropError::IncompatibleGraph);
+    }
+    let destination_path = destination_path.canonicalize()?;
+    if destination_path.starts_with(source_root) {
+        return Err(GitInteropError::UnsupportedDestination);
+    }
+    let destination = Repository::open_bare(&destination_path)?;
+    if !destination.is_bare() || destination.object_format() != ObjectFormat::Sha1 {
+        return Err(GitInteropError::UnsupportedDestination);
+    }
+    let graph = export_graph_source(control, repository_id)?;
+    if !matches!(graph.format_version, 1 | 2) || graph.repository_id != repository_id {
+        return Err(GitInteropError::IncompatibleGraph);
+    }
+    let selected = graph
+        .refs
+        .iter()
+        .find(|reference| reference.name == reference_name.as_bytes())
+        .ok_or(GitInteropError::TagNotFound)?;
+    let target = Oid::from_bytes(&selected.oid)?;
+    let previous = match destination.find_reference(&reference_name) {
+        Ok(reference) => Some(
+            reference
+                .target()
+                .ok_or(GitInteropError::IncompatibleGraph)?,
+        ),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if previous.is_some_and(|old| old != target) {
+        return Err(GitInteropError::TagExists);
+    }
+    export_objects(&destination, &graph)?;
+    if let Some(old) = previous {
+        destination.reference_matching(&reference_name, target, true, old, "mutualgit push tag")?;
+    } else {
+        destination.reference(&reference_name, target, false, "mutualgit push tag")?;
     }
     Ok(target)
 }
