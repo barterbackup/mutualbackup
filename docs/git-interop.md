@@ -13,6 +13,8 @@ replays its recorded plan, so a backend change cannot reinterpret its bytes.
 Fetched and pushed Git blobs likewise select a native import plan through the
 binding; an interrupted import replays its recorded plan. Automatic content
 merges use the same backend for their generated raw bytes.
+Checkout and restore publish regular files through the selected backend after
+the root probe, including when the daemon replays an interrupted checkout.
 
 ```sh
 mutualgit init /absolute/path/to/source

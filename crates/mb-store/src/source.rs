@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    AnchorError, FileAnchorManifest, ImportedBlobCapturePlan, ReflinkAnchor, ReflinkCapturePlan,
-    ReflinkFileCapturePlan, StableAnchorManifest, probe_reflink,
+    AnchorError, FileAnchorManifest, ImportedBlobCapturePlan, PinnedDirectory, ReflinkAnchor,
+    ReflinkCapturePlan, ReflinkFileCapturePlan, StableAnchorManifest, probe_reflink,
 };
 
 /// Local source capabilities never enter a signed peer record. Version 1
@@ -93,6 +93,19 @@ impl SourceBackendKind {
     ) -> Result<SourceBlobImportPlan, AnchorError> {
         match self {
             Self::ReflinkV1 => SourceBlobImportPlan::plan_direct(source_root, logical_len),
+        }
+    }
+
+    /// Publish a distinct editable inode from a verified immutable anchor.
+    pub fn publish_checkout_file(
+        self,
+        staging: &PinnedDirectory,
+        name: impl AsRef<Path>,
+        anchor: &FileAnchorManifest,
+        mode: u32,
+    ) -> Result<(), AnchorError> {
+        match self {
+            Self::ReflinkV1 => staging.publish_reflink_child(name, anchor, mode),
         }
     }
 }

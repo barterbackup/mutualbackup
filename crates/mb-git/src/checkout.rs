@@ -15,7 +15,7 @@ use git2::{Branch, ObjectType, Oid};
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
 use mb_store::{
     AnchorError, ControlStore, DatabaseError, FileAnchorManifest, NativeFileId, PinnedDirectory,
-    PinnedEntryKind,
+    PinnedEntryKind, SourceBackendKind,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -517,9 +517,12 @@ fn publish_staged_target(
     name: &OsStr,
     anchor: &FileAnchorManifest,
     mode: u32,
+    source_backend: SourceBackendKind,
 ) -> Result<(), CheckoutError> {
     match entry_kind(mode)? {
-        PinnedEntryKind::RegularFile => staging.publish_reflink_child(name, anchor, mode)?,
+        PinnedEntryKind::RegularFile => {
+            source_backend.publish_checkout_file(staging, name, anchor, mode)?
+        }
         PinnedEntryKind::Symlink => {
             if anchor.logical_len == 0 || anchor.logical_len > 4095 {
                 return Err(CheckoutError::UnsupportedTopology);
@@ -1050,6 +1053,7 @@ pub(crate) fn begin_switch(
     root_path: &Path,
     catalog_dir: &PinnedDirectory,
     name: &str,
+    source_backend: SourceBackendKind,
 ) -> Result<GitBranchInfo, CheckoutError> {
     begin_switch_for_scope(
         control,
@@ -1057,6 +1061,7 @@ pub(crate) fn begin_switch(
         root_path,
         catalog_dir,
         name,
+        source_backend,
     )
 }
 
@@ -1066,9 +1071,10 @@ pub(crate) fn begin_switch_for_scope(
     root_path: &Path,
     catalog_dir: &PinnedDirectory,
     name: &str,
+    source_backend: SourceBackendKind,
 ) -> Result<GitBranchInfo, CheckoutError> {
     let repository_id = scope.repository_id();
-    resume_pending_checkout_for_scope(control, scope, root_path, catalog_dir)?;
+    resume_pending_checkout_for_scope(control, scope, root_path, catalog_dir, source_backend)?;
     if branch_selected_elsewhere(control, scope, name)? {
         return Err(CheckoutError::BranchCheckedOutElsewhere);
     }
@@ -1106,6 +1112,7 @@ pub(crate) fn begin_switch_for_scope(
             merge_commit: false,
             resolved_paths: None,
         },
+        source_backend,
     )?;
     Ok(GitBranchInfo {
         current: true,
@@ -1124,7 +1131,13 @@ pub(crate) fn begin_pull(
     author_email: &str,
 ) -> Result<Oid, CheckoutError> {
     let root_path = source.root;
-    resume_pending_checkout(control, repository_id, root_path, catalog_dir)?;
+    resume_pending_checkout(
+        control,
+        repository_id,
+        root_path,
+        catalog_dir,
+        source.backend,
+    )?;
     let branch = selected_branch(control, repository_id)?;
     let remote_ref = format!("refs/remotes/origin/{branch}");
     let target = ref_oid(control, repository_id, remote_ref.as_bytes())?
@@ -1172,6 +1185,7 @@ pub(crate) fn begin_pull(
             merge_commit: false,
             resolved_paths: None,
         },
+        source.backend,
     )?;
     Ok(target)
 }
@@ -1188,7 +1202,13 @@ pub(crate) fn begin_merge_branch(
     author_email: &str,
 ) -> Result<Oid, CheckoutError> {
     let root_path = source.root;
-    resume_pending_checkout(control, repository_id, root_path, catalog_dir)?;
+    resume_pending_checkout(
+        control,
+        repository_id,
+        root_path,
+        catalog_dir,
+        source.backend,
+    )?;
     if branch.len() > 1024 || !Branch::name_is_valid(branch)? {
         return Err(HistoryError::InvalidBranch.into());
     }
@@ -1239,6 +1259,7 @@ pub(crate) fn begin_merge_branch(
             merge_commit: false,
             resolved_paths: None,
         },
+        source.backend,
     )?;
     Ok(target)
 }
@@ -1308,6 +1329,7 @@ fn begin_divergent_merge(
             merge_commit: true,
             resolved_paths: None,
         },
+        source.backend,
     )?;
     Ok(merged)
 }
@@ -1319,7 +1341,13 @@ pub(crate) fn continue_merge(
     catalog_dir: &PinnedDirectory,
 ) -> Result<Oid, CheckoutError> {
     let root_path = source.root;
-    resume_pending_checkout(control, repository_id, root_path, catalog_dir)?;
+    resume_pending_checkout(
+        control,
+        repository_id,
+        root_path,
+        catalog_dir,
+        source.backend,
+    )?;
     let (session, _) =
         load_merge_session(control, repository_id)?.ok_or(MergeBlobError::MissingSession)?;
     let branch = selected_branch(control, repository_id)?;
@@ -1382,6 +1410,7 @@ pub(crate) fn continue_merge(
             merge_commit: true,
             resolved_paths: Some(&resolved_paths),
         },
+        source.backend,
     )?;
     Ok(merged)
 }
@@ -1392,6 +1421,7 @@ fn begin_checkout_to(
     root_path: &Path,
     catalog_dir: &PinnedDirectory,
     target: CheckoutTarget<'_>,
+    source_backend: SourceBackendKind,
 ) -> Result<(), CheckoutError> {
     begin_checkout_to_for_scope(
         control,
@@ -1399,6 +1429,7 @@ fn begin_checkout_to(
         root_path,
         catalog_dir,
         target,
+        source_backend,
     )
 }
 
@@ -1408,6 +1439,7 @@ fn begin_checkout_to_for_scope(
     root_path: &Path,
     catalog_dir: &PinnedDirectory,
     target: CheckoutTarget<'_>,
+    source_backend: SourceBackendKind,
 ) -> Result<(), CheckoutError> {
     let repository_id = scope.repository_id();
     if target.merge_commit {
@@ -1632,7 +1664,14 @@ fn begin_checkout_to_for_scope(
     )? {
         return Err(CheckoutError::IncompatibleIntent);
     }
-    apply_intent(control, scope, &mut intent, &root, catalog_dir)?;
+    apply_intent(
+        control,
+        scope,
+        &mut intent,
+        &root,
+        catalog_dir,
+        source_backend,
+    )?;
     Ok(())
 }
 
@@ -1697,8 +1736,17 @@ pub(crate) fn begin_restore_for_scope(
     root_path: &Path,
     catalog_dir: &PinnedDirectory,
     paths: &[PathBuf],
+    source_backend: SourceBackendKind,
 ) -> Result<u32, CheckoutError> {
-    begin_index_or_head_restore(control, scope, root_path, catalog_dir, paths, false)
+    begin_index_or_head_restore(
+        control,
+        scope,
+        root_path,
+        catalog_dir,
+        paths,
+        false,
+        source_backend,
+    )
 }
 
 /// Reset the whole working tree and index to the selected HEAD. One intent
@@ -1708,8 +1756,17 @@ pub(crate) fn begin_hard_reset_for_scope(
     scope: GitWorktreeScope,
     root_path: &Path,
     catalog_dir: &PinnedDirectory,
+    source_backend: SourceBackendKind,
 ) -> Result<u32, CheckoutError> {
-    begin_index_or_head_restore(control, scope, root_path, catalog_dir, &[], true)
+    begin_index_or_head_restore(
+        control,
+        scope,
+        root_path,
+        catalog_dir,
+        &[],
+        true,
+        source_backend,
+    )
 }
 
 fn begin_index_or_head_restore(
@@ -1719,9 +1776,10 @@ fn begin_index_or_head_restore(
     catalog_dir: &PinnedDirectory,
     paths: &[PathBuf],
     hard_reset: bool,
+    source_backend: SourceBackendKind,
 ) -> Result<u32, CheckoutError> {
     let repository_id = scope.repository_id();
-    resume_pending_checkout_for_scope(control, scope, root_path, catalog_dir)?;
+    resume_pending_checkout_for_scope(control, scope, root_path, catalog_dir, source_backend)?;
     if has_pending_stages_for_scope(control, scope)? {
         return Err(CheckoutError::DirtyWorktree);
     }
@@ -1911,7 +1969,14 @@ fn begin_index_or_head_restore(
     )? {
         return Err(CheckoutError::IncompatibleIntent);
     }
-    apply_intent(control, scope, &mut intent, &root, catalog_dir)?;
+    apply_intent(
+        control,
+        scope,
+        &mut intent,
+        &root,
+        catalog_dir,
+        source_backend,
+    )?;
     Ok(changed)
 }
 
@@ -1920,12 +1985,14 @@ pub(crate) fn resume_pending_checkout(
     repository_id: Uuid,
     root_path: &Path,
     catalog_dir: &PinnedDirectory,
+    source_backend: SourceBackendKind,
 ) -> Result<(), CheckoutError> {
     resume_pending_checkout_for_scope(
         control,
         GitWorktreeScope::primary(repository_id),
         root_path,
         catalog_dir,
+        source_backend,
     )
 }
 
@@ -1934,12 +2001,20 @@ pub(crate) fn resume_pending_checkout_for_scope(
     scope: GitWorktreeScope,
     root_path: &Path,
     catalog_dir: &PinnedDirectory,
+    source_backend: SourceBackendKind,
 ) -> Result<(), CheckoutError> {
     let root = PinnedDirectory::open(root_path)?;
     let Some(mut intent) = load_intent(control, scope, root.identity()?)? else {
         return Ok(());
     };
-    apply_intent(control, scope, &mut intent, &root, catalog_dir)
+    apply_intent(
+        control,
+        scope,
+        &mut intent,
+        &root,
+        catalog_dir,
+        source_backend,
+    )
 }
 
 fn apply_intent(
@@ -1948,6 +2023,7 @@ fn apply_intent(
     intent: &mut CheckoutIntent,
     root: &PinnedDirectory,
     catalog: &PinnedDirectory,
+    source_backend: SourceBackendKind,
 ) -> Result<(), CheckoutError> {
     if intent.repository_id != scope.repository_id() {
         return Err(CheckoutError::IncompatibleIntent);
@@ -1999,7 +2075,13 @@ fn apply_intent(
                         .into_iter()
                         .find(|anchor| anchor.anchor_id == target.anchor_id)
                         .ok_or(CheckoutError::MissingAnchor)?;
-                publish_staged_target(&staging, OsStr::new(&name), &anchor, target.mode)?;
+                publish_staged_target(
+                    &staging,
+                    OsStr::new(&name),
+                    &anchor,
+                    target.mode,
+                    source_backend,
+                )?;
                 let identity = entry_identity_for(&staging, OsStr::new(&name), target.mode)?
                     .ok_or(CheckoutError::IncompatibleIntent)?;
                 verify_file(&staging, OsStr::new(&name), identity, target)?;

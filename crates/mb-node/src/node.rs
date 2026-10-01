@@ -1377,8 +1377,8 @@ impl Node {
         let root = self.add_protected_root(&source_root)?;
         let backend = self.source_backend_for_root(&root, filesystem_identity(&root.path)?)?;
         let key = self.git_catalog_key(root.root_id);
-        let repository = GitRepository::init(&root.path, root.root_id, &key)?
-            .with_source_backend(backend.backend);
+        let repository =
+            GitRepository::init_with_backend(&root.path, root.root_id, &key, backend.backend)?;
         if repository.id() != root.root_id {
             anyhow::bail!("Git catalog does not match the protected root");
         }
@@ -1433,8 +1433,8 @@ impl Node {
         }
         let backend = self.source_backend_for_root(&root, filesystem)?;
         let key = self.git_catalog_key(repository_id);
-        let repository = GitRepository::open(&root.path, repository_id, &key)?
-            .with_source_backend(backend.backend);
+        let repository =
+            GitRepository::open_with_backend(&root.path, repository_id, &key, backend.backend)?;
         Ok(repository)
     }
 
@@ -24058,6 +24058,29 @@ pub(crate) mod tests {
         fs::write(source.join("tracked"), b"backend-routed Git bytes\r\n").unwrap();
         let staged = node.git_add_path(info.repository_id, Path::new("tracked"));
         assert!(staged.unwrap().is_some());
+        node.git_commit(
+            info.repository_id,
+            "Source Test",
+            "source@test.invalid",
+            "first",
+        )
+        .unwrap();
+        node.git_create_branch(info.repository_id, "saved").unwrap();
+        fs::write(source.join("tracked"), b"edited bytes\n").unwrap();
+        node.git_add_path(info.repository_id, Path::new("tracked"))
+            .unwrap();
+        node.git_commit(
+            info.repository_id,
+            "Source Test",
+            "source@test.invalid",
+            "second",
+        )
+        .unwrap();
+        node.git_switch_branch(info.repository_id, "saved").unwrap();
+        assert_eq!(
+            fs::read(source.join("tracked")).unwrap(),
+            b"backend-routed Git bytes\r\n"
+        );
 
         let recovered_source = run_root.join("recovered-source");
         fs::create_dir(&recovered_source).unwrap();

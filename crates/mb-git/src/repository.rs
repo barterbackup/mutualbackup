@@ -114,6 +114,20 @@ impl GitRepository {
         repository_id: Uuid,
         catalog_key: &[u8; 32],
     ) -> Result<Self, RepositoryError> {
+        Self::init_with_backend(
+            source_root,
+            repository_id,
+            catalog_key,
+            SourceBackendKind::ReflinkV1,
+        )
+    }
+
+    pub fn init_with_backend(
+        source_root: impl AsRef<Path>,
+        repository_id: Uuid,
+        catalog_key: &[u8; 32],
+        source_backend: SourceBackendKind,
+    ) -> Result<Self, RepositoryError> {
         if repository_id.is_nil() {
             return Err(RepositoryError::Conflict);
         }
@@ -142,7 +156,13 @@ impl GitRepository {
                 directory.sync_all()?;
             }
             cleanup_staged_markers(&directory)?;
-            return Self::open_from_pinned(root, repository_id, directory, catalog_key);
+            return Self::open_from_pinned(
+                root,
+                repository_id,
+                directory,
+                catalog_key,
+                source_backend,
+            );
         }
 
         let intent_bytes = initialization_intent_bytes(repository_id);
@@ -166,7 +186,7 @@ impl GitRepository {
             directory,
             root,
             repository_id,
-            source_backend: SourceBackendKind::ReflinkV1,
+            source_backend,
         };
         repository.resume_checkout()?;
         resume_pending_prune(&repository.catalog, repository.repository_id)?;
@@ -178,6 +198,20 @@ impl GitRepository {
         repository_id: Uuid,
         catalog_key: &[u8; 32],
     ) -> Result<Self, RepositoryError> {
+        Self::open_with_backend(
+            source_root,
+            repository_id,
+            catalog_key,
+            SourceBackendKind::ReflinkV1,
+        )
+    }
+
+    pub fn open_with_backend(
+        source_root: impl AsRef<Path>,
+        repository_id: Uuid,
+        catalog_key: &[u8; 32],
+        source_backend: SourceBackendKind,
+    ) -> Result<Self, RepositoryError> {
         if repository_id.is_nil() {
             return Err(RepositoryError::Conflict);
         }
@@ -186,7 +220,7 @@ impl GitRepository {
         let directory = root_dir
             .open_child_directory(GIT_CATALOG_DIRECTORY)?
             .ok_or(RepositoryError::NotInitialized)?;
-        Self::open_from_pinned(root, repository_id, directory, catalog_key)
+        Self::open_from_pinned(root, repository_id, directory, catalog_key, source_backend)
     }
 
     fn open_from_pinned(
@@ -194,6 +228,7 @@ impl GitRepository {
         repository_id: Uuid,
         directory: PinnedDirectory,
         catalog_key: &[u8; 32],
+        source_backend: SourceBackendKind,
     ) -> Result<Self, RepositoryError> {
         require_private_catalog(&directory)?;
         let ready = read_marker(&directory, GIT_CATALOG_MARKER_FILE)?
@@ -208,7 +243,7 @@ impl GitRepository {
             directory,
             root,
             repository_id,
-            source_backend: SourceBackendKind::ReflinkV1,
+            source_backend,
         };
         repository.resume_checkout()?;
         resume_pending_prune(&repository.catalog, repository.repository_id)?;
@@ -217,12 +252,6 @@ impl GitRepository {
 
     pub fn id(&self) -> Uuid {
         self.repository_id
-    }
-
-    /// The daemon supplies the kind from its validated protected-root binding.
-    pub fn with_source_backend(mut self, source_backend: SourceBackendKind) -> Self {
-        self.source_backend = source_backend;
-        self
     }
 
     fn native_source(&self) -> NativeSource<'_> {
@@ -249,6 +278,7 @@ impl GitRepository {
             &self.directory,
             destination.as_ref(),
             branch,
+            self.source_backend,
         )?)
     }
 
@@ -274,12 +304,14 @@ impl GitRepository {
             worktree_id,
             &self.root,
             &self.directory,
+            self.source_backend,
         )?;
         resume_pending_checkout_for_scope(
             &self.catalog,
             info.scope().ok_or(GitWorktreeError::Conflict)?,
             &info.path,
             &self.directory,
+            self.source_backend,
         )?;
         Ok(info)
     }
@@ -455,6 +487,7 @@ impl GitRepository {
             &info.path,
             &self.directory,
             paths,
+            self.source_backend,
         )?)
     }
 
@@ -466,6 +499,7 @@ impl GitRepository {
             info.scope().ok_or(GitWorktreeError::Conflict)?,
             &info.path,
             &self.directory,
+            self.source_backend,
         )?)
     }
 
@@ -572,9 +606,16 @@ impl GitRepository {
         let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
         match switch_same_tree_branch_for_scope(&self.catalog, scope, name) {
             Ok(branch) => Ok(branch),
-            Err(HistoryError::CheckoutRequired | HistoryError::NoHead) => Ok(
-                begin_switch_for_scope(&self.catalog, scope, &info.path, &self.directory, name)?,
-            ),
+            Err(HistoryError::CheckoutRequired | HistoryError::NoHead) => {
+                Ok(begin_switch_for_scope(
+                    &self.catalog,
+                    scope,
+                    &info.path,
+                    &self.directory,
+                    name,
+                    self.source_backend,
+                )?)
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -798,6 +839,7 @@ impl GitRepository {
             &self.root,
             &self.directory,
             paths,
+            self.source_backend,
         )?)
     }
 
@@ -809,6 +851,7 @@ impl GitRepository {
             crate::GitWorktreeScope::primary(self.repository_id),
             &self.root,
             &self.directory,
+            self.source_backend,
         )?)
     }
 
@@ -902,6 +945,7 @@ impl GitRepository {
                 &self.root,
                 &self.directory,
                 name,
+                self.source_backend,
             )?),
             Err(error) => Err(error.into()),
         }
@@ -914,6 +958,7 @@ impl GitRepository {
             self.repository_id,
             &self.root,
             &self.directory,
+            self.source_backend,
         )?)
     }
 
@@ -1649,6 +1694,7 @@ mod tests {
                 &linked_root,
                 &local.directory,
                 "main",
+                SourceBackendKind::ReflinkV1,
             ),
             Err(crate::CheckoutError::BranchCheckedOutElsewhere)
         ));
@@ -1723,6 +1769,7 @@ mod tests {
             &linked_root,
             &local.directory,
             "base-copy",
+            SourceBackendKind::ReflinkV1,
         )
         .unwrap();
         assert_eq!(fs::read(linked_root.join("tracked")).unwrap(), b"base\r\n");
@@ -1749,6 +1796,7 @@ mod tests {
                 &linked_root,
                 &local.directory,
                 "topic",
+                SourceBackendKind::ReflinkV1,
             )
             .unwrap();
         }));
@@ -1763,6 +1811,7 @@ mod tests {
                 scope,
                 &wrong_root,
                 &local.directory,
+                SourceBackendKind::ReflinkV1,
             ),
             Err(crate::CheckoutError::IncompatibleIntent)
         ));
@@ -1771,6 +1820,7 @@ mod tests {
             scope,
             &linked_root,
             &local.directory,
+            SourceBackendKind::ReflinkV1,
         )
         .unwrap();
         assert_eq!(

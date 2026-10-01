@@ -11,6 +11,7 @@ use git2::Branch;
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
 use mb_store::{
     AnchorError, ControlStore, DatabaseError, GIT_CATALOG_DIRECTORY, NativeFileId, PinnedDirectory,
+    SourceBackendKind,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -164,6 +165,7 @@ pub(crate) fn add_worktree(
     catalog: &PinnedDirectory,
     destination: &Path,
     branch: &str,
+    source_backend: SourceBackendKind,
 ) -> Result<GitWorktreeInfo, GitWorktreeError> {
     let path = destination.canonicalize()?;
     let root = PinnedDirectory::open(&path)?;
@@ -225,6 +227,7 @@ pub(crate) fn add_worktree(
         info.worktree_id,
         primary_root,
         catalog,
+        source_backend,
     )
 }
 
@@ -234,6 +237,7 @@ pub(crate) fn resume_worktree(
     worktree_id: Uuid,
     primary_root: &Path,
     catalog: &PinnedDirectory,
+    source_backend: SourceBackendKind,
 ) -> Result<GitWorktreeInfo, GitWorktreeError> {
     let info = get_worktree(control, repository_id, worktree_id)?;
     let canonical = info.path.canonicalize()?;
@@ -251,7 +255,7 @@ pub(crate) fn resume_worktree(
         return Ok(info);
     }
     let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
-    resume_pending_checkout_for_scope(control, scope, &info.path, catalog)?;
+    resume_pending_checkout_for_scope(control, scope, &info.path, catalog, source_backend)?;
     let selected = selected_branch_for_scope(control, scope)?;
     if selected != info.target_branch {
         let unborn = format!("mutualbackup-init-{}", info.worktree_id);
@@ -267,7 +271,14 @@ pub(crate) fn resume_worktree(
         if fs::read_dir(root.descriptor_path())?.next().is_some() {
             return Err(GitWorktreeError::InvalidDestination);
         }
-        begin_switch_for_scope(control, scope, &info.path, catalog, &info.target_branch)?;
+        begin_switch_for_scope(
+            control,
+            scope,
+            &info.path,
+            catalog,
+            &info.target_branch,
+            source_backend,
+        )?;
     }
     let status = repository_status_for_scope(control, scope, &info.path)?;
     if status.branch != info.target_branch
