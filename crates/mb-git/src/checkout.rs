@@ -1,5 +1,6 @@
-//! Crash-replayable checkout for files and symlinks. The selected HEAD and index
-//! change together only after every target file is durably in the worktree.
+//! Crash-replayable checkout and worktree restore for files and symlinks.
+//! Checkout changes the selected HEAD and index together only after every
+//! target file is durable; restore changes working files without moving either.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -658,11 +659,16 @@ fn published_target_file(
 }
 
 fn validate_intent(intent: &CheckoutIntent, repository_id: Uuid) -> Result<(), CheckoutError> {
-    if !matches!(intent.format_version, 1..=6)
+    if !matches!(intent.format_version, 1..=7)
         || matches!(intent.format_version, 3 | 4 | 6) != intent.advance_ref
         || matches!(intent.format_version, 4 | 6) != intent.target_ref.is_some()
         || intent.format_version == 5
             && (intent.old_oid != [0; 20] || intent.old_branch == intent.new_branch)
+        || intent.format_version == 7
+            && (intent.advance_ref
+                || intent.target_ref.is_some()
+                || intent.old_branch != intent.new_branch
+                || intent.old_oid != intent.new_oid)
         || intent.target_ref.as_ref().is_some_and(|reference| {
             let Ok(name) = std::str::from_utf8(reference) else {
                 return true;
@@ -780,7 +786,7 @@ fn encode_intent(intent: &CheckoutIntent) -> Result<Vec<u8>, CheckoutError> {
             removed_directories: intent.removed_directories.clone(),
         })
         .map_err(Into::into),
-        4..=6 => canonical_bytes(intent).map_err(Into::into),
+        4..=7 => canonical_bytes(intent).map_err(Into::into),
         _ => Err(CheckoutError::IncompatibleIntent),
     }
 }
@@ -847,7 +853,7 @@ fn decode_intent(bytes: &[u8], repository_id: Uuid) -> Result<CheckoutIntent, Ch
         Some(1) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntent>(bytes)?),
         Some(2) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntentV2>(bytes)?),
         Some(3) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntentV3>(bytes)?),
-        Some(4..=6) => decode_canonical::<CheckoutIntent>(bytes)?,
+        Some(4..=7) => decode_canonical::<CheckoutIntent>(bytes)?,
         _ => return Err(CheckoutError::IncompatibleIntent),
     };
     validate_intent(&intent, repository_id)?;
@@ -859,6 +865,18 @@ fn target_branch_is_current(
     scope: GitWorktreeScope,
     intent: &CheckoutIntent,
 ) -> Result<bool, CheckoutError> {
+    if intent.format_version == 7 {
+        let selected = selected_branch_for_scope(control, scope)?;
+        let current = ref_oid(
+            control,
+            intent.repository_id,
+            format!("refs/heads/{selected}").as_bytes(),
+        )?;
+        let expected = (intent.new_oid != [0; 20])
+            .then(|| Oid::from_bytes(&intent.new_oid))
+            .transpose()?;
+        return Ok(selected == intent.new_branch && current == expected);
+    }
     Ok(list_branches_for_scope(control, scope)?
         .iter()
         .any(|branch| {
@@ -1614,6 +1632,227 @@ fn begin_checkout_to_for_scope(
     Ok(())
 }
 
+fn captured_worktree_file(
+    root: &PinnedDirectory,
+    path: &[u8],
+) -> Result<Option<(CheckoutFile, NativeFileId)>, CheckoutError> {
+    let Some((parent, leaf)) = parent_and_name_if_exists(root, path)? else {
+        return Ok(None);
+    };
+    if let Some(identity) = entry_identity_for(&parent, &leaf, 0o100644)? {
+        let file = parent
+            .open_child_file(&leaf)?
+            .ok_or(CheckoutError::DirtyWorktree)?;
+        let before = file.metadata()?;
+        let mode = if before.mode() & 0o111 != 0 {
+            0o100755
+        } else {
+            0o100644
+        };
+        let oid = Oid::hash_file(
+            ObjectType::Blob,
+            PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
+        )?;
+        if file_fingerprint(&before) != file_fingerprint(&file.metadata()?) {
+            return Err(CheckoutError::DirtyWorktree);
+        }
+        let captured = CheckoutFile {
+            oid: oid.as_bytes().try_into().expect("SHA-1 OID"),
+            mode,
+            anchor_id: Uuid::nil(),
+        };
+        verify_file(&parent, &leaf, identity, &captured)?;
+        return Ok(Some((captured, identity)));
+    }
+    let symlink = match parent.read_child_symlink(&leaf) {
+        Ok(symlink) => symlink,
+        Err(AnchorError::UnsupportedObject(_)) => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some((target, identity)) = symlink {
+        let captured = CheckoutFile {
+            oid: Oid::hash_object(ObjectType::Blob, &target)?
+                .as_bytes()
+                .try_into()
+                .expect("SHA-1 OID"),
+            mode: 0o120000,
+            anchor_id: Uuid::nil(),
+        };
+        verify_file(&parent, &leaf, identity, &captured)?;
+        return Ok(Some((captured, identity)));
+    }
+    Ok(None)
+}
+
+/// Restore selected paths from the index without moving HEAD or changing the
+/// index. Dirty working bytes are fingerprinted before the replayable intent is
+/// installed, then checked again before any replacement is published.
+pub(crate) fn begin_restore_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    root_path: &Path,
+    catalog_dir: &PinnedDirectory,
+    paths: &[PathBuf],
+) -> Result<u32, CheckoutError> {
+    let repository_id = scope.repository_id();
+    resume_pending_checkout_for_scope(control, scope, root_path, catalog_dir)?;
+    if has_pending_stages_for_scope(control, scope)? {
+        return Err(CheckoutError::DirtyWorktree);
+    }
+    let branch = selected_branch_for_scope(control, scope)?;
+    let head = ref_oid(
+        control,
+        repository_id,
+        format!("refs/heads/{branch}").as_bytes(),
+    )?;
+    let committed = files_for_commit(control, repository_id, head)?;
+    let staged = staged_entries_for_scope(control, scope)?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let available = committed
+        .keys()
+        .chain(staged.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut selected = BTreeSet::new();
+    for path in paths {
+        let key = stage_path_key(path)?;
+        let mut prefix = key.clone();
+        prefix.push(b'/');
+        let matches = available
+            .iter()
+            .filter(|candidate| *candidate == &key || candidate.starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Err(StageError::MissingUntrackedPath.into());
+        }
+        selected.extend(matches);
+    }
+    if selected.len() > MAX_CHECKOUT_FILES {
+        return Err(CheckoutError::TooManyFiles);
+    }
+    let root = PinnedDirectory::open(root_path)?;
+    let mut old_files = BTreeMap::new();
+    let mut old_tree = TreeFiles::new();
+    let mut target_tree = TreeFiles::new();
+    for path in &selected {
+        if let Some((file, identity)) = captured_worktree_file(&root, path)? {
+            old_tree.insert(path.clone(), (file.oid, file.mode));
+            old_files.insert(path.clone(), (file, identity));
+        }
+        if let Some(index) = staged.get(path) {
+            entry_kind(index.mode)?;
+            target_tree.insert(path.clone(), (index.oid, index.mode));
+            if is_attributes_path(path) && matches!(index.mode, 0o100644 | 0o100755) {
+                let anchor = anchors_for_oid(control, repository_id, Oid::from_bytes(&index.oid)?)?
+                    .into_iter()
+                    .find(|anchor| anchor.anchor_id == index.anchor_id)
+                    .ok_or(CheckoutError::MissingAnchor)?;
+                validate_anchor(&anchor)?;
+            }
+        }
+    }
+    let old_directories = parent_directory_paths(&old_tree)?;
+    for path in &selected {
+        if old_files.contains_key(path) {
+            continue;
+        }
+        if let Some((parent, leaf)) = parent_and_name_if_exists(&root, path)?
+            && entry_exists(&parent, &leaf)?
+            && !old_directories.contains(path)
+        {
+            return Err(CheckoutError::DirtyWorktree);
+        }
+    }
+    preflight_blocking_directories(&root, &old_tree, &target_tree, &old_directories)?;
+    let directories = missing_target_directories(&root, &old_tree, &target_tree)?;
+    let removed_directories = obsolete_directories(&root, &old_tree, &target_tree)?;
+    let missing_directories = directories
+        .iter()
+        .map(|directory| directory.path.as_slice())
+        .collect::<BTreeSet<_>>();
+    let mut entries = Vec::new();
+    for path in selected {
+        let old = old_files.get(&path);
+        let new = staged.get(&path);
+        if old.is_some_and(|(file, _)| {
+            new.is_some_and(|index| index.oid == file.oid && index.mode == file.mode)
+        }) || old.is_none() && new.is_none()
+        {
+            continue;
+        }
+        let relative = relative_path(&path)?;
+        let parent = relative
+            .parent()
+            .ok_or(CheckoutError::UnsupportedTopology)?;
+        let new_parent_is_missing = missing_directories.contains(parent.as_os_str().as_bytes());
+        if old.is_none()
+            && new.is_some()
+            && !new_parent_is_missing
+            && !old_directories.contains(&path)
+            && let Some((directory, leaf)) = parent_and_name_if_exists(&root, &path)?
+            && entry_exists(&directory, &leaf)?
+        {
+            return Err(CheckoutError::DirtyWorktree);
+        }
+        let new_file = new
+            .map(|index| {
+                Ok::<_, CheckoutError>(CheckoutFile {
+                    oid: index.oid,
+                    mode: index.mode,
+                    anchor_id: choose_anchor(
+                        control,
+                        repository_id,
+                        index.oid,
+                        root.identity()?.filesystem_id,
+                    )?,
+                })
+            })
+            .transpose()?;
+        entries.push(CheckoutEntry {
+            path,
+            old: old.map(|(file, _)| file.clone()),
+            old_id: old.map(|(_, identity)| *identity),
+            new: new_file,
+            new_id: None,
+        });
+    }
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let changed = u32::try_from(entries.len()).map_err(|_| CheckoutError::TooManyFiles)?;
+    let oid = head
+        .map(|oid| oid.as_bytes().try_into().expect("SHA-1 OID"))
+        .unwrap_or([0; 20]);
+    let mut intent = CheckoutIntent {
+        format_version: 7,
+        advance_ref: false,
+        target_ref: None,
+        repository_id,
+        old_branch: branch.clone(),
+        old_oid: oid,
+        new_branch: branch,
+        new_oid: oid,
+        staging_name: format!("checkout-{}", Uuid::new_v4()),
+        staging_id: None,
+        phase: Phase::Preparing,
+        entries,
+        directories,
+        removed_directories,
+    };
+    validate_intent(&intent, repository_id)?;
+    if !control.put_record_if_absent(
+        &intent_kind_for_scope(scope),
+        INTENT_KEY,
+        &encode_intent_for_scope(scope, root.identity()?, &intent)?,
+    )? {
+        return Err(CheckoutError::IncompatibleIntent);
+    }
+    apply_intent(control, scope, &mut intent, &root, catalog_dir)?;
+    Ok(changed)
+}
+
 pub(crate) fn resume_pending_checkout(
     control: &ControlStore,
     repository_id: Uuid,
@@ -1745,7 +1984,10 @@ fn apply_intent(
             return Err(CheckoutError::BranchCheckedOutElsewhere);
         }
         let branches = list_branches_for_scope(control, scope)?;
-        let (old_current, target_available) = if intent.advance_ref {
+        let (old_current, target_available) = if intent.format_version == 7 {
+            let current = target_branch_is_current(control, scope, intent)?;
+            (current, current)
+        } else if intent.advance_ref {
             let local_ref = format!("refs/heads/{}", intent.old_branch);
             let remote_ref = format!("refs/remotes/origin/{}", intent.new_branch);
             let target_ref = intent
@@ -1800,11 +2042,30 @@ fn apply_intent(
         if !old_current || !target_available {
             return Err(CheckoutError::IncompatibleIntent);
         }
-        let target_files = files_for_commit(
-            control,
-            intent.repository_id,
-            Some(Oid::from_bytes(&intent.new_oid)?),
-        )?;
+        let target_files = if intent.format_version == 7 {
+            let staged = staged_entries_for_scope(control, scope)?
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+            let mut files = TreeFiles::new();
+            for entry in &intent.entries {
+                match (&entry.new, staged.get(&entry.path)) {
+                    (Some(target), Some(index))
+                        if target.oid == index.oid && target.mode == index.mode =>
+                    {
+                        files.insert(entry.path.clone(), (target.oid, target.mode));
+                    }
+                    (None, None) => {}
+                    _ => return Err(CheckoutError::IncompatibleIntent),
+                }
+            }
+            files
+        } else {
+            files_for_commit(
+                control,
+                intent.repository_id,
+                Some(Oid::from_bytes(&intent.new_oid)?),
+            )?
+        };
         for (index, entry) in intent.entries.iter().enumerate() {
             if entry.new.is_none() {
                 apply_old_deletion(root, &staging, index, entry)?;
@@ -1924,99 +2185,104 @@ fn apply_intent(
                 },
             )?;
         }
-        let mut records = Vec::new();
-        let mut deletions = Vec::new();
-        let previous_index = staged_entries_for_scope(control, scope)?
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
-        for (path, (oid, mode)) in &target_files {
-            let anchor_id = match intent.entries.iter().find(|entry| entry.path == *path) {
-                Some(entry) => {
-                    entry
-                        .new
-                        .as_ref()
-                        .ok_or(CheckoutError::IncompatibleIntent)?
-                        .anchor_id
-                }
-                None => {
-                    let staged = previous_index
-                        .get(path)
-                        .ok_or(CheckoutError::IncompatibleIntent)?;
-                    if staged.oid != *oid || staged.mode != *mode {
-                        return Err(CheckoutError::IncompatibleIntent);
-                    }
-                    staged.anchor_id
-                }
-            };
-            records.push((
-                index_kind_for_scope(scope),
-                path.clone(),
-                canonical_bytes(&GitIndexEntry {
-                    format_version: 1,
-                    oid: *oid,
-                    mode: *mode,
-                    anchor_id,
-                })?,
-            ));
-        }
-        for path in previous_index.keys() {
-            if !target_files.contains_key(path) {
-                deletions.push((index_kind_for_scope(scope), path.clone()));
-            }
-        }
-        records.push(selected_branch_record_for_scope(scope, &intent.new_branch)?);
-        if intent.advance_ref {
-            records.push((
-                ref_kind(intent.repository_id),
-                format!("refs/heads/{}", intent.new_branch).into_bytes(),
-                fetched_ref_record(intent.new_oid)?,
-            ));
-        }
-        intent.phase = Phase::Cleanup;
-        records.push((
-            intent_kind_for_scope(scope),
-            INTENT_KEY.to_vec(),
-            encode_intent_for_scope(scope, root.identity()?, intent)?,
-        ));
-        let merge_session = if scope.worktree_id() == scope.repository_id() {
-            load_merge_session(control, intent.repository_id)?
+        if intent.format_version == 7 {
+            intent.phase = Phase::Cleanup;
+            save_intent(control, scope, root.identity()?, intent)?;
         } else {
-            None
-        };
-        if let Some((session, encoded)) = merge_session {
-            let (first, second) = merge_commit_parents(
-                control,
-                intent.repository_id,
-                Oid::from_bytes(&intent.new_oid)?,
-            )?;
-            if intent.format_version != 6
-                || session.branch != intent.old_branch
-                || session.ours != intent.old_oid
-                || session.theirs != second.as_bytes()
-                || first.as_bytes() != session.ours
-                || intent.target_ref.as_deref() != Some(session.source_ref.as_slice())
-                || session.conflicts.len() != session.resolved.len()
-                || session.conflicts.iter().any(|path| {
-                    match (target_files.get(path), previous_index.get(path)) {
-                        (Some((oid, mode)), Some(staged)) => {
-                            staged.oid != *oid || staged.mode != *mode
+            let mut records = Vec::new();
+            let mut deletions = Vec::new();
+            let previous_index = staged_entries_for_scope(control, scope)?
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+            for (path, (oid, mode)) in &target_files {
+                let anchor_id = match intent.entries.iter().find(|entry| entry.path == *path) {
+                    Some(entry) => {
+                        entry
+                            .new
+                            .as_ref()
+                            .ok_or(CheckoutError::IncompatibleIntent)?
+                            .anchor_id
+                    }
+                    None => {
+                        let staged = previous_index
+                            .get(path)
+                            .ok_or(CheckoutError::IncompatibleIntent)?;
+                        if staged.oid != *oid || staged.mode != *mode {
+                            return Err(CheckoutError::IncompatibleIntent);
                         }
-                        (None, None) => false,
-                        _ => true,
+                        staged.anchor_id
                     }
-                })
-            {
-                return Err(CheckoutError::IncompatibleIntent);
+                };
+                records.push((
+                    index_kind_for_scope(scope),
+                    path.clone(),
+                    canonical_bytes(&GitIndexEntry {
+                        format_version: 1,
+                        oid: *oid,
+                        mode: *mode,
+                        anchor_id,
+                    })?,
+                ));
             }
-            control.put_records_and_retire_and_delete_if_value(
-                &records,
-                &deletions,
-                &session_kind(intent.repository_id),
-                session_key(),
-                &encoded,
-            )?;
-        } else {
-            control.put_records_and_delete(&records, &deletions)?;
+            for path in previous_index.keys() {
+                if !target_files.contains_key(path) {
+                    deletions.push((index_kind_for_scope(scope), path.clone()));
+                }
+            }
+            records.push(selected_branch_record_for_scope(scope, &intent.new_branch)?);
+            if intent.advance_ref {
+                records.push((
+                    ref_kind(intent.repository_id),
+                    format!("refs/heads/{}", intent.new_branch).into_bytes(),
+                    fetched_ref_record(intent.new_oid)?,
+                ));
+            }
+            intent.phase = Phase::Cleanup;
+            records.push((
+                intent_kind_for_scope(scope),
+                INTENT_KEY.to_vec(),
+                encode_intent_for_scope(scope, root.identity()?, intent)?,
+            ));
+            let merge_session = if scope.worktree_id() == scope.repository_id() {
+                load_merge_session(control, intent.repository_id)?
+            } else {
+                None
+            };
+            if let Some((session, encoded)) = merge_session {
+                let (first, second) = merge_commit_parents(
+                    control,
+                    intent.repository_id,
+                    Oid::from_bytes(&intent.new_oid)?,
+                )?;
+                if intent.format_version != 6
+                    || session.branch != intent.old_branch
+                    || session.ours != intent.old_oid
+                    || session.theirs != second.as_bytes()
+                    || first.as_bytes() != session.ours
+                    || intent.target_ref.as_deref() != Some(session.source_ref.as_slice())
+                    || session.conflicts.len() != session.resolved.len()
+                    || session.conflicts.iter().any(|path| {
+                        match (target_files.get(path), previous_index.get(path)) {
+                            (Some((oid, mode)), Some(staged)) => {
+                                staged.oid != *oid || staged.mode != *mode
+                            }
+                            (None, None) => false,
+                            _ => true,
+                        }
+                    })
+                {
+                    return Err(CheckoutError::IncompatibleIntent);
+                }
+                control.put_records_and_retire_and_delete_if_value(
+                    &records,
+                    &deletions,
+                    &session_kind(intent.repository_id),
+                    session_key(),
+                    &encoded,
+                )?;
+            } else {
+                control.put_records_and_delete(&records, &deletions)?;
+            }
         }
         run_after_checkout_commit_hook();
     }

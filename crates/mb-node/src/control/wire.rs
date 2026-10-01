@@ -111,6 +111,11 @@ pub enum LocalRequest {
         worktree_id: Uuid,
         paths: Vec<PathBuf>,
     },
+    GitWorktreeRestore {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        paths: Vec<PathBuf>,
+    },
     GitWorktreeCreateBranch {
         repository_id: Uuid,
         worktree_id: Uuid,
@@ -232,6 +237,10 @@ pub enum LocalRequest {
         repository_id: Uuid,
     },
     GitResetIndex {
+        repository_id: Uuid,
+        paths: Vec<PathBuf>,
+    },
+    GitRestoreWorktree {
         repository_id: Uuid,
         paths: Vec<PathBuf>,
     },
@@ -380,6 +389,10 @@ pub enum LocalResponse {
         removed: bool,
     },
     GitIndexReset {
+        repository_id: Uuid,
+        changed_paths: u32,
+    },
+    GitWorktreeRestored {
         repository_id: Uuid,
         changed_paths: u32,
     },
@@ -653,6 +666,11 @@ mod tests {
                 worktree_id: Uuid::from_bytes([5; 16]),
                 paths: vec![PathBuf::from("tracked")],
             },
+            LocalRequest::GitWorktreeRestore {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                paths: vec![PathBuf::from("tracked")],
+            },
             LocalRequest::GitWorktreeCreateBranch {
                 repository_id,
                 worktree_id: Uuid::from_bytes([5; 16]),
@@ -820,6 +838,10 @@ mod tests {
                 repository_id,
                 paths: Vec::new(),
             },
+            LocalRequest::GitRestoreWorktree {
+                repository_id,
+                paths: vec![PathBuf::from("tracked")],
+            },
             LocalRequest::GitCreateBranch {
                 repository_id,
                 name: "older".to_owned(),
@@ -967,6 +989,10 @@ mod tests {
             LocalResponse::GitIndexReset {
                 repository_id,
                 changed_paths: 2,
+            },
+            LocalResponse::GitWorktreeRestored {
+                repository_id,
+                changed_paths: 1,
             },
             LocalResponse::GitPendingAddAbandoned { abandoned: true },
             LocalResponse::GitCommitted(GitCommitInfo {

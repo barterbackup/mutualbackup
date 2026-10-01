@@ -54,10 +54,12 @@ enum Command {
     },
     /// Reset the whole index or selected paths to HEAD without changing files.
     Reset { paths: Vec<PathBuf> },
-    /// Restore selected index paths from HEAD; worktree restore is not yet supported.
+    /// Restore selected paths from the index, HEAD, or both.
     Restore {
         #[arg(long)]
         staged: bool,
+        #[arg(long)]
+        worktree: bool,
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
@@ -350,11 +352,17 @@ async fn main() -> Result<()> {
         Command::Reset { paths } => {
             reset_index(&socket, &working_directory, paths).await?;
         }
-        Command::Restore { staged, paths } => {
-            if !staged {
-                bail!("only `restore --staged` is supported");
+        Command::Restore {
+            staged,
+            worktree,
+            paths,
+        } => {
+            if staged {
+                reset_index(&socket, &working_directory, paths.clone()).await?;
             }
-            reset_index(&socket, &working_directory, paths).await?;
+            if worktree || !staged {
+                restore_worktree(&socket, &working_directory, paths).await?;
+            }
         }
         Command::Commit {
             message,
@@ -1083,6 +1091,41 @@ async fn reset_index(socket: &Path, working_directory: &Path, paths: Vec<PathBuf
         bail!("daemon reset another repository's index");
     }
     println!("Reset {changed_paths} staged path(s) to HEAD");
+    Ok(())
+}
+
+async fn restore_worktree(
+    socket: &Path,
+    working_directory: &Path,
+    paths: Vec<PathBuf>,
+) -> Result<()> {
+    let (root, repository_id, worktree_id) = discover_location(working_directory)?;
+    let paths = paths
+        .iter()
+        .map(|path| relative_for_add(&root, working_directory, path))
+        .collect::<Result<Vec<_>>>()?;
+    let request = match worktree_id {
+        Some(worktree_id) => LocalRequest::GitWorktreeRestore {
+            repository_id,
+            worktree_id,
+            paths,
+        },
+        None => LocalRequest::GitRestoreWorktree {
+            repository_id,
+            paths,
+        },
+    };
+    let LocalResponse::GitWorktreeRestored {
+        repository_id: returned_id,
+        changed_paths,
+    } = local_control_call(socket, &request).await?
+    else {
+        bail!("daemon returned the wrong response to Git worktree restore");
+    };
+    if returned_id != repository_id {
+        bail!("daemon restored another repository's worktree");
+    }
+    println!("Restored {changed_paths} working path(s) from the index");
     Ok(())
 }
 

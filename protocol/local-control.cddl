@@ -37,6 +37,7 @@ local-request =
   / { "GitWorktreeLog": { repository_id: uuid-text, worktree_id: uuid-text, limit: uint } }
   / { "GitWorktreeBranches": { repository_id: uuid-text, worktree_id: uuid-text } }
   / { "GitWorktreeResetIndex": { repository_id: uuid-text, worktree_id: uuid-text, paths: [* tstr] } }
+  / { "GitWorktreeRestore": { repository_id: uuid-text, worktree_id: uuid-text, paths: [* tstr] } }
   / { "GitWorktreeCreateBranch": { repository_id: uuid-text, worktree_id: uuid-text, name: tstr } }
   / { "GitWorktreeCreateBranchFrom": { repository_id: uuid-text, worktree_id: uuid-text, name: tstr, start_point: tstr } }
   / { "GitWorktreeDeleteBranch": { repository_id: uuid-text, worktree_id: uuid-text, name: tstr, force: bool } }
@@ -62,6 +63,7 @@ local-request =
   / { "GitUnpinCommit": { repository_id: uuid-text, oid: bytes20-array } }
   / { "GitPrune": { repository_id: uuid-text } }
   / { "GitResetIndex": { repository_id: uuid-text, paths: [* tstr] } }
+  / { "GitRestoreWorktree": { repository_id: uuid-text, paths: [* tstr] } }
   / { "GitCreateBranch": { repository_id: uuid-text, name: tstr } }
   / { "GitCreateBranchFrom": { repository_id: uuid-text, name: tstr, start_point: tstr } }
   / { "GitDeleteBranch": { repository_id: uuid-text, name: tstr, force: bool } }
@@ -114,6 +116,7 @@ local-response =
   / { "GitDeletionStaged": { repository_id: uuid-text, path: tstr } }
   / { "GitCachedPathRemoved": { removed: bool } }
   / { "GitIndexReset": { repository_id: uuid-text, changed_paths: uint } }
+  / { "GitWorktreeRestored": { repository_id: uuid-text, changed_paths: uint } }
   / { "GitPendingAddAbandoned": { abandoned: bool } }
   / { "GitCommitted": git-commit-info }
   / { "GitLog": [* git-log-entry] }

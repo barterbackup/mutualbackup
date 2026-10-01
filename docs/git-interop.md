@@ -13,7 +13,12 @@ mutualgit -C /absolute/path/to/source status
 ```
 
 The local binary supports branches, linked worktrees, exact-byte checkout,
-merge, staged reset and restore, diff, log, explicit commit pins, and prune.
+merge, staged reset, worktree restore, diff, log, explicit commit pins, and prune.
+`mutualgit restore PATH` restores working files from the staged index without
+moving HEAD or changing that index; `mutualgit restore --staged PATH` resets
+the selected index paths from HEAD without changing working files. Use both
+flags to reset the index first and then restore those working paths. Restore
+replays an interrupted file replacement when the daemon reopens the repository.
 `mutualgit tag` lists, creates, and deletes lightweight commit tags. Use
 `mutualgit tag -a -m 'release notes' NAME [START-POINT]` to create an annotated
 commit tag with the configured committer identity. Both tag forms are included
