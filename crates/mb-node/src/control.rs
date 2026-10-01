@@ -468,6 +468,19 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitFetchBare {
+            repository_id,
+            path,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_fetch_bare(repository_id, &path)
+                    .map(|branch_count| LocalResponse::GitFetched {
+                        repository_id,
+                        branch_count,
+                    })
+            })
+            .await
+        }
         LocalRequest::GitDiff {
             repository_id,
             cached,

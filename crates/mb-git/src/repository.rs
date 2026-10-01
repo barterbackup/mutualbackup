@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::checkout::{CheckoutError, begin_switch, resume_pending_checkout};
 use crate::diff::{DiffError, GitDiff, repository_diff};
+use crate::fetch::{FetchError, fetch_bare};
 use crate::head::{HeadError, selected_branch};
 use crate::history::{
     GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, HistoryError, commit_index,
@@ -57,6 +58,8 @@ pub enum RepositoryError {
     Checkout(#[from] CheckoutError),
     #[error("Git interoperability error: {0}")]
     Interop(#[from] GitInteropError),
+    #[error("Git fetch error: {0}")]
+    Fetch(#[from] FetchError),
     #[error("repository marker or catalog identity conflicts with this root")]
     Conflict,
     #[error("the Git repository is not initialized")]
@@ -393,6 +396,18 @@ impl GitRepository {
         )?)
     }
 
+    /// Import remote branches without changing the selected HEAD, index, or
+    /// working tree. Interrupted imports resume from the durable fetch intent.
+    pub fn fetch_bare(&self, source: impl AsRef<Path>) -> Result<usize, RepositoryError> {
+        self.resume_checkout()?;
+        Ok(fetch_bare(
+            &self.catalog,
+            self.repository_id,
+            &self.root,
+            source.as_ref(),
+        )?)
+    }
+
     pub fn import_backup(
         &self,
         descriptor: &crate::GitBackupDescriptor,
@@ -539,6 +554,101 @@ mod tests {
             fs::read(unrelated_catalog.join("user-file")).unwrap(),
             b"must be preserved"
         );
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn local_bare_git_fetch_imports_packed_objects_without_changing_worktree() {
+        use std::process::Command;
+
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-bare-fetch-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        let bare_root = run_root.join("remote.git");
+        fs::create_dir_all(&source_root).unwrap();
+        let remote = git2::Repository::init_bare(&bare_root).unwrap();
+        let mut payload = vec![0x5a_u8; 2 * 1024 * 1024];
+        payload.extend_from_slice(b"\r\n\0tail\n");
+        let large = remote.blob(&payload).unwrap();
+        let link = remote.blob(b"missing\r\npath").unwrap();
+        let mut builder = remote.treebuilder(None).unwrap();
+        builder.insert("large", large, 0o100644).unwrap();
+        builder.insert("link", link, 0o120000).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = remote.find_tree(tree_oid).unwrap();
+        let author = git2::Signature::now("Remote", "remote@example.invalid").unwrap();
+        let commit = remote
+            .commit(
+                Some("refs/heads/main"),
+                &author,
+                &author,
+                "first",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        assert!(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&bare_root)
+                .arg("gc")
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let repository_id = Uuid::new_v4();
+        let key = [83_u8; 32];
+        let local = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        assert_eq!(local.fetch_bare(&bare_root).unwrap(), 1);
+        assert_eq!(local.selected_branch().unwrap(), "main");
+        assert!(!source_root.join("large").exists());
+        let graph = local.export_graph_source().unwrap();
+        assert_eq!(graph.refs.len(), 1);
+        assert_eq!(graph.refs[0].name, b"refs/remotes/origin/main");
+        assert_eq!(graph.refs[0].oid.as_slice(), commit.as_bytes());
+        assert_eq!(graph.blobs.len(), 2);
+        let large_anchor = graph
+            .blobs
+            .iter()
+            .find(|blob| blob.oid.as_slice() == large.as_bytes())
+            .unwrap();
+        let link_anchor = graph
+            .blobs
+            .iter()
+            .find(|blob| blob.oid.as_slice() == link.as_bytes())
+            .unwrap();
+        let mut imported_large = Vec::new();
+        large_anchor
+            .anchor
+            .open_verified()
+            .unwrap()
+            .read_to_end(&mut imported_large)
+            .unwrap();
+        assert_eq!(imported_large, payload);
+        let mut imported_link = Vec::new();
+        link_anchor
+            .anchor
+            .open_verified()
+            .unwrap()
+            .read_to_end(&mut imported_link)
+            .unwrap();
+        assert_eq!(imported_link, b"missing\r\npath");
+        assert_eq!(local.fetch_bare(&bare_root).unwrap(), 1);
+        drop(local);
+        let local = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        assert_eq!(local.export_graph_source().unwrap(), graph);
+        drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        drop(tree);
+        drop(builder);
+        drop(remote);
+        fs::remove_dir_all(run_root).unwrap();
     }
 
     #[test]

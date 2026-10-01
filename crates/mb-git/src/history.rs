@@ -27,8 +27,8 @@ use crate::{GitAnchorError, GitBackupDescriptor, GitBackupError, NativeOdb, blob
 const METADATA_PREFIX: &str = "git-metadata-object-v1/";
 const REF_PREFIX: &str = "git-ref-v1/";
 const MAIN_REF: &[u8] = b"refs/heads/main";
-const MAX_GRAPH_OBJECTS: usize = 100_000;
-const MAX_GRAPH_METADATA_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_GRAPH_OBJECTS: usize = 100_000;
+pub(crate) const MAX_GRAPH_METADATA_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum HistoryError {
@@ -138,11 +138,11 @@ struct RefRecord {
     oid: [u8; 20],
 }
 
-fn metadata_kind(repository_id: Uuid) -> String {
+pub(crate) fn metadata_kind(repository_id: Uuid) -> String {
     format!("{METADATA_PREFIX}{repository_id}")
 }
 
-fn ref_kind(repository_id: Uuid) -> String {
+pub(crate) fn ref_kind(repository_id: Uuid) -> String {
     format!("{REF_PREFIX}{repository_id}")
 }
 
@@ -162,11 +162,18 @@ fn object_code(kind: ObjectType) -> Result<u8, HistoryError> {
     }
 }
 
-fn object_record(kind: ObjectType, bytes: Vec<u8>) -> Result<Vec<u8>, HistoryError> {
+pub(crate) fn object_record(kind: ObjectType, bytes: Vec<u8>) -> Result<Vec<u8>, HistoryError> {
     Ok(canonical_bytes(&MetadataObject {
         format_version: 1,
         kind: object_code(kind)?,
         bytes,
+    })?)
+}
+
+pub(crate) fn fetched_ref_record(oid: [u8; 20]) -> Result<Vec<u8>, HistoryError> {
+    Ok(canonical_bytes(&RefRecord {
+        format_version: 1,
+        oid,
     })?)
 }
 

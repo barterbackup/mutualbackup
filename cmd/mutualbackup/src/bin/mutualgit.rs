@@ -69,6 +69,8 @@ enum Command {
     Checkout { name: String },
     /// Push the current branch to an existing local bare Git repository.
     Push { destination: PathBuf },
+    /// Fetch branches from an existing local bare Git repository.
+    Fetch { source: PathBuf },
     /// Show raw-byte changes in the worktree or staged index.
     Diff {
         #[arg(long, alias = "staged")]
@@ -324,6 +326,31 @@ async fn main() -> Result<()> {
                 "Pushed {} to {}",
                 git2::Oid::from_bytes(&oid)?,
                 destination.display()
+            );
+        }
+        Command::Fetch { source } => {
+            let (_, repository_id) = discover_repository(&working_directory)?;
+            let source = working_directory.join(source);
+            let LocalResponse::GitFetched {
+                repository_id: returned_id,
+                branch_count,
+            } = local_control_call(
+                &socket,
+                &LocalRequest::GitFetchBare {
+                    repository_id,
+                    path: source.clone(),
+                },
+            )
+            .await?
+            else {
+                bail!("daemon returned the wrong response to Git fetch");
+            };
+            if returned_id != repository_id {
+                bail!("daemon fetched another repository");
+            }
+            println!(
+                "Fetched {branch_count} branch(es) from {}",
+                source.display()
             );
         }
         Command::Diff { cached } => {

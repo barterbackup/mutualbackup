@@ -48,7 +48,7 @@ fn object_type(kind: u8) -> Result<ObjectType, GitInteropError> {
     }
 }
 
-fn matches_existing<R: Read>(
+pub(crate) fn matches_existing<R: Read>(
     repository: &Repository,
     oid: Oid,
     kind: ObjectType,

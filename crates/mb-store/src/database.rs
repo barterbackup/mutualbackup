@@ -293,6 +293,25 @@ impl ControlStore {
         intent_id: &[u8],
         expected_intent: &[u8],
     ) -> Result<(), DatabaseError> {
+        self.put_records_and_retire_and_delete_if_value(
+            records,
+            &[],
+            intent_kind,
+            intent_id,
+            expected_intent,
+        )
+    }
+
+    /// Publish dependent records and retire one exact intent together with
+    /// temporary records that only had meaning while that intent was pending.
+    pub fn put_records_and_retire_and_delete_if_value(
+        &self,
+        records: &[(String, Vec<u8>, Vec<u8>)],
+        deletions: &[(String, Vec<u8>)],
+        intent_kind: &str,
+        intent_id: &[u8],
+        expected_intent: &[u8],
+    ) -> Result<(), DatabaseError> {
         let transaction = self.connection.unchecked_transaction()?;
         let retired = transaction.execute(
             "DELETE FROM protocol_records
@@ -309,6 +328,12 @@ impl ControlStore {
             )?;
             for (kind, id, bytes) in records {
                 put.execute(params![kind, id, bytes])?;
+            }
+            let mut delete = transaction.prepare_cached(
+                "DELETE FROM protocol_records WHERE kind = ?1 AND record_id = ?2",
+            )?;
+            for (kind, id) in deletions {
+                delete.execute(params![kind, id])?;
             }
         }
         transaction.commit()?;

@@ -1469,6 +1469,11 @@ impl Node {
         Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
     }
 
+    pub fn git_fetch_bare(&self, repository_id: Uuid, path: &Path) -> Result<u32> {
+        let count = self.open_git_repository(repository_id)?.fetch_bare(path)?;
+        Ok(u32::try_from(count).expect("bounded Git ref count"))
+    }
+
     pub fn git_diff(&self, repository_id: Uuid, cached: bool) -> Result<GitDiff> {
         self.open_git_repository(repository_id)?
             .diff(cached)
@@ -15400,6 +15405,16 @@ pub(crate) mod tests {
                 .unwrap()
                 .as_bytes(),
             second_commit.oid
+        );
+        assert_eq!(
+            reopened
+                .git_fetch_bare(info.repository_id, &bare_root)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened.git_status(info.repository_id).unwrap().head_oid,
+            Some(second_commit.oid)
         );
         let branches = reopened.git_branches(info.repository_id).unwrap();
         assert_eq!(branches.len(), 2);

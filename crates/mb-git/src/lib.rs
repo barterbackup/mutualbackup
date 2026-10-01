@@ -18,6 +18,8 @@ mod checkout;
 #[cfg(target_os = "linux")]
 mod diff;
 #[cfg(target_os = "linux")]
+mod fetch;
+#[cfg(target_os = "linux")]
 mod head;
 #[cfg(target_os = "linux")]
 mod history;
@@ -35,6 +37,8 @@ pub use backup::{GitBackupBlob, GitBackupDescriptor, GitBackupError, GitDataExte
 pub use checkout::CheckoutError;
 #[cfg(target_os = "linux")]
 pub use diff::{DiffError, GitDiff};
+#[cfg(target_os = "linux")]
+pub use fetch::FetchError;
 #[cfg(target_os = "linux")]
 pub use head::HeadError;
 #[cfg(target_os = "linux")]
