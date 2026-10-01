@@ -2779,6 +2779,59 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn fetches_exact_bytes_from_a_local_nonbare_git_worktree() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-worktree-fetch-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        let stock_root = run_root.join("stock");
+        fs::create_dir_all(&source_root).unwrap();
+        let stock = git2::Repository::init(&stock_root).unwrap();
+        let payload = b"from worktree\r\nwith\0raw\xff";
+        let blob = stock.blob(payload).unwrap();
+        let mut builder = stock.treebuilder(None).unwrap();
+        builder.insert("tracked", blob, 0o100644).unwrap();
+        let tree = stock.find_tree(builder.write().unwrap()).unwrap();
+        let signature = git2::Signature::now("Stock", "stock@example.test").unwrap();
+        let commit = stock
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "source",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [99_u8; 32];
+        let local = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        assert_eq!(local.fetch_bare(&stock_root).unwrap(), 1);
+        assert!(
+            local
+                .remote_branches()
+                .unwrap()
+                .iter()
+                .any(|branch| branch.name == "origin/main" && branch.oid == commit.as_bytes())
+        );
+        assert!(!source_root.join("tracked").exists());
+        assert_eq!(local.pull_bare(&stock_root, "", "").unwrap(), commit);
+        assert_eq!(fs::read(source_root.join("tracked")).unwrap(), payload);
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
+        drop(tree);
+        drop(builder);
+        drop(stock);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn exports_advertised_graph_into_stock_git_without_a_local_payload_mirror() {
         use std::process::Command;
 

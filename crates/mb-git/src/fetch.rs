@@ -1,4 +1,4 @@
-//! Crash-replayable import from a local bare Git repository or stock Git push.
+//! Crash-replayable import from a local Git repository or stock Git push.
 //! Commit/tree metadata is bounded in the encrypted catalog. Blob payloads
 //! stream from raw Git objects directly into native immutable anchors.
 
@@ -56,7 +56,7 @@ pub enum FetchError {
     Database(#[from] DatabaseError),
     #[error("versioned fetch intent error: {0}")]
     Model(#[from] ModelError),
-    #[error("source must be an existing exact SHA-1 Git directory outside this root")]
+    #[error("source must be an existing exact SHA-1 Git repository outside this root")]
     UnsupportedSource,
     #[error("Git attributes policy error: {0}")]
     Attributes(#[from] GitAttributesError),
@@ -162,13 +162,22 @@ fn source_repository(
     }
     let repo = match format_version {
         1 => Repository::open_bare(path)?,
-        2 => Repository::open(path)?,
+        2 | 3 => Repository::open(path)?,
         _ => return Err(FetchError::UnsupportedSource),
     };
-    if (format_version == 1 && !repo.is_bare())
-        || repo.path().canonicalize()? != path
-        || repo.object_format() != ObjectFormat::Sha1
-    {
+    let git_directory = repo.path().canonicalize()?;
+    if git_directory.starts_with(root) {
+        return Err(FetchError::UnsupportedSource);
+    }
+    let exact_location = if format_version == 3 {
+        !repo.is_bare()
+            && repo
+                .workdir()
+                .is_some_and(|workdir| workdir.canonicalize().ok().as_deref() == Some(path))
+    } else {
+        (format_version != 1 || repo.is_bare()) && git_directory == path
+    };
+    if !exact_location || repo.object_format() != ObjectFormat::Sha1 {
         return Err(FetchError::UnsupportedSource);
     }
     Ok(repo)
@@ -203,6 +212,7 @@ fn discover(
     repository_id: Uuid,
     source_path: PathBuf,
     source_root: PathBuf,
+    format_version: u16,
 ) -> Result<FetchIntent, FetchError> {
     let mut refs = Vec::new();
     for reference in repo.references_glob("refs/heads/*")? {
@@ -229,7 +239,14 @@ fn discover(
     }
     refs.sort_by(|left, right| left.name.cmp(&right.name));
 
-    discover_from_refs(repo, repository_id, source_path, source_root, refs, 1)
+    discover_from_refs(
+        repo,
+        repository_id,
+        source_path,
+        source_root,
+        refs,
+        format_version,
+    )
 }
 
 fn discover_from_refs(
@@ -365,7 +382,7 @@ fn validate_intent(
     repository_id: Uuid,
     root: &Path,
 ) -> Result<(), FetchError> {
-    if !matches!(intent.format_version, 1 | 2)
+    if !matches!(intent.format_version, 1..=3)
         || intent.fetch_id.is_nil()
         || intent.repository_id != repository_id
         || intent.source_root != root
@@ -380,10 +397,10 @@ fn validate_intent(
     for reference in &intent.refs {
         let name =
             std::str::from_utf8(&reference.name).map_err(|_| FetchError::IncompatibleSource)?;
-        let prefix = if intent.format_version == 1 {
-            "refs/remotes/origin/"
-        } else {
+        let prefix = if intent.format_version == 2 {
             "refs/heads/"
+        } else {
+            "refs/remotes/origin/"
         };
         if !name.starts_with(prefix) || !git2::Reference::is_valid_name(name) {
             return Err(FetchError::IncompatibleSource);
@@ -592,12 +609,12 @@ fn import_blob(
     let anchor = match state.plan.capture(std::io::empty()) {
         Ok(anchor) => anchor,
         Err(AnchorError::SourceChanged(_)) => {
-            source_repository(
+            let repository = source_repository(
                 &intent.source_path,
                 &intent.source_root,
                 intent.format_version,
             )?;
-            capture_raw_blob(&intent.source_path, oid, blob.logical_len, &state.plan)?
+            capture_raw_blob(repository.path(), oid, blob.logical_len, &state.plan)?
         }
         Err(error) => return Err(error.into()),
     };
@@ -628,7 +645,7 @@ fn import_blob(
     Ok(())
 }
 
-/// Fetch every remote branch into `refs/remotes/origin/*`. The selected local
+/// Fetch every local Git source branch into `refs/remotes/origin/*`. The selected local
 /// branch, index and worktree are unchanged. Blob imports are replayable; refs
 /// become visible only when every required native anchor has been published.
 pub fn fetch_bare(
@@ -648,7 +665,7 @@ pub fn fetch_bare(
         Some(bytes) => {
             let intent: FetchIntent = decode_canonical(&bytes)?;
             validate_intent(&intent, repository_id, source_root)?;
-            if intent.format_version != 1
+            if !matches!(intent.format_version, 1 | 3)
                 || source_path != intent.source_path
                     && source_path.canonicalize().ok().as_deref()
                         != Some(intent.source_path.as_path())
@@ -659,12 +676,15 @@ pub fn fetch_bare(
         }
         None => {
             let canonical = source_path.canonicalize()?;
-            let repository = source_repository(&canonical, source_root, 1)?;
+            let candidate = Repository::open(&canonical)?;
+            let format_version = if candidate.is_bare() { 1 } else { 3 };
+            let repository = source_repository(&canonical, source_root, format_version)?;
             let intent = discover(
                 &repository,
                 repository_id,
                 canonical,
                 source_root.to_owned(),
+                format_version,
             )?;
             validate_intent(&intent, repository_id, source_root)?;
             let bytes = canonical_bytes(&intent)?;
@@ -899,7 +919,8 @@ mod tests {
                 &remote,
                 Uuid::new_v4(),
                 remote_path,
-                temp.path().join("work")
+                temp.path().join("work"),
+                1,
             ),
             Err(FetchError::IncompatibleSource)
         ));
@@ -1035,7 +1056,8 @@ mod tests {
         drop(local);
         let catalog_path = root.join(GIT_CATALOG_DIRECTORY).join("catalog.db");
         let control = ControlStore::open_existing_with_key(&catalog_path, &key).unwrap();
-        let intent = discover(&remote, repository_id, remote_path.clone(), root.clone()).unwrap();
+        let intent =
+            discover(&remote, repository_id, remote_path.clone(), root.clone(), 1).unwrap();
         assert_eq!(intent.blobs.len(), 2);
         control
             .put_record_if_absent(
@@ -1088,6 +1110,75 @@ mod tests {
         let control = ControlStore::open_existing_with_key(&catalog_path, &key).unwrap();
         assert!(control.records(&verified_kind(&intent)).unwrap().is_empty());
         drop(control);
+        for item in graph.blobs {
+            item.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn nonbare_fetch_replays_after_source_disappears() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-worktree-fetch-replay-{}", Uuid::new_v4()));
+        let root = run_root.join("work");
+        let stock_root = run_root.join("stock");
+        fs::create_dir_all(&root).unwrap();
+        let stock = Repository::init(&stock_root).unwrap();
+        let payload = b"raw\r\nworktree\0blob";
+        let blob = stock.blob(payload).unwrap();
+        let mut builder = stock.treebuilder(None).unwrap();
+        builder.insert("tracked", blob, 0o100644).unwrap();
+        let tree = stock.find_tree(builder.write().unwrap()).unwrap();
+        let signature = git2::Signature::now("Stock", "stock@example.test").unwrap();
+        let commit = stock
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "source",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [100_u8; 32];
+        let local = GitRepository::init(&root, repository_id, &key).unwrap();
+        drop(local);
+        let catalog_path = root.join(GIT_CATALOG_DIRECTORY).join("catalog.db");
+        let control = ControlStore::open_existing_with_key(&catalog_path, &key).unwrap();
+        let intent = discover(&stock, repository_id, stock_root.clone(), root.clone(), 3).unwrap();
+        assert_eq!(intent.blobs.len(), 1);
+        control
+            .put_record_if_absent(
+                &fetch_kind(repository_id),
+                ACTIVE,
+                &canonical_bytes(&intent).unwrap(),
+            )
+            .unwrap();
+        import_blob(&control, &intent, &intent.blobs[0]).unwrap();
+        drop(control);
+        drop(tree);
+        drop(builder);
+        drop(stock);
+        fs::remove_dir_all(&stock_root).unwrap();
+
+        let local = GitRepository::open(&root, repository_id, &key).unwrap();
+        assert_eq!(local.fetch_bare(&stock_root).unwrap(), 1);
+        let graph = local.export_graph_source().unwrap();
+        assert_eq!(graph.refs[0].oid.as_slice(), commit.as_bytes());
+        let mut recovered = Vec::new();
+        graph.blobs[0]
+            .anchor
+            .open_verified()
+            .unwrap()
+            .read_to_end(&mut recovered)
+            .unwrap();
+        assert_eq!(recovered, payload);
+        drop(local);
         for item in graph.blobs {
             item.anchor.remove().unwrap();
         }

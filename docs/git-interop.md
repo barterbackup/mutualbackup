@@ -39,5 +39,6 @@ exported object copies; its checkout or staging may apply that client's
 attributes or configuration outside our control. The exchanged Git blobs retain
 their raw object IDs and bytes. Push accepts a new or fast-forward branch only
 when that branch is not checked out in a MutualBackup worktree; force pushes and
-branch deletion are unsupported. `mutualgit push` and `mutualgit fetch` also
-interoperate with existing local bare Git repositories.
+branch deletion are unsupported. `mutualgit fetch` and `mutualgit pull` accept
+existing local bare or working-tree Git repositories; `mutualgit push` targets
+local bare Git repositories.

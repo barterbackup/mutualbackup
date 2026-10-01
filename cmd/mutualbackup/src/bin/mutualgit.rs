@@ -103,9 +103,9 @@ enum Command {
     Checkout { name: String },
     /// Push the current branch to an existing local bare Git repository.
     Push { destination: PathBuf },
-    /// Fetch branches from an existing local bare Git repository.
+    /// Fetch branches from an existing local Git repository.
     Fetch { source: PathBuf },
-    /// Fetch and merge the selected branch from a local bare repository.
+    /// Fetch and merge the selected branch from a local Git repository.
     Pull {
         source: PathBuf,
         #[arg(long)]
