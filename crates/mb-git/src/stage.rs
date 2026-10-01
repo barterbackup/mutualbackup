@@ -5,6 +5,7 @@
 //! a source-capture intent. One SQL transaction then publishes the index entry
 //! and object-to-anchor mapping while retiring that intent.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::Read;
 #[cfg(unix)]
@@ -704,6 +705,40 @@ pub(crate) fn has_pending_stages_for_scope(
         || !control
             .records(&symlink_intent_kind_for_scope(scope))?
             .is_empty())
+}
+
+/// Discover every linked worktree with an index or unfinished add. Prune must
+/// treat these namespaces as roots even before worktree registration is wired
+/// into the daemon.
+pub(crate) fn worktree_scopes_with_stage_state(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<Vec<GitWorktreeScope>, StageError> {
+    let mut ids = BTreeSet::new();
+    for kind_prefix in [
+        WORKTREE_INDEX_PREFIX,
+        WORKTREE_STAGE_INTENT_PREFIX,
+        WORKTREE_SYMLINK_INTENT_PREFIX,
+    ] {
+        let prefix = format!("{kind_prefix}{repository_id}/");
+        for (kind, _, _) in control.records_with_kind_prefix(&prefix)? {
+            let suffix = kind
+                .strip_prefix(&prefix)
+                .ok_or(StageError::IncompatibleRecord)?;
+            let worktree_id =
+                Uuid::parse_str(suffix).map_err(|_| StageError::IncompatibleRecord)?;
+            if suffix != worktree_id.to_string()
+                || GitWorktreeScope::linked(repository_id, worktree_id).is_none()
+            {
+                return Err(StageError::IncompatibleRecord);
+            }
+            ids.insert(worktree_id);
+        }
+    }
+    Ok(ids
+        .into_iter()
+        .map(|id| GitWorktreeScope::linked(repository_id, id).expect("validated linked scope"))
+        .collect())
 }
 
 pub fn pending_stage_paths(

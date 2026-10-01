@@ -1104,6 +1104,83 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn prune_waits_for_linked_stage_and_preserves_its_index_anchor() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-scope-prune-{}", Uuid::new_v4()));
+        let primary_root = run_root.join("primary");
+        let linked_root = run_root.join("linked");
+        fs::create_dir_all(&primary_root).unwrap();
+        fs::create_dir_all(&linked_root).unwrap();
+        fs::write(primary_root.join("tracked"), b"committed").unwrap();
+        fs::write(linked_root.join("scratch"), b"linked-only\n").unwrap();
+        let repository_id = Uuid::new_v4();
+        let scope = crate::GitWorktreeScope::linked(repository_id, Uuid::new_v4()).unwrap();
+        let local = GitRepository::init(&primary_root, repository_id, &[93; 32]).unwrap();
+        local.stage_file("tracked").unwrap();
+        local.commit("Author", "a@example.test", "base").unwrap();
+        let graph = local.export_graph_source().unwrap();
+
+        let path = b"scratch".to_vec();
+        let entry =
+            crate::stage::stage_file_for_scope(&local.catalog, scope, &linked_root, "scratch")
+                .unwrap();
+        let pending_kind =
+            scope.local_kind("git-stage-intent-v1/", "git-worktree-stage-intent-v1/");
+        local
+            .catalog
+            .put_record(&pending_kind, b"pending", b"test-only-pending")
+            .unwrap();
+        assert!(matches!(
+            local.prune_unreachable(&crate::GitPruneRoots::default()),
+            Err(RepositoryError::Prune(
+                crate::GitPruneError::PendingOperation
+            ))
+        ));
+        local
+            .catalog
+            .delete_record(&pending_kind, b"pending")
+            .unwrap();
+        let anchor = crate::stage::anchors_for_oid(
+            &local.catalog,
+            repository_id,
+            Oid::from_bytes(&entry.oid).unwrap(),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|anchor| anchor.anchor_id == entry.anchor_id)
+        .unwrap();
+        assert_eq!(
+            local
+                .prune_unreachable(&crate::GitPruneRoots::default())
+                .unwrap()
+                .native_anchors_removed,
+            0
+        );
+        assert!(anchor.open_verified().is_ok());
+        local
+            .catalog
+            .delete_record(&crate::stage::index_kind_for_scope(scope), &path)
+            .unwrap();
+        assert_eq!(
+            local
+                .prune_unreachable(&crate::GitPruneRoots::default())
+                .unwrap()
+                .native_anchors_removed,
+            1
+        );
+        assert!(anchor.open_verified().is_err());
+        drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn attributes_reject_conversion_before_stage_and_preserve_raw_checkout_bytes() {
         let test_root = PathBuf::from(
             std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")

@@ -15,7 +15,10 @@ use crate::blob_oid_from_anchor;
 use crate::fetch::{FetchError, has_pending_fetch};
 use crate::history::{HistoryError, export_graph_source, metadata_kind, verified_metadata_ids};
 use crate::merge::{MergeBlobError, has_merge_session, has_pending_merge_blob};
-use crate::stage::{StageError, has_pending_stages, object_kind_prefix, staged_entries};
+use crate::stage::{
+    StageError, has_pending_stages, has_pending_stages_for_scope, object_kind_prefix,
+    staged_entries, staged_entries_for_scope, worktree_scopes_with_stage_state,
+};
 
 const INTENT_PREFIX: &str = "git-prune-intent-v1/";
 const ACTIVE: &[u8] = b"active";
@@ -140,7 +143,11 @@ pub(crate) fn prune_unreachable(
     protected: &GitPruneRoots,
 ) -> Result<GitPruneReport, GitPruneError> {
     resume_pending_prune(control, repository_id)?;
+    let linked_scopes = worktree_scopes_with_stage_state(control, repository_id)?;
     if has_pending_stages(control, repository_id)?
+        || linked_scopes.iter().try_fold(false, |pending, scope| {
+            Ok::<_, StageError>(pending || has_pending_stages_for_scope(control, *scope)?)
+        })?
         || has_pending_fetch(control, repository_id)?
         || has_pending_merge_blob(control, repository_id)?
         || has_merge_session(control, repository_id)?
@@ -165,6 +172,12 @@ pub(crate) fn prune_unreachable(
     for (_, entry) in index {
         live_blobs.insert(entry.oid);
         indexed_anchors.insert((entry.oid, entry.anchor_id));
+    }
+    for scope in linked_scopes {
+        for (_, entry) in staged_entries_for_scope(control, scope)? {
+            live_blobs.insert(entry.oid);
+            indexed_anchors.insert((entry.oid, entry.anchor_id));
+        }
     }
 
     let all_metadata = verified_metadata_ids(control, repository_id)?;
