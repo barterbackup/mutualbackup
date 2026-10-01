@@ -3,6 +3,9 @@
 //! Git commit and tree objects stay small metadata, never a second blob store.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
 
 use git2::{Branch, ObjectType, Oid, Repository};
 use mb_core::{SectorRef, V1_MAX_CATALOG_BYTES, V1_SECTOR_SIZE, canonical_bytes};
@@ -10,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::stage::stage_path_key;
 use crate::{GitGraphObject, GitGraphRef};
 
 const MAX_OBJECTS: usize = 100_000;
@@ -170,13 +174,16 @@ impl GitBackupDescriptor {
             let commit = repository
                 .find_commit(oid)
                 .map_err(|_| GitBackupError::InvalidGraph)?;
-            pending_trees.push(commit.tree_id());
+            pending_trees.push((Vec::<u8>::new(), commit.tree_id()));
             pending_commits.extend(commit.parent_ids());
         }
-        while let Some(oid) = pending_trees.pop() {
-            if !seen_trees.insert(oid) {
-                continue;
+        let mut tree_visits = 0_usize;
+        while let Some((prefix, oid)) = pending_trees.pop() {
+            tree_visits += 1;
+            if tree_visits > MAX_OBJECTS {
+                return Err(GitBackupError::InvalidGraph);
             }
+            seen_trees.insert(oid);
             if kinds.get(&oid) != Some(&ObjectType::Tree) {
                 return Err(GitBackupError::InvalidGraph);
             }
@@ -184,9 +191,14 @@ impl GitBackupDescriptor {
                 .find_tree(oid)
                 .map_err(|_| GitBackupError::InvalidGraph)?;
             for entry in tree.iter() {
+                let mut path = prefix.clone();
+                path.extend_from_slice(entry.name_bytes());
+                stage_path_key(&PathBuf::from(OsString::from_vec(path.clone())))
+                    .map_err(|_| GitBackupError::InvalidGraph)?;
                 match entry.kind() {
                     Some(ObjectType::Tree) if entry.filemode() == 0o040000 => {
-                        pending_trees.push(entry.id());
+                        path.push(b'/');
+                        pending_trees.push((path, entry.id()));
                     }
                     Some(ObjectType::Blob) => {
                         if !matches!(entry.filemode(), 0o100644 | 0o100755 | 0o120000)
@@ -204,5 +216,73 @@ impl GitBackupDescriptor {
             return Err(GitBackupError::InvalidGraph);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backup_rejects_unsafe_path_on_another_branch() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::init_bare(directory.path()).unwrap();
+        let blob = repository.blob(b"").unwrap();
+        let mut nested = repository.treebuilder(None).unwrap();
+        nested.insert("file", blob, 0o100644).unwrap();
+        let nested_oid = nested.write().unwrap();
+        let mut main_builder = repository.treebuilder(None).unwrap();
+        main_builder.insert("safe", nested_oid, 0o040000).unwrap();
+        let main_tree_oid = main_builder.write().unwrap();
+        let mut topic_builder = repository.treebuilder(None).unwrap();
+        topic_builder
+            .insert(".mutualbackup", nested_oid, 0o040000)
+            .unwrap();
+        let topic_tree_oid = topic_builder.write().unwrap();
+        let signature = git2::Signature::now("Author", "a@example.test").unwrap();
+        let main_tree = repository.find_tree(main_tree_oid).unwrap();
+        let topic_tree = repository.find_tree(topic_tree_oid).unwrap();
+        let main_commit = repository
+            .commit(None, &signature, &signature, "main", &main_tree, &[])
+            .unwrap();
+        let topic_commit = repository
+            .commit(None, &signature, &signature, "topic", &topic_tree, &[])
+            .unwrap();
+        let odb = repository.odb().unwrap();
+        let graph_object = |kind: u8, oid: Oid| GitGraphObject {
+            kind,
+            oid: oid.as_bytes().try_into().unwrap(),
+            bytes: odb.read(oid).unwrap().data().to_vec(),
+        };
+        let mut descriptor = GitBackupDescriptor {
+            format_version: 2,
+            repository_id: Uuid::new_v4(),
+            refs: vec![GitGraphRef {
+                name: b"refs/heads/main".to_vec(),
+                oid: main_commit.as_bytes().try_into().unwrap(),
+            }],
+            objects: vec![
+                graph_object(1, main_commit),
+                graph_object(2, main_tree_oid),
+                graph_object(2, nested_oid),
+            ],
+            blobs: vec![GitBackupBlob {
+                oid: blob.as_bytes().try_into().unwrap(),
+                logical_len: 0,
+                data_extents: Vec::new(),
+            }],
+            head_branch: "main".to_owned(),
+        };
+        descriptor.validate().unwrap();
+        descriptor.refs.push(GitGraphRef {
+            name: b"refs/heads/topic".to_vec(),
+            oid: topic_commit.as_bytes().try_into().unwrap(),
+        });
+        descriptor.objects.push(graph_object(1, topic_commit));
+        descriptor.objects.push(graph_object(2, topic_tree_oid));
+        assert!(matches!(
+            descriptor.validate(),
+            Err(GitBackupError::InvalidGraph)
+        ));
     }
 }
