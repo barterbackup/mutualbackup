@@ -877,4 +877,75 @@ mod tests {
         }
         fs::remove_dir_all(run_root).unwrap();
     }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn nested_directory_checkout_replays_after_directory_move() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-checkout-nested-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("base"), b"base\r\nbytes").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [32_u8; 32];
+        let repo = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        repo.stage_file("base").unwrap();
+        repo.commit("Author", "a@example.test", "main").unwrap();
+        repo.create_branch("topic").unwrap();
+        repo.switch_branch("topic").unwrap();
+        fs::create_dir_all(source_root.join("new/deep")).unwrap();
+        fs::write(source_root.join("new/deep/file"), b"nested\r\nblob\0").unwrap();
+        repo.stage_file("new/deep/file").unwrap();
+        repo.commit("Author", "a@example.test", "topic").unwrap();
+        let graph = repo.export_graph_source().unwrap();
+        crate::checkout::set_after_directory_cleanup_hook(Box::new(|| panic!("cleanup crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repo.switch_branch("main").unwrap();
+        }));
+        assert!(interrupted.is_err());
+        assert!(!source_root.join("new/deep").exists());
+        assert!(source_root.join("new").is_dir());
+        drop(repo);
+        let repo = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        assert_eq!(repo.status().unwrap().branch, "main");
+        assert!(!source_root.join("new").exists());
+
+        crate::checkout::set_after_checkout_directory_hook(Box::new(|| panic!("directory crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repo.switch_branch("topic").unwrap();
+        }));
+        assert!(interrupted.is_err());
+        assert!(source_root.join("new").is_dir());
+        assert!(!source_root.join("new/deep").exists());
+        drop(repo);
+
+        let resumed = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        assert_eq!(resumed.status().unwrap().branch, "topic");
+        assert_eq!(
+            fs::read(source_root.join("new/deep/file")).unwrap(),
+            b"nested\r\nblob\0"
+        );
+        fs::write(source_root.join("new/deep/keep"), b"untracked keep").unwrap();
+        resumed.switch_branch("main").unwrap();
+        assert_eq!(
+            fs::read(source_root.join("new/deep/keep")).unwrap(),
+            b"untracked keep"
+        );
+        fs::write(source_root.join("new/deep/file"), b"untracked collision").unwrap();
+        assert!(resumed.switch_branch("topic").is_err());
+        assert_eq!(
+            fs::read(source_root.join("new/deep/file")).unwrap(),
+            b"untracked collision"
+        );
+        fs::remove_file(source_root.join("new/deep/file")).unwrap();
+        fs::remove_file(source_root.join("new/deep/keep")).unwrap();
+        drop(resumed);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
 }

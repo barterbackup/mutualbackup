@@ -309,6 +309,38 @@ impl PinnedDirectory {
         })
     }
 
+    /// Remove only an empty directory that still has the recorded identity.
+    /// An untracked child or a replacement directory makes this a no-op.
+    pub fn remove_empty_child_directory(
+        &self,
+        name: impl AsRef<Path>,
+        expected: NativeFileId,
+    ) -> Result<bool, AnchorError> {
+        let name = name.as_ref();
+        validate_single_component(name)?;
+        let pinned = match open_path_no_xdev_beneath(&self.file, name) {
+            Ok(pinned) => pinned,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = pinned.metadata()?;
+        if !metadata.is_dir() || native_file_id(self.filesystem_id, &metadata) != expected {
+            return Ok(false);
+        }
+        match unlink_pinned_name(&self.file, name, &pinned, true, name) {
+            Ok(()) => {
+                self.sync_all()?;
+                Ok(true)
+            }
+            Err(AnchorError::Io(error))
+                if matches!(error.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST)) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn rename_child_no_replace(
         &self,
         source: impl AsRef<Path>,
@@ -340,6 +372,29 @@ impl PinnedDirectory {
         }
         rename_no_replace_at(&self.file, source, &destination_parent.file, destination)?;
         if destination_parent.entry_identity(destination, false)? != Some(expected) {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        self.sync_all()?;
+        destination_parent.sync_all()
+    }
+
+    /// Move a pinned directory without replacing a destination. The caller
+    /// journals the directory identity before the move so a restart can tell
+    /// which side of the rename owns it.
+    pub fn move_child_directory_no_replace(
+        &self,
+        source: impl AsRef<Path>,
+        expected: NativeFileId,
+        destination_parent: &Self,
+        destination: impl AsRef<Path>,
+    ) -> Result<(), AnchorError> {
+        let source = source.as_ref();
+        let destination = destination.as_ref();
+        if self.entry_identity(source, true)? != Some(expected) {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        rename_no_replace_at(&self.file, source, &destination_parent.file, destination)?;
+        if destination_parent.entry_identity(destination, true)? != Some(expected) {
             return Err(AnchorError::PinnedFileChanged);
         }
         self.sync_all()?;
