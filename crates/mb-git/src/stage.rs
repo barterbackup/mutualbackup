@@ -56,8 +56,6 @@ pub enum StageError {
     UnsupportedPlatform,
     #[error("staged symlink temporary file I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("linked worktree symlink staging is not implemented yet")]
-    UnsupportedLinkedSymlink,
     #[error("Git attributes policy error: {0}")]
     Attributes(#[from] crate::GitAttributesError),
 }
@@ -92,18 +90,48 @@ struct SymlinkStageIntent {
     temp_name: String,
     temp_id: Option<NativeFileId>,
     plan: Option<SourceFileCapturePlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    catalog_root: Option<PathBuf>,
 }
 
-fn intent_kind(repository_id: Uuid) -> String {
-    intent_kind_for_scope(GitWorktreeScope::primary(repository_id))
+// Canonical CBOR encodes struct fields as a sequence. A new trailing field
+// therefore needs an explicit decoder for intents written by older versions.
+#[derive(Serialize, Deserialize)]
+struct SymlinkStageIntentV1 {
+    format_version: u16,
+    repository_id: Uuid,
+    source_root: PathBuf,
+    root_id: NativeFileId,
+    catalog_id: NativeFileId,
+    relative_path: PathBuf,
+    source_id: NativeFileId,
+    target: Vec<u8>,
+    temp_name: String,
+    temp_id: Option<NativeFileId>,
+    plan: Option<SourceFileCapturePlan>,
+}
+
+impl From<SymlinkStageIntentV1> for SymlinkStageIntent {
+    fn from(old: SymlinkStageIntentV1) -> Self {
+        Self {
+            format_version: old.format_version,
+            repository_id: old.repository_id,
+            source_root: old.source_root,
+            root_id: old.root_id,
+            catalog_id: old.catalog_id,
+            relative_path: old.relative_path,
+            source_id: old.source_id,
+            target: old.target,
+            temp_name: old.temp_name,
+            temp_id: old.temp_id,
+            plan: old.plan,
+            catalog_root: None,
+        }
+    }
 }
 
 fn intent_kind_for_scope(scope: GitWorktreeScope) -> String {
     scope.local_kind(INTENT_PREFIX, WORKTREE_STAGE_INTENT_PREFIX)
-}
-
-fn symlink_intent_kind(repository_id: Uuid) -> String {
-    symlink_intent_kind_for_scope(GitWorktreeScope::primary(repository_id))
 }
 
 fn symlink_intent_kind_for_scope(scope: GitWorktreeScope) -> String {
@@ -197,10 +225,19 @@ fn decode_symlink_intent(
     repository_id: Uuid,
     path_key: &[u8],
 ) -> Result<SymlinkStageIntent, StageError> {
-    let intent: SymlinkStageIntent = decode_canonical(encoded)?;
+    let intent: SymlinkStageIntent = match decode_canonical(encoded) {
+        Ok(intent) => intent,
+        Err(_) => SymlinkStageIntent::from(decode_canonical::<SymlinkStageIntentV1>(encoded)?),
+    };
     let temp_relative = PathBuf::from(GIT_CATALOG_DIRECTORY).join(&intent.temp_name);
-    if intent.format_version != 1
+    if !matches!(intent.format_version, 1 | 2)
         || intent.repository_id != repository_id
+        || (intent.format_version == 1 && intent.catalog_root.is_some())
+        || (intent.format_version == 2
+            && !intent
+                .catalog_root
+                .as_ref()
+                .is_some_and(|root| root.is_absolute()))
         || stage_path_key(&intent.relative_path)? != path_key
         || !intent.source_root.is_absolute()
         || intent.target.is_empty()
@@ -210,7 +247,12 @@ fn decode_symlink_intent(
         || Uuid::parse_str(&intent.temp_name["symlink-input-".len()..]).is_err()
         || intent.plan.is_some() && intent.temp_id.is_none()
         || intent.plan.as_ref().is_some_and(|plan| {
-            plan.source_root() != intent.source_root || plan.relative_path() != temp_relative
+            plan.source_root()
+                != intent
+                    .catalog_root
+                    .as_deref()
+                    .unwrap_or(&intent.source_root)
+                || plan.relative_path() != temp_relative
         })
     {
         return Err(StageError::IncompatibleRecord);
@@ -223,7 +265,12 @@ fn symlink_catalog(intent: &SymlinkStageIntent) -> Result<PinnedDirectory, Stage
     if root.identity()? != intent.root_id {
         return Err(StageError::IncompatibleRecord);
     }
-    let catalog = root
+    let catalog_root = if let Some(path) = &intent.catalog_root {
+        PinnedDirectory::open(path)?
+    } else {
+        root
+    };
+    let catalog = catalog_root
         .open_child_directory(GIT_CATALOG_DIRECTORY)?
         .ok_or(StageError::IncompatibleRecord)?;
     if catalog.identity()? != intent.catalog_id {
@@ -252,12 +299,13 @@ fn verify_temporary_symlink_bytes(
 
 fn save_symlink_intent(
     control: &ControlStore,
+    scope: GitWorktreeScope,
     key: &[u8],
     before: &SymlinkStageIntent,
     after: &SymlinkStageIntent,
 ) -> Result<(), StageError> {
     control.replace_record_if_value(
-        &symlink_intent_kind(before.repository_id),
+        &symlink_intent_kind_for_scope(scope),
         key,
         &canonical_bytes(before)?,
         &canonical_bytes(after)?,
@@ -316,6 +364,7 @@ fn begin_stage_for_scope(
     Ok((path_key, intent))
 }
 
+#[cfg(test)]
 fn begin_symlink_stage(
     control: &ControlStore,
     repository_id: Uuid,
@@ -323,19 +372,38 @@ fn begin_symlink_stage(
     catalog: &PinnedDirectory,
     relative_path: &Path,
 ) -> Result<(Vec<u8>, SymlinkStageIntent), StageError> {
+    begin_symlink_stage_for_scope(
+        control,
+        GitWorktreeScope::primary(repository_id),
+        source_root,
+        source_root,
+        catalog,
+        relative_path,
+    )
+}
+
+fn begin_symlink_stage_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    source_root: &Path,
+    catalog_root: &Path,
+    catalog: &PinnedDirectory,
+    relative_path: &Path,
+) -> Result<(Vec<u8>, SymlinkStageIntent), StageError> {
     let key = stage_path_key(relative_path)?;
     if control
-        .get_record(&intent_kind(repository_id), &key)?
+        .get_record(&intent_kind_for_scope(scope), &key)?
         .is_some()
         || control
-            .get_record(&symlink_intent_kind(repository_id), &key)?
+            .get_record(&symlink_intent_kind_for_scope(scope), &key)?
             .is_some()
     {
         return Err(StageError::PendingStage);
     }
     validate_worktree_path(source_root, relative_path)?;
     let root = PinnedDirectory::open(source_root)?;
-    let actual_catalog = root
+    let catalog_root_pinned = PinnedDirectory::open(catalog_root)?;
+    let actual_catalog = catalog_root_pinned
         .open_child_directory(GIT_CATALOG_DIRECTORY)?
         .ok_or(StageError::IncompatibleRecord)?;
     if actual_catalog.identity()? != catalog.identity()? {
@@ -343,8 +411,12 @@ fn begin_symlink_stage(
     }
     let (target, source_id) = read_symlink(&root, relative_path)?;
     let intent = SymlinkStageIntent {
-        format_version: 1,
-        repository_id,
+        format_version: if scope.worktree_id() == scope.repository_id() {
+            1
+        } else {
+            2
+        },
+        repository_id: scope.repository_id(),
         source_root: source_root.to_path_buf(),
         root_id: root.identity()?,
         catalog_id: catalog.identity()?,
@@ -354,9 +426,11 @@ fn begin_symlink_stage(
         temp_name: format!("symlink-input-{}", Uuid::new_v4()),
         temp_id: None,
         plan: None,
+        catalog_root: (scope.worktree_id() != scope.repository_id())
+            .then(|| catalog_root.to_path_buf()),
     };
     if !control.put_record_if_absent(
-        &symlink_intent_kind(repository_id),
+        &symlink_intent_kind_for_scope(scope),
         &key,
         &canonical_bytes(&intent)?,
     )? {
@@ -367,11 +441,11 @@ fn begin_symlink_stage(
 
 fn finish_symlink_stage(
     control: &ControlStore,
-    repository_id: Uuid,
+    scope: GitWorktreeScope,
     key: &[u8],
     mut intent: SymlinkStageIntent,
 ) -> Result<GitIndexEntry, StageError> {
-    let kind = symlink_intent_kind(repository_id);
+    let kind = symlink_intent_kind_for_scope(scope);
     if control.get_record(&kind, key)?.as_deref() != Some(canonical_bytes(&intent)?.as_slice()) {
         return Err(StageError::IncompatibleRecord);
     }
@@ -394,16 +468,19 @@ fn finish_symlink_stage(
         if intent.temp_id.is_none() {
             let mut next = intent.clone();
             next.temp_id = Some(temp_id);
-            save_symlink_intent(control, key, &intent, &next)?;
+            save_symlink_intent(control, scope, key, &intent, &next)?;
             intent = next;
         }
         let plan = SourceFileCapturePlan::plan_reflink(
-            &intent.source_root,
+            intent
+                .catalog_root
+                .as_deref()
+                .unwrap_or(&intent.source_root),
             PathBuf::from(GIT_CATALOG_DIRECTORY).join(&intent.temp_name),
         )?;
         let mut next = intent.clone();
         next.plan = Some(plan);
-        save_symlink_intent(control, key, &intent, &next)?;
+        save_symlink_intent(control, scope, key, &intent, &next)?;
         intent = next;
     }
     let plan = intent.plan.as_ref().ok_or(StageError::IncompatibleRecord)?;
@@ -425,12 +502,12 @@ fn finish_symlink_stage(
     control.put_records_and_retire_if_value(
         &[
             (
-                object_kind(repository_id, oid),
+                object_kind(scope.repository_id(), oid),
                 manifest.anchor_id.as_bytes().to_vec(),
                 canonical_bytes(&manifest)?,
             ),
             (
-                index_kind(repository_id),
+                index_kind_for_scope(scope),
                 key.to_vec(),
                 canonical_bytes(&entry)?,
             ),
@@ -450,14 +527,33 @@ pub fn stage_symlink(
     catalog: &PinnedDirectory,
     relative_path: impl AsRef<Path>,
 ) -> Result<GitIndexEntry, StageError> {
-    let (key, intent) = begin_symlink_stage(
+    stage_symlink_for_scope(
         control,
-        repository_id,
+        GitWorktreeScope::primary(repository_id),
+        source_root.as_ref(),
         source_root.as_ref(),
         catalog,
         relative_path.as_ref(),
+    )
+}
+
+pub(crate) fn stage_symlink_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    source_root: &Path,
+    catalog_root: &Path,
+    catalog: &PinnedDirectory,
+    relative_path: &Path,
+) -> Result<GitIndexEntry, StageError> {
+    let (key, intent) = begin_symlink_stage_for_scope(
+        control,
+        scope,
+        source_root,
+        catalog_root,
+        catalog,
+        relative_path,
     )?;
-    finish_symlink_stage(control, repository_id, &key, intent)
+    finish_symlink_stage(control, scope, &key, intent)
 }
 
 fn finish_stage_for_scope(
@@ -598,16 +694,11 @@ pub(crate) fn resume_pending_stages_for_scope(
         resumed.push(finish_stage_for_scope(control, scope, &key, &intent)?);
     }
     for (key, encoded) in control.records(&symlink_intent_kind_for_scope(scope))? {
-        if scope.worktree_id() != scope.repository_id() {
+        let intent = decode_symlink_intent(&encoded, scope.repository_id(), &key)?;
+        if (intent.format_version == 1) != (scope.worktree_id() == scope.repository_id()) {
             return Err(StageError::IncompatibleRecord);
         }
-        let intent = decode_symlink_intent(&encoded, scope.repository_id(), &key)?;
-        resumed.push(finish_symlink_stage(
-            control,
-            scope.repository_id(),
-            &key,
-            intent,
-        )?);
+        resumed.push(finish_symlink_stage(control, scope, &key, intent)?);
     }
     Ok(resumed)
 }
@@ -642,10 +733,10 @@ pub(crate) fn abandon_pending_stage_for_scope(
     let Some(encoded) = control.get_record(&kind, &key)? else {
         return Ok(false);
     };
-    if scope.worktree_id() != scope.repository_id() {
+    let intent = decode_symlink_intent(&encoded, scope.repository_id(), &key)?;
+    if (intent.format_version == 1) != (scope.worktree_id() == scope.repository_id()) {
         return Err(StageError::IncompatibleRecord);
     }
-    let intent = decode_symlink_intent(&encoded, scope.repository_id(), &key)?;
     let catalog = symlink_catalog(&intent)?;
     if let Some(plan) = &intent.plan {
         plan.discard()?;
@@ -832,12 +923,39 @@ mod tests {
 
     use super::{
         StageError, abandon_pending_stage, abandon_pending_stage_for_scope, anchors_for_oid,
-        begin_stage, begin_stage_for_scope, begin_symlink_stage, has_pending_stages,
-        pending_stage_paths_for_scope, resume_pending_stages, resume_pending_stages_for_scope,
-        save_symlink_intent, stage_file, staged_entries_for_scope, staged_entry,
-        staged_entry_for_scope,
+        begin_stage, begin_stage_for_scope, begin_symlink_stage, begin_symlink_stage_for_scope,
+        has_pending_stages, pending_stage_paths_for_scope, resume_pending_stages,
+        resume_pending_stages_for_scope, save_symlink_intent, stage_file, staged_entries_for_scope,
+        staged_entry, staged_entry_for_scope,
     };
     use crate::GitWorktreeScope;
+
+    #[test]
+    fn original_symlink_intent_encoding_remains_replayable() {
+        let repository_id = Uuid::new_v4();
+        let file_id = mb_store::NativeFileId {
+            filesystem_id: 4,
+            inode: 12,
+        };
+        let old = super::SymlinkStageIntentV1 {
+            format_version: 1,
+            repository_id,
+            source_root: PathBuf::from("/source"),
+            root_id: file_id,
+            catalog_id: file_id,
+            relative_path: PathBuf::from("link"),
+            source_id: file_id,
+            target: b"target".to_vec(),
+            temp_name: format!("symlink-input-{}", Uuid::new_v4()),
+            temp_id: None,
+            plan: None,
+        };
+        let encoded = mb_core::canonical_bytes(&old).unwrap();
+        let decoded = super::decode_symlink_intent(&encoded, repository_id, b"link").unwrap();
+        assert_eq!(decoded.format_version, 1);
+        assert!(decoded.catalog_root.is_none());
+        assert_eq!(mb_core::canonical_bytes(&decoded).unwrap(), encoded);
+    }
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
@@ -869,7 +987,14 @@ mod tests {
             .unwrap();
         let mut prepared = initial.clone();
         prepared.temp_id = Some(temp_id);
-        save_symlink_intent(&control, &path_key, &initial, &prepared).unwrap();
+        save_symlink_intent(
+            &control,
+            GitWorktreeScope::primary(repository_id),
+            &path_key,
+            &initial,
+            &prepared,
+        )
+        .unwrap();
         let mut planned = prepared.clone();
         planned.plan = Some(
             SourceFileCapturePlan::plan_reflink(
@@ -878,7 +1003,14 @@ mod tests {
             )
             .unwrap(),
         );
-        save_symlink_intent(&control, &path_key, &prepared, &planned).unwrap();
+        save_symlink_intent(
+            &control,
+            GitWorktreeScope::primary(repository_id),
+            &path_key,
+            &prepared,
+            &planned,
+        )
+        .unwrap();
         let manifest = planned.plan.as_ref().unwrap().capture().unwrap();
         catalog.remove_child_file(&planned.temp_name).unwrap();
         fs::remove_file(source_root.join("linked")).unwrap();
@@ -891,6 +1023,85 @@ mod tests {
         assert_eq!(resumed[0].anchor_id, manifest.anchor_id);
         assert!(
             resume_pending_stages(&control, repository_id)
+                .unwrap()
+                .is_empty()
+        );
+        drop(control);
+        drop(catalog);
+        manifest.remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn linked_symlink_stage_replays_into_its_own_index() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-linked-symlink-{}", Uuid::new_v4()));
+        let primary_root = run_root.join("primary");
+        let linked_root = run_root.join("linked");
+        let catalog_path = primary_root.join(GIT_CATALOG_DIRECTORY);
+        fs::create_dir_all(&catalog_path).unwrap();
+        fs::create_dir_all(&linked_root).unwrap();
+        let catalog = PinnedDirectory::open(&catalog_path).unwrap();
+        let repository_id = Uuid::new_v4();
+        let scope = GitWorktreeScope::linked(repository_id, Uuid::new_v4()).unwrap();
+        let key = [84_u8; 32];
+        let database = catalog_path.join("catalog.db");
+        symlink("../target\nbytes", linked_root.join("link")).unwrap();
+        let control = ControlStore::open_with_key(&database, &key).unwrap();
+        let (path_key, initial) = begin_symlink_stage_for_scope(
+            &control,
+            scope,
+            &linked_root,
+            &primary_root,
+            &catalog,
+            Path::new("link"),
+        )
+        .unwrap();
+        assert_eq!(initial.format_version, 2);
+        assert_eq!(
+            initial.catalog_root.as_deref(),
+            Some(primary_root.as_path())
+        );
+        let temp_id = catalog
+            .publish_small_bytes_child(&initial.temp_name, &initial.target)
+            .unwrap();
+        let mut prepared = initial.clone();
+        prepared.temp_id = Some(temp_id);
+        save_symlink_intent(&control, scope, &path_key, &initial, &prepared).unwrap();
+        let mut planned = prepared.clone();
+        planned.plan = Some(
+            SourceFileCapturePlan::plan_reflink(
+                &primary_root,
+                PathBuf::from(GIT_CATALOG_DIRECTORY).join(&planned.temp_name),
+            )
+            .unwrap(),
+        );
+        save_symlink_intent(&control, scope, &path_key, &prepared, &planned).unwrap();
+        let manifest = planned.plan.as_ref().unwrap().capture().unwrap();
+        catalog.remove_child_file(&planned.temp_name).unwrap();
+        fs::remove_file(linked_root.join("link")).unwrap();
+        drop(control);
+
+        let control = ControlStore::open_with_key(&database, &key).unwrap();
+        let resumed = resume_pending_stages_for_scope(&control, scope).unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].mode, 0o120000);
+        assert_eq!(resumed[0].anchor_id, manifest.anchor_id);
+        assert_eq!(
+            staged_entry_for_scope(&control, scope, "link").unwrap(),
+            Some(resumed[0].clone())
+        );
+        assert!(
+            staged_entry(&control, repository_id, "link")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            resume_pending_stages_for_scope(&control, scope)
                 .unwrap()
                 .is_empty()
         );

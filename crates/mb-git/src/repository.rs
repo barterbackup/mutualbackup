@@ -40,7 +40,7 @@ use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, abandon_pending_stage_for_scope,
     anchors_for_oid, pending_stage_paths, remove_cached, remove_cached_for_scope,
     resume_pending_stages, resume_pending_stages_for_scope, stage_file, stage_file_for_scope,
-    stage_path_key, stage_symlink, staged_entry,
+    stage_path_key, stage_symlink, stage_symlink_for_scope, staged_entry,
 };
 use crate::status::{GitStatus, StatusError, repository_status, repository_status_for_scope};
 use crate::worktree::{
@@ -301,7 +301,14 @@ impl GitRepository {
             Err(error) => return Err(error.into()),
         };
         if symlink {
-            return Err(StageError::UnsupportedLinkedSymlink.into());
+            return Ok(Some(stage_symlink_for_scope(
+                &self.catalog,
+                scope,
+                &info.path,
+                &self.root,
+                &self.directory,
+                relative,
+            )?));
         }
         if parent.open_child_file(name)?.is_some() {
             Ok(Some(stage_file_for_scope(
@@ -1488,6 +1495,13 @@ mod tests {
         );
         assert_eq!(local.status().unwrap().head_oid, Some(base.oid));
         fs::write(linked_root.join("tracked"), b"linked edit\r\n\0").unwrap();
+        std::os::unix::fs::symlink("../exact\nlink", linked_root.join("symbolic")).unwrap();
+        let symlink_entry = local
+            .linked_add_path(linked.worktree_id, "symbolic")
+            .unwrap()
+            .unwrap();
+        assert_eq!(symlink_entry.mode, 0o120000);
+        assert!(local.staged_entry("symbolic").unwrap().is_none());
         assert!(
             local
                 .linked_add_path(linked.worktree_id, "tracked")
@@ -1526,6 +1540,7 @@ mod tests {
             .linked_switch_branch(linked.worktree_id, "base-copy")
             .unwrap();
         assert_eq!(fs::read(linked_root.join("tracked")).unwrap(), b"base\r\n");
+        assert!(fs::symlink_metadata(linked_root.join("symbolic")).is_err());
         assert_eq!(local.status().unwrap().head_oid, Some(base.oid));
         local
             .linked_switch_branch(linked.worktree_id, "topic")
@@ -1533,6 +1548,10 @@ mod tests {
         assert_eq!(
             fs::read(linked_root.join("tracked")).unwrap(),
             b"linked edit\r\n\0"
+        );
+        assert_eq!(
+            fs::read_link(linked_root.join("symbolic")).unwrap(),
+            PathBuf::from("../exact\nlink")
         );
         let graph = local.export_graph_source().unwrap();
         drop(local);
