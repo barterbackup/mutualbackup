@@ -17,8 +17,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::stage::{GitIndexEntry, StageError, anchors_for_oid, stage_path_key, staged_entries};
-use crate::status::{StatusError, committed_files};
+use crate::GitWorktreeScope;
+use crate::stage::{
+    GitIndexEntry, StageError, anchors_for_oid, stage_path_key, staged_entries_for_scope,
+};
+use crate::status::{StatusError, committed_files_for_scope};
 
 const MAX_DIFF_FILE_BYTES: u64 = 16 * 1024 * 1024;
 // The local control socket currently has a 1 MiB JSON frame; a byte array can
@@ -350,11 +353,26 @@ pub fn repository_diff(
     root: &Path,
     cached: bool,
 ) -> Result<GitDiff, DiffError> {
-    let staged = staged_entries(control, repository_id)?
+    repository_diff_for_scope(
+        control,
+        GitWorktreeScope::primary(repository_id),
+        root,
+        cached,
+    )
+}
+
+pub(crate) fn repository_diff_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    root: &Path,
+    cached: bool,
+) -> Result<GitDiff, DiffError> {
+    let repository_id = scope.repository_id();
+    let staged = staged_entries_for_scope(control, scope)?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     let committed = if cached {
-        committed_files(control, repository_id)?
+        committed_files_for_scope(control, scope)?
     } else {
         BTreeMap::new()
     };

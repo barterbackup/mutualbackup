@@ -16,9 +16,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::head::{HeadError, selected_branch, selected_ref};
+use crate::GitWorktreeScope;
+use crate::head::{HeadError, selected_branch_for_scope, selected_ref_for_scope};
 use crate::merge::{GitMergeState, MergeBlobError, merge_state};
-use crate::stage::{GitIndexEntry, StageError, pending_stage_paths, staged_entries};
+use crate::stage::{
+    GitIndexEntry, StageError, pending_stage_paths_for_scope, staged_entries_for_scope,
+};
 
 const METADATA_PREFIX: &str = "git-metadata-object-v1/";
 const REF_PREFIX: &str = "git-ref-v1/";
@@ -93,9 +96,12 @@ struct RefRecord {
     oid: [u8; 20],
 }
 
-fn head_oid(control: &ControlStore, repository_id: Uuid) -> Result<Option<Oid>, StatusError> {
-    let kind = format!("{REF_PREFIX}{repository_id}");
-    let reference = selected_ref(control, repository_id)?;
+fn head_oid_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+) -> Result<Option<Oid>, StatusError> {
+    let kind = format!("{REF_PREFIX}{}", scope.repository_id());
+    let reference = selected_ref_for_scope(control, scope)?;
     let Some(encoded) = control.get_record(&kind, &reference)? else {
         if reference != b"refs/heads/main" {
             return Err(StatusError::IncompatibleRecord);
@@ -173,11 +179,15 @@ pub(crate) fn files_for_commit(
     Ok(files)
 }
 
-pub(crate) fn committed_files(
+pub(crate) fn committed_files_for_scope(
     control: &ControlStore,
-    repository_id: Uuid,
+    scope: GitWorktreeScope,
 ) -> Result<TreeFiles, StatusError> {
-    files_for_commit(control, repository_id, head_oid(control, repository_id)?)
+    files_for_commit(
+        control,
+        scope.repository_id(),
+        head_oid_for_scope(control, scope)?,
+    )
 }
 
 fn worktree_change(
@@ -277,9 +287,18 @@ pub fn repository_status(
     repository_id: Uuid,
     root: &Path,
 ) -> Result<GitStatus, StatusError> {
-    let head = head_oid(control, repository_id)?;
+    repository_status_for_scope(control, GitWorktreeScope::primary(repository_id), root)
+}
+
+pub(crate) fn repository_status_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    root: &Path,
+) -> Result<GitStatus, StatusError> {
+    let repository_id = scope.repository_id();
+    let head = head_oid_for_scope(control, scope)?;
     let committed = files_for_commit(control, repository_id, head)?;
-    let staged = staged_entries(control, repository_id)?
+    let staged = staged_entries_for_scope(control, scope)?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     if staged.len() > MAX_STATUS_FILES {
@@ -316,12 +335,16 @@ pub fn repository_status(
     Ok(GitStatus {
         format_version: 1,
         repository_id,
-        branch: selected_branch(control, repository_id)?,
+        branch: selected_branch_for_scope(control, scope)?,
         head_oid: head.map(|oid| oid.as_bytes().try_into().expect("SHA-1 OID")),
         history_backed_up: false,
         changes,
         untracked,
-        pending_adds: pending_stage_paths(control, repository_id)?,
-        merge: merge_state(control, repository_id)?,
+        pending_adds: pending_stage_paths_for_scope(control, scope)?,
+        merge: if scope.worktree_id() == repository_id {
+            merge_state(control, repository_id)?
+        } else {
+            None
+        },
     })
 }

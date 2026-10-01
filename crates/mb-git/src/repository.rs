@@ -1021,6 +1021,89 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn scoped_status_and_diff_keep_linked_changes_out_of_primary() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-scope-status-{}", Uuid::new_v4()));
+        let primary_root = run_root.join("primary");
+        let linked_root = run_root.join("linked");
+        fs::create_dir_all(&primary_root).unwrap();
+        fs::create_dir_all(&linked_root).unwrap();
+        fs::write(primary_root.join("tracked"), b"base\r\n").unwrap();
+        fs::write(linked_root.join("tracked"), b"base\r\n").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [99_u8; 32];
+        let local = GitRepository::init(&primary_root, repository_id, &key).unwrap();
+        local.stage_file("tracked").unwrap();
+        local.commit("Author", "a@example.test", "base").unwrap();
+        local.create_branch("topic").unwrap();
+        let scope = crate::GitWorktreeScope::linked(repository_id, Uuid::new_v4()).unwrap();
+        crate::head::store_selected_branch_for_scope(&local.catalog, scope, "topic").unwrap();
+        crate::stage::stage_file_for_scope(&local.catalog, scope, &linked_root, "tracked").unwrap();
+        let linked_status =
+            crate::status::repository_status_for_scope(&local.catalog, scope, &linked_root)
+                .unwrap();
+        assert_eq!(linked_status.branch, "topic");
+        assert!(linked_status.changes.is_empty());
+        assert_eq!(local.status().unwrap().branch, "main");
+        assert!(local.status().unwrap().changes.is_empty());
+
+        fs::write(linked_root.join("tracked"), b"linked\nbytes\n").unwrap();
+        let linked_status =
+            crate::status::repository_status_for_scope(&local.catalog, scope, &linked_root)
+                .unwrap();
+        assert_eq!(
+            linked_status.changes[0].worktree,
+            Some(crate::GitChange::Modified)
+        );
+        assert!(local.status().unwrap().changes.is_empty());
+        let linked_staged =
+            crate::stage::stage_file_for_scope(&local.catalog, scope, &linked_root, "tracked")
+                .unwrap();
+        let linked_status =
+            crate::status::repository_status_for_scope(&local.catalog, scope, &linked_root)
+                .unwrap();
+        assert_eq!(
+            linked_status.changes[0].staged,
+            Some(crate::GitChange::Modified)
+        );
+        assert_eq!(linked_status.changes[0].worktree, None);
+        assert!(local.status().unwrap().changes.is_empty());
+        let linked_diff =
+            crate::diff::repository_diff_for_scope(&local.catalog, scope, &linked_root, true)
+                .unwrap();
+        assert!(
+            linked_diff
+                .patch
+                .windows(b"+linked".len())
+                .any(|w| w == b"+linked")
+        );
+        assert!(local.diff(true).unwrap().patch.is_empty());
+
+        let primary = local.staged_entry("tracked").unwrap().unwrap();
+        let mut anchors = std::collections::BTreeMap::new();
+        for oid in [primary.oid, linked_staged.oid] {
+            for anchor in crate::stage::anchors_for_oid(
+                &local.catalog,
+                repository_id,
+                Oid::from_bytes(&oid).unwrap(),
+            )
+            .unwrap()
+            {
+                anchors.insert(anchor.anchor_id, anchor);
+            }
+        }
+        drop(local);
+        for anchor in anchors.into_values() {
+            anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn attributes_reject_conversion_before_stage_and_preserve_raw_checkout_bytes() {
         let test_root = PathBuf::from(
             std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
