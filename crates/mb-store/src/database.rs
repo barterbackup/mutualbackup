@@ -265,6 +265,37 @@ impl ControlStore {
         Ok(())
     }
 
+    /// Publish dependent records only while an exact durable intent still
+    /// owns the transition. A stale worker cannot overwrite a newer result.
+    pub fn put_records_and_retire_if_value(
+        &self,
+        records: &[(String, Vec<u8>, Vec<u8>)],
+        intent_kind: &str,
+        intent_id: &[u8],
+        expected_intent: &[u8],
+    ) -> Result<(), DatabaseError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let retired = transaction.execute(
+            "DELETE FROM protocol_records
+             WHERE kind = ?1 AND record_id = ?2 AND bytes = ?3",
+            params![intent_kind, intent_id, expected_intent],
+        )?;
+        if retired != 1 {
+            return Err(DatabaseError::Conflict);
+        }
+        {
+            let mut put = transaction.prepare_cached(
+                "INSERT INTO protocol_records(kind, record_id, bytes) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(kind, record_id) DO UPDATE SET bytes = excluded.bytes",
+            )?;
+            for (kind, id, bytes) in records {
+                put.execute(params![kind, id, bytes])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn move_protocol_record(
         &mut self,
         source_kind: &str,
@@ -3549,6 +3580,32 @@ mod tests {
             Err(DatabaseError::Conflict)
         ));
         assert_eq!(store.get_record("job", b"one").unwrap().unwrap(), b"second");
+    }
+
+    #[test]
+    fn conditional_publication_never_overwrites_after_intent_replacement() {
+        let temp = tempdir().unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([75; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        store.put_record("intent", b"path", b"newer").unwrap();
+        let published = vec![("index".to_owned(), b"path".to_vec(), b"stale".to_vec())];
+        assert!(matches!(
+            store.put_records_and_retire_if_value(&published, "intent", b"path", b"older"),
+            Err(DatabaseError::Conflict)
+        ));
+        assert_eq!(
+            store.get_record("intent", b"path").unwrap(),
+            Some(b"newer".to_vec())
+        );
+        assert!(store.get_record("index", b"path").unwrap().is_none());
+        store
+            .put_records_and_retire_if_value(&published, "intent", b"path", b"newer")
+            .unwrap();
+        assert!(store.get_record("intent", b"path").unwrap().is_none());
+        assert_eq!(
+            store.get_record("index", b"path").unwrap(),
+            Some(b"stale".to_vec())
+        );
     }
 
     #[test]

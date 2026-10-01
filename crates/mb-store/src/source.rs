@@ -70,6 +70,24 @@ impl SourceFileCapturePlan {
         }
     }
 
+    pub fn source_mode(&self) -> Result<u32, AnchorError> {
+        match self {
+            Self::ReflinkV1(plan) => plan.source_mode(),
+        }
+    }
+
+    pub fn source_root(&self) -> &Path {
+        match self {
+            Self::ReflinkV1(plan) => plan.source_root(),
+        }
+    }
+
+    pub fn relative_path(&self) -> &Path {
+        match self {
+            Self::ReflinkV1(plan) => plan.relative_path(),
+        }
+    }
+
     pub fn reconcile(&self) -> Result<(), AnchorError> {
         match self {
             Self::ReflinkV1(plan) => ReflinkAnchor::reconcile_file_capture(plan),

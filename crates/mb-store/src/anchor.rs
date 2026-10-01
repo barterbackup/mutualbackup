@@ -454,6 +454,44 @@ pub struct ReflinkFileCapturePlan {
     file_version: CaptureVersion,
 }
 
+impl ReflinkFileCapturePlan {
+    pub fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+
+    pub fn source_root(&self) -> &Path {
+        &self.root.source_root
+    }
+
+    /// Read the source file's mode only while its planned capture version still
+    /// matches. Git stages this separately from payload bytes.
+    pub fn source_mode(&self) -> Result<u32, AnchorError> {
+        if self.format_version != 1 || self.root.format_version != 1 {
+            return Err(AnchorError::InvalidRoot);
+        }
+        validate_relative(&self.relative_path)?;
+        let root = open_source_root(&self.root.source_root)?;
+        let root_filesystem = filesystem_identity_for_file(&root)?;
+        if capture_version(root_filesystem.stable_id, &root.metadata()?) != self.root.root_version {
+            return Err(AnchorError::SourceChanged(PathBuf::new()));
+        }
+        let source = open_source_beneath(&root, &self.relative_path, false)?;
+        let filesystem = filesystem_identity_for_file(&source)?;
+        if filesystem.stable_id != root_filesystem.stable_id
+            || filesystem.mount_id != root_filesystem.mount_id
+        {
+            return Err(AnchorError::NestedFilesystem(
+                self.root.source_root.join(&self.relative_path),
+            ));
+        }
+        let metadata = source.metadata()?;
+        if capture_version(root_filesystem.stable_id, &metadata) != self.file_version {
+            return Err(AnchorError::SourceChanged(self.relative_path.clone()));
+        }
+        Ok(unix_mode(&metadata))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileAnchorManifest {
     pub format_version: u16,
@@ -3423,6 +3461,7 @@ mod tests {
         fs::write(source_root.join("unrelated"), b"must not be captured").unwrap();
         let plan =
             crate::SourceFileCapturePlan::plan_reflink(&source_root, "nested/payload").unwrap();
+        assert_eq!(plan.source_mode().unwrap() & 0o111, 0);
         let manifest = plan.capture().unwrap();
         assert_eq!(manifest.logical_len, 14);
         assert_eq!(manifest.source_relative_path, Path::new("nested/payload"));
@@ -3445,6 +3484,10 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains(&FILE_ANCHOR_PAYLOAD.into()));
         fs::write(&source, b"later edits").unwrap();
+        assert!(matches!(
+            plan.source_mode(),
+            Err(AnchorError::SourceChanged(_))
+        ));
         assert_eq!(
             fs::read_to_string(source_root.join("unrelated")).unwrap(),
             "must not be captured"

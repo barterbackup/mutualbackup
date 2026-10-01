@@ -11,7 +11,12 @@ use mb_store::{AnchorError, FileAnchorManifest};
 use thiserror::Error;
 
 mod odb;
+mod stage;
 pub use odb::NativeOdb;
+pub use stage::{
+    GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, resume_pending_stages,
+    stage_file, staged_entry,
+};
 
 #[derive(Debug, Error)]
 pub enum GitAnchorError {

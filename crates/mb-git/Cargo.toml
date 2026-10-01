@@ -8,8 +8,8 @@ rust-version.workspace = true
 [dependencies]
 git2.workspace = true
 libgit2-sys.workspace = true
+mb-core = { path = "../mb-core" }
 mb-store = { path = "../mb-store" }
+serde.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
 uuid.workspace = true
