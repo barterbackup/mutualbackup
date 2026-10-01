@@ -1653,6 +1653,36 @@ impl Node {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn git_create_annotated_tag(
+        &mut self,
+        repository_id: Uuid,
+        worktree_id: Option<Uuid>,
+        name: &str,
+        start_point: Option<&str>,
+        tagger_name: &str,
+        tagger_email: &str,
+        message: &str,
+    ) -> Result<GitTagInfo> {
+        self.mark_root_dirty(repository_id, "Git tag changed")?;
+        let repository = self.open_git_repository(repository_id)?;
+        match worktree_id {
+            Some(worktree_id) => repository
+                .linked_create_annotated_tag(
+                    worktree_id,
+                    name,
+                    start_point,
+                    tagger_name,
+                    tagger_email,
+                    message,
+                )
+                .map_err(Into::into),
+            None => repository
+                .create_annotated_tag(name, start_point, tagger_name, tagger_email, message)
+                .map_err(Into::into),
+        }
+    }
+
     pub fn git_delete_tag(&mut self, repository_id: Uuid, name: &str) -> Result<GitTagInfo> {
         self.mark_root_dirty(repository_id, "Git tag changed")?;
         self.open_git_repository(repository_id)?

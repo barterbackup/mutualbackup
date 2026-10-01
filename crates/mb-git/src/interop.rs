@@ -45,6 +45,7 @@ fn object_type(kind: u8) -> Result<ObjectType, GitInteropError> {
     match kind {
         1 => Ok(ObjectType::Commit),
         2 => Ok(ObjectType::Tree),
+        3 => Ok(ObjectType::Tag),
         _ => Err(GitInteropError::IncompatibleGraph),
     }
 }
@@ -135,6 +136,7 @@ fn matches_packed_with_stock_git(
             ObjectType::Blob => "blob",
             ObjectType::Tree => "tree",
             ObjectType::Commit => "commit",
+            ObjectType::Tag => "tag",
             _ => return Err(GitInteropError::IncompatibleGraph),
         };
         let oid_text = oid.to_string();
@@ -233,7 +235,7 @@ pub(crate) fn export_graph_to_git_repository(
         return Err(GitInteropError::UnsupportedDestination);
     }
     let graph = export_graph_source(control, repository_id)?;
-    if graph.format_version != 1 || graph.repository_id != repository_id {
+    if !matches!(graph.format_version, 1 | 2) || graph.repository_id != repository_id {
         return Err(GitInteropError::IncompatibleGraph);
     }
     let actual = graph
@@ -307,7 +309,7 @@ pub fn push_current_branch_to_bare(
         return Err(GitInteropError::UnsupportedDestination);
     }
     let graph = export_graph_source(control, repository_id)?;
-    if graph.format_version != 1 || graph.repository_id != repository_id {
+    if !matches!(graph.format_version, 1 | 2) || graph.repository_id != repository_id {
         return Err(GitInteropError::IncompatibleGraph);
     }
     let reference_name = format!("refs/heads/{branch}");

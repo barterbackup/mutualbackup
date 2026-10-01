@@ -23,12 +23,13 @@ use crate::fetch::{FetchError, fetch_bare, import_pushed_branch};
 use crate::head::{HeadError, selected_branch};
 use crate::history::{
     GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, GitRemoteBranchInfo, GitTagInfo,
-    HistoryError, commit_index, commit_index_for_scope, create_branch, create_branch_for_scope,
-    create_branch_from, create_branch_from_for_scope, create_tag_for_scope, delete_branch,
-    delete_branch_for_scope, delete_tag, export_graph_source, import_graph_backup, list_branches,
-    list_branches_for_scope, list_commit_pins, list_remote_branches, list_tags, log_history,
-    log_history_for_scope, pin_commit, reset_index_for_scope, switch_same_tree_branch,
-    switch_same_tree_branch_for_scope, unpin_commit,
+    HistoryError, commit_index, commit_index_for_scope, create_annotated_tag_for_scope,
+    create_branch, create_branch_for_scope, create_branch_from, create_branch_from_for_scope,
+    create_tag_for_scope, delete_branch, delete_branch_for_scope, delete_tag, export_graph_source,
+    import_graph_backup, list_branches, list_branches_for_scope, list_commit_pins,
+    list_remote_branches, list_tags, log_history, log_history_for_scope, pin_commit,
+    reset_index_for_scope, switch_same_tree_branch, switch_same_tree_branch_for_scope,
+    unpin_commit,
 };
 use crate::interop::{
     GitInteropError, export_graph_to_git_repository, push_current_branch_to_bare,
@@ -482,6 +483,28 @@ impl GitRepository {
         )?)
     }
 
+    pub fn linked_create_annotated_tag(
+        &self,
+        worktree_id: Uuid,
+        name: &str,
+        start_point: Option<&str>,
+        tagger_name: &str,
+        tagger_email: &str,
+        message: &str,
+    ) -> Result<GitTagInfo, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        self.ensure_no_merge_session()?;
+        Ok(create_annotated_tag_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+            name,
+            start_point,
+            tagger_name,
+            tagger_email,
+            message,
+        )?)
+    }
+
     pub fn linked_diff(&self, worktree_id: Uuid, cached: bool) -> Result<GitDiff, RepositoryError> {
         let info = self.resume_linked_worktree(worktree_id)?;
         Ok(repository_diff_for_scope(
@@ -744,6 +767,27 @@ impl GitRepository {
             crate::GitWorktreeScope::primary(self.repository_id),
             name,
             start_point,
+        )?)
+    }
+
+    pub fn create_annotated_tag(
+        &self,
+        name: &str,
+        start_point: Option<&str>,
+        tagger_name: &str,
+        tagger_email: &str,
+        message: &str,
+    ) -> Result<GitTagInfo, RepositoryError> {
+        self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
+        Ok(create_annotated_tag_for_scope(
+            &self.catalog,
+            crate::GitWorktreeScope::primary(self.repository_id),
+            name,
+            start_point,
+            tagger_name,
+            tagger_email,
+            message,
         )?)
     }
 
@@ -2974,6 +3018,130 @@ mod tests {
         drop(local);
         for blob in current.blobs {
             blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn annotated_tag_survives_reopen_and_retains_unbranched_history() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-annotated-tag-{}", Uuid::new_v4()));
+        let root = run_root.join("work");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("tracked"), b"base\r\n").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [105_u8; 32];
+        let local = GitRepository::init(&root, repository_id, &key).unwrap();
+        local.stage_file("tracked").unwrap();
+        local.commit("Author", "a@example.test", "base").unwrap();
+        local.create_branch("topic").unwrap();
+        local.switch_branch("topic").unwrap();
+        fs::write(root.join("tracked"), b"tagged\r\nraw\0bytes").unwrap();
+        local.stage_file("tracked").unwrap();
+        let tagged = local.commit("Author", "a@example.test", "topic").unwrap();
+        let tag = local
+            .create_annotated_tag(
+                "release",
+                None,
+                "Tagger",
+                "tagger@example.test",
+                "release notes\r\n",
+            )
+            .unwrap();
+        assert_ne!(tag.oid, tagged.oid);
+        local.status().unwrap();
+        local.switch_branch("main").unwrap();
+        local.delete_branch("topic", true).unwrap();
+        drop(local);
+        let local = GitRepository::open(&root, repository_id, &key).unwrap();
+        assert_eq!(local.tags().unwrap(), vec![tag.clone()]);
+        let graph = local.export_graph_source().unwrap();
+        assert_eq!(graph.format_version, 2);
+        assert!(
+            graph
+                .objects
+                .iter()
+                .any(|object| object.kind == 3 && object.oid == tag.oid)
+        );
+        assert!(graph.objects.iter().any(|object| object.oid == tagged.oid));
+        let descriptor = crate::GitBackupDescriptor {
+            format_version: 3,
+            repository_id,
+            refs: graph.refs.clone(),
+            objects: graph.objects.clone(),
+            blobs: graph
+                .blobs
+                .iter()
+                .enumerate()
+                .map(|(index, blob)| crate::GitBackupBlob {
+                    oid: blob.oid,
+                    logical_len: blob.anchor.logical_len,
+                    data_extents: vec![crate::GitDataExtent {
+                        offset: 0,
+                        logical_len: blob.anchor.logical_len,
+                        sectors: vec![mb_core::SectorRef {
+                            id: [index as u8; 32],
+                            root: [index as u8; 32],
+                            logical_len: blob.anchor.logical_len as u32,
+                        }],
+                    }],
+                })
+                .collect(),
+            head_branch: "main".to_owned(),
+        };
+        descriptor.validate().unwrap();
+        let recovered_root = run_root.join("recovered");
+        fs::create_dir_all(&recovered_root).unwrap();
+        let recovered = GitRepository::init(&recovered_root, repository_id, &key).unwrap();
+        let source_anchors = graph
+            .blobs
+            .iter()
+            .map(|blob| blob.anchor.clone())
+            .collect::<Vec<_>>();
+        recovered
+            .import_backup(&descriptor, &source_anchors)
+            .unwrap();
+        assert_eq!(recovered.tags().unwrap(), vec![tag.clone()]);
+        assert_eq!(
+            recovered.export_graph_source().unwrap().objects,
+            graph.objects
+        );
+        drop(recovered);
+        let bare_root = run_root.join("stock.git");
+        let stock = git2::Repository::init_bare(&bare_root).unwrap();
+        local.push_current_branch_to_bare(&bare_root).unwrap();
+        assert_eq!(
+            stock
+                .find_tag(git2::Oid::from_bytes(&tag.oid).unwrap())
+                .unwrap()
+                .target_id()
+                .as_bytes(),
+            tagged.oid
+        );
+        assert_eq!(
+            local
+                .prune_unreachable(&crate::GitPruneRoots::default())
+                .unwrap()
+                .native_anchors_removed,
+            0
+        );
+        local.delete_tag("release").unwrap();
+        assert!(
+            local
+                .prune_unreachable(&crate::GitPruneRoots::default())
+                .unwrap()
+                .native_anchors_removed
+                > 0
+        );
+        drop(local);
+        for blob in graph.blobs {
+            if blob.anchor.open_verified().is_ok() {
+                blob.anchor.remove().unwrap();
+            }
         }
         fs::remove_dir_all(run_root).unwrap();
     }

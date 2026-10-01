@@ -89,10 +89,14 @@ enum Command {
         name: Option<String>,
         start_point: Option<String>,
     },
-    /// List, create, or delete lightweight commit tags.
+    /// List, create, or delete lightweight and annotated commit tags.
     Tag {
         #[arg(short = 'd', long = "delete")]
         delete: bool,
+        #[arg(short = 'a', long = "annotate", conflicts_with = "delete")]
+        annotate: bool,
+        #[arg(short = 'm', long = "message", requires = "annotate")]
+        message: Option<String>,
         name: Option<String>,
         start_point: Option<String>,
     },
@@ -545,6 +549,8 @@ async fn main() -> Result<()> {
         }
         Command::Tag {
             delete,
+            annotate,
+            message,
             name,
             start_point,
         } => {
@@ -574,16 +580,26 @@ async fn main() -> Result<()> {
                         git2::Oid::from_bytes(&tag.oid)?
                     );
                 } else {
-                    let LocalResponse::GitTagCreated(tag) = local_control_call(
-                        &socket,
-                        &LocalRequest::GitCreateTag {
+                    let request = if annotate {
+                        LocalRequest::GitCreateAnnotatedTag {
                             repository_id,
                             worktree_id,
                             name: name.clone(),
                             start_point,
-                        },
-                    )
-                    .await?
+                            tagger_name: author_field("GIT_COMMITTER_NAME", "user.name")?,
+                            tagger_email: author_field("GIT_COMMITTER_EMAIL", "user.email")?,
+                            message: message.context("annotated tags require -m MESSAGE")?,
+                        }
+                    } else {
+                        LocalRequest::GitCreateTag {
+                            repository_id,
+                            worktree_id,
+                            name: name.clone(),
+                            start_point,
+                        }
+                    };
+                    let LocalResponse::GitTagCreated(tag) =
+                        local_control_call(&socket, &request).await?
                     else {
                         bail!("daemon returned the wrong response to Git tag creation");
                     };
@@ -597,7 +613,7 @@ async fn main() -> Result<()> {
                     );
                 }
             } else {
-                if delete || start_point.is_some() {
+                if delete || annotate || message.is_some() || start_point.is_some() {
                     bail!("a tag name is required");
                 }
                 let LocalResponse::GitTags(tags) =

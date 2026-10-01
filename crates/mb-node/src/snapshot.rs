@@ -423,7 +423,7 @@ fn prepare_git_graph_intent(
             || intent.revision_id != revision_id
             || intent.protected_root_id != protected_root_id
             || intent.graph.repository_id != protected_root_id
-            || intent.graph.format_version != 1
+            || !matches!(intent.graph.format_version, 1 | 2)
         {
             bail!("pending Git graph backup conflicts with the source revision");
         }
@@ -460,7 +460,11 @@ fn prepare_git_graph_intent(
 }
 
 fn validate_git_graph_intent(intent: &GitGraphIntent) -> Result<()> {
-    if intent.format_version != 2 || intent.graph.format_version != 1 {
+    let has_tags = intent.graph.objects.iter().any(|object| object.kind == 3);
+    if intent.format_version != 2
+        || !matches!(intent.graph.format_version, 1 | 2)
+        || (intent.graph.format_version == 2) != has_tags
+    {
         bail!("pending Git graph backup has an unsupported version");
     }
     let head_ref = format!("refs/heads/{}", intent.head_branch);
@@ -1209,7 +1213,7 @@ fn prepare_git_backup_descriptor(
         });
     }
     let descriptor = GitBackupDescriptor {
-        format_version: 2,
+        format_version: if graph.format_version == 2 { 3 } else { 2 },
         repository_id: graph.repository_id,
         refs: graph.refs,
         objects: graph.objects,
@@ -1642,7 +1646,7 @@ fn decode_private_metadata_with_git(
         }
         5 => {
             let metadata: GitPrivateMetadataV5 = decode_canonical(bytes)?;
-            if metadata.format_version != 5 || metadata.git.format_version != 2 {
+            if metadata.format_version != 5 || !matches!(metadata.git.format_version, 2 | 3) {
                 bail!("Git private metadata has the wrong version");
             }
             metadata.git.validate()?;

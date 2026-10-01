@@ -1,6 +1,6 @@
 //! Versioned, source-independent Git graph descriptor for encrypted revision
 //! metadata. Blob payloads are referenced by MutualBackup data sectors; raw
-//! Git commit and tree objects stay small metadata, never a second blob store.
+//! Git commit, tree, and tag objects stay small metadata, never a second blob store.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -60,7 +60,7 @@ impl GitBackupDescriptor {
     /// Validate the full Git DAG and each blob's sector geometry before this
     /// descriptor can be placed in a signed revision or accepted on recovery.
     pub fn validate(&self) -> Result<(), GitBackupError> {
-        if !matches!(self.format_version, 1 | 2)
+        if !matches!(self.format_version, 1..=3)
             || self.repository_id.is_nil()
             || self.refs.len() > MAX_OBJECTS
             || self.objects.len() > MAX_OBJECTS
@@ -85,6 +85,7 @@ impl GitBackupDescriptor {
             let kind = match object.kind {
                 1 => ObjectType::Commit,
                 2 => ObjectType::Tree,
+                3 if self.format_version == 3 => ObjectType::Tag,
                 _ => return Err(GitBackupError::InvalidGraph),
             };
             let oid = Oid::hash_object(kind, &object.bytes)?;
@@ -128,6 +129,7 @@ impl GitBackupDescriptor {
         }
         let mut ref_names = HashSet::new();
         let mut pending_commits = Vec::new();
+        let mut seen_tags = HashSet::new();
         for reference in &self.refs {
             let name =
                 std::str::from_utf8(&reference.name).map_err(|_| GitBackupError::InvalidGraph)?;
@@ -142,7 +144,39 @@ impl GitBackupDescriptor {
             {
                 return Err(GitBackupError::InvalidGraph);
             }
-            pending_commits.push(Oid::from_bytes(&reference.oid)?);
+            let mut oid = Oid::from_bytes(&reference.oid)?;
+            let mut chain = HashSet::new();
+            loop {
+                if !chain.insert(oid) || chain.len() > MAX_OBJECTS {
+                    return Err(GitBackupError::InvalidGraph);
+                }
+                match kinds.get(&oid) {
+                    Some(ObjectType::Commit) => {
+                        pending_commits.push(oid);
+                        break;
+                    }
+                    Some(ObjectType::Tag) if name.starts_with("refs/tags/") => {
+                        let tag = repository
+                            .find_tag(oid)
+                            .map_err(|_| GitBackupError::InvalidGraph)?;
+                        if chain.len() == 1
+                            && tag.name_bytes() != &name.as_bytes()["refs/tags/".len()..]
+                        {
+                            return Err(GitBackupError::InvalidGraph);
+                        }
+                        if !matches!(
+                            tag.target_type(),
+                            Some(ObjectType::Commit | ObjectType::Tag)
+                        ) || kinds.get(&tag.target_id()) != tag.target_type().as_ref()
+                        {
+                            return Err(GitBackupError::InvalidGraph);
+                        }
+                        seen_tags.insert(oid);
+                        oid = tag.target_id();
+                    }
+                    _ => return Err(GitBackupError::InvalidGraph),
+                }
+            }
         }
         if ref_names.iter().any(|name| {
             name.iter()
@@ -151,13 +185,13 @@ impl GitBackupDescriptor {
         }) {
             return Err(GitBackupError::InvalidGraph);
         }
-        if self.format_version == 2
+        if self.format_version >= 2
             && !self.refs.is_empty()
             && !ref_names.contains(format!("refs/heads/{}", self.head_branch).as_bytes())
         {
             return Err(GitBackupError::InvalidGraph);
         }
-        if self.format_version == 2 && self.refs.is_empty() && self.head_branch != "main" {
+        if self.format_version >= 2 && self.refs.is_empty() && self.head_branch != "main" {
             return Err(GitBackupError::InvalidGraph);
         }
         let mut seen_commits = HashSet::new();
@@ -212,7 +246,9 @@ impl GitBackupDescriptor {
                 }
             }
         }
-        if seen_commits.len() + seen_trees.len() != kinds.len() || seen_blobs != blob_ids {
+        if seen_commits.len() + seen_trees.len() + seen_tags.len() != kinds.len()
+            || seen_blobs != blob_ids
+        {
             return Err(GitBackupError::InvalidGraph);
         }
         Ok(())
@@ -222,6 +258,61 @@ impl GitBackupDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn annotated_tag_is_reachable_metadata_and_must_match_its_ref() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::init_bare(directory.path()).unwrap();
+        let tree_oid = repository.treebuilder(None).unwrap().write().unwrap();
+        let tree = repository.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Tagger", "tagger@example.test").unwrap();
+        let commit_oid = repository
+            .commit(None, &signature, &signature, "base", &tree, &[])
+            .unwrap();
+        let commit = repository
+            .find_object(commit_oid, Some(ObjectType::Commit))
+            .unwrap();
+        let tag_oid = repository
+            .tag_annotation_create("release", &commit, &signature, "raw bytes\r\n")
+            .unwrap();
+        let odb = repository.odb().unwrap();
+        let object = |kind, oid: Oid| GitGraphObject {
+            kind,
+            oid: oid.as_bytes().try_into().unwrap(),
+            bytes: odb.read(oid).unwrap().data().to_vec(),
+        };
+        let descriptor = GitBackupDescriptor {
+            format_version: 3,
+            repository_id: Uuid::new_v4(),
+            refs: vec![
+                GitGraphRef {
+                    name: b"refs/heads/main".to_vec(),
+                    oid: commit_oid.as_bytes().try_into().unwrap(),
+                },
+                GitGraphRef {
+                    name: b"refs/tags/release".to_vec(),
+                    oid: tag_oid.as_bytes().try_into().unwrap(),
+                },
+            ],
+            objects: vec![
+                object(1, commit_oid),
+                object(2, tree_oid),
+                object(3, tag_oid),
+            ],
+            blobs: Vec::new(),
+            head_branch: "main".to_owned(),
+        };
+        descriptor.validate().unwrap();
+        let mut old_format = descriptor.clone();
+        old_format.format_version = 2;
+        assert!(old_format.validate().is_err());
+        let mut wrong_name = descriptor.clone();
+        wrong_name.refs[1].name = b"refs/tags/other".to_vec();
+        assert!(wrong_name.validate().is_err());
+        let mut orphan = descriptor.clone();
+        orphan.refs.pop();
+        assert!(orphan.validate().is_err());
+    }
 
     #[test]
     fn backup_rejects_unsafe_path_on_another_branch() {

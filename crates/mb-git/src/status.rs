@@ -133,6 +133,7 @@ pub(crate) fn files_for_commit(
         let kind = match object.kind {
             1 => ObjectType::Commit,
             2 => ObjectType::Tree,
+            3 => ObjectType::Tag,
             _ => return Err(StatusError::IncompatibleRecord),
         };
         let oid = Oid::hash_object(kind, &object.bytes)?;

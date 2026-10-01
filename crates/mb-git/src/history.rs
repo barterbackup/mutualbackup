@@ -39,6 +39,7 @@ const REF_PREFIX: &str = "git-ref-v1/";
 const MAIN_REF: &[u8] = b"refs/heads/main";
 const PIN_REF_PREFIX: &str = "refs/mutualbackup/pins/";
 const TAG_REF_PREFIX: &str = "refs/tags/";
+const MAX_TAG_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_AUTOMERGE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_GRAPH_OBJECTS: usize = 100_000;
 pub(crate) const MAX_GRAPH_METADATA_BYTES: usize = 64 * 1024 * 1024;
@@ -209,6 +210,7 @@ fn object_type(code: u8) -> Option<ObjectType> {
     match code {
         1 => Some(ObjectType::Commit),
         2 => Some(ObjectType::Tree),
+        3 => Some(ObjectType::Tag),
         _ => None,
     }
 }
@@ -217,6 +219,7 @@ fn object_code(kind: ObjectType) -> Result<u8, HistoryError> {
     match kind {
         ObjectType::Commit => Ok(1),
         ObjectType::Tree => Ok(2),
+        ObjectType::Tag => Ok(3),
         _ => Err(HistoryError::IncompatibleRecord),
     }
 }
@@ -508,18 +511,32 @@ pub fn list_tags(
     control: &ControlStore,
     repository_id: Uuid,
 ) -> Result<Vec<GitTagInfo>, HistoryError> {
+    let tag_records = control
+        .records(&ref_kind(repository_id))?
+        .into_iter()
+        .filter(|(name, _)| name.starts_with(TAG_REF_PREFIX.as_bytes()))
+        .collect::<Vec<_>>();
+    if tag_records.is_empty() {
+        return Ok(Vec::new());
+    }
+    let temporary = tempfile::tempdir()?;
+    let repository = Repository::init_bare(temporary.path())?;
+    let odb = git2::Odb::new()?;
+    let _pack = odb.add_new_mempack_backend(1000)?;
+    repository.set_odb(&odb)?;
+    load_metadata(control, repository_id, &repository)?;
     let mut tags = Vec::new();
-    for (name, encoded) in control.records(&ref_kind(repository_id))? {
-        let Some(name) = name.strip_prefix(TAG_REF_PREFIX.as_bytes()) else {
-            continue;
-        };
+    for (name, encoded) in tag_records {
+        let name = name
+            .strip_prefix(TAG_REF_PREFIX.as_bytes())
+            .ok_or(HistoryError::IncompatibleRecord)?;
         let name = std::str::from_utf8(name).map_err(|_| HistoryError::IncompatibleRecord)?;
         checked_tag_name(name).map_err(|_| HistoryError::IncompatibleRecord)?;
         let record: RefRecord = decode_canonical(&encoded)?;
         if record.format_version != 1 {
             return Err(HistoryError::IncompatibleRecord);
         }
-        checked_commit(control, repository_id, Oid::from_bytes(&record.oid)?)?;
+        peel_tag_in_repository(&repository, Oid::from_bytes(&record.oid)?, Some(name))?;
         tags.push(GitTagInfo {
             format_version: 1,
             repository_id,
@@ -532,6 +549,65 @@ pub fn list_tags(
     }
     tags.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(tags)
+}
+
+fn peel_tag_in_repository(
+    repository: &Repository,
+    mut oid: Oid,
+    reference_name: Option<&str>,
+) -> Result<(Oid, Vec<Oid>), HistoryError> {
+    let mut tags = Vec::new();
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(oid) || seen.len() > MAX_GRAPH_OBJECTS {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        let object = repository
+            .find_object(oid, None)
+            .map_err(|_| HistoryError::IncompatibleRecord)?;
+        match object.kind() {
+            Some(ObjectType::Commit) => return Ok((oid, tags)),
+            Some(ObjectType::Tag) => {
+                let tag = object
+                    .into_tag()
+                    .map_err(|_| HistoryError::IncompatibleRecord)?;
+                if tags.is_empty()
+                    && reference_name.is_some_and(|name| tag.name_bytes() != name.as_bytes())
+                {
+                    return Err(HistoryError::IncompatibleRecord);
+                }
+                if !matches!(
+                    tag.target_type(),
+                    Some(ObjectType::Commit | ObjectType::Tag)
+                ) || repository
+                    .find_object(tag.target_id(), None)
+                    .map_err(|_| HistoryError::IncompatibleRecord)?
+                    .kind()
+                    != tag.target_type()
+                {
+                    return Err(HistoryError::IncompatibleRecord);
+                }
+                tags.push(oid);
+                oid = tag.target_id();
+            }
+            _ => return Err(HistoryError::IncompatibleRecord),
+        }
+    }
+}
+
+fn peel_tag_target(
+    control: &ControlStore,
+    repository_id: Uuid,
+    oid: Oid,
+    reference_name: Option<&str>,
+) -> Result<Oid, HistoryError> {
+    let temporary = tempfile::tempdir()?;
+    let repository = Repository::init_bare(temporary.path())?;
+    let odb = git2::Odb::new()?;
+    let _pack = odb.add_new_mempack_backend(1000)?;
+    repository.set_odb(&odb)?;
+    load_metadata(control, repository_id, &repository)?;
+    Ok(peel_tag_in_repository(&repository, oid, reference_name)?.0)
 }
 
 fn tag_target(
@@ -563,8 +639,7 @@ fn tag_target(
             }
         }
     };
-    checked_commit(control, repository_id, target)?;
-    Ok(target)
+    peel_tag_target(control, repository_id, target, None)
 }
 
 pub(crate) fn create_tag_for_scope(
@@ -591,6 +666,69 @@ pub(crate) fn create_tag_for_scope(
         repository_id,
         name: name.to_owned(),
         oid: target.as_bytes().try_into().expect("SHA-1 OID"),
+    };
+    if !control.put_record_if_absent(
+        &ref_kind(repository_id),
+        reference.as_bytes(),
+        &fetched_ref_record(info.oid)?,
+    )? {
+        return Err(HistoryError::TagExists);
+    }
+    Ok(info)
+}
+
+pub(crate) fn create_annotated_tag_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    name: &str,
+    start_point: Option<&str>,
+    tagger_name: &str,
+    tagger_email: &str,
+    message: &str,
+) -> Result<GitTagInfo, HistoryError> {
+    let repository_id = scope.repository_id();
+    let reference = checked_tag_name(name)?;
+    if message.len() > MAX_TAG_MESSAGE_BYTES {
+        return Err(HistoryError::InvalidTag);
+    }
+    for existing in list_tags(control, repository_id)? {
+        if existing.name == name {
+            return Err(HistoryError::TagExists);
+        }
+        if existing.name.starts_with(&format!("{name}/"))
+            || name.starts_with(&format!("{}/", existing.name))
+        {
+            return Err(HistoryError::InvalidTag);
+        }
+    }
+    let target = tag_target(control, scope, start_point)?;
+    let temporary = tempfile::tempdir()?;
+    let repository = Repository::init_bare(temporary.path())?;
+    let odb = git2::Odb::new()?;
+    let _pack = odb.add_new_mempack_backend(1000)?;
+    repository.set_odb(&odb)?;
+    load_metadata(control, repository_id, &repository)?;
+    let target_object = repository.find_object(target, Some(ObjectType::Commit))?;
+    let tagger = Signature::now(tagger_name, tagger_email)?;
+    let oid = repository.tag_annotation_create(name, &target_object, &tagger, message)?;
+    let raw = odb.read(oid)?;
+    if raw.kind() != ObjectType::Tag || raw.len() > MAX_GRAPH_METADATA_BYTES {
+        return Err(HistoryError::GraphTooLarge);
+    }
+    let encoded = object_record(ObjectType::Tag, raw.data().to_vec())?;
+    if !control.put_record_if_absent(&metadata_kind(repository_id), oid.as_bytes(), &encoded)?
+        && control
+            .get_record(&metadata_kind(repository_id), oid.as_bytes())?
+            .as_deref()
+            != Some(encoded.as_slice())
+    {
+        return Err(HistoryError::IncompatibleRecord);
+    }
+    let info = GitTagInfo {
+        format_version: 1,
+        repository_id,
+        name: name.to_owned(),
+        oid: oid.as_bytes().try_into().expect("SHA-1 OID"),
     };
     if !control.put_record_if_absent(
         &ref_kind(repository_id),
@@ -1437,10 +1575,23 @@ pub fn export_graph_source(
     let _pack = odb.add_new_mempack_backend(1000)?;
     repository.set_odb(&odb)?;
     let stored = load_metadata(control, repository_id, &repository)?;
-    let mut commits = refs
-        .iter()
-        .map(|reference| Oid::from_bytes(&reference.oid))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut commits = Vec::new();
+    let mut seen_tags = HashSet::new();
+    for reference in &refs {
+        let name =
+            std::str::from_utf8(&reference.name).map_err(|_| HistoryError::IncompatibleRecord)?;
+        let tag_name = name.strip_prefix(TAG_REF_PREFIX);
+        let (commit, tags) =
+            peel_tag_in_repository(&repository, Oid::from_bytes(&reference.oid)?, tag_name)?;
+        if tag_name.is_none() && !tags.is_empty() {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        commits.push(commit);
+        seen_tags.extend(tags);
+    }
+    if seen_tags.len() > MAX_GRAPH_OBJECTS {
+        return Err(HistoryError::GraphTooLarge);
+    }
     let mut trees = Vec::new();
     let mut seen_commits = HashSet::new();
     let mut seen_trees = HashSet::new();
@@ -1485,6 +1636,7 @@ pub fn export_graph_source(
         .into_iter()
         .map(|oid| (oid, ObjectType::Commit))
         .chain(seen_trees.into_iter().map(|oid| (oid, ObjectType::Tree)))
+        .chain(seen_tags.iter().copied().map(|oid| (oid, ObjectType::Tag)))
         .collect::<Vec<_>>();
     reachable.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
     let mut objects = Vec::with_capacity(reachable.len());
@@ -1520,7 +1672,7 @@ pub fn export_graph_source(
         });
     }
     Ok(GitGraphSource {
-        format_version: 1,
+        format_version: if seen_tags.is_empty() { 1 } else { 2 },
         repository_id,
         refs,
         objects,
@@ -1614,7 +1766,7 @@ pub fn import_graph_backup(
             })?,
         ));
     }
-    if descriptor.format_version == 2 {
+    if descriptor.format_version >= 2 {
         records.push(selected_branch_record(
             repository_id,
             &descriptor.head_branch,

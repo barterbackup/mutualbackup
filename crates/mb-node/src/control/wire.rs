@@ -172,6 +172,15 @@ pub enum LocalRequest {
         name: String,
         start_point: Option<String>,
     },
+    GitCreateAnnotatedTag {
+        repository_id: Uuid,
+        worktree_id: Option<Uuid>,
+        name: String,
+        start_point: Option<String>,
+        tagger_name: String,
+        tagger_email: String,
+        message: String,
+    },
     GitDeleteTag {
         repository_id: Uuid,
         name: String,
@@ -700,6 +709,15 @@ mod tests {
                 worktree_id: None,
                 name: "v1".to_owned(),
                 start_point: Some("main".to_owned()),
+            },
+            LocalRequest::GitCreateAnnotatedTag {
+                repository_id,
+                worktree_id: None,
+                name: "v2".to_owned(),
+                start_point: Some("main".to_owned()),
+                tagger_name: "Test Tagger".to_owned(),
+                tagger_email: "tagger@example.test".to_owned(),
+                message: "release".to_owned(),
             },
             LocalRequest::GitDeleteTag {
                 repository_id,

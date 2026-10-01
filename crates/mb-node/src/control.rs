@@ -652,6 +652,29 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitCreateAnnotatedTag {
+            repository_id,
+            worktree_id,
+            name,
+            start_point,
+            tagger_name,
+            tagger_email,
+            message,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_create_annotated_tag(
+                    repository_id,
+                    worktree_id,
+                    &name,
+                    start_point.as_deref(),
+                    &tagger_name,
+                    &tagger_email,
+                    &message,
+                )
+                .map(LocalResponse::GitTagCreated)
+            })
+            .await
+        }
         LocalRequest::GitDeleteTag {
             repository_id,
             name,
