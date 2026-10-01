@@ -76,6 +76,8 @@ pub enum AnchorError {
     UnsupportedObject(PathBuf),
     #[error("unsafe relative path")]
     UnsafePath,
+    #[error("unsupported Git worktree file mode")]
+    UnsupportedGitMode,
     #[error("an unrecognized or unsafe source-anchor area already exists: {0}")]
     AnchorAreaCollision(PathBuf),
     #[error("owned directory is missing, replaced, mounted, or unsafe to remove: {0}")]
@@ -317,6 +319,58 @@ impl PinnedDirectory {
             destination.as_ref(),
         )
     }
+
+    /// Publish verified anchor bytes as a complete, editable worktree file.
+    /// The unnamed inode is reflinked and synced before it becomes visible;
+    /// an existing path is never replaced. The worktree inode is distinct from
+    /// the immutable anchor, so subsequent edits cannot change staged bytes.
+    pub fn publish_reflink_child(
+        &self,
+        name: impl AsRef<Path>,
+        anchor: &FileAnchorManifest,
+        mode: u32,
+    ) -> Result<(), AnchorError> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        if !matches!(mode, 0o100644 | 0o100755) {
+            return Err(AnchorError::UnsupportedGitMode);
+        }
+        let name = name.as_ref();
+        validate_single_component(name)?;
+        let encoded =
+            CString::new(name.as_os_str().as_bytes()).map_err(|_| AnchorError::UnsafePath)?;
+        let source = anchor.open_verified()?;
+        let descriptor = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let destination = unsafe { File::from_raw_fd(descriptor) };
+        reflink_file(&source, &destination).map_err(AnchorError::ReflinkUnavailable)?;
+        destination.set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
+        destination.sync_all()?;
+        let result = unsafe {
+            libc::linkat(
+                destination.as_raw_fd(),
+                c"".as_ptr(),
+                self.file.as_raw_fd(),
+                encoded.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        self.sync_all()
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -407,6 +461,15 @@ impl PinnedDirectory {
         &self,
         _source: impl AsRef<Path>,
         _destination: impl AsRef<Path>,
+    ) -> Result<(), AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn publish_reflink_child(
+        &self,
+        _name: impl AsRef<Path>,
+        _anchor: &FileAnchorManifest,
+        _mode: u32,
     ) -> Result<(), AnchorError> {
         Err(unsupported_pinned_directory())
     }
@@ -3595,6 +3658,68 @@ mod tests {
             invalid_format.open_verified(),
             Err(AnchorError::InvalidRoot)
         ));
+        manifest.remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn verified_anchor_publishes_private_reflink_without_replacing_worktree_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-checkout-{}", Uuid::new_v4()));
+        let source_root = run_root.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let source = source_root.join("source-file");
+        let original = b"exact\r\nbytes\0";
+        fs::write(&source, original).unwrap();
+        let manifest = crate::SourceFileCapturePlan::plan_reflink(&source_root, "source-file")
+            .unwrap()
+            .capture()
+            .unwrap();
+        fs::write(&source, b"later edit").unwrap();
+
+        let pinned = PinnedDirectory::open(&source_root).unwrap();
+        assert!(matches!(
+            pinned.publish_reflink_child("invalid", &manifest, 0o100777),
+            Err(AnchorError::UnsupportedGitMode)
+        ));
+        assert!(!source_root.join("invalid").exists());
+        pinned
+            .publish_reflink_child("checkout", &manifest, 0o100755)
+            .unwrap();
+        let checkout = source_root.join("checkout");
+        assert_eq!(fs::read(&checkout).unwrap(), original);
+        assert_eq!(
+            checkout.metadata().unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_ne!(
+            checkout.metadata().unwrap().ino(),
+            manifest.open_verified().unwrap().metadata().unwrap().ino()
+        );
+        assert!(matches!(
+            pinned.publish_reflink_child("checkout", &manifest, 0o100644),
+            Err(AnchorError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(
+            checkout.metadata().unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::write(&checkout, b"worktree edit").unwrap();
+        let mut anchored = Vec::new();
+        manifest
+            .open_verified()
+            .unwrap()
+            .read_to_end(&mut anchored)
+            .unwrap();
+        assert_eq!(anchored, original);
+
         manifest.remove().unwrap();
         fs::remove_dir_all(run_root).unwrap();
     }
