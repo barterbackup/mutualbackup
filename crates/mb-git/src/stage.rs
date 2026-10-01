@@ -34,6 +34,26 @@ const WORKTREE_SYMLINK_INTENT_PREFIX: &str = "git-worktree-symlink-stage-intent-
 const WORKTREE_INDEX_PREFIX: &str = "git-worktree-index-entry-v1/";
 const OBJECT_PREFIX: &str = "git-object-anchor-v1/";
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_MISSING_STAGE_DISCARD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_missing_stage_discard_hook(hook: Box<dyn FnOnce()>) {
+    AFTER_MISSING_STAGE_DISCARD.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+fn run_after_missing_stage_discard_hook() {
+    #[cfg(test)]
+    AFTER_MISSING_STAGE_DISCARD.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 #[derive(Debug, Error)]
 pub enum StageError {
     #[error("source anchor error: {0}")]
@@ -773,6 +793,72 @@ pub(crate) fn abandon_pending_stage_for_scope(
     Ok(true)
 }
 
+/// Discard pending adds after their linked worktree directory was removed.
+/// Validate every intent against the exact worktree and protected catalog
+/// before removing any anchor or temporary input. Each discard is idempotent
+/// across a crash before its intent record is retired.
+pub(crate) fn abandon_missing_linked_worktree_stages(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    source_root: &Path,
+    root_id: NativeFileId,
+    catalog_root: &Path,
+    catalog: &PinnedDirectory,
+) -> Result<(), StageError> {
+    if scope.worktree_id() == scope.repository_id() {
+        return Err(StageError::IncompatibleRecord);
+    }
+    let file_kind = intent_kind_for_scope(scope);
+    let mut files = Vec::new();
+    for (key, encoded) in control.records(&file_kind)? {
+        let intent = decode_intent(&encoded, scope.repository_id(), &key)?;
+        if intent.plan.source_root() != source_root || intent.plan.source_root_identity() != root_id
+        {
+            return Err(StageError::IncompatibleRecord);
+        }
+        files.push((key, encoded, intent));
+    }
+    let symlink_kind = symlink_intent_kind_for_scope(scope);
+    let mut symlinks = Vec::new();
+    let mut temp_names = BTreeSet::new();
+    let catalog_id = catalog.identity()?;
+    for (key, encoded) in control.records(&symlink_kind)? {
+        let intent = decode_symlink_intent(&encoded, scope.repository_id(), &key)?;
+        if intent.format_version != 2
+            || intent.source_root != source_root
+            || intent.root_id != root_id
+            || intent.catalog_root.as_deref() != Some(catalog_root)
+            || intent.catalog_id != catalog_id
+            || !temp_names.insert(intent.temp_name.clone())
+            || verify_temporary_symlink_bytes(catalog, &intent)?
+                .is_some_and(|observed| intent.temp_id.is_some_and(|expected| expected != observed))
+        {
+            return Err(StageError::IncompatibleRecord);
+        }
+        symlinks.push((key, encoded, intent));
+    }
+    for (key, encoded, intent) in files {
+        intent.plan.discard()?;
+        control.delete_record_if_value(&file_kind, &key, &encoded)?;
+        run_after_missing_stage_discard_hook();
+    }
+    for (key, encoded, intent) in symlinks {
+        if let Some(plan) = &intent.plan {
+            plan.discard()?;
+        }
+        if let Some(observed) = verify_temporary_symlink_bytes(catalog, &intent)? {
+            if intent.temp_id.is_some_and(|expected| expected != observed) {
+                return Err(StageError::IncompatibleRecord);
+            }
+            catalog.remove_child_file(&intent.temp_name)?;
+            catalog.sync_all()?;
+        }
+        control.delete_record_if_value(&symlink_kind, &key, &encoded)?;
+        run_after_missing_stage_discard_hook();
+    }
+    Ok(())
+}
+
 pub fn staged_entry(
     control: &ControlStore,
     repository_id: Uuid,
@@ -1312,6 +1398,116 @@ mod tests {
         drop(control);
         captured.remove().unwrap();
         second_anchors[0].remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn missing_linked_worktree_force_prune_replays_pending_file_and_symlink_discards() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-missing-stage-{}", Uuid::new_v4()));
+        let primary_root = run_root.join("primary");
+        let linked_root = run_root.join("linked");
+        let catalog_path = primary_root.join(GIT_CATALOG_DIRECTORY);
+        fs::create_dir_all(&primary_root).unwrap();
+        fs::create_dir_all(&linked_root).unwrap();
+        fs::write(primary_root.join("tracked"), b"base\r\n").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [123; 32];
+        let repo = crate::GitRepository::init(&primary_root, repository_id, &key).unwrap();
+        repo.stage_file("tracked").unwrap();
+        repo.commit("Author", "a@example.test", "base").unwrap();
+        repo.create_branch("topic").unwrap();
+        let linked = repo.add_linked_worktree(&linked_root, "topic").unwrap();
+        let scope = linked.scope().unwrap();
+        fs::write(linked_root.join("pending-file"), b"orphaned\n").unwrap();
+        symlink("../raw\nlink", linked_root.join("pending-link")).unwrap();
+
+        let control =
+            ControlStore::open_existing_with_key(catalog_path.join("catalog.db"), &key).unwrap();
+        let catalog = PinnedDirectory::open(&catalog_path).unwrap();
+        let (_, file_intent) = begin_stage_for_scope(
+            &control,
+            scope,
+            &linked_root,
+            Path::new("pending-file"),
+            SourceBackendKind::ReflinkV1,
+        )
+        .unwrap();
+        let file_anchor = file_intent.plan.capture().unwrap();
+        let (link_key, initial) = begin_symlink_stage_for_scope(
+            &control,
+            scope,
+            &linked_root,
+            &primary_root,
+            &catalog,
+            Path::new("pending-link"),
+        )
+        .unwrap();
+        let temp_id = catalog
+            .publish_small_bytes_child(&initial.temp_name, &initial.target)
+            .unwrap();
+        let mut prepared = initial.clone();
+        prepared.temp_id = Some(temp_id);
+        save_symlink_intent(&control, scope, &link_key, &initial, &prepared).unwrap();
+        let mut planned = prepared.clone();
+        planned.plan = Some(
+            SourceFileCapturePlan::plan_reflink(
+                &primary_root,
+                PathBuf::from(GIT_CATALOG_DIRECTORY).join(&planned.temp_name),
+            )
+            .unwrap(),
+        );
+        save_symlink_intent(&control, scope, &link_key, &prepared, &planned).unwrap();
+        let link_anchor = planned.plan.as_ref().unwrap().capture().unwrap();
+        fs::remove_dir_all(&linked_root).unwrap();
+        assert!(matches!(
+            repo.prune_missing_linked_worktree(linked.worktree_id, false),
+            Err(crate::RepositoryError::Worktree(
+                crate::GitWorktreeError::PendingOperation
+            ))
+        ));
+        let mut wrong_catalog = planned.clone();
+        wrong_catalog.catalog_id.inode += 1;
+        save_symlink_intent(&control, scope, &link_key, &planned, &wrong_catalog).unwrap();
+        assert!(matches!(
+            repo.prune_missing_linked_worktree(linked.worktree_id, true),
+            Err(crate::RepositoryError::Worktree(
+                crate::GitWorktreeError::Stage(StageError::IncompatibleRecord)
+            ))
+        ));
+        assert!(file_anchor.open_verified().is_ok());
+        assert!(link_anchor.open_verified().is_ok());
+        save_symlink_intent(&control, scope, &link_key, &wrong_catalog, &planned).unwrap();
+        super::set_after_missing_stage_discard_hook(Box::new(|| panic!("stage discard crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repo.prune_missing_linked_worktree(linked.worktree_id, true)
+                .unwrap();
+        }));
+        assert!(interrupted.is_err());
+        assert!(file_anchor.open_verified().is_err());
+        assert!(link_anchor.open_verified().is_ok());
+        assert!(super::has_pending_stages_for_scope(&control, scope).unwrap());
+        drop(control);
+        drop(catalog);
+        drop(repo);
+
+        let repo = crate::GitRepository::open(&primary_root, repository_id, &key).unwrap();
+        repo.prune_missing_linked_worktree(linked.worktree_id, true)
+            .unwrap();
+        assert!(link_anchor.open_verified().is_err());
+        assert!(fs::symlink_metadata(catalog_path.join(&planned.temp_name)).is_err());
+        assert!(repo.linked_worktrees().unwrap().is_empty());
+        repo.switch_branch("topic").unwrap();
+        assert_eq!(fs::read(primary_root.join("tracked")).unwrap(), b"base\r\n");
+        let graph = repo.export_graph_source().unwrap();
+        drop(repo);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
         fs::remove_dir_all(run_root).unwrap();
     }
 }

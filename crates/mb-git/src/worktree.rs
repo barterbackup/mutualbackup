@@ -28,7 +28,8 @@ use crate::head::{
 };
 use crate::history::{HistoryError, list_branches_for_scope};
 use crate::stage::{
-    StageError, has_pending_stages_for_scope, index_kind_for_scope, staged_entries_for_scope,
+    StageError, abandon_missing_linked_worktree_stages, has_pending_stages_for_scope,
+    index_kind_for_scope, staged_entries_for_scope,
 };
 use crate::status::{StatusError, committed_files_for_scope, repository_status_for_scope};
 
@@ -198,6 +199,7 @@ pub(crate) fn prune_missing_worktree(
     repository_id: Uuid,
     worktree_id: Uuid,
     force: bool,
+    primary_root: &Path,
     catalog: &PinnedDirectory,
 ) -> Result<GitWorktreeInfo, GitWorktreeError> {
     let kind = record_kind(repository_id);
@@ -222,11 +224,11 @@ pub(crate) fn prune_missing_worktree(
         return Err(GitWorktreeError::StillPresent);
     }
     let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
-    if has_pending_stages_for_scope(control, scope)? {
-        return Err(GitWorktreeError::PendingOperation);
-    }
+    let pending_stages = has_pending_stages_for_scope(control, scope)?;
     let pending_checkout = has_pending_checkout_for_scope(control, scope)?;
-    if pending_checkout && (!force || info.state != GitWorktreeState::Preparing) {
+    if (pending_stages && (!force || pending_checkout))
+        || (pending_checkout && (!force || info.state != GitWorktreeState::Preparing))
+    {
         return Err(GitWorktreeError::PendingOperation);
     }
     let head_kind = head_kind_for_scope(scope);
@@ -270,6 +272,16 @@ pub(crate) fn prune_missing_worktree(
         .collect::<Vec<_>>();
     if !head_rows.is_empty() {
         deletions.push((head_kind, b"branch".to_vec()));
+    }
+    if pending_stages {
+        abandon_missing_linked_worktree_stages(
+            control,
+            scope,
+            &info.path,
+            info.root_id,
+            primary_root,
+            catalog,
+        )?;
     }
     if pending_checkout {
         abandon_missing_initial_checkout_for_scope(

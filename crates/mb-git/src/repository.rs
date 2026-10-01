@@ -307,6 +307,7 @@ impl GitRepository {
             self.repository_id,
             worktree_id,
             force,
+            &self.root,
             &self.directory,
         )?)
     }

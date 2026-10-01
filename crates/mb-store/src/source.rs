@@ -178,6 +178,12 @@ impl SourceFileCapturePlan {
         }
     }
 
+    pub fn source_root_identity(&self) -> crate::NativeFileId {
+        match self {
+            Self::ReflinkV1(plan) => plan.source_root_identity(),
+        }
+    }
+
     pub fn relative_path(&self) -> &Path {
         match self {
             Self::ReflinkV1(plan) => plan.relative_path(),

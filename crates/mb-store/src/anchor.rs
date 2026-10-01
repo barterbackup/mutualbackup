@@ -1226,6 +1226,13 @@ impl ReflinkFileCapturePlan {
         &self.root.source_root
     }
 
+    pub fn source_root_identity(&self) -> NativeFileId {
+        NativeFileId {
+            filesystem_id: self.root.root_version.filesystem_id,
+            inode: self.root.root_version.inode,
+        }
+    }
+
     /// Read the source file's mode only while its planned capture version still
     /// matches. Git stages this separately from payload bytes.
     pub fn source_mode(&self) -> Result<u32, AnchorError> {
