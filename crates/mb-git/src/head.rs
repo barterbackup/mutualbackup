@@ -9,6 +9,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::GitWorktreeScope;
+use crate::worktree::{GitWorktreeInfo, GitWorktreeState, record_kind};
 
 const HEAD_PREFIX: &str = "git-head-v1/";
 const WORKTREE_HEAD_PREFIX: &str = "git-worktree-head-v1/";
@@ -107,6 +108,28 @@ fn linked_selected_branches_with_scope(
             return Err(HeadError::IncompatibleRecord);
         }
         branches.push((scope, selected_branch_for_scope(control, scope)?));
+    }
+    // A durable registration reserves its target before checkout has created
+    // the linked HEAD. This closes the deletion/switch window after a crash.
+    let registration_kind = record_kind(repository_id);
+    for (key, encoded) in control.records(&registration_kind)? {
+        let info: GitWorktreeInfo = decode_canonical(&encoded)?;
+        let scope = GitWorktreeScope::linked(repository_id, info.worktree_id)
+            .ok_or(HeadError::IncompatibleRecord)?;
+        if info.format_version != 1
+            || info.repository_id != repository_id
+            || key != info.worktree_id.as_bytes()
+        {
+            return Err(HeadError::IncompatibleRecord);
+        }
+        if info.state == GitWorktreeState::Preparing {
+            branches.push((scope, info.target_branch));
+        } else if !branches
+            .iter()
+            .any(|(selected_scope, _)| *selected_scope == scope)
+        {
+            return Err(HeadError::IncompatibleRecord);
+        }
     }
     Ok(branches)
 }

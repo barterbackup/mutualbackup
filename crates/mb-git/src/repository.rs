@@ -40,6 +40,9 @@ use crate::stage::{
     remove_cached, resume_pending_stages, stage_file, stage_path_key, stage_symlink, staged_entry,
 };
 use crate::status::{GitStatus, StatusError, repository_status};
+use crate::worktree::{
+    GitWorktreeError, GitWorktreeInfo, add_worktree, get_worktree, list_worktrees, resume_worktree,
+};
 
 const INITIALIZATION_INTENT: &str = "repository-intent";
 const INITIALIZATION_MAGIC: &str = "mutualbackup-git-repository-init-v1\n";
@@ -75,6 +78,8 @@ pub enum RepositoryError {
     MergeBlob(#[from] MergeBlobError),
     #[error("Git history prune error: {0}")]
     Prune(#[from] GitPruneError),
+    #[error("Git linked worktree error: {0}")]
+    Worktree(#[from] GitWorktreeError),
     #[error("repository marker or catalog identity conflicts with this root")]
     Conflict,
     #[error("the Git repository is not initialized")]
@@ -202,6 +207,46 @@ impl GitRepository {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn add_linked_worktree(
+        &self,
+        destination: impl AsRef<Path>,
+        branch: &str,
+    ) -> Result<GitWorktreeInfo, RepositoryError> {
+        self.resume_checkout()?;
+        Ok(add_worktree(
+            &self.catalog,
+            self.repository_id,
+            &self.root,
+            &self.directory,
+            destination.as_ref(),
+            branch,
+        )?)
+    }
+
+    pub fn linked_worktrees(&self) -> Result<Vec<GitWorktreeInfo>, RepositoryError> {
+        Ok(list_worktrees(&self.catalog, self.repository_id)?)
+    }
+
+    pub fn linked_worktree(&self, worktree_id: Uuid) -> Result<GitWorktreeInfo, RepositoryError> {
+        Ok(get_worktree(
+            &self.catalog,
+            self.repository_id,
+            worktree_id,
+        )?)
+    }
+
+    pub fn resume_linked_worktree(
+        &self,
+        worktree_id: Uuid,
+    ) -> Result<GitWorktreeInfo, RepositoryError> {
+        Ok(resume_worktree(
+            &self.catalog,
+            self.repository_id,
+            worktree_id,
+            &self.directory,
+        )?)
     }
 
     pub fn stage_file(
@@ -1203,6 +1248,137 @@ mod tests {
         drop(local);
         for anchor in anchors.into_values() {
             anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn linked_worktree_registration_checkouts_and_reopens_exact_bytes() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-worktree-register-{}", Uuid::new_v4()));
+        let primary_root = run_root.join("primary");
+        let linked_root = run_root.join("linked");
+        let another_root = run_root.join("another");
+        fs::create_dir_all(&primary_root).unwrap();
+        fs::create_dir_all(&linked_root).unwrap();
+        fs::create_dir_all(&another_root).unwrap();
+        fs::write(primary_root.join("tracked"), b"base\r\n").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [73_u8; 32];
+        let local = GitRepository::init(&primary_root, repository_id, &key).unwrap();
+        local.stage_file("tracked").unwrap();
+        let base = local.commit("Author", "a@example.test", "base").unwrap();
+        local.create_branch("topic").unwrap();
+        local.switch_branch("topic").unwrap();
+        fs::write(primary_root.join("tracked"), b"topic\n\0bytes\r\n").unwrap();
+        local.stage_file("tracked").unwrap();
+        let topic = local.commit("Author", "a@example.test", "topic").unwrap();
+        local.switch_branch("main").unwrap();
+
+        let linked = local.add_linked_worktree(&linked_root, "topic").unwrap();
+        assert_eq!(linked.state, crate::GitWorktreeState::Ready);
+        assert_eq!(linked.target_branch, "topic");
+        assert_eq!(local.linked_worktrees().unwrap(), vec![linked.clone()]);
+        assert_eq!(
+            fs::read(linked_root.join("tracked")).unwrap(),
+            b"topic\n\0bytes\r\n"
+        );
+        assert_eq!(fs::read(primary_root.join("tracked")).unwrap(), b"base\r\n");
+        let linked_status = crate::status::repository_status_for_scope(
+            &local.catalog,
+            linked.scope().unwrap(),
+            &linked_root,
+        )
+        .unwrap();
+        assert_eq!(linked_status.head_oid, Some(topic.oid));
+        assert!(linked_status.changes.is_empty());
+        assert!(linked_status.untracked.is_empty());
+        assert!(matches!(
+            local.add_linked_worktree(&another_root, "topic"),
+            Err(RepositoryError::Worktree(
+                crate::GitWorktreeError::BranchCheckedOutElsewhere
+            ))
+        ));
+        drop(local);
+
+        let local = GitRepository::open(&primary_root, repository_id, &key).unwrap();
+        assert_eq!(
+            local.resume_linked_worktree(linked.worktree_id).unwrap(),
+            linked
+        );
+        assert_eq!(local.status().unwrap().head_oid, Some(base.oid));
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn pending_linked_worktree_reserves_branch_and_resumes_after_reopen() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-worktree-replay-{}", Uuid::new_v4()));
+        let primary_root = run_root.join("primary");
+        let linked_root = run_root.join("linked");
+        fs::create_dir_all(&primary_root).unwrap();
+        fs::create_dir_all(&linked_root).unwrap();
+        fs::write(primary_root.join("tracked"), b"raw\r\n\0bytes").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [83_u8; 32];
+        let local = GitRepository::init(&primary_root, repository_id, &key).unwrap();
+        local.stage_file("tracked").unwrap();
+        local.commit("Author", "a@example.test", "base").unwrap();
+        local.create_branch("topic").unwrap();
+
+        crate::worktree::set_after_registration_hook(Box::new(|| panic!("worktree crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local.add_linked_worktree(&linked_root, "topic").unwrap();
+        }));
+        assert!(interrupted.is_err());
+        let pending = local.linked_worktrees().unwrap().pop().unwrap();
+        assert_eq!(pending.state, crate::GitWorktreeState::Preparing);
+        assert!(matches!(
+            local.delete_branch("topic", true),
+            Err(RepositoryError::History(crate::HistoryError::CurrentBranch))
+        ));
+        assert!(matches!(
+            local.switch_branch("topic"),
+            Err(RepositoryError::History(
+                crate::HistoryError::BranchCheckedOutElsewhere
+            ))
+        ));
+        drop(local);
+
+        let local = GitRepository::open(&primary_root, repository_id, &key).unwrap();
+        let ready = local.resume_linked_worktree(pending.worktree_id).unwrap();
+        assert_eq!(ready.state, crate::GitWorktreeState::Ready);
+        assert_eq!(
+            fs::read(linked_root.join("tracked")).unwrap(),
+            b"raw\r\n\0bytes"
+        );
+        assert!(
+            crate::status::repository_status_for_scope(
+                &local.catalog,
+                ready.scope().unwrap(),
+                &linked_root,
+            )
+            .unwrap()
+            .changes
+            .is_empty()
+        );
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
         }
         fs::remove_dir_all(run_root).unwrap();
     }

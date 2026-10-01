@@ -36,6 +36,8 @@ mod repository;
 mod stage;
 #[cfg(target_os = "linux")]
 mod status;
+#[cfg(target_os = "linux")]
+mod worktree;
 mod worktree_scope;
 pub use attributes::GitAttributesError;
 #[cfg(target_os = "linux")]
@@ -69,6 +71,8 @@ pub use stage::{
 };
 #[cfg(target_os = "linux")]
 pub use status::{GitChange, GitStatus, GitStatusChange, StatusError};
+#[cfg(target_os = "linux")]
+pub use worktree::{GitWorktreeError, GitWorktreeInfo, GitWorktreeState};
 pub use worktree_scope::GitWorktreeScope;
 
 #[derive(Debug, Error)]
