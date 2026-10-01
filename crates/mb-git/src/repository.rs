@@ -1021,6 +1021,131 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn attributes_reject_conversion_before_stage_and_preserve_raw_checkout_bytes() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-attributes-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join(".gitattributes"), b"*.txt text=auto\n").unwrap();
+        fs::write(source_root.join("payload.txt"), b"base\r\nbytes\0").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [97_u8; 32];
+        let local = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        assert!(matches!(
+            local.stage_file("payload.txt"),
+            Err(RepositoryError::Stage(StageError::Attributes(
+                crate::GitAttributesError::ContentConversion
+            )))
+        ));
+        assert!(local.staged_entry("payload.txt").unwrap().is_none());
+        assert!(local.status().unwrap().pending_adds.is_empty());
+        assert!(local.export_graph_source().unwrap().blobs.is_empty());
+
+        fs::write(source_root.join(".gitattributes"), b"*.txt -text\n").unwrap();
+        local.stage_file(".gitattributes").unwrap();
+        local.stage_file("payload.txt").unwrap();
+        local.commit("Author", "a@example.test", "base").unwrap();
+        local.create_branch("topic").unwrap();
+        local.switch_branch("topic").unwrap();
+        fs::write(source_root.join("payload.txt"), b"topic\nraw\r\n").unwrap();
+        local.stage_file("payload.txt").unwrap();
+        local.commit("Author", "a@example.test", "topic").unwrap();
+        local.switch_branch("main").unwrap();
+        assert_eq!(
+            fs::read(source_root.join("payload.txt")).unwrap(),
+            b"base\r\nbytes\0"
+        );
+
+        fs::write(
+            source_root.join(".gitattributes"),
+            b"*.txt filter=convert\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            local.stage_file(".gitattributes"),
+            Err(RepositoryError::Stage(StageError::Attributes(
+                crate::GitAttributesError::ContentConversion
+            )))
+        ));
+        assert!(matches!(
+            local.stage_file("payload.txt"),
+            Err(RepositoryError::Stage(StageError::Attributes(
+                crate::GitAttributesError::ContentConversion
+            )))
+        ));
+        assert!(local.status().unwrap().pending_adds.is_empty());
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn bare_fetch_rejects_transforming_attributes_before_import() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-fetch-attributes-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        let bare_root = run_root.join("remote.git");
+        let filter_marker = run_root.join("filter-executed");
+        fs::create_dir_all(&source_root).unwrap();
+        let remote = git2::Repository::init_bare(&bare_root).unwrap();
+        remote
+            .config()
+            .unwrap()
+            .set_str(
+                "filter.convert.smudge",
+                &format!("touch {}", filter_marker.display()),
+            )
+            .unwrap();
+        let attributes = remote.blob(b"*.txt filter=convert\n").unwrap();
+        let payload = remote.blob(b"raw\r\nbytes\0").unwrap();
+        let mut builder = remote.treebuilder(None).unwrap();
+        builder
+            .insert(".gitattributes", attributes, 0o100644)
+            .unwrap();
+        builder.insert("payload.txt", payload, 0o100644).unwrap();
+        let tree = remote.find_tree(builder.write().unwrap()).unwrap();
+        let author = git2::Signature::now("Author", "a@example.test").unwrap();
+        remote
+            .commit(
+                Some("refs/heads/main"),
+                &author,
+                &author,
+                "unsafe",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        drop(tree);
+        drop(builder);
+        drop(remote);
+        let repository_id = Uuid::new_v4();
+        let key = [98_u8; 32];
+        let local = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        assert!(matches!(
+            local.fetch_bare(&bare_root),
+            Err(RepositoryError::Fetch(crate::FetchError::Attributes(
+                crate::GitAttributesError::ContentConversion
+            )))
+        ));
+        assert!(local.remote_branches().unwrap().is_empty());
+        assert!(local.export_graph_source().unwrap().blobs.is_empty());
+        assert!(!filter_marker.exists());
+        drop(local);
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn deleted_file_can_resolve_a_modify_delete_merge_conflict() {
         let test_root = PathBuf::from(
             std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")

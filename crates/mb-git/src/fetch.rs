@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::attributes::{GitAttributesError, MAX_ATTRIBUTES_BYTES, validate_attributes};
 use crate::history::{
     GitGraphObject, GitGraphRef, HistoryError, MAX_GRAPH_METADATA_BYTES, MAX_GRAPH_OBJECTS,
     fetched_ref_record, metadata_kind, object_record, ref_kind,
@@ -53,6 +54,8 @@ pub enum FetchError {
     Model(#[from] ModelError),
     #[error("source must be an existing SHA-1 bare Git repository outside this root")]
     UnsupportedSource,
+    #[error("Git attributes policy error: {0}")]
+    Attributes(#[from] GitAttributesError),
     #[error("the pending fetch belongs to another source or root")]
     PendingFetch,
     #[error("the Git source changed or contains an unsupported or corrupt object")]
@@ -258,6 +261,14 @@ fn discover(
                         return Err(FetchError::IncompatibleSource);
                     }
                     let size = size as u64;
+                    if entry.name_bytes() == b".gitattributes"
+                        && matches!(mode, 0o100644 | 0o100755)
+                    {
+                        if size > MAX_ATTRIBUTES_BYTES {
+                            return Err(GitAttributesError::TooLarge.into());
+                        }
+                        validate_attributes(odb.read(entry.id())?.data())?;
+                    }
                     let blob = blobs.entry(entry.id()).or_insert_with(|| FetchedBlob {
                         oid: sha1(entry.id()),
                         logical_len: size,

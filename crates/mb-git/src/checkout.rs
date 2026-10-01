@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::attributes::{is_attributes_path, validate_anchor};
 use crate::head::{HeadError, selected_branch, selected_branch_record, selected_ref};
 use crate::history::{
     GitBranchInfo, HistoryError, MergeIdentity, commit_descends_from, create_pathwise_merge_commit,
@@ -128,6 +129,8 @@ pub enum CheckoutError {
     GitAnchor(#[from] GitAnchorError),
     #[error("Git merge state error: {0}")]
     MergeState(#[from] MergeBlobError),
+    #[error("Git attributes policy error: {0}")]
+    Attributes(#[from] crate::GitAttributesError),
     #[error("Git object error: {0}")]
     Git(#[from] git2::Error),
     #[error("working-tree I/O error: {0}")]
@@ -1306,6 +1309,15 @@ fn begin_checkout_to(
     }
     let old_tree = files_for_commit(control, repository_id, target.old_oid)?;
     let new_tree = files_for_commit(control, repository_id, Some(target.new_oid))?;
+    for (path, (oid, mode)) in &new_tree {
+        if is_attributes_path(path) && matches!(mode, 0o100644 | 0o100755) {
+            let anchor = anchors_for_oid(control, repository_id, Oid::from_bytes(oid)?)?
+                .into_iter()
+                .next()
+                .ok_or(CheckoutError::MissingAnchor)?;
+            validate_anchor(&anchor)?;
+        }
+    }
     let staged = staged_entries(control, repository_id)?
         .into_iter()
         .collect::<BTreeMap<_, _>>();

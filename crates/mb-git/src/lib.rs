@@ -11,6 +11,7 @@ use mb_core::KeyMaterial;
 use mb_store::{AnchorError, FileAnchorManifest};
 use thiserror::Error;
 
+mod attributes;
 #[cfg(target_os = "linux")]
 mod backup;
 #[cfg(target_os = "linux")]
@@ -35,6 +36,7 @@ mod repository;
 mod stage;
 #[cfg(target_os = "linux")]
 mod status;
+pub use attributes::GitAttributesError;
 #[cfg(target_os = "linux")]
 pub use backup::{GitBackupBlob, GitBackupDescriptor, GitBackupError, GitDataExtent};
 #[cfg(target_os = "linux")]

@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::attributes::{is_attributes_path, validate_anchor, validate_worktree_path};
 use crate::{GitAnchorError, blob_oid_from_anchor};
 
 const MAX_STAGE_PATH_BYTES: usize = 4096;
@@ -51,6 +52,8 @@ pub enum StageError {
     UnsupportedPlatform,
     #[error("staged symlink temporary file I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Git attributes policy error: {0}")]
+    Attributes(#[from] crate::GitAttributesError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -259,6 +262,7 @@ fn begin_stage(
     {
         return Err(StageError::PendingStage);
     }
+    validate_worktree_path(source_root, relative_path)?;
     let plan = SourceFileCapturePlan::plan_reflink(source_root, relative_path)?;
     let mode = if plan.source_mode()? & 0o111 != 0 {
         0o100755
@@ -296,6 +300,7 @@ fn begin_symlink_stage(
     {
         return Err(StageError::PendingStage);
     }
+    validate_worktree_path(source_root, relative_path)?;
     let root = PinnedDirectory::open(source_root)?;
     let actual_catalog = root
         .open_child_directory(GIT_CATALOG_DIRECTORY)?
@@ -337,6 +342,7 @@ fn finish_symlink_stage(
     if control.get_record(&kind, key)?.as_deref() != Some(canonical_bytes(&intent)?.as_slice()) {
         return Err(StageError::IncompatibleRecord);
     }
+    validate_worktree_path(&intent.source_root, &intent.relative_path)?;
     let catalog = symlink_catalog(&intent)?;
     let observed_temp = verify_temporary_symlink_bytes(&catalog, &intent)?;
     if let (Some(expected), Some(observed)) = (intent.temp_id, observed_temp)
@@ -432,7 +438,15 @@ fn finish_stage(
     if control.get_record(&kind, path_key)?.as_deref() != Some(expected.as_slice()) {
         return Err(StageError::IncompatibleRecord);
     }
+    validate_worktree_path(intent.plan.source_root(), &intent.relative_path)?;
     let manifest = intent.plan.capture()?;
+    if is_attributes_path(path_key)
+        && let Err(error) = validate_anchor(&manifest)
+    {
+        intent.plan.discard()?;
+        control.delete_record_if_value(&kind, path_key, &expected)?;
+        return Err(error.into());
+    }
     let oid = blob_oid_from_anchor(&manifest)?;
     intent.plan.reconcile()?;
     let entry = GitIndexEntry {

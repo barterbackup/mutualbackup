@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::attributes::{is_attributes_path, validate_anchor, validate_attributes};
 use crate::head::{
     HeadError, head_kind, selected_branch, selected_branch_record, selected_ref,
     store_selected_branch,
@@ -57,6 +58,8 @@ pub enum HistoryError {
     Status(#[from] StatusError),
     #[error("Git merge blob error: {0}")]
     MergeBlob(#[from] MergeBlobError),
+    #[error("Git attributes policy error: {0}")]
+    Attributes(#[from] crate::GitAttributesError),
     #[error("temporary metadata repository error: {0}")]
     Io(#[from] std::io::Error),
     #[error("an unfinished add must be resumed or abandoned before committing")]
@@ -645,12 +648,15 @@ pub fn commit_index(
     }
     let staged = staged_entries(control, repository_id)?;
     let mut anchors = Vec::new();
-    for (_, entry) in &staged {
+    for (path, entry) in &staged {
         let oid = Oid::from_bytes(&entry.oid)?;
         let anchor = anchors_for_oid(control, repository_id, oid)?
             .into_iter()
             .find(|anchor| anchor.anchor_id == entry.anchor_id)
             .ok_or(HistoryError::IncompatibleRecord)?;
+        if is_attributes_path(path) && matches!(entry.mode, 0o100644 | 0o100755) {
+            validate_anchor(&anchor)?;
+        }
         anchors.push(anchor);
     }
 
@@ -872,6 +878,20 @@ pub(crate) fn create_pathwise_merge_commit(
             if *byte == b'/' && merged.contains_key(&path[..index]) {
                 return Err(HistoryError::ContentMergeRequired);
             }
+        }
+    }
+    for (path, (oid, mode)) in &merged {
+        if !is_attributes_path(path) || !matches!(mode, 0o100644 | 0o100755) {
+            continue;
+        }
+        if let Some((_, _, blob)) = generated.iter().find(|(candidate, _, _)| candidate == path) {
+            validate_attributes(&blob.bytes)?;
+        } else {
+            let anchor = anchors_for_oid(control, repository_id, Oid::from_bytes(oid)?)?
+                .into_iter()
+                .next()
+                .ok_or(HistoryError::IncompatibleRecord)?;
+            validate_anchor(&anchor)?;
         }
     }
     for (path, inputs, blob) in &generated {
@@ -1240,6 +1260,19 @@ pub fn import_graph_backup(
             object.oid.to_vec(),
             object_record(kind, object.bytes.clone())?,
         ));
+    }
+    for object in descriptor.objects.iter().filter(|object| object.kind == 2) {
+        let tree = repository.find_tree(Oid::from_bytes(&object.oid)?)?;
+        for entry in tree.iter() {
+            if entry.name_bytes() == b".gitattributes"
+                && matches!(entry.filemode(), 0o100644 | 0o100755)
+            {
+                let anchor = by_oid
+                    .get(&entry.id())
+                    .ok_or(HistoryError::IncompatibleRecord)?;
+                validate_anchor(anchor)?;
+            }
+        }
     }
     for reference in &descriptor.refs {
         records.push((
