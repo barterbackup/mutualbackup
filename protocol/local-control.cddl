@@ -36,6 +36,9 @@ local-request =
   / { "GitWorktreeCommit": { repository_id: uuid-text, worktree_id: uuid-text, author_name: tstr, author_email: tstr, message: tstr } }
   / { "GitWorktreeLog": { repository_id: uuid-text, worktree_id: uuid-text, limit: uint } }
   / { "GitWorktreeBranches": { repository_id: uuid-text, worktree_id: uuid-text } }
+  / { "GitWorktreeCreateBranch": { repository_id: uuid-text, worktree_id: uuid-text, name: tstr } }
+  / { "GitWorktreeCreateBranchFrom": { repository_id: uuid-text, worktree_id: uuid-text, name: tstr, start_point: tstr } }
+  / { "GitWorktreeDeleteBranch": { repository_id: uuid-text, worktree_id: uuid-text, name: tstr, force: bool } }
   / { "GitWorktreeDiff": { repository_id: uuid-text, worktree_id: uuid-text, cached: bool } }
   / { "GitWorktreeSwitchBranch": { repository_id: uuid-text, worktree_id: uuid-text, name: tstr } }
   / { "GitAdd": { repository_id: uuid-text, path: tstr } }

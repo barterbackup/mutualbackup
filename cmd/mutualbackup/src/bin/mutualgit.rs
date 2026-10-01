@@ -403,11 +403,6 @@ async fn main() -> Result<()> {
         } => {
             let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
             if let Some(name) = name {
-                if worktree_id.is_some() {
-                    bail!(
-                        "branch creation and deletion are not yet supported from linked worktrees"
-                    );
-                }
                 if all {
                     bail!("branch -a lists refs; omit -a when changing a branch");
                 }
@@ -415,15 +410,21 @@ async fn main() -> Result<()> {
                     if start_point.is_some() {
                         bail!("branch deletion does not accept a start point");
                     }
-                    let LocalResponse::GitBranchDeleted(branch) = local_control_call(
-                        &socket,
-                        &LocalRequest::GitDeleteBranch {
+                    let request = match worktree_id {
+                        Some(worktree_id) => LocalRequest::GitWorktreeDeleteBranch {
+                            repository_id,
+                            worktree_id,
+                            name,
+                            force: force_delete,
+                        },
+                        None => LocalRequest::GitDeleteBranch {
                             repository_id,
                             name,
                             force: force_delete,
                         },
-                    )
-                    .await?
+                    };
+                    let LocalResponse::GitBranchDeleted(branch) =
+                        local_control_call(&socket, &request).await?
                     else {
                         bail!("daemon returned the wrong response to Git branch deletion");
                     };
@@ -437,13 +438,26 @@ async fn main() -> Result<()> {
                     );
                     return Ok(());
                 }
-                let request = match start_point {
-                    Some(start_point) => LocalRequest::GitCreateBranchFrom {
+                let request = match (worktree_id, start_point) {
+                    (Some(worktree_id), Some(start_point)) => {
+                        LocalRequest::GitWorktreeCreateBranchFrom {
+                            repository_id,
+                            worktree_id,
+                            name,
+                            start_point,
+                        }
+                    }
+                    (Some(worktree_id), None) => LocalRequest::GitWorktreeCreateBranch {
+                        repository_id,
+                        worktree_id,
+                        name,
+                    },
+                    (None, Some(start_point)) => LocalRequest::GitCreateBranchFrom {
                         repository_id,
                         name,
                         start_point,
                     },
-                    None => LocalRequest::GitCreateBranch {
+                    (None, None) => LocalRequest::GitCreateBranch {
                         repository_id,
                         name,
                     },

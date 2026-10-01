@@ -1496,6 +1496,41 @@ impl Node {
             .map_err(Into::into)
     }
 
+    pub fn git_worktree_create_branch(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        name: &str,
+    ) -> Result<GitBranchInfo> {
+        self.open_git_repository(repository_id)?
+            .linked_create_branch(worktree_id, name)
+            .map_err(Into::into)
+    }
+
+    pub fn git_worktree_create_branch_from(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        name: &str,
+        start_point: &str,
+    ) -> Result<GitBranchInfo> {
+        self.open_git_repository(repository_id)?
+            .linked_create_branch_from(worktree_id, name, start_point)
+            .map_err(Into::into)
+    }
+
+    pub fn git_worktree_delete_branch(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        name: &str,
+        force: bool,
+    ) -> Result<GitBranchInfo> {
+        self.open_git_repository(repository_id)?
+            .linked_delete_branch(worktree_id, name, force)
+            .map_err(Into::into)
+    }
+
     pub fn git_worktree_diff(
         &self,
         repository_id: Uuid,

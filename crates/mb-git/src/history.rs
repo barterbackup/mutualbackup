@@ -298,10 +298,6 @@ pub(crate) fn verified_metadata_ids(
         .collect())
 }
 
-fn head_oid(control: &ControlStore, repository_id: Uuid) -> Result<Option<Oid>, HistoryError> {
-    head_oid_for_scope(control, GitWorktreeScope::primary(repository_id))
-}
-
 fn head_oid_for_scope(
     control: &ControlStore,
     scope: GitWorktreeScope,
@@ -510,7 +506,16 @@ pub fn create_branch(
     repository_id: Uuid,
     name: &str,
 ) -> Result<GitBranchInfo, HistoryError> {
-    let oid = head_oid(control, repository_id)?.ok_or(HistoryError::NoHead)?;
+    create_branch_for_scope(control, GitWorktreeScope::primary(repository_id), name)
+}
+
+pub(crate) fn create_branch_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    name: &str,
+) -> Result<GitBranchInfo, HistoryError> {
+    let repository_id = scope.repository_id();
+    let oid = head_oid_for_scope(control, scope)?.ok_or(HistoryError::NoHead)?;
     create_branch_at(control, repository_id, name, oid)
 }
 
@@ -522,6 +527,21 @@ pub fn create_branch_from(
     name: &str,
     start_point: &str,
 ) -> Result<GitBranchInfo, HistoryError> {
+    create_branch_from_for_scope(
+        control,
+        GitWorktreeScope::primary(repository_id),
+        name,
+        start_point,
+    )
+}
+
+pub(crate) fn create_branch_from_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    name: &str,
+    start_point: &str,
+) -> Result<GitBranchInfo, HistoryError> {
+    let repository_id = scope.repository_id();
     let source = if let Some(remote) = start_point.strip_prefix("origin/") {
         if remote.len() > 1024 || !Branch::name_is_valid(remote)? {
             return Err(HistoryError::InvalidBranch);
@@ -535,8 +555,8 @@ pub fn create_branch_from(
     };
     let oid = ref_oid(control, repository_id, source.as_bytes())?
         .ok_or(HistoryError::StartPointNotFound)?;
-    if name == selected_branch(control, repository_id)?
-        && head_oid(control, repository_id)?.is_none()
+    if name == selected_branch_for_scope(control, scope)?
+        && head_oid_for_scope(control, scope)?.is_none()
     {
         return Err(HistoryError::UnbornSelectedBranch);
     }
@@ -552,6 +572,21 @@ pub fn delete_branch(
     name: &str,
     force: bool,
 ) -> Result<GitBranchInfo, HistoryError> {
+    delete_branch_for_scope(
+        control,
+        GitWorktreeScope::primary(repository_id),
+        name,
+        force,
+    )
+}
+
+pub(crate) fn delete_branch_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    name: &str,
+    force: bool,
+) -> Result<GitBranchInfo, HistoryError> {
+    let repository_id = scope.repository_id();
     if name.len() > 1024 || !Branch::name_is_valid(name)? {
         return Err(HistoryError::InvalidBranch);
     }
@@ -567,7 +602,7 @@ pub fn delete_branch(
         .find(|branch| branch.name == name)
         .ok_or(HistoryError::BranchNotFound)?;
     if !force {
-        let head = head_oid(control, repository_id)?;
+        let head = head_oid_for_scope(control, scope)?;
         let target = Oid::from_bytes(&branch.oid)?;
         if !head
             .map(|oid| commit_descends_from(control, repository_id, oid, target))

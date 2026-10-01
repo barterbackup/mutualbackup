@@ -106,6 +106,23 @@ pub enum LocalRequest {
         repository_id: Uuid,
         worktree_id: Uuid,
     },
+    GitWorktreeCreateBranch {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        name: String,
+    },
+    GitWorktreeCreateBranchFrom {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        name: String,
+        start_point: String,
+    },
+    GitWorktreeDeleteBranch {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        name: String,
+        force: bool,
+    },
     GitWorktreeDiff {
         repository_id: Uuid,
         worktree_id: Uuid,
@@ -533,6 +550,23 @@ mod tests {
             LocalRequest::GitWorktreeBranches {
                 repository_id,
                 worktree_id: Uuid::from_bytes([5; 16]),
+            },
+            LocalRequest::GitWorktreeCreateBranch {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                name: "copy".to_owned(),
+            },
+            LocalRequest::GitWorktreeCreateBranchFrom {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                name: "copy".to_owned(),
+                start_point: "topic".to_owned(),
+            },
+            LocalRequest::GitWorktreeDeleteBranch {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                name: "copy".to_owned(),
+                force: false,
             },
             LocalRequest::GitWorktreeDiff {
                 repository_id,

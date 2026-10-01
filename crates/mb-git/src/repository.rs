@@ -23,7 +23,8 @@ use crate::fetch::{FetchError, fetch_bare};
 use crate::head::{HeadError, selected_branch};
 use crate::history::{
     GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, GitRemoteBranchInfo, HistoryError,
-    commit_index, commit_index_for_scope, create_branch, create_branch_from, delete_branch,
+    commit_index, commit_index_for_scope, create_branch, create_branch_for_scope,
+    create_branch_from, create_branch_from_for_scope, delete_branch, delete_branch_for_scope,
     export_graph_source, import_graph_backup, list_branches, list_branches_for_scope,
     list_commit_pins, list_remote_branches, log_history, log_history_for_scope, pin_commit,
     switch_same_tree_branch, switch_same_tree_branch_for_scope, unpin_commit,
@@ -399,6 +400,52 @@ impl GitRepository {
         Ok(list_branches_for_scope(
             &self.catalog,
             info.scope().ok_or(GitWorktreeError::Conflict)?,
+        )?)
+    }
+
+    pub fn linked_create_branch(
+        &self,
+        worktree_id: Uuid,
+        name: &str,
+    ) -> Result<GitBranchInfo, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        self.ensure_no_merge_session()?;
+        Ok(create_branch_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+            name,
+        )?)
+    }
+
+    pub fn linked_create_branch_from(
+        &self,
+        worktree_id: Uuid,
+        name: &str,
+        start_point: &str,
+    ) -> Result<GitBranchInfo, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        self.ensure_no_merge_session()?;
+        Ok(create_branch_from_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+            name,
+            start_point,
+        )?)
+    }
+
+    pub fn linked_delete_branch(
+        &self,
+        worktree_id: Uuid,
+        name: &str,
+        force: bool,
+    ) -> Result<GitBranchInfo, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        self.ensure_no_merge_session()?;
+        Ok(delete_branch_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+            name,
+            force,
         )?)
     }
 
@@ -1528,6 +1575,23 @@ mod tests {
             local.linked_log(linked.worktree_id, 1).unwrap()[0].oid,
             linked_commit.oid
         );
+        let copy = local
+            .linked_create_branch(linked.worktree_id, "linked-copy")
+            .unwrap();
+        assert_eq!(copy.oid, linked_commit.oid);
+        assert!(matches!(
+            local.delete_branch("linked-copy", false),
+            Err(RepositoryError::History(
+                crate::HistoryError::BranchNotMerged
+            ))
+        ));
+        assert_eq!(
+            local
+                .linked_delete_branch(linked.worktree_id, "linked-copy", false)
+                .unwrap()
+                .oid,
+            linked_commit.oid
+        );
         assert!(
             local
                 .linked_branches(linked.worktree_id)
@@ -1535,7 +1599,9 @@ mod tests {
                 .iter()
                 .any(|branch| branch.name == "topic" && branch.current)
         );
-        local.create_branch_from("base-copy", "main").unwrap();
+        local
+            .linked_create_branch_from(linked.worktree_id, "base-copy", "main")
+            .unwrap();
         local
             .linked_switch_branch(linked.worktree_id, "base-copy")
             .unwrap();

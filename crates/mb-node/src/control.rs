@@ -491,6 +491,46 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitWorktreeCreateBranch {
+            repository_id,
+            worktree_id,
+            name,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_create_branch(repository_id, worktree_id, &name)
+                    .map(LocalResponse::GitBranchCreated)
+            })
+            .await
+        }
+        LocalRequest::GitWorktreeCreateBranchFrom {
+            repository_id,
+            worktree_id,
+            name,
+            start_point,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_create_branch_from(
+                    repository_id,
+                    worktree_id,
+                    &name,
+                    &start_point,
+                )
+                .map(LocalResponse::GitBranchCreated)
+            })
+            .await
+        }
+        LocalRequest::GitWorktreeDeleteBranch {
+            repository_id,
+            worktree_id,
+            name,
+            force,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_delete_branch(repository_id, worktree_id, &name, force)
+                    .map(LocalResponse::GitBranchDeleted)
+            })
+            .await
+        }
         LocalRequest::GitWorktreeDiff {
             repository_id,
             worktree_id,
