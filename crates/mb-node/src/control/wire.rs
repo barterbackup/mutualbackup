@@ -206,6 +206,14 @@ pub enum LocalRequest {
         target_oid: [u8; 20],
         expected_old: Option<[u8; 20]>,
     },
+    GitReceivePushedTag {
+        repository_id: Uuid,
+        source_root: PathBuf,
+        source_git_directory: PathBuf,
+        target_tag: String,
+        target_oid: [u8; 20],
+        expected_old: Option<[u8; 20]>,
+    },
     GitRemoteBranches {
         repository_id: Uuid,
     },
@@ -375,6 +383,11 @@ pub enum LocalResponse {
     GitPushReceived {
         repository_id: Uuid,
         branch: String,
+        oid: [u8; 20],
+    },
+    GitTagPushReceived {
+        repository_id: Uuid,
+        name: String,
         oid: [u8; 20],
     },
     GitRemoteBranches(Vec<GitRemoteBranchInfo>),
@@ -768,6 +781,14 @@ mod tests {
                 target_oid: [4; 20],
                 expected_old: Some([3; 20]),
             },
+            LocalRequest::GitReceivePushedTag {
+                repository_id,
+                source_root: PathBuf::from("/tmp/source"),
+                source_git_directory: PathBuf::from("/tmp/stock-git/.git"),
+                target_tag: "release".to_owned(),
+                target_oid: [4; 20],
+                expected_old: None,
+            },
             LocalRequest::GitRemoteBranches { repository_id },
             LocalRequest::GitCommitPins { repository_id },
             LocalRequest::GitPinCommit {
@@ -964,6 +985,11 @@ mod tests {
             LocalResponse::GitPushReceived {
                 repository_id,
                 branch: "topic".to_owned(),
+                oid: [4; 20],
+            },
+            LocalResponse::GitTagPushReceived {
+                repository_id,
+                name: "release".to_owned(),
                 oid: [4; 20],
             },
             LocalResponse::GitRemoteBranches(vec![GitRemoteBranchInfo {

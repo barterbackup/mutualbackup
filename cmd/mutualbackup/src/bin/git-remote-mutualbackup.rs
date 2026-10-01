@@ -134,7 +134,8 @@ async fn receive_push(
     repository_id: Uuid,
     source_root: &Path,
     source_git_directory: &Path,
-    advertised: &[GitBranchInfo],
+    advertised_branches: &[GitBranchInfo],
+    advertised_tags: &[GitTagInfo],
 ) -> Result<()> {
     let specification = line
         .strip_prefix("push ")
@@ -142,15 +143,20 @@ async fn receive_push(
     let (source, destination) = specification
         .split_once(':')
         .context("Git push needs a source and destination ref")?;
-    let branch = destination
-        .strip_prefix("refs/heads/")
-        .context("only local branch refs can receive stock Git pushes")?;
-    if source.is_empty()
-        || source.starts_with('+')
-        || branch.len() > 1024
-        || !git2::Branch::name_is_valid(branch)?
+    let tag = destination.strip_prefix("refs/tags/");
+    let branch = destination.strip_prefix("refs/heads/");
+    if source.is_empty() || source.starts_with('+') || tag.is_none() && branch.is_none() {
+        bail!("forced pushes, ref deletion, and this destination ref are not supported");
+    }
+    if let Some(name) = branch
+        && (name.len() > 1024 || !git2::Branch::name_is_valid(name)?)
     {
-        bail!("forced pushes and branch deletion are not supported");
+        bail!("invalid Git push branch");
+    }
+    if let Some(name) = tag
+        && (name.len() > 1024 || !git2::Reference::is_valid_name(destination))
+    {
+        bail!("invalid Git push tag");
     }
     let stock = git2::Repository::open(source_git_directory)?;
     if stock.path().canonicalize()? != source_git_directory
@@ -158,8 +164,43 @@ async fn receive_push(
     {
         bail!("stock Git source is not an exact SHA-1 repository");
     }
-    let oid = stock.revparse_single(source)?.peel_to_commit()?.id();
-    let expected_old = advertised
+    let source_object = stock.revparse_single(source)?;
+    let oid = if branch.is_some() {
+        source_object.peel_to_commit()?.id()
+    } else {
+        source_object.id()
+    };
+    if let Some(tag) = tag {
+        let expected_old = advertised_tags
+            .iter()
+            .find(|entry| entry.name == tag)
+            .map(|entry| entry.oid);
+        let LocalResponse::GitTagPushReceived {
+            repository_id: returned_id,
+            name: returned_name,
+            oid: returned_oid,
+        } = local_control_call(
+            socket,
+            &LocalRequest::GitReceivePushedTag {
+                repository_id,
+                source_root: source_root.to_path_buf(),
+                source_git_directory: source_git_directory.to_path_buf(),
+                target_tag: tag.to_owned(),
+                target_oid: oid.as_bytes().try_into().expect("SHA-1 OID"),
+                expected_old,
+            },
+        )
+        .await?
+        else {
+            bail!("daemon returned the wrong Git tag push response");
+        };
+        if returned_id != repository_id || returned_name != tag || returned_oid != oid.as_bytes() {
+            bail!("daemon received another Git tag or object");
+        }
+        return Ok(());
+    }
+    let branch = branch.context("Git push destination has no branch")?;
+    let expected_old = advertised_branches
         .iter()
         .find(|entry| entry.name == branch)
         .map(|entry| entry.oid);
@@ -294,7 +335,7 @@ async fn main() -> Result<()> {
                 output.flush()?;
             }
             value if value.starts_with("push ") => {
-                let (branches, _) = advertised
+                let (branches, tags) = advertised
                     .as_ref()
                     .context("Git requested a push before listing remote refs")?;
                 let mut commands = vec![value.to_owned()];
@@ -322,6 +363,7 @@ async fn main() -> Result<()> {
                         &source_root,
                         &destination,
                         branches,
+                        tags,
                     )
                     .await
                     {

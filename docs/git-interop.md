@@ -18,8 +18,8 @@ merge, staged reset and restore, diff, log, explicit commit pins, and prune.
 `mutualgit tag -a -m 'release notes' NAME [START-POINT]` to create an annotated
 commit tag with the configured committer identity. Both tag forms are included
 in encrypted history backups and keep their commits reachable until removed
-and pruned. Stock Git can fetch either tag form through the remote helper;
-stock Git tag pushes and `mutualgit fetch` of tags are still pending.
+and pruned. Stock Git can fetch and push either tag form through the remote
+helper. Native `mutualgit fetch` and `mutualgit push` of tags are still pending.
 `mutualgit --help` gives the current command forms. Staging and checkout do
 not apply Git line-ending rules or content filters. A transforming
 `.gitattributes` rule is rejected before publishing staged bytes.
@@ -36,6 +36,8 @@ git -C another-repo fetch 'mutualbackup::/absolute/path/to/source' \
   refs/tags/release:refs/tags/release
 git -C another-repo push 'mutualbackup::/absolute/path/to/source' \
   refs/heads/topic:refs/heads/topic
+git -C another-repo push 'mutualbackup::/absolute/path/to/source' \
+  refs/tags/release:refs/tags/release
 ```
 
 The helper uses the same default local control socket as `mutualgit`. Set
@@ -49,4 +51,6 @@ their raw object IDs and bytes. Push accepts a new or fast-forward branch only
 when that branch is not checked out in a MutualBackup worktree; force pushes and
 branch deletion are unsupported. `mutualgit fetch` and `mutualgit pull` accept
 existing local bare or working-tree Git repositories; `mutualgit push` targets
-local bare Git repositories.
+local bare Git repositories. Tag pushes create new tag refs after their complete
+object graph and native blob anchors are durable; moving, deleting, and force
+pushing tags are unsupported.

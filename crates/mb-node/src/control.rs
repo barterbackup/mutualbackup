@@ -822,6 +822,31 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitReceivePushedTag {
+            repository_id,
+            source_root,
+            source_git_directory,
+            target_tag,
+            target_oid,
+            expected_old,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_receive_pushed_tag(
+                    repository_id,
+                    &source_root,
+                    &source_git_directory,
+                    &target_tag,
+                    target_oid,
+                    expected_old,
+                )?;
+                Ok(LocalResponse::GitTagPushReceived {
+                    repository_id,
+                    name: target_tag,
+                    oid: target_oid,
+                })
+            })
+            .await
+        }
         LocalRequest::GitCreateBranchFrom {
             repository_id,
             name,

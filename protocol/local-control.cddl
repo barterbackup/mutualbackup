@@ -55,6 +55,7 @@ local-request =
   / { "GitExportToGitRepository": { repository_id: uuid-text, source_root: tstr, destination: tstr, advertised: [* git-branch-info] } }
   / { "GitExportToGitRepositoryV2": { repository_id: uuid-text, source_root: tstr, destination: tstr, advertised_branches: [* git-branch-info], advertised_tags: [* git-tag-info] } }
   / { "GitReceivePushedBranch": { repository_id: uuid-text, source_root: tstr, source_git_directory: tstr, target_branch: tstr, target_oid: bytes20-array, expected_old: null / bytes20-array } }
+  / { "GitReceivePushedTag": { repository_id: uuid-text, source_root: tstr, source_git_directory: tstr, target_tag: tstr, target_oid: bytes20-array, expected_old: null / bytes20-array } }
   / { "GitRemoteBranches": { repository_id: uuid-text } }
   / { "GitCommitPins": { repository_id: uuid-text } }
   / { "GitPinCommit": { repository_id: uuid-text, oid: bytes20-array } }
@@ -119,6 +120,7 @@ local-response =
   / { "GitTagDeleted": git-tag-info }
   / { "GitObjectsExported": { repository_id: uuid-text, object_count: uint } }
   / { "GitPushReceived": { repository_id: uuid-text, branch: tstr, oid: bytes20-array } }
+  / { "GitTagPushReceived": { repository_id: uuid-text, name: tstr, oid: bytes20-array } }
   / { "GitRemoteBranches": [* git-remote-branch-info] }
   / { "GitCommitPins": { repository_id: uuid-text, oids: [* bytes20-array] } }
   / { "GitCommitPinChanged": { repository_id: uuid-text, oid: bytes20-array, pinned: bool } }

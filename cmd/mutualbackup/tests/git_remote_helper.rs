@@ -155,6 +155,30 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
                         })
                         .map_err(WireError::operation)
                 }
+                LocalRequest::GitReceivePushedTag {
+                    repository_id: requested,
+                    source_root,
+                    source_git_directory,
+                    target_tag,
+                    target_oid,
+                    expected_old,
+                } => {
+                    assert_eq!(requested, repository_id);
+                    assert_eq!(source_root, server_root);
+                    repository
+                        .receive_pushed_tag(
+                            &source_git_directory,
+                            &target_tag,
+                            target_oid,
+                            expected_old,
+                        )
+                        .map(|()| LocalResponse::GitTagPushReceived {
+                            repository_id,
+                            name: target_tag,
+                            oid: target_oid,
+                        })
+                        .map_err(WireError::operation)
+                }
                 _ => panic!("unexpected Git helper request"),
             };
             let response = serde_json::json!({
@@ -376,6 +400,66 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&clone_root)
+        .args([
+            "-c",
+            "user.name=Stock",
+            "-c",
+            "user.email=stock@example.test",
+            "tag",
+            "-a",
+            "-m",
+            "stock release\r\n",
+            "stock-release",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stock_tag = git2::Repository::open(&clone_root)
+        .unwrap()
+        .find_reference("refs/tags/stock-release")
+        .unwrap()
+        .target()
+        .unwrap();
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&clone_root)
+        .args(["push"])
+        .arg(format!("mutualbackup::{}", source_root.display()))
+        .arg("refs/tags/stock-release:refs/tags/stock-release")
+        .env("PATH", &path)
+        .env("MUTUALBACKUP_CONTROL_SOCKET", &socket)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&clone_root)
+        .args(["tag", "stock-light"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&clone_root)
+        .args(["push"])
+        .arg(format!("mutualbackup::{}", source_root.display()))
+        .arg("refs/tags/stock-light:refs/tags/stock-light")
+        .env("PATH", &path)
+        .env("MUTUALBACKUP_CONTROL_SOCKET", &socket)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let roundtrip_root = run_root.join("roundtrip");
     let output = Command::new("git")
         .args(["-c", "core.autocrlf=false", "clone", "--no-tags"])
@@ -408,6 +492,30 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
     assert_eq!(
         fs::read(roundtrip_root.join("tracked")).unwrap(),
         pushed_again
+    );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&roundtrip_root)
+        .args(["fetch", "--no-tags"])
+        .arg(format!("mutualbackup::{}", source_root.display()))
+        .arg("refs/tags/stock-release:refs/tags/stock-release")
+        .env("PATH", &path)
+        .env("MUTUALBACKUP_CONTROL_SOCKET", &socket)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        git2::Repository::open(&roundtrip_root)
+            .unwrap()
+            .find_reference("refs/tags/stock-release")
+            .unwrap()
+            .target()
+            .unwrap(),
+        stock_tag
     );
     let output = Command::new("git")
         .arg("-C")
@@ -454,6 +562,42 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
         .to_string(),
         fast_forward_oid
     );
+    assert_eq!(
+        repository
+            .tags()
+            .unwrap()
+            .into_iter()
+            .find(|tag| tag.name == "stock-release")
+            .unwrap()
+            .oid,
+        stock_tag.as_bytes()
+    );
+    let stock = git2::Repository::open(&clone_root).unwrap();
+    let topic_object = stock
+        .find_object(git2::Oid::from_str(&fast_forward_oid).unwrap(), None)
+        .unwrap();
+    let signature = git2::Signature::now("Stock", "stock@example.test").unwrap();
+    let changed_tag = stock
+        .tag_annotation_create("stock-release", &topic_object, &signature, "changed")
+        .unwrap();
+    assert!(matches!(
+        repository.receive_pushed_tag(
+            stock.path(),
+            "stock-release",
+            changed_tag.as_bytes().try_into().unwrap(),
+            Some(stock_tag.as_bytes().try_into().unwrap()),
+        ),
+        Err(RepositoryError::Fetch(FetchError::TagExists))
+    ));
+    assert!(matches!(
+        repository.receive_pushed_tag(
+            stock.path(),
+            "stock-release/nested",
+            changed_tag.as_bytes().try_into().unwrap(),
+            None,
+        ),
+        Err(RepositoryError::Fetch(FetchError::TagExists))
+    ));
     let main_oid = commit.oid;
     let topic_oid = git2::Oid::from_str(&fast_forward_oid).unwrap();
     assert!(matches!(
