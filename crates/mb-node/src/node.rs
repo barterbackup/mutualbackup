@@ -1423,9 +1423,53 @@ impl Node {
     }
 
     pub fn git_status(&self, repository_id: Uuid) -> Result<GitStatus> {
-        self.open_git_repository(repository_id)?
-            .status()
-            .map_err(Into::into)
+        let repository = self.open_git_repository(repository_id)?;
+        let mut status = repository.status()?;
+        let Some(installed) = self.installed_guild()? else {
+            return Ok(status);
+        };
+        let guild_id = installed.certificate.genesis.guild_id;
+        let Some(checkpoint) = self.current_checkpoint(guild_id)? else {
+            return Ok(status);
+        };
+        checkpoint.verify()?;
+        if checkpoint.checkpoint.guild_id != guild_id
+            || checkpoint.checkpoint.genesis_hash != installed.certificate.hash()?
+        {
+            anyhow::bail!("Git backup status checkpoint belongs to another guild");
+        }
+        let Some(revision) = checkpoint
+            .checkpoint
+            .revisions
+            .iter()
+            .filter(|revision| {
+                revision.value.owner == self.keys.node_id()
+                    && revision.value.protected_root_id == repository_id
+            })
+            .max_by_key(|revision| revision.value.sequence)
+        else {
+            return Ok(status);
+        };
+        if revision.value.metadata_sectors.is_empty() {
+            return Ok(status);
+        }
+        let Some(backup) = revision_git_backup(&self.control, &self.keys, guild_id, revision)?
+        else {
+            return Ok(status);
+        };
+        let graph = repository.export_graph_source()?;
+        status.history_backed_up = backup.repository_id == repository_id
+            && backup.refs == graph.refs
+            && backup.objects == graph.objects
+            && backup.blobs.len() == graph.blobs.len()
+            && backup
+                .blobs
+                .iter()
+                .zip(graph.blobs.iter())
+                .all(|(backed_up, local)| {
+                    backed_up.oid == local.oid && backed_up.logical_len == local.anchor.logical_len
+                });
+        Ok(status)
     }
 
     fn register_protected_root(

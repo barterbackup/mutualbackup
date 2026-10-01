@@ -62,8 +62,8 @@ pub struct GitStatus {
     pub repository_id: Uuid,
     pub branch: String,
     pub head_oid: Option<[u8; 20]>,
-    /// Local Git commits are not seed-recoverable until a signed backup covers
-    /// their graph. This stays false until that protection path is implemented.
+    /// The daemon sets this only when a certified checkpoint covers the same
+    /// reachable graph and refs currently present in the local catalog.
     pub history_backed_up: bool,
     pub changes: Vec<GitStatusChange>,
     pub untracked: Vec<Vec<u8>>,
