@@ -537,6 +537,10 @@ formats. A tracked regular file's Git blob is exactly the bytes captured at
 `add`: no CRLF or other end-of-line normalization, clean/smudge/process filter,
 `ident` expansion, or `working-tree-encoding` conversion on add, commit,
 checkout, restore/reset, switch, merge, worktree creation, import, or export.
+For a tracked file that the user has not edited, require byte identity across
+the captured source, staged blob, committed blob, and every restored worktree
+file. A merge result intentionally written by the user or merge engine becomes
+a new raw-byte blob; the frontend does not apply an additional conversion.
 Incoming Git blobs become identical local file bytes; outgoing blobs retain
 their original bytes and object IDs. Do not use `core.autocrlf`, `core.eol`,
 `core.safecrlf`, or `text`, `eol`, `filter`, `ident`, and
@@ -3123,9 +3127,11 @@ backend gates. A command being present does not by itself close its slice.
   must pass its complete capture/edit/restore probe; never fall back silently
   to an eager full copy.
 - Close the Git phase with a local gate for exact-byte add/edit/commit/checkout
-  and multi-worktree cases; mixed LF/CRLF, binary NUL, non-UTF-8 payloads, and
-  conversion-inducing system/global/repository `core.autocrlf`, `core.eol`,
-  and `merge.renormalize` settings and `.gitattributes` rules for `text=auto`,
+  and multi-worktree cases, asserting captured source = staged blob = committed
+  blob = restored file when no edit intervenes, and asserting imported/exported
+  blob bytes and IDs remain identical; mixed LF/CRLF, binary NUL, non-UTF-8
+  payloads, and conversion-inducing system/global/repository `core.autocrlf`,
+  `core.eol`, and `merge.renormalize` settings and `.gitattributes` rules for `text=auto`,
   `eol`, `filter`, `ident`, and `working-tree-encoding` across add, merge,
   reset/restore, pull, worktree checkout, import, and export; verify a configured
   filter is never executed
