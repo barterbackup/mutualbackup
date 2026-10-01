@@ -78,6 +78,29 @@ pub(crate) fn selected_ref_for_scope(
     Ok(format!("refs/heads/{}", selected_branch_for_scope(control, scope)?).into_bytes())
 }
 
+/// Enumerate linked HEADs for operations that must protect every checked-out
+/// branch, including branch deletion before linked worktree routing is exposed.
+pub(crate) fn linked_selected_branches(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<Vec<String>, HeadError> {
+    let prefix = format!("{WORKTREE_HEAD_PREFIX}{repository_id}/");
+    let mut branches = Vec::new();
+    for (kind, key, _) in control.records_with_kind_prefix(&prefix)? {
+        let suffix = kind
+            .strip_prefix(&prefix)
+            .ok_or(HeadError::IncompatibleRecord)?;
+        let worktree_id = Uuid::parse_str(suffix).map_err(|_| HeadError::IncompatibleRecord)?;
+        let scope = GitWorktreeScope::linked(repository_id, worktree_id)
+            .ok_or(HeadError::IncompatibleRecord)?;
+        if suffix != worktree_id.to_string() || key != HEAD_KEY {
+            return Err(HeadError::IncompatibleRecord);
+        }
+        branches.push(selected_branch_for_scope(control, scope)?);
+    }
+    Ok(branches)
+}
+
 pub(crate) fn store_selected_branch(
     control: &ControlStore,
     repository_id: Uuid,

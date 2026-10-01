@@ -16,8 +16,8 @@ use uuid::Uuid;
 
 use crate::attributes::{is_attributes_path, validate_anchor, validate_attributes};
 use crate::head::{
-    HeadError, head_kind, selected_branch, selected_branch_for_scope, selected_branch_record,
-    selected_ref, selected_ref_for_scope, store_selected_branch,
+    HeadError, head_kind, linked_selected_branches, selected_branch, selected_branch_for_scope,
+    selected_branch_record, selected_ref, selected_ref_for_scope, store_selected_branch,
 };
 use crate::merge::{
     GeneratedBlob, MergeBlobError, MergeFileInput, MergeFileInputs, capture_generated_blob,
@@ -537,7 +537,11 @@ pub fn delete_branch(
     if name.len() > 1024 || !Branch::name_is_valid(name)? {
         return Err(HistoryError::InvalidBranch);
     }
-    if selected_branch(control, repository_id)? == name {
+    if selected_branch(control, repository_id)? == name
+        || linked_selected_branches(control, repository_id)?
+            .iter()
+            .any(|selected| selected == name)
+    {
         return Err(HistoryError::CurrentBranch);
     }
     let branch = branch_records(control, repository_id)?

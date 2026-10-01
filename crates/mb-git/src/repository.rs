@@ -1100,6 +1100,10 @@ mod tests {
         );
         assert_eq!(local.status().unwrap().head_oid, Some(base.oid));
         assert!(local.status().unwrap().changes.is_empty());
+        assert!(matches!(
+            local.delete_branch("topic", true),
+            Err(RepositoryError::History(crate::HistoryError::CurrentBranch))
+        ));
 
         let primary = local.staged_entry("tracked").unwrap().unwrap();
         let mut anchors = std::collections::BTreeMap::new();
