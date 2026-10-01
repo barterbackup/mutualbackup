@@ -102,7 +102,7 @@ fn head_oid(control: &ControlStore, repository_id: Uuid) -> Result<Option<Oid>, 
     Ok(Some(Oid::from_bytes(&record.oid)?))
 }
 
-fn head_files(
+pub(crate) fn files_for_commit(
     control: &ControlStore,
     repository_id: Uuid,
     head: Option<Oid>,
@@ -168,7 +168,7 @@ pub(crate) fn committed_files(
     control: &ControlStore,
     repository_id: Uuid,
 ) -> Result<TreeFiles, StatusError> {
-    head_files(control, repository_id, head_oid(control, repository_id)?)
+    files_for_commit(control, repository_id, head_oid(control, repository_id)?)
 }
 
 fn worktree_change(
@@ -247,7 +247,7 @@ pub fn repository_status(
     root: &Path,
 ) -> Result<GitStatus, StatusError> {
     let head = head_oid(control, repository_id)?;
-    let committed = head_files(control, repository_id, head)?;
+    let committed = files_for_commit(control, repository_id, head)?;
     let staged = staged_entries(control, repository_id)?
         .into_iter()
         .collect::<BTreeMap<_, _>>();

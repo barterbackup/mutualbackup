@@ -1436,7 +1436,7 @@ impl Node {
 
     pub fn git_switch_branch(&self, repository_id: Uuid, name: &str) -> Result<GitBranchInfo> {
         self.open_git_repository(repository_id)?
-            .switch_same_tree_branch(name)
+            .switch_branch(name)
             .map_err(Into::into)
     }
 
@@ -15358,10 +15358,23 @@ pub(crate) mod tests {
         assert_eq!(branches[0].name, "main");
         assert!(branches[0].current);
         assert_eq!(branches[1], older);
-        assert!(
-            reopened
-                .git_switch_branch(info.repository_id, "older")
-                .is_err()
+        reopened
+            .git_switch_branch(info.repository_id, "older")
+            .unwrap();
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"first\r\nbytes\0"
+        );
+        assert_eq!(
+            reopened.git_status(info.repository_id).unwrap().branch,
+            "older"
+        );
+        reopened
+            .git_switch_branch(info.repository_id, "main")
+            .unwrap();
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"second\nbytes"
         );
         let history = reopened.git_log(info.repository_id, 10).unwrap();
         assert_eq!(history.len(), 2);

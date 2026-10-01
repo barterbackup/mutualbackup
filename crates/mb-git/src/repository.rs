@@ -14,6 +14,7 @@ use mb_store::{
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::checkout::{CheckoutError, begin_switch, resume_pending_checkout};
 use crate::diff::{DiffError, GitDiff, repository_diff};
 use crate::head::{HeadError, selected_branch};
 use crate::history::{
@@ -51,6 +52,8 @@ pub enum RepositoryError {
     Status(#[from] StatusError),
     #[error("Git diff error: {0}")]
     Diff(#[from] DiffError),
+    #[error("Git checkout error: {0}")]
+    Checkout(#[from] CheckoutError),
     #[error("repository marker or catalog identity conflicts with this root")]
     Conflict,
     #[error("the Git repository is not initialized")]
@@ -120,12 +123,14 @@ impl GitRepository {
         publish_marker(&directory, GIT_CATALOG_MARKER_FILE, &ready_bytes)?;
         directory.remove_child_file(INITIALIZATION_INTENT)?;
         directory.sync_all()?;
-        Ok(Self {
+        let repository = Self {
             catalog,
             directory,
             root,
             repository_id,
-        })
+        };
+        repository.resume_checkout()?;
+        Ok(repository)
     }
 
     pub fn open(
@@ -158,12 +163,14 @@ impl GitRepository {
         }
         let path = directory.descriptor_path().join(CATALOG_DATABASE);
         let catalog = ControlStore::open_existing_with_key(&path, catalog_key)?;
-        Ok(Self {
+        let repository = Self {
             catalog,
             directory,
             root,
             repository_id,
-        })
+        };
+        repository.resume_checkout()?;
+        Ok(repository)
     }
 
     pub fn id(&self) -> Uuid {
@@ -178,6 +185,7 @@ impl GitRepository {
         &self,
         relative_path: impl AsRef<Path>,
     ) -> Result<GitIndexEntry, RepositoryError> {
+        self.resume_checkout()?;
         Ok(stage_file(
             &self.catalog,
             self.repository_id,
@@ -187,6 +195,7 @@ impl GitRepository {
     }
 
     pub fn resume_pending_stages(&self) -> Result<Vec<GitIndexEntry>, RepositoryError> {
+        self.resume_checkout()?;
         Ok(resume_pending_stages(&self.catalog, self.repository_id)?)
     }
 
@@ -194,6 +203,7 @@ impl GitRepository {
         &self,
         relative_path: impl AsRef<Path>,
     ) -> Result<bool, RepositoryError> {
+        self.resume_checkout()?;
         Ok(abandon_pending_stage(
             &self.catalog,
             self.repository_id,
@@ -205,6 +215,7 @@ impl GitRepository {
         &self,
         relative_path: impl AsRef<Path>,
     ) -> Result<Option<GitIndexEntry>, RepositoryError> {
+        self.resume_checkout()?;
         Ok(staged_entry(
             &self.catalog,
             self.repository_id,
@@ -213,6 +224,7 @@ impl GitRepository {
     }
 
     pub fn anchors_for_oid(&self, oid: Oid) -> Result<Vec<FileAnchorManifest>, RepositoryError> {
+        self.resume_checkout()?;
         Ok(anchors_for_oid(&self.catalog, self.repository_id, oid)?)
     }
 
@@ -222,6 +234,7 @@ impl GitRepository {
         author_email: &str,
         message: &str,
     ) -> Result<GitCommitInfo, RepositoryError> {
+        self.resume_checkout()?;
         Ok(commit_index(
             &self.catalog,
             self.repository_id,
@@ -232,30 +245,51 @@ impl GitRepository {
     }
 
     pub fn log(&self, limit: usize) -> Result<Vec<GitLogEntry>, RepositoryError> {
+        self.resume_checkout()?;
         Ok(log_history(&self.catalog, self.repository_id, limit)?)
     }
 
     pub fn branches(&self) -> Result<Vec<GitBranchInfo>, RepositoryError> {
+        self.resume_checkout()?;
         Ok(list_branches(&self.catalog, self.repository_id)?)
     }
 
     pub fn selected_branch(&self) -> Result<String, RepositoryError> {
+        self.resume_checkout()?;
         Ok(selected_branch(&self.catalog, self.repository_id)?)
     }
 
     pub fn create_branch(&self, name: &str) -> Result<GitBranchInfo, RepositoryError> {
+        self.resume_checkout()?;
         Ok(create_branch(&self.catalog, self.repository_id, name)?)
     }
 
-    pub fn switch_same_tree_branch(&self, name: &str) -> Result<GitBranchInfo, RepositoryError> {
-        Ok(switch_same_tree_branch(
+    pub fn switch_branch(&self, name: &str) -> Result<GitBranchInfo, RepositoryError> {
+        self.resume_checkout()?;
+        match switch_same_tree_branch(&self.catalog, self.repository_id, name) {
+            Ok(info) => Ok(info),
+            Err(HistoryError::CheckoutRequired) => Ok(begin_switch(
+                &self.catalog,
+                self.repository_id,
+                &self.root,
+                &self.directory,
+                name,
+            )?),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn resume_checkout(&self) -> Result<(), RepositoryError> {
+        Ok(resume_pending_checkout(
             &self.catalog,
             self.repository_id,
-            name,
+            &self.root,
+            &self.directory,
         )?)
     }
 
     pub fn status(&self) -> Result<GitStatus, RepositoryError> {
+        self.resume_checkout()?;
         Ok(repository_status(
             &self.catalog,
             self.repository_id,
@@ -264,6 +298,7 @@ impl GitRepository {
     }
 
     pub fn diff(&self, cached: bool) -> Result<GitDiff, RepositoryError> {
+        self.resume_checkout()?;
         Ok(repository_diff(
             &self.catalog,
             self.repository_id,
@@ -273,6 +308,7 @@ impl GitRepository {
     }
 
     pub fn export_graph_source(&self) -> Result<GitGraphSource, RepositoryError> {
+        self.resume_checkout()?;
         Ok(export_graph_source(&self.catalog, self.repository_id)?)
     }
 
@@ -281,6 +317,7 @@ impl GitRepository {
         descriptor: &crate::GitBackupDescriptor,
         anchors: &[FileAnchorManifest],
     ) -> Result<(), RepositoryError> {
+        self.resume_checkout()?;
         Ok(import_graph_backup(
             &self.catalog,
             self.repository_id,
@@ -623,12 +660,12 @@ mod tests {
         let first = repo.commit("Author", "a@example.test", "first").unwrap();
         repo.create_branch("topic").unwrap();
         assert!(matches!(
-            repo.switch_same_tree_branch("missing"),
+            repo.switch_branch("missing"),
             Err(RepositoryError::History(
                 crate::HistoryError::BranchNotFound
             ))
         ));
-        let selected = repo.switch_same_tree_branch("topic").unwrap();
+        let selected = repo.switch_branch("topic").unwrap();
         assert!(selected.current);
         assert_eq!(repo.status().unwrap().branch, "topic");
         assert!(
@@ -643,7 +680,9 @@ mod tests {
         assert_eq!(repo.status().unwrap().head_oid, Some(first.oid));
         assert_eq!(repo.status().unwrap().branch, "topic");
         fs::write(source_root.join("tracked"), b"second\nbytes").unwrap();
+        fs::write(source_root.join("added"), b"new\r\nblob\0").unwrap();
         repo.stage_file("tracked").unwrap();
+        repo.stage_file("added").unwrap();
         let second = repo.commit("Author", "a@example.test", "second").unwrap();
         assert_eq!(second.branch, "topic");
         assert_eq!(second.parent_oid, Some(first.oid));
@@ -657,17 +696,185 @@ mod tests {
         assert!(graph.refs.iter().any(|reference| {
             reference.name == b"refs/heads/topic" && reference.oid == second.oid
         }));
+        fs::write(source_root.join("tracked"), b"dirty worktree").unwrap();
         assert!(matches!(
-            repo.switch_same_tree_branch("main"),
-            Err(RepositoryError::History(
-                crate::HistoryError::CheckoutRequired
+            repo.switch_branch("main"),
+            Err(RepositoryError::Checkout(
+                crate::CheckoutError::DirtyWorktree
             ))
         ));
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"dirty worktree"
+        );
+        fs::write(source_root.join("tracked"), b"second\nbytes").unwrap();
+        repo.switch_branch("main").unwrap();
+        assert_eq!(repo.status().unwrap().branch, "main");
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"first\r\nbytes\0"
+        );
+        assert!(!source_root.join("added").exists());
+        fs::write(source_root.join("added"), b"untracked collision").unwrap();
+        assert!(repo.switch_branch("topic").is_err());
+        assert_eq!(
+            fs::read(source_root.join("added")).unwrap(),
+            b"untracked collision"
+        );
+        assert_eq!(repo.status().unwrap().branch, "main");
+        fs::remove_file(source_root.join("added")).unwrap();
+        repo.switch_branch("topic").unwrap();
         assert_eq!(repo.status().unwrap().branch, "topic");
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"second\nbytes"
+        );
+        assert_eq!(
+            fs::read(source_root.join("added")).unwrap(),
+            b"new\r\nblob\0"
+        );
+        assert!(
+            !fs::read_dir(source_root.join(".mutualbackup"))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("checkout-"))
+        );
         for blob in graph.blobs {
             blob.anchor.remove().unwrap();
         }
         drop(repo);
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn interrupted_checkout_waits_for_dirty_file_then_resumes_on_reopen() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-checkout-replay-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("tracked"), b"main bytes\r\n").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [29_u8; 32];
+        let repo = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        repo.stage_file("tracked").unwrap();
+        repo.commit("Author", "a@example.test", "main").unwrap();
+        repo.create_branch("topic").unwrap();
+        repo.switch_branch("topic").unwrap();
+        fs::write(source_root.join("tracked"), b"topic bytes\n").unwrap();
+        fs::write(source_root.join("added"), b"branch only\0").unwrap();
+        repo.stage_file("tracked").unwrap();
+        repo.stage_file("added").unwrap();
+        repo.commit("Author", "a@example.test", "topic").unwrap();
+        let graph = repo.export_graph_source().unwrap();
+        crate::checkout::set_after_checkout_file_hook(Box::new(|| panic!("checkout crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repo.switch_branch("main").unwrap();
+        }));
+        assert!(interrupted.is_err());
+        assert!(!source_root.join("added").exists());
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"topic bytes\n"
+        );
+
+        fs::write(source_root.join("tracked"), b"post-crash edit").unwrap();
+        assert!(matches!(
+            repo.stage_file("tracked"),
+            Err(RepositoryError::Checkout(
+                crate::CheckoutError::DirtyWorktree
+            ))
+        ));
+        drop(repo);
+        assert!(matches!(
+            GitRepository::open(&source_root, repository_id, &key),
+            Err(RepositoryError::Checkout(
+                crate::CheckoutError::DirtyWorktree
+            ))
+        ));
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"post-crash edit"
+        );
+        fs::write(source_root.join("tracked"), b"topic bytes\n").unwrap();
+        let resumed = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        assert_eq!(resumed.status().unwrap().branch, "main");
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"main bytes\r\n"
+        );
+        assert!(!source_root.join("added").exists());
+        assert!(
+            !fs::read_dir(source_root.join(".mutualbackup"))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("checkout-"))
+        );
+        drop(resumed);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn committed_checkout_cleans_old_files_after_reopen() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-checkout-cleanup-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("tracked"), b"main\r\nbytes\0").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [31_u8; 32];
+        let repo = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        repo.stage_file("tracked").unwrap();
+        repo.commit("Author", "a@example.test", "main").unwrap();
+        repo.create_branch("topic").unwrap();
+        repo.switch_branch("topic").unwrap();
+        fs::write(source_root.join("tracked"), b"topic\nbytes").unwrap();
+        repo.stage_file("tracked").unwrap();
+        repo.commit("Author", "a@example.test", "topic").unwrap();
+        let graph = repo.export_graph_source().unwrap();
+
+        crate::checkout::set_after_checkout_commit_hook(Box::new(|| panic!("checkout crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repo.switch_branch("main").unwrap();
+        }));
+        assert!(interrupted.is_err());
+        drop(repo);
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"main\r\nbytes\0"
+        );
+
+        let resumed = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        assert_eq!(resumed.status().unwrap().branch, "main");
+        assert!(
+            !fs::read_dir(source_root.join(".mutualbackup"))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("checkout-"))
+        );
+        drop(resumed);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
         fs::remove_dir_all(run_root).unwrap();
     }
 }

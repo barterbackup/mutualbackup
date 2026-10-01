@@ -55,7 +55,7 @@ enum Command {
     },
     /// List local branches or create one at the current commit.
     Branch { name: Option<String> },
-    /// Select a branch whose committed tree matches the current branch.
+    /// Switch to a branch using exact-byte reflink checkout.
     Switch { name: String },
     /// Show raw-byte changes in the worktree or staged index.
     Diff {

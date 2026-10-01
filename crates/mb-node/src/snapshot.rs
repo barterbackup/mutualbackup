@@ -4169,7 +4169,7 @@ mod metadata_compatibility_tests {
         assert_eq!(old_branch.oid, first_commit.oid);
         assert!(repo.create_branch("older").is_err());
         assert!(repo.create_branch("older/nested").is_err());
-        repo.switch_same_tree_branch("older").unwrap();
+        repo.switch_branch("older").unwrap();
         fs::write(source.join("tracked"), b"second\nbytes").unwrap();
         let second_blob = repo.stage_file("tracked").unwrap();
         let second_commit = repo.commit("Author", "a@example.test", "second").unwrap();

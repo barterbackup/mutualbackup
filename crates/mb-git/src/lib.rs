@@ -14,6 +14,8 @@ use thiserror::Error;
 #[cfg(target_os = "linux")]
 mod backup;
 #[cfg(target_os = "linux")]
+mod checkout;
+#[cfg(target_os = "linux")]
 mod diff;
 #[cfg(target_os = "linux")]
 mod head;
@@ -27,6 +29,8 @@ mod stage;
 mod status;
 #[cfg(target_os = "linux")]
 pub use backup::{GitBackupBlob, GitBackupDescriptor, GitBackupError, GitDataExtent};
+#[cfg(target_os = "linux")]
+pub use checkout::CheckoutError;
 #[cfg(target_os = "linux")]
 pub use diff::{DiffError, GitDiff};
 #[cfg(target_os = "linux")]
