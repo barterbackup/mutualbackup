@@ -1421,6 +1421,103 @@ impl Node {
             .map_err(Into::into)
     }
 
+    pub fn git_worktree_add_path(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        path: &Path,
+    ) -> Result<Option<GitStagedFile>> {
+        let repository = self.open_git_repository(repository_id)?;
+        Ok(repository
+            .linked_add_path(worktree_id, path)?
+            .map(|entry| GitStagedFile {
+                format_version: 1,
+                repository_id,
+                path: path.to_path_buf(),
+                oid: hex::encode(entry.oid),
+                mode: entry.mode,
+            }))
+    }
+
+    pub fn git_worktree_remove_cached(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        path: &Path,
+    ) -> Result<bool> {
+        self.open_git_repository(repository_id)?
+            .linked_remove_cached(worktree_id, path)
+            .map_err(Into::into)
+    }
+
+    pub fn git_worktree_abandon_pending_add(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        path: &Path,
+    ) -> Result<bool> {
+        self.open_git_repository(repository_id)?
+            .linked_abandon_pending_stage(worktree_id, path)
+            .map_err(Into::into)
+    }
+
+    pub fn git_worktree_commit(
+        &mut self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        author_name: &str,
+        author_email: &str,
+        message: &str,
+    ) -> Result<GitCommitInfo> {
+        self.mark_root_dirty(repository_id, "linked Git history changed")?;
+        self.open_git_repository(repository_id)?
+            .linked_commit(worktree_id, author_name, author_email, message)
+            .map_err(Into::into)
+    }
+
+    pub fn git_worktree_log(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<GitLogEntry>> {
+        self.open_git_repository(repository_id)?
+            .linked_log(worktree_id, limit)
+            .map_err(Into::into)
+    }
+
+    pub fn git_worktree_branches(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+    ) -> Result<Vec<GitBranchInfo>> {
+        self.open_git_repository(repository_id)?
+            .linked_branches(worktree_id)
+            .map_err(Into::into)
+    }
+
+    pub fn git_worktree_diff(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        cached: bool,
+    ) -> Result<GitDiff> {
+        self.open_git_repository(repository_id)?
+            .linked_diff(worktree_id, cached)
+            .map_err(Into::into)
+    }
+
+    pub fn git_worktree_switch_branch(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        name: &str,
+    ) -> Result<GitBranchInfo> {
+        self.open_git_repository(repository_id)?
+            .linked_switch_branch(worktree_id, name)
+            .map_err(Into::into)
+    }
+
     pub fn git_add(&mut self, repository_id: Uuid, path: &Path) -> Result<GitStagedFile> {
         let repository = self.open_git_repository(repository_id)?;
         repository.resume_pending_stages()?;
@@ -1469,6 +1566,7 @@ impl Node {
         author_email: &str,
         message: &str,
     ) -> Result<GitCommitInfo> {
+        self.mark_root_dirty(repository_id, "Git history changed")?;
         let repository = self.open_git_repository(repository_id)?;
         repository.resume_pending_stages()?;
         Ok(repository.commit(author_name, author_email, message)?)
@@ -15798,7 +15896,7 @@ pub(crate) mod tests {
         );
         drop(node);
 
-        let reopened = Node::open(data.path(), seed).unwrap();
+        let mut reopened = Node::open(data.path(), seed).unwrap();
         assert_eq!(
             reopened
                 .git_resume_worktree(repository.repository_id, linked.worktree_id)
@@ -15814,6 +15912,70 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(status.branch, "topic");
         assert!(status.changes.is_empty());
+        fs::write(linked_root.join("tracked"), b"linked\nchange").unwrap();
+        assert!(
+            reopened
+                .git_worktree_add_path(
+                    repository.repository_id,
+                    linked.worktree_id,
+                    Path::new("tracked")
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !reopened
+                .git_worktree_diff(repository.repository_id, linked.worktree_id, true)
+                .unwrap()
+                .patch
+                .is_empty()
+        );
+        let dirty_sequence = reopened
+            .root_dirty_state(repository.repository_id)
+            .unwrap()
+            .unwrap()
+            .change_sequence;
+        let committed = reopened
+            .git_worktree_commit(
+                repository.repository_id,
+                linked.worktree_id,
+                "Test Author",
+                "author@example.test",
+                "linked",
+            )
+            .unwrap();
+        assert!(
+            reopened
+                .root_dirty_state(repository.repository_id)
+                .unwrap()
+                .unwrap()
+                .change_sequence
+                > dirty_sequence
+        );
+        assert_eq!(
+            reopened
+                .git_worktree_log(repository.repository_id, linked.worktree_id, 1)
+                .unwrap()[0]
+                .oid,
+            committed.oid
+        );
+        assert!(
+            reopened
+                .git_worktree_branches(repository.repository_id, linked.worktree_id)
+                .unwrap()
+                .iter()
+                .any(|branch| branch.name == "topic" && branch.current)
+        );
+        reopened
+            .git_create_branch_from(repository.repository_id, "base-copy", "main")
+            .unwrap();
+        reopened
+            .git_worktree_switch_branch(repository.repository_id, linked.worktree_id, "base-copy")
+            .unwrap();
+        assert_eq!(
+            fs::read(linked_root.join("tracked")).unwrap(),
+            b"exact\r\n\0bytes"
+        );
         let graph = reopened
             .open_git_repository(repository.repository_id)
             .unwrap()

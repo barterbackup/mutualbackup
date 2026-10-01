@@ -410,6 +410,109 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitWorktreeAddPath {
+            repository_id,
+            worktree_id,
+            path,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_add_path(repository_id, worktree_id, &path)
+                    .map(|result| {
+                        result.map_or(
+                            LocalResponse::GitDeletionStaged {
+                                repository_id,
+                                path: path.clone(),
+                            },
+                            LocalResponse::GitFileStaged,
+                        )
+                    })
+            })
+            .await
+        }
+        LocalRequest::GitWorktreeRemoveCached {
+            repository_id,
+            worktree_id,
+            path,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_remove_cached(repository_id, worktree_id, &path)
+                    .map(|removed| LocalResponse::GitCachedPathRemoved { removed })
+            })
+            .await
+        }
+        LocalRequest::GitWorktreeAbandonPendingAdd {
+            repository_id,
+            worktree_id,
+            path,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_abandon_pending_add(repository_id, worktree_id, &path)
+                    .map(|abandoned| LocalResponse::GitPendingAddAbandoned { abandoned })
+            })
+            .await
+        }
+        LocalRequest::GitWorktreeCommit {
+            repository_id,
+            worktree_id,
+            author_name,
+            author_email,
+            message,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_commit(
+                    repository_id,
+                    worktree_id,
+                    &author_name,
+                    &author_email,
+                    &message,
+                )
+                .map(LocalResponse::GitCommitted)
+            })
+            .await
+        }
+        LocalRequest::GitWorktreeLog {
+            repository_id,
+            worktree_id,
+            limit,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_log(repository_id, worktree_id, limit as usize)
+                    .map(LocalResponse::GitLog)
+            })
+            .await
+        }
+        LocalRequest::GitWorktreeBranches {
+            repository_id,
+            worktree_id,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_branches(repository_id, worktree_id)
+                    .map(LocalResponse::GitBranches)
+            })
+            .await
+        }
+        LocalRequest::GitWorktreeDiff {
+            repository_id,
+            worktree_id,
+            cached,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_diff(repository_id, worktree_id, cached)
+                    .map(LocalResponse::GitDiff)
+            })
+            .await
+        }
+        LocalRequest::GitWorktreeSwitchBranch {
+            repository_id,
+            worktree_id,
+            name,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_switch_branch(repository_id, worktree_id, &name)
+                    .map(LocalResponse::GitBranchSelected)
+            })
+            .await
+        }
         LocalRequest::GitAdd {
             repository_id,
             path,

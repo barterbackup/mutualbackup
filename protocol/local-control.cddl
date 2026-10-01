@@ -30,6 +30,14 @@ local-request =
   / { "GitWorktrees": { repository_id: uuid-text } }
   / { "GitWorktreeResume": { repository_id: uuid-text, worktree_id: uuid-text } }
   / { "GitWorktreeStatus": { repository_id: uuid-text, worktree_id: uuid-text } }
+  / { "GitWorktreeAddPath": { repository_id: uuid-text, worktree_id: uuid-text, path: tstr } }
+  / { "GitWorktreeRemoveCached": { repository_id: uuid-text, worktree_id: uuid-text, path: tstr } }
+  / { "GitWorktreeAbandonPendingAdd": { repository_id: uuid-text, worktree_id: uuid-text, path: tstr } }
+  / { "GitWorktreeCommit": { repository_id: uuid-text, worktree_id: uuid-text, author_name: tstr, author_email: tstr, message: tstr } }
+  / { "GitWorktreeLog": { repository_id: uuid-text, worktree_id: uuid-text, limit: uint } }
+  / { "GitWorktreeBranches": { repository_id: uuid-text, worktree_id: uuid-text } }
+  / { "GitWorktreeDiff": { repository_id: uuid-text, worktree_id: uuid-text, cached: bool } }
+  / { "GitWorktreeSwitchBranch": { repository_id: uuid-text, worktree_id: uuid-text, name: tstr } }
   / { "GitAdd": { repository_id: uuid-text, path: tstr } }
   / { "GitRemoveCached": { repository_id: uuid-text, path: tstr } }
   / { "GitAbandonPendingAdd": { repository_id: uuid-text, path: tstr } }

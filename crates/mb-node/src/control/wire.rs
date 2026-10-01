@@ -75,6 +75,47 @@ pub enum LocalRequest {
         repository_id: Uuid,
         worktree_id: Uuid,
     },
+    GitWorktreeAddPath {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        path: PathBuf,
+    },
+    GitWorktreeRemoveCached {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        path: PathBuf,
+    },
+    GitWorktreeAbandonPendingAdd {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        path: PathBuf,
+    },
+    GitWorktreeCommit {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        author_name: String,
+        author_email: String,
+        message: String,
+    },
+    GitWorktreeLog {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        limit: u32,
+    },
+    GitWorktreeBranches {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+    },
+    GitWorktreeDiff {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        cached: bool,
+    },
+    GitWorktreeSwitchBranch {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        name: String,
+    },
     GitAdd {
         repository_id: Uuid,
         path: PathBuf,
@@ -461,6 +502,83 @@ mod tests {
             LocalRequest::GitWorktreeStatus {
                 repository_id,
                 worktree_id: Uuid::from_bytes([5; 16]),
+            },
+            LocalRequest::GitWorktreeAddPath {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                path: PathBuf::from("tracked"),
+            },
+            LocalRequest::GitWorktreeRemoveCached {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                path: PathBuf::from("tracked"),
+            },
+            LocalRequest::GitWorktreeAbandonPendingAdd {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                path: PathBuf::from("tracked"),
+            },
+            LocalRequest::GitWorktreeCommit {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                author_name: "Author".to_owned(),
+                author_email: "a@example.test".to_owned(),
+                message: "linked".to_owned(),
+            },
+            LocalRequest::GitWorktreeLog {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                limit: 5,
+            },
+            LocalRequest::GitWorktreeBranches {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+            },
+            LocalRequest::GitWorktreeDiff {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                cached: true,
+            },
+            LocalRequest::GitWorktreeSwitchBranch {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                name: "topic".to_owned(),
+            },
+            LocalRequest::GitWorktreeAddPath {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                path: PathBuf::from("tracked"),
+            },
+            LocalRequest::GitWorktreeRemoveCached {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                path: PathBuf::from("tracked"),
+            },
+            LocalRequest::GitWorktreeCommit {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                author_name: "Author".to_owned(),
+                author_email: "a@example.test".to_owned(),
+                message: "linked".to_owned(),
+            },
+            LocalRequest::GitWorktreeLog {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                limit: 5,
+            },
+            LocalRequest::GitWorktreeBranches {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+            },
+            LocalRequest::GitWorktreeDiff {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                cached: true,
+            },
+            LocalRequest::GitWorktreeSwitchBranch {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                name: "topic".to_owned(),
             },
             LocalRequest::GitAdd {
                 repository_id,

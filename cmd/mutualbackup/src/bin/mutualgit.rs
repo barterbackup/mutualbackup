@@ -235,18 +235,23 @@ async fn main() -> Result<()> {
             abort_pending,
             paths,
         } => {
-            let (root, repository_id) = discover_repository(&working_directory)?;
+            let (root, repository_id, worktree_id) = discover_location(&working_directory)?;
             for path in paths {
                 let relative = relative_for_add(&root, &working_directory, &path)?;
                 if abort_pending {
-                    let LocalResponse::GitPendingAddAbandoned { abandoned } = local_control_call(
-                        &socket,
-                        &LocalRequest::GitAbandonPendingAdd {
+                    let request = match worktree_id {
+                        Some(worktree_id) => LocalRequest::GitWorktreeAbandonPendingAdd {
+                            repository_id,
+                            worktree_id,
+                            path: relative.clone(),
+                        },
+                        None => LocalRequest::GitAbandonPendingAdd {
                             repository_id,
                             path: relative.clone(),
                         },
-                    )
-                    .await?
+                    };
+                    let LocalResponse::GitPendingAddAbandoned { abandoned } =
+                        local_control_call(&socket, &request).await?
                     else {
                         bail!("daemon returned the wrong response to pending add abort");
                     };
@@ -261,14 +266,18 @@ async fn main() -> Result<()> {
                     );
                     continue;
                 }
-                let response = local_control_call(
-                    &socket,
-                    &LocalRequest::GitAdd {
+                let request = match worktree_id {
+                    Some(worktree_id) => LocalRequest::GitWorktreeAddPath {
+                        repository_id,
+                        worktree_id,
+                        path: relative.clone(),
+                    },
+                    None => LocalRequest::GitAdd {
                         repository_id,
                         path: relative.clone(),
                     },
-                )
-                .await?;
+                };
+                let response = local_control_call(&socket, &request).await?;
                 match response {
                     LocalResponse::GitFileStaged(staged)
                         if staged.repository_id == repository_id && staged.path == relative =>
@@ -289,17 +298,22 @@ async fn main() -> Result<()> {
             if !cached {
                 bail!("only `rm --cached` is supported; worktree files were not removed");
             }
-            let (root, repository_id) = discover_repository(&working_directory)?;
+            let (root, repository_id, worktree_id) = discover_location(&working_directory)?;
             for path in paths {
                 let relative = relative_for_add(&root, &working_directory, &path)?;
-                let LocalResponse::GitCachedPathRemoved { removed } = local_control_call(
-                    &socket,
-                    &LocalRequest::GitRemoveCached {
+                let request = match worktree_id {
+                    Some(worktree_id) => LocalRequest::GitWorktreeRemoveCached {
+                        repository_id,
+                        worktree_id,
+                        path: relative.clone(),
+                    },
+                    None => LocalRequest::GitRemoveCached {
                         repository_id,
                         path: relative.clone(),
                     },
-                )
-                .await?
+                };
+                let LocalResponse::GitCachedPathRemoved { removed } =
+                    local_control_call(&socket, &request).await?
                 else {
                     bail!("daemon returned the wrong response to Git index removal");
                 };
@@ -314,23 +328,29 @@ async fn main() -> Result<()> {
             author_name,
             author_email,
         } => {
-            let (_, repository_id) = discover_repository(&working_directory)?;
+            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
             let author_name = author_name
                 .map(Ok)
                 .unwrap_or_else(|| author_field("GIT_AUTHOR_NAME", "user.name"))?;
             let author_email = author_email
                 .map(Ok)
                 .unwrap_or_else(|| author_field("GIT_AUTHOR_EMAIL", "user.email"))?;
-            let LocalResponse::GitCommitted(commit) = local_control_call(
-                &socket,
-                &LocalRequest::GitCommit {
+            let request = match worktree_id {
+                Some(worktree_id) => LocalRequest::GitWorktreeCommit {
+                    repository_id,
+                    worktree_id,
+                    author_name,
+                    author_email,
+                    message,
+                },
+                None => LocalRequest::GitCommit {
                     repository_id,
                     author_name,
                     author_email,
                     message,
                 },
-            )
-            .await?
+            };
+            let LocalResponse::GitCommitted(commit) = local_control_call(&socket, &request).await?
             else {
                 bail!("daemon returned the wrong response to Git commit");
             };
@@ -344,15 +364,19 @@ async fn main() -> Result<()> {
             );
         }
         Command::Log { limit } => {
-            let (_, repository_id) = discover_repository(&working_directory)?;
-            let LocalResponse::GitLog(commits) = local_control_call(
-                &socket,
-                &LocalRequest::GitLog {
+            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
+            let request = match worktree_id {
+                Some(worktree_id) => LocalRequest::GitWorktreeLog {
+                    repository_id,
+                    worktree_id,
+                    limit,
+                },
+                None => LocalRequest::GitLog {
                     repository_id,
                     limit,
                 },
-            )
-            .await?
+            };
+            let LocalResponse::GitLog(commits) = local_control_call(&socket, &request).await?
             else {
                 bail!("daemon returned the wrong response to Git log");
             };
@@ -377,8 +401,13 @@ async fn main() -> Result<()> {
             name,
             start_point,
         } => {
-            let (_, repository_id) = discover_repository(&working_directory)?;
+            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
             if let Some(name) = name {
+                if worktree_id.is_some() {
+                    bail!(
+                        "branch creation and deletion are not yet supported from linked worktrees"
+                    );
+                }
                 if all {
                     bail!("branch -a lists refs; omit -a when changing a branch");
                 }
@@ -439,9 +468,15 @@ async fn main() -> Result<()> {
                 if start_point.is_some() {
                     bail!("a branch name is required before a start point");
                 }
+                let request = match worktree_id {
+                    Some(worktree_id) => LocalRequest::GitWorktreeBranches {
+                        repository_id,
+                        worktree_id,
+                    },
+                    None => LocalRequest::GitBranches { repository_id },
+                };
                 let LocalResponse::GitBranches(branches) =
-                    local_control_call(&socket, &LocalRequest::GitBranches { repository_id })
-                        .await?
+                    local_control_call(&socket, &request).await?
                 else {
                     bail!("daemon returned the wrong response to Git branch listing");
                 };
@@ -534,15 +569,20 @@ async fn main() -> Result<()> {
             }
         }
         Command::Switch { name } | Command::Checkout { name } => {
-            let (_, repository_id) = discover_repository(&working_directory)?;
-            let LocalResponse::GitBranchSelected(branch) = local_control_call(
-                &socket,
-                &LocalRequest::GitSwitchBranch {
+            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
+            let request = match worktree_id {
+                Some(worktree_id) => LocalRequest::GitWorktreeSwitchBranch {
+                    repository_id,
+                    worktree_id,
+                    name,
+                },
+                None => LocalRequest::GitSwitchBranch {
                     repository_id,
                     name,
                 },
-            )
-            .await?
+            };
+            let LocalResponse::GitBranchSelected(branch) =
+                local_control_call(&socket, &request).await?
             else {
                 bail!("daemon returned the wrong response to Git switch");
             };
@@ -718,16 +758,19 @@ async fn main() -> Result<()> {
             println!("Merged '{}' at {}", branch, git2::Oid::from_bytes(&oid)?);
         }
         Command::Diff { cached } => {
-            let (_, repository_id) = discover_repository(&working_directory)?;
-            let LocalResponse::GitDiff(diff) = local_control_call(
-                &socket,
-                &LocalRequest::GitDiff {
+            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
+            let request = match worktree_id {
+                Some(worktree_id) => LocalRequest::GitWorktreeDiff {
+                    repository_id,
+                    worktree_id,
+                    cached,
+                },
+                None => LocalRequest::GitDiff {
                     repository_id,
                     cached,
                 },
-            )
-            .await?
-            else {
+            };
+            let LocalResponse::GitDiff(diff) = local_control_call(&socket, &request).await? else {
                 bail!("daemon returned the wrong response to Git diff");
             };
             if diff.repository_id != repository_id || diff.cached != cached {

@@ -56,6 +56,8 @@ pub enum StageError {
     UnsupportedPlatform,
     #[error("staged symlink temporary file I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("linked worktree symlink staging is not implemented yet")]
+    UnsupportedLinkedSymlink,
     #[error("Git attributes policy error: {0}")]
     Attributes(#[from] crate::GitAttributesError),
 }
@@ -543,17 +545,29 @@ pub fn remove_cached(
     repository_id: Uuid,
     relative_path: impl AsRef<Path>,
 ) -> Result<bool, StageError> {
+    remove_cached_for_scope(
+        control,
+        GitWorktreeScope::primary(repository_id),
+        relative_path,
+    )
+}
+
+pub(crate) fn remove_cached_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    relative_path: impl AsRef<Path>,
+) -> Result<bool, StageError> {
     let key = stage_path_key(relative_path.as_ref())?;
     if control
-        .get_record(&intent_kind(repository_id), &key)?
+        .get_record(&intent_kind_for_scope(scope), &key)?
         .is_some()
         || control
-            .get_record(&symlink_intent_kind(repository_id), &key)?
+            .get_record(&symlink_intent_kind_for_scope(scope), &key)?
             .is_some()
     {
         return Err(StageError::PendingStage);
     }
-    let kind = index_kind(repository_id);
+    let kind = index_kind_for_scope(scope);
     let Some(encoded) = control.get_record(&kind, &key)? else {
         return Ok(false);
     };
@@ -604,19 +618,34 @@ pub fn abandon_pending_stage(
     repository_id: Uuid,
     relative_path: impl AsRef<Path>,
 ) -> Result<bool, StageError> {
+    abandon_pending_stage_for_scope(
+        control,
+        GitWorktreeScope::primary(repository_id),
+        relative_path,
+    )
+}
+
+pub(crate) fn abandon_pending_stage_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    relative_path: impl AsRef<Path>,
+) -> Result<bool, StageError> {
     let key = stage_path_key(relative_path.as_ref())?;
-    let kind = intent_kind(repository_id);
+    let kind = intent_kind_for_scope(scope);
     if let Some(encoded) = control.get_record(&kind, &key)? {
-        let intent = decode_intent(&encoded, repository_id, &key)?;
+        let intent = decode_intent(&encoded, scope.repository_id(), &key)?;
         intent.plan.discard()?;
         control.delete_record_if_value(&kind, &key, &encoded)?;
         return Ok(true);
     }
-    let kind = symlink_intent_kind(repository_id);
+    let kind = symlink_intent_kind_for_scope(scope);
     let Some(encoded) = control.get_record(&kind, &key)? else {
         return Ok(false);
     };
-    let intent = decode_symlink_intent(&encoded, repository_id, &key)?;
+    if scope.worktree_id() != scope.repository_id() {
+        return Err(StageError::IncompatibleRecord);
+    }
+    let intent = decode_symlink_intent(&encoded, scope.repository_id(), &key)?;
     let catalog = symlink_catalog(&intent)?;
     if let Some(plan) = &intent.plan {
         plan.discard()?;
@@ -802,10 +831,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        StageError, abandon_pending_stage, anchors_for_oid, begin_stage, begin_stage_for_scope,
-        begin_symlink_stage, has_pending_stages, pending_stage_paths_for_scope,
-        resume_pending_stages, resume_pending_stages_for_scope, save_symlink_intent, stage_file,
-        staged_entries_for_scope, staged_entry, staged_entry_for_scope,
+        StageError, abandon_pending_stage, abandon_pending_stage_for_scope, anchors_for_oid,
+        begin_stage, begin_stage_for_scope, begin_symlink_stage, has_pending_stages,
+        pending_stage_paths_for_scope, resume_pending_stages, resume_pending_stages_for_scope,
+        save_symlink_intent, stage_file, staged_entries_for_scope, staged_entry,
+        staged_entry_for_scope,
     };
     use crate::GitWorktreeScope;
 
@@ -934,6 +964,21 @@ mod tests {
             )
             .unwrap(),
             vec![linked_anchor.clone()]
+        );
+        fs::write(linked_root.join("discard"), b"discard me").unwrap();
+        let (_, discard_intent) =
+            begin_stage_for_scope(&control, scope, &linked_root, Path::new("discard")).unwrap();
+        let discarded_anchor = discard_intent.plan.capture().unwrap();
+        assert!(abandon_pending_stage_for_scope(&control, scope, "discard").unwrap());
+        assert!(discarded_anchor.open_verified().is_err());
+        assert!(
+            pending_stage_paths_for_scope(&control, scope)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            staged_entry_for_scope(&control, scope, "tracked").unwrap(),
+            Some(resumed[0].clone())
         );
         drop(control);
         primary_anchor[0].remove().unwrap();

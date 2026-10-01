@@ -15,17 +15,18 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::checkout::{
-    CheckoutError, begin_merge_branch, begin_pull, begin_switch, continue_merge,
-    resume_pending_checkout,
+    CheckoutError, begin_merge_branch, begin_pull, begin_switch, begin_switch_for_scope,
+    continue_merge, resume_pending_checkout, resume_pending_checkout_for_scope,
 };
-use crate::diff::{DiffError, GitDiff, repository_diff};
+use crate::diff::{DiffError, GitDiff, repository_diff, repository_diff_for_scope};
 use crate::fetch::{FetchError, fetch_bare};
 use crate::head::{HeadError, selected_branch};
 use crate::history::{
     GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, GitRemoteBranchInfo, HistoryError,
-    commit_index, create_branch, create_branch_from, delete_branch, export_graph_source,
-    import_graph_backup, list_branches, list_commit_pins, list_remote_branches, log_history,
-    pin_commit, switch_same_tree_branch, unpin_commit,
+    commit_index, commit_index_for_scope, create_branch, create_branch_from, delete_branch,
+    export_graph_source, import_graph_backup, list_branches, list_branches_for_scope,
+    list_commit_pins, list_remote_branches, log_history, log_history_for_scope, pin_commit,
+    switch_same_tree_branch, switch_same_tree_branch_for_scope, unpin_commit,
 };
 use crate::interop::{GitInteropError, push_current_branch_to_bare};
 use crate::merge::{
@@ -36,8 +37,10 @@ use crate::prune::{
     GitPruneError, GitPruneReport, GitPruneRoots, prune_unreachable, resume_pending_prune,
 };
 use crate::stage::{
-    GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, pending_stage_paths,
-    remove_cached, resume_pending_stages, stage_file, stage_path_key, stage_symlink, staged_entry,
+    GitIndexEntry, StageError, abandon_pending_stage, abandon_pending_stage_for_scope,
+    anchors_for_oid, pending_stage_paths, remove_cached, remove_cached_for_scope,
+    resume_pending_stages, resume_pending_stages_for_scope, stage_file, stage_file_for_scope,
+    stage_path_key, stage_symlink, staged_entry,
 };
 use crate::status::{GitStatus, StatusError, repository_status, repository_status_for_scope};
 use crate::worktree::{
@@ -241,13 +244,20 @@ impl GitRepository {
         &self,
         worktree_id: Uuid,
     ) -> Result<GitWorktreeInfo, RepositoryError> {
-        Ok(resume_worktree(
+        let info = resume_worktree(
             &self.catalog,
             self.repository_id,
             worktree_id,
             &self.root,
             &self.directory,
-        )?)
+        )?;
+        resume_pending_checkout_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+            &info.path,
+            &self.directory,
+        )?;
+        Ok(info)
     }
 
     pub fn linked_status(&self, worktree_id: Uuid) -> Result<GitStatus, RepositoryError> {
@@ -258,6 +268,157 @@ impl GitRepository {
             scope,
             &info.path,
         )?)
+    }
+
+    pub fn linked_add_path(
+        &self,
+        worktree_id: Uuid,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<Option<GitIndexEntry>, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
+        resume_pending_stages_for_scope(&self.catalog, scope)?;
+        let relative = relative_path.as_ref();
+        stage_path_key(relative)?;
+        let mut parent = PinnedDirectory::open(&info.path)?;
+        for component in relative
+            .parent()
+            .ok_or(StageError::UnsafePath)?
+            .components()
+        {
+            let Component::Normal(name) = component else {
+                return Err(StageError::UnsafePath.into());
+            };
+            match parent.open_child_directory(name)? {
+                Some(next) => parent = next,
+                None => return self.linked_missing_path(scope, relative),
+            }
+        }
+        let name = relative.file_name().ok_or(StageError::UnsafePath)?;
+        let symlink = match parent.read_child_symlink(name) {
+            Ok(found) => found.is_some(),
+            Err(AnchorError::UnsupportedObject(_)) => false,
+            Err(error) => return Err(error.into()),
+        };
+        if symlink {
+            return Err(StageError::UnsupportedLinkedSymlink.into());
+        }
+        if parent.open_child_file(name)?.is_some() {
+            Ok(Some(stage_file_for_scope(
+                &self.catalog,
+                scope,
+                &info.path,
+                relative,
+            )?))
+        } else {
+            self.linked_missing_path(scope, relative)
+        }
+    }
+
+    fn linked_missing_path(
+        &self,
+        scope: crate::GitWorktreeScope,
+        relative: &Path,
+    ) -> Result<Option<GitIndexEntry>, RepositoryError> {
+        if !remove_cached_for_scope(&self.catalog, scope, relative)? {
+            return Err(StageError::MissingUntrackedPath.into());
+        }
+        Ok(None)
+    }
+
+    pub fn linked_remove_cached(
+        &self,
+        worktree_id: Uuid,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<bool, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        Ok(remove_cached_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+            relative_path,
+        )?)
+    }
+
+    pub fn linked_abandon_pending_stage(
+        &self,
+        worktree_id: Uuid,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<bool, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        Ok(abandon_pending_stage_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+            relative_path,
+        )?)
+    }
+
+    pub fn linked_commit(
+        &self,
+        worktree_id: Uuid,
+        author_name: &str,
+        author_email: &str,
+        message: &str,
+    ) -> Result<GitCommitInfo, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
+        resume_pending_stages_for_scope(&self.catalog, scope)?;
+        Ok(commit_index_for_scope(
+            &self.catalog,
+            scope,
+            author_name,
+            author_email,
+            message,
+        )?)
+    }
+
+    pub fn linked_log(
+        &self,
+        worktree_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<GitLogEntry>, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        Ok(log_history_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+            limit,
+        )?)
+    }
+
+    pub fn linked_branches(
+        &self,
+        worktree_id: Uuid,
+    ) -> Result<Vec<GitBranchInfo>, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        Ok(list_branches_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+        )?)
+    }
+
+    pub fn linked_diff(&self, worktree_id: Uuid, cached: bool) -> Result<GitDiff, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        Ok(repository_diff_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+            &info.path,
+            cached,
+        )?)
+    }
+
+    pub fn linked_switch_branch(
+        &self,
+        worktree_id: Uuid,
+        name: &str,
+    ) -> Result<GitBranchInfo, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
+        match switch_same_tree_branch_for_scope(&self.catalog, scope, name) {
+            Ok(branch) => Ok(branch),
+            Err(HistoryError::CheckoutRequired | HistoryError::NoHead) => Ok(
+                begin_switch_for_scope(&self.catalog, scope, &info.path, &self.directory, name)?,
+            ),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn stage_file(
@@ -1326,6 +1487,53 @@ mod tests {
             linked
         );
         assert_eq!(local.status().unwrap().head_oid, Some(base.oid));
+        fs::write(linked_root.join("tracked"), b"linked edit\r\n\0").unwrap();
+        assert!(
+            local
+                .linked_add_path(linked.worktree_id, "tracked")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !local
+                .linked_diff(linked.worktree_id, true)
+                .unwrap()
+                .patch
+                .is_empty()
+        );
+        let linked_commit = local
+            .linked_commit(
+                linked.worktree_id,
+                "Author",
+                "a@example.test",
+                "linked edit",
+            )
+            .unwrap();
+        assert_eq!(linked_commit.parent_oid, Some(topic.oid));
+        assert_eq!(
+            local.linked_log(linked.worktree_id, 1).unwrap()[0].oid,
+            linked_commit.oid
+        );
+        assert!(
+            local
+                .linked_branches(linked.worktree_id)
+                .unwrap()
+                .iter()
+                .any(|branch| branch.name == "topic" && branch.current)
+        );
+        local.create_branch_from("base-copy", "main").unwrap();
+        local
+            .linked_switch_branch(linked.worktree_id, "base-copy")
+            .unwrap();
+        assert_eq!(fs::read(linked_root.join("tracked")).unwrap(), b"base\r\n");
+        assert_eq!(local.status().unwrap().head_oid, Some(base.oid));
+        local
+            .linked_switch_branch(linked.worktree_id, "topic")
+            .unwrap();
+        assert_eq!(
+            fs::read(linked_root.join("tracked")).unwrap(),
+            b"linked edit\r\n\0"
+        );
         let graph = local.export_graph_source().unwrap();
         drop(local);
         for blob in graph.blobs {
