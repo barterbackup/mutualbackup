@@ -32,7 +32,8 @@ them as ADRs and test vectors before promising wire compatibility.
   when the host's Git configuration enables one. This policy covers local
   staging, history, checkout, merge, and interoperability with ordinary Git;
   Git-compatible object IDs describe the bytes actually retained in native
-  anchors.
+  anchors. Treat Git's automatic conversion settings as disabled in our binary,
+  including when opening an existing repository or importing a commit.
 - Use a pinned SQLCipher/SQLite build as the common local storage engine, with
   per-page HMAC enabled. Keep control state separate from parity storage. The
   prototype instantiates one parity database; later, one database per configured
@@ -539,9 +540,10 @@ their original bytes and object IDs. Do not use `core.autocrlf`, `core.eol`,
 independently of system, global, and repository Git config; reject an explicit
 repository rule that requests an unsupported content transformation before it
 can alter bytes. A `.gitattributes` file is itself ordinary tracked bytes, but
-it does not grant permission to transform other files. Git object IDs use the
-selected repository's canonical object framing and hash algorithm, computed by
-the Git library from the immutable captured bytes.
+it does not grant permission to transform other files. Never invoke an external
+filter or write a converted temporary payload while checking such rules. Git
+object IDs use the selected repository's canonical object framing and hash
+algorithm, computed by the Git library from the immutable captured bytes.
 Retain MutualBackup's independent content roots and signed revision authority.
 
 - **Prototype sector object:** fixed 64 KiB RS-level bytes, logical tail length,
@@ -3061,8 +3063,9 @@ Milestone 5.
   library's default checkout/filter behavior re-enable conversion, including
   during merge, reset/restore, pull, and worktree creation. Import Git blob
   bytes as raw file bytes and export the same bytes; report explicit repository
-  transforming rules before they can alter content. Define safe support for
-  Git file modes, symlinks, and path names rather than silently dropping them.
+  transforming rules before changing the index, refs, anchors, or worktree.
+  Never run a configured filter command. Define safe support for Git file
+  modes, symlinks, and path names rather than silently dropping them.
 - Protect the whole reachable Git commit graph and refs as owner-owned backed-up
   content, not just the currently checked-out tree. A signed MutualBackup
   revision/checkpoint is the protection boundary; seed-only recovery must
@@ -3095,11 +3098,12 @@ Milestone 5.
   to an eager full copy.
 - Close the Git phase with a local gate for exact-byte add/edit/commit/checkout
   and multi-worktree cases; mixed LF/CRLF, binary NUL, non-UTF-8 payloads, and
-  conversion-inducing `core.autocrlf`/`core.eol` settings and `.gitattributes`
-  across add, merge, reset/restore, pull, worktree checkout, import, and export;
-  sparse and
-  large files; hard links, symlinks, modes, and unusual path names; dirty and
-  untracked checkout safety; merge conflicts/abort; crash/reopen at stage,
+  conversion-inducing system/global/repository `core.autocrlf`/`core.eol`
+  settings and `.gitattributes` across add, merge, reset/restore, pull, worktree
+  checkout, import, and export; verify a configured filter is never executed
+  and a rejected rule leaves index, refs, anchors, and worktree unchanged;
+  sparse and large files; hard links, symlinks, modes, and unusual path names;
+  dirty and untracked checkout safety; merge conflicts/abort; crash/reopen at stage,
   ref, checkout, switch, merge, worktree HEAD/index, import, prune, and backup
   transitions; byte-exact branch recovery from a seed after source loss; Btrfs
   extent-sharing and deletion measurements; and bidirectional stock-Git round
