@@ -81,6 +81,8 @@ enum Command {
     Unpin { oid: String },
     /// List explicitly pinned commit IDs.
     Pins,
+    /// Delete unreachable Git metadata and native anchors after retention checks.
+    Prune,
     /// Switch to a branch using exact-byte reflink checkout.
     Switch { name: String },
     /// Check out a branch using the same protected worktree transition.
@@ -407,6 +409,27 @@ async fn main() -> Result<()> {
             }
             for oid in oids {
                 println!("{}", git2::Oid::from_bytes(&oid)?);
+            }
+        }
+        Command::Prune => {
+            let (_, repository_id) = discover_repository(&working_directory)?;
+            let LocalResponse::GitPruned(report) =
+                local_control_call(&socket, &LocalRequest::GitPrune { repository_id }).await?
+            else {
+                bail!("daemon returned the wrong response to Git prune");
+            };
+            if report.repository_id != repository_id || report.format_version != 1 {
+                bail!("daemon returned an invalid Git prune report");
+            }
+            println!(
+                "Pruned {} metadata object(s) and {} native anchor(s) ({} logical bytes)",
+                report.metadata_objects_removed,
+                report.native_anchors_removed,
+                report.logical_anchor_bytes_removed
+            );
+            match report.physical_bytes_reclaimed {
+                Some(bytes) => println!("Physical bytes reclaimed: {bytes}"),
+                None => println!("Physical bytes reclaimed: not measured"),
             }
         }
         Command::Switch { name } | Command::Checkout { name } => {

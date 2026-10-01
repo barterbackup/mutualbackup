@@ -27,8 +27,8 @@ use mb_core::{
     sector_root, sign_guild_event, sign_legacy_coding_add_binding, synthetic_filler_sector,
 };
 use mb_git::{
-    GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitRemoteBranchInfo, GitRepository,
-    GitStatus,
+    GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitPruneReport, GitPruneRoots,
+    GitRemoteBranchInfo, GitRepository, GitStatus,
 };
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
@@ -41,11 +41,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::control::{GitRepositoryInfo, GitStagedFile, NodeStatus, ProtectedRoot};
 use crate::snapshot::{
     WriterCredentials, abandon_recovered_anchor_capture, build_revision_restore,
-    install_inline_recipe, install_recovered_sector_recipe, make_restore_root_private_at,
-    prepare_revision, publish_owned_restore, reanchor_recovered_revision,
-    reconcile_pending_captures, recovered_recipe_is_stable, render_sector,
-    restore_revision_from_source, restore_signed_root_metadata_at, resume_restore_publication,
-    retire_revision_anchor, revision_git_backup, revision_head_id,
+    git_prune_capture_pending, install_inline_recipe, install_recovered_sector_recipe,
+    make_restore_root_private_at, prepare_revision, publish_owned_restore,
+    reanchor_recovered_revision, reconcile_pending_captures, recovered_recipe_is_stable,
+    render_sector, restore_revision_from_source, restore_signed_root_metadata_at,
+    resume_restore_publication, retire_revision_anchor, revision_git_backup, revision_head_id,
 };
 use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open_control_store};
 
@@ -1474,6 +1474,84 @@ impl Node {
     pub fn git_unpin_commit(&self, repository_id: Uuid, oid: [u8; 20]) -> Result<()> {
         self.open_git_repository(repository_id)?
             .unpin_commit(git2::Oid::from_bytes(&oid)?)
+            .map_err(Into::into)
+    }
+
+    pub fn git_prune(&mut self, repository_id: Uuid) -> Result<GitPruneReport> {
+        self.reconcile_garbage_collection()?;
+        for kind in ["gc-anchor", "gc-revision", "gc-sector"] {
+            if !self.control.records(kind)?.is_empty() {
+                anyhow::bail!("retained revision cleanup is unfinished; Git prune must wait");
+            }
+        }
+        let root = self.protected_root_by_id(repository_id)?;
+        if git_prune_capture_pending(&self.control, repository_id, &root.path)?
+            || !self.control.records("restore-job")?.is_empty()
+        {
+            anyhow::bail!("a source capture or restore is in progress; Git prune must wait");
+        }
+        for (_, bytes) in self.control.records("backup-job")? {
+            let job: BackupJob = decode_canonical(&bytes)?;
+            validate_backup_descriptor(&job.descriptor)?;
+            if job.format_version != 1 {
+                anyhow::bail!("durable backup job is invalid");
+            }
+            if job.descriptor.protected_root_id == repository_id
+                && job.state != BackupJobState::Committed
+            {
+                anyhow::bail!("a Git backup job is unfinished; prune must wait");
+            }
+        }
+        let mut protected = GitPruneRoots::default();
+        let mut include_revision = |revision: &SignedRecord<UserRevision>| -> Result<()> {
+            if revision.value.protected_root_id != repository_id
+                || revision.value.owner != self.keys.node_id()
+            {
+                return Ok(());
+            }
+            revision.verify(USER_REVISION_DOMAIN)?;
+            revision.value.verify_writer()?;
+            if let Some(graph) =
+                revision_git_backup(&self.control, &self.keys, revision.value.guild_id, revision)?
+            {
+                if graph.repository_id != repository_id {
+                    anyhow::bail!("retained Git backup belongs to another repository");
+                }
+                protected
+                    .metadata_oids
+                    .extend(graph.objects.iter().map(|object| object.oid));
+                protected
+                    .blob_oids
+                    .extend(graph.blobs.iter().map(|blob| blob.oid));
+            }
+            Ok(())
+        };
+        for (id, bytes) in self.control.records("user-revision")? {
+            let revision: SignedRecord<UserRevision> = decode_canonical(&bytes)?;
+            if id != revision.value.revision_id.as_bytes() {
+                anyhow::bail!("durable user revision ID is invalid");
+            }
+            include_revision(&revision)?;
+        }
+        if let Some(installed) = self.installed_guild()?
+            && let Some(checkpoint) =
+                self.current_checkpoint(installed.certificate.genesis.guild_id)?
+        {
+            checkpoint.verify()?;
+            if let Some(parent) = checkpoint.checkpoint.parent
+                && self
+                    .control
+                    .get_record("guild-checkpoint", &parent)?
+                    .is_none()
+            {
+                anyhow::bail!("checkpoint history is incomplete; Git prune must wait");
+            }
+            for revision in &checkpoint.checkpoint.revisions {
+                include_revision(revision)?;
+            }
+        }
+        self.open_git_repository(repository_id)?
+            .prune_unreachable(&protected)
             .map_err(Into::into)
     }
 
@@ -15616,7 +15694,100 @@ pub(crate) mod tests {
                     && change.staged == Some(mb_git::GitChange::Deleted))
         );
         assert!(source_root.join(".mutualbackup/catalog.db").exists());
+        let prune = reopened.git_prune(info.repository_id).unwrap();
+        assert_eq!(prune.repository_id, info.repository_id);
+        assert_eq!(prune.format_version, 1);
+        assert_eq!(prune.physical_bytes_reclaimed, None);
         drop(reopened);
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn git_prune_keeps_signed_revision_history_until_its_retirement() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-prune-revision-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("tracked"), b"base\r\n").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut node = Node::open(data.path(), Seed::from_bytes([83; 32])).unwrap();
+        let info = node.git_init(&source_root).unwrap();
+        node.git_add(info.repository_id, Path::new("tracked"))
+            .unwrap();
+        node.git_commit(info.repository_id, "Author", "a@example.test", "base")
+            .unwrap();
+        node.git_create_branch(info.repository_id, "topic").unwrap();
+        node.git_switch_branch(info.repository_id, "topic").unwrap();
+        fs::write(source_root.join("tracked"), b"topic\nbytes\0").unwrap();
+        node.git_add(info.repository_id, Path::new("tracked"))
+            .unwrap();
+        let topic = node
+            .git_commit(info.repository_id, "Author", "a@example.test", "topic")
+            .unwrap();
+        node.git_switch_branch(info.repository_id, "main").unwrap();
+        let before = node
+            .open_git_repository(info.repository_id)
+            .unwrap()
+            .export_graph_source()
+            .unwrap();
+        let guild_id = [84; 32];
+        let revision = prepare_revision(
+            &mut node.control,
+            &node.keys,
+            guild_id,
+            info.repository_id,
+            &source_root,
+            1,
+            None,
+            WriterCredentials {
+                epoch: 1,
+                secret: &[85; 32],
+                captured_change_sequence: None,
+            },
+        )
+        .unwrap();
+        node.git_delete_branch(info.repository_id, "topic", true)
+            .unwrap();
+        let retained = node.git_prune(info.repository_id).unwrap();
+        assert_eq!(retained.native_anchors_removed, 0);
+        assert_eq!(retained.metadata_objects_removed, 0);
+        assert!(before.objects.iter().any(|object| object.oid == topic.oid));
+        let current = node
+            .open_git_repository(info.repository_id)
+            .unwrap()
+            .export_graph_source()
+            .unwrap();
+        let orphan = before
+            .blobs
+            .iter()
+            .find(|blob| !current.blobs.iter().any(|live| live.oid == blob.oid))
+            .unwrap()
+            .anchor
+            .clone();
+        assert!(orphan.open_verified().is_ok());
+
+        node.control
+            .delete_record("user-revision", revision.value.revision_id.as_bytes())
+            .unwrap();
+        let removed = node.git_prune(info.repository_id).unwrap();
+        assert!(removed.native_anchors_removed > 0);
+        assert!(removed.metadata_objects_removed > 0);
+        assert!(orphan.open_verified().is_err());
+        assert_eq!(
+            node.open_git_repository(info.repository_id)
+                .unwrap()
+                .export_graph_source()
+                .unwrap(),
+            current
+        );
+        drop(node);
+        for blob in before.blobs {
+            blob.anchor.remove().unwrap();
+        }
         fs::remove_dir_all(run_root).unwrap();
     }
 

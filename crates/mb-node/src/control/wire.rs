@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
 use mb_core::{NodeId, QuorumPolicy, Seed};
-use mb_git::{GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitRemoteBranchInfo, GitStatus};
+use mb_git::{
+    GitBranchInfo, GitCommitInfo, GitDiff, GitLogEntry, GitPruneReport, GitRemoteBranchInfo,
+    GitStatus,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -94,6 +97,9 @@ pub enum LocalRequest {
     GitUnpinCommit {
         repository_id: Uuid,
         oid: [u8; 20],
+    },
+    GitPrune {
+        repository_id: Uuid,
     },
     GitCreateBranch {
         repository_id: Uuid,
@@ -223,6 +229,7 @@ pub enum LocalResponse {
         oid: [u8; 20],
         pinned: bool,
     },
+    GitPruned(GitPruneReport),
     GitBranchCreated(GitBranchInfo),
     GitBranchDeleted(GitBranchInfo),
     GitBranchSelected(GitBranchInfo),
@@ -439,6 +446,7 @@ mod tests {
                 repository_id,
                 oid: [7; 20],
             },
+            LocalRequest::GitPrune { repository_id },
             LocalRequest::GitCreateBranch {
                 repository_id,
                 name: "older".to_owned(),
@@ -547,6 +555,14 @@ mod tests {
                 oid: [7; 20],
                 pinned: true,
             },
+            LocalResponse::GitPruned(GitPruneReport {
+                format_version: 1,
+                repository_id,
+                metadata_objects_removed: 1,
+                native_anchors_removed: 2,
+                logical_anchor_bytes_removed: 1024,
+                physical_bytes_reclaimed: None,
+            }),
             LocalResponse::GitBranchCreated(GitBranchInfo {
                 format_version: 1,
                 repository_id,

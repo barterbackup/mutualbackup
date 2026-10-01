@@ -100,6 +100,17 @@ fn fetch_kind(repository_id: Uuid) -> String {
     format!("{FETCH_PREFIX}{repository_id}")
 }
 
+pub(crate) fn has_pending_fetch(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<bool, FetchError> {
+    Ok(!control.records(&fetch_kind(repository_id))?.is_empty()
+        || !control.records(&blob_kind(repository_id))?.is_empty()
+        || !control
+            .records_with_kind_prefix(&format!("{VERIFIED_PREFIX}{repository_id}/"))?
+            .is_empty())
+}
+
 fn blob_kind(repository_id: Uuid) -> String {
     format!("{BLOB_PREFIX}{repository_id}")
 }

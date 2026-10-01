@@ -18,8 +18,9 @@ pub use anchor::{
     remove_owned_directory_tree,
 };
 pub use database::{
-    CheckpointRow, ControlStore, DatabaseError, DatabaseShellResult, ObjectAttemptState,
-    ParityObject, ParityScrubReport, ParityStore, ProtocolRecordRow, VariableParityObject,
+    CheckpointRow, ControlStore, DatabaseError, DatabaseShellResult, KindedProtocolRecordRow,
+    ObjectAttemptState, ParityObject, ParityScrubReport, ParityStore, ProtocolRecordRow,
+    VariableParityObject,
 };
 pub use source::{SourceBlobImportPlan, SourceCapturePlan, SourceFileCapturePlan};
 

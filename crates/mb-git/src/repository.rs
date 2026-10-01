@@ -27,6 +27,9 @@ use crate::history::{
     pin_commit, switch_same_tree_branch, unpin_commit,
 };
 use crate::interop::{GitInteropError, push_current_branch_to_bare};
+use crate::prune::{
+    GitPruneError, GitPruneReport, GitPruneRoots, prune_unreachable, resume_pending_prune,
+};
 use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, remove_cached,
     resume_pending_stages, stage_file, stage_path_key, stage_symlink, staged_entry,
@@ -63,6 +66,8 @@ pub enum RepositoryError {
     Interop(#[from] GitInteropError),
     #[error("Git fetch error: {0}")]
     Fetch(#[from] FetchError),
+    #[error("Git history prune error: {0}")]
+    Prune(#[from] GitPruneError),
     #[error("repository marker or catalog identity conflicts with this root")]
     Conflict,
     #[error("the Git repository is not initialized")]
@@ -139,6 +144,7 @@ impl GitRepository {
             repository_id,
         };
         repository.resume_checkout()?;
+        resume_pending_prune(&repository.catalog, repository.repository_id)?;
         Ok(repository)
     }
 
@@ -179,6 +185,7 @@ impl GitRepository {
             repository_id,
         };
         repository.resume_checkout()?;
+        resume_pending_prune(&repository.catalog, repository.repository_id)?;
         Ok(repository)
     }
 
@@ -427,6 +434,19 @@ impl GitRepository {
     pub fn export_graph_source(&self) -> Result<GitGraphSource, RepositoryError> {
         self.resume_checkout()?;
         Ok(export_graph_source(&self.catalog, self.repository_id)?)
+    }
+
+    /// The daemon supplies signed-revision pins after checking in-flight work.
+    pub fn prune_unreachable(
+        &self,
+        protected: &GitPruneRoots,
+    ) -> Result<GitPruneReport, RepositoryError> {
+        self.resume_checkout()?;
+        Ok(prune_unreachable(
+            &self.catalog,
+            self.repository_id,
+            protected,
+        )?)
     }
 
     pub fn push_current_branch_to_bare(
@@ -860,6 +880,11 @@ mod tests {
             ))
         ));
         assert_eq!(local.branches().unwrap().len(), 1);
+        let protected_prune = local
+            .prune_unreachable(&crate::GitPruneRoots::default())
+            .unwrap();
+        assert_eq!(protected_prune.metadata_objects_removed, 0);
+        assert_eq!(protected_prune.native_anchors_removed, 0);
         drop(local);
         let local = GitRepository::open(&source_root, repository_id, &key).unwrap();
         assert_eq!(local.commit_pins().unwrap(), vec![topic_divergent.oid]);
@@ -872,6 +897,40 @@ mod tests {
         assert_eq!(base.parent_oid, None);
         let graph = local.export_graph_source().unwrap();
         assert_eq!(graph.refs.len(), 1);
+        let protected = crate::GitPruneRoots {
+            metadata_oids: pinned_graph
+                .objects
+                .iter()
+                .map(|object| object.oid)
+                .collect(),
+            blob_oids: pinned_graph.blobs.iter().map(|blob| blob.oid).collect(),
+        };
+        let signed_prune = local.prune_unreachable(&protected).unwrap();
+        assert_eq!(signed_prune.metadata_objects_removed, 0);
+        assert_eq!(signed_prune.native_anchors_removed, 0);
+        let orphan_anchors = pinned_graph
+            .blobs
+            .iter()
+            .filter(|blob| !graph.blobs.iter().any(|live| live.oid == blob.oid))
+            .map(|blob| blob.anchor.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(orphan_anchors.len(), 1);
+        crate::prune::set_after_catalog_delete_hook(Box::new(|| panic!("prune crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local
+                .prune_unreachable(&crate::GitPruneRoots::default())
+                .unwrap();
+        }));
+        assert!(interrupted.is_err());
+        assert!(orphan_anchors[0].open_verified().is_ok());
+        drop(local);
+        let local = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        assert!(orphan_anchors[0].open_verified().is_err());
+        assert_eq!(local.export_graph_source().unwrap(), graph);
+        let report = local
+            .prune_unreachable(&crate::GitPruneRoots::default())
+            .unwrap();
+        assert_eq!(report.native_anchors_removed, 0);
         drop(local);
         for blob in graph.blobs {
             blob.anchor.remove().unwrap();

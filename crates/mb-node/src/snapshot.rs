@@ -503,6 +503,26 @@ fn decode_git_graph_intent(bytes: &[u8]) -> Result<(GitGraphIntent, bool)> {
     Ok((intent, migrated))
 }
 
+pub(crate) fn git_prune_capture_pending(
+    control: &ControlStore,
+    repository_id: Uuid,
+    source_root: &Path,
+) -> Result<bool> {
+    for (_, bytes) in control.records("capture-intent")? {
+        let (intent, _) = decode_capture_intent(&bytes)?;
+        if intent.requested_source == source_root {
+            return Ok(true);
+        }
+    }
+    for (_, bytes) in control.records(GIT_GRAPH_INTENT_KIND)? {
+        let (intent, _) = decode_git_graph_intent(&bytes)?;
+        if intent.protected_root_id == repository_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn decode_recovery_anchor_intent(bytes: &[u8]) -> Result<(RecoveryAnchorIntent, bool)> {
     if let Ok(intent) = decode_canonical::<RecoveryAnchorIntent>(bytes)
         && intent.format_version == 2

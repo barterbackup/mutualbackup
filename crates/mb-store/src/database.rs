@@ -19,6 +19,7 @@ const CHECKPOINT_GENERATION_KIND: &str = "guild-checkpoint-generation";
 const CHECKPOINT_LEGACY_EPOCH_KIND: &str = "guild-checkpoint-legacy-epoch";
 pub type CheckpointRow = (u64, [u8; 32], Vec<u8>);
 pub type ProtocolRecordRow = (Vec<u8>, Vec<u8>);
+pub type KindedProtocolRecordRow = (String, Vec<u8>, Vec<u8>);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatabaseShellResult {
@@ -453,6 +454,23 @@ impl ControlStore {
             "SELECT record_id, bytes FROM protocol_records WHERE kind = ?1 ORDER BY record_id",
         )?;
         let rows = statement.query_map([kind], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::from)
+    }
+
+    /// Enumerate versioned record kinds that share an exact ASCII prefix.
+    /// Callers use this for bounded catalog maintenance across per-object kinds.
+    pub fn records_with_kind_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<KindedProtocolRecordRow>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT kind, record_id, bytes FROM protocol_records
+             WHERE substr(kind, 1, ?1) = ?2 ORDER BY kind, record_id",
+        )?;
+        let rows = statement.query_map(params![prefix.len(), prefix], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(DatabaseError::from)
     }

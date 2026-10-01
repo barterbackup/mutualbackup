@@ -479,6 +479,12 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitPrune { repository_id } => {
+            blocking_node(node, move |node| {
+                node.git_prune(repository_id).map(LocalResponse::GitPruned)
+            })
+            .await
+        }
         LocalRequest::GitCreateBranch {
             repository_id,
             name,

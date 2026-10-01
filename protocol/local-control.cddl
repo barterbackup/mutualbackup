@@ -36,6 +36,7 @@ local-request =
   / { "GitCommitPins": { repository_id: uuid-text } }
   / { "GitPinCommit": { repository_id: uuid-text, oid: bytes20-array } }
   / { "GitUnpinCommit": { repository_id: uuid-text, oid: bytes20-array } }
+  / { "GitPrune": { repository_id: uuid-text } }
   / { "GitCreateBranch": { repository_id: uuid-text, name: tstr } }
   / { "GitCreateBranchFrom": { repository_id: uuid-text, name: tstr, start_point: tstr } }
   / { "GitDeleteBranch": { repository_id: uuid-text, name: tstr, force: bool } }
@@ -87,6 +88,7 @@ local-response =
   / { "GitRemoteBranches": [* git-remote-branch-info] }
   / { "GitCommitPins": { repository_id: uuid-text, oids: [* bytes20-array] } }
   / { "GitCommitPinChanged": { repository_id: uuid-text, oid: bytes20-array, pinned: bool } }
+  / { "GitPruned": git-prune-report }
   / { "GitBranchCreated": git-branch-info }
   / { "GitBranchDeleted": git-branch-info }
   / { "GitBranchSelected": git-branch-info }
@@ -218,6 +220,15 @@ git-remote-branch-info = {
   repository_id: uuid-text,
   name: tstr,
   oid: bytes20-array
+}
+
+git-prune-report = {
+  format_version: uint,
+  repository_id: uuid-text,
+  metadata_objects_removed: uint,
+  native_anchors_removed: uint,
+  logical_anchor_bytes_removed: uint,
+  physical_bytes_reclaimed: null / uint
 }
 
 git-diff = {

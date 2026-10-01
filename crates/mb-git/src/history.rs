@@ -259,6 +259,20 @@ fn load_metadata(
     Ok(objects)
 }
 
+pub(crate) fn verified_metadata_ids(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<HashSet<Oid>, HistoryError> {
+    let temporary = tempfile::tempdir()?;
+    let repository = Repository::init_bare(temporary.path())?;
+    let odb = git2::Odb::new()?;
+    let _pack = odb.add_new_mempack_backend(1000)?;
+    repository.set_odb(&odb)?;
+    Ok(load_metadata(control, repository_id, &repository)?
+        .into_keys()
+        .collect())
+}
+
 fn head_oid(control: &ControlStore, repository_id: Uuid) -> Result<Option<Oid>, HistoryError> {
     let head = selected_ref(control, repository_id)?;
     let Some(encoded) = control.get_record(&ref_kind(repository_id), &head)? else {

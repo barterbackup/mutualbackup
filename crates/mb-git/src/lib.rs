@@ -27,6 +27,8 @@ mod history;
 mod interop;
 mod odb;
 #[cfg(target_os = "linux")]
+mod prune;
+#[cfg(target_os = "linux")]
 mod repository;
 mod stage;
 #[cfg(target_os = "linux")]
@@ -49,6 +51,8 @@ pub use history::{
 #[cfg(target_os = "linux")]
 pub use interop::GitInteropError;
 pub use odb::NativeOdb;
+#[cfg(target_os = "linux")]
+pub use prune::{GitPruneError, GitPruneReport, GitPruneRoots};
 #[cfg(target_os = "linux")]
 pub use repository::{GitRepository, RepositoryError};
 pub use stage::{

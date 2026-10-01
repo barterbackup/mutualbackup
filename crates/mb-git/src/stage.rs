@@ -101,6 +101,10 @@ pub(crate) fn object_kind(repository_id: Uuid, oid: Oid) -> String {
     format!("{OBJECT_PREFIX}{repository_id}/{oid}")
 }
 
+pub(crate) fn object_kind_prefix(repository_id: Uuid) -> String {
+    format!("{OBJECT_PREFIX}{repository_id}/")
+}
+
 pub(crate) fn stage_path_key(path: &Path) -> Result<Vec<u8>, StageError> {
     if path.as_os_str().is_empty()
         || path.is_absolute()
