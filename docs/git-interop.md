@@ -24,6 +24,8 @@ repository with `mutualgit push /path/to/bare.git refs/tags/release`. Native
 branch pushes also accept `mutualgit push /path/to/bare.git topic:review/topic`
 or full `refs/heads/` names; they can send a branch that is not checked out.
 The destination branch must be new or advance by fast-forward. Native
+push from a linked worktree uses that worktree's selected branch when no
+refspec is given; explicit branch and tag refspecs use the shared history.
 `mutualgit fetch /path/to/git-repository` imports branches and tags together;
 `mutualgit pull` fetches those refs before merging the selected branch. An
 existing local tag may be fetched again at the same object ID, but a remote

@@ -1928,6 +1928,18 @@ impl Node {
         Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
     }
 
+    pub fn git_worktree_push_bare(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        path: &Path,
+    ) -> Result<[u8; 20]> {
+        let oid = self
+            .open_git_repository(repository_id)?
+            .push_linked_current_branch_to_bare(worktree_id, path)?;
+        Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
+    }
+
     pub fn git_push_tag_bare(
         &self,
         repository_id: Uuid,

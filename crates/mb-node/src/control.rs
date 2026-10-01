@@ -889,6 +889,17 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitWorktreePushBare {
+            repository_id,
+            worktree_id,
+            path,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_push_bare(repository_id, worktree_id, &path)
+                    .map(|oid| LocalResponse::GitPushed { repository_id, oid })
+            })
+            .await
+        }
         LocalRequest::GitPushBranchBare {
             repository_id,
             path,

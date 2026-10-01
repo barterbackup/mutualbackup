@@ -20,7 +20,7 @@ use crate::checkout::{
 };
 use crate::diff::{DiffError, GitDiff, repository_diff, repository_diff_for_scope};
 use crate::fetch::{FetchError, fetch_bare, import_pushed_branch, import_pushed_tag};
-use crate::head::{HeadError, selected_branch};
+use crate::head::{HeadError, selected_branch, selected_branch_for_scope};
 use crate::history::{
     GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, GitRemoteBranchInfo, GitTagInfo,
     HistoryError, commit_index, commit_index_for_scope, create_annotated_tag_for_scope,
@@ -943,6 +943,26 @@ impl GitRepository {
         )?)
     }
 
+    pub fn push_linked_current_branch_to_bare(
+        &self,
+        worktree_id: Uuid,
+        destination: impl AsRef<Path>,
+    ) -> Result<Oid, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        let branch = selected_branch_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+        )?;
+        Ok(push_branch_to_bare(
+            &self.catalog,
+            self.repository_id,
+            &self.root,
+            destination.as_ref(),
+            &branch,
+            &branch,
+        )?)
+    }
+
     pub fn push_tag_to_bare(
         &self,
         destination: impl AsRef<Path>,
@@ -1813,6 +1833,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(linked_commit.parent_oid, Some(topic.oid));
+        let bare_root = run_root.join("remote.git");
+        let remote = git2::Repository::init_bare(&bare_root).unwrap();
+        assert_eq!(
+            local
+                .push_linked_current_branch_to_bare(linked.worktree_id, &bare_root)
+                .unwrap()
+                .as_bytes(),
+            linked_commit.oid
+        );
+        assert_eq!(
+            remote.find_reference("refs/heads/topic").unwrap().target(),
+            Some(Oid::from_bytes(&linked_commit.oid).unwrap())
+        );
+        assert!(remote.find_reference("refs/heads/main").is_err());
+        local.push_current_branch_to_bare(&bare_root).unwrap();
+        assert_eq!(
+            remote.find_reference("refs/heads/main").unwrap().target(),
+            Some(Oid::from_bytes(&base.oid).unwrap())
+        );
         assert_eq!(
             local.linked_log(linked.worktree_id, 1).unwrap()[0].oid,
             linked_commit.oid
@@ -1854,6 +1893,20 @@ mod tests {
             .linked_switch_branch(linked.worktree_id, "base-copy")
             .unwrap();
         assert_eq!(fs::read(linked_root.join("tracked")).unwrap(), b"base\r\n");
+        assert_eq!(
+            local
+                .push_linked_current_branch_to_bare(linked.worktree_id, &bare_root)
+                .unwrap()
+                .as_bytes(),
+            base.oid
+        );
+        assert_eq!(
+            remote
+                .find_reference("refs/heads/base-copy")
+                .unwrap()
+                .target(),
+            Some(Oid::from_bytes(&base.oid).unwrap())
+        );
         assert!(fs::symlink_metadata(linked_root.join("symbolic")).is_err());
         assert_eq!(local.status().unwrap().head_oid, Some(base.oid));
         local
@@ -1869,6 +1922,7 @@ mod tests {
         );
         let graph = local.export_graph_source().unwrap();
         drop(local);
+        drop(remote);
         for blob in graph.blobs {
             blob.anchor.remove().unwrap();
         }

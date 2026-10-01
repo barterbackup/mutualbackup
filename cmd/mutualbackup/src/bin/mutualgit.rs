@@ -724,7 +724,7 @@ async fn main() -> Result<()> {
             destination,
             refspec,
         } => {
-            let (_, repository_id) = discover_repository(&working_directory)?;
+            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
             let destination = working_directory
                 .join(destination)
                 .canonicalize()
@@ -742,9 +742,16 @@ async fn main() -> Result<()> {
                     source_branch: source.to_owned(),
                     target_branch: target.to_owned(),
                 },
-                None => LocalRequest::GitPushBare {
-                    repository_id,
-                    path: destination.clone(),
+                None => match worktree_id {
+                    Some(worktree_id) => LocalRequest::GitWorktreePushBare {
+                        repository_id,
+                        worktree_id,
+                        path: destination.clone(),
+                    },
+                    None => LocalRequest::GitPushBare {
+                        repository_id,
+                        path: destination.clone(),
+                    },
                 },
             };
             let LocalResponse::GitPushed {
