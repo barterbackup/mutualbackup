@@ -6,6 +6,8 @@
 //! and object-to-anchor mapping while retiring that intent.
 
 use std::ffi::OsStr;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
 
 use git2::Oid;
@@ -257,6 +259,37 @@ pub fn staged_entry(
         return Err(StageError::IncompatibleRecord);
     }
     Ok(Some(entry))
+}
+
+/// Enumerate the staged snapshot in Git's bytewise path order. These are raw
+/// repository-relative path bytes, so a future non-UTF-8 wire encoding need not
+/// reinterpret the index keys.
+pub fn staged_entries(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<Vec<(Vec<u8>, GitIndexEntry)>, StageError> {
+    let mut entries = Vec::new();
+    for (key, encoded) in control.records(&index_kind(repository_id))? {
+        #[cfg(unix)]
+        {
+            let path = PathBuf::from(std::ffi::OsString::from_vec(key.clone()));
+            if stage_path_key(&path)? != key {
+                return Err(StageError::IncompatibleRecord);
+            }
+        }
+        #[cfg(not(unix))]
+        return Err(StageError::UnsupportedPlatform);
+        let entry: GitIndexEntry = decode_canonical(&encoded)?;
+        if entry.format_version != 1 || !matches!(entry.mode, 0o100644 | 0o100755) {
+            return Err(StageError::IncompatibleRecord);
+        }
+        entries.push((key, entry));
+    }
+    Ok(entries)
+}
+
+pub fn has_pending_stages(control: &ControlStore, repository_id: Uuid) -> Result<bool, StageError> {
+    Ok(!control.records(&intent_kind(repository_id))?.is_empty())
 }
 
 /// Resolve all physical anchors for a Git blob ID, verifying both the native

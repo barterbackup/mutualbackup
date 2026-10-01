@@ -10,16 +10,20 @@ use git2::{ObjectType, Oid};
 use mb_store::{AnchorError, FileAnchorManifest};
 use thiserror::Error;
 
+#[cfg(target_os = "linux")]
+mod history;
 mod odb;
 #[cfg(target_os = "linux")]
 mod repository;
 mod stage;
+#[cfg(target_os = "linux")]
+pub use history::{GitCommitInfo, HistoryError};
 pub use odb::NativeOdb;
 #[cfg(target_os = "linux")]
 pub use repository::{GitRepository, RepositoryError};
 pub use stage::{
-    GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, resume_pending_stages,
-    stage_file, staged_entry,
+    GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, has_pending_stages,
+    resume_pending_stages, stage_file, staged_entries, staged_entry,
 };
 
 #[derive(Debug, Error)]

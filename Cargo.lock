@@ -4129,6 +4129,7 @@ dependencies = [
  "blake3",
  "clap",
  "conf",
+ "git2",
  "hex",
  "libc",
  "libp2p",

@@ -27,6 +27,7 @@ local-request =
   / { "AddRoot": { path: tstr } }
   / { "GitInit": { path: tstr } }
   / { "GitAdd": { repository_id: uuid-text, path: tstr } }
+  / { "GitCommit": { repository_id: uuid-text, author_name: tstr, author_email: tstr, message: tstr } }
   / "GuildStatus"
   / "GuildCreate"
   / "GuildInvite"
@@ -59,6 +60,7 @@ local-response =
   / { "RootAdded": protected-root }
   / { "GitRepositoryInitialized": git-repository-info }
   / { "GitFileStaged": git-staged-file }
+  / { "GitCommitted": git-commit-info }
   / { "Guild": null / guild-summary }
   / { "GuildInvite": { token: tstr, expires_at_unix_seconds: uint } }
   / { "GuildEventCommitted": { sequence: uint, event_hash: bytes32-array } }
@@ -148,6 +150,15 @@ git-staged-file = {
   path: tstr,
   oid: tstr,
   mode: uint
+}
+
+git-commit-info = {
+  format_version: uint,
+  repository_id: uuid-text,
+  oid: bytes20-array,
+  tree_oid: bytes20-array,
+  parent_oid: null / bytes20-array,
+  branch: tstr
 }
 
 p2p-status = {
@@ -288,3 +299,4 @@ uuid-text = tstr
 uint8 = 0..255
 bytes16-array = [16*16 uint8]
 bytes32-array = [32*32 uint8]
+bytes20-array = [20*20 uint8]

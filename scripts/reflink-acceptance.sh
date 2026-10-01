@@ -18,6 +18,7 @@ cargo test -p mb-git tests::git_blob_oid_hashes_exact_anchor_bytes_after_worktre
 cargo test -p mb-git odb::tests::native_odb_reads_small_and_large_git_blobs_from_anchors --locked -- --ignored --exact
 cargo test -p mb-git stage::tests::stage_index_and_object_map_replay_after_capture_and_reopen --locked -- --ignored --exact
 cargo test -p mb-git repository::tests::repository_catalog_stays_outside_ordinary_source_capture --locked -- --ignored --exact
+cargo test -p mb-git repository::tests::local_commits_preserve_exact_staged_blobs_and_parentage --locked -- --ignored --exact
 cargo test -p mb-node node::tests::git_repository_init_and_add_survive_daemon_reopen --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::nested_btrfs_subvolumes_are_rejected_before_and_during_capture --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::capture_walk_remains_bound_to_the_open_root --locked -- --ignored --exact

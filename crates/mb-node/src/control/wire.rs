@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use mb_core::{NodeId, QuorumPolicy, Seed};
+use mb_git::GitCommitInfo;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -58,6 +59,12 @@ pub enum LocalRequest {
     GitAdd {
         repository_id: Uuid,
         path: PathBuf,
+    },
+    GitCommit {
+        repository_id: Uuid,
+        author_name: String,
+        author_email: String,
+        message: String,
     },
     GuildStatus,
     GuildCreate,
@@ -123,6 +130,7 @@ pub enum LocalResponse {
     RootAdded(ProtectedRoot),
     GitRepositoryInitialized(GitRepositoryInfo),
     GitFileStaged(GitStagedFile),
+    GitCommitted(GitCommitInfo),
     Guild(Option<GuildSummary>),
     GuildInvite {
         token: String,
@@ -289,6 +297,12 @@ mod tests {
                 repository_id,
                 path: PathBuf::from("folder/file"),
             },
+            LocalRequest::GitCommit {
+                repository_id,
+                author_name: "Test Author".to_owned(),
+                author_email: "author@example.test".to_owned(),
+                message: "first".to_owned(),
+            },
         ] {
             let envelope = LocalRequestEnvelope {
                 format_version: LOCAL_WIRE_FORMAT_VERSION,
@@ -313,6 +327,14 @@ mod tests {
                 path: PathBuf::from("folder/file"),
                 oid: "81b2d75d7f1e1b71438019a1128f25986bebd588".to_owned(),
                 mode: 0o100644,
+            }),
+            LocalResponse::GitCommitted(GitCommitInfo {
+                format_version: 1,
+                repository_id,
+                oid: [7; 20],
+                tree_oid: [8; 20],
+                parent_oid: None,
+                branch: "main".to_owned(),
             }),
         ] {
             let envelope = LocalResponseEnvelope {

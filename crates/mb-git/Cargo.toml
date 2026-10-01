@@ -13,6 +13,7 @@ mb-core = { path = "../mb-core" }
 mb-store = { path = "../mb-store" }
 serde.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

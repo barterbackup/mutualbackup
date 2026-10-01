@@ -14,6 +14,7 @@ use mb_store::{
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::history::{GitCommitInfo, HistoryError, commit_index};
 use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, resume_pending_stages,
     stage_file, staged_entry,
@@ -35,6 +36,8 @@ pub enum RepositoryError {
     Database(#[from] DatabaseError),
     #[error("Git stage error: {0}")]
     Stage(#[from] StageError),
+    #[error("Git history error: {0}")]
+    History(#[from] HistoryError),
     #[error("repository marker or catalog identity conflicts with this root")]
     Conflict,
     #[error("the Git repository is not initialized")]
@@ -198,6 +201,21 @@ impl GitRepository {
 
     pub fn anchors_for_oid(&self, oid: Oid) -> Result<Vec<FileAnchorManifest>, RepositoryError> {
         Ok(anchors_for_oid(&self.catalog, self.repository_id, oid)?)
+    }
+
+    pub fn commit(
+        &self,
+        author_name: &str,
+        author_email: &str,
+        message: &str,
+    ) -> Result<GitCommitInfo, RepositoryError> {
+        Ok(commit_index(
+            &self.catalog,
+            self.repository_id,
+            author_name,
+            author_email,
+            message,
+        )?)
     }
 
     pub fn catalog_directory_identity(&self) -> Result<mb_store::NativeFileId, RepositoryError> {
@@ -369,6 +387,62 @@ mod tests {
         backup.remove().unwrap();
         drop(repo);
         anchors[0].remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn local_commits_preserve_exact_staged_blobs_and_parentage() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-history-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        fs::create_dir_all(source_root.join("nested")).unwrap();
+        fs::write(source_root.join("nested/tracked"), b"first\r\nbytes\0").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [23_u8; 32];
+        let repo = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        let first_blob = repo.stage_file("nested/tracked").unwrap();
+        fs::write(source_root.join("nested/tracked"), b"second\nbytes").unwrap();
+        let first = repo
+            .commit("Test Author", "author@example.test", "first")
+            .unwrap();
+        assert_eq!(first.parent_oid, None);
+        assert_eq!(first.branch, "main");
+        assert!(matches!(
+            repo.commit("Test Author", "author@example.test", "unchanged"),
+            Err(RepositoryError::History(crate::HistoryError::UnchangedTree))
+        ));
+        drop(repo);
+
+        let repo = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        let second_blob = repo.stage_file("nested/tracked").unwrap();
+        assert_ne!(first_blob.oid, second_blob.oid);
+        let second = repo
+            .commit("Test Author", "author@example.test", "second")
+            .unwrap();
+        assert_eq!(second.parent_oid, Some(first.oid));
+        assert_ne!(second.tree_oid, first.tree_oid);
+        let first_anchor = repo
+            .anchors_for_oid(Oid::from_bytes(&first_blob.oid).unwrap())
+            .unwrap();
+        assert_eq!(first_anchor.len(), 1);
+        let mut bytes = Vec::new();
+        use std::io::Read;
+        first_anchor[0]
+            .open_verified()
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"first\r\nbytes\0");
+        let second_anchor = repo
+            .anchors_for_oid(Oid::from_bytes(&second_blob.oid).unwrap())
+            .unwrap();
+        drop(repo);
+        first_anchor[0].remove().unwrap();
+        second_anchor[0].remove().unwrap();
         fs::remove_dir_all(run_root).unwrap();
     }
 }

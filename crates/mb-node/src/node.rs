@@ -26,7 +26,7 @@ use mb_core::{
     open_recovery_record, packing_protected_root, replay_coding_transcript, seal_recovery_record,
     sector_root, sign_guild_event, sign_legacy_coding_add_binding, synthetic_filler_sector,
 };
-use mb_git::GitRepository;
+use mb_git::{GitCommitInfo, GitRepository};
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
     VariableParityObject, filesystem_identity, probe_reflink,
@@ -1357,7 +1357,7 @@ impl Node {
         Ok(info)
     }
 
-    pub fn git_add(&mut self, repository_id: Uuid, path: &Path) -> Result<GitStagedFile> {
+    fn open_git_repository(&self, repository_id: Uuid) -> Result<GitRepository> {
         let encoded = self
             .control
             .get_record("git-repository", repository_id.as_bytes())?
@@ -1384,6 +1384,11 @@ impl Node {
         }
         let key = self.git_catalog_key(repository_id);
         let repository = GitRepository::open(&root.path, repository_id, &key)?;
+        Ok(repository)
+    }
+
+    pub fn git_add(&mut self, repository_id: Uuid, path: &Path) -> Result<GitStagedFile> {
+        let repository = self.open_git_repository(repository_id)?;
         repository.resume_pending_stages()?;
         let entry = repository.stage_file(path)?;
         Ok(GitStagedFile {
@@ -1393,6 +1398,18 @@ impl Node {
             oid: hex::encode(entry.oid),
             mode: entry.mode,
         })
+    }
+
+    pub fn git_commit(
+        &mut self,
+        repository_id: Uuid,
+        author_name: &str,
+        author_email: &str,
+        message: &str,
+    ) -> Result<GitCommitInfo> {
+        let repository = self.open_git_repository(repository_id)?;
+        repository.resume_pending_stages()?;
+        Ok(repository.commit(author_name, author_email, message)?)
     }
 
     fn register_protected_root(
@@ -15119,6 +15136,15 @@ pub(crate) mod tests {
             .git_add(info.repository_id, Path::new("tracked"))
             .unwrap();
         assert_eq!(first.mode, 0o100644);
+        let first_commit = node
+            .git_commit(
+                info.repository_id,
+                "Test Author",
+                "author@example.test",
+                "first",
+            )
+            .unwrap();
+        assert_eq!(first_commit.parent_oid, None);
         drop(node);
 
         let mut reopened = Node::open(data.path(), seed).unwrap();
@@ -15128,6 +15154,15 @@ pub(crate) mod tests {
             .unwrap();
         assert_ne!(first.oid, second.oid);
         assert_eq!(second.repository_id, info.repository_id);
+        let second_commit = reopened
+            .git_commit(
+                info.repository_id,
+                "Test Author",
+                "author@example.test",
+                "second",
+            )
+            .unwrap();
+        assert_eq!(second_commit.parent_oid, Some(first_commit.oid));
         assert!(source_root.join(".mutualbackup/catalog.db").exists());
         drop(reopened);
         fs::remove_dir_all(run_root).unwrap();

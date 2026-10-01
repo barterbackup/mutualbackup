@@ -382,6 +382,18 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitCommit {
+            repository_id,
+            author_name,
+            author_email,
+            message,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_commit(repository_id, &author_name, &author_email, &message)
+                    .map(LocalResponse::GitCommitted)
+            })
+            .await
+        }
         LocalRequest::GuildStatus => {
             blocking_node(node, |node| node.guild_summary().map(LocalResponse::Guild)).await
         }

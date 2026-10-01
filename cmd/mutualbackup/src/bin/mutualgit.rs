@@ -34,6 +34,15 @@ enum Command {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
+    /// Commit the staged snapshot to the current local branch.
+    Commit {
+        #[arg(short = 'm', long)]
+        message: String,
+        #[arg(long)]
+        author_name: Option<String>,
+        #[arg(long)]
+        author_email: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -82,8 +91,53 @@ async fn main() -> Result<()> {
                 println!("staged {} {} (local)", staged.oid, staged.path.display());
             }
         }
+        Command::Commit {
+            message,
+            author_name,
+            author_email,
+        } => {
+            let (_, repository_id) = discover_repository(&working_directory)?;
+            let author_name = author_name
+                .map(Ok)
+                .unwrap_or_else(|| author_field("GIT_AUTHOR_NAME", "user.name"))?;
+            let author_email = author_email
+                .map(Ok)
+                .unwrap_or_else(|| author_field("GIT_AUTHOR_EMAIL", "user.email"))?;
+            let LocalResponse::GitCommitted(commit) = local_control_call(
+                &socket,
+                &LocalRequest::GitCommit {
+                    repository_id,
+                    author_name,
+                    author_email,
+                    message,
+                },
+            )
+            .await?
+            else {
+                bail!("daemon returned the wrong response to Git commit");
+            };
+            if commit.repository_id != repository_id {
+                bail!("daemon committed another repository");
+            }
+            println!(
+                "[{} {}] committed locally; backup pending",
+                commit.branch,
+                git2::Oid::from_bytes(&commit.oid)?
+            );
+        }
     }
     Ok(())
+}
+
+fn author_field(environment: &str, config_key: &str) -> Result<String> {
+    if let Some(value) = std::env::var_os(environment) {
+        return value
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("{environment} is not valid UTF-8"));
+    }
+    git2::Config::open_default()?
+        .get_string(config_key)
+        .with_context(|| format!("set {environment} or Git {config_key} before committing"))
 }
 
 fn discover_repository(start: &Path) -> Result<(PathBuf, Uuid)> {
