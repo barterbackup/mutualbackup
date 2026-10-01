@@ -31,7 +31,7 @@ struct Cli {
 enum Command {
     /// Enroll this directory as a protected Git-compatible repository.
     Init { directory: Option<PathBuf> },
-    /// Create, list, resume, or prune linked worktrees of this repository.
+    /// Create, list, resume, remove, or prune linked worktrees of this repository.
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
@@ -164,6 +164,8 @@ enum WorktreeCommand {
     List,
     /// Finish an interrupted linked-worktree checkout.
     Resume { worktree_id: Uuid },
+    /// Remove a clean linked worktree and release its branch ownership.
+    Remove { worktree_id: Uuid },
     /// Forget the registration of a clean linked worktree whose directory was removed.
     Prune {
         worktree_id: Uuid,
@@ -284,6 +286,27 @@ async fn main() -> Result<()> {
                         bail!("daemon pruned another worktree");
                     }
                     println!("Pruned worktree {} at {}", worktree_id, info.path.display());
+                }
+                WorktreeCommand::Remove { worktree_id } => {
+                    let LocalResponse::GitWorktreeRemoved(info) = local_control_call(
+                        &socket,
+                        &LocalRequest::GitWorktreeRemove {
+                            repository_id,
+                            worktree_id,
+                        },
+                    )
+                    .await?
+                    else {
+                        bail!("daemon returned the wrong response to worktree remove");
+                    };
+                    if info.repository_id != repository_id || info.worktree_id != worktree_id {
+                        bail!("daemon removed another worktree");
+                    }
+                    println!(
+                        "Removed worktree {} at {}",
+                        worktree_id,
+                        info.path.display()
+                    );
                 }
             }
         }

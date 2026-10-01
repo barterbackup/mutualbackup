@@ -473,7 +473,7 @@ fn parent_and_name(
     Ok((directory, name))
 }
 
-fn parent_and_name_if_exists(
+pub(crate) fn parent_and_name_if_exists(
     root: &PinnedDirectory,
     path: &[u8],
 ) -> Result<Option<(PinnedDirectory, OsString)>, CheckoutError> {
@@ -652,6 +652,25 @@ fn verify_file(
         return Err(CheckoutError::DirtyWorktree);
     }
     Ok(())
+}
+
+pub(crate) fn verify_tracked_file_for_removal(
+    parent: &PinnedDirectory,
+    name: &OsStr,
+    identity: NativeFileId,
+    oid: [u8; 20],
+    mode: u32,
+) -> Result<(), CheckoutError> {
+    verify_file(
+        parent,
+        name,
+        identity,
+        &CheckoutFile {
+            oid,
+            mode,
+            anchor_id: Uuid::nil(),
+        },
+    )
 }
 
 fn verify_staged_directory(

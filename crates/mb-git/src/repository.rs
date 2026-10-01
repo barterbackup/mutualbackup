@@ -53,7 +53,7 @@ use crate::stage::{
 use crate::status::{GitStatus, StatusError, repository_status, repository_status_for_scope};
 use crate::worktree::{
     GitWorktreeError, GitWorktreeInfo, add_worktree, get_worktree, list_worktrees,
-    prune_missing_worktree, resume_worktree,
+    prune_missing_worktree, remove_worktree, resume_worktree,
 };
 
 const INITIALIZATION_INTENT: &str = "repository-intent";
@@ -309,6 +309,19 @@ impl GitRepository {
             force,
             &self.root,
             &self.directory,
+        )?)
+    }
+
+    pub fn remove_linked_worktree(
+        &self,
+        worktree_id: Uuid,
+    ) -> Result<GitWorktreeInfo, RepositoryError> {
+        self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
+        Ok(remove_worktree(
+            &self.catalog,
+            self.repository_id,
+            worktree_id,
         )?)
     }
 
@@ -2193,6 +2206,146 @@ mod tests {
             1
         );
         assert!(staged_anchor.open_verified().is_err());
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn clean_linked_worktree_removal_replays_and_preserves_replacements() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-worktree-remove-{}", Uuid::new_v4()));
+        let primary_root = run_root.join("primary");
+        let linked_root = run_root.join("linked");
+        fs::create_dir_all(primary_root.join("folder")).unwrap();
+        fs::create_dir_all(&linked_root).unwrap();
+        fs::write(primary_root.join("folder/tracked"), b"raw\r\n\0bytes").unwrap();
+        fs::write(primary_root.join("other"), b"another\nfile").unwrap();
+        std::os::unix::fs::symlink("folder/tracked", primary_root.join("link")).unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [127_u8; 32];
+        let local = GitRepository::init(&primary_root, repository_id, &key).unwrap();
+        local.stage_file("folder/tracked").unwrap();
+        local.add_path("link").unwrap();
+        local.stage_file("other").unwrap();
+        local.commit("Author", "a@example.test", "base").unwrap();
+        local.create_branch("topic").unwrap();
+        let linked = local.add_linked_worktree(&linked_root, "topic").unwrap();
+
+        fs::write(linked_root.join("other"), b"edited").unwrap();
+        assert!(matches!(
+            local.remove_linked_worktree(linked.worktree_id),
+            Err(RepositoryError::Worktree(
+                crate::GitWorktreeError::DirtyWorktree
+            ))
+        ));
+        assert_eq!(fs::read(linked_root.join("other")).unwrap(), b"edited");
+        fs::write(linked_root.join("other"), b"another\nfile").unwrap();
+        fs::create_dir(linked_root.join("empty-extra")).unwrap();
+        assert!(matches!(
+            local.remove_linked_worktree(linked.worktree_id),
+            Err(RepositoryError::Worktree(
+                crate::GitWorktreeError::DirtyWorktree
+            ))
+        ));
+        assert!(linked_root.join("folder/tracked").exists());
+        fs::remove_dir(linked_root.join("empty-extra")).unwrap();
+        fs::create_dir(linked_root.join(".git")).unwrap();
+        assert!(matches!(
+            local.remove_linked_worktree(linked.worktree_id),
+            Err(RepositoryError::Worktree(
+                crate::GitWorktreeError::DirtyWorktree
+            ))
+        ));
+        fs::remove_dir(linked_root.join(".git")).unwrap();
+        fs::write(linked_root.join(".mutualbackup/extra"), b"user metadata").unwrap();
+        assert!(matches!(
+            local.remove_linked_worktree(linked.worktree_id),
+            Err(RepositoryError::Worktree(
+                crate::GitWorktreeError::DirtyWorktree
+            ))
+        ));
+        fs::remove_file(linked_root.join(".mutualbackup/extra")).unwrap();
+
+        crate::worktree::set_after_removal_file_hook(Box::new(|| panic!("remove interruption")));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                local.remove_linked_worktree(linked.worktree_id).unwrap();
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            local.linked_worktree(linked.worktree_id).unwrap().state,
+            crate::GitWorktreeState::Removing
+        );
+        assert!(matches!(
+            local.switch_branch("topic"),
+            Err(RepositoryError::History(
+                crate::HistoryError::BranchCheckedOutElsewhere
+            ))
+        ));
+        fs::write(linked_root.join("folder/tracked"), b"replacement").unwrap();
+        drop(local);
+
+        let local = GitRepository::open(&primary_root, repository_id, &key).unwrap();
+        assert!(local.remove_linked_worktree(linked.worktree_id).is_err());
+        assert_eq!(
+            fs::read(linked_root.join("folder/tracked")).unwrap(),
+            b"replacement"
+        );
+        fs::remove_file(linked_root.join("folder/tracked")).unwrap();
+        let removed = local.remove_linked_worktree(linked.worktree_id).unwrap();
+        assert_eq!(removed.state, crate::GitWorktreeState::Removing);
+        assert!(!linked_root.exists());
+        assert!(local.linked_worktrees().unwrap().is_empty());
+        let scope = linked.scope().unwrap();
+        assert!(
+            local
+                .catalog
+                .records(&crate::head::head_kind_for_scope(scope))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            local
+                .catalog
+                .records(&crate::stage::index_kind_for_scope(scope))
+                .unwrap()
+                .is_empty()
+        );
+        local.switch_branch("topic").unwrap();
+        assert_eq!(
+            fs::read(primary_root.join("folder/tracked")).unwrap(),
+            b"raw\r\n\0bytes"
+        );
+        local.create_branch("another").unwrap();
+        let another_root = run_root.join("another");
+        fs::create_dir(&another_root).unwrap();
+        let another = local.add_linked_worktree(&another_root, "another").unwrap();
+        crate::worktree::set_after_removal_root_hook(Box::new(|| panic!("removed root crash")));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                local.remove_linked_worktree(another.worktree_id).unwrap();
+            }))
+            .is_err()
+        );
+        assert!(!another_root.exists());
+        drop(local);
+
+        let local = GitRepository::open(&primary_root, repository_id, &key).unwrap();
+        assert_eq!(
+            local.linked_worktree(another.worktree_id).unwrap().state,
+            crate::GitWorktreeState::Removing
+        );
+        local.remove_linked_worktree(another.worktree_id).unwrap();
+        local.switch_branch("another").unwrap();
         let graph = local.export_graph_source().unwrap();
         drop(local);
         for blob in graph.blobs {

@@ -28,6 +28,11 @@ merge, staged reset, hard reset, worktree restore, diff, log, explicit commit pi
 and prune.
 `mutualgit worktree list` reports the current branch of each ready worktree;
 an interrupted addition reports its reserved target branch.
+`mutualgit worktree remove WORKTREE_ID` removes a clean linked worktree's
+tracked files and directory, then releases its branch ownership and index pins.
+It refuses modified or untracked content, including an unexpected `.git`
+directory. An interrupted removal remains visible as `Removing`; rerun the same
+command to finish it after resolving any conflicting file or directory.
 After deliberately removing a linked worktree directory, run
 `mutualgit worktree prune WORKTREE_ID` from the primary repository to release
 its branch ownership and index pins. The command refuses an existing path,

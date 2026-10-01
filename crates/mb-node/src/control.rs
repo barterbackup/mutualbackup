@@ -411,6 +411,16 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitWorktreeRemove {
+            repository_id,
+            worktree_id,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_remove_worktree(repository_id, worktree_id)
+                    .map(LocalResponse::GitWorktreeRemoved)
+            })
+            .await
+        }
         LocalRequest::GitWorktreeStatus {
             repository_id,
             worktree_id,

@@ -366,6 +366,10 @@ pub enum LocalRequest {
         worktree_id: Uuid,
         force: bool,
     },
+    GitWorktreeRemove {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -484,6 +488,7 @@ pub enum LocalResponse {
     Snapshots(Vec<SnapshotInfo>),
     SnapshotRestored(SnapshotInfo),
     GitWorktreePruned(GitWorktreeInfo),
+    GitWorktreeRemoved(GitWorktreeInfo),
 }
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -647,6 +652,10 @@ mod tests {
                 repository_id,
                 worktree_id: Uuid::from_bytes([5; 16]),
                 force: true,
+            },
+            LocalRequest::GitWorktreeRemove {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
             },
             LocalRequest::GitWorktreeStatus {
                 repository_id,
@@ -1011,6 +1020,18 @@ mod tests {
                 },
                 target_branch: "topic".to_owned(),
                 state: mb_git::GitWorktreeState::Ready,
+            }),
+            LocalResponse::GitWorktreeRemoved(GitWorktreeInfo {
+                format_version: 1,
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                path: PathBuf::from("/home/user/linked"),
+                root_id: mb_store::NativeFileId {
+                    filesystem_id: 1,
+                    inode: 2,
+                },
+                target_branch: "topic".to_owned(),
+                state: mb_git::GitWorktreeState::Removing,
             }),
             LocalResponse::GitWorktrees(vec![]),
             LocalResponse::GitFileStaged(GitStagedFile {

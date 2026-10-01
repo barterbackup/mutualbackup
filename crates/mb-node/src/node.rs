@@ -1476,6 +1476,16 @@ impl Node {
             .map_err(Into::into)
     }
 
+    pub fn git_remove_worktree(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+    ) -> Result<GitWorktreeInfo> {
+        self.open_git_repository(repository_id)?
+            .remove_linked_worktree(worktree_id)
+            .map_err(Into::into)
+    }
+
     pub fn git_worktree_status(&self, repository_id: Uuid, worktree_id: Uuid) -> Result<GitStatus> {
         self.open_git_repository(repository_id)?
             .linked_status(worktree_id)

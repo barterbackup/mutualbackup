@@ -2,8 +2,11 @@
 //! in the primary repository catalog; only HEAD, index, and checkout are local
 //! to each registered worktree.
 
+use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Read;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -20,7 +23,8 @@ use uuid::Uuid;
 use crate::GitWorktreeScope;
 use crate::checkout::{
     CheckoutError, abandon_missing_initial_checkout_for_scope, begin_switch_for_scope,
-    has_pending_checkout_for_scope, resume_pending_checkout_for_scope,
+    has_pending_checkout_for_scope, parent_and_name_if_exists, resume_pending_checkout_for_scope,
+    verify_tracked_file_for_removal,
 };
 use crate::head::{
     HeadError, branch_selected_elsewhere, head_kind_for_scope, selected_branch_for_scope,
@@ -29,24 +33,58 @@ use crate::head::{
 use crate::history::{HistoryError, list_branches_for_scope};
 use crate::stage::{
     StageError, abandon_missing_linked_worktree_stages, has_pending_stages_for_scope,
-    index_kind_for_scope, staged_entries_for_scope,
+    index_kind_for_scope, stage_path_key, staged_entries_for_scope,
 };
 use crate::status::{StatusError, committed_files_for_scope, repository_status_for_scope};
 
 const RECORD_PREFIX: &str = "git-linked-worktree-v1/";
+const REMOVE_PREFIX: &str = "git-worktree-remove-intent-v1/";
 const MARKER_NAME: &str = "worktree";
 const MARKER_MAGIC: &str = "mutualbackup-git-worktree-v1\n";
 const MAX_WORKTREES: usize = 256;
+const MAX_REMOVAL_FILES: usize = 8_192;
 
 #[cfg(test)]
 thread_local! {
     static AFTER_REGISTRATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static AFTER_REMOVAL_FILE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static AFTER_REMOVAL_ROOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
 pub(crate) fn set_after_registration_hook(hook: Box<dyn FnOnce()>) {
     AFTER_REGISTRATION.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_removal_file_hook(hook: Box<dyn FnOnce()>) {
+    AFTER_REMOVAL_FILE.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_removal_root_hook(hook: Box<dyn FnOnce()>) {
+    AFTER_REMOVAL_ROOT.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+fn run_after_removal_file_hook() {
+    #[cfg(test)]
+    AFTER_REMOVAL_FILE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+fn run_after_removal_root_hook() {
+    #[cfg(test)]
+    AFTER_REMOVAL_ROOT.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
 }
 
 fn run_after_registration_hook() {
@@ -62,6 +100,34 @@ fn run_after_registration_hook() {
 pub enum GitWorktreeState {
     Preparing,
     Ready,
+    Removing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct RemovalFile {
+    path: Vec<u8>,
+    oid: [u8; 20],
+    mode: u32,
+    identity: NativeFileId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct RemovalDirectory {
+    path: Vec<u8>,
+    identity: NativeFileId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct RemovalIntent {
+    format_version: u16,
+    repository_id: Uuid,
+    worktree_id: Uuid,
+    root_id: NativeFileId,
+    parent_id: NativeFileId,
+    marker_directory_id: NativeFileId,
+    marker_id: NativeFileId,
+    files: Vec<RemovalFile>,
+    directories: Vec<RemovalDirectory>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -118,6 +184,367 @@ pub enum GitWorktreeError {
     StagedChanges,
     #[error("the linked worktree has an unfinished add or checkout")]
     PendingOperation,
+    #[error("the linked worktree contains modified or untracked files")]
+    DirtyWorktree,
+    #[error("the linked worktree has too many tracked paths to remove in one operation")]
+    TooManyFiles,
+}
+
+fn remove_kind(repository_id: Uuid) -> String {
+    format!("{REMOVE_PREFIX}{repository_id}")
+}
+
+fn tracked_identity(
+    parent: &PinnedDirectory,
+    name: &OsStr,
+    mode: u32,
+) -> Result<Option<NativeFileId>, GitWorktreeError> {
+    Ok(match mode {
+        0o100644 | 0o100755 => parent.entry_identity(name, false)?,
+        0o120000 => parent.symlink_identity(name)?,
+        _ => return Err(GitWorktreeError::Conflict),
+    })
+}
+
+fn verify_removal_layout(
+    root: &PinnedDirectory,
+    files: &[RemovalFile],
+    directories: &[RemovalDirectory],
+) -> Result<(), GitWorktreeError> {
+    let expected_files: BTreeSet<&[u8]> = files.iter().map(|file| file.path.as_slice()).collect();
+    let expected_directories: BTreeSet<&[u8]> = directories
+        .iter()
+        .map(|directory| directory.path.as_slice())
+        .collect();
+    let mut pending = vec![(root.try_clone()?, Vec::<u8>::new())];
+    let mut visited = 0_usize;
+    while let Some((directory, prefix)) = pending.pop() {
+        for entry in fs::read_dir(directory.descriptor_path())? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if prefix.is_empty() && name == GIT_CATALOG_DIRECTORY {
+                continue;
+            }
+            visited += 1;
+            if visited > MAX_REMOVAL_FILES * 2 {
+                return Err(GitWorktreeError::TooManyFiles);
+            }
+            let mut path = prefix.clone();
+            path.extend_from_slice(name.as_encoded_bytes());
+            if entry.file_type()?.is_dir() {
+                if !expected_directories.contains(path.as_slice()) {
+                    return Err(GitWorktreeError::DirtyWorktree);
+                }
+                let child = directory
+                    .open_child_directory(&name)?
+                    .ok_or(GitWorktreeError::DirtyWorktree)?;
+                path.push(b'/');
+                pending.push((child, path));
+            } else if !expected_files.contains(path.as_slice()) {
+                return Err(GitWorktreeError::DirtyWorktree);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn begin_remove_worktree(
+    control: &ControlStore,
+    info: &GitWorktreeInfo,
+    encoded: &[u8],
+) -> Result<(), GitWorktreeError> {
+    let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
+    let root = PinnedDirectory::open(&info.path)?;
+    if root.identity()? != info.root_id || info.path.canonicalize()? != info.path {
+        return Err(GitWorktreeError::Conflict);
+    }
+    verify_marker(&root, info)?;
+    if has_pending_stages_for_scope(control, scope)?
+        || has_pending_checkout_for_scope(control, scope)?
+    {
+        return Err(GitWorktreeError::PendingOperation);
+    }
+    let status = repository_status_for_scope(control, scope, &info.path)?;
+    if !status.changes.is_empty() || !status.untracked.is_empty() || !status.pending_adds.is_empty()
+    {
+        return Err(GitWorktreeError::DirtyWorktree);
+    }
+    match fs::symlink_metadata(info.path.join(".git")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err(GitWorktreeError::DirtyWorktree),
+        Err(error) => return Err(error.into()),
+    }
+    let marker_directory = root
+        .open_child_directory(GIT_CATALOG_DIRECTORY)?
+        .ok_or(GitWorktreeError::Conflict)?;
+    if fs::read_dir(marker_directory.descriptor_path())?
+        .any(|entry| entry.is_err() || entry.is_ok_and(|entry| entry.file_name() != MARKER_NAME))
+    {
+        return Err(GitWorktreeError::DirtyWorktree);
+    }
+    let marker_id = marker_directory
+        .entry_identity(MARKER_NAME, false)?
+        .ok_or(GitWorktreeError::Conflict)?;
+    let parent = PinnedDirectory::open(info.path.parent().ok_or(GitWorktreeError::Conflict)?)?;
+    let staged = staged_entries_for_scope(control, scope)?;
+    if staged.len() > MAX_REMOVAL_FILES {
+        return Err(GitWorktreeError::TooManyFiles);
+    }
+    let mut files = Vec::with_capacity(staged.len());
+    let mut directory_paths = BTreeSet::new();
+    for (path, entry) in staged {
+        let relative = PathBuf::from(OsString::from_vec(path.clone()));
+        if stage_path_key(&relative)? != path {
+            return Err(GitWorktreeError::Conflict);
+        }
+        let (directory, name) =
+            parent_and_name_if_exists(&root, &path)?.ok_or(GitWorktreeError::DirtyWorktree)?;
+        let identity = tracked_identity(&directory, &name, entry.mode)?
+            .ok_or(GitWorktreeError::DirtyWorktree)?;
+        verify_tracked_file_for_removal(&directory, &name, identity, entry.oid, entry.mode)?;
+        files.push(RemovalFile {
+            path,
+            oid: entry.oid,
+            mode: entry.mode,
+            identity,
+        });
+        let mut ancestor = PathBuf::new();
+        for component in relative.parent().into_iter().flat_map(Path::components) {
+            ancestor.push(component);
+            directory_paths.insert(stage_path_key(&ancestor)?);
+        }
+    }
+    if directory_paths.len() > MAX_REMOVAL_FILES {
+        return Err(GitWorktreeError::TooManyFiles);
+    }
+    let mut directories = Vec::with_capacity(directory_paths.len());
+    for path in directory_paths {
+        let relative = PathBuf::from(OsString::from_vec(path.clone()));
+        let identity = root.open_descendant_directory(&relative)?.identity()?;
+        directories.push(RemovalDirectory { path, identity });
+    }
+    verify_removal_layout(&root, &files, &directories)?;
+    let intent = RemovalIntent {
+        format_version: 1,
+        repository_id: info.repository_id,
+        worktree_id: info.worktree_id,
+        root_id: info.root_id,
+        parent_id: parent.identity()?,
+        marker_directory_id: marker_directory.identity()?,
+        marker_id,
+        files,
+        directories,
+    };
+    let removing = GitWorktreeInfo {
+        target_branch: status.branch,
+        state: GitWorktreeState::Removing,
+        ..info.clone()
+    };
+    control.put_records_and_retire_if_value(
+        &[
+            (
+                record_kind(info.repository_id),
+                info.worktree_id.as_bytes().to_vec(),
+                canonical_bytes(&removing)?,
+            ),
+            (
+                remove_kind(info.repository_id),
+                info.worktree_id.as_bytes().to_vec(),
+                canonical_bytes(&intent)?,
+            ),
+        ],
+        &record_kind(info.repository_id),
+        info.worktree_id.as_bytes(),
+        encoded,
+    )?;
+    Ok(())
+}
+
+fn resume_remove_worktree(
+    control: &ControlStore,
+    info: &GitWorktreeInfo,
+    encoded_registration: &[u8],
+) -> Result<(), GitWorktreeError> {
+    let kind = remove_kind(info.repository_id);
+    let encoded_intent = control
+        .get_record(&kind, info.worktree_id.as_bytes())?
+        .ok_or(GitWorktreeError::Conflict)?;
+    let intent: RemovalIntent = decode_canonical(&encoded_intent)?;
+    if intent.format_version != 1
+        || intent.repository_id != info.repository_id
+        || intent.worktree_id != info.worktree_id
+        || intent.root_id != info.root_id
+        || intent.files.len() > MAX_REMOVAL_FILES
+        || intent.directories.len() > MAX_REMOVAL_FILES
+    {
+        return Err(GitWorktreeError::Conflict);
+    }
+    let mut seen = BTreeSet::new();
+    for file in &intent.files {
+        let path = PathBuf::from(OsString::from_vec(file.path.clone()));
+        if stage_path_key(&path)? != file.path
+            || !seen.insert(&file.path)
+            || !matches!(file.mode, 0o100644 | 0o100755 | 0o120000)
+            || file.identity.filesystem_id != intent.root_id.filesystem_id
+        {
+            return Err(GitWorktreeError::Conflict);
+        }
+    }
+    seen.clear();
+    for directory in &intent.directories {
+        let path = PathBuf::from(OsString::from_vec(directory.path.clone()));
+        if stage_path_key(&path)? != directory.path
+            || !seen.insert(&directory.path)
+            || directory.identity.filesystem_id != intent.root_id.filesystem_id
+        {
+            return Err(GitWorktreeError::Conflict);
+        }
+    }
+    let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
+    if has_pending_stages_for_scope(control, scope)?
+        || has_pending_checkout_for_scope(control, scope)?
+        || selected_branch_for_scope(control, scope)? != info.target_branch
+    {
+        return Err(GitWorktreeError::Conflict);
+    }
+    let staged = staged_entries_for_scope(control, scope)?;
+    if staged.len() != intent.files.len()
+        || staged
+            .iter()
+            .zip(&intent.files)
+            .any(|((path, entry), file)| {
+                path != &file.path || entry.oid != file.oid || entry.mode != file.mode
+            })
+    {
+        return Err(GitWorktreeError::Conflict);
+    }
+    let head_kind = head_kind_for_scope(scope);
+    let head_rows = control.records(&head_kind)?;
+    if head_rows.len() != 1 || head_rows[0].0 != b"branch" {
+        return Err(GitWorktreeError::Conflict);
+    }
+    let parent = PinnedDirectory::open(info.path.parent().ok_or(GitWorktreeError::Conflict)?)?;
+    if parent.identity()? != intent.parent_id {
+        return Err(GitWorktreeError::Conflict);
+    }
+    let root_name = info.path.file_name().ok_or(GitWorktreeError::Conflict)?;
+    match fs::symlink_metadata(&info.path) {
+        Ok(_) => {
+            let root = PinnedDirectory::open(&info.path)?;
+            if root.identity()? != intent.root_id || info.path.canonicalize()? != info.path {
+                return Err(GitWorktreeError::Conflict);
+            }
+            for file in &intent.files {
+                let Some((directory, name)) = parent_and_name_if_exists(&root, &file.path)? else {
+                    continue;
+                };
+                let actual = tracked_identity(&directory, &name, file.mode)?;
+                let Some(actual) = actual else {
+                    continue;
+                };
+                if actual != file.identity {
+                    return Err(GitWorktreeError::DirtyWorktree);
+                }
+                verify_tracked_file_for_removal(&directory, &name, actual, file.oid, file.mode)?;
+                if file.mode == 0o120000 {
+                    directory.remove_child_symlink(&name, actual)?;
+                } else {
+                    directory.remove_child_file_if_identity(&name, actual)?;
+                }
+                run_after_removal_file_hook();
+            }
+            let mut directories = intent.directories.iter().collect::<Vec<_>>();
+            directories.sort_by(|left, right| {
+                right
+                    .path
+                    .len()
+                    .cmp(&left.path.len())
+                    .then(right.path.cmp(&left.path))
+            });
+            for item in directories {
+                let Some((directory, name)) = parent_and_name_if_exists(&root, &item.path)? else {
+                    continue;
+                };
+                if directory.entry_identity(&name, true)?.is_none() {
+                    continue;
+                }
+                if !directory.remove_empty_child_directory(&name, item.identity)? {
+                    return Err(GitWorktreeError::DirtyWorktree);
+                }
+            }
+            if let Some(marker_directory) = root.open_child_directory(GIT_CATALOG_DIRECTORY)? {
+                if marker_directory.identity()? != intent.marker_directory_id {
+                    return Err(GitWorktreeError::Conflict);
+                }
+                if let Some(actual) = marker_directory.entry_identity(MARKER_NAME, false)? {
+                    if actual != intent.marker_id {
+                        return Err(GitWorktreeError::Conflict);
+                    }
+                    verify_marker(&root, info)?;
+                    marker_directory.remove_child_file_if_identity(MARKER_NAME, actual)?;
+                }
+                if !root.remove_empty_child_directory(
+                    GIT_CATALOG_DIRECTORY,
+                    intent.marker_directory_id,
+                )? {
+                    return Err(GitWorktreeError::DirtyWorktree);
+                }
+            }
+            if !parent.remove_empty_child_directory(root_name, intent.root_id)? {
+                return Err(GitWorktreeError::DirtyWorktree);
+            }
+            run_after_removal_root_hook();
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if parent.entry_identity(root_name, true)?.is_some() {
+        return Err(GitWorktreeError::DirtyWorktree);
+    }
+    let index_kind = index_kind_for_scope(scope);
+    let mut deletions = control
+        .records(&index_kind)?
+        .into_iter()
+        .map(|(key, _)| (index_kind.clone(), key))
+        .collect::<Vec<_>>();
+    deletions.push((head_kind, b"branch".to_vec()));
+    deletions.push((kind, info.worktree_id.as_bytes().to_vec()));
+    control.put_records_and_retire_and_delete_if_value(
+        &[],
+        &deletions,
+        &record_kind(info.repository_id),
+        info.worktree_id.as_bytes(),
+        encoded_registration,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn remove_worktree(
+    control: &ControlStore,
+    repository_id: Uuid,
+    worktree_id: Uuid,
+) -> Result<GitWorktreeInfo, GitWorktreeError> {
+    let kind = record_kind(repository_id);
+    let encoded = control
+        .get_record(&kind, worktree_id.as_bytes())?
+        .ok_or(GitWorktreeError::NotRegistered)?;
+    let info: GitWorktreeInfo = decode_canonical(&encoded)?;
+    validate(&info, repository_id, worktree_id.as_bytes())?;
+    match info.state {
+        GitWorktreeState::Preparing => return Err(GitWorktreeError::PendingOperation),
+        GitWorktreeState::Ready => begin_remove_worktree(control, &info, &encoded)?,
+        GitWorktreeState::Removing => {}
+    }
+    let encoded = control
+        .get_record(&kind, worktree_id.as_bytes())?
+        .ok_or(GitWorktreeError::Conflict)?;
+    let removing: GitWorktreeInfo = decode_canonical(&encoded)?;
+    validate(&removing, repository_id, worktree_id.as_bytes())?;
+    if removing.state != GitWorktreeState::Removing {
+        return Err(GitWorktreeError::Conflict);
+    }
+    resume_remove_worktree(control, &removing, &encoded)?;
+    Ok(removing)
 }
 
 pub(crate) fn record_kind(repository_id: Uuid) -> String {
@@ -165,7 +592,7 @@ fn ready_info_with_selected_branch(
     control: &ControlStore,
     mut info: GitWorktreeInfo,
 ) -> Result<GitWorktreeInfo, GitWorktreeError> {
-    if info.state == GitWorktreeState::Ready {
+    if info.state != GitWorktreeState::Preparing {
         let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
         if control
             .get_record(&head_kind_for_scope(scope), b"branch")?
@@ -208,6 +635,9 @@ pub(crate) fn prune_missing_worktree(
         .ok_or(GitWorktreeError::NotRegistered)?;
     let info: GitWorktreeInfo = decode_canonical(&encoded)?;
     validate(&info, repository_id, worktree_id.as_bytes())?;
+    if info.state == GitWorktreeState::Removing {
+        return Err(GitWorktreeError::PendingOperation);
+    }
     match fs::symlink_metadata(&info.path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Ok(_) => return Err(GitWorktreeError::StillPresent),
@@ -384,6 +814,9 @@ pub(crate) fn resume_worktree(
     source_backend: SourceBackendKind,
 ) -> Result<GitWorktreeInfo, GitWorktreeError> {
     let info = get_worktree(control, repository_id, worktree_id)?;
+    if info.state == GitWorktreeState::Removing {
+        return Err(GitWorktreeError::PendingOperation);
+    }
     let canonical = info.path.canonicalize()?;
     let root = PinnedDirectory::open(&info.path)?;
     if canonical != info.path

@@ -510,6 +510,24 @@ impl PinnedDirectory {
         unlink_pinned_name(&self.file, name, &pinned, false, name)
     }
 
+    /// Unlink a regular file only if its pinned identity is still the one
+    /// recorded before a replayable worktree cleanup began.
+    pub fn remove_child_file_if_identity(
+        &self,
+        name: impl AsRef<Path>,
+        expected: NativeFileId,
+    ) -> Result<(), AnchorError> {
+        let name = name.as_ref();
+        validate_single_component(name)?;
+        let pinned = open_path_no_xdev_beneath(&self.file, name)?;
+        let metadata = pinned.metadata()?;
+        if !metadata.is_file() || native_file_id(self.filesystem_id, &metadata) != expected {
+            return Err(AnchorError::PinnedFileChanged);
+        }
+        unlink_pinned_name(&self.file, name, &pinned, false, name)?;
+        self.sync_all()
+    }
+
     pub fn remove_child_directory(
         &self,
         name: impl AsRef<Path>,
@@ -842,6 +860,14 @@ impl PinnedDirectory {
     }
 
     pub fn remove_child_file(&self, _name: impl AsRef<Path>) -> Result<(), AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
+    pub fn remove_child_file_if_identity(
+        &self,
+        _name: impl AsRef<Path>,
+        _expected: NativeFileId,
+    ) -> Result<(), AnchorError> {
         Err(unsupported_pinned_directory())
     }
 
