@@ -25,6 +25,8 @@ local-request =
   / { "GuildAudit": { repair: bool } }
   / { "Unlock": { secret: bytes32-array } }
   / { "AddRoot": { path: tstr } }
+  / { "GitInit": { path: tstr } }
+  / { "GitAdd": { repository_id: uuid-text, path: tstr } }
   / "GuildStatus"
   / "GuildCreate"
   / "GuildInvite"
@@ -55,6 +57,8 @@ local-response =
   / "StorageReconciled"
   / { "GuildAudited": guild-audit-report }
   / { "RootAdded": protected-root }
+  / { "GitRepositoryInitialized": git-repository-info }
+  / { "GitFileStaged": git-staged-file }
   / { "Guild": null / guild-summary }
   / { "GuildInvite": { token: tstr, expires_at_unix_seconds: uint } }
   / { "GuildEventCommitted": { sequence: uint, event_hash: bytes32-array } }
@@ -130,6 +134,20 @@ protected-root = {
   path: tstr,
   filesystem_id: uint,
   root_inode: uint
+}
+
+git-repository-info = {
+  format_version: uint,
+  repository_id: uuid-text,
+  path: tstr
+}
+
+git-staged-file = {
+  format_version: uint,
+  repository_id: uuid-text,
+  path: tstr,
+  oid: tstr,
+  mode: uint
 }
 
 p2p-status = {

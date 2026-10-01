@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use super::{NodeStatus, ProtectedRoot};
+use super::{GitRepositoryInfo, GitStagedFile, NodeStatus, ProtectedRoot};
 use crate::{
     BackupJob, DhtRecoveryResult, GuildAuditReport, GuildSummary, SnapshotInfo, StorageScrubReport,
     StorageVolumeStatus, WireError,
@@ -50,6 +50,13 @@ pub enum LocalRequest {
         secret: UnlockSecret,
     },
     AddRoot {
+        path: PathBuf,
+    },
+    GitInit {
+        path: PathBuf,
+    },
+    GitAdd {
+        repository_id: Uuid,
         path: PathBuf,
     },
     GuildStatus,
@@ -114,6 +121,8 @@ pub enum LocalResponse {
     StorageReconciled,
     GuildAudited(GuildAuditReport),
     RootAdded(ProtectedRoot),
+    GitRepositoryInitialized(GitRepositoryInfo),
+    GitFileStaged(GitStagedFile),
     Guild(Option<GuildSummary>),
     GuildInvite {
         token: String,
@@ -267,5 +276,54 @@ mod tests {
         cddl_cat::validate_json_str("local-response-envelope", SCHEMA, &encoded).unwrap();
         let decoded: LocalResponseEnvelope = serde_json::from_str(&encoded).unwrap();
         assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn git_frontend_requests_and_responses_match_local_schema() {
+        let repository_id = Uuid::from_bytes([6; 16]);
+        for request in [
+            LocalRequest::GitInit {
+                path: PathBuf::from("/home/user/work"),
+            },
+            LocalRequest::GitAdd {
+                repository_id,
+                path: PathBuf::from("folder/file"),
+            },
+        ] {
+            let envelope = LocalRequestEnvelope {
+                format_version: LOCAL_WIRE_FORMAT_VERSION,
+                request_id: [9; 16],
+                request,
+            };
+            let encoded = serde_json::to_string(&envelope).unwrap();
+            cddl_cat::validate_json_str("local-request-envelope", SCHEMA, &encoded).unwrap();
+            let decoded: LocalRequestEnvelope<LocalRequest> =
+                serde_json::from_str(&encoded).unwrap();
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+        }
+        for response in [
+            LocalResponse::GitRepositoryInitialized(GitRepositoryInfo {
+                format_version: 1,
+                repository_id,
+                path: PathBuf::from("/home/user/work"),
+            }),
+            LocalResponse::GitFileStaged(GitStagedFile {
+                format_version: 1,
+                repository_id,
+                path: PathBuf::from("folder/file"),
+                oid: "81b2d75d7f1e1b71438019a1128f25986bebd588".to_owned(),
+                mode: 0o100644,
+            }),
+        ] {
+            let envelope = LocalResponseEnvelope {
+                format_version: LOCAL_WIRE_FORMAT_VERSION,
+                request_id: [9; 16],
+                result: Ok(response),
+            };
+            let encoded = serde_json::to_string(&envelope).unwrap();
+            cddl_cat::validate_json_str("local-response-envelope", SCHEMA, &encoded).unwrap();
+            let decoded: LocalResponseEnvelope = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+        }
     }
 }

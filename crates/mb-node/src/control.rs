@@ -47,6 +47,22 @@ pub struct ProtectedRoot {
     pub root_inode: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitRepositoryInfo {
+    pub format_version: u16,
+    pub repository_id: Uuid,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitStagedFile {
+    pub format_version: u16,
+    pub repository_id: Uuid,
+    pub path: PathBuf,
+    pub oid: String,
+    pub mode: u32,
+}
+
 impl ProtectedRoot {
     pub(crate) fn matches_identity(&self, filesystem: FilesystemIdentity, root_inode: u64) -> bool {
         match self.format_version {
@@ -346,6 +362,23 @@ async fn handle_request(
         LocalRequest::AddRoot { path } => {
             blocking_node(node, move |node| {
                 node.add_protected_root(&path).map(LocalResponse::RootAdded)
+            })
+            .await
+        }
+        LocalRequest::GitInit { path } => {
+            blocking_node(node, move |node| {
+                node.git_init(&path)
+                    .map(LocalResponse::GitRepositoryInitialized)
+            })
+            .await
+        }
+        LocalRequest::GitAdd {
+            repository_id,
+            path,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_add(repository_id, &path)
+                    .map(LocalResponse::GitFileStaged)
             })
             .await
         }

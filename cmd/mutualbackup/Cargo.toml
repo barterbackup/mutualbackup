@@ -9,6 +9,10 @@ rust-version.workspace = true
 name = "mutualbackup"
 path = "src/main.rs"
 
+[[bin]]
+name = "mutualgit"
+path = "src/bin/mutualgit.rs"
+
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true

@@ -1,0 +1,147 @@
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use mb_node::{LocalRequest, LocalResponse, local_control_call};
+use mb_store::git_catalog_marker;
+use mutualbackup::default_control_socket;
+use uuid::Uuid;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "mutualgit",
+    version,
+    about = "Git-compatible MutualBackup history"
+)]
+struct Cli {
+    /// Run as if started in this directory.
+    #[arg(short = 'C', global = true)]
+    directory: Option<PathBuf>,
+    /// Local mutualbackupd control socket.
+    #[arg(long, global = true)]
+    socket: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Enroll this directory as a protected Git-compatible repository.
+    Init { directory: Option<PathBuf> },
+    /// Stage exact regular-file bytes in native reflink anchors.
+    Add {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let working_directory = cli
+        .directory
+        .unwrap_or(std::env::current_dir()?)
+        .canonicalize()
+        .context("cannot resolve working directory")?;
+    let socket = cli.socket.unwrap_or_else(default_control_socket);
+    match cli.command {
+        Command::Init { directory } => {
+            let root = directory
+                .map(|path| working_directory.join(path))
+                .unwrap_or(working_directory);
+            let LocalResponse::GitRepositoryInitialized(info) =
+                local_control_call(&socket, &LocalRequest::GitInit { path: root }).await?
+            else {
+                bail!("daemon returned the wrong response to Git initialization");
+            };
+            println!(
+                "Initialized MutualBackup Git repository {} in {}",
+                info.repository_id,
+                info.path.display()
+            );
+        }
+        Command::Add { paths } => {
+            let (root, repository_id) = discover_repository(&working_directory)?;
+            for path in paths {
+                let relative = relative_for_add(&root, &working_directory, &path)?;
+                let LocalResponse::GitFileStaged(staged) = local_control_call(
+                    &socket,
+                    &LocalRequest::GitAdd {
+                        repository_id,
+                        path: relative,
+                    },
+                )
+                .await?
+                else {
+                    bail!("daemon returned the wrong response to Git add");
+                };
+                if staged.repository_id != repository_id {
+                    bail!("daemon staged a file for another repository");
+                }
+                println!("staged {} {} (local)", staged.oid, staged.path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn discover_repository(start: &Path) -> Result<(PathBuf, Uuid)> {
+    for directory in start.ancestors() {
+        if let Some(repository_id) = git_catalog_marker(directory)? {
+            return Ok((directory.to_path_buf(), repository_id));
+        }
+    }
+    bail!("no initialized MutualBackup Git repository contains this directory")
+}
+
+fn relative_for_add(root: &Path, working_directory: &Path, path: &Path) -> Result<PathBuf> {
+    let candidate = if path.is_absolute() {
+        path.strip_prefix(root)
+            .context("file is outside the repository")?
+            .to_path_buf()
+    } else {
+        working_directory
+            .strip_prefix(root)
+            .context("working directory is outside the repository")?
+            .join(path)
+    };
+    let mut parts = Vec::<OsString>::new();
+    for component in candidate.components() {
+        match component {
+            Component::Normal(name) => parts.push(name.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    bail!("file is outside the repository");
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => bail!("invalid repository path"),
+        }
+    }
+    if parts.is_empty() {
+        bail!("add requires a file path");
+    }
+    Ok(parts.iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_paths_stay_inside_the_marked_repository() {
+        let root = Path::new("/project");
+        let subdir = Path::new("/project/src");
+        assert_eq!(
+            relative_for_add(root, subdir, Path::new("../README.md")).unwrap(),
+            Path::new("README.md")
+        );
+        assert_eq!(
+            relative_for_add(root, subdir, Path::new("./main.rs")).unwrap(),
+            Path::new("src/main.rs")
+        );
+        assert!(relative_for_add(root, subdir, Path::new("../../escape")).is_err());
+        assert!(relative_for_add(root, subdir, Path::new("/outside")).is_err());
+    }
+}

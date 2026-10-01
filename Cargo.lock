@@ -3949,6 +3949,7 @@ dependencies = [
  "libc",
  "libp2p",
  "mb-core",
+ "mb-git",
  "mb-store",
  "notify",
  "portmapper",

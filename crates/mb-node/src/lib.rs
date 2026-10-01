@@ -13,9 +13,9 @@ mod wire;
 
 pub use automation::{run_automatic_backups, run_periodic_audits};
 pub use control::{
-    LocalControlConnection, LocalControlListener, LocalRequest, LocalResponse, NodeStatus,
-    ProtectedRoot, UnlockSecret, bind_local_control, local_control_call, serve_local_control,
-    serve_local_control_on,
+    GitRepositoryInfo, GitStagedFile, LocalControlConnection, LocalControlListener, LocalRequest,
+    LocalResponse, NodeStatus, ProtectedRoot, UnlockSecret, bind_local_control, local_control_call,
+    serve_local_control, serve_local_control_on,
 };
 pub use mb_core::{KeyMaterial, NodeId, Seed};
 pub use network::{

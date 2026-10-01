@@ -26,6 +26,7 @@ use mb_core::{
     open_recovery_record, packing_protected_root, replay_coding_transcript, seal_recovery_record,
     sector_root, sign_guild_event, sign_legacy_coding_add_binding, synthetic_filler_sector,
 };
+use mb_git::GitRepository;
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
     VariableParityObject, filesystem_identity, probe_reflink,
@@ -34,7 +35,7 @@ use rand::RngCore;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::control::{NodeStatus, ProtectedRoot};
+use crate::control::{GitRepositoryInfo, GitStagedFile, NodeStatus, ProtectedRoot};
 use crate::snapshot::{
     WriterCredentials, abandon_recovered_anchor_capture, build_revision_restore,
     install_inline_recipe, install_recovered_sector_recipe, make_restore_root_private_at,
@@ -1312,6 +1313,86 @@ impl Node {
 
     pub fn add_protected_root(&mut self, source_root: &Path) -> Result<ProtectedRoot> {
         self.register_protected_root(source_root, None, true, true)
+    }
+
+    fn git_catalog_key(&self, repository_id: Uuid) -> [u8; 32] {
+        let mut database_id = b"git-catalog-v1/".to_vec();
+        database_id.extend_from_slice(repository_id.as_bytes());
+        self.keys.database_key(&database_id)
+    }
+
+    pub fn git_init(&mut self, source_root: &Path) -> Result<GitRepositoryInfo> {
+        let source_root = source_root
+            .canonicalize()
+            .with_context(|| format!("cannot resolve Git root {}", source_root.display()))?;
+        if fs::symlink_metadata(source_root.join(".git")).is_ok() {
+            anyhow::bail!("ordinary .git storage already exists; use an explicit import path");
+        }
+        let root = self.add_protected_root(&source_root)?;
+        let key = self.git_catalog_key(root.root_id);
+        let repository = GitRepository::init(&root.path, root.root_id, &key)?;
+        if repository.id() != root.root_id {
+            anyhow::bail!("Git catalog does not match the protected root");
+        }
+        let info = GitRepositoryInfo {
+            format_version: 1,
+            repository_id: root.root_id,
+            path: root.path,
+        };
+        if let Some(encoded) = self
+            .control
+            .get_record("git-repository", info.repository_id.as_bytes())?
+        {
+            let existing: GitRepositoryInfo = decode_canonical(&encoded)?;
+            if existing != info {
+                anyhow::bail!("Git repository registration conflicts with its protected root");
+            }
+        } else {
+            self.control.put_record_if_absent(
+                "git-repository",
+                info.repository_id.as_bytes(),
+                &canonical_bytes(&info)?,
+            )?;
+        }
+        Ok(info)
+    }
+
+    pub fn git_add(&mut self, repository_id: Uuid, path: &Path) -> Result<GitStagedFile> {
+        let encoded = self
+            .control
+            .get_record("git-repository", repository_id.as_bytes())?
+            .context("Git repository is not registered with this daemon")?;
+        let info: GitRepositoryInfo = decode_canonical(&encoded)?;
+        let root = self.protected_root_by_id(repository_id)?;
+        if info.format_version != 1 || info.repository_id != repository_id || info.path != root.path
+        {
+            anyhow::bail!("Git repository registration is invalid");
+        }
+        let metadata = fs::symlink_metadata(&root.path)?;
+        #[cfg(unix)]
+        let root_inode = {
+            use std::os::unix::fs::MetadataExt;
+            metadata.ino()
+        };
+        #[cfg(not(unix))]
+        let root_inode = 0;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || !root.matches_identity(filesystem_identity(&root.path)?, root_inode)
+        {
+            anyhow::bail!("protected Git root identity changed");
+        }
+        let key = self.git_catalog_key(repository_id);
+        let repository = GitRepository::open(&root.path, repository_id, &key)?;
+        repository.resume_pending_stages()?;
+        let entry = repository.stage_file(path)?;
+        Ok(GitStagedFile {
+            format_version: 1,
+            repository_id,
+            path: path.to_path_buf(),
+            oid: hex::encode(entry.oid),
+            mode: entry.mode,
+        })
     }
 
     fn register_protected_root(
@@ -15012,6 +15093,44 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(reopened.protected_roots().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn git_repository_init_and_add_survive_daemon_reopen() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-node-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("tracked"), b"first\r\nbytes\0").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let seed = Seed::from_bytes([243; 32]);
+        let mut node = Node::open(data.path(), seed.clone()).unwrap();
+        let info = node.git_init(&source_root).unwrap();
+        assert_eq!(info.path, source_root);
+        assert_eq!(
+            info.repository_id,
+            node.git_init(&source_root).unwrap().repository_id
+        );
+        let first = node
+            .git_add(info.repository_id, Path::new("tracked"))
+            .unwrap();
+        assert_eq!(first.mode, 0o100644);
+        drop(node);
+
+        let mut reopened = Node::open(data.path(), seed).unwrap();
+        fs::write(source_root.join("tracked"), b"second\nbytes").unwrap();
+        let second = reopened
+            .git_add(info.repository_id, Path::new("tracked"))
+            .unwrap();
+        assert_ne!(first.oid, second.oid);
+        assert_eq!(second.repository_id, info.repository_id);
+        assert!(source_root.join(".mutualbackup/catalog.db").exists());
+        drop(reopened);
+        fs::remove_dir_all(run_root).unwrap();
     }
 
     #[test]
