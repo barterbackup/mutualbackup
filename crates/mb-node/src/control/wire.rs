@@ -130,6 +130,10 @@ pub enum LocalRequest {
     GitPullBare {
         repository_id: Uuid,
         path: PathBuf,
+        #[serde(default)]
+        author_name: String,
+        #[serde(default)]
+        author_email: String,
     },
     GitMergeBranch {
         repository_id: Uuid,
@@ -480,6 +484,8 @@ mod tests {
             LocalRequest::GitPullBare {
                 repository_id,
                 path: PathBuf::from("/home/user/remote.git"),
+                author_name: "Author".to_owned(),
+                author_email: "a@example.test".to_owned(),
             },
             LocalRequest::GitMergeBranch {
                 repository_id,
@@ -519,6 +525,26 @@ mod tests {
         assert!(matches!(
             decoded.request,
             LocalRequest::GitMergeBranch {
+                author_name,
+                author_email,
+                ..
+            } if author_name.is_empty() && author_email.is_empty()
+        ));
+        let older_pull = serde_json::json!({
+            "format_version": LOCAL_WIRE_FORMAT_VERSION,
+            "request_id": vec![9_u8; 16],
+            "request": { "GitPullBare": {
+                "repository_id": repository_id,
+                "path": "/home/user/remote.git"
+            }}
+        });
+        let older_pull = serde_json::to_string(&older_pull).unwrap();
+        cddl_cat::validate_json_str("local-request-envelope", SCHEMA, &older_pull).unwrap();
+        let decoded: LocalRequestEnvelope<LocalRequest> =
+            serde_json::from_str(&older_pull).unwrap();
+        assert!(matches!(
+            decoded.request,
+            LocalRequest::GitPullBare {
                 author_name,
                 author_email,
                 ..

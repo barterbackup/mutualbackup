@@ -479,15 +479,21 @@ impl GitRepository {
         )?)
     }
 
-    /// Fetch origin and fast-forward the selected branch through the same
-    /// crash-replayable, dirty-worktree-safe transition as branch checkout.
-    pub fn pull_bare(&self, source: impl AsRef<Path>) -> Result<Oid, RepositoryError> {
+    /// Fetch origin and merge it through the replayable checkout transition.
+    pub fn pull_bare(
+        &self,
+        source: impl AsRef<Path>,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<Oid, RepositoryError> {
         self.fetch_bare(source)?;
         Ok(begin_pull(
             &self.catalog,
             self.repository_id,
             &self.root,
             &self.directory,
+            author_name,
+            author_email,
         )?)
     }
 
@@ -1146,6 +1152,115 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn divergent_bare_pull_replays_two_parent_merge_without_moving_remote_ref() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-divergent-pull-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        let bare_root = run_root.join("remote.git");
+        fs::create_dir_all(&source_root).unwrap();
+        let remote = git2::Repository::init_bare(&bare_root).unwrap();
+        let signature = git2::Signature::now("Remote", "remote@example.invalid").unwrap();
+        let left = remote.blob(b"left\r\nbase\0").unwrap();
+        let right = remote.blob(b"right\nbase\0").unwrap();
+        let mut base_builder = remote.treebuilder(None).unwrap();
+        base_builder.insert("left", left, 0o100644).unwrap();
+        base_builder.insert("right", right, 0o100644).unwrap();
+        let base_tree = remote.find_tree(base_builder.write().unwrap()).unwrap();
+        let base = remote
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "base",
+                &base_tree,
+                &[],
+            )
+            .unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [96_u8; 32];
+        let local = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        assert_eq!(local.pull_bare(&bare_root, "", "").unwrap(), base);
+        fs::write(source_root.join("left"), b"left\nlocal\0").unwrap();
+        local.stage_file("left").unwrap();
+        let ours = local
+            .commit("Local", "local@example.invalid", "local")
+            .unwrap();
+
+        let new_right = remote.blob(b"right\r\nremote\0").unwrap();
+        let mut remote_builder = remote.treebuilder(None).unwrap();
+        remote_builder.insert("left", left, 0o100644).unwrap();
+        remote_builder.insert("right", new_right, 0o100644).unwrap();
+        let remote_tree = remote.find_tree(remote_builder.write().unwrap()).unwrap();
+        let base_commit = remote.find_commit(base).unwrap();
+        let theirs = remote
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "remote",
+                &remote_tree,
+                &[&base_commit],
+            )
+            .unwrap();
+        crate::checkout::set_after_checkout_file_hook(Box::new(|| panic!("divergent pull crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local
+                .pull_bare(&bare_root, "Local", "local@example.invalid")
+                .unwrap();
+        }));
+        assert!(interrupted.is_err());
+        assert_eq!(
+            crate::history::ref_oid(&local.catalog, repository_id, b"refs/heads/main").unwrap(),
+            Some(Oid::from_bytes(&ours.oid).unwrap())
+        );
+        drop(local);
+        let local = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        let merged = Oid::from_bytes(&local.status().unwrap().head_oid.unwrap()).unwrap();
+        assert_ne!(merged.as_bytes(), ours.oid);
+        assert_ne!(merged, theirs);
+        assert_eq!(
+            fs::read(source_root.join("left")).unwrap(),
+            b"left\nlocal\0"
+        );
+        assert_eq!(
+            fs::read(source_root.join("right")).unwrap(),
+            b"right\r\nremote\0"
+        );
+        assert_eq!(
+            local.log(1).unwrap()[0].parent_oids,
+            vec![ours.oid, theirs.as_bytes().try_into().unwrap()]
+        );
+        assert_eq!(
+            crate::history::ref_oid(&local.catalog, repository_id, b"refs/remotes/origin/main")
+                .unwrap(),
+            Some(theirs)
+        );
+        assert_eq!(remote.refname_to_id("refs/heads/main").unwrap(), theirs);
+        assert_eq!(local.pull_bare(&bare_root, "", "").unwrap(), merged);
+        local.push_current_branch_to_bare(&bare_root).unwrap();
+        let exported = remote.find_commit(merged).unwrap();
+        assert_eq!(exported.parent_id(0).unwrap().as_bytes(), ours.oid);
+        assert_eq!(exported.parent_id(1).unwrap(), theirs);
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
+        drop(exported);
+        drop(base_commit);
+        drop(base_tree);
+        drop(remote_tree);
+        drop(base_builder);
+        drop(remote_builder);
+        drop(remote);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn bare_git_pull_fast_forwards_exact_bytes_and_replays_checkout() {
         let test_root = PathBuf::from(
             std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
@@ -1179,7 +1294,7 @@ mod tests {
         let local = GitRepository::init(&source_root, repository_id, &key).unwrap();
         fs::write(source_root.join("tracked"), b"untracked collision").unwrap();
         assert!(matches!(
-            local.pull_bare(&bare_root),
+            local.pull_bare(&bare_root, "", ""),
             Err(RepositoryError::Checkout(
                 crate::CheckoutError::DirtyWorktree
             ))
@@ -1190,7 +1305,7 @@ mod tests {
         );
         assert!(local.status().unwrap().head_oid.is_none());
         fs::remove_file(source_root.join("tracked")).unwrap();
-        assert_eq!(local.pull_bare(&bare_root).unwrap(), first);
+        assert_eq!(local.pull_bare(&bare_root, "", "").unwrap(), first);
         assert_eq!(
             fs::read(source_root.join("tracked")).unwrap(),
             b"first\r\nbytes\0"
@@ -1199,7 +1314,7 @@ mod tests {
             local.status().unwrap().head_oid.unwrap().as_slice(),
             first.as_bytes()
         );
-        assert_eq!(local.pull_bare(&bare_root).unwrap(), first);
+        assert_eq!(local.pull_bare(&bare_root, "", "").unwrap(), first);
 
         let second_blob = remote.blob(b"second\nbytes\r\n").unwrap();
         let link_blob = remote.blob(b"missing\r\npath").unwrap();
@@ -1222,7 +1337,7 @@ mod tests {
             .unwrap();
         fs::write(source_root.join("tracked"), b"dirty local bytes").unwrap();
         assert!(matches!(
-            local.pull_bare(&bare_root),
+            local.pull_bare(&bare_root, "", ""),
             Err(RepositoryError::Checkout(
                 crate::CheckoutError::DirtyWorktree
             ))
@@ -1238,7 +1353,7 @@ mod tests {
         fs::write(source_root.join("tracked"), b"first\r\nbytes\0").unwrap();
         crate::checkout::set_after_checkout_file_hook(Box::new(|| panic!("pull crash")));
         let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            local.pull_bare(&bare_root).unwrap();
+            local.pull_bare(&bare_root, "", "").unwrap();
         }));
         assert!(interrupted.is_err());
         drop(local);
@@ -1272,7 +1387,7 @@ mod tests {
             .unwrap();
         crate::checkout::set_after_checkout_commit_hook(Box::new(|| panic!("pull commit crash")));
         let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            local.pull_bare(&bare_root).unwrap();
+            local.pull_bare(&bare_root, "", "").unwrap();
         }));
         assert!(interrupted.is_err());
         drop(local);
@@ -1309,9 +1424,9 @@ mod tests {
             .commit("Local", "local@example.invalid", "local third")
             .unwrap();
         assert!(matches!(
-            local.pull_bare(&bare_root),
+            local.pull_bare(&bare_root, "", ""),
             Err(RepositoryError::Checkout(
-                crate::CheckoutError::NonFastForward
+                crate::CheckoutError::MissingMergeIdentity
             ))
         ));
         assert_eq!(

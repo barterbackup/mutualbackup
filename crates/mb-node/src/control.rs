@@ -553,9 +553,11 @@ async fn handle_request(
         LocalRequest::GitPullBare {
             repository_id,
             path,
+            author_name,
+            author_email,
         } => {
             blocking_node(node, move |node| {
-                node.git_pull_bare(repository_id, &path)
+                node.git_pull_bare(repository_id, &path, &author_name, &author_email)
                     .map(|oid| LocalResponse::GitPulled { repository_id, oid })
             })
             .await

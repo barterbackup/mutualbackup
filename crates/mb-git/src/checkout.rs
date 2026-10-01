@@ -140,11 +140,9 @@ pub enum CheckoutError {
     TooManyFiles,
     #[error("the selected branch has no matching origin branch to pull")]
     MissingRemoteBranch,
-    #[error("the selected branch has diverged from origin; pull requires a fast-forward")]
-    NonFastForward,
     #[error("the requested merge branch does not exist")]
     MissingMergeBranch,
-    #[error("a divergent merge needs an author name and email")]
+    #[error("a divergent merge or pull needs an author name and email")]
     MissingMergeIdentity,
 }
 
@@ -209,6 +207,16 @@ struct CheckoutTarget<'a> {
     advance_ref: bool,
     target_ref: Option<&'a [u8]>,
     merge_commit: bool,
+}
+
+struct DivergentMerge<'a> {
+    selected: &'a str,
+    old: Oid,
+    target: Oid,
+    source_ref: &'a [u8],
+    author_name: &'a str,
+    author_email: &'a str,
+    message: &'a str,
 }
 
 /// Version 1 intents may remain on disk after an interrupted older checkout.
@@ -631,8 +639,13 @@ fn validate_intent(intent: &CheckoutIntent, repository_id: Uuid) -> Result<(), C
             let Ok(name) = std::str::from_utf8(reference) else {
                 return true;
             };
-            reference.len() > "refs/heads/".len() + 1024
-                || !name.starts_with("refs/heads/")
+            let prefix = if intent.format_version == 6 && name.starts_with("refs/remotes/origin/") {
+                "refs/remotes/origin/"
+            } else {
+                "refs/heads/"
+            };
+            reference.len() > prefix.len() + 1024
+                || !name.starts_with(prefix)
                 || !git2::Reference::is_valid_name(name)
         })
         || intent.advance_ref
@@ -981,6 +994,8 @@ pub(crate) fn begin_pull(
     repository_id: Uuid,
     root_path: &Path,
     catalog_dir: &PinnedDirectory,
+    author_name: &str,
+    author_email: &str,
 ) -> Result<Oid, CheckoutError> {
     resume_pending_checkout(control, repository_id, root_path, catalog_dir)?;
     let branch = selected_branch(control, repository_id)?;
@@ -994,7 +1009,25 @@ pub(crate) fn begin_pull(
             return Ok(target);
         }
         if !commit_descends_from(control, repository_id, target, old)? {
-            return Err(CheckoutError::NonFastForward);
+            if commit_descends_from(control, repository_id, old, target)? {
+                return Ok(old);
+            }
+            let message = format!("Merge remote-tracking branch 'origin/{branch}'");
+            return begin_divergent_merge(
+                control,
+                repository_id,
+                root_path,
+                catalog_dir,
+                DivergentMerge {
+                    selected: &branch,
+                    old,
+                    target,
+                    source_ref: remote_ref.as_bytes(),
+                    author_name,
+                    author_email,
+                    message: &message,
+                },
+            );
         }
     }
     begin_checkout_to(
@@ -1044,42 +1077,22 @@ pub(crate) fn begin_merge_branch(
             if commit_descends_from(control, repository_id, old, target)? {
                 return Ok(old);
             }
-            if author_name.is_empty() || author_email.is_empty() {
-                return Err(CheckoutError::MissingMergeIdentity);
-            }
-            let status = repository_status(control, repository_id, root_path)?;
-            if !status.changes.is_empty() || !status.pending_adds.is_empty() {
-                return Err(CheckoutError::DirtyWorktree);
-            }
             let message = format!("Merge branch '{branch}'");
-            let merged = create_pathwise_merge_commit(
-                control,
-                repository_id,
-                root_path,
-                old,
-                target,
-                MergeIdentity {
-                    name: author_name,
-                    email: author_email,
-                    message: &message,
-                },
-            )?;
-            begin_checkout_to(
+            return begin_divergent_merge(
                 control,
                 repository_id,
                 root_path,
                 catalog_dir,
-                CheckoutTarget {
-                    old_branch: &selected,
-                    old_oid: Some(old),
-                    new_branch: &selected,
-                    new_oid: merged,
-                    advance_ref: true,
-                    target_ref: Some(source_ref.as_bytes()),
-                    merge_commit: true,
+                DivergentMerge {
+                    selected: &selected,
+                    old,
+                    target,
+                    source_ref: source_ref.as_bytes(),
+                    author_name,
+                    author_email,
+                    message: &message,
                 },
-            )?;
-            return Ok(merged);
+            );
         }
     }
     begin_checkout_to(
@@ -1098,6 +1111,50 @@ pub(crate) fn begin_merge_branch(
         },
     )?;
     Ok(target)
+}
+
+fn begin_divergent_merge(
+    control: &ControlStore,
+    repository_id: Uuid,
+    root_path: &Path,
+    catalog_dir: &PinnedDirectory,
+    merge: DivergentMerge<'_>,
+) -> Result<Oid, CheckoutError> {
+    if merge.author_name.is_empty() || merge.author_email.is_empty() {
+        return Err(CheckoutError::MissingMergeIdentity);
+    }
+    let status = repository_status(control, repository_id, root_path)?;
+    if !status.changes.is_empty() || !status.pending_adds.is_empty() {
+        return Err(CheckoutError::DirtyWorktree);
+    }
+    let merged = create_pathwise_merge_commit(
+        control,
+        repository_id,
+        root_path,
+        merge.old,
+        merge.target,
+        MergeIdentity {
+            name: merge.author_name,
+            email: merge.author_email,
+            message: merge.message,
+        },
+    )?;
+    begin_checkout_to(
+        control,
+        repository_id,
+        root_path,
+        catalog_dir,
+        CheckoutTarget {
+            old_branch: merge.selected,
+            old_oid: Some(merge.old),
+            new_branch: merge.selected,
+            new_oid: merged,
+            advance_ref: true,
+            target_ref: Some(merge.source_ref),
+            merge_commit: true,
+        },
+    )?;
+    Ok(merged)
 }
 
 fn begin_checkout_to(

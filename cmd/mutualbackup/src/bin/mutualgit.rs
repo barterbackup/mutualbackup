@@ -91,8 +91,14 @@ enum Command {
     Push { destination: PathBuf },
     /// Fetch branches from an existing local bare Git repository.
     Fetch { source: PathBuf },
-    /// Fetch and fast-forward the selected branch from a local bare repository.
-    Pull { source: PathBuf },
+    /// Fetch and merge the selected branch from a local bare repository.
+    Pull {
+        source: PathBuf,
+        #[arg(long)]
+        author_name: Option<String>,
+        #[arg(long)]
+        author_email: Option<String>,
+    },
     /// Merge a local branch into the selected branch.
     Merge {
         branch: String,
@@ -510,9 +516,23 @@ async fn main() -> Result<()> {
                 source.display()
             );
         }
-        Command::Pull { source } => {
+        Command::Pull {
+            source,
+            author_name,
+            author_email,
+        } => {
             let (_, repository_id) = discover_repository(&working_directory)?;
             let source = working_directory.join(source);
+            let author_name = match author_name {
+                Some(value) => value,
+                None => optional_author_field("GIT_AUTHOR_NAME", "user.name")?.unwrap_or_default(),
+            };
+            let author_email = match author_email {
+                Some(value) => value,
+                None => {
+                    optional_author_field("GIT_AUTHOR_EMAIL", "user.email")?.unwrap_or_default()
+                }
+            };
             let LocalResponse::GitPulled {
                 repository_id: returned_id,
                 oid,
@@ -521,6 +541,8 @@ async fn main() -> Result<()> {
                 &LocalRequest::GitPullBare {
                     repository_id,
                     path: source.clone(),
+                    author_name,
+                    author_email,
                 },
             )
             .await?

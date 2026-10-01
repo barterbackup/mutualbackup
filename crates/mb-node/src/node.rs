@@ -1601,8 +1601,16 @@ impl Node {
         Ok(u32::try_from(count).expect("bounded Git ref count"))
     }
 
-    pub fn git_pull_bare(&self, repository_id: Uuid, path: &Path) -> Result<[u8; 20]> {
-        let oid = self.open_git_repository(repository_id)?.pull_bare(path)?;
+    pub fn git_pull_bare(
+        &self,
+        repository_id: Uuid,
+        path: &Path,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<[u8; 20]> {
+        let oid =
+            self.open_git_repository(repository_id)?
+                .pull_bare(path, author_name, author_email)?;
         Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
     }
 
@@ -15570,7 +15578,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             reopened
-                .git_pull_bare(info.repository_id, &bare_root)
+                .git_pull_bare(info.repository_id, &bare_root, "", "")
                 .unwrap(),
             second_commit.oid
         );
