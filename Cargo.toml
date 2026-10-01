@@ -2,6 +2,7 @@
 members = [
     "crates/mb-core",
     "crates/mb-store",
+    "crates/mb-git",
     "crates/mb-node",
     "cmd/mutualbackup",
     "vendor/libp2p-relay",
@@ -31,6 +32,7 @@ conf = "=0.4.5"
 data-encoding = "2.9"
 ed25519-dalek = { version = "2.2", features = ["rand_core", "serde"] }
 futures = "0.3"
+git2 = { version = "=0.21.0", default-features = false, features = ["vendored-libgit2"] }
 filetime = "0.2"
 fs2 = "0.4"
 hex = "0.4"

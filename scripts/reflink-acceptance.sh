@@ -13,6 +13,7 @@ fi
 
 cargo test -p mb-store anchor::tests::stable_locator_survives_parent_rename --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::single_file_reflink_anchor_preserves_staged_bytes_without_sibling_capture --locked -- --ignored --exact
+cargo test -p mb-git tests::git_blob_oid_hashes_exact_anchor_bytes_after_worktree_edit --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::nested_btrfs_subvolumes_are_rejected_before_and_during_capture --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::capture_walk_remains_bound_to_the_open_root --locked -- --ignored --exact
 cargo test -p mb-store anchor::tests::capture_walk_enumerates_a_descendant_through_its_pinned_descriptor --locked -- --ignored --exact
