@@ -370,6 +370,15 @@ pub enum LocalRequest {
         repository_id: Uuid,
         worktree_id: Uuid,
     },
+    GitRemoveTracked {
+        repository_id: Uuid,
+        path: PathBuf,
+    },
+    GitWorktreeRemoveTracked {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -656,6 +665,15 @@ mod tests {
             LocalRequest::GitWorktreeRemove {
                 repository_id,
                 worktree_id: Uuid::from_bytes([5; 16]),
+            },
+            LocalRequest::GitRemoveTracked {
+                repository_id,
+                path: PathBuf::from("tracked"),
+            },
+            LocalRequest::GitWorktreeRemoveTracked {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                path: PathBuf::from("tracked"),
             },
             LocalRequest::GitWorktreeStatus {
                 repository_id,

@@ -26,6 +26,10 @@ mutualgit -C /absolute/path/to/source status
 The local binary supports branches, linked worktrees, exact-byte checkout,
 merge, staged reset, hard reset, worktree restore, diff, log, explicit commit pins,
 and prune.
+`mutualgit rm PATH` removes a clean tracked file or symlink and stages its
+deletion. It rejects staged or working-tree changes, and replays an interrupted
+unlink before clearing the index. `mutualgit rm --cached PATH` keeps the working
+file.
 `mutualgit worktree list` reports the current branch of each ready worktree;
 an interrupted addition reports its reserved target branch.
 `mutualgit worktree remove WORKTREE_ID` removes a clean linked worktree's

@@ -44,6 +44,7 @@ use crate::merge::{
 use crate::prune::{
     GitPruneError, GitPruneReport, GitPruneRoots, prune_unreachable, resume_pending_prune,
 };
+use crate::rm::{GitRmError, remove_tracked_for_scope, resume_pending_rm_for_scope};
 use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, abandon_pending_stage_for_scope,
     anchors_for_oid, pending_stage_paths, remove_cached, remove_cached_for_scope,
@@ -92,6 +93,8 @@ pub enum RepositoryError {
     Prune(#[from] GitPruneError),
     #[error("Git linked worktree error: {0}")]
     Worktree(#[from] GitWorktreeError),
+    #[error("tracked Git removal failed: {0}")]
+    Rm(#[from] GitRmError),
     #[error("repository marker or catalog identity conflicts with this root")]
     Conflict,
     #[error("the Git repository is not initialized")]
@@ -344,6 +347,11 @@ impl GitRepository {
             &self.directory,
             self.source_backend,
         )?;
+        resume_pending_rm_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+            &info.path,
+        )?;
         Ok(info)
     }
 
@@ -432,6 +440,20 @@ impl GitRepository {
             &self.catalog,
             info.scope().ok_or(GitWorktreeError::Conflict)?,
             relative_path,
+        )?)
+    }
+
+    pub fn linked_remove_tracked(
+        &self,
+        worktree_id: Uuid,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<bool, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        Ok(remove_tracked_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+            &info.path,
+            relative_path.as_ref(),
         )?)
     }
 
@@ -756,6 +778,17 @@ impl GitRepository {
         Ok(removed)
     }
 
+    pub fn remove_tracked(&self, relative_path: impl AsRef<Path>) -> Result<bool, RepositoryError> {
+        self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
+        Ok(remove_tracked_for_scope(
+            &self.catalog,
+            crate::GitWorktreeScope::primary(self.repository_id),
+            &self.root,
+            relative_path.as_ref(),
+        )?)
+    }
+
     pub fn resume_pending_stages(&self) -> Result<Vec<GitIndexEntry>, RepositoryError> {
         self.resume_checkout()?;
         let paths = pending_stage_paths(&self.catalog, self.repository_id)?;
@@ -984,13 +1017,19 @@ impl GitRepository {
 
     fn resume_checkout(&self) -> Result<(), RepositoryError> {
         resume_pending_merge_blob(&self.catalog, self.repository_id, &self.root)?;
-        Ok(resume_pending_checkout(
+        resume_pending_checkout(
             &self.catalog,
             self.repository_id,
             &self.root,
             &self.directory,
             self.source_backend,
-        )?)
+        )?;
+        resume_pending_rm_for_scope(
+            &self.catalog,
+            crate::GitWorktreeScope::primary(self.repository_id),
+            &self.root,
+        )?;
+        Ok(())
     }
 
     fn ensure_no_merge_session(&self) -> Result<(), RepositoryError> {
@@ -2206,6 +2245,116 @@ mod tests {
             1
         );
         assert!(staged_anchor.open_verified().is_err());
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn tracked_rm_preserves_dirty_bytes_and_replays_primary_and_linked_unlinks() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-tracked-rm-{}", Uuid::new_v4()));
+        let primary_root = run_root.join("primary");
+        let linked_root = run_root.join("linked");
+        fs::create_dir_all(&primary_root).unwrap();
+        fs::create_dir_all(&linked_root).unwrap();
+        fs::write(primary_root.join("tracked"), b"raw\r\n\0bytes").unwrap();
+        std::os::unix::fs::symlink("tracked", primary_root.join("link")).unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [201_u8; 32];
+        let local = GitRepository::init(&primary_root, repository_id, &key).unwrap();
+        local.stage_file("tracked").unwrap();
+        local.add_path("link").unwrap();
+        local.commit("Author", "a@example.test", "base").unwrap();
+        local.create_branch("topic").unwrap();
+        let linked = local.add_linked_worktree(&linked_root, "topic").unwrap();
+
+        fs::write(primary_root.join("tracked"), b"edited").unwrap();
+        assert!(local.remove_tracked("tracked").is_err());
+        assert_eq!(fs::read(primary_root.join("tracked")).unwrap(), b"edited");
+        assert!(local.staged_entry("tracked").unwrap().is_some());
+        fs::write(primary_root.join("tracked"), b"raw\r\n\0bytes").unwrap();
+
+        crate::rm::set_after_unlink_hook(Box::new(|| panic!("primary rm crash")));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                local.remove_tracked("tracked").unwrap();
+            }))
+            .is_err()
+        );
+        assert!(!primary_root.join("tracked").exists());
+        drop(local);
+
+        fs::write(primary_root.join("tracked"), b"replacement").unwrap();
+        assert!(GitRepository::open(&primary_root, repository_id, &key).is_err());
+        assert_eq!(
+            fs::read(primary_root.join("tracked")).unwrap(),
+            b"replacement"
+        );
+        fs::remove_file(primary_root.join("tracked")).unwrap();
+        let local = GitRepository::open(&primary_root, repository_id, &key).unwrap();
+        assert!(local.staged_entry("tracked").unwrap().is_none());
+        assert!(local.status().unwrap().changes.iter().any(|change| {
+            change.path == b"tracked" && change.staged == Some(crate::GitChange::Deleted)
+        }));
+        local
+            .commit("Author", "a@example.test", "remove tracked")
+            .unwrap();
+        assert!(primary_root.join("link").is_symlink());
+
+        crate::rm::set_after_unlink_hook(Box::new(|| panic!("linked rm crash")));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                local
+                    .linked_remove_tracked(linked.worktree_id, "link")
+                    .unwrap();
+            }))
+            .is_err()
+        );
+        assert!(fs::symlink_metadata(linked_root.join("link")).is_err());
+        drop(local);
+
+        let local = GitRepository::open(&primary_root, repository_id, &key).unwrap();
+        let status = local.linked_status(linked.worktree_id).unwrap();
+        assert!(status.changes.iter().any(|change| {
+            change.path == b"link" && change.staged == Some(crate::GitChange::Deleted)
+        }));
+        assert_eq!(
+            fs::read(linked_root.join("tracked")).unwrap(),
+            b"raw\r\n\0bytes"
+        );
+        assert!(primary_root.join("link").is_symlink());
+        local.create_branch_from("other", "topic").unwrap();
+        let other_root = run_root.join("other");
+        fs::create_dir(&other_root).unwrap();
+        let other = local.add_linked_worktree(&other_root, "other").unwrap();
+        crate::rm::set_after_unlink_hook(Box::new(|| panic!("missing linked rm")));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                local
+                    .linked_remove_tracked(other.worktree_id, "tracked")
+                    .unwrap();
+            }))
+            .is_err()
+        );
+        fs::remove_dir_all(&other_root).unwrap();
+        local
+            .prune_missing_linked_worktree(other.worktree_id, true)
+            .unwrap();
+        assert!(
+            local
+                .catalog
+                .records(&crate::rm::intent_kind_for_scope(other.scope().unwrap()))
+                .unwrap()
+                .is_empty()
+        );
         let graph = local.export_graph_source().unwrap();
         drop(local);
         for blob in graph.blobs {

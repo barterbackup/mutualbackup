@@ -31,6 +31,8 @@ local-request =
   / { "GitWorktreeResume": { repository_id: uuid-text, worktree_id: uuid-text } }
   / { "GitWorktreePrune": { repository_id: uuid-text, worktree_id: uuid-text, force: bool } }
   / { "GitWorktreeRemove": { repository_id: uuid-text, worktree_id: uuid-text } }
+  / { "GitRemoveTracked": { repository_id: uuid-text, path: tstr } }
+  / { "GitWorktreeRemoveTracked": { repository_id: uuid-text, worktree_id: uuid-text, path: tstr } }
   / { "GitWorktreeStatus": { repository_id: uuid-text, worktree_id: uuid-text } }
   / { "GitWorktreeAddPath": { repository_id: uuid-text, worktree_id: uuid-text, path: tstr } }
   / { "GitWorktreeRemoveCached": { repository_id: uuid-text, worktree_id: uuid-text, path: tstr } }

@@ -44,9 +44,9 @@ enum Command {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
-    /// Remove paths from the staged index while keeping working files.
+    /// Remove tracked paths from the index and working tree, or index only.
     Rm {
-        /// Required until worktree-removing `rm` is implemented.
+        /// Keep working files while removing the index entries.
         #[arg(long)]
         cached: bool,
         #[arg(required = true)]
@@ -374,19 +374,25 @@ async fn main() -> Result<()> {
             }
         }
         Command::Rm { cached, paths } => {
-            if !cached {
-                bail!("only `rm --cached` is supported; worktree files were not removed");
-            }
             let (root, repository_id, worktree_id) = discover_location(&working_directory)?;
             for path in paths {
                 let relative = relative_for_add(&root, &working_directory, &path)?;
-                let request = match worktree_id {
-                    Some(worktree_id) => LocalRequest::GitWorktreeRemoveCached {
+                let request = match (worktree_id, cached) {
+                    (Some(worktree_id), true) => LocalRequest::GitWorktreeRemoveCached {
                         repository_id,
                         worktree_id,
                         path: relative.clone(),
                     },
-                    None => LocalRequest::GitRemoveCached {
+                    (None, true) => LocalRequest::GitRemoveCached {
+                        repository_id,
+                        path: relative.clone(),
+                    },
+                    (Some(worktree_id), false) => LocalRequest::GitWorktreeRemoveTracked {
+                        repository_id,
+                        worktree_id,
+                        path: relative.clone(),
+                    },
+                    (None, false) => LocalRequest::GitRemoveTracked {
                         repository_id,
                         path: relative.clone(),
                     },
@@ -399,7 +405,11 @@ async fn main() -> Result<()> {
                 if !removed {
                     bail!("{} is not staged in the index", relative.display());
                 }
-                println!("removed {} from index", relative.display());
+                if cached {
+                    println!("removed {} from index", relative.display());
+                } else {
+                    println!("removed {}", relative.display());
+                }
             }
         }
         Command::Reset { hard, paths } => {

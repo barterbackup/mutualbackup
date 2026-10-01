@@ -64,7 +64,7 @@ pub enum StageError {
     Git(#[from] GitAnchorError),
     #[error("versioned local metadata error: {0}")]
     Model(#[from] ModelError),
-    #[error("a pending add already owns this path; replay or abandon it first")]
+    #[error("a pending add or removal already owns this path; resolve it first")]
     PendingStage,
     #[error("the missing path is not staged in the index")]
     MissingUntrackedPath,
@@ -418,6 +418,9 @@ fn begin_symlink_stage_for_scope(
         .is_some()
         || control
             .get_record(&symlink_intent_kind_for_scope(scope), &key)?
+            .is_some()
+        || control
+            .get_record(&crate::rm::intent_kind_for_scope(scope), &key)?
             .is_some()
     {
         return Err(StageError::PendingStage);
@@ -932,10 +935,13 @@ pub(crate) fn has_pending_stages_for_scope(
     Ok(!control.records(&intent_kind_for_scope(scope))?.is_empty()
         || !control
             .records(&symlink_intent_kind_for_scope(scope))?
+            .is_empty()
+        || !control
+            .records(&crate::rm::intent_kind_for_scope(scope))?
             .is_empty())
 }
 
-/// Discover every linked worktree with an index or unfinished add. Prune must
+/// Discover every linked worktree with an index or unfinished add/removal. Prune must
 /// treat these namespaces as roots even before worktree registration is wired
 /// into the daemon.
 pub(crate) fn worktree_scopes_with_stage_state(
@@ -947,6 +953,7 @@ pub(crate) fn worktree_scopes_with_stage_state(
         WORKTREE_INDEX_PREFIX,
         WORKTREE_STAGE_INTENT_PREFIX,
         WORKTREE_SYMLINK_INTENT_PREFIX,
+        "git-worktree-rm-intent-v1/",
     ] {
         let prefix = format!("{kind_prefix}{repository_id}/");
         for (kind, _, _) in control.records_with_kind_prefix(&prefix)? {

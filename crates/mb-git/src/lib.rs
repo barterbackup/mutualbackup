@@ -35,6 +35,8 @@ mod odb;
 mod prune;
 #[cfg(target_os = "linux")]
 mod repository;
+#[cfg(target_os = "linux")]
+mod rm;
 mod stage;
 #[cfg(target_os = "linux")]
 mod status;
@@ -66,6 +68,8 @@ pub use odb::NativeOdb;
 pub use prune::{GitPruneError, GitPruneReport, GitPruneRoots};
 #[cfg(target_os = "linux")]
 pub use repository::{GitRepository, RepositoryError};
+#[cfg(target_os = "linux")]
+pub use rm::GitRmError;
 pub use stage::{
     GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, has_pending_stages,
     pending_stage_paths, remove_cached, resume_pending_stages, stage_file, staged_entries,

@@ -31,6 +31,7 @@ use crate::head::{
     store_selected_branch_for_scope,
 };
 use crate::history::{HistoryError, list_branches_for_scope};
+use crate::rm::{GitRmError, abandon_missing_linked_rm};
 use crate::stage::{
     StageError, abandon_missing_linked_worktree_stages, has_pending_stages_for_scope,
     index_kind_for_scope, stage_path_key, staged_entries_for_scope,
@@ -168,6 +169,8 @@ pub enum GitWorktreeError {
     Status(#[from] StatusError),
     #[error("Git worktree index failed: {0}")]
     Stage(#[from] StageError),
+    #[error("tracked removal recovery failed: {0}")]
+    Rm(#[from] GitRmError),
     #[error("the linked worktree path, identity, or marker conflicts with its registration")]
     Conflict,
     #[error("a linked worktree must start in an empty directory on the primary filesystem")]
@@ -712,6 +715,9 @@ pub(crate) fn prune_missing_worktree(
             primary_root,
             catalog,
         )?;
+        if force {
+            abandon_missing_linked_rm(control, scope, info.root_id)?;
+        }
     }
     if pending_checkout {
         abandon_missing_initial_checkout_for_scope(
