@@ -8,6 +8,8 @@ Each enrolled root records a versioned local source backend and the mount that
 passed its capture probe. After a remount, the daemon repeats that probe before
 using the root; an unavailable backend leaves the root unavailable. A root
 restored through recovery records this binding on its first successful probe.
+New Git adds select a capture plan through that binding. An interrupted add
+replays its recorded plan, so a backend change cannot reinterpret its bytes.
 
 ```sh
 mutualgit init /absolute/path/to/source

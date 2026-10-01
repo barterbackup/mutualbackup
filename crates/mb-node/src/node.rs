@@ -1375,8 +1375,10 @@ impl Node {
             anyhow::bail!("ordinary .git storage already exists; use an explicit import path");
         }
         let root = self.add_protected_root(&source_root)?;
+        let backend = self.source_backend_for_root(&root, filesystem_identity(&root.path)?)?;
         let key = self.git_catalog_key(root.root_id);
-        let repository = GitRepository::init(&root.path, root.root_id, &key)?;
+        let repository = GitRepository::init(&root.path, root.root_id, &key)?
+            .with_source_backend(backend.backend);
         if repository.id() != root.root_id {
             anyhow::bail!("Git catalog does not match the protected root");
         }
@@ -1429,9 +1431,10 @@ impl Node {
         {
             anyhow::bail!("protected Git root identity changed");
         }
-        self.source_backend_for_root(&root, filesystem)?;
+        let backend = self.source_backend_for_root(&root, filesystem)?;
         let key = self.git_catalog_key(repository_id);
-        let repository = GitRepository::open(&root.path, repository_id, &key)?;
+        let repository = GitRepository::open(&root.path, repository_id, &key)?
+            .with_source_backend(backend.backend);
         Ok(repository)
     }
 
@@ -24049,6 +24052,12 @@ pub(crate) mod tests {
             node.control.get_record("source-backend", key).unwrap(),
             Some(bytes)
         );
+        node.control
+            .put_record("source-backend", key, &canonical_bytes(&initial).unwrap())
+            .unwrap();
+        fs::write(source.join("tracked"), b"backend-routed Git bytes\r\n").unwrap();
+        let staged = node.git_add_path(info.repository_id, Path::new("tracked"));
+        assert!(staged.unwrap().is_some());
 
         let recovered_source = run_root.join("recovered-source");
         fs::create_dir(&recovered_source).unwrap();

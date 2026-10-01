@@ -16,7 +16,7 @@ use git2::Oid;
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
 use mb_store::{
     AnchorError, ControlStore, DatabaseError, FileAnchorManifest, GIT_CATALOG_DIRECTORY,
-    NativeFileId, PinnedDirectory, SourceFileCapturePlan,
+    NativeFileId, PinnedDirectory, SourceBackendKind, SourceFileCapturePlan,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -325,6 +325,7 @@ fn begin_stage(
         GitWorktreeScope::primary(repository_id),
         source_root,
         relative_path,
+        SourceBackendKind::ReflinkV1,
     )
 }
 
@@ -333,6 +334,7 @@ fn begin_stage_for_scope(
     scope: GitWorktreeScope,
     source_root: &Path,
     relative_path: &Path,
+    source_backend: SourceBackendKind,
 ) -> Result<(Vec<u8>, StageIntent), StageError> {
     let path_key = stage_path_key(relative_path)?;
     let kind = intent_kind_for_scope(scope);
@@ -344,7 +346,7 @@ fn begin_stage_for_scope(
         return Err(StageError::PendingStage);
     }
     validate_worktree_path(source_root, relative_path)?;
-    let plan = SourceFileCapturePlan::plan_reflink(source_root, relative_path)?;
+    let plan = source_backend.plan_file(source_root, relative_path)?;
     let mode = if plan.source_mode()? & 0o111 != 0 {
         0o100755
     } else {
@@ -444,6 +446,7 @@ fn finish_symlink_stage(
     scope: GitWorktreeScope,
     key: &[u8],
     mut intent: SymlinkStageIntent,
+    source_backend: SourceBackendKind,
 ) -> Result<GitIndexEntry, StageError> {
     let kind = symlink_intent_kind_for_scope(scope);
     if control.get_record(&kind, key)?.as_deref() != Some(canonical_bytes(&intent)?.as_slice()) {
@@ -471,7 +474,7 @@ fn finish_symlink_stage(
             save_symlink_intent(control, scope, key, &intent, &next)?;
             intent = next;
         }
-        let plan = SourceFileCapturePlan::plan_reflink(
+        let plan = source_backend.plan_file(
             intent
                 .catalog_root
                 .as_deref()
@@ -520,30 +523,14 @@ fn finish_symlink_stage(
 }
 
 /// Stage the target bytes of a symlink without following it.
-pub fn stage_symlink(
-    control: &ControlStore,
-    repository_id: Uuid,
-    source_root: impl AsRef<Path>,
-    catalog: &PinnedDirectory,
-    relative_path: impl AsRef<Path>,
-) -> Result<GitIndexEntry, StageError> {
-    stage_symlink_for_scope(
-        control,
-        GitWorktreeScope::primary(repository_id),
-        source_root.as_ref(),
-        source_root.as_ref(),
-        catalog,
-        relative_path.as_ref(),
-    )
-}
-
-pub(crate) fn stage_symlink_for_scope(
+pub(crate) fn stage_symlink_for_scope_with_backend(
     control: &ControlStore,
     scope: GitWorktreeScope,
     source_root: &Path,
     catalog_root: &Path,
     catalog: &PinnedDirectory,
     relative_path: &Path,
+    source_backend: SourceBackendKind,
 ) -> Result<GitIndexEntry, StageError> {
     let (key, intent) = begin_symlink_stage_for_scope(
         control,
@@ -553,7 +540,7 @@ pub(crate) fn stage_symlink_for_scope(
         catalog,
         relative_path,
     )?;
-    finish_symlink_stage(control, scope, &key, intent)
+    finish_symlink_stage(control, scope, &key, intent, source_backend)
 }
 
 fn finish_stage_for_scope(
@@ -628,8 +615,29 @@ pub(crate) fn stage_file_for_scope(
     source_root: impl AsRef<Path>,
     relative_path: impl AsRef<Path>,
 ) -> Result<GitIndexEntry, StageError> {
-    let (key, intent) =
-        begin_stage_for_scope(control, scope, source_root.as_ref(), relative_path.as_ref())?;
+    stage_file_for_scope_with_backend(
+        control,
+        scope,
+        source_root,
+        relative_path,
+        SourceBackendKind::ReflinkV1,
+    )
+}
+
+pub(crate) fn stage_file_for_scope_with_backend(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    source_root: impl AsRef<Path>,
+    relative_path: impl AsRef<Path>,
+    source_backend: SourceBackendKind,
+) -> Result<GitIndexEntry, StageError> {
+    let (key, intent) = begin_stage_for_scope(
+        control,
+        scope,
+        source_root.as_ref(),
+        relative_path.as_ref(),
+        source_backend,
+    )?;
     finish_stage_for_scope(control, scope, &key, &intent)
 }
 
@@ -688,6 +696,14 @@ pub(crate) fn resume_pending_stages_for_scope(
     control: &ControlStore,
     scope: GitWorktreeScope,
 ) -> Result<Vec<GitIndexEntry>, StageError> {
+    resume_pending_stages_for_scope_with_backend(control, scope, SourceBackendKind::ReflinkV1)
+}
+
+pub(crate) fn resume_pending_stages_for_scope_with_backend(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    source_backend: SourceBackendKind,
+) -> Result<Vec<GitIndexEntry>, StageError> {
     let mut resumed = Vec::new();
     for (key, encoded) in control.records(&intent_kind_for_scope(scope))? {
         let intent = decode_intent(&encoded, scope.repository_id(), &key)?;
@@ -698,7 +714,13 @@ pub(crate) fn resume_pending_stages_for_scope(
         if (intent.format_version == 1) != (scope.worktree_id() == scope.repository_id()) {
             return Err(StageError::IncompatibleRecord);
         }
-        resumed.push(finish_symlink_stage(control, scope, &key, intent)?);
+        resumed.push(finish_symlink_stage(
+            control,
+            scope,
+            &key,
+            intent,
+            source_backend,
+        )?);
     }
     Ok(resumed)
 }
@@ -917,7 +939,8 @@ mod tests {
 
     use git2::Oid;
     use mb_store::{
-        AnchorError, ControlStore, GIT_CATALOG_DIRECTORY, PinnedDirectory, SourceFileCapturePlan,
+        AnchorError, ControlStore, GIT_CATALOG_DIRECTORY, PinnedDirectory, SourceBackendKind,
+        SourceFileCapturePlan,
     };
     use uuid::Uuid;
 
@@ -1131,8 +1154,14 @@ mod tests {
         let key = [62_u8; 32];
         let control = ControlStore::open_with_key(&database, &key).unwrap();
         let primary = stage_file(&control, repository_id, &primary_root, "tracked").unwrap();
-        let (path, intent) =
-            begin_stage_for_scope(&control, scope, &linked_root, Path::new("tracked")).unwrap();
+        let (path, intent) = begin_stage_for_scope(
+            &control,
+            scope,
+            &linked_root,
+            Path::new("tracked"),
+            SourceBackendKind::ReflinkV1,
+        )
+        .unwrap();
         let linked_anchor = intent.plan.capture().unwrap();
         assert_eq!(
             pending_stage_paths_for_scope(&control, scope).unwrap(),
@@ -1177,8 +1206,14 @@ mod tests {
             vec![linked_anchor.clone()]
         );
         fs::write(linked_root.join("discard"), b"discard me").unwrap();
-        let (_, discard_intent) =
-            begin_stage_for_scope(&control, scope, &linked_root, Path::new("discard")).unwrap();
+        let (_, discard_intent) = begin_stage_for_scope(
+            &control,
+            scope,
+            &linked_root,
+            Path::new("discard"),
+            SourceBackendKind::ReflinkV1,
+        )
+        .unwrap();
         let discarded_anchor = discard_intent.plan.capture().unwrap();
         assert!(abandon_pending_stage_for_scope(&control, scope, "discard").unwrap());
         assert!(discarded_anchor.open_verified().is_err());

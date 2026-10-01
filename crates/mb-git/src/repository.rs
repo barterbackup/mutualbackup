@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use git2::Oid;
 use mb_store::{
     AnchorError, ControlStore, DatabaseError, FileAnchorManifest, GIT_CATALOG_DIRECTORY,
-    GIT_CATALOG_MARKER_FILE, PinnedDirectory, git_catalog_marker_bytes,
+    GIT_CATALOG_MARKER_FILE, PinnedDirectory, SourceBackendKind, git_catalog_marker_bytes,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -46,8 +46,8 @@ use crate::prune::{
 use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, abandon_pending_stage_for_scope,
     anchors_for_oid, pending_stage_paths, remove_cached, remove_cached_for_scope,
-    resume_pending_stages, resume_pending_stages_for_scope, stage_file, stage_file_for_scope,
-    stage_path_key, stage_symlink, stage_symlink_for_scope, staged_entry,
+    resume_pending_stages_for_scope_with_backend, stage_file_for_scope_with_backend,
+    stage_path_key, stage_symlink_for_scope_with_backend, staged_entry,
 };
 use crate::status::{GitStatus, StatusError, repository_status, repository_status_for_scope};
 use crate::worktree::{
@@ -104,6 +104,7 @@ pub struct GitRepository {
     directory: PinnedDirectory,
     root: PathBuf,
     repository_id: Uuid,
+    source_backend: SourceBackendKind,
 }
 
 impl GitRepository {
@@ -164,6 +165,7 @@ impl GitRepository {
             directory,
             root,
             repository_id,
+            source_backend: SourceBackendKind::ReflinkV1,
         };
         repository.resume_checkout()?;
         resume_pending_prune(&repository.catalog, repository.repository_id)?;
@@ -205,6 +207,7 @@ impl GitRepository {
             directory,
             root,
             repository_id,
+            source_backend: SourceBackendKind::ReflinkV1,
         };
         repository.resume_checkout()?;
         resume_pending_prune(&repository.catalog, repository.repository_id)?;
@@ -213,6 +216,12 @@ impl GitRepository {
 
     pub fn id(&self) -> Uuid {
         self.repository_id
+    }
+
+    /// The daemon supplies the kind from its validated protected-root binding.
+    pub fn with_source_backend(mut self, source_backend: SourceBackendKind) -> Self {
+        self.source_backend = source_backend;
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -284,7 +293,7 @@ impl GitRepository {
     ) -> Result<Option<GitIndexEntry>, RepositoryError> {
         let info = self.resume_linked_worktree(worktree_id)?;
         let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
-        resume_pending_stages_for_scope(&self.catalog, scope)?;
+        resume_pending_stages_for_scope_with_backend(&self.catalog, scope, self.source_backend)?;
         let relative = relative_path.as_ref();
         stage_path_key(relative)?;
         let mut parent = PinnedDirectory::open(&info.path)?;
@@ -308,21 +317,23 @@ impl GitRepository {
             Err(error) => return Err(error.into()),
         };
         if symlink {
-            return Ok(Some(stage_symlink_for_scope(
+            return Ok(Some(stage_symlink_for_scope_with_backend(
                 &self.catalog,
                 scope,
                 &info.path,
                 &self.root,
                 &self.directory,
                 relative,
+                self.source_backend,
             )?));
         }
         if parent.open_child_file(name)?.is_some() {
-            Ok(Some(stage_file_for_scope(
+            Ok(Some(stage_file_for_scope_with_backend(
                 &self.catalog,
                 scope,
                 &info.path,
                 relative,
+                self.source_backend,
             )?))
         } else {
             self.linked_missing_path(scope, relative)
@@ -375,7 +386,7 @@ impl GitRepository {
     ) -> Result<GitCommitInfo, RepositoryError> {
         let info = self.resume_linked_worktree(worktree_id)?;
         let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
-        resume_pending_stages_for_scope(&self.catalog, scope)?;
+        resume_pending_stages_for_scope_with_backend(&self.catalog, scope, self.source_backend)?;
         Ok(commit_index_for_scope(
             &self.catalog,
             scope,
@@ -566,7 +577,13 @@ impl GitRepository {
     ) -> Result<GitIndexEntry, RepositoryError> {
         self.resume_checkout()?;
         let relative = relative_path.as_ref();
-        let entry = stage_file(&self.catalog, self.repository_id, &self.root, relative)?;
+        let entry = stage_file_for_scope_with_backend(
+            &self.catalog,
+            crate::GitWorktreeScope::primary(self.repository_id),
+            &self.root,
+            relative,
+            self.source_backend,
+        )?;
         mark_merge_resolved(
             &self.catalog,
             self.repository_id,
@@ -605,12 +622,14 @@ impl GitRepository {
             Err(error) => return Err(error.into()),
         };
         if symlink {
-            let entry = stage_symlink(
+            let entry = stage_symlink_for_scope_with_backend(
                 &self.catalog,
-                self.repository_id,
+                crate::GitWorktreeScope::primary(self.repository_id),
+                &self.root,
                 &self.root,
                 &self.directory,
                 relative,
+                self.source_backend,
             )?;
             mark_merge_resolved(
                 &self.catalog,
@@ -660,7 +679,11 @@ impl GitRepository {
     pub fn resume_pending_stages(&self) -> Result<Vec<GitIndexEntry>, RepositoryError> {
         self.resume_checkout()?;
         let paths = pending_stage_paths(&self.catalog, self.repository_id)?;
-        let entries = resume_pending_stages(&self.catalog, self.repository_id)?;
+        let entries = resume_pending_stages_for_scope_with_backend(
+            &self.catalog,
+            crate::GitWorktreeScope::primary(self.repository_id),
+            self.source_backend,
+        )?;
         for path in paths {
             mark_merge_resolved(&self.catalog, self.repository_id, &path)?;
         }
