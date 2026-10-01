@@ -4467,6 +4467,182 @@ mod metadata_compatibility_tests {
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn fetched_history_with_unborn_head_recovers_after_source_loss() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-unborn-revision-{}", Uuid::new_v4()));
+        let source = run_root.join("source");
+        let remote_path = run_root.join("remote.git");
+        let restored = run_root.join("restored");
+        fs::create_dir_all(&source).unwrap();
+        let remote = git2::Repository::init_bare(&remote_path).unwrap();
+        let signature = git2::Signature::now("Stock", "stock@example.test").unwrap();
+        let main_bytes = b"main\r\nraw\0bytes";
+        let main_blob = remote.blob(main_bytes).unwrap();
+        let mut main_builder = remote.treebuilder(None).unwrap();
+        main_builder.insert("tracked", main_blob, 0o100644).unwrap();
+        let main_tree = remote.find_tree(main_builder.write().unwrap()).unwrap();
+        let main_commit = remote
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "main",
+                &main_tree,
+                &[],
+            )
+            .unwrap();
+        let tag_bytes = b"tag-only\nraw\xffbytes";
+        let tag_blob = remote.blob(tag_bytes).unwrap();
+        let mut tag_builder = remote.treebuilder(None).unwrap();
+        tag_builder.insert("tracked", tag_blob, 0o100644).unwrap();
+        let tag_tree = remote.find_tree(tag_builder.write().unwrap()).unwrap();
+        let tagged_commit = remote
+            .commit(None, &signature, &signature, "tagged", &tag_tree, &[])
+            .unwrap();
+        let target = remote
+            .find_object(tagged_commit, Some(git2::ObjectType::Commit))
+            .unwrap();
+        let tag = remote
+            .tag_annotation_create("release", &target, &signature, "release\r\n")
+            .unwrap();
+        remote
+            .reference("refs/tags/release", tag, false, "annotated tag")
+            .unwrap();
+        drop(target);
+        drop(main_tree);
+        drop(main_builder);
+        drop(tag_tree);
+        drop(tag_builder);
+        drop(remote);
+
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([211; 32]));
+        let root_id = Uuid::new_v4();
+        let catalog_key = mb_git::catalog_key(&keys, root_id);
+        let repo = GitRepository::init(&source, root_id, &catalog_key).unwrap();
+        assert_eq!(repo.fetch_bare(&remote_path).unwrap(), 1);
+        assert!(repo.status().unwrap().head_oid.is_none());
+        let graph = repo.export_graph_source().unwrap();
+        assert_eq!(graph.refs.len(), 2);
+        drop(repo);
+
+        let mut control = ControlStore::open(run_root.join("control.db"), &keys).unwrap();
+        control
+            .put_record(
+                "git-repository",
+                root_id.as_bytes(),
+                &canonical_bytes(&crate::control::GitRepositoryInfo {
+                    format_version: 1,
+                    repository_id: root_id,
+                    path: source.clone(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let guild_id = [212; 32];
+        let revision = prepare_revision(
+            &mut control,
+            &keys,
+            guild_id,
+            root_id,
+            &source,
+            1,
+            None,
+            WriterCredentials {
+                epoch: 1,
+                secret: &[213; 32],
+                captured_change_sequence: None,
+            },
+        )
+        .unwrap();
+        let descriptor = revision_git_backup(&control, &keys, guild_id, &revision)
+            .unwrap()
+            .unwrap();
+        assert_eq!(descriptor.format_version, 4);
+        assert!(
+            descriptor
+                .refs
+                .iter()
+                .all(|reference| reference.name.as_slice() != b"refs/heads/main")
+        );
+        assert!(descriptor.refs.iter().any(|reference| {
+            reference.name == b"refs/remotes/origin/main"
+                && reference.oid.as_slice() == main_commit.as_bytes()
+        }));
+        assert!(descriptor.refs.iter().any(|reference| {
+            reference.name == b"refs/tags/release" && reference.oid.as_slice() == tag.as_bytes()
+        }));
+        let mut ciphertexts = BTreeMap::new();
+        for reference in revision
+            .value
+            .metadata_sectors
+            .iter()
+            .chain(&revision.value.data_sectors)
+        {
+            ciphertexts.insert(
+                reference.id,
+                render_sector(&control, &keys, &reference.id, Some(&guild_id)).unwrap(),
+            );
+        }
+        let manifest: mb_store::StableAnchorManifest = decode_canonical(
+            &control
+                .get_record("anchor-manifest", revision.value.revision_id.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        manifest.remove().unwrap();
+        for blob in &graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(&source).unwrap();
+
+        restore_revision_from_source(&control, &keys, guild_id, &revision, &restored, |id| {
+            ciphertexts
+                .get(id)
+                .cloned()
+                .context("missing captured ciphertext")
+        })
+        .unwrap();
+        let recovered = GitRepository::open(&restored, root_id, &catalog_key).unwrap();
+        assert_eq!(recovered.selected_branch().unwrap(), "main");
+        assert!(recovered.status().unwrap().head_oid.is_none());
+        assert!(recovered.branches().unwrap().is_empty());
+        assert_eq!(recovered.tags().unwrap()[0].oid, *tag.as_bytes());
+        let recovered_graph = recovered.export_graph_source().unwrap();
+        assert_eq!(recovered_graph.refs, graph.refs);
+        assert_eq!(recovered_graph.objects, graph.objects);
+        let tag_anchor = recovered_graph
+            .blobs
+            .iter()
+            .find(|blob| blob.oid == *tag_blob.as_bytes())
+            .unwrap();
+        let mut recovered_tag_bytes = Vec::new();
+        tag_anchor
+            .anchor
+            .open_verified()
+            .unwrap()
+            .read_to_end(&mut recovered_tag_bytes)
+            .unwrap();
+        assert_eq!(recovered_tag_bytes, tag_bytes);
+        recovered
+            .create_branch_from("topic", "origin/main")
+            .unwrap();
+        recovered.switch_branch("topic").unwrap();
+        assert_eq!(fs::read(restored.join("tracked")).unwrap(), main_bytes);
+        drop(recovered);
+        for blob in recovered_graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        drop(control);
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn rejected_capture_can_be_repaired_and_replanned() {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
