@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use git2::{ObjectType, Oid, Repository};
+use git2::{Branch, ObjectType, Oid, Repository};
 use mb_core::{SectorRef, V1_MAX_CATALOG_BYTES, V1_SECTOR_SIZE, canonical_bytes};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -123,13 +123,25 @@ impl GitBackupDescriptor {
         for reference in &self.refs {
             let name =
                 std::str::from_utf8(&reference.name).map_err(|_| GitBackupError::InvalidGraph)?;
+            let branch_valid = match name.strip_prefix("refs/heads/") {
+                Some(branch) => Branch::name_is_valid(branch)?,
+                None => true,
+            };
             if !name.starts_with("refs/")
                 || !git2::Reference::is_valid_name(name)
+                || !branch_valid
                 || !ref_names.insert(reference.name.as_slice())
             {
                 return Err(GitBackupError::InvalidGraph);
             }
             pending_commits.push(Oid::from_bytes(&reference.oid)?);
+        }
+        if ref_names.iter().any(|name| {
+            name.iter()
+                .enumerate()
+                .any(|(index, byte)| *byte == b'/' && ref_names.contains(&name[..index]))
+        }) {
+            return Err(GitBackupError::InvalidGraph);
         }
         let mut seen_commits = HashSet::new();
         let mut pending_trees = Vec::new();

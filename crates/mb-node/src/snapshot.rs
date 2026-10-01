@@ -4000,8 +4000,13 @@ mod metadata_compatibility_tests {
         let root_id = Uuid::new_v4();
         let repo =
             GitRepository::init(&source, root_id, &mb_git::catalog_key(&keys, root_id)).unwrap();
+        assert!(repo.create_branch("unborn").is_err());
         let first_blob = repo.stage_file("tracked").unwrap();
         let first_commit = repo.commit("Author", "a@example.test", "first").unwrap();
+        let old_branch = repo.create_branch("older").unwrap();
+        assert_eq!(old_branch.oid, first_commit.oid);
+        assert!(repo.create_branch("older").is_err());
+        assert!(repo.create_branch("older/nested").is_err());
         fs::write(source.join("tracked"), b"second\nbytes").unwrap();
         let second_blob = repo.stage_file("tracked").unwrap();
         let second_commit = repo.commit("Author", "a@example.test", "second").unwrap();
@@ -4049,7 +4054,22 @@ mod metadata_compatibility_tests {
         let metadata: GitPrivateMetadataV4 = decode_canonical(&encoded).unwrap();
         assert_eq!(metadata.format_version, 4);
         metadata.git.validate().unwrap();
-        assert_eq!(metadata.git.refs[0].oid, second_commit.oid);
+        let mut conflicting_refs = metadata.git.clone();
+        conflicting_refs.refs.push(mb_git::GitGraphRef {
+            name: b"refs/heads/older.foo".to_vec(),
+            oid: first_commit.oid,
+        });
+        conflicting_refs.refs.push(mb_git::GitGraphRef {
+            name: b"refs/heads/older/nested".to_vec(),
+            oid: first_commit.oid,
+        });
+        assert!(conflicting_refs.validate().is_err());
+        assert!(metadata.git.refs.iter().any(|reference| {
+            reference.name == b"refs/heads/main" && reference.oid == second_commit.oid
+        }));
+        assert!(metadata.git.refs.iter().any(|reference| {
+            reference.name == b"refs/heads/older" && reference.oid == first_commit.oid
+        }));
         assert!(
             metadata
                 .git
@@ -4091,6 +4111,16 @@ mod metadata_compatibility_tests {
         assert_eq!(recovered_history.len(), 2);
         assert_eq!(recovered_history[0].oid, second_commit.oid);
         assert_eq!(recovered_history[1].oid, first_commit.oid);
+        assert_eq!(
+            recovered_repo
+                .branches()
+                .unwrap()
+                .into_iter()
+                .find(|branch| branch.name == "older")
+                .unwrap()
+                .oid,
+            first_commit.oid
+        );
         assert!(recovered_repo.status().unwrap().changes.is_empty());
         let recovered_graph = recovered_repo.export_graph_source().unwrap();
         assert_eq!(recovered_graph.blobs.len(), 2);

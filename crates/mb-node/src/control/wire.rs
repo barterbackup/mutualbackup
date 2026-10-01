@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use mb_core::{NodeId, QuorumPolicy, Seed};
-use mb_git::{GitCommitInfo, GitLogEntry, GitStatus};
+use mb_git::{GitBranchInfo, GitCommitInfo, GitLogEntry, GitStatus};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -73,6 +73,13 @@ pub enum LocalRequest {
     GitLog {
         repository_id: Uuid,
         limit: u32,
+    },
+    GitBranches {
+        repository_id: Uuid,
+    },
+    GitCreateBranch {
+        repository_id: Uuid,
+        name: String,
     },
     GitStatus {
         repository_id: Uuid,
@@ -146,6 +153,8 @@ pub enum LocalResponse {
     },
     GitCommitted(GitCommitInfo),
     GitLog(Vec<GitLogEntry>),
+    GitBranches(Vec<GitBranchInfo>),
+    GitBranchCreated(GitBranchInfo),
     GitStatus(GitStatus),
     Guild(Option<GuildSummary>),
     GuildInvite {
@@ -327,6 +336,11 @@ mod tests {
                 repository_id,
                 limit: 10,
             },
+            LocalRequest::GitBranches { repository_id },
+            LocalRequest::GitCreateBranch {
+                repository_id,
+                name: "older".to_owned(),
+            },
             LocalRequest::GitStatus { repository_id },
         ] {
             let envelope = LocalRequestEnvelope {
@@ -370,6 +384,20 @@ mod tests {
                 author_email: b"author@example.test".to_vec(),
                 message: b"first\n".to_vec(),
             }]),
+            LocalResponse::GitBranches(vec![GitBranchInfo {
+                format_version: 1,
+                repository_id,
+                name: "main".to_owned(),
+                oid: [7; 20],
+                current: true,
+            }]),
+            LocalResponse::GitBranchCreated(GitBranchInfo {
+                format_version: 1,
+                repository_id,
+                name: "older".to_owned(),
+                oid: [7; 20],
+                current: false,
+            }),
             LocalResponse::GitStatus(GitStatus {
                 format_version: 1,
                 repository_id,

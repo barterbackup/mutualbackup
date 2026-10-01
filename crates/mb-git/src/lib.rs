@@ -25,8 +25,8 @@ mod status;
 pub use backup::{GitBackupBlob, GitBackupDescriptor, GitBackupError, GitDataExtent};
 #[cfg(target_os = "linux")]
 pub use history::{
-    GitCommitInfo, GitGraphBlobSource, GitGraphObject, GitGraphRef, GitGraphSource, GitLogEntry,
-    HistoryError,
+    GitBranchInfo, GitCommitInfo, GitGraphBlobSource, GitGraphObject, GitGraphRef, GitGraphSource,
+    GitLogEntry, HistoryError,
 };
 pub use odb::NativeOdb;
 #[cfg(target_os = "linux")]

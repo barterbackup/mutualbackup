@@ -15,8 +15,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::history::{
-    GitCommitInfo, GitGraphSource, GitLogEntry, HistoryError, commit_index, export_graph_source,
-    import_graph_backup, log_history,
+    GitBranchInfo, GitCommitInfo, GitGraphSource, GitLogEntry, HistoryError, commit_index,
+    create_branch, export_graph_source, import_graph_backup, list_branches, log_history,
 };
 use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, resume_pending_stages,
@@ -226,6 +226,14 @@ impl GitRepository {
 
     pub fn log(&self, limit: usize) -> Result<Vec<GitLogEntry>, RepositoryError> {
         Ok(log_history(&self.catalog, self.repository_id, limit)?)
+    }
+
+    pub fn branches(&self) -> Result<Vec<GitBranchInfo>, RepositoryError> {
+        Ok(list_branches(&self.catalog, self.repository_id)?)
+    }
+
+    pub fn create_branch(&self, name: &str) -> Result<GitBranchInfo, RepositoryError> {
+        Ok(create_branch(&self.catalog, self.repository_id, name)?)
     }
 
     pub fn status(&self) -> Result<GitStatus, RepositoryError> {

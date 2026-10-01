@@ -52,6 +52,8 @@ enum Command {
         #[arg(short = 'n', long = "max-count", default_value_t = 10)]
         limit: u32,
     },
+    /// List local branches or create one at the current commit.
+    Branch { name: Option<String> },
     /// Show staged, working-tree, and backup-protection state.
     Status,
 }
@@ -187,6 +189,43 @@ async fn main() -> Result<()> {
                     println!("    {line}");
                 }
                 println!();
+            }
+        }
+        Command::Branch { name } => {
+            let (_, repository_id) = discover_repository(&working_directory)?;
+            if let Some(name) = name {
+                let LocalResponse::GitBranchCreated(branch) = local_control_call(
+                    &socket,
+                    &LocalRequest::GitCreateBranch {
+                        repository_id,
+                        name,
+                    },
+                )
+                .await?
+                else {
+                    bail!("daemon returned the wrong response to Git branch creation");
+                };
+                if branch.repository_id != repository_id {
+                    bail!("daemon created a branch in another repository");
+                }
+                println!(
+                    "created branch {} at {}",
+                    branch.name,
+                    git2::Oid::from_bytes(&branch.oid)?
+                );
+            } else {
+                let LocalResponse::GitBranches(branches) =
+                    local_control_call(&socket, &LocalRequest::GitBranches { repository_id })
+                        .await?
+                else {
+                    bail!("daemon returned the wrong response to Git branch listing");
+                };
+                for branch in branches {
+                    if branch.repository_id != repository_id {
+                        bail!("daemon listed a branch from another repository");
+                    }
+                    println!("{} {}", if branch.current { '*' } else { ' ' }, branch.name);
+                }
             }
         }
         Command::Status => {

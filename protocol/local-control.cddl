@@ -30,6 +30,8 @@ local-request =
   / { "GitAbandonPendingAdd": { repository_id: uuid-text, path: tstr } }
   / { "GitCommit": { repository_id: uuid-text, author_name: tstr, author_email: tstr, message: tstr } }
   / { "GitLog": { repository_id: uuid-text, limit: uint } }
+  / { "GitBranches": { repository_id: uuid-text } }
+  / { "GitCreateBranch": { repository_id: uuid-text, name: tstr } }
   / { "GitStatus": { repository_id: uuid-text } }
   / "GuildStatus"
   / "GuildCreate"
@@ -66,6 +68,8 @@ local-response =
   / { "GitPendingAddAbandoned": { abandoned: bool } }
   / { "GitCommitted": git-commit-info }
   / { "GitLog": [* git-log-entry] }
+  / { "GitBranches": [* git-branch-info] }
+  / { "GitBranchCreated": git-branch-info }
   / { "GitStatus": git-status }
   / { "Guild": null / guild-summary }
   / { "GuildInvite": { token: tstr, expires_at_unix_seconds: uint } }
@@ -174,6 +178,14 @@ git-log-entry = {
   author_name: [* uint8],
   author_email: [* uint8],
   message: [* uint8]
+}
+
+git-branch-info = {
+  format_version: uint,
+  repository_id: uuid-text,
+  name: tstr,
+  oid: bytes20-array,
+  current: bool
 }
 
 git-status = {

@@ -26,7 +26,7 @@ use mb_core::{
     open_recovery_record, packing_protected_root, replay_coding_transcript, seal_recovery_record,
     sector_root, sign_guild_event, sign_legacy_coding_add_binding, synthetic_filler_sector,
 };
-use mb_git::{GitCommitInfo, GitLogEntry, GitRepository, GitStatus};
+use mb_git::{GitBranchInfo, GitCommitInfo, GitLogEntry, GitRepository, GitStatus};
 use mb_store::{
     ControlStore, DatabaseError, NativeFileId, ParityObject, ParityStore, PinnedDirectory,
     VariableParityObject, filesystem_identity, probe_reflink,
@@ -1419,6 +1419,18 @@ impl Node {
     pub fn git_log(&self, repository_id: Uuid, limit: usize) -> Result<Vec<GitLogEntry>> {
         self.open_git_repository(repository_id)?
             .log(limit)
+            .map_err(Into::into)
+    }
+
+    pub fn git_branches(&self, repository_id: Uuid) -> Result<Vec<GitBranchInfo>> {
+        self.open_git_repository(repository_id)?
+            .branches()
+            .map_err(Into::into)
+    }
+
+    pub fn git_create_branch(&self, repository_id: Uuid, name: &str) -> Result<GitBranchInfo> {
+        self.open_git_repository(repository_id)?
+            .create_branch(name)
             .map_err(Into::into)
     }
 
@@ -15256,6 +15268,13 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(first_commit.parent_oid, None);
+        let older = node.git_create_branch(info.repository_id, "older").unwrap();
+        assert_eq!(older.oid, first_commit.oid);
+        assert!(!older.current);
+        assert!(
+            node.git_create_branch(info.repository_id, "older/nested")
+                .is_err()
+        );
         drop(node);
 
         let mut reopened = Node::open(data.path(), seed).unwrap();
@@ -15278,6 +15297,11 @@ pub(crate) mod tests {
         assert_eq!(status.head_oid, Some(second_commit.oid));
         assert!(!status.history_backed_up);
         assert!(status.changes.is_empty());
+        let branches = reopened.git_branches(info.repository_id).unwrap();
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].name, "main");
+        assert!(branches[0].current);
+        assert_eq!(branches[1], older);
         let history = reopened.git_log(info.repository_id, 10).unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].oid, second_commit.oid);

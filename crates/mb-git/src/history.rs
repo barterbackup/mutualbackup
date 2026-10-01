@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
-use git2::{Index, IndexEntry, IndexTime, ObjectType, Oid, Repository, Signature};
+use git2::{Branch, Index, IndexEntry, IndexTime, ObjectType, Oid, Repository, Signature};
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
 use mb_store::{ControlStore, DatabaseError, FileAnchorManifest};
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,12 @@ pub enum HistoryError {
     IncompatibleRecord,
     #[error("the reachable Git graph exceeds the bounded backup metadata limit")]
     GraphTooLarge,
+    #[error("a branch name is invalid or conflicts with another branch namespace")]
+    InvalidBranch,
+    #[error("the branch already exists")]
+    BranchExists,
+    #[error("the current branch has no commit to branch from")]
+    NoHead,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -72,6 +78,15 @@ pub struct GitLogEntry {
     pub author_name: Vec<u8>,
     pub author_email: Vec<u8>,
     pub message: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitBranchInfo {
+    pub format_version: u16,
+    pub repository_id: Uuid,
+    pub name: String,
+    pub oid: [u8; 20],
+    pub current: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -182,9 +197,111 @@ fn head_oid(control: &ControlStore, repository_id: Uuid) -> Result<Option<Oid>, 
     Ok(Some(Oid::from_bytes(&record.oid)?))
 }
 
-/// Commit the staged snapshot to `main`. This first history path has one
-/// worktree and one branch; later branch/worktree commands extend the ref
-/// selection without changing the stored Git object bytes.
+fn branch_records(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<Vec<GitBranchInfo>, HistoryError> {
+    let mut branches = Vec::new();
+    for (name, encoded) in control.records(&ref_kind(repository_id))? {
+        let full_name = std::str::from_utf8(&name).map_err(|_| HistoryError::IncompatibleRecord)?;
+        let Some(short_name) = full_name.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        if !Branch::name_is_valid(short_name)? {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        let record: RefRecord = decode_canonical(&encoded)?;
+        if record.format_version != 1 {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        let oid = Oid::from_bytes(&record.oid)?;
+        let object_bytes = control
+            .get_record(&metadata_kind(repository_id), oid.as_bytes())?
+            .ok_or(HistoryError::IncompatibleRecord)?;
+        let object: MetadataObject = decode_canonical(&object_bytes)?;
+        if object.format_version != 1
+            || object.kind != 1
+            || Oid::hash_object(ObjectType::Commit, &object.bytes)? != oid
+        {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        branches.push(GitBranchInfo {
+            format_version: 1,
+            repository_id,
+            name: short_name.to_owned(),
+            oid: record.oid,
+            current: name == MAIN_REF,
+        });
+        if branches.len() > MAX_GRAPH_OBJECTS {
+            return Err(HistoryError::GraphTooLarge);
+        }
+    }
+    branches.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(branches)
+}
+
+pub fn list_branches(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<Vec<GitBranchInfo>, HistoryError> {
+    branch_records(control, repository_id)
+}
+
+/// Create a ref at the current commit without copying any Git blob payload.
+/// The daemon serializes this with commits and other catalog mutations.
+pub fn create_branch(
+    control: &ControlStore,
+    repository_id: Uuid,
+    name: &str,
+) -> Result<GitBranchInfo, HistoryError> {
+    if name.len() > 1024 || !Branch::name_is_valid(name)? {
+        return Err(HistoryError::InvalidBranch);
+    }
+    let full_name = format!("refs/heads/{name}");
+    let branches = branch_records(control, repository_id)?;
+    for branch in branches {
+        if branch.name == name {
+            return Err(HistoryError::BranchExists);
+        }
+        if branch.name.starts_with(&format!("{name}/"))
+            || name.starts_with(&format!("{}/", branch.name))
+        {
+            return Err(HistoryError::InvalidBranch);
+        }
+    }
+    let oid = head_oid(control, repository_id)?.ok_or(HistoryError::NoHead)?;
+    let encoded = control
+        .get_record(&metadata_kind(repository_id), oid.as_bytes())?
+        .ok_or(HistoryError::IncompatibleRecord)?;
+    let object: MetadataObject = decode_canonical(&encoded)?;
+    if object.format_version != 1
+        || object.kind != object_code(ObjectType::Commit)?
+        || Oid::hash_object(ObjectType::Commit, &object.bytes)? != oid
+    {
+        return Err(HistoryError::IncompatibleRecord);
+    }
+    let info = GitBranchInfo {
+        format_version: 1,
+        repository_id,
+        name: name.to_owned(),
+        oid: oid.as_bytes().try_into().expect("SHA-1 OID"),
+        current: false,
+    };
+    if !control.put_record_if_absent(
+        &ref_kind(repository_id),
+        full_name.as_bytes(),
+        &canonical_bytes(&RefRecord {
+            format_version: 1,
+            oid: info.oid,
+        })?,
+    )? {
+        return Err(HistoryError::BranchExists);
+    }
+    Ok(info)
+}
+
+/// Commit the staged snapshot to `main`. Branch creation is available, while
+/// checkout and per-worktree ref selection are added separately.
 pub fn commit_index(
     control: &ControlStore,
     repository_id: Uuid,
