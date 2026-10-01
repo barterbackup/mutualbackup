@@ -7,16 +7,26 @@ them as ADRs and test vectors before promising wire compatibility.
 ## 1. Direction and first decisions
 
 - Continue the layered Rust workspace; transplant small proven utilities rather
-  than extending BarterBackup's whole-blob core. Ship two binaries:
+  than extending BarterBackup's whole-blob core. The current product has two binaries:
   `mutualbackupd` is the sole owner of the live node, databases, peer network,
   and background jobs; `mutualbackup` is a thin local control and offline
-  bootstrap CLI. A bootstrap, DHT, or relay role is a daemon configuration, not
-  a third program.
+  bootstrap CLI. Milestone 6 adds a separate Git-compatible local command
+  binary over that same daemon and a versioned source-backend interface; it
+  does not create a second live writer or change what guild peers see. A
+  bootstrap, DHT, or relay role is a daemon configuration, not another program.
 - The implemented first usable prototype baseline is Linux and
   **reflink-only**. Probe the complete COW lifecycle when a root is added and
   reject the root if reflinks are not safe there. Never silently fall back to
   an eager full copy. Guarded
   link-freeze, VSS, FUSE, and other source backends come after the prototype.
+- Build the Milestone 6 Git-compatible frontend on native immutable source
+  anchors, not a second persistent Git payload store. Reuse a maintained Git
+  implementation for object IDs, object formats, refs, index, and pack/protocol
+  handling, with a custom object-store adapter where needed; do not reimplement
+  SHA-1 or Git serialization from scratch. Git commits, branches, and worktrees
+  are owner-local history represented in ordinary protected user data and
+  metadata. Guild protocol authority remains the signed MutualBackup revision
+  and checkpoint, and peers need no Git awareness.
 - Use a pinned SQLCipher/SQLite build as the common local storage engine, with
   per-page HMAC enabled. Keep control state separate from parity storage. The
   prototype instantiates one parity database; later, one database per configured
@@ -416,6 +426,7 @@ the regression contract.
 | --- | --- |
 | Plaintext and recovery seed | Plaintext stays on the owner's selected filesystem, in the working folder or restricted source-anchor area. The printable recovery string is normally retained offline, entered through the CLI, never stored by the daemon, and never enters the DHT. An explicitly configured seed file is a convenience auto-unlock source. The string alone deterministically derives the stable identity and recovery-decryption roots |
 | Active source anchor | The prototype owner retains a COW reflink until every referencing revision is retired. A write-protected hard link and its sparse private copy are later backends |
+| Git-facing history, stage, and object map (Milestone 6) | The owner keeps Git-compatible commit/tree/tag bytes, refs, index, worktree state, and an object-ID-to-verified-anchors map keyed by root/filesystem in versioned local metadata. Committed reachable history and refs are included in encrypted owner-owned backup data so seed-only recovery can rebuild them; uncommitted stage state remains locally pinned until committed or explicitly discarded. A Git object ID is an interoperability identifier, not signed guild authority or a substitute for MutualBackup content verification |
 | Information sectors | Guild-specific encrypted form normally comes from its owner; after owner-disk loss it is reconstructed from the coding group |
 | Private file metadata | Encrypted as user-owned information sectors and protected by the same coding machinery |
 | Parity sectors | Assigned peer or storage-only node; that host stores the exact RS-level bytes as locally SQLCipher-encrypted chunks on a selected volume |
@@ -509,6 +520,17 @@ only the exact RS-level bytes, never SQLCipher pages. Protocol encryption need
 not add its own authentication tag when every complete prototype sector is
 verified against a root authenticated by signed revision/coding-group state.
 Later partial-range transfer must supply proofs to that same authority.
+
+Milestone 6's Git-facing object format is separate from these signed protocol
+formats. A tracked regular file's Git blob is exactly the bytes captured at
+`add`: no CRLF or other end-of-line normalization, clean/smudge/process filter,
+`ident` expansion, or `working-tree-encoding` conversion on add, checkout,
+import, or export. Enforce this independently of global Git config and
+`.gitattributes`; reject an operation that requires an unsupported content
+transformation with a clear error instead of silently changing bytes. Git
+object IDs use the selected Git repository's canonical object framing and hash
+algorithm, computed by the Git library from the immutable captured bytes.
+Retain MutualBackup's independent content roots and signed revision authority.
 
 - **Prototype sector object:** fixed 64 KiB RS-level bytes, logical tail length,
   encoding/key-suite version, nonce material, and a full-sector BLAKE3 root.
@@ -609,6 +631,63 @@ Proactive background repair comes later.
 - Preserve sparse files and hard-link relationships when capturing and
   restoring them. Retain every committed reflink anchor indefinitely until the
   later retention/GC milestone can prove it unreachable.
+
+### Versioned source backend and Git local history (Milestone 6)
+
+- Introduce a versioned source-backend boundary between local capture/restore
+  and the existing revision/sector pipeline. Its durable contract identifies
+  immutable source bytes, metadata, source filesystem capabilities, restore
+  behavior, and reachability pins. Keep blocking filesystem work in bounded
+  workers and keep the signed guild protocol independent of backend choice.
+  The existing reflink root is the first implementation; Git history consumes
+  that boundary, and guarded link-freeze/platform capture later implement it.
+- `init` associates each Git repository with a stable protected-root ID and
+  working-tree location, enrolling and probing a source backend before claiming
+  backup protection. Keep the repository marker and Git-facing metadata in an
+  app-owned `.mutualbackup` catalog while payload anchors stay in their
+  filesystem-specific anchor areas. Exclude that catalog from ordinary tracked
+  file scans and protect its reachable graph through encrypted revision metadata
+  instead of recursively capturing itself. Reject initialization if that
+  protection backend is unavailable; adding a worktree does not silently enroll
+  its uncommitted edits.
+- Stage a regular file by first creating and durably recording an immutable same-
+  filesystem reflink of the user's bytes. Hash that captured file through the
+  Git library, record its blob ID, source locator, and index entry atomically
+  or with crash-reconcilable intent, and never persist another copy merely to
+  satisfy `.git/objects`. A later edit to the working file cannot change the
+  staged bytes. Detect concurrent source changes during capture and fail or
+  retry rather than recording mixed bytes. An unavailable reflink fails this
+  capture path explicitly; the later guarded link-freeze backend must meet its
+  own safety probe before offering a hard-link alternative. Preserve sparse
+  extents and file identity where the backend supports them.
+- Capture Git symlinks without following them: their blob bytes are the exact
+  link-target bytes, and checkout recreates the link under the path-safety
+  policy. Never treat a symlink as a regular-file reflink; explicitly reject
+  unsupported gitlinks/submodules until their separate semantics are defined.
+- Store Git trees, commits, tags, refs, and index metadata in the versioned
+  local catalog; map a blob ID to one or more verified immutable anchors on
+  their respective roots/filesystems. A custom Git object backend
+  supplies Git-format bytes on demand and imports Git blob bytes into native
+  anchors. Pin and collect each physical anchor separately so a same-filesystem
+  checkout can use an available reflink without losing the last viable copy.
+  Avoid a persistent second payload copy or Git pack mirror. A full
+  read/hash pass and bounded transient pack buffers are acceptable; verify
+  both Git object IDs and MutualBackup content roots, and reject an ID alias
+  whose bytes disagree.
+- For checkout or a second worktree, restore verified anchor bytes by reflink
+  on a capable same-filesystem destination, preserving the exact blob bytes.
+  Never hard-link an editable worktree file directly to an immutable anchor.
+  Make any unavoidable cross-filesystem copy explicit and bounded, and do not
+  confuse checkout copy policy with the no-silent-copy capture rule. Protect
+  dirty or untracked worktree files from destructive checkout. Keep per-worktree
+  HEAD/index state distinct while sharing immutable anchors safely.
+- Back up the reachable Git object graph and refs as encrypted owner-owned
+  content/metadata through the existing UserRevision pipeline, including
+  commits on branches that are not checked out. A Git commit is only locally
+  durable until a signed backup revision and checkpoint cover its graph; status
+  must distinguish local history from guild-protected, seed-recoverable history.
+  Recovery reconstructs the Git graph, refs, object map, and checked-out view
+  from authenticated backup data without a cached local catalog.
 
 ### Deferred source backends and platform work
 
@@ -767,6 +846,13 @@ subsequent validation locally; do not use a remote compilation server.
   formatting is redacted, and zeroizes text, KDF work buffers, and frames. Long
   operations return durable job IDs with status/follow/cancel; offline
   configuration, reflink probe, and later `db-shell` remain local.
+- The Milestone 6 Git-compatible binary presents the supported basic Git
+  command syntax but sends stateful operations through the same versioned local
+  control boundary; `mutualbackupd` remains the sole live catalog writer.
+  Keep command parsing, Git object semantics, durable source capture, and
+  asynchronous backup jobs distinct. Unsupported Git commands or byte-changing
+  attributes fail explicitly rather than delegating to a stock Git process
+  that would create an untracked second object store.
 - Keep one resolved daemon-options model for human TOML and command-line flags;
   the config file is optional, flags override it, and neither form contains
   generated identity state. Paths written in TOML are relative to that file;
@@ -871,6 +957,16 @@ all linear parity roles, are exactly zero. Secure physical erasure cannot be
 proved on remote hosts, COW filesystems, or SSDs; deletion ends the obligation
 and requests best-effort removal.
 
+For Git-backed roots, live refs, the staged index, open worktrees, protected
+commits, retained signed backup revisions, and in-flight jobs all pin their
+reachable anchors and metadata. A Git-facing prune/GC operation first updates
+the protected graph with a durable intent, then removes only data unreachable
+from every such root after the ordinary retention and peer-cleanup obligations
+finish; it must not merely hide commit names. Report logical deletion and
+physical space returned separately, because Btrfs extents may still be shared
+with another reflink or the working file. Reflog/history-expiry behavior and
+explicit protection pins must be documented before deletion is enabled.
+
 ## 6. Networking and hole punching
 
 ### Implemented robust connectivity profile
@@ -951,16 +1047,16 @@ handling instead of copying the custom fork or hard-coded cleanup paths.
 
 ## 8. Delivery milestones and review gates
 
-Each milestone extends the same runnable product. Preserve the two-binary
-architecture and real data/network path; do not build a parallel replacement to
-integrate later. Pause for a focused source, runtime, security, and usability
-review at every gate before committing the next milestone's detailed scope.
+Each milestone extends the same runnable product. Preserve the daemon/control
+split and real data/network path; the Milestone 6 Git-compatible command binary
+uses that same live node rather than a parallel replacement. Pause for a focused
+source, runtime, security, and usability review at every gate before committing
+the next milestone's detailed scope.
 
-**Current position:** Milestones 0 through 4 have passed. M5-132 and M5-133
-were corrected on `a7da0ce`, and the complete local M5-134 gate passed on that
-exact code source. Source-only review found M5-135 and M5-136; Milestone 5 is
-reopened for those fixes and the M5-137 exact-source local gate. Milestone 6
-waits. M5-134 remains historical evidence for its exercised cases.
+**Current position:** Milestones 0 through 5 have passed. The final Milestone 5
+gate passed on exact committed source `53ec2ec`; its earlier review and gate
+records below are historical. Milestone 6 is next, with Git-compatible local
+history added ahead of the already planned source-backend and platform work.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
@@ -2922,15 +3018,74 @@ Milestone 5.
   member add/remove/replacement during interrupted work, key rotation across
   retained revisions, and bounded storage/network amplification.
 
-### Milestone 6 — additional source backends and platforms
+### Milestone 6 — Git-compatible local history, then additional source backends and platforms
 
-- Implement the guarded link-freeze backend, including its atomic sparse private
-  copy transition when the user needs to edit the original inode. Preserve file
-  IDs, paths and metadata without freezing directory names or removal.
-- Then validate native Windows NTFS capture, including VSS where appropriate,
-  macOS cloning, platform watchers, portable metadata/ACL policy, and explicit
-  application-consistent capture hooks. Each enrolled root must pass its complete
-  capture/edit/restore probe; never fall back silently to an eager full copy.
+- First extract and version the source-backend boundary from section 4 without
+  changing the existing signed peer format. Prove a custom object-store adapter
+  over native anchors with a maintained Git library, initially targeting
+  SHA-1-format Git repositories for ordinary interoperability. Prefer libgit2's
+  custom ODB with a narrow audited Rust FFI adapter; reconsider Gitoxide's
+  lower-level components if the prototype cannot meet streaming, safety, or
+  storage-amplification gates. Do not implement Git hashing, object encodings,
+  or pack parsing ourselves.
+- Add the separate Git-compatible local binary for `init`, `add`, `status`,
+  `commit`, `log`, `diff`, `branch`, `switch`/`checkout`, `merge`, and multiple
+  worktrees. Implement the supported Git index, commit DAG, refs, and safe
+  worktree operations over the daemon's single-writer catalog. Stage exact file
+  bytes in durable reflink anchors and reflink checkouts on capable same-
+  filesystem destinations; use guarded link-freeze only after its own gate.
+  A requested merge may create new content; capture its exact resulting bytes
+  as new blobs, and make conflicts/abort recoverable without normalization.
+  Never create a persistent second Git blob or pack copy of native payloads.
+- Disable all automatic content conversion in this binary, including CRLF/text
+  handling, clean/smudge/process filters, `ident`, and working-tree encodings,
+  regardless of inherited Git config or attributes. Import Git blob bytes as
+  raw file bytes and export the same bytes; report unsupported transforming
+  rules before they can alter content. Define safe support for Git file modes,
+  symlinks, and path names rather than silently dropping them.
+- Protect the whole reachable Git commit graph and refs as owner-owned backed-up
+  content, not just the currently checked-out tree. A signed MutualBackup
+  revision/checkpoint is the protection boundary; seed-only recovery must
+  reconstruct branches, commits, object mappings, and usable worktrees with no
+  local Git catalog. Keep status explicit about commits awaiting backup.
+- Implement two-way interoperability through standard Git objects and packs:
+  our binary fetches/pulls and pushes against ordinary Git repositories, and
+  stock Git can fetch/pull and push through a documented Git transport bridge
+  backed by our object store. Do not claim stock Git can open `.mutualbackup`
+  directly or require a permanent Git-format payload mirror. Bound transient
+  pack space and memory for large and sparse files. The bridge preserves the
+  exchanged Git blob bytes and object IDs; a stock Git client's own attributes
+  or config may transform its external working tree outside our control.
+- Define Git-facing history expiry and prune/GC over refs, index, worktrees,
+  retained signed revisions, explicit protection pins, and in-flight work.
+  Deletion must release unreachable native anchors and trigger existing remote
+  cleanup; it must never collect an object still needed for recovery. Report
+  reclaimable logical bytes separately from physically freed shared extents.
+- Then implement the already planned guarded link-freeze backend, including its
+  atomic sparse private-copy transition when the user needs to edit the
+  original inode. Preserve file IDs, paths, and metadata without freezing
+  directory names or removal. Never expose a raw hard link between an editable
+  worktree and an immutable anchor.
+- Then validate the already planned native Windows NTFS capture, including VSS
+  where appropriate, macOS cloning, platform watchers, portable metadata/ACL
+  policy, and explicit application-consistent capture hooks. Each enrolled root
+  must pass its complete capture/edit/restore probe; never fall back silently
+  to an eager full copy.
+- Close the Git phase with a local gate for exact-byte add/edit/commit/checkout
+  and multi-worktree cases; conversion-inducing config/attributes; sparse and
+  large files; hard links, symlinks, modes, and unusual path names; dirty and
+  untracked checkout safety; merge conflicts/abort; crash/reopen at stage,
+  ref, checkout, switch, merge, worktree HEAD/index, import, prune, and backup
+  transitions; byte-exact branch recovery from a seed after source loss; Btrfs
+  extent-sharing and deletion measurements; and bidirectional stock-Git round
+  trips without a persistent payload mirror.
+- Close guarded link-freeze separately with its full atomic edit/failure and
+  anchor-recovery probe, including `ENOSPC`, unknown hard-link aliases, and
+  restart at each permission and sparse-detach transition.
+- Close each listed platform backend only after its own capture/edit/restore,
+  metadata fidelity, application-consistency, and source-loss recovery gate.
+  Milestone 6 closes only after the Git, guarded-link-freeze, and listed
+  platform gates.
 
 ### Milestone 7 — release candidate and compatibility freeze
 
@@ -2939,6 +3094,11 @@ Milestone 5.
   trees, disk/WAL exhaustion, interrupted upgrades, and every incomplete object
   transition. Measure and cap tasks, queues, memory, CPU, connections, relay/DHT
   work, bandwidth, and storage amplification.
+- Freeze the documented Git-command subset, byte-exact file policy, Git object
+  and transport interoperability, source-backend versions, branch/reflog
+  retention, and prune semantics only after cross-version migration and
+  source-loss recovery gates pass. Measure both logical and physical Btrfs
+  space across add, checkout, branch retention, import/export, and prune.
 - Finish migrations, observability and actionable status, install/service and
   upgrade/rollback paths, backup/restore operator documentation, and independent
   cryptographic/protocol/security review. Freeze wire and storage compatibility
@@ -2952,3 +3112,6 @@ sector/encryption/root representation, variable coding profiles, membership and
 fork policy, key epochs, retention/deletion, audit/repair, endpoint privacy and
 Tor policy, relay abuse controls, portable metadata, volume manifests, source
 backends, application consistency, and final resource/headroom limits.
+Also settle Git format/hash support, ordinary-Git transport compatibility,
+byte-preserving attribute policy, source-backend migration, worktree safety,
+and history reachability before promising the Git-facing compatibility freeze.
