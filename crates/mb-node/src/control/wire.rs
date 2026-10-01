@@ -143,6 +143,12 @@ pub enum LocalRequest {
         #[serde(default)]
         author_email: String,
     },
+    GitMergeContinue {
+        repository_id: Uuid,
+    },
+    GitMergeAbort {
+        repository_id: Uuid,
+    },
     GitDiff {
         repository_id: Uuid,
         cached: bool,
@@ -256,6 +262,9 @@ pub enum LocalResponse {
     GitMerged {
         repository_id: Uuid,
         oid: [u8; 20],
+    },
+    GitMergeAborted {
+        repository_id: Uuid,
     },
     GitDiff(GitDiff),
     GitStatus(GitStatus),
@@ -493,6 +502,8 @@ mod tests {
                 author_name: "Author".to_owned(),
                 author_email: "a@example.test".to_owned(),
             },
+            LocalRequest::GitMergeContinue { repository_id },
+            LocalRequest::GitMergeAbort { repository_id },
             LocalRequest::GitDiff {
                 repository_id,
                 cached: true,
@@ -652,6 +663,7 @@ mod tests {
                 repository_id,
                 oid: [7; 20],
             },
+            LocalResponse::GitMergeAborted { repository_id },
             LocalResponse::GitDiff(GitDiff {
                 format_version: 1,
                 repository_id,
@@ -671,6 +683,12 @@ mod tests {
                 }],
                 untracked: vec![b"new".to_vec()],
                 pending_adds: vec![],
+                merge: Some(mb_git::GitMergeState {
+                    source_ref: b"refs/heads/topic".to_vec(),
+                    ours: [7; 20],
+                    theirs: [8; 20],
+                    unresolved_paths: vec![b"tracked".to_vec()],
+                }),
             }),
         ] {
             let envelope = LocalResponseEnvelope {

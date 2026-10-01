@@ -53,7 +53,7 @@ pub use history::{
 #[cfg(target_os = "linux")]
 pub use interop::GitInteropError;
 #[cfg(target_os = "linux")]
-pub use merge::MergeBlobError;
+pub use merge::{GitMergeState, MergeBlobError};
 pub use odb::NativeOdb;
 #[cfg(target_os = "linux")]
 pub use prune::{GitPruneError, GitPruneReport, GitPruneRoots};

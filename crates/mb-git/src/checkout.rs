@@ -25,6 +25,10 @@ use crate::history::{
     GitBranchInfo, HistoryError, MergeIdentity, commit_descends_from, create_pathwise_merge_commit,
     fetched_ref_record, list_branches, merge_commit_parents, ref_kind, ref_oid,
 };
+use crate::merge::{
+    MergeBlobError, MergeSession, load_merge_session, session_key, session_kind,
+    store_merge_session,
+};
 use crate::stage::{
     GitIndexEntry, StageError, anchors_for_oid, has_pending_stages, index_kind, stage_path_key,
     staged_entries,
@@ -122,6 +126,8 @@ pub enum CheckoutError {
     Head(#[from] HeadError),
     #[error("Git blob verification error: {0}")]
     GitAnchor(#[from] GitAnchorError),
+    #[error("Git merge state error: {0}")]
+    MergeState(#[from] MergeBlobError),
     #[error("Git object error: {0}")]
     Git(#[from] git2::Error),
     #[error("working-tree I/O error: {0}")]
@@ -144,6 +150,8 @@ pub enum CheckoutError {
     MissingMergeBranch,
     #[error("a divergent merge or pull needs an author name and email")]
     MissingMergeIdentity,
+    #[error("merge needs resolution for paths: {0:?}")]
+    MergeConflicts(Vec<Vec<u8>>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -207,6 +215,7 @@ struct CheckoutTarget<'a> {
     advance_ref: bool,
     target_ref: Option<&'a [u8]>,
     merge_commit: bool,
+    resolved_paths: Option<&'a BTreeSet<Vec<u8>>>,
 }
 
 struct DivergentMerge<'a> {
@@ -808,6 +817,33 @@ fn index_matches_tree(staged: &BTreeMap<Vec<u8>, GitIndexEntry>, tree: &TreeFile
         })
 }
 
+fn index_matches_checkout(
+    staged: &BTreeMap<Vec<u8>, GitIndexEntry>,
+    old_tree: &TreeFiles,
+    new_tree: &TreeFiles,
+    resolved: Option<&BTreeSet<Vec<u8>>>,
+) -> bool {
+    let Some(resolved) = resolved else {
+        return index_matches_tree(staged, old_tree);
+    };
+    staged.len() == old_tree.len()
+        && resolved.iter().all(|path| {
+            old_tree.contains_key(path)
+                && new_tree.contains_key(path)
+                && old_tree.get(path) != new_tree.get(path)
+        })
+        && old_tree.iter().all(|(path, old)| {
+            let expected = if resolved.contains(path) {
+                new_tree.get(path).unwrap_or(old)
+            } else {
+                old
+            };
+            staged
+                .get(path)
+                .is_some_and(|entry| entry.oid == expected.0 && entry.mode == expected.1)
+        })
+}
+
 fn parent_directory_paths(tree: &TreeFiles) -> Result<BTreeSet<Vec<u8>>, CheckoutError> {
     let mut parents = BTreeSet::new();
     for path in tree.keys() {
@@ -979,6 +1015,7 @@ pub(crate) fn begin_switch(
             advance_ref: false,
             target_ref: None,
             merge_commit: false,
+            resolved_paths: None,
         },
     )?;
     Ok(GitBranchInfo {
@@ -1043,6 +1080,7 @@ pub(crate) fn begin_pull(
             advance_ref: true,
             target_ref: None,
             merge_commit: false,
+            resolved_paths: None,
         },
     )?;
     Ok(target)
@@ -1108,6 +1146,7 @@ pub(crate) fn begin_merge_branch(
             advance_ref: true,
             target_ref: Some(source_ref.as_bytes()),
             merge_commit: false,
+            resolved_paths: None,
         },
     )?;
     Ok(target)
@@ -1127,7 +1166,7 @@ fn begin_divergent_merge(
     if !status.changes.is_empty() || !status.pending_adds.is_empty() {
         return Err(CheckoutError::DirtyWorktree);
     }
-    let merged = create_pathwise_merge_commit(
+    let merged = match create_pathwise_merge_commit(
         control,
         repository_id,
         root_path,
@@ -1138,7 +1177,30 @@ fn begin_divergent_merge(
             email: merge.author_email,
             message: merge.message,
         },
-    )?;
+        None,
+    ) {
+        Ok(merged) => merged,
+        Err(HistoryError::MergeConflicts(paths)) => {
+            store_merge_session(
+                control,
+                &MergeSession {
+                    format_version: 1,
+                    repository_id,
+                    branch: merge.selected.to_owned(),
+                    ours: merge.old.as_bytes().try_into().expect("SHA-1 OID"),
+                    theirs: merge.target.as_bytes().try_into().expect("SHA-1 OID"),
+                    source_ref: merge.source_ref.to_vec(),
+                    author_name: merge.author_name.to_owned(),
+                    author_email: merge.author_email.to_owned(),
+                    message: merge.message.to_owned(),
+                    conflicts: paths.clone(),
+                    resolved: Vec::new(),
+                },
+            )?;
+            return Err(CheckoutError::MergeConflicts(paths));
+        }
+        Err(error) => return Err(error.into()),
+    };
     begin_checkout_to(
         control,
         repository_id,
@@ -1152,6 +1214,81 @@ fn begin_divergent_merge(
             advance_ref: true,
             target_ref: Some(merge.source_ref),
             merge_commit: true,
+            resolved_paths: None,
+        },
+    )?;
+    Ok(merged)
+}
+
+pub(crate) fn continue_merge(
+    control: &ControlStore,
+    repository_id: Uuid,
+    root_path: &Path,
+    catalog_dir: &PinnedDirectory,
+) -> Result<Oid, CheckoutError> {
+    resume_pending_checkout(control, repository_id, root_path, catalog_dir)?;
+    let (session, _) =
+        load_merge_session(control, repository_id)?.ok_or(MergeBlobError::MissingSession)?;
+    let branch = selected_branch(control, repository_id)?;
+    let ours = Oid::from_bytes(&session.ours)?;
+    let theirs = Oid::from_bytes(&session.theirs)?;
+    if branch != session.branch
+        || ref_oid(
+            control,
+            repository_id,
+            &selected_ref(control, repository_id)?,
+        )? != Some(ours)
+        || ref_oid(control, repository_id, &session.source_ref)? != Some(theirs)
+    {
+        return Err(CheckoutError::IncompatibleIntent);
+    }
+    if session.conflicts.len() != session.resolved.len() {
+        return Err(CheckoutError::MergeConflicts(
+            session
+                .conflicts
+                .iter()
+                .filter(|path| session.resolved.binary_search(path).is_err())
+                .cloned()
+                .collect(),
+        ));
+    }
+    let staged = staged_entries(control, repository_id)?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let mut resolutions = BTreeMap::new();
+    let mut resolved_paths = BTreeSet::new();
+    for path in &session.conflicts {
+        let entry = staged.get(path).ok_or(CheckoutError::IncompatibleIntent)?;
+        resolutions.insert(path.clone(), entry.clone());
+        resolved_paths.insert(path.clone());
+    }
+    let merged = create_pathwise_merge_commit(
+        control,
+        repository_id,
+        root_path,
+        ours,
+        theirs,
+        MergeIdentity {
+            name: &session.author_name,
+            email: &session.author_email,
+            message: &session.message,
+        },
+        Some(&resolutions),
+    )?;
+    begin_checkout_to(
+        control,
+        repository_id,
+        root_path,
+        catalog_dir,
+        CheckoutTarget {
+            old_branch: &branch,
+            old_oid: Some(ours),
+            new_branch: &branch,
+            new_oid: merged,
+            advance_ref: true,
+            target_ref: Some(&session.source_ref),
+            merge_commit: true,
+            resolved_paths: Some(&resolved_paths),
         },
     )?;
     Ok(merged)
@@ -1180,7 +1317,7 @@ fn begin_checkout_to(
     let staged = staged_entries(control, repository_id)?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
-    if !index_matches_tree(&staged, &old_tree) {
+    if !index_matches_checkout(&staged, &old_tree, &new_tree, target.resolved_paths) {
         return Err(CheckoutError::DirtyWorktree);
     }
     let root = PinnedDirectory::open(root_path)?;
@@ -1196,17 +1333,27 @@ fn begin_checkout_to(
         return Err(CheckoutError::TooManyFiles);
     }
     for (path, (oid, mode)) in &old_tree {
-        entry_kind(*mode)?;
+        let (oid, mode) = if target
+            .resolved_paths
+            .is_some_and(|paths| paths.contains(path))
+        {
+            *new_tree
+                .get(path)
+                .ok_or(CheckoutError::IncompatibleIntent)?
+        } else {
+            (*oid, *mode)
+        };
+        entry_kind(mode)?;
         let (parent, leaf) = parent_and_name(&root, path)?;
         let identity =
-            entry_identity_for(&parent, &leaf, *mode)?.ok_or(CheckoutError::DirtyWorktree)?;
+            entry_identity_for(&parent, &leaf, mode)?.ok_or(CheckoutError::DirtyWorktree)?;
         verify_file(
             &parent,
             &leaf,
             identity,
             &CheckoutFile {
-                oid: *oid,
-                mode: *mode,
+                oid,
+                mode,
                 anchor_id: staged[path].anchor_id,
             },
         )?;
@@ -1220,6 +1367,12 @@ fn begin_checkout_to(
     {
         let old = old_tree.get(&path);
         let new = new_tree.get(&path);
+        if target
+            .resolved_paths
+            .is_some_and(|paths| paths.contains(&path))
+        {
+            continue;
+        }
         if old == new {
             continue;
         }
@@ -1636,10 +1789,13 @@ fn apply_intent(
                         .anchor_id
                 }
                 None => {
-                    previous_index
+                    let staged = previous_index
                         .get(path)
-                        .ok_or(CheckoutError::IncompatibleIntent)?
-                        .anchor_id
+                        .ok_or(CheckoutError::IncompatibleIntent)?;
+                    if staged.oid != *oid || staged.mode != *mode {
+                        return Err(CheckoutError::IncompatibleIntent);
+                    }
+                    staged.anchor_id
                 }
             };
             records.push((
@@ -1653,9 +1809,9 @@ fn apply_intent(
                 })?,
             ));
         }
-        for (path, _) in previous_index {
-            if !target_files.contains_key(&path) {
-                deletions.push((index_kind(intent.repository_id), path));
+        for path in previous_index.keys() {
+            if !target_files.contains_key(path) {
+                deletions.push((index_kind(intent.repository_id), path.clone()));
             }
         }
         records.push(selected_branch_record(
@@ -1675,7 +1831,39 @@ fn apply_intent(
             INTENT_KEY.to_vec(),
             encode_intent(intent)?,
         ));
-        control.put_records_and_delete(&records, &deletions)?;
+        if let Some((session, encoded)) = load_merge_session(control, intent.repository_id)? {
+            let (first, second) = merge_commit_parents(
+                control,
+                intent.repository_id,
+                Oid::from_bytes(&intent.new_oid)?,
+            )?;
+            if intent.format_version != 6
+                || session.branch != intent.old_branch
+                || session.ours != intent.old_oid
+                || session.theirs != second.as_bytes()
+                || first.as_bytes() != session.ours
+                || intent.target_ref.as_deref() != Some(session.source_ref.as_slice())
+                || session.conflicts.len() != session.resolved.len()
+                || session.conflicts.iter().any(|path| {
+                    target_files.get(path).is_none_or(|(oid, mode)| {
+                        previous_index
+                            .get(path)
+                            .is_none_or(|staged| staged.oid != *oid || staged.mode != *mode)
+                    })
+                })
+            {
+                return Err(CheckoutError::IncompatibleIntent);
+            }
+            control.put_records_and_retire_and_delete_if_value(
+                &records,
+                &deletions,
+                &session_kind(intent.repository_id),
+                session_key(),
+                &encoded,
+            )?;
+        } else {
+            control.put_records_and_delete(&records, &deletions)?;
+        }
         run_after_checkout_commit_hook();
     }
     if intent.phase == Phase::Cleanup {

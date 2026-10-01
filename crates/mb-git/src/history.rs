@@ -2,7 +2,7 @@
 //! canonical objects in a disposable metadata-only repository; file blobs never
 //! enter that repository or a Git object directory.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
@@ -89,6 +89,8 @@ pub enum HistoryError {
     CheckoutRequired,
     #[error("the branches changed a path that cannot be merged automatically")]
     ContentMergeRequired,
+    #[error("the merge has unresolved paths: {0:?}")]
+    MergeConflicts(Vec<Vec<u8>>),
     #[error("the branches have no unique common ancestor")]
     AmbiguousMergeBase,
 }
@@ -771,6 +773,7 @@ pub(crate) fn create_pathwise_merge_commit(
     ours: Oid,
     theirs: Oid,
     identity: MergeIdentity<'_>,
+    resolutions: Option<&BTreeMap<Vec<u8>, GitIndexEntry>>,
 ) -> Result<Oid, HistoryError> {
     let temporary = tempfile::tempdir()?;
     let repository = Repository::init_bare(temporary.path())?;
@@ -796,6 +799,8 @@ pub(crate) fn create_pathwise_merge_commit(
     let mut merged = TreeFiles::new();
     let mut generated = Vec::<(Vec<u8>, MergeFileInputs, GeneratedBlob)>::new();
     let mut generated_len = 0_usize;
+    let mut unresolved = Vec::new();
+    let mut used_resolutions = BTreeSet::new();
     for path in paths {
         let base_file = base_files.get(path);
         let our_file = our_files.get(path);
@@ -807,10 +812,21 @@ pub(crate) fn create_pathwise_merge_commit(
         } else if their_file == base_file {
             our_file
         } else {
+            if let Some(entry) = resolutions.and_then(|entries| entries.get(path)) {
+                if entry.format_version != 1
+                    || !matches!(entry.mode, 0o100644 | 0o100755 | 0o120000)
+                {
+                    return Err(HistoryError::IncompatibleRecord);
+                }
+                merged.insert(path.clone(), (entry.oid, entry.mode));
+                used_resolutions.insert(path.clone());
+                continue;
+            }
             let (Some(base_file), Some(our_file), Some(their_file)) =
                 (base_file, our_file, their_file)
             else {
-                return Err(HistoryError::ContentMergeRequired);
+                unresolved.push(path.clone());
+                continue;
             };
             let input = |(oid, mode): &([u8; 20], u32)| MergeFileInput {
                 oid: *oid,
@@ -821,8 +837,10 @@ pub(crate) fn create_pathwise_merge_commit(
                 ours: input(our_file),
                 theirs: input(their_file),
             };
-            let blob = merge_file_bytes(control, repository_id, path, inputs)?
-                .ok_or(HistoryError::ContentMergeRequired)?;
+            let Some(blob) = merge_file_bytes(control, repository_id, path, inputs)? else {
+                unresolved.push(path.clone());
+                continue;
+            };
             generated_len = generated_len
                 .checked_add(blob.bytes.len())
                 .filter(|total| *total <= MAX_AUTOMERGE_TOTAL_BYTES)
@@ -840,6 +858,12 @@ pub(crate) fn create_pathwise_merge_commit(
         if let Some(file) = chosen {
             merged.insert(path.clone(), *file);
         }
+    }
+    if !unresolved.is_empty() {
+        return Err(HistoryError::MergeConflicts(unresolved));
+    }
+    if resolutions.is_some_and(|entries| used_resolutions.len() != entries.len()) {
+        return Err(HistoryError::IncompatibleRecord);
     }
     for path in merged.keys() {
         for (index, byte) in path.iter().enumerate() {

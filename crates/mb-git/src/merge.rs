@@ -18,6 +18,7 @@ use crate::stage::{StageError, anchors_for_oid, object_kind, stage_path_key};
 use crate::{GitAnchorError, NativeOdb, blob_oid_from_anchor};
 
 const INTENT_PREFIX: &str = "git-merge-blob-intent-v1/";
+const SESSION_PREFIX: &str = "git-merge-session-v1/";
 const ACTIVE: &[u8] = b"active";
 pub(crate) const MAX_AUTOMERGE_FILE_BYTES: u64 = 1024 * 1024;
 
@@ -37,8 +38,186 @@ pub enum MergeBlobError {
     Stage(#[from] StageError),
     #[error("merge blob read error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("the pending merge blob or an existing Git object is incompatible")]
+    #[error("the pending merge state or an existing Git object is incompatible")]
     IncompatibleRecord,
+    #[error("a merge session is already pending")]
+    PendingSession,
+    #[error("there is no merge session to continue or abort")]
+    MissingSession,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitMergeState {
+    pub source_ref: Vec<u8>,
+    pub ours: [u8; 20],
+    pub theirs: [u8; 20],
+    pub unresolved_paths: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct MergeSession {
+    pub format_version: u16,
+    pub repository_id: Uuid,
+    pub branch: String,
+    pub ours: [u8; 20],
+    pub theirs: [u8; 20],
+    pub source_ref: Vec<u8>,
+    pub author_name: String,
+    pub author_email: String,
+    pub message: String,
+    pub conflicts: Vec<Vec<u8>>,
+    pub resolved: Vec<Vec<u8>>,
+}
+
+pub(crate) fn session_kind(repository_id: Uuid) -> String {
+    format!("{SESSION_PREFIX}{repository_id}")
+}
+
+pub(crate) fn session_key() -> &'static [u8] {
+    ACTIVE
+}
+
+fn validate_session(session: &MergeSession, repository_id: Uuid) -> Result<(), MergeBlobError> {
+    let reference =
+        std::str::from_utf8(&session.source_ref).map_err(|_| MergeBlobError::IncompatibleRecord)?;
+    let prefix = if reference.starts_with("refs/remotes/origin/") {
+        "refs/remotes/origin/"
+    } else {
+        "refs/heads/"
+    };
+    if session.format_version != 1
+        || session.repository_id != repository_id
+        || session.branch.len() > 1024
+        || !git2::Branch::name_is_valid(&session.branch)?
+        || session.source_ref.len() > prefix.len() + 1024
+        || !reference.starts_with(prefix)
+        || !git2::Reference::is_valid_name(reference)
+        || session.author_name.is_empty()
+        || session.author_email.is_empty()
+        || session.conflicts.is_empty()
+        || session.conflicts.len() > 8_192
+        || session.conflicts.windows(2).any(|pair| pair[0] >= pair[1])
+        || session.resolved.windows(2).any(|pair| pair[0] >= pair[1])
+        || session
+            .resolved
+            .iter()
+            .any(|path| session.conflicts.binary_search(path).is_err())
+    {
+        return Err(MergeBlobError::IncompatibleRecord);
+    }
+    for path in &session.conflicts {
+        let relative = PathBuf::from(OsString::from_vec(path.clone()));
+        if stage_path_key(&relative)? != *path {
+            return Err(MergeBlobError::IncompatibleRecord);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn load_merge_session(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<Option<(MergeSession, Vec<u8>)>, MergeBlobError> {
+    let Some(encoded) = control.get_record(&session_kind(repository_id), ACTIVE)? else {
+        return Ok(None);
+    };
+    let session: MergeSession = decode_canonical(&encoded)?;
+    validate_session(&session, repository_id)?;
+    Ok(Some((session, encoded)))
+}
+
+pub(crate) fn has_merge_session(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<bool, MergeBlobError> {
+    Ok(load_merge_session(control, repository_id)?.is_some())
+}
+
+pub(crate) fn store_merge_session(
+    control: &ControlStore,
+    session: &MergeSession,
+) -> Result<(), MergeBlobError> {
+    validate_session(session, session.repository_id)?;
+    if !control.put_record_if_absent(
+        &session_kind(session.repository_id),
+        ACTIVE,
+        &canonical_bytes(session)?,
+    )? {
+        return Err(MergeBlobError::PendingSession);
+    }
+    Ok(())
+}
+
+pub(crate) fn mark_merge_resolved(
+    control: &ControlStore,
+    repository_id: Uuid,
+    path: &[u8],
+) -> Result<(), MergeBlobError> {
+    let Some((mut session, before)) = load_merge_session(control, repository_id)? else {
+        return Ok(());
+    };
+    if session
+        .conflicts
+        .binary_search_by(|candidate| candidate.as_slice().cmp(path))
+        .is_err()
+    {
+        return Ok(());
+    }
+    if let Err(position) = session
+        .resolved
+        .binary_search_by(|candidate| candidate.as_slice().cmp(path))
+    {
+        session.resolved.insert(position, path.to_vec());
+        control.replace_record_if_value(
+            &session_kind(repository_id),
+            ACTIVE,
+            &before,
+            &canonical_bytes(&session)?,
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn unmark_merge_resolved(
+    control: &ControlStore,
+    repository_id: Uuid,
+    path: &[u8],
+) -> Result<(), MergeBlobError> {
+    let Some((mut session, before)) = load_merge_session(control, repository_id)? else {
+        return Ok(());
+    };
+    if let Ok(position) = session
+        .resolved
+        .binary_search_by(|candidate| candidate.as_slice().cmp(path))
+    {
+        session.resolved.remove(position);
+        control.replace_record_if_value(
+            &session_kind(repository_id),
+            ACTIVE,
+            &before,
+            &canonical_bytes(&session)?,
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn merge_state(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<Option<GitMergeState>, MergeBlobError> {
+    let Some((session, _)) = load_merge_session(control, repository_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(GitMergeState {
+        source_ref: session.source_ref,
+        ours: session.ours,
+        theirs: session.theirs,
+        unresolved_paths: session
+            .conflicts
+            .into_iter()
+            .filter(|path| session.resolved.binary_search(path).is_err())
+            .collect(),
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

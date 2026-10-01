@@ -15,7 +15,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::checkout::{
-    CheckoutError, begin_merge_branch, begin_pull, begin_switch, resume_pending_checkout,
+    CheckoutError, begin_merge_branch, begin_pull, begin_switch, continue_merge,
+    resume_pending_checkout,
 };
 use crate::diff::{DiffError, GitDiff, repository_diff};
 use crate::fetch::{FetchError, fetch_bare};
@@ -27,13 +28,16 @@ use crate::history::{
     pin_commit, switch_same_tree_branch, unpin_commit,
 };
 use crate::interop::{GitInteropError, push_current_branch_to_bare};
-use crate::merge::{MergeBlobError, resume_pending_merge_blob};
+use crate::merge::{
+    MergeBlobError, has_merge_session, load_merge_session, mark_merge_resolved,
+    resume_pending_merge_blob, session_key, session_kind, unmark_merge_resolved,
+};
 use crate::prune::{
     GitPruneError, GitPruneReport, GitPruneRoots, prune_unreachable, resume_pending_prune,
 };
 use crate::stage::{
-    GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, remove_cached,
-    resume_pending_stages, stage_file, stage_path_key, stage_symlink, staged_entry,
+    GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, pending_stage_paths,
+    remove_cached, resume_pending_stages, stage_file, stage_path_key, stage_symlink, staged_entry,
 };
 use crate::status::{GitStatus, StatusError, repository_status};
 
@@ -205,12 +209,14 @@ impl GitRepository {
         relative_path: impl AsRef<Path>,
     ) -> Result<GitIndexEntry, RepositoryError> {
         self.resume_checkout()?;
-        Ok(stage_file(
+        let relative = relative_path.as_ref();
+        let entry = stage_file(&self.catalog, self.repository_id, &self.root, relative)?;
+        mark_merge_resolved(
             &self.catalog,
             self.repository_id,
-            &self.root,
-            relative_path,
-        )?)
+            &stage_path_key(relative)?,
+        )?;
+        Ok(entry)
     }
 
     /// Like `git add <path>`, capture a present file or symlink, or stage the
@@ -243,13 +249,19 @@ impl GitRepository {
             Err(error) => return Err(error.into()),
         };
         if symlink {
-            return Ok(Some(stage_symlink(
+            let entry = stage_symlink(
                 &self.catalog,
                 self.repository_id,
                 &self.root,
                 &self.directory,
                 relative,
-            )?));
+            )?;
+            mark_merge_resolved(
+                &self.catalog,
+                self.repository_id,
+                &stage_path_key(relative)?,
+            )?;
+            return Ok(Some(entry));
         }
         if parent.open_child_file(name)?.is_some() {
             Ok(Some(self.stage_file(relative)?))
@@ -270,16 +282,26 @@ impl GitRepository {
 
     pub fn remove_cached(&self, relative_path: impl AsRef<Path>) -> Result<bool, RepositoryError> {
         self.resume_checkout()?;
-        Ok(remove_cached(
-            &self.catalog,
-            self.repository_id,
-            relative_path,
-        )?)
+        let relative = relative_path.as_ref();
+        let removed = remove_cached(&self.catalog, self.repository_id, relative)?;
+        if removed {
+            unmark_merge_resolved(
+                &self.catalog,
+                self.repository_id,
+                &stage_path_key(relative)?,
+            )?;
+        }
+        Ok(removed)
     }
 
     pub fn resume_pending_stages(&self) -> Result<Vec<GitIndexEntry>, RepositoryError> {
         self.resume_checkout()?;
-        Ok(resume_pending_stages(&self.catalog, self.repository_id)?)
+        let paths = pending_stage_paths(&self.catalog, self.repository_id)?;
+        let entries = resume_pending_stages(&self.catalog, self.repository_id)?;
+        for path in paths {
+            mark_merge_resolved(&self.catalog, self.repository_id, &path)?;
+        }
+        Ok(entries)
     }
 
     pub fn abandon_pending_stage(
@@ -318,6 +340,7 @@ impl GitRepository {
         message: &str,
     ) -> Result<GitCommitInfo, RepositoryError> {
         self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
         Ok(commit_index(
             &self.catalog,
             self.repository_id,
@@ -364,6 +387,7 @@ impl GitRepository {
 
     pub fn create_branch(&self, name: &str) -> Result<GitBranchInfo, RepositoryError> {
         self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
         Ok(create_branch(&self.catalog, self.repository_id, name)?)
     }
 
@@ -373,6 +397,7 @@ impl GitRepository {
         start_point: &str,
     ) -> Result<GitBranchInfo, RepositoryError> {
         self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
         Ok(create_branch_from(
             &self.catalog,
             self.repository_id,
@@ -383,6 +408,7 @@ impl GitRepository {
 
     pub fn delete_branch(&self, name: &str, force: bool) -> Result<GitBranchInfo, RepositoryError> {
         self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
         Ok(delete_branch(
             &self.catalog,
             self.repository_id,
@@ -393,6 +419,7 @@ impl GitRepository {
 
     pub fn switch_branch(&self, name: &str) -> Result<GitBranchInfo, RepositoryError> {
         self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
         match switch_same_tree_branch(&self.catalog, self.repository_id, name) {
             Ok(info) => Ok(info),
             Err(HistoryError::CheckoutRequired | HistoryError::NoHead) => Ok(begin_switch(
@@ -414,6 +441,13 @@ impl GitRepository {
             &self.root,
             &self.directory,
         )?)
+    }
+
+    fn ensure_no_merge_session(&self) -> Result<(), RepositoryError> {
+        if has_merge_session(&self.catalog, self.repository_id)? {
+            return Err(MergeBlobError::PendingSession.into());
+        }
+        Ok(())
     }
 
     pub fn status(&self) -> Result<GitStatus, RepositoryError> {
@@ -471,6 +505,7 @@ impl GitRepository {
     /// working tree. Interrupted imports resume from the durable fetch intent.
     pub fn fetch_bare(&self, source: impl AsRef<Path>) -> Result<usize, RepositoryError> {
         self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
         Ok(fetch_bare(
             &self.catalog,
             self.repository_id,
@@ -505,6 +540,7 @@ impl GitRepository {
         author_email: &str,
     ) -> Result<Oid, RepositoryError> {
         self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
         Ok(begin_merge_branch(
             &self.catalog,
             self.repository_id,
@@ -516,12 +552,38 @@ impl GitRepository {
         )?)
     }
 
+    /// Finish a conflicted merge using explicitly staged resolution bytes.
+    pub fn merge_continue(&self) -> Result<Oid, RepositoryError> {
+        self.resume_checkout()?;
+        Ok(continue_merge(
+            &self.catalog,
+            self.repository_id,
+            &self.root,
+            &self.directory,
+        )?)
+    }
+
+    /// A conflict session does not modify the worktree; abort only drops that
+    /// pending merge. User edits and staged entries remain untouched.
+    pub fn merge_abort(&self) -> Result<(), RepositoryError> {
+        self.resume_checkout()?;
+        let (_, encoded) = load_merge_session(&self.catalog, self.repository_id)?
+            .ok_or(MergeBlobError::MissingSession)?;
+        self.catalog.delete_record_if_value(
+            &session_kind(self.repository_id),
+            session_key(),
+            &encoded,
+        )?;
+        Ok(())
+    }
+
     pub fn import_backup(
         &self,
         descriptor: &crate::GitBackupDescriptor,
         anchors: &[FileAnchorManifest],
     ) -> Result<(), RepositoryError> {
         self.resume_checkout()?;
+        self.ensure_no_merge_session()?;
         Ok(import_graph_backup(
             &self.catalog,
             self.repository_id,
@@ -952,6 +1014,132 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn conflicted_merge_continues_from_staged_bytes_after_checkout_crash() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-conflict-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        let bare_root = run_root.join("remote.git");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("conflict"), b"base\r\n").unwrap();
+        fs::write(source_root.join("source-only"), b"base\n").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [95_u8; 32];
+        let local = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        local.stage_file("conflict").unwrap();
+        local.stage_file("source-only").unwrap();
+        local.commit("Author", "a@example.test", "base").unwrap();
+        local.create_branch("topic").unwrap();
+        local.switch_branch("topic").unwrap();
+        fs::write(source_root.join("conflict"), b"topic\r\n").unwrap();
+        fs::write(source_root.join("source-only"), b"topic\n\0").unwrap();
+        local.stage_file("conflict").unwrap();
+        local.stage_file("source-only").unwrap();
+        let topic = local.commit("Author", "a@example.test", "topic").unwrap();
+        local.switch_branch("main").unwrap();
+        fs::write(source_root.join("conflict"), b"main\n").unwrap();
+        local.stage_file("conflict").unwrap();
+        let main = local.commit("Author", "a@example.test", "main").unwrap();
+        assert!(matches!(
+            local.merge_branch("topic", "Author", "a@example.test"),
+            Err(RepositoryError::Checkout(crate::CheckoutError::MergeConflicts(paths)))
+                if paths == vec![b"conflict".to_vec()]
+        ));
+        assert_eq!(local.status().unwrap().head_oid, Some(main.oid));
+        assert_eq!(fs::read(source_root.join("conflict")).unwrap(), b"main\n");
+        assert!(matches!(
+            local.commit("Author", "a@example.test", "blocked"),
+            Err(RepositoryError::MergeBlob(MergeBlobError::PendingSession))
+        ));
+        drop(local);
+        let local = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        assert_eq!(
+            local.status().unwrap().merge.unwrap().unresolved_paths,
+            vec![b"conflict".to_vec()]
+        );
+        fs::write(source_root.join("conflict"), b"resolved\r\n\0").unwrap();
+        let resolution = local.stage_file("conflict").unwrap();
+        assert!(
+            local
+                .status()
+                .unwrap()
+                .merge
+                .unwrap()
+                .unresolved_paths
+                .is_empty()
+        );
+        local.merge_abort().unwrap();
+        assert!(local.status().unwrap().merge.is_none());
+        assert_eq!(local.staged_entry("conflict").unwrap(), Some(resolution));
+        assert_eq!(
+            fs::read(source_root.join("conflict")).unwrap(),
+            b"resolved\r\n\0"
+        );
+        fs::write(source_root.join("conflict"), b"main\n").unwrap();
+        local.stage_file("conflict").unwrap();
+        assert!(matches!(
+            local.merge_branch("topic", "Author", "a@example.test"),
+            Err(RepositoryError::Checkout(
+                crate::CheckoutError::MergeConflicts(_)
+            ))
+        ));
+        fs::write(source_root.join("conflict"), b"resolved\r\n\0").unwrap();
+        local.stage_file("conflict").unwrap();
+        crate::checkout::set_after_checkout_file_hook(Box::new(|| {
+            panic!("merge continuation crash")
+        }));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local.merge_continue().unwrap();
+        }));
+        assert!(interrupted.is_err());
+        assert_eq!(
+            crate::history::ref_oid(&local.catalog, repository_id, b"refs/heads/main").unwrap(),
+            Some(Oid::from_bytes(&main.oid).unwrap())
+        );
+        drop(local);
+        let local = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        let status = local.status().unwrap();
+        assert!(status.merge.is_none());
+        assert!(status.changes.is_empty());
+        assert_eq!(
+            fs::read(source_root.join("conflict")).unwrap(),
+            b"resolved\r\n\0"
+        );
+        assert_eq!(
+            fs::read(source_root.join("source-only")).unwrap(),
+            b"topic\n\0"
+        );
+        assert_eq!(
+            local.log(1).unwrap()[0].parent_oids,
+            vec![main.oid, topic.oid]
+        );
+        git2::Repository::init_bare(&bare_root).unwrap();
+        local.push_current_branch_to_bare(&bare_root).unwrap();
+        let remote = git2::Repository::open_bare(&bare_root).unwrap();
+        let commit = remote
+            .find_commit(Oid::from_bytes(&status.head_oid.unwrap()).unwrap())
+            .unwrap();
+        assert_eq!(
+            remote
+                .find_blob(commit.tree().unwrap().get_name("conflict").unwrap().id())
+                .unwrap()
+                .content(),
+            b"resolved\r\n\0"
+        );
+        let graph = local.export_graph_source().unwrap();
+        drop(commit);
+        drop(remote);
+        drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn local_branch_merge_fast_forwards_and_replays_without_moving_source_ref() {
         let test_root = PathBuf::from(
             std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
@@ -1044,10 +1232,15 @@ mod tests {
         ));
         assert!(matches!(
             local.merge_branch("topic", "Author", "a@example.test"),
-            Err(RepositoryError::Checkout(crate::CheckoutError::History(
-                crate::HistoryError::ContentMergeRequired
-            )))
+            Err(RepositoryError::Checkout(crate::CheckoutError::MergeConflicts(paths)))
+                if paths == vec![b"tracked".to_vec()]
         ));
+        assert_eq!(
+            local.status().unwrap().merge.unwrap().unresolved_paths,
+            vec![b"tracked".to_vec()]
+        );
+        local.merge_abort().unwrap();
+        assert!(local.status().unwrap().merge.is_none());
         assert_eq!(local.status().unwrap().head_oid, Some(main.oid));
         assert_eq!(
             fs::read(source_root.join("tracked")).unwrap(),

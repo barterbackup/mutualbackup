@@ -99,9 +99,13 @@ enum Command {
         #[arg(long)]
         author_email: Option<String>,
     },
-    /// Merge a local branch into the selected branch.
+    /// Merge a local branch, continue a resolved merge, or abort its session.
     Merge {
-        branch: String,
+        branch: Option<String>,
+        #[arg(long, conflicts_with_all = ["abort", "branch"])]
+        continue_merge: bool,
+        #[arg(long, conflicts_with_all = ["continue_merge", "branch"])]
+        abort: bool,
         #[arg(long)]
         author_name: Option<String>,
         #[arg(long)]
@@ -560,10 +564,43 @@ async fn main() -> Result<()> {
         }
         Command::Merge {
             branch,
+            continue_merge,
+            abort,
             author_name,
             author_email,
         } => {
             let (_, repository_id) = discover_repository(&working_directory)?;
+            if abort {
+                let LocalResponse::GitMergeAborted {
+                    repository_id: returned_id,
+                } = local_control_call(&socket, &LocalRequest::GitMergeAbort { repository_id })
+                    .await?
+                else {
+                    bail!("daemon returned the wrong response to Git merge --abort");
+                };
+                if returned_id != repository_id {
+                    bail!("daemon aborted another repository's merge");
+                }
+                println!("Aborted pending merge; worktree and index edits remain");
+                return Ok(());
+            }
+            if continue_merge {
+                let LocalResponse::GitMerged {
+                    repository_id: returned_id,
+                    oid,
+                } = local_control_call(&socket, &LocalRequest::GitMergeContinue { repository_id })
+                    .await?
+                else {
+                    bail!("daemon returned the wrong response to Git merge --continue");
+                };
+                if returned_id != repository_id {
+                    bail!("daemon merged another repository");
+                }
+                println!("Merge continued at {}", git2::Oid::from_bytes(&oid)?);
+                return Ok(());
+            }
+            let branch = branch
+                .ok_or_else(|| anyhow::anyhow!("merge needs a branch, --continue, or --abort"))?;
             let author_name = match author_name {
                 Some(value) => value,
                 None => optional_author_field("GIT_AUTHOR_NAME", "user.name")?.unwrap_or_default(),
@@ -626,6 +663,12 @@ async fn main() -> Result<()> {
                     println!("Local history is protected by a signed backup");
                 } else {
                     println!("Local commits are awaiting a signed backup");
+                }
+            }
+            if let Some(merge) = &status.merge {
+                println!("Merge pending from {}", display_path(&merge.source_ref));
+                for path in &merge.unresolved_paths {
+                    println!("unresolved {}", display_path(path));
                 }
             }
             for change in status.changes {

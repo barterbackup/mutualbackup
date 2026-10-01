@@ -45,6 +45,8 @@ local-request =
   / { "GitFetchBare": { repository_id: uuid-text, path: tstr } }
   / { "GitPullBare": { repository_id: uuid-text, path: tstr, ? author_name: tstr, ? author_email: tstr } }
   / { "GitMergeBranch": { repository_id: uuid-text, branch: tstr, ? author_name: tstr, ? author_email: tstr } }
+  / { "GitMergeContinue": { repository_id: uuid-text } }
+  / { "GitMergeAbort": { repository_id: uuid-text } }
   / { "GitDiff": { repository_id: uuid-text, cached: bool } }
   / { "GitStatus": { repository_id: uuid-text } }
   / "GuildStatus"
@@ -96,6 +98,7 @@ local-response =
   / { "GitFetched": { repository_id: uuid-text, branch_count: uint } }
   / { "GitPulled": { repository_id: uuid-text, oid: bytes20-array } }
   / { "GitMerged": { repository_id: uuid-text, oid: bytes20-array } }
+  / { "GitMergeAborted": { repository_id: uuid-text } }
   / { "GitDiff": git-diff }
   / { "GitStatus": git-status }
   / { "Guild": null / guild-summary }
@@ -246,7 +249,13 @@ git-status = {
   history_backed_up: bool,
   changes: [* git-status-change],
   untracked: [* [* uint8]],
-  pending_adds: [* [* uint8]]
+  pending_adds: [* [* uint8]],
+  ? merge: {
+    source_ref: [* uint8],
+    ours: bytes20-array,
+    theirs: bytes20-array,
+    unresolved_paths: [* [* uint8]]
+  }
 }
 
 git-status-change = {

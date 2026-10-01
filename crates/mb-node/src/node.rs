@@ -1629,6 +1629,16 @@ impl Node {
         Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
     }
 
+    pub fn git_merge_continue(&self, repository_id: Uuid) -> Result<[u8; 20]> {
+        let oid = self.open_git_repository(repository_id)?.merge_continue()?;
+        Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
+    }
+
+    pub fn git_merge_abort(&self, repository_id: Uuid) -> Result<()> {
+        self.open_git_repository(repository_id)?.merge_abort()?;
+        Ok(())
+    }
+
     pub fn git_diff(&self, repository_id: Uuid, cached: bool) -> Result<GitDiff> {
         self.open_git_repository(repository_id)?
             .diff(cached)

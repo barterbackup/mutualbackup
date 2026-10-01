@@ -574,6 +574,20 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitMergeContinue { repository_id } => {
+            blocking_node(node, move |node| {
+                node.git_merge_continue(repository_id)
+                    .map(|oid| LocalResponse::GitMerged { repository_id, oid })
+            })
+            .await
+        }
+        LocalRequest::GitMergeAbort { repository_id } => {
+            blocking_node(node, move |node| {
+                node.git_merge_abort(repository_id)
+                    .map(|()| LocalResponse::GitMergeAborted { repository_id })
+            })
+            .await
+        }
         LocalRequest::GitDiff {
             repository_id,
             cached,

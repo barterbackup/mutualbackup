@@ -17,6 +17,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::head::{HeadError, selected_branch, selected_ref};
+use crate::merge::{GitMergeState, MergeBlobError, merge_state};
 use crate::stage::{GitIndexEntry, StageError, pending_stage_paths, staged_entries};
 
 const METADATA_PREFIX: &str = "git-metadata-object-v1/";
@@ -36,6 +37,8 @@ pub enum StatusError {
     Model(#[from] ModelError),
     #[error("Git HEAD record error: {0}")]
     Head(#[from] HeadError),
+    #[error("Git merge state error: {0}")]
+    Merge(#[from] MergeBlobError),
     #[error("Git object error: {0}")]
     Git(#[from] git2::Error),
     #[error("working-tree or temporary repository error: {0}")]
@@ -73,6 +76,8 @@ pub struct GitStatus {
     pub changes: Vec<GitStatusChange>,
     pub untracked: Vec<Vec<u8>>,
     pub pending_adds: Vec<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge: Option<GitMergeState>,
 }
 
 #[derive(Deserialize)]
@@ -317,5 +322,6 @@ pub fn repository_status(
         changes,
         untracked,
         pending_adds: pending_stage_paths(control, repository_id)?,
+        merge: merge_state(control, repository_id)?,
     })
 }
