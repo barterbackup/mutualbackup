@@ -14,7 +14,10 @@ use mb_store::{
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::history::{GitCommitInfo, GitLogEntry, HistoryError, commit_index, log_history};
+use crate::history::{
+    GitCommitInfo, GitGraphSource, GitLogEntry, HistoryError, commit_index, export_graph_source,
+    log_history,
+};
 use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, anchors_for_oid, resume_pending_stages,
     stage_file, staged_entry,
@@ -231,6 +234,10 @@ impl GitRepository {
             self.repository_id,
             &self.root,
         )?)
+    }
+
+    pub fn export_graph_source(&self) -> Result<GitGraphSource, RepositoryError> {
+        Ok(export_graph_source(&self.catalog, self.repository_id)?)
     }
 
     pub fn catalog_directory_identity(&self) -> Result<mb_store::NativeFileId, RepositoryError> {
@@ -473,6 +480,15 @@ mod tests {
         assert_eq!(history[0].parent_oids, vec![first.oid]);
         assert_eq!(history[0].message, b"second");
         assert_eq!(history[1].oid, first.oid);
+        let graph = repo.export_graph_source().unwrap();
+        assert_eq!(graph.refs.len(), 1);
+        assert_eq!(graph.refs[0].name, b"refs/heads/main");
+        assert_eq!(graph.refs[0].oid, second.oid);
+        assert_eq!(graph.blobs.len(), 2);
+        assert!(graph.blobs.iter().any(|blob| blob.oid == first_blob.oid));
+        assert!(graph.blobs.iter().any(|blob| blob.oid == second_blob.oid));
+        assert!(graph.objects.iter().any(|object| object.oid == first.oid));
+        assert!(graph.objects.iter().any(|object| object.oid == second.oid));
         let first_anchor = repo
             .anchors_for_oid(Oid::from_bytes(&first_blob.oid).unwrap())
             .unwrap();
@@ -488,9 +504,20 @@ mod tests {
         let second_anchor = repo
             .anchors_for_oid(Oid::from_bytes(&second_blob.oid).unwrap())
             .unwrap();
+        fs::write(source_root.join("nested/tracked"), b"uncommitted").unwrap();
+        let third_blob = repo.stage_file("nested/tracked").unwrap();
+        assert_ne!(third_blob.oid, second_blob.oid);
+        let after_stage = repo.export_graph_source().unwrap();
+        assert_eq!(after_stage.refs, graph.refs);
+        assert_eq!(after_stage.objects, graph.objects);
+        assert_eq!(after_stage.blobs, graph.blobs);
+        let third_anchor = repo
+            .anchors_for_oid(Oid::from_bytes(&third_blob.oid).unwrap())
+            .unwrap();
         drop(repo);
         first_anchor[0].remove().unwrap();
         second_anchor[0].remove().unwrap();
+        third_anchor[0].remove().unwrap();
         fs::remove_dir_all(run_root).unwrap();
     }
 }

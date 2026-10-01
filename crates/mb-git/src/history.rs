@@ -2,11 +2,11 @@
 //! canonical objects in a disposable metadata-only repository; file blobs never
 //! enter that repository or a Git object directory.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use git2::{Index, IndexEntry, IndexTime, ObjectType, Oid, Repository, Signature};
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
-use mb_store::{ControlStore, DatabaseError};
+use mb_store::{ControlStore, DatabaseError, FileAnchorManifest};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -17,6 +17,8 @@ use crate::{GitAnchorError, NativeOdb};
 const METADATA_PREFIX: &str = "git-metadata-object-v1/";
 const REF_PREFIX: &str = "git-ref-v1/";
 const MAIN_REF: &[u8] = b"refs/heads/main";
+const MAX_GRAPH_OBJECTS: usize = 100_000;
+const MAX_GRAPH_METADATA_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum HistoryError {
@@ -40,6 +42,8 @@ pub enum HistoryError {
     UnchangedTree,
     #[error("the history catalog contains an incompatible or corrupt object")]
     IncompatibleRecord,
+    #[error("the reachable Git graph exceeds the bounded backup metadata limit")]
+    GraphTooLarge,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -62,7 +66,35 @@ pub struct GitLogEntry {
     pub message: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitGraphRef {
+    pub name: Vec<u8>,
+    pub oid: [u8; 20],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitGraphObject {
+    pub kind: u8,
+    pub oid: [u8; 20],
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitGraphBlobSource {
+    pub oid: [u8; 20],
+    pub anchor: FileAnchorManifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitGraphSource {
+    pub format_version: u16,
+    pub repository_id: Uuid,
+    pub refs: Vec<GitGraphRef>,
+    pub objects: Vec<GitGraphObject>,
+    pub blobs: Vec<GitGraphBlobSource>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct MetadataObject {
     format_version: u16,
     kind: u8,
@@ -111,8 +143,9 @@ fn load_metadata(
     control: &ControlStore,
     repository_id: Uuid,
     repository: &Repository,
-) -> Result<(), HistoryError> {
+) -> Result<HashMap<Oid, MetadataObject>, HistoryError> {
     let odb = repository.odb()?;
+    let mut objects = HashMap::new();
     for (key, encoded) in control.records(&metadata_kind(repository_id))? {
         let object: MetadataObject = decode_canonical(&encoded)?;
         let kind = object_type(object.kind).ok_or(HistoryError::IncompatibleRecord)?;
@@ -123,8 +156,11 @@ fn load_metadata(
         if odb.write(kind, &object.bytes)? != oid {
             return Err(HistoryError::IncompatibleRecord);
         }
+        if objects.insert(oid, object).is_some() || objects.len() > MAX_GRAPH_OBJECTS {
+            return Err(HistoryError::GraphTooLarge);
+        }
     }
-    Ok(())
+    Ok(objects)
 }
 
 fn head_oid(control: &ControlStore, repository_id: Uuid) -> Result<Option<Oid>, HistoryError> {
@@ -329,4 +365,135 @@ pub fn log_history(
         }
     }
     Ok(result)
+}
+
+/// Export only objects reachable from durable refs. Uncommitted staged blobs
+/// and unreachable local objects are absent from this backup source.
+pub fn export_graph_source(
+    control: &ControlStore,
+    repository_id: Uuid,
+) -> Result<GitGraphSource, HistoryError> {
+    let mut refs = Vec::new();
+    for (name, encoded) in control.records(&ref_kind(repository_id))? {
+        let name_text = std::str::from_utf8(&name).map_err(|_| HistoryError::IncompatibleRecord)?;
+        if !name_text.starts_with("refs/") || !git2::Reference::is_valid_name(name_text) {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        let record: RefRecord = decode_canonical(&encoded)?;
+        if record.format_version != 1 {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        refs.push(GitGraphRef {
+            name,
+            oid: record.oid,
+        });
+    }
+    if refs.len() > MAX_GRAPH_OBJECTS {
+        return Err(HistoryError::GraphTooLarge);
+    }
+    if refs.is_empty() {
+        return Ok(GitGraphSource {
+            format_version: 1,
+            repository_id,
+            refs,
+            objects: Vec::new(),
+            blobs: Vec::new(),
+        });
+    }
+
+    let temporary = tempfile::tempdir()?;
+    let repository = Repository::init_bare(temporary.path())?;
+    let odb = git2::Odb::new()?;
+    let _pack = odb.add_new_mempack_backend(1000)?;
+    repository.set_odb(&odb)?;
+    let stored = load_metadata(control, repository_id, &repository)?;
+    let mut commits = refs
+        .iter()
+        .map(|reference| Oid::from_bytes(&reference.oid))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut trees = Vec::new();
+    let mut seen_commits = HashSet::new();
+    let mut seen_trees = HashSet::new();
+    let mut blob_ids = HashSet::new();
+    while let Some(oid) = commits.pop() {
+        if !seen_commits.insert(oid) {
+            continue;
+        }
+        if seen_commits.len() > MAX_GRAPH_OBJECTS {
+            return Err(HistoryError::GraphTooLarge);
+        }
+        let commit = repository
+            .find_commit(oid)
+            .map_err(|_| HistoryError::IncompatibleRecord)?;
+        trees.push(commit.tree_id());
+        commits.extend(commit.parent_ids());
+    }
+    while let Some(oid) = trees.pop() {
+        if !seen_trees.insert(oid) {
+            continue;
+        }
+        if seen_trees.len() > MAX_GRAPH_OBJECTS {
+            return Err(HistoryError::GraphTooLarge);
+        }
+        let tree = repository
+            .find_tree(oid)
+            .map_err(|_| HistoryError::IncompatibleRecord)?;
+        for entry in tree.iter() {
+            match entry.kind() {
+                Some(ObjectType::Tree) => trees.push(entry.id()),
+                Some(ObjectType::Blob) => {
+                    blob_ids.insert(entry.id());
+                    if blob_ids.len() > MAX_GRAPH_OBJECTS {
+                        return Err(HistoryError::GraphTooLarge);
+                    }
+                }
+                _ => return Err(HistoryError::IncompatibleRecord),
+            }
+        }
+    }
+    let mut reachable = seen_commits
+        .into_iter()
+        .map(|oid| (oid, ObjectType::Commit))
+        .chain(seen_trees.into_iter().map(|oid| (oid, ObjectType::Tree)))
+        .collect::<Vec<_>>();
+    reachable.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    let mut objects = Vec::with_capacity(reachable.len());
+    let mut metadata_bytes = refs.iter().map(|item| item.name.len() + 20).sum::<usize>();
+    for (oid, kind) in reachable {
+        let stored_object = stored.get(&oid).ok_or(HistoryError::IncompatibleRecord)?;
+        if object_type(stored_object.kind) != Some(kind) {
+            return Err(HistoryError::IncompatibleRecord);
+        }
+        metadata_bytes = metadata_bytes
+            .checked_add(stored_object.bytes.len() + 24)
+            .ok_or(HistoryError::GraphTooLarge)?;
+        if metadata_bytes > MAX_GRAPH_METADATA_BYTES {
+            return Err(HistoryError::GraphTooLarge);
+        }
+        objects.push(GitGraphObject {
+            kind: stored_object.kind,
+            oid: oid.as_bytes().try_into().expect("SHA-1 OID"),
+            bytes: stored_object.bytes.clone(),
+        });
+    }
+    let mut blob_ids = blob_ids.into_iter().collect::<Vec<_>>();
+    blob_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    let mut blobs = Vec::with_capacity(blob_ids.len());
+    for oid in blob_ids {
+        let anchor = anchors_for_oid(control, repository_id, oid)?
+            .into_iter()
+            .min_by_key(|anchor| anchor.anchor_id)
+            .ok_or(HistoryError::IncompatibleRecord)?;
+        blobs.push(GitGraphBlobSource {
+            oid: oid.as_bytes().try_into().expect("SHA-1 OID"),
+            anchor,
+        });
+    }
+    Ok(GitGraphSource {
+        format_version: 1,
+        repository_id,
+        refs,
+        objects,
+        blobs,
+    })
 }
