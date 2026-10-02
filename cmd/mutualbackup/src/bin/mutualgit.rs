@@ -139,7 +139,7 @@ enum Command {
     /// Merge a local branch, continue a resolved merge, or abort its session.
     Merge {
         branch: Option<String>,
-        #[arg(long, conflicts_with_all = ["abort", "branch"])]
+        #[arg(long = "continue", alias = "continue-merge", conflicts_with_all = ["abort", "branch"])]
         continue_merge: bool,
         #[arg(long, conflicts_with_all = ["continue_merge", "branch"])]
         abort: bool,
@@ -1344,6 +1344,24 @@ fn parse_push_refspec(value: &str) -> Result<PushRefspec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_accepts_git_continue_flag_and_rejects_conflicting_actions() {
+        for flag in ["--continue", "--continue-merge"] {
+            let cli = Cli::try_parse_from(["mutualgit", "merge", flag]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Merge {
+                    continue_merge: true,
+                    abort: false,
+                    branch: None,
+                    ..
+                }
+            ));
+        }
+        assert!(Cli::try_parse_from(["mutualgit", "merge", "--continue", "--abort"]).is_err());
+        assert!(Cli::try_parse_from(["mutualgit", "merge", "--continue", "topic"]).is_err());
+    }
 
     #[test]
     fn add_paths_stay_inside_the_marked_repository() {
