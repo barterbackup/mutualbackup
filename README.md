@@ -18,7 +18,8 @@ packing remain later work. Do not entrust unique data to this prototype.
   source anchors, peer network, DHT publication, watcher, and durable jobs.
 - `mutualbackup` is the local control and offline bootstrap CLI. Run
   `mutualbackup --help` and its subcommand help for the complete interface.
-- `mutualgit` provides Git-compatible local history over native anchors.
+- `mutualgit` provides Git-compatible local history over native anchors. The
+  optional `git-command` package exposes the same binary as `git`.
 - `git-remote-mutualbackup` lets stock Git fetch or clone from a local
   MutualBackup repository through its unlocked daemon.
 

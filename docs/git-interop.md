@@ -23,6 +23,20 @@ mutualgit -C /absolute/path/to/source commit -m 'first'
 mutualgit -C /absolute/path/to/source status
 ```
 
+The command can also be invoked as `git` by explicitly selecting the optional
+alias package. It links to the same `mutualgit` binary and does not create a
+Git payload store:
+
+```sh
+nix build --no-substitute .#git-command
+./result/bin/git -C /absolute/path/to/source status
+```
+
+For a Cargo build, a symlink named `git` to the locally built `mutualgit`
+binary works the same way. Put that symlink on `PATH` only in shells where you
+want the documented MutualBackup command subset; unsupported Git commands fail
+explicitly. Use stock Git separately for the bridge examples below.
+
 The local binary supports branches, linked worktrees, exact-byte checkout,
 merge, staged reset, hard reset, worktree restore, diff, log, explicit commit pins,
 and prune.

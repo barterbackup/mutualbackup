@@ -53,14 +53,20 @@
         install -Dm755 ${staticBinary}/bin/mutualbackupd \
           $out/mutualbackupd-x86_64-linux
       '';
+      gitCommand = pkgs.runCommandNoCC "mutualbackup-git-command-0.1.0" { } ''
+        mkdir -p $out/bin
+        ln -s ${staticBinary}/bin/mutualgit $out/bin/git
+      '';
     in {
       packages.${system} = {
         default = staticBinary;
         lab-artifacts = labArtifacts;
+        git-command = gitCommand;
       };
       checks.${system} = {
         default = staticBinary;
         lab-artifacts = labArtifacts;
+        git-command = gitCommand;
       };
 
       devShells.${system} = {

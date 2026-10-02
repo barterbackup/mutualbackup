@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::symlink;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::Command;
@@ -195,6 +196,22 @@ fn stock_git_fetches_and_pushes_through_native_anchors() {
     });
 
     let helper = PathBuf::from(env!("CARGO_BIN_EXE_git-remote-mutualbackup"));
+    let git_alias = run_root.join("git");
+    symlink(env!("CARGO_BIN_EXE_mutualgit"), &git_alias).unwrap();
+    let output = Command::new(&git_alias)
+        .arg("-C")
+        .arg(&source_root)
+        .arg("--socket")
+        .arg(&socket)
+        .arg("branch")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("main"));
     let path = format!(
         "{}:{}",
         helper.parent().unwrap().display(),
