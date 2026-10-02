@@ -26173,15 +26173,25 @@ mod tests {
             &nodes[..active_count],
             mb_core::GuildEventKind::ForgetCodingGroup { group_id: group.id },
         );
-        process_coding_activation_job(nodes[0].clone(), &clients[0])
-            .await
-            .unwrap();
-        let successor = nodes[0]
-            .lock()
-            .unwrap()
-            .coding_launch_successor_for_test(plan.value.attempt_id)
-            .unwrap()
-            .unwrap();
+        let successor = tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                process_coding_activation_job(nodes[0].clone(), &clients[0])
+                    .await
+                    .unwrap();
+                if let Some(successor) = nodes[0]
+                    .lock()
+                    .unwrap()
+                    .coding_launch_successor_for_test(plan.value.attempt_id)
+                    .unwrap()
+                {
+                    break successor;
+                }
+                assert!(!backup.is_finished(), "backup exited before renewal");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .expect("retired full-width activation did not create a successor");
         if let Some(before_forget) = before_forget {
             assert_eq!(successor, before_forget);
         }

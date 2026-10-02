@@ -1175,10 +1175,19 @@ fn execute_peer_request(
             source,
             sequence,
         } => {
+            let source_path = Path::new(&source)
+                .canonicalize()
+                .context("test source root is unavailable")?;
+            let root_id = node
+                .protected_roots()?
+                .into_iter()
+                .find(|root| root.path == source_path)
+                .context("test source root is not registered")?
+                .root_id;
             let revision = node.prepare_revision(
                 guild_id,
-                Uuid::from_bytes([1; 16]),
-                Path::new(&source),
+                root_id,
+                &source_path,
                 sequence,
                 Some(_request_id),
             )?;
@@ -3577,11 +3586,14 @@ mod tests {
         let mut peer_tasks = Vec::new();
         for index in 0_u8..5 {
             let address = free_address();
-            let node = Node::open(
+            let mut node = Node::open(
                 root.join(format!("node-{index}")),
                 Seed::from_bytes([100 + index; 32]),
             )
             .unwrap();
+            if index == 0 {
+                node.add_protected_root(&source).unwrap();
+            }
             let task = tokio::spawn(serve_node(
                 Arc::new(Mutex::new(node)),
                 NodeServerConfig {

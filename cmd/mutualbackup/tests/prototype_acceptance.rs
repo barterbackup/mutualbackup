@@ -1257,7 +1257,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     assert!(first.contains("state:      Committed"));
     assert!(
         git_cli(&sockets[1], &owner_one_source, ["status"])
-            .contains("Local history is protected by a signed backup")
+            .contains("Commit graph and refs are protected by a signed backup")
     );
     let second = cli(
         &sockets[2],
@@ -1442,7 +1442,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     );
     assert!(
         git_cli(&recovered_socket, &restored, ["status"])
-            .contains("Local history is protected by a signed backup")
+            .contains("Commit graph and refs are protected by a signed backup")
     );
     assert!(git_cli(&recovered_socket, &restored, ["branch"]).contains("topic"));
     git_cli(
