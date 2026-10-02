@@ -32,6 +32,20 @@ const PROCESS_SMALL_BACKUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PROCESS_LARGE_BACKUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const PROCESS_TOPOLOGY_BACKUP_TIMEOUT: Duration = Duration::from_secs(90 * 60);
 
+fn process_topology_backup_timeout() -> Duration {
+    match std::env::var("MUTUALBACKUP_TEST_TOPOLOGY_BACKUP_TIMEOUT_SECONDS") {
+        Ok(value) => {
+            let seconds: u64 = value
+                .parse()
+                .expect("topology backup timeout override must be whole seconds");
+            assert!(seconds > 0, "topology backup timeout must be positive");
+            Duration::from_secs(seconds)
+        }
+        Err(std::env::VarError::NotPresent) => PROCESS_TOPOLOGY_BACKUP_TIMEOUT,
+        Err(error) => panic!("invalid topology backup timeout override: {error}"),
+    }
+}
+
 struct Daemon {
     args: Vec<OsString>,
     environment: Vec<(OsString, OsString)>,
@@ -1673,7 +1687,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     let topology_backup = cli(
         &sockets[2],
         ["backup", "--wait"],
-        PROCESS_TOPOLOGY_BACKUP_TIMEOUT,
+        process_topology_backup_timeout(),
     );
     assert!(topology_backup.contains("state:      Committed"));
     wait_for_peer_transfer(
@@ -1792,7 +1806,7 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
     let relay_backup = cli(
         &sockets[2],
         ["backup", "--wait"],
-        PROCESS_TOPOLOGY_BACKUP_TIMEOUT,
+        process_topology_backup_timeout(),
     );
     assert!(relay_backup.contains("state:      Committed"));
     wait_for_peer_transfer(
