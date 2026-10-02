@@ -88,9 +88,10 @@
   loop image: it reads exact bytes through a shared read-only mapping, rejects
   a writable open in the FUSE handler, and keeps the lower inode unchanged
   after read-only `O_TRUNC` and owner `chmod` attempts. It does not yet detach
-  on writes, supervise the mount, or recover after restart. Keep guarded
-  enrollment and Git staging and checkout gated until the complete privileged
-  probe passes. See
+  on writes, supervise the mount, or recover after restart. `eac567e` also
+  proves an ordinary user can read the view but cannot access the private
+  lower source on both filesystems. Keep guarded enrollment, Git staging, and
+  checkout gated until the complete privileged probe passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
   and [fanotify(7)](https://man7.org/linux/man-pages/man7/fanotify.7.html).
 
