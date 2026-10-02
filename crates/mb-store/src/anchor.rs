@@ -15,6 +15,12 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 #[cfg(target_os = "linux")]
+#[path = "guarded_file.rs"]
+mod guarded_file;
+#[cfg(target_os = "linux")]
+pub use guarded_file::GuardedFileCapturePlan;
+
+#[cfg(target_os = "linux")]
 use crate::link_freeze::{
     AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion, install_probe_acl,
 };
@@ -1417,7 +1423,7 @@ impl ReflinkCapturePlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct CaptureVersion {
+pub(crate) struct CaptureVersion {
     filesystem_id: u64,
     inode: u64,
     logical_len: u64,
@@ -4077,7 +4083,7 @@ fn capture_link_pool_name(anchor_id: Uuid) -> String {
 }
 
 #[cfg(unix)]
-fn capture_version(filesystem_id: u64, metadata: &fs::Metadata) -> CaptureVersion {
+pub(crate) fn capture_version(filesystem_id: u64, metadata: &fs::Metadata) -> CaptureVersion {
     use std::os::unix::fs::MetadataExt;
     CaptureVersion {
         filesystem_id,
@@ -4091,7 +4097,7 @@ fn capture_version(filesystem_id: u64, metadata: &fs::Metadata) -> CaptureVersio
 }
 
 #[cfg(not(unix))]
-fn capture_version(_filesystem_id: u64, metadata: &fs::Metadata) -> CaptureVersion {
+pub(crate) fn capture_version(_filesystem_id: u64, metadata: &fs::Metadata) -> CaptureVersion {
     let (modified_secs, modified_nanos) = modified_parts(metadata);
     CaptureVersion {
         filesystem_id: 0,

@@ -12,7 +12,7 @@ use super::{
     FileAccessSnapshot, FileWriteExclusion, FrozenAnchorProof, IndependentSparseCopy,
     LinkFreezeEditIntent, LinkFreezeEditPhase, file_data_extents, hash_exact,
 };
-use crate::anchor::{NativeFileId, PinnedDirectory};
+use crate::anchor::{CaptureVersion, NativeFileId, PinnedDirectory, capture_version};
 use crate::database::ControlStore;
 
 const CAPTURE_INTENT_KIND: &str = "link-freeze-capture-v1";
@@ -63,6 +63,48 @@ impl LinkFreezeCaptureIntent {
         anchor_parent: &PinnedDirectory,
         anchor_name: impl AsRef<Path>,
     ) -> anyhow::Result<Self> {
+        Self::begin_inner(
+            control,
+            anchor_id,
+            source_parent,
+            source_name,
+            anchor_parent,
+            anchor_name,
+            None,
+        )
+    }
+
+    /// A durable source plan can require its exact pre-freeze inode version.
+    /// The comparison happens inside the guarded first-capture transition.
+    pub(crate) fn begin_checked(
+        control: &ControlStore,
+        anchor_id: Uuid,
+        source_parent: &PinnedDirectory,
+        source_name: impl AsRef<Path>,
+        anchor_parent: &PinnedDirectory,
+        anchor_name: impl AsRef<Path>,
+        expected: &CaptureVersion,
+    ) -> anyhow::Result<Self> {
+        Self::begin_inner(
+            control,
+            anchor_id,
+            source_parent,
+            source_name,
+            anchor_parent,
+            anchor_name,
+            Some(expected),
+        )
+    }
+
+    fn begin_inner(
+        control: &ControlStore,
+        anchor_id: Uuid,
+        source_parent: &PinnedDirectory,
+        source_name: impl AsRef<Path>,
+        anchor_parent: &PinnedDirectory,
+        anchor_name: impl AsRef<Path>,
+        expected: Option<&CaptureVersion>,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(!anchor_id.is_nil(), "nil frozen anchor ID");
         let source_name = source_name.as_ref();
         let anchor_name = anchor_name.as_ref();
@@ -87,7 +129,10 @@ impl LinkFreezeCaptureIntent {
             before.is_file()
                 && before.nlink() == 1
                 && before.ino() == source_id.inode
-                && source_id.filesystem_id == source_parent_id.filesystem_id,
+                && source_id.filesystem_id == source_parent_id.filesystem_id
+                && expected.is_none_or(|version| {
+                    *version == capture_version(source_id.filesystem_id, &before)
+                }),
             "capture requires one pinned, unaliased source file"
         );
         let guard = FileWriteExclusion::acquire(source)?;
@@ -186,6 +231,23 @@ impl LinkFreezeCaptureIntent {
 
     pub fn phase(&self) -> LinkFreezeCapturePhase {
         self.phase
+    }
+
+    pub(crate) fn matches_file_plan(
+        &self,
+        anchor_id: Uuid,
+        source_id: NativeFileId,
+        anchor_parent: &PinnedDirectory,
+        anchor_name: &Path,
+    ) -> anyhow::Result<bool> {
+        Ok(self.anchor_id == anchor_id
+            && self.source_id == source_id
+            && self.anchor_parent_id == anchor_parent.identity()?
+            && self.anchor_name == anchor_name)
+    }
+
+    pub(crate) fn content_proof(&self) -> &IndependentSparseCopy {
+        &self.proof.content
     }
 
     pub fn frozen_proof(&self) -> Option<&FrozenAnchorProof> {

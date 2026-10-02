@@ -10,8 +10,6 @@ mod database;
 mod link_freeze;
 mod source;
 
-#[cfg(target_os = "linux")]
-pub use anchor::probe_guarded_link_freeze;
 pub use anchor::{
     AnchorAreaLocator, AnchorError, AnchorFileLocator, AnchorManifest, CapturedEntry,
     FileAnchorManifest, FileExtent, FilesystemIdentity, GIT_CATALOG_DIRECTORY,
@@ -21,6 +19,8 @@ pub use anchor::{
     filesystem_identity, git_catalog_marker, git_catalog_marker_bytes, probe_reflink,
     remove_owned_directory_tree,
 };
+#[cfg(target_os = "linux")]
+pub use anchor::{GuardedFileCapturePlan, probe_guarded_link_freeze};
 pub use database::{
     CheckpointRow, ControlStore, DatabaseError, DatabaseShellResult, KindedProtocolRecordRow,
     ObjectAttemptState, ParityObject, ParityScrubReport, ParityStore, ProtocolRecordRow,
