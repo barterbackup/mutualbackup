@@ -19,6 +19,7 @@ use crate::{ControlStore, LinkFreezeCaptureIntent, LinkFreezeCapturePhase};
 
 const PLAN_KIND: &str = "guarded-file-plan-v1";
 const DIRECTORY_CLAIM_KIND: &str = "guarded-file-directory-v1";
+const MANIFEST_CLAIM_KIND: &str = "guarded-file-manifest-v1";
 const RETIRE_KIND: &str = "guarded-file-retire-v1";
 const MARKER_PREFIX: &str = ".mutualbackup-guarded-file-v1-";
 const PAYLOAD_NAME: &str = "blob";
@@ -29,6 +30,15 @@ struct DirectoryClaim {
     anchor_id: Uuid,
     directory_id: NativeFileId,
     plan_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ManifestClaim {
+    format_version: u16,
+    anchor_id: Uuid,
+    directory_id: NativeFileId,
+    plan_hash: [u8; 32],
+    manifest_hash: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -206,26 +216,57 @@ impl GuardedFileCapturePlan {
         };
         let manifest_name = capture_manifest_name(self.anchor_id);
         let manifest_bytes = mb_core::canonical_bytes(&manifest)?;
+        let claim = ManifestClaim {
+            format_version: 1,
+            anchor_id: self.anchor_id,
+            directory_id: anchor_parent.identity()?,
+            plan_hash,
+            manifest_hash: *blake3::hash(&manifest_bytes).as_bytes(),
+        };
+        let claim_bytes = mb_core::canonical_bytes(&claim)?;
+        let recorded_claim = control.get_record(MANIFEST_CLAIM_KIND, self.anchor_id.as_bytes())?;
+        if let Some(bytes) = recorded_claim.as_ref() {
+            anyhow::ensure!(bytes == &claim_bytes, "guarded file manifest claim changed");
+        }
         match anchor_parent.open_child_file(&manifest_name)? {
             Some(mut file) => {
                 let metadata = file.metadata()?;
+                let identity = NativeFileId {
+                    filesystem_id: self.area.filesystem_id,
+                    inode: metadata.ino(),
+                };
                 anyhow::ensure!(
-                    metadata.len() <= 64 * 1024
+                    metadata.len() == manifest_bytes.len() as u64
                         && metadata.nlink() == 1
                         && unix_mode(&metadata) & 0o222 == 0,
                     "guarded manifest metadata changed"
                 );
                 let mut existing_bytes = Vec::new();
                 file.read_to_end(&mut existing_bytes)?;
-                anyhow::ensure!(existing_bytes == manifest_bytes, "guarded manifest changed");
+                anyhow::ensure!(
+                    existing_bytes == manifest_bytes
+                        && anchor_parent.entry_identity(&manifest_name, false)? == Some(identity),
+                    "guarded manifest changed"
+                );
             }
             None => {
+                anyhow::ensure!(
+                    recorded_claim.is_none(),
+                    "claimed guarded file manifest disappeared"
+                );
                 anchor_parent.publish_sealed_bytes_child(&manifest_name, &manifest_bytes)?;
             }
         }
         anchor_parent.sync_all()?;
         area.sync_all()?;
         manifest.open_verified()?;
+        if recorded_claim.is_none() {
+            anyhow::ensure!(control.put_record_if_absent(
+                MANIFEST_CLAIM_KIND,
+                self.anchor_id.as_bytes(),
+                &claim_bytes,
+            )?);
+        }
         Ok(manifest)
     }
 
@@ -336,6 +377,60 @@ impl GuardedFileCapturePlan {
         Ok(directory)
     }
 
+    fn verified_manifest_for_retirement(
+        &self,
+        directory: Option<&PinnedDirectory>,
+        claim: Option<&ManifestClaim>,
+        allow_missing: bool,
+    ) -> anyhow::Result<Option<NativeFileId>> {
+        let name = capture_manifest_name(self.anchor_id);
+        let present = directory
+            .map(|directory| directory.entry_identity(&name, false))
+            .transpose()?
+            .flatten();
+        let Some(claim) = claim else {
+            anyhow::ensure!(
+                present.is_none(),
+                "unclaimed guarded file manifest blocks retirement"
+            );
+            return Ok(None);
+        };
+        let Some(identity) = present else {
+            anyhow::ensure!(allow_missing, "claimed guarded file manifest disappeared");
+            return Ok(None);
+        };
+        let directory =
+            directory.ok_or_else(|| anyhow::anyhow!("guarded file directory vanished"))?;
+        let mut file = directory
+            .open_child_file(&name)?
+            .ok_or_else(|| anyhow::anyhow!("guarded file manifest vanished"))?;
+        let metadata = file.metadata()?;
+        anyhow::ensure!(
+            metadata.len() <= 64 * 1024
+                && metadata.nlink() == 1
+                && unix_mode(&metadata) & 0o222 == 0,
+            "guarded file manifest metadata changed"
+        );
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            *blake3::hash(&bytes).as_bytes() == claim.manifest_hash
+                && directory.entry_identity(&name, false)? == Some(identity),
+            "guarded file manifest bytes changed"
+        );
+        let manifest: FileAnchorManifest = mb_core::decode_canonical(&bytes)?;
+        anyhow::ensure!(
+            manifest.format_version == 1
+                && manifest.anchor_id == self.anchor_id
+                && manifest.area == self.area
+                && manifest.source_root_hint == self.source_root
+                && manifest.source_relative_path == self.relative_path
+                && manifest.source_version == self.source_version,
+            "guarded file manifest differs from its source plan"
+        );
+        Ok(Some(identity))
+    }
+
     /// The owner must prove this anchor is unreferenced before calling this
     /// method. Keep the plan record until source access and namespace cleanup
     /// both finish, so a crash can replay the same retirement.
@@ -353,6 +448,8 @@ impl GuardedFileCapturePlan {
         let directory_name = self.anchor_id.to_string();
         let anchor_parent = area.open_child_directory(&directory_name)?;
         let claim_bytes = control.get_record(DIRECTORY_CLAIM_KIND, self.anchor_id.as_bytes())?;
+        let manifest_claim_bytes =
+            control.get_record(MANIFEST_CLAIM_KIND, self.anchor_id.as_bytes())?;
         let marker_id = self.verified_marker(&area, plan_hash)?;
         let retirement = FileRetirement {
             format_version: 1,
@@ -371,6 +468,7 @@ impl GuardedFileCapturePlan {
             anyhow::ensure!(
                 anchor_parent.is_none()
                     && claim_bytes.is_none()
+                    && manifest_claim_bytes.is_none()
                     && marker_id.is_none()
                     && LinkFreezeCaptureIntent::load(control, self.anchor_id)?.is_none(),
                 "unowned guarded file namespace or capture remains after retirement"
@@ -389,6 +487,10 @@ impl GuardedFileCapturePlan {
         let claim = claim_bytes
             .as_deref()
             .map(mb_core::decode_canonical::<DirectoryClaim>)
+            .transpose()?;
+        let manifest_claim = manifest_claim_bytes
+            .as_deref()
+            .map(mb_core::decode_canonical::<ManifestClaim>)
             .transpose()?;
         let present_id = anchor_parent
             .as_ref()
@@ -414,6 +516,22 @@ impl GuardedFileCapturePlan {
                 "guarded file directory differs from its durable claim"
             );
         }
+        if let Some(manifest_claim) = manifest_claim.as_ref() {
+            anyhow::ensure!(
+                manifest_claim.format_version == 1
+                    && manifest_claim.anchor_id == self.anchor_id
+                    && manifest_claim.plan_hash == plan_hash
+                    && claim.as_ref().is_some_and(|directory| {
+                        directory.directory_id == manifest_claim.directory_id
+                    }),
+                "guarded file manifest claim differs from its directory plan"
+            );
+            anyhow::ensure!(
+                LinkFreezeCaptureIntent::load(control, self.anchor_id)?.is_some()
+                    || LinkFreezeCaptureIntent::retirement_pending(control, self.anchor_id)?,
+                "claimed guarded file manifest lacks its freeze or retirement journal"
+            );
+        }
         anyhow::ensure!(
             marker_id.is_some() || (anchor_parent.is_none() && claim.is_none()),
             "guarded file ownership marker disappeared before retirement"
@@ -426,6 +544,11 @@ impl GuardedFileCapturePlan {
             claim.is_some() || LinkFreezeCaptureIntent::load(control, self.anchor_id)?.is_none(),
             "unjournaled guarded file directory has a capture"
         );
+        self.verified_manifest_for_retirement(
+            anchor_parent.as_ref(),
+            manifest_claim.as_ref(),
+            prior_retirement.is_some(),
+        )?;
         if prior_retirement.is_none() {
             anyhow::ensure!(control.put_record_if_absent(
                 RETIRE_KIND,
@@ -453,25 +576,15 @@ impl GuardedFileCapturePlan {
                     && anchor_parent.entry_identity(PAYLOAD_NAME, false)?.is_none(),
                 "guarded anchor still has a live capture or payload"
             );
-            let manifest_name = capture_manifest_name(self.anchor_id);
-            if let Some(manifest_id) = anchor_parent.entry_identity(&manifest_name, false)? {
-                let mut file = anchor_parent
-                    .open_child_file(&manifest_name)?
-                    .ok_or_else(|| anyhow::anyhow!("guarded manifest disappeared"))?;
-                anyhow::ensure!(file.metadata()?.len() <= 64 * 1024);
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)?;
-                let manifest: FileAnchorManifest = mb_core::decode_canonical(&bytes)?;
-                anyhow::ensure!(
-                    manifest.format_version == 1
-                        && manifest.anchor_id == self.anchor_id
-                        && manifest.area == self.area
-                        && manifest.source_root_hint == self.source_root
-                        && manifest.source_relative_path == self.relative_path
-                        && manifest.source_version == self.source_version,
-                    "guarded manifest does not belong to this source plan"
-                );
-                anchor_parent.remove_child_file_if_identity(&manifest_name, manifest_id)?;
+            if let Some(manifest_id) = self.verified_manifest_for_retirement(
+                Some(anchor_parent),
+                manifest_claim.as_ref(),
+                true,
+            )? {
+                anchor_parent.remove_child_file_if_identity(
+                    capture_manifest_name(self.anchor_id),
+                    manifest_id,
+                )?;
             }
             anyhow::ensure!(
                 area.remove_empty_child_directory(&directory_name, anchor_parent.identity()?)?,
@@ -495,6 +608,13 @@ impl GuardedFileCapturePlan {
                 LinkFreezeCaptureIntent::retirement_ready_for_cleanup(control, self.anchor_id)?,
                 "guarded retirement has not restored source access"
             );
+        }
+        if let Some(bytes) = manifest_claim_bytes {
+            control.delete_record_if_value(
+                MANIFEST_CLAIM_KIND,
+                self.anchor_id.as_bytes(),
+                &bytes,
+            )?;
         }
         if let Some(bytes) = claim_bytes {
             control.delete_record_if_value(
@@ -602,6 +722,108 @@ mod tests {
             identity
         );
         (area, hash, identity)
+    }
+
+    fn mock_manifest(plan: &GuardedFileCapturePlan) -> FileAnchorManifest {
+        FileAnchorManifest {
+            format_version: 1,
+            anchor_id: plan.anchor_id,
+            area: plan.area.clone(),
+            source_root_hint: plan.source_root.clone(),
+            source_relative_path: plan.relative_path.clone(),
+            logical_len: 9,
+            content_hash: [42; 32],
+            source_version: plan.source_version.clone(),
+        }
+    }
+
+    #[test]
+    fn guarded_file_manifest_claim_detects_replacement_and_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("protected");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("source"), b"raw bytes").unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([121; 32]));
+        let control = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let (area, plan_hash, directory_id) = claimed_test_directory(&plan, &control);
+        let directory = area
+            .open_child_directory(plan.anchor_id.to_string())
+            .unwrap()
+            .unwrap();
+        let bytes = mb_core::canonical_bytes(&mock_manifest(&plan)).unwrap();
+        let claim = ManifestClaim {
+            format_version: 1,
+            anchor_id: plan.anchor_id,
+            directory_id,
+            plan_hash,
+            manifest_hash: *blake3::hash(&bytes).as_bytes(),
+        };
+        let name = capture_manifest_name(plan.anchor_id);
+        let first = directory.publish_sealed_bytes_child(&name, &bytes).unwrap();
+        assert_eq!(
+            plan.verified_manifest_for_retirement(Some(&directory), Some(&claim), false)
+                .unwrap(),
+            Some(first)
+        );
+        directory
+            .remove_child_file_if_identity(&name, first)
+            .unwrap();
+        let mut altered = bytes.clone();
+        altered[0] ^= 1;
+        let changed = directory
+            .publish_sealed_bytes_child(&name, &altered)
+            .unwrap();
+        assert!(
+            plan.verified_manifest_for_retirement(Some(&directory), Some(&claim), false)
+                .is_err()
+        );
+        directory
+            .remove_child_file_if_identity(&name, changed)
+            .unwrap();
+        assert!(
+            plan.verified_manifest_for_retirement(Some(&directory), Some(&claim), false)
+                .is_err()
+        );
+        assert_eq!(
+            plan.verified_manifest_for_retirement(Some(&directory), Some(&claim), true)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn unclaimed_guarded_file_manifest_blocks_retirement() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("protected");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("source"), b"raw bytes").unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([122; 32]));
+        let control = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let (area, _, _) = claimed_test_directory(&plan, &control);
+        let directory = area
+            .open_child_directory(plan.anchor_id.to_string())
+            .unwrap()
+            .unwrap();
+        let name = capture_manifest_name(plan.anchor_id);
+        let bytes = mb_core::canonical_bytes(&mock_manifest(&plan)).unwrap();
+        let identity = directory.publish_sealed_bytes_child(&name, &bytes).unwrap();
+        assert!(plan.discard_unreferenced(&control).is_err());
+        assert!(
+            control
+                .get_record(RETIRE_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            directory.entry_identity(&name, false).unwrap(),
+            Some(identity)
+        );
+        directory
+            .remove_child_file_if_identity(&name, identity)
+            .unwrap();
+        plan.discard_unreferenced(&control).unwrap();
     }
 
     #[test]
@@ -787,6 +1009,12 @@ mod tests {
         let store = ControlStore::open(&database_path, &keys).unwrap();
         let plan = GuardedFileCapturePlan::plan(&source_root, "source").unwrap();
         let manifest = plan.capture(&store).unwrap();
+        assert!(
+            store
+                .get_record(MANIFEST_CLAIM_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_some()
+        );
         let mut captured = Vec::new();
         manifest
             .open_verified()
@@ -829,6 +1057,12 @@ mod tests {
         assert_eq!(retained, b"raw\r\nbytes\0");
         plan.discard_unreferenced(&store).unwrap();
         assert!(manifest.open_verified().is_err());
+        assert!(
+            store
+                .get_record(MANIFEST_CLAIM_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
         assert!(
             LinkFreezeCaptureIntent::load(&store, plan.anchor_id)
                 .unwrap()
