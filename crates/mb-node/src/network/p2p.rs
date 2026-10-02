@@ -7986,7 +7986,7 @@ async fn commit_verified_coding_group(
         match result {
             Ok(signature) => signatures.push(signature),
             Err(error) => {
-                tracing::debug!(%signer, %error, "guild member did not sign coding-group event");
+                tracing::warn!(%signer, %error, "guild member did not sign coding-group event");
             }
         }
     }
