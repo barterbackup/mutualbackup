@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use mb_core::{canonical_bytes, decode_canonical};
+use mb_core::{V1_MAX_CATALOG_BYTES, canonical_bytes, decode_canonical};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -274,6 +274,19 @@ impl PinnedDirectory {
                 std::io::ErrorKind::InvalidInput,
                 "sealed metadata must contain 1 to 65536 bytes",
             )));
+        }
+        self.publish_bytes_child(name.as_ref(), bytes, true)
+    }
+
+    /// Publish a bounded whole-root catalog with the same atomic sealed-file
+    /// transition as small metadata. A full inventory can exceed 64 KiB.
+    pub fn publish_sealed_catalog_child(
+        &self,
+        name: impl AsRef<Path>,
+        bytes: &[u8],
+    ) -> Result<NativeFileId, AnchorError> {
+        if bytes.is_empty() || bytes.len() > V1_MAX_CATALOG_BYTES {
+            return Err(AnchorError::CatalogTooLarge);
         }
         self.publish_bytes_child(name.as_ref(), bytes, true)
     }
@@ -1518,6 +1531,16 @@ impl StableAnchorManifest {
         }
         let area = resolve_anchor_area(&self.area)?;
         let area_file = open_stable_anchor_area(&area, &self.area)?;
+        let guarded_marker = guarded_root::guarded_root_marker_name(self.anchor_id);
+        match open_path_no_xdev_beneath(&area_file, Path::new(&guarded_marker)) {
+            Ok(_) => {
+                return Err(AnchorError::UnsafeOwnedDirectory(
+                    area.join(self.anchor_id.to_string()),
+                ));
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(error) => return Err(error.into()),
+        }
         remove_directory_at(
             &area_file,
             &self.anchor_id.to_string(),

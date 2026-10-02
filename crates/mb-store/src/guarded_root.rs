@@ -18,18 +18,23 @@ use super::{
     AnchorError, CaptureVersion, CapturedEntry, DirectoryStream, FilesystemIdentity,
     GIT_CATALOG_DIRECTORY, MAX_CAPTURE_DEPTH, MAX_CAPTURE_ENTRIES, MAX_CAPTURE_EXTENTS,
     MAX_RELATIVE_PATH_BYTES, NativeFileId, PinnedDirectory, StableAnchorAreaLocator,
-    capture_version, filesystem_identity_for_file, git_catalog_marker_from_root, modified_parts,
-    open_path_no_xdev_beneath, open_source_beneath, open_source_root, open_stable_anchor_area,
-    probe_guarded_link_freeze, reopen_pinned_file, resolve_anchor_area, unix_mode,
-    validate_relative,
+    StableAnchorManifest, capture_manifest_name, capture_version, filesystem_identity_for_file,
+    git_catalog_marker_from_root, modified_parts, open_path_no_xdev_beneath, open_source_beneath,
+    open_source_root, open_stable_anchor_area, probe_guarded_link_freeze, reopen_pinned_file,
+    resolve_anchor_area, unix_mode, validate_relative,
 };
 use crate::{ControlStore, LinkFreezeCaptureIntent, LinkFreezeCapturePhase};
 
 const PLAN_KIND: &str = "guarded-root-plan-v1";
 const ROOT_CLAIM_KIND: &str = "guarded-root-claim-v1";
 const DIRECTORY_CLAIM_PREFIX: &str = "guarded-root-directory-v1/";
+const MANIFEST_CLAIM_KIND: &str = "guarded-root-manifest-v1";
 const RETIRE_KIND: &str = "guarded-root-retire-v1";
 const MARKER_PREFIX: &str = ".mutualbackup-guarded-root-v1-";
+
+pub(super) fn guarded_root_marker_name(anchor_id: Uuid) -> String {
+    format!("{MARKER_PREFIX}{anchor_id}")
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct RootClaim {
@@ -47,6 +52,15 @@ struct DirectoryClaim {
     parent_id: NativeFileId,
     directory_id: NativeFileId,
     plan_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct RootManifestClaim {
+    format_version: u16,
+    anchor_id: Uuid,
+    root_id: NativeFileId,
+    plan_hash: [u8; 32],
+    manifest_hash: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -205,6 +219,7 @@ impl GuardedRootCapturePlan {
                 || path.len() > MAX_RELATIVE_PATH_BYTES
                 || relative.components().count() > MAX_CAPTURE_DEPTH
                 || previous.is_some_and(|prior| prior >= path)
+                || path == capture_manifest_name(self.anchor_id)
                 || entry.version().filesystem_id != self.root_version.filesystem_id
                 || entry.version().inode == 0
                 || entry.version().modified_secs != modified_secs
@@ -589,11 +604,151 @@ impl GuardedRootCapturePlan {
         Ok(captured)
     }
 
+    /// Publish a complete native root manifest only after every planned file
+    /// journal has verified its anchor and the anchor tree has no extra names.
+    /// The sealed publication is replayable after a crash. A guarded manifest
+    /// must be retired through this backend, never by generic anchor removal.
+    pub fn capture(&self, control: &ControlStore) -> anyhow::Result<StableAnchorManifest> {
+        let entries = self.freeze_planned_files(control)?;
+        self.prepare_anchor_directories(control)?;
+        let area_path = resolve_anchor_area(&self.area)?;
+        let area_file = open_stable_anchor_area(&area_path, &self.area)?;
+        let area = PinnedDirectory {
+            file: area_file,
+            filesystem_id: self.area.filesystem_id,
+        };
+        let anchor_root = area
+            .open_child_directory(self.anchor_id.to_string())?
+            .ok_or_else(|| anyhow::anyhow!("claimed guarded root disappeared"))?;
+        let manifest_name = capture_manifest_name(self.anchor_id);
+        let manifest = StableAnchorManifest {
+            format_version: 2,
+            anchor_id: self.anchor_id,
+            source_root_hint: self.source_root.clone(),
+            area: self.area.clone(),
+            root_mode: self.root_mode,
+            root_modified_secs: self.root_modified_secs,
+            root_modified_nanos: self.root_modified_nanos,
+            entries,
+        };
+        let manifest_bytes = mb_core::canonical_bytes(&manifest)?;
+        anyhow::ensure!(
+            manifest_bytes.len() <= V1_MAX_CATALOG_BYTES,
+            AnchorError::CatalogTooLarge
+        );
+        let claim = RootManifestClaim {
+            format_version: 1,
+            anchor_id: self.anchor_id,
+            root_id: anchor_root.identity()?,
+            plan_hash: *blake3::hash(&mb_core::canonical_bytes(self)?).as_bytes(),
+            manifest_hash: *blake3::hash(&manifest_bytes).as_bytes(),
+        };
+        let claim_bytes = mb_core::canonical_bytes(&claim)?;
+        let recorded_claim = control.get_record(MANIFEST_CLAIM_KIND, self.anchor_id.as_bytes())?;
+        if let Some(recorded) = recorded_claim.as_ref() {
+            anyhow::ensure!(
+                recorded == &claim_bytes,
+                "guarded root manifest claim changed"
+            );
+        }
+        self.verify_anchor_names(&anchor_root, &manifest_name)?;
+        match anchor_root.open_child_file(&manifest_name)? {
+            Some(mut file) => {
+                let metadata = file.metadata()?;
+                anyhow::ensure!(
+                    metadata.len() == manifest_bytes.len() as u64
+                        && metadata.nlink() == 1
+                        && unix_mode(&metadata) & 0o222 == 0,
+                    "guarded root manifest metadata changed"
+                );
+                let mut existing = Vec::new();
+                file.read_to_end(&mut existing)?;
+                anyhow::ensure!(
+                    existing == manifest_bytes,
+                    "guarded root manifest differs from its frozen inventory"
+                );
+            }
+            None => {
+                anyhow::ensure!(
+                    recorded_claim.is_none(),
+                    "claimed guarded root manifest disappeared"
+                );
+                anchor_root.publish_sealed_catalog_child(&manifest_name, &manifest_bytes)?;
+            }
+        }
+        anchor_root.sync_all()?;
+        area.sync_all()?;
+        if recorded_claim.is_none() {
+            anyhow::ensure!(control.put_record_if_absent(
+                MANIFEST_CLAIM_KIND,
+                self.anchor_id.as_bytes(),
+                &claim_bytes,
+            )?);
+        }
+        Ok(manifest)
+    }
+
+    fn verify_anchor_names(
+        &self,
+        anchor_root: &PinnedDirectory,
+        manifest_name: &str,
+    ) -> anyhow::Result<()> {
+        let mut expected = BTreeMap::<String, BTreeSet<String>>::new();
+        expected.entry(String::new()).or_default();
+        for entry in &self.entries {
+            let relative = Path::new(entry.path());
+            let name = relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or(AnchorError::InvalidGuardedPlan)?;
+            let parent = relative
+                .parent()
+                .and_then(|parent| parent.to_str())
+                .ok_or(AnchorError::InvalidGuardedPlan)?;
+            expected
+                .entry(parent.to_owned())
+                .or_default()
+                .insert(name.to_owned());
+            if entry.is_directory() {
+                expected.entry(entry.path().to_owned()).or_default();
+            }
+        }
+        if anchor_root.entry_identity(manifest_name, false)?.is_some() {
+            expected
+                .get_mut("")
+                .ok_or(AnchorError::InvalidGuardedPlan)?
+                .insert(manifest_name.to_owned());
+        }
+        for (path, names) in expected {
+            let directory = if path.is_empty() {
+                anchor_root.try_clone()?
+            } else {
+                anchor_root.open_descendant_directory(&path)?
+            };
+            let mut actual = BTreeSet::new();
+            let mut stream = DirectoryStream::open(directory.as_file())?;
+            while let Some(name) = stream.next_name()? {
+                actual.insert(String::from_utf8(name.as_bytes().to_vec())?);
+            }
+            anyhow::ensure!(
+                actual == names,
+                "guarded anchor contains unknown entries: {path}"
+            );
+        }
+        Ok(())
+    }
+
     /// Abandon only a prepared, empty root namespace. A file freeze requires
     /// the later journal-aware retirement path; this method refuses any file
     /// capture intent or child entry rather than unlinking a frozen source.
     pub fn discard_empty_anchor_root(&self, control: &ControlStore) -> anyhow::Result<()> {
         self.validate()?;
+        anyhow::ensure!(
+            control
+                .get_record(MANIFEST_CLAIM_KIND, self.anchor_id.as_bytes())?
+                .is_none(),
+            "published guarded root needs journal-aware retirement"
+        );
         let plan_bytes = mb_core::canonical_bytes(self)?;
         let plan_hash = *blake3::hash(&plan_bytes).as_bytes();
         let recorded_plan = control.get_record(PLAN_KIND, self.anchor_id.as_bytes())?;
@@ -865,7 +1020,7 @@ impl GuardedRootCapturePlan {
     }
 
     fn marker_name(&self) -> String {
-        format!("{MARKER_PREFIX}{}", self.anchor_id)
+        guarded_root_marker_name(self.anchor_id)
     }
 
     fn directory_claim_kind(&self) -> String {
@@ -1326,6 +1481,83 @@ mod tests {
             CapturedEntry::Directory { path, .. } if path == "parent/child"
         ));
         plan.discard_empty_anchor_root(&store).unwrap();
+    }
+
+    #[test]
+    fn complete_empty_root_manifest_reopens_and_blocks_generic_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("parent/child")).unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([75; 32]));
+        let database_path = temp.path().join("control.db");
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        let manifest = plan.capture(&store).unwrap();
+        assert_eq!(manifest.entries.len(), 2);
+        assert!(manifest.remove().is_err());
+        assert!(plan.discard_empty_anchor_root(&store).is_err());
+        assert!(
+            store
+                .get_record(MANIFEST_CLAIM_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        // A crash after the sealed file was published but before its SQL
+        // claim must replay by verifying the exact same catalog bytes.
+        store
+            .delete_record(MANIFEST_CLAIM_KIND, plan.anchor_id.as_bytes())
+            .unwrap();
+        assert_eq!(plan.capture(&store).unwrap(), manifest);
+        drop(store);
+
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        assert_eq!(plan.capture(&store).unwrap(), manifest);
+    }
+
+    #[test]
+    fn claimed_manifest_cannot_be_silently_recreated_after_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([77; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        plan.capture(&store).unwrap();
+        let anchor =
+            PinnedDirectory::open(plan.area.path_hint.join(plan.anchor_id.to_string())).unwrap();
+        anchor
+            .remove_child_file(capture_manifest_name(plan.anchor_id))
+            .unwrap();
+        assert!(plan.capture(&store).is_err());
+        assert!(
+            store
+                .get_record(MANIFEST_CLAIM_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn complete_manifest_rejects_unknown_anchor_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("child")).unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([76; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        plan.prepare_anchor_directories(&store).unwrap();
+        let anchor = plan.area.path_hint.join(plan.anchor_id.to_string());
+        fs::write(anchor.join("child/foreign"), b"keep").unwrap();
+        assert!(plan.capture(&store).is_err());
+        assert!(
+            store
+                .get_record(MANIFEST_CLAIM_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(anchor.join("child/foreign")).unwrap(), b"keep");
+        fs::remove_file(anchor.join("child/foreign")).unwrap();
+        assert!(plan.capture(&store).is_ok());
     }
 
     #[test]
