@@ -239,13 +239,37 @@ impl PinnedDirectory {
         name: impl AsRef<Path>,
         bytes: &[u8],
     ) -> Result<NativeFileId, AnchorError> {
-        use std::os::fd::{AsRawFd, FromRawFd};
-        use std::os::unix::ffi::OsStrExt;
-
         if bytes.is_empty() || bytes.len() > 4095 {
             return Err(AnchorError::UnsupportedSymlinkTarget);
         }
-        let name = name.as_ref();
+        self.publish_bytes_child(name.as_ref(), bytes, false)
+    }
+
+    /// Atomically link a fully synced, read-only metadata file into this
+    /// pinned directory. A crash before the link leaves no partial pathname.
+    pub fn publish_sealed_bytes_child(
+        &self,
+        name: impl AsRef<Path>,
+        bytes: &[u8],
+    ) -> Result<NativeFileId, AnchorError> {
+        if bytes.is_empty() || bytes.len() > 64 * 1024 {
+            return Err(AnchorError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sealed metadata must contain 1 to 65536 bytes",
+            )));
+        }
+        self.publish_bytes_child(name.as_ref(), bytes, true)
+    }
+
+    fn publish_bytes_child(
+        &self,
+        name: &Path,
+        bytes: &[u8],
+        seal: bool,
+    ) -> Result<NativeFileId, AnchorError> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+
         validate_single_component(name)?;
         let encoded =
             CString::new(name.as_os_str().as_bytes()).map_err(|_| AnchorError::UnsafePath)?;
@@ -262,7 +286,11 @@ impl PinnedDirectory {
         }
         let mut file = unsafe { File::from_raw_fd(descriptor) };
         file.write_all(bytes)?;
-        file.sync_all()?;
+        if seal {
+            seal_anchor_file_handle(&file)?;
+        } else {
+            file.sync_all()?;
+        }
         let identity = native_file_id(self.filesystem_id, &file.metadata()?);
         if unsafe {
             libc::linkat(
@@ -796,6 +824,14 @@ impl PinnedDirectory {
         Err(unsupported_pinned_directory())
     }
 
+    pub fn publish_sealed_bytes_child(
+        &self,
+        _name: impl AsRef<Path>,
+        _bytes: &[u8],
+    ) -> Result<NativeFileId, AnchorError> {
+        Err(unsupported_pinned_directory())
+    }
+
     pub fn open_child_file(&self, _name: impl AsRef<Path>) -> Result<Option<File>, AnchorError> {
         Err(unsupported_pinned_directory())
     }
@@ -1020,6 +1056,23 @@ pub struct StableAnchorAreaLocator {
     pub path_hint: PathBuf,
     pub filesystem_id: u64,
     pub volume_root_hint: PathBuf,
+}
+
+impl StableAnchorAreaLocator {
+    /// Prepare a same-mount anchor area without selecting a capture backend.
+    /// Each backend must still pass its own full source/edit/restore probe.
+    pub fn prepare_for_root(source_root: impl AsRef<Path>) -> Result<Self, AnchorError> {
+        let source_root = source_root
+            .as_ref()
+            .canonicalize()
+            .map_err(|_| AnchorError::InvalidRoot)?;
+        let root = open_source_root(&source_root)?;
+        let metadata = root.metadata()?;
+        if !metadata.is_dir() {
+            return Err(AnchorError::InvalidRoot);
+        }
+        prepare_stable_anchor_area(&source_root, &metadata)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1562,7 +1615,7 @@ impl ReflinkAnchor {
         }
         probe_reflink(&source_root)?;
 
-        let area = ensure_anchor_area(&source_root, &root_metadata)?;
+        let area = prepare_stable_anchor_area(&source_root, &root_metadata)?;
         #[cfg(target_os = "linux")]
         let filesystem = filesystem_identity_for_file(&root_file)?;
         #[cfg(not(target_os = "linux"))]
@@ -2951,6 +3004,19 @@ fn ensure_anchor_area(
     };
     validate_stable_anchor_area(&locator.path_hint, locator.area_id)?;
     Ok(locator)
+}
+
+fn prepare_stable_anchor_area(
+    source_root: &Path,
+    root_metadata: &fs::Metadata,
+) -> Result<StableAnchorAreaLocator, AnchorError> {
+    let parent = source_root
+        .parent()
+        .ok_or(AnchorError::NoExternalAnchorLocation)?;
+    if filesystem_identity(source_root)? != filesystem_identity(parent)? {
+        return Err(AnchorError::NoExternalAnchorLocation);
+    }
+    ensure_anchor_area(source_root, root_metadata)
 }
 
 fn publish_anchor_area(
@@ -4507,6 +4573,68 @@ mod tests {
         );
         assert_eq!(fs::read(temp.path().join("target")).unwrap(), bytes);
         directory.remove_child_file("target").unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stable_area_can_be_prepared_without_a_reflink_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("protected");
+        fs::create_dir(&root).unwrap();
+        let area = StableAnchorAreaLocator::prepare_for_root(&root).unwrap();
+        assert_eq!(area.path_hint.parent(), Some(temp.path()));
+        assert_eq!(
+            area.filesystem_id,
+            filesystem_identity(&root).unwrap().stable_id
+        );
+        assert_eq!(
+            area,
+            StableAnchorAreaLocator::prepare_for_root(&root).unwrap()
+        );
+        let opened = open_stable_anchor_area(&area.path_hint, &area).unwrap();
+        assert!(opened.metadata().unwrap().is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_sealed_publication_is_atomic_and_byte_exact() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let directory = PinnedDirectory::open(temp.path()).unwrap();
+        let bytes = vec![0xa5_u8; 8192];
+        let identity = directory
+            .publish_sealed_bytes_child("manifest", &bytes)
+            .unwrap();
+        let path = temp.path().join("manifest");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(
+            directory.entry_identity("manifest", false).unwrap(),
+            Some(identity)
+        );
+        assert!(
+            directory
+                .publish_sealed_bytes_child("manifest", b"other")
+                .is_err()
+        );
+        assert!(directory.publish_sealed_bytes_child("empty", b"").is_err());
+        assert!(
+            directory
+                .publish_sealed_bytes_child("oversize", &vec![0; 64 * 1024 + 1])
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(directory.entry_identity("empty", false).unwrap().is_none());
+        assert!(
+            directory
+                .entry_identity("oversize", false)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(target_os = "linux")]
