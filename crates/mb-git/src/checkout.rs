@@ -3154,11 +3154,13 @@ fn apply_intent(
                 target
             };
             for (path, entry) in &target_index {
-                records.push((
-                    index_kind_for_scope(scope),
-                    path.clone(),
-                    canonical_bytes(entry)?,
-                ));
+                if previous_index.get(path) != Some(entry) {
+                    records.push((
+                        index_kind_for_scope(scope),
+                        path.clone(),
+                        canonical_bytes(entry)?,
+                    ));
+                }
             }
             for path in previous_index.keys() {
                 if !target_index.contains_key(path) {

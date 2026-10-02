@@ -74,7 +74,9 @@ measures unique extents removed after pruning an unreferenced branch.
 `mutualgit restore PATH` restores working files from the staged index without
 moving HEAD or changing that index; `mutualgit restore --staged PATH` resets
 the selected index paths from HEAD without changing working files. Use both
-flags to reset the index first and then restore those working paths. Restore
+flags to restore the selected index and working paths from HEAD in one
+replayable daemon operation. It publishes working paths before the index
+transition, so a failed worktree preflight leaves staged bytes intact. Restore
 replays an interrupted file replacement when the daemon reopens the repository.
 Its durable intent records the old working file's native content root and
 length. A pending restore written by an older version without that root
@@ -100,6 +102,8 @@ refspec is given; explicit branch and tag refspecs use the shared history.
 existing local tag may be fetched again at the same object ID, but a remote
 rewrite or tag namespace conflict rejects the entire fetch without moving any
 refs.
+`mutualgit pull` and `mutualgit merge` currently require the primary worktree;
+linked-worktree merge sessions and replay are still an open milestone 6 gate.
 Repository-wide `fetch`, `pin`, `unpin`, `pins`, and history `prune`/`gc` also
 work when invoked from a linked worktree; they use the shared repository catalog.
 `mutualgit --help` gives the current command forms. Staging, checkout, merge,

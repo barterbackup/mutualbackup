@@ -2,6 +2,14 @@
 
 ## Milestone 6 active implementation gates
 
+- [ ] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
+  and `mutualgit merge` still call the primary-only repository discovery path;
+  their checkout and merge-session code also assumes the primary index and
+  worktree. Scope fetch/merge, conflict resolution, and replay to the selected
+  linked worktree while retaining the shared commit graph and single-writer
+  daemon. Cover fast-forward, divergent clean and conflicted merges, abort and
+  continue, dirty-file refusal, and interruption/reopen without altering the
+  primary worktree or another linked index.
 - [ ] **M6 combined Git restore is one recoverable operation.**
   `mutualgit restore --staged --worktree PATH` now sends one daemon request for
   primary or linked worktrees. Version 11 checkout intents bind the selected
