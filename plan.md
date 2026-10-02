@@ -552,12 +552,14 @@ Incoming Git blobs become identical local file bytes; outgoing blobs retain
 their original bytes and object IDs. Do not use `core.autocrlf`, `core.eol`,
 `core.safecrlf`, or `text`, `eol`, `filter`, `ident`, and
 `working-tree-encoding` attributes to rewrite payloads. Enforce this
-independently of system, global, and repository Git config. Treat transforming
-rules as inert when reading or writing file content, including when importing
-an ordinary Git repository. A `.gitattributes` file is itself ordinary tracked
-bytes, but it does not grant permission to transform other files. Never invoke
-an external filter or write a converted temporary payload while checking such
-rules. Git object IDs use the selected repository's canonical object framing
+independently of system, global, repository, and environment-supplied Git
+config, and of attributes from `.gitattributes`, an attributes file selected
+by `core.attributesFile`, or `.git/info/attributes` when importing an ordinary
+Git repository. Treat transforming rules as inert when reading or writing file
+content. A `.gitattributes` file is itself ordinary tracked bytes, but it does
+not grant permission to transform other files. Never invoke an external filter
+or write a converted temporary payload while checking such rules. Git object
+IDs use the selected repository's canonical object framing
 and hash algorithm, computed by the Git library from the immutable captured bytes.
 Retain MutualBackup's independent content roots and signed revision authority.
 
@@ -3099,8 +3101,9 @@ backend gates. A command being present does not by itself close its slice.
   Never create a persistent second Git blob or pack copy of native payloads.
 - Disable all automatic content conversion in this binary, including CRLF/text
   handling, clean/smudge/process filters, `ident`, and working-tree encodings,
-  regardless of inherited Git config or attributes. Force Git-library calls
-  that touch blob or working-tree bytes onto raw-byte paths; never let a Git
+  regardless of inherited Git config, environment overrides, or attribute
+  source. Force Git-library calls that touch blob or working-tree bytes onto
+  raw-byte paths; never let a Git
   library's default checkout/filter behavior re-enable conversion, including
   during merge with `merge.renormalize`, reset/restore, pull, and
   worktree creation. Reject any command option that requests renormalization
@@ -3149,10 +3152,11 @@ backend gates. A command being present does not by itself close its slice.
   blob = restored file when no edit intervenes, and asserting imported/exported
   blob bytes and IDs remain identical even when a stock Git peer has different
   line-ending or filter settings; mixed LF/CRLF, binary NUL, non-UTF-8
-  payloads, and conversion-inducing system/global/repository `core.autocrlf`,
-  `core.eol`, and `merge.renormalize` settings and `.gitattributes` rules for `text=auto`,
-  `eol`, `filter`, `ident`, and `working-tree-encoding` across add, merge,
-  reset/restore, pull, worktree checkout, import, and export; verify a configured
+  payloads, and conversion-inducing system/global/repository/environment
+  `core.autocrlf`, `core.eol`, and `merge.renormalize` settings and rules from
+  `.gitattributes`, `core.attributesFile`, and `.git/info/attributes` for
+  `text=auto`, `eol`, `filter`, `ident`, and `working-tree-encoding` across add,
+  merge, reset/restore, pull, worktree checkout, import, and export; verify a configured
   filter is never executed; verify renormalization/filter-enabling command
   options are rejected without changing index, refs, anchors, or worktree;
   transforming rules remain present but inert while raw-byte commands succeed;
