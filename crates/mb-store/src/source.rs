@@ -76,6 +76,12 @@ impl SourceBackendKind {
         matches!(self, Self::ReflinkV1)
     }
 
+    /// Guarded checkout needs a protected editable hard-link transition;
+    /// publishing a regular file through that backend is still gated.
+    pub fn supports_git_checkout_file(self) -> bool {
+        matches!(self, Self::ReflinkV1)
+    }
+
     pub fn probe(self, source_root: impl AsRef<Path>) -> Result<(), AnchorError> {
         match self {
             Self::ReflinkV1 => probe_reflink(source_root),

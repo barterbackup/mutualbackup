@@ -1706,6 +1706,19 @@ fn begin_checkout_to_for_scope(
     if entries.is_empty() && !target.advance_ref && target.old_oid.is_some() {
         return Err(CheckoutError::IncompatibleIntent);
     }
+    if !source_backend.supports_git_checkout_file()
+        && entries.iter().any(|entry| {
+            entry
+                .new
+                .as_ref()
+                .is_some_and(|file| matches!(file.mode, 0o100644 | 0o100755))
+        })
+    {
+        return Err(AnchorError::UnsupportedSourceOperation(
+            "Git regular-file checkout with guarded link-freeze",
+        )
+        .into());
+    }
     let mut intent = CheckoutIntent {
         format_version: if target.merge_commit {
             6
@@ -2093,7 +2106,30 @@ fn apply_intent(
     if intent.repository_id != scope.repository_id() {
         return Err(CheckoutError::IncompatibleIntent);
     }
-    let staging = match catalog.open_child_directory(&intent.staging_name)? {
+    let existing_staging = catalog.open_child_directory(&intent.staging_name)?;
+    if intent.phase == Phase::Preparing && !source_backend.supports_git_checkout_file() {
+        for (index, entry) in intent.entries.iter().enumerate() {
+            let Some(target) = entry.new.as_ref() else {
+                continue;
+            };
+            if !matches!(target.mode, 0o100644 | 0o100755) || entry.new_id.is_some() {
+                continue;
+            }
+            let Some(staging) = existing_staging.as_ref() else {
+                return Err(AnchorError::UnsupportedSourceOperation(
+                    "Git regular-file checkout with guarded link-freeze",
+                )
+                .into());
+            };
+            if entry_identity_for(staging, OsStr::new(&stage_name(index)), target.mode)?.is_none() {
+                return Err(AnchorError::UnsupportedSourceOperation(
+                    "Git regular-file checkout with guarded link-freeze",
+                )
+                .into());
+            }
+        }
+    }
+    let staging = match existing_staging {
         Some(staging) => staging,
         None if intent.staging_id.is_none() && intent.phase == Phase::Preparing => {
             let staging = catalog.create_child_directory(&intent.staging_name)?;
@@ -2562,6 +2598,65 @@ fn apply_intent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guarded_checkout_replay_does_not_create_staging_for_a_regular_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("work");
+        let catalog_path = root_path.join(".mutualbackup");
+        std::fs::create_dir_all(&catalog_path).unwrap();
+        let root = PinnedDirectory::open(&root_path).unwrap();
+        let catalog = PinnedDirectory::open(&catalog_path).unwrap();
+        let control =
+            ControlStore::open_with_key(catalog_path.join("catalog.db"), &[41; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        let mut intent = CheckoutIntent {
+            format_version: 8,
+            advance_ref: false,
+            target_ref: None,
+            repository_id,
+            old_branch: "main".to_owned(),
+            old_oid: [0; 20],
+            new_branch: "main".to_owned(),
+            new_oid: [1; 20],
+            staging_name: format!("checkout-{}", Uuid::new_v4()),
+            staging_id: None,
+            phase: Phase::Preparing,
+            entries: vec![CheckoutEntry {
+                path: b"tracked".to_vec(),
+                old: None,
+                old_id: None,
+                new: Some(CheckoutFile {
+                    oid: [2; 20],
+                    mode: 0o100644,
+                    anchor_id: Uuid::new_v4(),
+                }),
+                new_id: None,
+            }],
+            directories: Vec::new(),
+            removed_directories: Vec::new(),
+        };
+        assert!(matches!(
+            apply_intent(
+                &control,
+                GitWorktreeScope::primary(repository_id),
+                &mut intent,
+                &root,
+                &catalog,
+                SourceBackendKind::GuardedLinkFreezeV1,
+            ),
+            Err(CheckoutError::Anchor(
+                AnchorError::UnsupportedSourceOperation(_)
+            ))
+        ));
+        assert!(
+            catalog
+                .entry_identity(&intent.staging_name, true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(intent.staging_id.is_none());
+    }
 
     #[test]
     fn old_checkout_intent_keeps_its_disk_format_during_replay() {

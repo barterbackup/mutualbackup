@@ -858,6 +858,8 @@ mod tests {
         );
         assert!(!SourceBackendKind::GuardedLinkFreezeV1.supports_git_file_staging());
         assert!(SourceBackendKind::ReflinkV1.supports_git_file_staging());
+        assert!(!SourceBackendKind::GuardedLinkFreezeV1.supports_git_checkout_file());
+        assert!(SourceBackendKind::ReflinkV1.supports_git_checkout_file());
         assert!(matches!(
             SourceBackendKind::GuardedLinkFreezeV1.plan_file(&root, "source"),
             Err(AnchorError::UnsupportedSourceOperation(_))
