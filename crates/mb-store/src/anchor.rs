@@ -94,6 +94,8 @@ pub enum AnchorError {
     UnsupportedObject(PathBuf),
     #[error("guarded capture cannot freeze a file with hard-link aliases: {0}")]
     UnsafeHardLink(PathBuf),
+    #[error("guarded root capture plan is invalid or exceeds its versioned bounds")]
+    InvalidGuardedPlan,
     #[error("unsafe relative path")]
     UnsafePath,
     #[error("unsupported Git worktree file mode")]

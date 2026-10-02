@@ -3,6 +3,7 @@
 //! not eligible for enrollment until capture, replay, and retirement consume
 //! this inventory through the versioned source-backend boundary.
 
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -68,6 +69,31 @@ impl GuardedRootEntry {
     fn is_directory(&self) -> bool {
         matches!(self, Self::Directory { .. })
     }
+
+    fn mode_and_modified(&self) -> (u32, i64, u32) {
+        match self {
+            Self::Directory {
+                mode,
+                modified_secs,
+                modified_nanos,
+                ..
+            }
+            | Self::File {
+                mode,
+                modified_secs,
+                modified_nanos,
+                ..
+            } => (*mode, *modified_secs, *modified_nanos),
+        }
+    }
+}
+
+fn lexically_normalized(path: &Path) -> bool {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        normalized.push(component.as_os_str());
+    }
+    normalized.as_os_str() == path.as_os_str()
 }
 
 impl GuardedRootCapturePlan {
@@ -101,14 +127,90 @@ impl GuardedRootCapturePlan {
             root_modified_nanos,
             entries,
         };
-        if mb_core::canonical_bytes(&plan)
-            .map_err(|_| AnchorError::CatalogTooLarge)?
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    /// Validate a decoded durable inventory before using any of its paths or
+    /// per-file journal IDs. Planning also calls this before returning it.
+    pub fn validate(&self) -> Result<(), AnchorError> {
+        if self.format_version != 1
+            || self.anchor_id.is_nil()
+            || self.area.area_id.is_nil()
+            || !self.source_root.is_absolute()
+            || !lexically_normalized(&self.source_root)
+            || self
+                .source_root
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            || !self.area.path_hint.is_absolute()
+            || !lexically_normalized(&self.area.path_hint)
+            || !self.area.volume_root_hint.is_absolute()
+            || !lexically_normalized(&self.area.volume_root_hint)
+            || self.root_version.filesystem_id == 0
+            || self.root_version.filesystem_id != self.area.filesystem_id
+            || self.root_version.inode == 0
+            || self.root_mode & libc::S_IFMT != libc::S_IFDIR
+            || self.root_modified_secs != self.root_version.modified_secs
+            || i64::from(self.root_modified_nanos) != self.root_version.modified_nanos
+            || self.entries.len() > MAX_CAPTURE_ENTRIES
+        {
+            return Err(AnchorError::InvalidGuardedPlan);
+        }
+        let mut directories = BTreeSet::new();
+        let mut capture_ids = BTreeSet::from([self.anchor_id]);
+        let mut inodes = BTreeSet::from([self.root_version.inode]);
+        let mut previous = None::<&str>;
+        for entry in &self.entries {
+            let path = entry.path();
+            let relative = Path::new(path);
+            let (mode, modified_secs, modified_nanos) = entry.mode_and_modified();
+            if validate_relative(relative).is_err()
+                || !lexically_normalized(relative)
+                || path.len() > MAX_RELATIVE_PATH_BYTES
+                || relative.components().count() > MAX_CAPTURE_DEPTH
+                || previous.is_some_and(|prior| prior >= path)
+                || entry.version().filesystem_id != self.root_version.filesystem_id
+                || entry.version().inode == 0
+                || entry.version().modified_secs != modified_secs
+                || entry.version().modified_nanos != i64::from(modified_nanos)
+                || mode & libc::S_IFMT
+                    != if entry.is_directory() {
+                        libc::S_IFDIR
+                    } else {
+                        libc::S_IFREG
+                    }
+                || !inodes.insert(entry.version().inode)
+            {
+                return Err(AnchorError::InvalidGuardedPlan);
+            }
+            if let Some(parent) = relative
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                && !directories.contains(parent.to_str().ok_or(AnchorError::InvalidGuardedPlan)?)
+            {
+                return Err(AnchorError::InvalidGuardedPlan);
+            }
+            match entry {
+                GuardedRootEntry::Directory { .. } => {
+                    directories.insert(path);
+                }
+                GuardedRootEntry::File { capture_id, .. } => {
+                    if capture_id.is_nil() || !capture_ids.insert(*capture_id) {
+                        return Err(AnchorError::InvalidGuardedPlan);
+                    }
+                }
+            }
+            previous = Some(path);
+        }
+        if mb_core::canonical_bytes(self)
+            .map_err(|_| AnchorError::InvalidGuardedPlan)?
             .len()
             > V1_MAX_CATALOG_BYTES / 2
         {
-            return Err(AnchorError::CatalogTooLarge);
+            return Err(AnchorError::InvalidGuardedPlan);
         }
-        Ok(plan)
+        Ok(())
     }
 
     pub fn source_root(&self) -> &Path {
@@ -265,6 +367,25 @@ mod tests {
         scan_root_inventory(root, &directory, filesystem, &root_version)
     }
 
+    fn planned_without_privileged_probe(root: &Path) -> GuardedRootCapturePlan {
+        let directory = open_source_root(root).unwrap();
+        let metadata = directory.metadata().unwrap();
+        let filesystem = filesystem_identity_for_file(&directory).unwrap();
+        let (root_modified_secs, root_modified_nanos) = modified_parts(&metadata);
+        let root_version = capture_version(filesystem.stable_id, &metadata);
+        GuardedRootCapturePlan {
+            format_version: 1,
+            anchor_id: Uuid::new_v4(),
+            source_root: root.to_path_buf(),
+            area: StableAnchorAreaLocator::prepare_for_root(root).unwrap(),
+            root_version: root_version.clone(),
+            root_mode: unix_mode(&metadata),
+            root_modified_secs,
+            root_modified_nanos,
+            entries: scan_root_inventory(root, &directory, filesystem, &root_version).unwrap(),
+        }
+    }
+
     #[test]
     fn inventory_is_sorted_and_retains_exact_file_versions() {
         let temp = tempfile::tempdir().unwrap();
@@ -335,5 +456,56 @@ mod tests {
         )
         .unwrap();
         assert!(inventory(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn decoded_inventory_rejects_reordered_paths_and_reused_journal_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("dir")).unwrap();
+        fs::write(root.join("dir/first"), b"first").unwrap();
+        fs::write(root.join("second"), b"second").unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        plan.validate().unwrap();
+        let decoded: GuardedRootCapturePlan =
+            mb_core::decode_canonical(&mb_core::canonical_bytes(&plan).unwrap()).unwrap();
+        assert_eq!(decoded, plan);
+        decoded.validate().unwrap();
+
+        let mut reordered = decoded.clone();
+        reordered.entries.swap(0, 1);
+        assert!(matches!(
+            reordered.validate(),
+            Err(AnchorError::InvalidGuardedPlan)
+        ));
+        let mut reused_id = decoded.clone();
+        let first_id = match &reused_id.entries[1] {
+            GuardedRootEntry::File { capture_id, .. } => *capture_id,
+            _ => panic!("expected first file"),
+        };
+        let GuardedRootEntry::File { capture_id, .. } = &mut reused_id.entries[2] else {
+            panic!("expected second file");
+        };
+        *capture_id = first_id;
+        assert!(matches!(
+            reused_id.validate(),
+            Err(AnchorError::InvalidGuardedPlan)
+        ));
+        let mut wrong_filesystem = decoded;
+        wrong_filesystem.area.filesystem_id ^= 1;
+        assert!(matches!(
+            wrong_filesystem.validate(),
+            Err(AnchorError::InvalidGuardedPlan)
+        ));
+        let mut aliased_path = plan;
+        let GuardedRootEntry::File { path, .. } = &mut aliased_path.entries[1] else {
+            panic!("expected nested file");
+        };
+        *path = "dir//first".to_owned();
+        assert!(matches!(
+            aliased_path.validate(),
+            Err(AnchorError::InvalidGuardedPlan)
+        ));
     }
 }
