@@ -18,7 +18,8 @@ use crate::checkout::{
     verify_tracked_file_for_removal,
 };
 use crate::stage::{
-    GitIndexEntry, StageError, index_kind_for_scope, stage_path_key, staged_entry_for_scope,
+    GitIndexEntry, StageError, index_kind_for_scope, indexed_anchor_manifest, stage_path_key,
+    staged_entry_for_scope,
 };
 use crate::status::{StatusError, committed_files_for_scope};
 
@@ -148,6 +149,7 @@ fn resume_one(
             actual,
             intent.entry.oid,
             intent.entry.mode,
+            &indexed_anchor_manifest(control, scope.repository_id(), &intent.entry)?,
         )?;
         if intent.entry.mode == 0o120000 {
             parent.remove_child_symlink(&name, actual)?;
@@ -225,7 +227,14 @@ pub(crate) fn remove_tracked_for_scope(
     let (parent, name) =
         parent_and_name_if_exists(&root, &key)?.ok_or(GitRmError::DirtyWorktree)?;
     let file_id = file_identity(&parent, &name, entry.mode)?.ok_or(GitRmError::DirtyWorktree)?;
-    verify_tracked_file_for_removal(&parent, &name, file_id, entry.oid, entry.mode)?;
+    verify_tracked_file_for_removal(
+        &parent,
+        &name,
+        file_id,
+        entry.oid,
+        entry.mode,
+        &indexed_anchor_manifest(control, scope.repository_id(), &entry)?,
+    )?;
     let intent = RmIntent {
         format_version: 1,
         repository_id: scope.repository_id(),

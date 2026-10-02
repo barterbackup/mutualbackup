@@ -657,6 +657,7 @@ pub(crate) fn verify_tracked_file_for_removal(
     identity: NativeFileId,
     oid: [u8; 20],
     mode: u32,
+    anchor: &FileAnchorManifest,
 ) -> Result<(), CheckoutError> {
     verify_file(
         parent,
@@ -667,7 +668,43 @@ pub(crate) fn verify_tracked_file_for_removal(
             mode,
             anchor_id: Uuid::nil(),
         },
-    )
+    )?;
+    if mode == 0o120000 {
+        let (target, observed) = parent
+            .read_child_symlink(name)?
+            .ok_or(CheckoutError::DirtyWorktree)?;
+        if observed != identity
+            || target.len() as u64 != anchor.logical_len
+            || blake3::hash(&target).as_bytes() != &anchor.content_hash
+            || entry_identity_for(parent, name, mode)? != Some(identity)
+        {
+            return Err(CheckoutError::DirtyWorktree);
+        }
+        return Ok(());
+    }
+    let mut file = parent
+        .open_child_file(name)?
+        .ok_or(CheckoutError::DirtyWorktree)?;
+    let before = file.metadata()?;
+    if before.len() != anchor.logical_len {
+        return Err(CheckoutError::DirtyWorktree);
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    if hasher.finalize().as_bytes() != &anchor.content_hash
+        || file_fingerprint(&before) != file_fingerprint(&file.metadata()?)
+        || entry_identity_for(parent, name, mode)? != Some(identity)
+    {
+        return Err(CheckoutError::DirtyWorktree);
+    }
+    Ok(())
 }
 
 fn verify_staged_directory(
@@ -2598,6 +2635,61 @@ fn apply_intent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tracked_removal_rechecks_native_bytes_after_matching_git_id() {
+        let worktree = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(worktree.path().join("tracked"), b"bravo").unwrap();
+        let anchor = mb_store::SourceBlobImportPlan::plan_direct(source.path(), 5)
+            .unwrap()
+            .capture(std::io::Cursor::new(b"alpha"))
+            .unwrap();
+        let root = PinnedDirectory::open(worktree.path()).unwrap();
+        let name = OsStr::new("tracked");
+        let identity = entry_identity_for(&root, name, 0o100644).unwrap().unwrap();
+        let oid = Oid::hash_object(ObjectType::Blob, b"bravo")
+            .unwrap()
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        assert!(matches!(
+            verify_tracked_file_for_removal(&root, name, identity, oid, 0o100644, &anchor),
+            Err(CheckoutError::DirtyWorktree)
+        ));
+        std::fs::write(worktree.path().join("tracked"), b"alpha").unwrap();
+        let oid = Oid::hash_object(ObjectType::Blob, b"alpha")
+            .unwrap()
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        verify_tracked_file_for_removal(&root, name, identity, oid, 0o100644, &anchor).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tracked_symlink_removal_rechecks_native_target_after_matching_git_id() {
+        let worktree = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("bravo", worktree.path().join("tracked")).unwrap();
+        let anchor = mb_store::SourceBlobImportPlan::plan_direct(source.path(), 5)
+            .unwrap()
+            .capture(std::io::Cursor::new(b"alpha"))
+            .unwrap();
+        let root = PinnedDirectory::open(worktree.path()).unwrap();
+        let name = OsStr::new("tracked");
+        let identity = entry_identity_for(&root, name, 0o120000).unwrap().unwrap();
+        let oid = Oid::hash_object(ObjectType::Blob, b"bravo")
+            .unwrap()
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        assert!(matches!(
+            verify_tracked_file_for_removal(&root, name, identity, oid, 0o120000, &anchor),
+            Err(CheckoutError::DirtyWorktree)
+        ));
+    }
 
     #[test]
     fn guarded_checkout_replay_does_not_create_staging_for_a_regular_file() {

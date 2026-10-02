@@ -34,7 +34,7 @@ use crate::history::{HistoryError, list_branches_for_scope};
 use crate::rm::{GitRmError, abandon_missing_linked_rm};
 use crate::stage::{
     StageError, abandon_missing_linked_worktree_stages, has_pending_stages_for_scope,
-    index_kind_for_scope, stage_path_key, staged_entries_for_scope,
+    index_kind_for_scope, indexed_anchor_manifest, stage_path_key, staged_entries_for_scope,
 };
 use crate::status::{StatusError, committed_files_for_scope, repository_status_for_scope};
 
@@ -304,7 +304,14 @@ fn begin_remove_worktree(
             parent_and_name_if_exists(&root, &path)?.ok_or(GitWorktreeError::DirtyWorktree)?;
         let identity = tracked_identity(&directory, &name, entry.mode)?
             .ok_or(GitWorktreeError::DirtyWorktree)?;
-        verify_tracked_file_for_removal(&directory, &name, identity, entry.oid, entry.mode)?;
+        verify_tracked_file_for_removal(
+            &directory,
+            &name,
+            identity,
+            entry.oid,
+            entry.mode,
+            &indexed_anchor_manifest(control, info.repository_id, &entry)?,
+        )?;
         files.push(RemovalFile {
             path,
             oid: entry.oid,
@@ -437,7 +444,7 @@ fn resume_remove_worktree(
             if root.identity()? != intent.root_id || info.path.canonicalize()? != info.path {
                 return Err(GitWorktreeError::Conflict);
             }
-            for file in &intent.files {
+            for (file, (_, entry)) in intent.files.iter().zip(&staged) {
                 let Some((directory, name)) = parent_and_name_if_exists(&root, &file.path)? else {
                     continue;
                 };
@@ -448,7 +455,14 @@ fn resume_remove_worktree(
                 if actual != file.identity {
                     return Err(GitWorktreeError::DirtyWorktree);
                 }
-                verify_tracked_file_for_removal(&directory, &name, actual, file.oid, file.mode)?;
+                verify_tracked_file_for_removal(
+                    &directory,
+                    &name,
+                    actual,
+                    file.oid,
+                    file.mode,
+                    &indexed_anchor_manifest(control, info.repository_id, entry)?,
+                )?;
                 if file.mode == 0o120000 {
                     directory.remove_child_symlink(&name, actual)?;
                 } else {
