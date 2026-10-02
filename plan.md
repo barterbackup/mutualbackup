@@ -35,8 +35,11 @@ them as ADRs and test vectors before promising wire compatibility.
   when the host's Git configuration enables one. Git clean filters can run
   arbitrary transformations; disabling CRLF normalization alone is insufficient.
   Do not offer a compatibility flag, `--renormalize` equivalent, or per-command
-  override that enables such conversion in our binary. This policy covers local
-  staging, history, checkout, merge, and interoperability with ordinary Git.
+  override that enables such conversion in our binary. Existing Git attributes
+  and configuration that request conversion are inert for file content in our
+  binary; their presence must not prevent raw-byte operations. This policy
+  covers local staging, history, checkout, merge, and interoperability with
+  ordinary Git.
   Git-compatible object IDs describe the bytes actually retained in native
   anchors. Treat Git's automatic conversion settings as disabled in our binary,
   including when opening an existing repository or importing a commit. `add`
@@ -549,13 +552,13 @@ Incoming Git blobs become identical local file bytes; outgoing blobs retain
 their original bytes and object IDs. Do not use `core.autocrlf`, `core.eol`,
 `core.safecrlf`, or `text`, `eol`, `filter`, `ident`, and
 `working-tree-encoding` attributes to rewrite payloads. Enforce this
-independently of system, global, and repository Git config; reject an explicit
-repository rule that requests an unsupported content transformation before it
-can alter bytes. A `.gitattributes` file is itself ordinary tracked bytes, but
-it does not grant permission to transform other files. Never invoke an external
-filter or write a converted temporary payload while checking such rules. Git
-object IDs use the selected repository's canonical object framing and hash
-algorithm, computed by the Git library from the immutable captured bytes.
+independently of system, global, and repository Git config. Treat transforming
+rules as inert when reading or writing file content, including when importing
+an ordinary Git repository. A `.gitattributes` file is itself ordinary tracked
+bytes, but it does not grant permission to transform other files. Never invoke
+an external filter or write a converted temporary payload while checking such
+rules. Git object IDs use the selected repository's canonical object framing
+and hash algorithm, computed by the Git library from the immutable captured bytes.
 Retain MutualBackup's independent content roots and signed revision authority.
 
 - **Prototype sector object:** fixed 64 KiB RS-level bytes, logical tail length,
@@ -3101,10 +3104,10 @@ backend gates. A command being present does not by itself close its slice.
   worktree creation. Reject any command option that requests renormalization
   or a content filter. Import Git blob bytes as raw file bytes and export the
   same bytes. Treat incoming blob bytes as authoritative; do not try to reverse
-  conversions already performed by another client's worktree. Report explicit
-  repository transforming rules before changing the index, refs, anchors, or
-  worktree.
-  Never run a configured filter command. Define safe support for Git file
+  conversions already performed by another client's worktree. Treat inherited
+  and repository transforming rules as inert for payload bytes, and make this
+  behavior visible in help and status when such rules exist. Never run a
+  configured filter command. Define safe support for Git file
   modes, symlinks, and path names rather than silently dropping them.
 - Protect the whole reachable Git commit graph and refs as owner-owned backed-up
   content, not just the currently checked-out tree. A signed MutualBackup
@@ -3149,8 +3152,8 @@ backend gates. A command being present does not by itself close its slice.
   `eol`, `filter`, `ident`, and `working-tree-encoding` across add, merge,
   reset/restore, pull, worktree checkout, import, and export; verify a configured
   filter is never executed; verify renormalization/filter-enabling command
-  options and transforming rules are rejected without changing index, refs,
-  anchors, or worktree;
+  options are rejected without changing index, refs, anchors, or worktree;
+  transforming rules remain present but inert while raw-byte commands succeed;
   sparse and large files; hard links, symlinks, modes, and unusual path names;
   dirty and untracked checkout safety; merge conflicts/abort; crash/reopen at stage,
   ref, checkout, switch, merge, worktree HEAD/index, import, prune, and backup
