@@ -202,7 +202,7 @@ async fn main() -> Result<()> {
             );
         }
         Command::Worktree { command } => {
-            let (_, repository_id) = discover_repository(&working_directory)?;
+            let repository_id = discover_shared_repository(&working_directory)?;
             match command {
                 WorktreeCommand::Add { path, branch } => {
                     let destination = working_directory.join(path);

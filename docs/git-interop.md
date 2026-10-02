@@ -52,7 +52,7 @@ It refuses modified or untracked content, including an unexpected `.git`
 directory. An interrupted removal remains visible as `Removing`; rerun the same
 command to finish it after resolving any conflicting file or directory.
 After deliberately removing a linked worktree directory, run
-`mutualgit worktree prune WORKTREE_ID` from the primary repository to release
+`mutualgit worktree prune WORKTREE_ID` from any remaining worktree to release
 its branch ownership and index pins. The command refuses an existing path,
 staged differences, or an unfinished add or checkout. Use `--force` to discard
 staged changes and pending adds after removing the directory. `--force` can also discard an
@@ -60,6 +60,8 @@ interrupted initial checkout and its private staging directory after that
 worktree directory is gone; later checkouts still block it.
 An interrupted registration that has not started checkout can be pruned without
 `--force` after its directory is removed.
+All `mutualgit worktree` subcommands can be invoked from a linked worktree;
+they operate on the shared repository rather than assuming the primary worktree.
 It only forgets that worktree's local metadata; its branch and shared commits
 remain available. Run the separate history `prune` (or `gc`) command to reclaim
 anchors that no remaining ref or index needs.
