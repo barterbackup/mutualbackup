@@ -1029,8 +1029,9 @@ pub(crate) fn pending_stage_paths_for_scope(
     Ok(paths)
 }
 
-/// Resolve all physical anchors for a Git blob ID, verifying both the native
-/// content root and the Git object ID before the caller reads them.
+/// Resolve usable physical anchors for a Git blob ID, verifying both the
+/// native content root and Git object ID. A damaged payload remains mapped for
+/// repair/retention, but cannot prevent use of another verified copy.
 pub fn anchors_for_oid(
     control: &ControlStore,
     repository_id: Uuid,
@@ -1039,13 +1040,15 @@ pub fn anchors_for_oid(
     let mut anchors = Vec::new();
     for (key, encoded) in control.records(&object_kind(repository_id, oid))? {
         let manifest: FileAnchorManifest = decode_canonical(&encoded)?;
-        if key != manifest.anchor_id.as_bytes()
-            || manifest.format_version != 1
-            || blob_oid_from_anchor(&manifest)? != oid
-        {
+        if key != manifest.anchor_id.as_bytes() || manifest.format_version != 1 {
             return Err(StageError::IncompatibleRecord);
         }
-        anchors.push(manifest);
+        match blob_oid_from_anchor(&manifest) {
+            Ok(actual) if actual == oid => anchors.push(manifest),
+            Ok(_) => return Err(StageError::IncompatibleRecord),
+            Err(GitAnchorError::Anchor(_)) => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(anchors)
 }
@@ -1062,8 +1065,9 @@ mod tests {
     use git2::Oid;
     use mb_store::{
         AnchorError, ControlStore, GIT_CATALOG_DIRECTORY, PinnedDirectory, SourceBackendKind,
-        SourceFileCapturePlan,
+        SourceFileCapturePlan, StableAnchorAreaLocator,
     };
+    use serde::Serialize;
     use uuid::Uuid;
 
     use super::{
@@ -1074,6 +1078,117 @@ mod tests {
         staged_entry, staged_entry_for_scope,
     };
     use crate::GitWorktreeScope;
+
+    #[derive(Serialize)]
+    struct TestCaptureVersion {
+        filesystem_id: u64,
+        inode: u64,
+        logical_len: u64,
+        modified_secs: i64,
+        modified_nanos: i64,
+        changed_secs: i64,
+        changed_nanos: i64,
+    }
+
+    #[derive(Serialize)]
+    struct TestFileManifest<'a> {
+        format_version: u16,
+        anchor_id: Uuid,
+        area: &'a StableAnchorAreaLocator,
+        source_root_hint: &'a Path,
+        source_relative_path: &'a Path,
+        logical_len: u64,
+        content_hash: [u8; 32],
+        source_version: TestCaptureVersion,
+    }
+
+    fn test_anchor(
+        area: &StableAnchorAreaLocator,
+        root: &Path,
+        payload: &[u8],
+        expected: &[u8],
+    ) -> mb_store::FileAnchorManifest {
+        let anchor_id = Uuid::new_v4();
+        let area_dir = PinnedDirectory::open(&area.path_hint).unwrap();
+        let directory = area_dir
+            .create_child_directory(anchor_id.to_string())
+            .unwrap();
+        directory
+            .publish_sealed_bytes_child("blob", payload)
+            .unwrap();
+        let encoded = mb_core::canonical_bytes(&TestFileManifest {
+            format_version: 1,
+            anchor_id,
+            area,
+            source_root_hint: root,
+            source_relative_path: Path::new("source"),
+            logical_len: expected.len() as u64,
+            content_hash: mb_core::sector_root(expected),
+            source_version: TestCaptureVersion {
+                filesystem_id: area.filesystem_id,
+                inode: 1,
+                logical_len: expected.len() as u64,
+                modified_secs: 0,
+                modified_nanos: 0,
+                changed_secs: 0,
+                changed_nanos: 0,
+            },
+        })
+        .unwrap();
+        mb_core::decode_canonical(&encoded).unwrap()
+    }
+
+    #[test]
+    fn damaged_git_anchor_does_not_hide_another_verified_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("work");
+        fs::create_dir(&root).unwrap();
+        let area = StableAnchorAreaLocator::prepare_for_root(&root).unwrap();
+        let control =
+            ControlStore::open_with_key(temp.path().join("catalog.db"), &[43; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        let bytes = b"exact\r\nblob\0";
+        let oid = Oid::hash_object(git2::ObjectType::Blob, bytes).unwrap();
+        let damaged = test_anchor(&area, &root, b"other\r\nblob\0", bytes);
+        let viable = test_anchor(&area, &root, bytes, bytes);
+        for anchor in [&damaged, &viable] {
+            control
+                .put_record(
+                    &super::object_kind(repository_id, oid),
+                    anchor.anchor_id.as_bytes(),
+                    &mb_core::canonical_bytes(anchor).unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            anchors_for_oid(&control, repository_id, oid).unwrap(),
+            vec![viable.clone()]
+        );
+        let wrong_key = Uuid::new_v4();
+        control
+            .put_record(
+                &super::object_kind(repository_id, oid),
+                wrong_key.as_bytes(),
+                &mb_core::canonical_bytes(&viable).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            anchors_for_oid(&control, repository_id, oid),
+            Err(StageError::IncompatibleRecord)
+        ));
+        let other_oid = Oid::hash_object(git2::ObjectType::Blob, b"different").unwrap();
+        control
+            .put_record(
+                &super::object_kind(repository_id, other_oid),
+                viable.anchor_id.as_bytes(),
+                &mb_core::canonical_bytes(&viable).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            anchors_for_oid(&control, repository_id, other_oid),
+            Err(StageError::IncompatibleRecord)
+        ));
+    }
 
     #[test]
     fn original_symlink_intent_encoding_remains_replayable() {
