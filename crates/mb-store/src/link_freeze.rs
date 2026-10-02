@@ -10,12 +10,15 @@
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+use crate::anchor::{AnchorError, FileExtent, file_data_extents};
 
 // Linux UAPI asm-generic/fcntl.h. The libc crate does not expose F_SETSIG.
 const F_SETSIG_LINUX: libc::c_int = 10;
@@ -32,6 +35,21 @@ const FANOTIFY_METADATA_VERSION: u8 = 3;
 const MAX_ACCESS_ACL_BYTES: usize = 64 * 1024;
 const ACCESS_ACL_NAME: &std::ffi::CStr = c"system.posix_acl_access";
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_SPARSE_COPY_START: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+fn run_after_sparse_copy_start_hook() {
+    #[cfg(test)]
+    AFTER_SPARSE_COPY_START.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 /// Exact original access metadata to persist before freezing a shared inode.
 /// An unsupported ACL facility is distinct from a supported filesystem with
 /// no access ACL, so a later backend does not silently invent ACL semantics.
@@ -47,6 +65,15 @@ pub enum AccessAclSnapshot {
     Unsupported,
     Absent,
     Present(Vec<u8>),
+}
+
+/// Verified private inode produced from a frozen hard-link source. Publication
+/// and recovery of the copy remain the owning backend's responsibility.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndependentSparseCopy {
+    pub logical_len: u64,
+    pub content_hash: [u8; 32],
+    pub data_extents: Vec<FileExtent>,
 }
 
 impl FileAccessSnapshot {
@@ -275,6 +302,27 @@ impl FileWriteExclusion {
         Ok(state == libc::F_RDLCK)
     }
 
+    /// Copy the pinned, frozen source into a distinct writable inode. The
+    /// source descriptor was opened before the fanotify mark, so its reads do
+    /// not need a permission exception. New opens and pathname truncates stay
+    /// denied, while other preexisting read-only descriptors remain harmless.
+    /// The caller must persist its freeze intent first and publish the result
+    /// only after the returned copy has been verified and synced.
+    pub fn copy_sparse_independent(
+        &self,
+        destination: &File,
+    ) -> Result<IndependentSparseCopy, AnchorError> {
+        if !self.is_held()? {
+            return Err(io::Error::other("write exclusion is no longer held").into());
+        }
+        run_after_sparse_copy_start_hook();
+        let copy = copy_sparse_independent(&self.file, destination)?;
+        if !self.is_held()? {
+            return Err(io::Error::other("write exclusion was lost during sparse copy").into());
+        }
+        Ok(copy)
+    }
+
     /// Release only after the caller has made the permission transition durable
     /// or abandoned it with the original permissions intact.
     pub fn release(mut self) -> io::Result<()> {
@@ -292,6 +340,114 @@ impl FileWriteExclusion {
         self.active = false;
         Ok(())
     }
+}
+
+fn copy_sparse_independent(
+    source: &File,
+    destination: &File,
+) -> Result<IndependentSparseCopy, AnchorError> {
+    let before = source.metadata()?;
+    let target = destination.metadata()?;
+    if !before.is_file()
+        || !target.is_file()
+        || before.dev() != target.dev()
+        || before.ino() == target.ino()
+        || target.nlink() != 1
+        || target.len() != 0
+        || before.len() > i64::MAX as u64
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sparse detach needs a new, empty, private inode on the source filesystem",
+        )
+        .into());
+    }
+    let logical_len = before.len();
+    let data_extents = file_data_extents(source, logical_len)?;
+    destination.set_len(logical_len)?;
+    let mut buffer = [0_u8; 64 * 1024];
+    for extent in &data_extents {
+        let end = extent.offset + extent.logical_len;
+        let mut position = extent.offset;
+        while position < end {
+            let take = (end - position).min(buffer.len() as u64) as usize;
+            let read = source.read_at(&mut buffer[..take], position)?;
+            if read == 0 {
+                return Err(
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "source extent shrank").into(),
+                );
+            }
+            let mut written = 0;
+            while written < read {
+                let count =
+                    destination.write_at(&buffer[written..read], position + written as u64)?;
+                if count == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "sparse copy write stopped",
+                    )
+                    .into());
+                }
+                written += count;
+            }
+            position += read as u64;
+        }
+    }
+    destination.sync_all()?;
+    let after = source.metadata()?;
+    if (
+        before.dev(),
+        before.ino(),
+        before.len(),
+        before.mode(),
+        before.mtime(),
+        before.mtime_nsec(),
+        before.ctime(),
+        before.ctime_nsec(),
+    ) != (
+        after.dev(),
+        after.ino(),
+        after.len(),
+        after.mode(),
+        after.mtime(),
+        after.mtime_nsec(),
+        after.ctime(),
+        after.ctime_nsec(),
+    ) || destination.metadata()?.len() != logical_len
+    {
+        return Err(io::Error::other("source changed during sparse detach copy").into());
+    }
+    if file_data_extents(destination, logical_len)? != data_extents {
+        return Err(io::Error::other("sparse detach copy changed hole layout").into());
+    }
+    let source_hash = hash_exact(source, logical_len)?;
+    if hash_exact(destination, logical_len)? != source_hash {
+        return Err(io::Error::other("sparse detach copy changed bytes").into());
+    }
+    Ok(IndependentSparseCopy {
+        logical_len,
+        content_hash: source_hash,
+        data_extents,
+    })
+}
+
+fn hash_exact(file: &File, logical_len: u64) -> io::Result<[u8; 32]> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut position = 0;
+    while position < logical_len {
+        let take = (logical_len - position).min(buffer.len() as u64) as usize;
+        let read = file.read_at(&mut buffer[..take], position)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "file shrank during hash",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+        position += read as u64;
+    }
+    Ok(*hasher.finalize().as_bytes())
 }
 
 impl Drop for FileWriteExclusion {
@@ -389,9 +545,12 @@ mod tests {
     use std::fs::{self, File, OpenOptions};
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 
-    use super::{ACCESS_ACL_NAME, AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion};
+    use super::{
+        ACCESS_ACL_NAME, AFTER_SPARSE_COPY_START, AccessAclSnapshot, FileAccessSnapshot,
+        FileWriteExclusion, file_data_extents,
+    };
 
     #[test]
     fn access_snapshot_records_the_acl_mask_changed_by_chmod() {
@@ -548,6 +707,97 @@ mod tests {
             assert!(OpenOptions::new().write(true).open(&anchor).is_err());
         }
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN for fanotify permission events"]
+    fn guarded_sparse_copy_detaches_the_anchor_without_changing_bytes_or_holes() {
+        let root = test_directory();
+        let source_path = root.path().join("source");
+        let anchor_path = root.path().join("anchor");
+        let staging_path = root.path().join("private-staging");
+        let logical_len = 1024 * 1024 + 4096;
+        let source = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&source_path)
+            .unwrap();
+        source.set_len(logical_len).unwrap();
+        source.write_at(b"head", 0).unwrap();
+        source.write_at(b"tail", logical_len - 4).unwrap();
+        source.sync_all().unwrap();
+        let original_extents = file_data_extents(&source, logical_len).unwrap();
+        assert!(original_extents.len() >= 2);
+        drop(source);
+
+        let other_reader = File::open(&source_path).unwrap();
+        let guard = FileWriteExclusion::acquire(File::open(&source_path).unwrap()).unwrap();
+        let access = FileAccessSnapshot::capture(&guard.file).unwrap();
+        fs::hard_link(&source_path, &anchor_path).unwrap();
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o444)).unwrap();
+        let shared = guard.file.try_clone().unwrap();
+        assert!(guard.copy_sparse_independent(&shared).is_err());
+        assert_eq!(fs::metadata(&source_path).unwrap().len(), logical_len);
+        let nonempty_path = root.path().join("nonempty");
+        fs::write(&nonempty_path, b"keep").unwrap();
+        let nonempty = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&nonempty_path)
+            .unwrap();
+        assert!(guard.copy_sparse_independent(&nonempty).is_err());
+        assert_eq!(fs::read(&nonempty_path).unwrap(), b"keep");
+        let private = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&staging_path)
+            .unwrap();
+        let alias_for_attempt = anchor_path.clone();
+        AFTER_SPARSE_COPY_START.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let read = std::thread::spawn(move || {
+                    let mut byte = [0];
+                    (other_reader.read_at(&mut byte, 0).unwrap(), byte)
+                })
+                .join()
+                .unwrap();
+                assert_eq!(read, (1, *b"h"));
+                let truncate_error = std::thread::spawn(move || {
+                    let path = CString::new(alias_for_attempt.as_os_str().as_bytes()).unwrap();
+                    // SAFETY: the pathname is a valid NUL-terminated string.
+                    assert_eq!(unsafe { libc::truncate(path.as_ptr(), 0) }, -1);
+                    std::io::Error::last_os_error()
+                })
+                .join()
+                .unwrap();
+                assert_eq!(truncate_error.raw_os_error(), Some(libc::EPERM));
+            }));
+        });
+        let copied = guard.copy_sparse_independent(&private).unwrap();
+        assert_eq!(copied.logical_len, logical_len);
+        assert_eq!(copied.data_extents, original_extents);
+        assert!(guard.is_held().unwrap());
+        guard.release().unwrap();
+
+        fs::rename(&staging_path, &anchor_path).unwrap();
+        assert_ne!(
+            fs::metadata(&source_path).unwrap().ino(),
+            fs::metadata(&anchor_path).unwrap().ino()
+        );
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(access.mode)).unwrap();
+        fs::write(&source_path, b"edited").unwrap();
+        assert_eq!(fs::metadata(&anchor_path).unwrap().len(), logical_len);
+        assert_eq!(fs::read(&anchor_path).unwrap()[..4], *b"head");
+        assert_eq!(
+            fs::read(&anchor_path).unwrap()[(logical_len - 4) as usize..],
+            *b"tail"
+        );
+        assert_eq!(
+            file_data_extents(&File::open(&anchor_path).unwrap(), logical_len).unwrap(),
+            original_extents
+        );
     }
 
     fn test_directory() -> tempfile::TempDir {

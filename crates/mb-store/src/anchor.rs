@@ -3890,7 +3890,10 @@ fn native_file_id(_filesystem_id: u64, _metadata: &fs::Metadata) -> NativeFileId
 }
 
 #[cfg(target_os = "linux")]
-fn file_data_extents(file: &File, logical_len: u64) -> Result<Vec<FileExtent>, AnchorError> {
+pub(crate) fn file_data_extents(
+    file: &File,
+    logical_len: u64,
+) -> Result<Vec<FileExtent>, AnchorError> {
     use std::os::fd::AsRawFd;
 
     let mut extents = Vec::new();

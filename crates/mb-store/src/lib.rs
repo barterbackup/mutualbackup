@@ -25,7 +25,9 @@ pub use database::{
     VariableParityObject,
 };
 #[cfg(target_os = "linux")]
-pub use link_freeze::{AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion};
+pub use link_freeze::{
+    AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion, IndependentSparseCopy,
+};
 pub use source::{
     SourceBackendBinding, SourceBackendKind, SourceBlobImportPlan, SourceCapturePlan,
     SourceFileCapturePlan,
