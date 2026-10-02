@@ -16,7 +16,8 @@ use git2::Oid;
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
 use mb_store::{
     AnchorError, ControlStore, DatabaseError, FileAnchorManifest, GIT_CATALOG_DIRECTORY,
-    NativeFileId, PinnedDirectory, SourceBackendKind, SourceFileCapturePlan,
+    NativeFileId, PinnedDirectory, SourceBackendKind, SourceFileCaptureError,
+    SourceFileCapturePlan,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -57,6 +58,8 @@ fn run_after_missing_stage_discard_hook() {
 pub enum StageError {
     #[error("source anchor error: {0}")]
     Anchor(#[from] AnchorError),
+    #[error("guarded source capture error: {0}")]
+    Guarded(anyhow::Error),
     #[error("encrypted catalog error: {0}")]
     Database(#[from] DatabaseError),
     #[error("Git object error: {0}")]
@@ -75,6 +78,16 @@ pub enum StageError {
     UnsupportedPlatform,
     #[error("staged symlink temporary file I/O failed: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<SourceFileCaptureError> for StageError {
+    fn from(error: SourceFileCaptureError) -> Self {
+        match error {
+            SourceFileCaptureError::Anchor(error) => Self::Anchor(error),
+            #[cfg(target_os = "linux")]
+            SourceFileCaptureError::Guarded(error) => Self::Guarded(error),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -504,9 +517,9 @@ fn finish_symlink_stage(
         intent = next;
     }
     let plan = intent.plan.as_ref().ok_or(StageError::IncompatibleRecord)?;
-    let manifest = plan.capture()?;
+    let manifest = plan.capture_with_control(control)?;
     let oid = blob_oid_from_anchor(&manifest)?;
-    plan.reconcile()?;
+    plan.reconcile_with_control(control)?;
     if let Some(observed) = verify_temporary_symlink_bytes(&catalog, &intent)? {
         if Some(observed) != intent.temp_id {
             return Err(StageError::IncompatibleRecord);
@@ -571,9 +584,9 @@ fn finish_stage_for_scope(
     if control.get_record(&kind, path_key)?.as_deref() != Some(expected.as_slice()) {
         return Err(StageError::IncompatibleRecord);
     }
-    let manifest = intent.plan.capture()?;
+    let manifest = intent.plan.capture_with_control(control)?;
     let oid = blob_oid_from_anchor(&manifest)?;
-    intent.plan.reconcile()?;
+    intent.plan.reconcile_with_control(control)?;
     let entry = GitIndexEntry {
         format_version: 1,
         oid: oid.as_bytes().try_into().expect("SHA-1 OID has 20 bytes"),
@@ -756,7 +769,7 @@ pub(crate) fn abandon_pending_stage_for_scope(
     let kind = intent_kind_for_scope(scope);
     if let Some(encoded) = control.get_record(&kind, &key)? {
         let intent = decode_intent(&encoded, scope.repository_id(), &key)?;
-        intent.plan.discard()?;
+        intent.plan.discard_with_control(control)?;
         control.delete_record_if_value(&kind, &key, &encoded)?;
         return Ok(true);
     }
@@ -770,7 +783,7 @@ pub(crate) fn abandon_pending_stage_for_scope(
     }
     let catalog = symlink_catalog(&intent)?;
     if let Some(plan) = &intent.plan {
-        plan.discard()?;
+        plan.discard_with_control(control)?;
     }
     if let Some(observed) = verify_temporary_symlink_bytes(&catalog, &intent)? {
         if intent.temp_id.is_some_and(|expected| expected != observed) {
@@ -827,13 +840,13 @@ pub(crate) fn abandon_missing_linked_worktree_stages(
         symlinks.push((key, encoded, intent));
     }
     for (key, encoded, intent) in files {
-        intent.plan.discard()?;
+        intent.plan.discard_with_control(control)?;
         control.delete_record_if_value(&file_kind, &key, &encoded)?;
         run_after_missing_stage_discard_hook();
     }
     for (key, encoded, intent) in symlinks {
         if let Some(plan) = &intent.plan {
-            plan.discard()?;
+            plan.discard_with_control(control)?;
         }
         if let Some(observed) = verify_temporary_symlink_bytes(catalog, &intent)? {
             if intent.temp_id.is_some_and(|expected| expected != observed) {

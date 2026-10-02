@@ -9,6 +9,7 @@ use std::io::Read;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
@@ -16,13 +17,13 @@ use crate::{
     ReflinkAnchor, ReflinkCapturePlan, ReflinkFileCapturePlan, StableAnchorManifest, probe_reflink,
 };
 #[cfg(target_os = "linux")]
-use crate::{GuardedRootCapturePlan, probe_guarded_link_freeze};
+use crate::{GuardedFileCapturePlan, GuardedRootCapturePlan, probe_guarded_link_freeze};
 
 /// Local source capabilities never enter a signed peer record. ReflinkV1
 /// provides byte-exact sparse reflink capture, raw imports, and reflink
 /// checkout. GuardedLinkFreezeV1 currently provides replayable whole-root
 /// capture and retirement. Node enrollment must not select it until a live
-/// edit guard protects retained hard links; its Git stage/checkout paths also
+/// edit guard protects retained hard links; new Git stage/checkout operations
 /// remain unavailable until their separate source-safety gate is implemented.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SourceBackendKind {
@@ -185,6 +186,17 @@ impl SourceCapturePlan {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SourceFileCapturePlan {
     ReflinkV1(ReflinkFileCapturePlan),
+    #[cfg(target_os = "linux")]
+    GuardedLinkFreezeV1(GuardedFileCapturePlan),
+}
+
+#[derive(Debug, Error)]
+pub enum SourceFileCaptureError {
+    #[error(transparent)]
+    Anchor(#[from] AnchorError),
+    #[cfg(target_os = "linux")]
+    #[error("guarded file capture failed: {0}")]
+    Guarded(#[from] anyhow::Error),
 }
 
 impl SourceFileCapturePlan {
@@ -198,42 +210,102 @@ impl SourceFileCapturePlan {
     pub fn capture(&self) -> Result<FileAnchorManifest, AnchorError> {
         match self {
             Self::ReflinkV1(plan) => ReflinkAnchor::capture_file_plan(plan),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(_) => Err(AnchorError::UnsupportedSourceOperation(
+                "guarded file capture needs the control store",
+            )),
+        }
+    }
+
+    /// Replay either backend using the durable control journal. New guarded
+    /// plans remain gated by `SourceBackendKind::plan_file` until edit safety
+    /// permits retaining a shared hard-link inode.
+    pub fn capture_with_control(
+        &self,
+        control: &ControlStore,
+    ) -> Result<FileAnchorManifest, SourceFileCaptureError> {
+        match self {
+            Self::ReflinkV1(plan) => Ok(ReflinkAnchor::capture_file_plan(plan)?),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(plan) => Ok(plan.capture(control)?),
         }
     }
 
     pub fn source_mode(&self) -> Result<u32, AnchorError> {
         match self {
             Self::ReflinkV1(plan) => plan.source_mode(),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(plan) => Ok(plan.source_mode()),
         }
     }
 
     pub fn source_root(&self) -> &Path {
         match self {
             Self::ReflinkV1(plan) => plan.source_root(),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(plan) => plan.source_root(),
         }
     }
 
     pub fn source_root_identity(&self) -> crate::NativeFileId {
         match self {
             Self::ReflinkV1(plan) => plan.source_root_identity(),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(plan) => plan.source_root_identity(),
         }
     }
 
     pub fn relative_path(&self) -> &Path {
         match self {
             Self::ReflinkV1(plan) => plan.relative_path(),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(plan) => plan.relative_path(),
         }
     }
 
     pub fn reconcile(&self) -> Result<(), AnchorError> {
         match self {
             Self::ReflinkV1(plan) => ReflinkAnchor::reconcile_file_capture(plan),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(_) => Err(AnchorError::UnsupportedSourceOperation(
+                "guarded file reconciliation needs the control store",
+            )),
+        }
+    }
+
+    pub fn reconcile_with_control(
+        &self,
+        _control: &ControlStore,
+    ) -> Result<(), SourceFileCaptureError> {
+        match self {
+            Self::ReflinkV1(plan) => Ok(ReflinkAnchor::reconcile_file_capture(plan)?),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(_) => {
+                // capture() verified and synced the guarded manifest before
+                // returning; replay calls capture() again before reaching here.
+                Ok(())
+            }
         }
     }
 
     pub fn discard(&self) -> Result<(), AnchorError> {
         match self {
             Self::ReflinkV1(plan) => ReflinkAnchor::discard_file_capture(plan),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(_) => Err(AnchorError::UnsupportedSourceOperation(
+                "guarded file retirement needs the control store",
+            )),
+        }
+    }
+
+    pub fn discard_with_control(
+        &self,
+        control: &ControlStore,
+    ) -> Result<(), SourceFileCaptureError> {
+        match self {
+            Self::ReflinkV1(plan) => Ok(ReflinkAnchor::discard_file_capture(plan)?),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(plan) => Ok(plan.discard_unreferenced(control)?),
         }
     }
 }

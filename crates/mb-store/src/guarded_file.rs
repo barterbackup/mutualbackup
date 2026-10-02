@@ -112,6 +112,10 @@ impl GuardedFileCapturePlan {
         &self.source_root
     }
 
+    pub fn source_root_identity(&self) -> NativeFileId {
+        self.source_root_id
+    }
+
     pub fn relative_path(&self) -> &Path {
         &self.relative_path
     }
@@ -761,7 +765,10 @@ mod tests {
     use mb_core::{KeyMaterial, Seed};
 
     use super::*;
-    use crate::{ControlStore, LinkFreezeCaptureIntent, LinkFreezeCapturePhase, PinnedDirectory};
+    use crate::{
+        ControlStore, LinkFreezeCaptureIntent, LinkFreezeCapturePhase, PinnedDirectory,
+        SourceBackendKind, SourceFileCapturePlan,
+    };
 
     fn planned_without_privileged_probe(root: &Path) -> GuardedFileCapturePlan {
         let root = root.canonicalize().unwrap();
@@ -825,6 +832,34 @@ mod tests {
             content_hash: [42; 32],
             source_version: plan.source_version.clone(),
         }
+    }
+
+    #[test]
+    fn guarded_git_file_plan_is_durable_but_new_staging_stays_gated() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("protected");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("source"), b"raw bytes").unwrap();
+        let guarded = planned_without_privileged_probe(&root);
+        let plan = SourceFileCapturePlan::GuardedLinkFreezeV1(guarded.clone());
+        let encoded = mb_core::canonical_bytes(&plan).unwrap();
+        let replayed: SourceFileCapturePlan = mb_core::decode_canonical(&encoded).unwrap();
+        assert_eq!(replayed, plan);
+        assert_eq!(replayed.source_root(), guarded.source_root());
+        assert_eq!(
+            replayed.source_root_identity(),
+            guarded.source_root_identity()
+        );
+        assert_eq!(replayed.relative_path(), guarded.relative_path());
+        assert_eq!(replayed.source_mode().unwrap(), guarded.source_mode());
+        assert!(matches!(
+            SourceBackendKind::GuardedLinkFreezeV1.plan_file(&root, "source"),
+            Err(AnchorError::UnsupportedSourceOperation(_))
+        ));
+        assert!(matches!(
+            replayed.capture(),
+            Err(AnchorError::UnsupportedSourceOperation(_))
+        ));
     }
 
     #[test]
