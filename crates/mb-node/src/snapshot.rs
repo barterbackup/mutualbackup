@@ -552,7 +552,7 @@ pub(crate) fn reconcile_pending_captures(control: &ControlStore) -> Result<()> {
         }
         // An offline source volume must not prevent unrelated guilds from
         // starting. The exact plan remains durable for a later explicit retry.
-        let _ = intent.plan.reconcile();
+        let _ = intent.plan.reconcile(control);
     }
     for (record_id, bytes) in control.records(GIT_GRAPH_INTENT_KIND)? {
         let (intent, migrated) = decode_git_graph_intent(&bytes)?;
@@ -585,9 +585,21 @@ pub(crate) fn reconcile_pending_captures(control: &ControlStore) -> Result<()> {
                 &canonical_bytes(&intent)?,
             )?;
         }
-        let _ = intent.plan.reconcile();
+        let _ = intent.plan.reconcile(control);
     }
     reconcile_anchor_retirements(control)?;
+    Ok(())
+}
+
+fn remove_revision_anchor(
+    control: &ControlStore,
+    manifest: &mb_store::StableAnchorManifest,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(plan) = mb_store::GuardedRootCapturePlan::load_for_manifest(control, manifest)? {
+        return plan.discard_unreferenced(control);
+    }
+    manifest.remove()?;
     Ok(())
 }
 
@@ -597,7 +609,7 @@ fn reconcile_anchor_retirements(control: &ControlStore) -> Result<()> {
         if record_id.as_slice() != manifest.anchor_id.as_bytes() {
             bail!("durable anchor retirement is inconsistent");
         }
-        if manifest.remove().is_ok() {
+        if remove_revision_anchor(control, &manifest).is_ok() {
             let _ = control.delete_record(ANCHOR_RETIREMENT_KIND, &record_id)?;
         }
     }
@@ -616,7 +628,7 @@ pub(crate) fn retire_revision_anchor(control: &mut ControlStore, revision_id: Uu
         ANCHOR_RETIREMENT_KIND,
         manifest.anchor_id.as_bytes(),
     )?;
-    if manifest.remove().is_ok() {
+    if remove_revision_anchor(control, &manifest).is_ok() {
         let _ = control.delete_record(ANCHOR_RETIREMENT_KIND, manifest.anchor_id.as_bytes())?;
     }
     Ok(())
@@ -637,7 +649,7 @@ pub(crate) fn abandon_recovered_anchor_capture(
     }
     intent
         .plan
-        .discard()
+        .discard(control)
         .context("discard recovered-anchor capture whose restored source was lost")?;
     if !control.delete_record(RECOVERY_ANCHOR_INTENT_KIND, revision_id.as_bytes())? {
         bail!("pending recovered-anchor capture disappeared");
@@ -779,8 +791,8 @@ pub(crate) fn prepare_revision(
         let mut anchor = PendingAnchor {
             manifest: intent
                 .plan
-                .capture()
-                .context("capture reflink source anchor")?,
+                .capture(control)
+                .context("capture source anchor")?,
             committed: false,
         };
         if canonical_bytes(&anchor.manifest)?.len() > V1_MAX_CATALOG_BYTES / 2 {
@@ -1053,8 +1065,8 @@ pub(crate) fn prepare_revision(
         Err(error) => {
             intent
                 .plan
-                .discard()
-                .context("discard failed reflink source capture")?;
+                .discard(control)
+                .context("discard failed source capture")?;
             control
                 .abandon_capture_intent(revision_id.as_bytes(), &intent_bytes)
                 .context("retire failed source-capture intent")?;
@@ -1428,7 +1440,7 @@ pub(crate) fn reanchor_recovered_revision(
             }
             intent
                 .plan
-                .discard()
+                .discard(control)
                 .context("discard redundant recovered-anchor capture")?;
             if !control.delete_record(
                 RECOVERY_ANCHOR_INTENT_KIND,
@@ -1492,7 +1504,7 @@ pub(crate) fn reanchor_recovered_revision(
     let mut anchor = PendingAnchor {
         manifest: intent
             .plan
-            .capture()
+            .capture(control)
             .context("capture recovered source anchor")?,
         committed: false,
     };

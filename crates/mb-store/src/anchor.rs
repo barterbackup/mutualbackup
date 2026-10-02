@@ -96,6 +96,8 @@ pub enum AnchorError {
     UnsafeHardLink(PathBuf),
     #[error("guarded root capture plan is invalid or exceeds its versioned bounds")]
     InvalidGuardedPlan,
+    #[error("source backend does not support this operation: {0}")]
+    UnsupportedSourceOperation(&'static str),
     #[error("unsafe relative path")]
     UnsafePath,
     #[error("unsupported Git worktree file mode")]

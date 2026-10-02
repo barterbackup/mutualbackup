@@ -12,17 +12,23 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    AnchorError, FileAnchorManifest, ImportedBlobCapturePlan, PinnedDirectory, ReflinkAnchor,
-    ReflinkCapturePlan, ReflinkFileCapturePlan, StableAnchorManifest, probe_reflink,
+    AnchorError, ControlStore, FileAnchorManifest, ImportedBlobCapturePlan, PinnedDirectory,
+    ReflinkAnchor, ReflinkCapturePlan, ReflinkFileCapturePlan, StableAnchorManifest, probe_reflink,
 };
+#[cfg(target_os = "linux")]
+use crate::{GuardedRootCapturePlan, probe_guarded_link_freeze};
 
-/// Local source capabilities never enter a signed peer record. Version 1
-/// means byte-exact sparse reflink capture, direct raw-byte imports, native
-/// metadata, reflink checkout, and reachability through catalogued immutable
-/// native anchors.
+/// Local source capabilities never enter a signed peer record. ReflinkV1
+/// provides byte-exact sparse reflink capture, raw imports, and reflink
+/// checkout. GuardedLinkFreezeV1 currently provides replayable whole-root
+/// capture and retirement. Node enrollment must not select it until a live
+/// edit guard protects retained hard links; its Git stage/checkout paths also
+/// remain unavailable until their separate source-safety gate is implemented.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SourceBackendKind {
     ReflinkV1,
+    #[cfg(target_os = "linux")]
+    GuardedLinkFreezeV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -50,6 +56,8 @@ impl SourceBackendBinding {
     }
 
     pub fn is_supported_for(&self, root_id: Uuid, filesystem_id: u64, root_inode: u64) -> bool {
+        // Existing node enrollment only activates the reflink contract. A
+        // guarded binding needs explicit selection and its own reprobe path.
         self.format_version == 1
             && self.contract_version == 1
             && self.root_id == root_id
@@ -64,6 +72,8 @@ impl SourceBackendKind {
     pub fn probe(self, source_root: impl AsRef<Path>) -> Result<(), AnchorError> {
         match self {
             Self::ReflinkV1 => probe_reflink(source_root),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1 => probe_guarded_link_freeze(source_root),
         }
     }
 
@@ -73,6 +83,9 @@ impl SourceBackendKind {
     ) -> Result<SourceCapturePlan, AnchorError> {
         match self {
             Self::ReflinkV1 => SourceCapturePlan::plan_reflink(source_root),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1 => GuardedRootCapturePlan::plan(source_root)
+                .map(SourceCapturePlan::GuardedLinkFreezeV1),
         }
     }
 
@@ -83,6 +96,10 @@ impl SourceBackendKind {
     ) -> Result<SourceFileCapturePlan, AnchorError> {
         match self {
             Self::ReflinkV1 => SourceFileCapturePlan::plan_reflink(source_root, relative_path),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1 => Err(AnchorError::UnsupportedSourceOperation(
+                "Git file staging with guarded link-freeze",
+            )),
         }
     }
 
@@ -93,6 +110,10 @@ impl SourceBackendKind {
     ) -> Result<SourceBlobImportPlan, AnchorError> {
         match self {
             Self::ReflinkV1 => SourceBlobImportPlan::plan_direct(source_root, logical_len),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1 => {
+                SourceBlobImportPlan::plan_direct(source_root, logical_len)
+            }
         }
     }
 
@@ -106,6 +127,10 @@ impl SourceBackendKind {
     ) -> Result<(), AnchorError> {
         match self {
             Self::ReflinkV1 => staging.publish_reflink_child(name, anchor, mode),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1 => Err(AnchorError::UnsupportedSourceOperation(
+                "Git checkout with guarded link-freeze",
+            )),
         }
     }
 }
@@ -113,6 +138,8 @@ impl SourceBackendKind {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SourceCapturePlan {
     ReflinkV1(ReflinkCapturePlan),
+    #[cfg(target_os = "linux")]
+    GuardedLinkFreezeV1(GuardedRootCapturePlan),
 }
 
 impl SourceCapturePlan {
@@ -123,24 +150,32 @@ impl SourceCapturePlan {
     pub fn source_root(&self) -> &Path {
         match self {
             Self::ReflinkV1(plan) => plan.source_root(),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(plan) => plan.source_root(),
         }
     }
 
-    pub fn capture(&self) -> Result<StableAnchorManifest, AnchorError> {
+    pub fn capture(&self, control: &ControlStore) -> anyhow::Result<StableAnchorManifest> {
         match self {
-            Self::ReflinkV1(plan) => ReflinkAnchor::capture_plan(plan),
+            Self::ReflinkV1(plan) => Ok(ReflinkAnchor::capture_plan(plan)?),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(plan) => plan.capture(control),
         }
     }
 
-    pub fn discard(&self) -> Result<(), AnchorError> {
+    pub fn discard(&self, control: &ControlStore) -> anyhow::Result<()> {
         match self {
-            Self::ReflinkV1(plan) => ReflinkAnchor::discard_capture(plan),
+            Self::ReflinkV1(plan) => Ok(ReflinkAnchor::discard_capture(plan)?),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(plan) => plan.discard_unreferenced(control),
         }
     }
 
-    pub fn reconcile(&self) -> Result<(), AnchorError> {
+    pub fn reconcile(&self, control: &ControlStore) -> anyhow::Result<()> {
         match self {
-            Self::ReflinkV1(plan) => ReflinkAnchor::reconcile_capture(plan),
+            Self::ReflinkV1(plan) => Ok(ReflinkAnchor::reconcile_capture(plan)?),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(plan) => plan.reconcile(control),
         }
     }
 }

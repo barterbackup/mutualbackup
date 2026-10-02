@@ -275,6 +275,76 @@ impl GuardedRootCapturePlan {
         self.entries.len()
     }
 
+    /// Decode a pending guarded plan without requiring its source volume to
+    /// be online. Capture itself performs the descriptor and journal checks.
+    pub fn reconcile(&self, control: &ControlStore) -> anyhow::Result<()> {
+        self.validate()?;
+        if let Some(recorded) = control.get_record(PLAN_KIND, self.anchor_id.as_bytes())? {
+            anyhow::ensure!(
+                recorded == mb_core::canonical_bytes(self)?,
+                "guarded root plan changed during replay"
+            );
+        }
+        if let Some(bytes) = control.get_record(RETIRE_KIND, self.anchor_id.as_bytes())? {
+            let retirement: RootRetirement = mb_core::decode_canonical(&bytes)?;
+            anyhow::ensure!(
+                retirement.format_version == 1
+                    && retirement.anchor_id == self.anchor_id
+                    && retirement.plan_hash
+                        == *blake3::hash(&mb_core::canonical_bytes(self)?).as_bytes(),
+                "guarded root retirement belongs to another plan"
+            );
+        }
+        Ok(())
+    }
+
+    /// Identify the backend that owns a stored revision manifest before node
+    /// cleanup. A manifest claim binds its exact bytes; once retirement has
+    /// unlinked that claim, the durable retirement marker continues replay.
+    pub fn load_for_manifest(
+        control: &ControlStore,
+        manifest: &StableAnchorManifest,
+    ) -> anyhow::Result<Option<Self>> {
+        let Some(bytes) = control.get_record(PLAN_KIND, manifest.anchor_id.as_bytes())? else {
+            return Ok(None);
+        };
+        let plan: Self = mb_core::decode_canonical(&bytes)?;
+        plan.validate()?;
+        anyhow::ensure!(
+            plan.anchor_id == manifest.anchor_id
+                && manifest.format_version == 2
+                && plan.area == manifest.area
+                && plan.source_root == manifest.source_root_hint
+                && plan.root_mode == manifest.root_mode
+                && plan.root_modified_secs == manifest.root_modified_secs
+                && plan.root_modified_nanos == manifest.root_modified_nanos
+                && plan.entries.len() == manifest.entries.len(),
+            "revision manifest differs from its guarded source plan"
+        );
+        plan.reconcile(control)?;
+        if let Some(claim_bytes) =
+            control.get_record(MANIFEST_CLAIM_KIND, plan.anchor_id.as_bytes())?
+        {
+            let claim: RootManifestClaim = mb_core::decode_canonical(&claim_bytes)?;
+            anyhow::ensure!(
+                claim.format_version == 1
+                    && claim.anchor_id == plan.anchor_id
+                    && claim.plan_hash == *blake3::hash(&bytes).as_bytes()
+                    && claim.manifest_hash
+                        == *blake3::hash(&mb_core::canonical_bytes(manifest)?).as_bytes(),
+                "revision manifest differs from its guarded claim"
+            );
+        } else {
+            anyhow::ensure!(
+                control
+                    .get_record(RETIRE_KIND, plan.anchor_id.as_bytes())?
+                    .is_some(),
+                "guarded revision manifest has no durable claim"
+            );
+        }
+        Ok(Some(plan))
+    }
+
     /// Claim the empty root directory before a future guarded capture starts.
     /// Reopening a claimed directory is safe even after it gains file anchors.
     /// The sibling sealed marker keeps app metadata out of the captured tree.
@@ -1906,7 +1976,7 @@ mod tests {
         let plan = planned_without_privileged_probe(&root);
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([81; 32]));
         let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
-        plan.capture(&store).unwrap();
+        let stored_manifest = plan.capture(&store).unwrap();
         let retirement = RootRetirement {
             format_version: 1,
             anchor_id: plan.anchor_id,
@@ -1924,6 +1994,11 @@ mod tests {
         anchor
             .remove_child_file(capture_manifest_name(plan.anchor_id))
             .unwrap();
+        assert!(
+            GuardedRootCapturePlan::load_for_manifest(&store, &stored_manifest)
+                .unwrap()
+                .is_some()
+        );
         plan.discard_unreferenced(&store).unwrap();
         assert!(
             store
@@ -1938,6 +2013,32 @@ mod tests {
                 .join(plan.anchor_id.to_string())
                 .exists()
         );
+    }
+
+    #[test]
+    fn durable_source_plan_dispatches_guarded_root_capture() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([83; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let source = crate::SourceCapturePlan::GuardedLinkFreezeV1(plan.clone());
+        let decoded: crate::SourceCapturePlan =
+            mb_core::decode_canonical(&mb_core::canonical_bytes(&source).unwrap()).unwrap();
+        assert_eq!(decoded, source);
+        assert_eq!(decoded.source_root(), root);
+        let manifest = decoded.capture(&store).unwrap();
+        assert!(
+            GuardedRootCapturePlan::load_for_manifest(&store, &manifest)
+                .unwrap()
+                .is_some()
+        );
+        let mut wrong = manifest.clone();
+        wrong.root_mode ^= 0o100;
+        assert!(GuardedRootCapturePlan::load_for_manifest(&store, &wrong).is_err());
+        decoded.discard(&store).unwrap();
+        decoded.reconcile(&store).unwrap();
     }
 
     #[test]
