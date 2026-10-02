@@ -3921,6 +3921,7 @@ name = "mb-git"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "git2",
  "libc",
  "libgit2-sys",

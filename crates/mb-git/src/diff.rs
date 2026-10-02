@@ -5,8 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{File, Metadata};
-use std::io::Read;
-use std::os::fd::AsRawFd;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
@@ -19,7 +18,8 @@ use uuid::Uuid;
 
 use crate::GitWorktreeScope;
 use crate::stage::{
-    GitIndexEntry, StageError, anchors_for_oid, stage_path_key, staged_entries_for_scope,
+    GitIndexEntry, StageError, anchors_for_oid, indexed_anchor_manifest, stage_path_key,
+    staged_entries_for_scope,
 };
 use crate::status::{StatusError, committed_files_for_scope};
 
@@ -49,6 +49,8 @@ pub enum DiffError {
     SourceChanged,
     #[error("the committed or staged file has an unsupported Git mode")]
     UnsupportedMode,
+    #[error("the working file has different bytes under the staged Git object ID")]
+    OidCollision,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -99,6 +101,8 @@ fn read_worktree(
     root: &PinnedDirectory,
     path: &[u8],
     expected: &GitIndexEntry,
+    expected_hash: [u8; 32],
+    expected_len: u64,
 ) -> Result<Option<DiffFile>, DiffError> {
     let relative = PathBuf::from(OsString::from_vec(path.to_vec()));
     stage_path_key(&relative)?;
@@ -121,19 +125,19 @@ fn read_worktree(
     let leaf = leaf.ok_or(StageError::UnsafePath)?;
     match parent.read_child_symlink(leaf) {
         Ok(Some((bytes, _))) => {
+            if bytes.len() as u64 == expected_len
+                && blake3::hash(&bytes).as_bytes() == &expected_hash
+            {
+                return Ok(Some((Vec::new(), 0o120000, expected.oid)));
+            }
             let oid: [u8; 20] = Oid::hash_object(ObjectType::Blob, &bytes)?
                 .as_bytes()
                 .try_into()
                 .expect("SHA-1 OID");
-            return Ok(Some((
-                if oid == expected.oid {
-                    Vec::new()
-                } else {
-                    bytes
-                },
-                0o120000,
-                oid,
-            )));
+            if oid == expected.oid {
+                return Err(DiffError::OidCollision);
+            }
+            return Ok(Some((bytes, 0o120000, oid)));
         }
         Ok(None) => return Ok(None),
         Err(AnchorError::UnsupportedObject(_)) => {}
@@ -142,38 +146,54 @@ fn read_worktree(
     let Some(mut file) = parent.open_child_file(leaf)? else {
         return Ok(None);
     };
-    read_worktree_file(&mut file, expected).map(Some)
+    read_worktree_file(&mut file, expected, expected_hash, expected_len).map(Some)
 }
 
-fn read_worktree_file(file: &mut File, expected: &GitIndexEntry) -> Result<DiffFile, DiffError> {
+fn read_worktree_file(
+    file: &mut File,
+    expected: &GitIndexEntry,
+    expected_hash: [u8; 32],
+    expected_len: u64,
+) -> Result<DiffFile, DiffError> {
     let before = file.metadata()?;
     let mode = if before.mode() & 0o111 != 0 {
         0o100755
     } else {
         0o100644
     };
-    let descriptor = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-    let oid: [u8; 20] = Oid::hash_file(ObjectType::Blob, descriptor)?
-        .as_bytes()
-        .try_into()
-        .expect("SHA-1 OID");
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
     if fingerprint(&before) != fingerprint(&file.metadata()?) {
         return Err(DiffError::SourceChanged);
     }
-    if oid == expected.oid {
-        return Ok((Vec::new(), mode, oid));
+    if before.len() == expected_len && hasher.finalize().as_bytes() == &expected_hash {
+        return Ok((Vec::new(), mode, expected.oid));
     }
     if before.len() > MAX_DIFF_FILE_BYTES {
         return Err(DiffError::TooLarge);
     }
+    file.seek(SeekFrom::Start(0))?;
     let mut bytes = Vec::with_capacity(before.len() as usize);
     file.take(MAX_DIFF_FILE_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_DIFF_FILE_BYTES
         || bytes.len() as u64 != before.len()
         || fingerprint(&before) != fingerprint(&file.metadata()?)
-        || Oid::hash_object(ObjectType::Blob, &bytes)?.as_bytes() != oid
     {
         return Err(DiffError::SourceChanged);
+    }
+    let oid: [u8; 20] = Oid::hash_object(ObjectType::Blob, &bytes)?
+        .as_bytes()
+        .try_into()
+        .expect("SHA-1 OID");
+    if oid == expected.oid {
+        return Err(DiffError::OidCollision);
     }
     Ok((bytes, mode, oid))
 }
@@ -424,7 +444,14 @@ pub(crate) fn repository_diff_for_scope(
                 .transpose()?;
             append_patch(&mut output, &path, old, new)?;
         } else if let Some(index) = index {
-            let new = read_worktree(working_root.as_ref().expect("uncached root"), &path, index)?;
+            let anchor = indexed_anchor_manifest(control, repository_id, index)?;
+            let new = read_worktree(
+                working_root.as_ref().expect("uncached root"),
+                &path,
+                index,
+                anchor.content_hash,
+                anchor.logical_len,
+            )?;
             if new
                 .as_ref()
                 .is_some_and(|(_, mode, oid)| *oid == index.oid && *mode == index.mode)
@@ -462,7 +489,35 @@ mod tests {
 
     use git2::{ObjectType, Oid};
 
-    use super::append_patch;
+    use super::{DiffError, append_patch, read_worktree_file};
+    use crate::stage::GitIndexEntry;
+
+    #[test]
+    fn diff_rejects_a_git_id_with_conflicting_native_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("file");
+        fs::write(&path, b"bravo").unwrap();
+        let entry = GitIndexEntry {
+            format_version: 1,
+            oid: Oid::hash_object(ObjectType::Blob, b"bravo")
+                .unwrap()
+                .as_bytes()
+                .try_into()
+                .unwrap(),
+            mode: 0o100644,
+            anchor_id: uuid::Uuid::new_v4(),
+        };
+        let mut file = fs::File::open(&path).unwrap();
+        assert_eq!(
+            read_worktree_file(&mut file, &entry, *blake3::hash(b"bravo").as_bytes(), 5).unwrap(),
+            (Vec::new(), entry.mode, entry.oid)
+        );
+        let mut file = fs::File::open(&path).unwrap();
+        assert!(matches!(
+            read_worktree_file(&mut file, &entry, *blake3::hash(b"alpha").as_bytes(), 5),
+            Err(DiffError::OidCollision)
+        ));
+    }
 
     fn blob(bytes: &[u8], mode: u32) -> (Vec<u8>, u32, [u8; 20]) {
         (

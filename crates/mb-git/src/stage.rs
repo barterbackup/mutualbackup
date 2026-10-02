@@ -959,6 +959,25 @@ pub(crate) fn staged_entries_for_scope(
     Ok(entries)
 }
 
+/// Read the catalog root recorded for an index entry without rehashing its
+/// payload. Status and diff compare working bytes with this stronger root;
+/// operations that consume an anchor still verify the payload and Git ID.
+pub(crate) fn indexed_anchor_manifest(
+    control: &ControlStore,
+    repository_id: Uuid,
+    entry: &GitIndexEntry,
+) -> Result<FileAnchorManifest, StageError> {
+    let oid = Oid::from_bytes(&entry.oid).expect("SHA-1 OID has 20 bytes");
+    let encoded = control
+        .get_record(&object_kind(repository_id, oid), entry.anchor_id.as_bytes())?
+        .ok_or(StageError::IncompatibleRecord)?;
+    let manifest: FileAnchorManifest = decode_canonical(&encoded)?;
+    if manifest.format_version != 1 || manifest.anchor_id != entry.anchor_id {
+        return Err(StageError::IncompatibleRecord);
+    }
+    Ok(manifest)
+}
+
 pub fn has_pending_stages(control: &ControlStore, repository_id: Uuid) -> Result<bool, StageError> {
     has_pending_stages_for_scope(control, GitWorktreeScope::primary(repository_id))
 }

@@ -3,8 +3,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::fs;
-use std::os::fd::AsRawFd;
+use std::fs::{self, Metadata};
+use std::io::Read;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,8 @@ use crate::GitWorktreeScope;
 use crate::head::{HeadError, selected_branch_for_scope, selected_ref_for_scope};
 use crate::merge::{GitMergeState, MergeBlobError, merge_state};
 use crate::stage::{
-    GitIndexEntry, StageError, pending_stage_paths_for_scope, staged_entries_for_scope,
+    GitIndexEntry, StageError, indexed_anchor_manifest, pending_stage_paths_for_scope,
+    staged_entries_for_scope,
 };
 
 const METADATA_PREFIX: &str = "git-metadata-object-v1/";
@@ -50,6 +51,8 @@ pub enum StatusError {
     IncompatibleRecord,
     #[error("status exceeds the supported file count")]
     TooManyFiles,
+    #[error("the working file changed while status was read")]
+    SourceChanged,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -191,10 +194,25 @@ pub(crate) fn committed_files_for_scope(
     )
 }
 
+fn file_fingerprint(metadata: &Metadata) -> (u64, u64, u64, u32, i64, i64, i64, i64) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mode(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
 fn worktree_change(
     root: &PinnedDirectory,
     path: &[u8],
     staged: &GitIndexEntry,
+    expected_hash: [u8; 32],
+    expected_len: u64,
 ) -> Result<Option<GitChange>, StatusError> {
     let relative = PathBuf::from(OsString::from_vec(path.to_vec()));
     let parent_path = relative.parent().ok_or(StatusError::IncompatibleRecord)?;
@@ -229,10 +247,11 @@ fn worktree_change(
             Err(AnchorError::UnsupportedObject(_)) => return Ok(Some(GitChange::TypeChanged)),
             Err(error) => return Err(error.into()),
         };
-        let oid = Oid::hash_object(ObjectType::Blob, &target.0)?;
-        return Ok((oid.as_bytes() != staged.oid).then_some(GitChange::Modified));
+        return Ok((target.0.len() as u64 != expected_len
+            || blake3::hash(&target.0).as_bytes() != &expected_hash)
+            .then_some(GitChange::Modified));
     }
-    let file = match parent.open_child_file(name) {
+    let mut file = match parent.open_child_file(name) {
         Ok(Some(file)) => file,
         Ok(None) => return Ok(Some(GitChange::Deleted)),
         Err(AnchorError::UnsupportedObject(_)) => return Ok(Some(GitChange::TypeChanged)),
@@ -245,18 +264,28 @@ fn worktree_change(
     if !opened_metadata.is_file() {
         return Ok(Some(GitChange::TypeChanged));
     }
-    let descriptor = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-    let oid = Oid::hash_file(ObjectType::Blob, descriptor)?;
     let mode = if opened_metadata.mode() & 0o111 != 0 {
         0o100755
     } else {
         0o100644
     };
-    if oid.as_bytes() != staged.oid || mode != staged.mode {
-        Ok(Some(GitChange::Modified))
-    } else {
-        Ok(None)
+    if mode != staged.mode || opened_metadata.len() != expected_len {
+        return Ok(Some(GitChange::Modified));
     }
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let after = file.metadata()?;
+    if file_fingerprint(&opened_metadata) != file_fingerprint(&after) {
+        return Err(StatusError::SourceChanged);
+    }
+    Ok((hasher.finalize().as_bytes() != &expected_hash).then_some(GitChange::Modified))
 }
 
 fn walk_untracked(
@@ -334,7 +363,10 @@ pub(crate) fn repository_status_for_scope(
             _ => None,
         };
         let worktree = match staged_entry {
-            Some(index) => worktree_change(&root, &path, index)?,
+            Some(index) => {
+                let anchor = indexed_anchor_manifest(control, repository_id, index)?;
+                worktree_change(&root, &path, index, anchor.content_hash, anchor.logical_len)?
+            }
             None => None,
         };
         if index_change.is_some() || worktree.is_some() {
@@ -388,7 +420,7 @@ mod tests {
             anchor_id: Uuid::new_v4(),
         };
         assert_eq!(
-            worktree_change(&pinned, b"dir/file", &staged).unwrap(),
+            worktree_change(&pinned, b"dir/file", &staged, [0; 32], 0).unwrap(),
             Some(GitChange::TypeChanged)
         );
         assert_eq!(
@@ -408,7 +440,7 @@ mod tests {
             anchor_id: Uuid::new_v4(),
         };
         assert_eq!(
-            worktree_change(&pinned, b"dir/file", &staged).unwrap(),
+            worktree_change(&pinned, b"dir/file", &staged, [0; 32], 0).unwrap(),
             Some(GitChange::Deleted)
         );
     }
@@ -431,8 +463,94 @@ mod tests {
             anchor_id: Uuid::new_v4(),
         };
         assert_eq!(
-            worktree_change(&pinned, b"file", &staged).unwrap(),
+            worktree_change(&pinned, b"file", &staged, [0; 32], 0).unwrap(),
             Some(GitChange::TypeChanged)
         );
+    }
+
+    #[test]
+    fn matching_git_id_does_not_hide_different_worktree_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("file"), b"bravo").unwrap();
+        let pinned = PinnedDirectory::open(root.path()).unwrap();
+        let staged = GitIndexEntry {
+            format_version: 1,
+            oid: Oid::hash_object(ObjectType::Blob, b"bravo")
+                .unwrap()
+                .as_bytes()
+                .try_into()
+                .unwrap(),
+            mode: 0o100644,
+            anchor_id: Uuid::new_v4(),
+        };
+        assert_eq!(
+            worktree_change(
+                &pinned,
+                b"file",
+                &staged,
+                *blake3::hash(b"alpha").as_bytes(),
+                5,
+            )
+            .unwrap(),
+            Some(GitChange::Modified)
+        );
+    }
+
+    #[test]
+    fn status_compares_with_the_mapped_native_root_and_requires_its_record() {
+        let worktree = tempfile::tempdir().unwrap();
+        let anchor_root = tempfile::tempdir().unwrap();
+        let database = tempfile::tempdir().unwrap();
+        let control =
+            ControlStore::open_with_key(database.path().join("control.db"), &[37; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        fs::write(worktree.path().join("file"), b"alpha").unwrap();
+        let anchor = mb_store::SourceBlobImportPlan::plan_direct(anchor_root.path(), 5)
+            .unwrap()
+            .capture(std::io::Cursor::new(b"alpha"))
+            .unwrap();
+        let oid = Oid::hash_object(ObjectType::Blob, b"alpha").unwrap();
+        let entry = GitIndexEntry {
+            format_version: 1,
+            oid: oid.as_bytes().try_into().unwrap(),
+            mode: 0o100644,
+            anchor_id: anchor.anchor_id,
+        };
+        control
+            .put_record(
+                &crate::stage::object_kind(repository_id, oid),
+                anchor.anchor_id.as_bytes(),
+                &mb_core::canonical_bytes(&anchor).unwrap(),
+            )
+            .unwrap();
+        control
+            .put_record(
+                &crate::stage::index_kind(repository_id),
+                b"file",
+                &mb_core::canonical_bytes(&entry).unwrap(),
+            )
+            .unwrap();
+        let clean = repository_status(&control, repository_id, worktree.path()).unwrap();
+        assert_eq!(clean.changes.len(), 1);
+        assert_eq!(clean.changes[0].staged, Some(GitChange::Added));
+        assert_eq!(clean.changes[0].worktree, None);
+        fs::write(worktree.path().join("file"), b"bravo").unwrap();
+        assert_eq!(
+            repository_status(&control, repository_id, worktree.path())
+                .unwrap()
+                .changes[0]
+                .worktree,
+            Some(GitChange::Modified)
+        );
+        control
+            .delete_record(
+                &crate::stage::object_kind(repository_id, oid),
+                anchor.anchor_id.as_bytes(),
+            )
+            .unwrap();
+        assert!(matches!(
+            repository_status(&control, repository_id, worktree.path()),
+            Err(StatusError::Stage(StageError::IncompatibleRecord))
+        ));
     }
 }
