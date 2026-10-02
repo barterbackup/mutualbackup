@@ -44,6 +44,7 @@ enum GuardedRootEntry {
     },
     File {
         path: String,
+        capture_id: Uuid,
         version: CaptureVersion,
         mode: u32,
         modified_secs: i64,
@@ -239,6 +240,7 @@ fn scan_directory(
         } else {
             entries.push(GuardedRootEntry::File {
                 path,
+                capture_id: Uuid::new_v4(),
                 version,
                 mode: unix_mode(&metadata),
                 modified_secs,
@@ -279,10 +281,27 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["nested", "nested/a", "z"]
         );
-        let GuardedRootEntry::File { version, .. } = &entries[2] else {
+        let GuardedRootEntry::File {
+            capture_id,
+            version,
+            ..
+        } = &entries[2]
+        else {
             panic!("expected regular file");
         };
+        assert!(!capture_id.is_nil());
         assert_eq!(version.logical_len, b"raw\r\nbytes\0".len() as u64);
+        let ids = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                GuardedRootEntry::File { capture_id, .. } => Some(*capture_id),
+                GuardedRootEntry::Directory { .. } => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids.len(), 2);
+        let encoded = mb_core::canonical_bytes(&entries).unwrap();
+        let decoded: Vec<GuardedRootEntry> = mb_core::decode_canonical(&encoded).unwrap();
+        assert_eq!(decoded, entries);
     }
 
     #[test]

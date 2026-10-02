@@ -80,6 +80,8 @@ pub enum AnchorError {
     InvalidRoot,
     #[error("the source root needs a writable parent on the same filesystem")]
     NoExternalAnchorLocation,
+    #[error("unsupported stable anchor manifest format {0}")]
+    UnsupportedAnchorFormat(u16),
     #[error("the protected root crosses into another filesystem mount at {0}")]
     NestedFilesystem(PathBuf),
     #[error("the protected root filesystem changed while it was being probed")]
@@ -1497,6 +1499,9 @@ impl StableAnchorManifest {
         &self,
         relative_path: String,
     ) -> Result<StableAnchorFileLocator, AnchorError> {
+        if self.format_version != 2 {
+            return Err(AnchorError::UnsupportedAnchorFormat(self.format_version));
+        }
         validate_relative(Path::new(&relative_path))?;
         Ok(StableAnchorFileLocator {
             area: self.area.clone(),
@@ -1506,6 +1511,9 @@ impl StableAnchorManifest {
     }
 
     pub fn remove(&self) -> Result<(), AnchorError> {
+        if self.format_version != 2 {
+            return Err(AnchorError::UnsupportedAnchorFormat(self.format_version));
+        }
         let area = resolve_anchor_area(&self.area)?;
         let area_file = open_stable_anchor_area(&area, &self.area)?;
         remove_directory_at(
@@ -4606,6 +4614,46 @@ mod tests {
         );
         let opened = open_stable_anchor_area(&area.path_hint, &area).unwrap();
         assert!(opened.metadata().unwrap().is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unknown_stable_manifest_cannot_unlink_an_anchor_or_supply_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("protected");
+        fs::create_dir(&root).unwrap();
+        let area = StableAnchorAreaLocator::prepare_for_root(&root).unwrap();
+        let anchor_id = Uuid::new_v4();
+        let area_directory = PinnedDirectory::open(&area.path_hint).unwrap();
+        area_directory
+            .create_child_directory(anchor_id.to_string())
+            .unwrap();
+        let mut manifest = StableAnchorManifest {
+            format_version: 3,
+            anchor_id,
+            source_root_hint: root,
+            area,
+            root_mode: 0o040700,
+            root_modified_secs: 0,
+            root_modified_nanos: 0,
+            entries: Vec::new(),
+        };
+        assert!(matches!(
+            manifest.remove(),
+            Err(AnchorError::UnsupportedAnchorFormat(3))
+        ));
+        assert!(matches!(
+            manifest.file_locator("file".to_owned()),
+            Err(AnchorError::UnsupportedAnchorFormat(3))
+        ));
+        assert!(
+            area_directory
+                .open_child_directory(anchor_id.to_string())
+                .unwrap()
+                .is_some()
+        );
+        manifest.format_version = 2;
+        manifest.remove().unwrap();
     }
 
     #[cfg(target_os = "linux")]
