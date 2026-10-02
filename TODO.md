@@ -81,10 +81,16 @@
   used alone as a write detector. Use the versioned FUSE worktree view specified
   in the plan: pass through reads of frozen inodes, complete durable detach
   before writable opens, shared mappings, truncate, allocation, or `chmod`,
-  and fail closed on mount/daemon loss. The existing 10 link-freeze and 2 guarded-root
-  privileged tests pass locally on Linux 7.2.5; they cover short-lived freeze
-  and replay, not this long-lived view. Keep guarded enrollment and Git staging
-  and checkout gated until the complete privileged probe passes. See
+  and fail closed on mount/daemon loss. The existing 10 link-freeze and 2
+  guarded-root privileged tests pass locally on Linux 7.2.5; they cover
+  short-lived freeze and replay, not this long-lived view. `b53be0b` adds a
+  disposable FUSE passthrough probe, passing locally on ext4 and a fresh Btrfs
+  loop image: it reads exact bytes through a shared read-only mapping, rejects
+  a writable open in the FUSE handler, and keeps the lower inode unchanged
+  after read-only `O_TRUNC` and owner `chmod` attempts. It does not yet detach
+  on writes, supervise the mount, or recover after restart. Keep guarded
+  enrollment and Git staging and checkout gated until the complete privileged
+  probe passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
   and [fanotify(7)](https://man7.org/linux/man-pages/man7/fanotify.7.html).
 
