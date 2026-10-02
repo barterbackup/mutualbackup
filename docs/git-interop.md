@@ -35,7 +35,9 @@ nix build --no-substitute .#git-command
 For a Cargo build, a symlink named `git` to the locally built `mutualgit`
 binary works the same way. Put that symlink on `PATH` only in shells where you
 want the documented MutualBackup command subset; unsupported Git commands fail
-explicitly. Use stock Git separately for the bridge examples below.
+explicitly. Keep stock Git later on `PATH`: packed-object import and export use
+its raw `cat-file` stream, and the daemon skips the `mutualgit` alias when
+selecting it. Use stock Git separately for the bridge examples below.
 
 The local binary supports branches, linked worktrees, exact-byte checkout,
 merge, staged reset, hard reset, worktree restore, diff, log, explicit commit pins,

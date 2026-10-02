@@ -101,7 +101,7 @@ fn matches_packed_with_stock_git(
     size: u64,
     mut expected: impl Read,
 ) -> Result<bool, GitInteropError> {
-    let mut child = Command::new("git")
+    let mut child = Command::new(crate::stock_git::executable()?)
         .arg("--git-dir")
         .arg(repository.path())
         .arg("cat-file")

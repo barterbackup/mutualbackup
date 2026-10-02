@@ -608,7 +608,7 @@ fn capture_raw_blob(
     len: u64,
     plan: &SourceBlobImportPlan,
 ) -> Result<FileAnchorManifest, FetchError> {
-    let mut child = Command::new("git")
+    let mut child = Command::new(crate::stock_git::executable()?)
         .arg("--git-dir")
         .arg(repository_path)
         .arg("cat-file")

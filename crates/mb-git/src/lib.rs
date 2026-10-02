@@ -40,6 +40,8 @@ mod stage;
 #[cfg(target_os = "linux")]
 mod status;
 #[cfg(target_os = "linux")]
+mod stock_git;
+#[cfg(target_os = "linux")]
 mod worktree;
 mod worktree_scope;
 #[cfg(target_os = "linux")]
