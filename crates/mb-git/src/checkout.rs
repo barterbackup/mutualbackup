@@ -2444,6 +2444,17 @@ fn apply_intent(
     if intent.repository_id != scope.repository_id() {
         return Err(CheckoutError::IncompatibleIntent);
     }
+    // Historical restore/reset intents did not bind an unanchored old file to
+    // its native bytes. Reject the whole replay before staging or moving any
+    // entry, rather than reaching an unverifiable file after earlier changes.
+    if intent.entries.iter().any(|entry| {
+        entry
+            .old
+            .as_ref()
+            .is_some_and(|old| old.anchor_id.is_nil() && old.native_root.is_none())
+    }) {
+        return Err(CheckoutError::UnverifiableLegacyIntent);
+    }
     let existing_staging = catalog.open_child_directory(&intent.staging_name)?;
     if intent.phase == Phase::Preparing && !source_backend.supports_git_checkout_file() {
         for (index, entry) in intent.entries.iter().enumerate() {
@@ -3141,6 +3152,94 @@ mod tests {
             b"bravo"
         );
         assert!(std::fs::read_dir(staging_path).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn legacy_restore_replay_stops_before_moving_an_earlier_entry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let worktree_path = temporary.path().join("worktree");
+        let catalog_path = worktree_path.join(".mutualbackup");
+        std::fs::create_dir_all(&catalog_path).unwrap();
+        std::fs::write(worktree_path.join("first"), b"first").unwrap();
+        std::fs::write(worktree_path.join("second"), b"second").unwrap();
+        let control =
+            ControlStore::open_with_key(catalog_path.join("catalog.db"), &[69; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        let root = PinnedDirectory::open(&worktree_path).unwrap();
+        let catalog = PinnedDirectory::open(&catalog_path).unwrap();
+        let first_id = entry_identity_for(&root, OsStr::new("first"), 0o100644)
+            .unwrap()
+            .unwrap();
+        let second_id = entry_identity_for(&root, OsStr::new("second"), 0o100644)
+            .unwrap()
+            .unwrap();
+        let mut intent = CheckoutIntent {
+            format_version: 8,
+            advance_ref: false,
+            target_ref: None,
+            repository_id,
+            old_branch: "main".to_owned(),
+            old_oid: [0; 20],
+            new_branch: "main".to_owned(),
+            new_oid: [0; 20],
+            staging_name: format!("checkout-{}", Uuid::new_v4()),
+            staging_id: None,
+            phase: Phase::Preparing,
+            entries: vec![
+                CheckoutEntry {
+                    path: b"first".to_vec(),
+                    old: Some(CheckoutFile {
+                        oid: [1; 20],
+                        mode: 0o100644,
+                        anchor_id: Uuid::new_v4(),
+                        native_root: None,
+                    }),
+                    old_id: Some(first_id),
+                    new: None,
+                    new_id: None,
+                },
+                CheckoutEntry {
+                    path: b"second".to_vec(),
+                    old: Some(CheckoutFile {
+                        oid: [2; 20],
+                        mode: 0o100644,
+                        anchor_id: Uuid::nil(),
+                        native_root: None,
+                    }),
+                    old_id: Some(second_id),
+                    new: None,
+                    new_id: None,
+                },
+            ],
+            directories: Vec::new(),
+            removed_directories: Vec::new(),
+        };
+        validate_intent(&intent, repository_id).unwrap();
+        assert!(matches!(
+            apply_intent(
+                &control,
+                GitWorktreeScope::primary(repository_id),
+                &mut intent,
+                &root,
+                &catalog,
+                SourceBackendKind::ReflinkV1,
+            ),
+            Err(CheckoutError::UnverifiableLegacyIntent)
+        ));
+        assert_eq!(
+            std::fs::read(worktree_path.join("first")).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            std::fs::read(worktree_path.join("second")).unwrap(),
+            b"second"
+        );
+        assert!(
+            catalog
+                .entry_identity(&intent.staging_name, true)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(target_os = "linux")]
