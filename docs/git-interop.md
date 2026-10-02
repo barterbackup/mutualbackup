@@ -92,6 +92,8 @@ refspec is given; explicit branch and tag refspecs use the shared history.
 existing local tag may be fetched again at the same object ID, but a remote
 rewrite or tag namespace conflict rejects the entire fetch without moving any
 refs.
+Repository-wide `fetch`, `pin`, `unpin`, `pins`, and history `prune`/`gc` also
+work when invoked from a linked worktree; they use the shared repository catalog.
 `mutualgit --help` gives the current command forms. Staging, checkout, merge,
 and import keep raw file bytes; Git line-ending rules, content filters,
 `ident`, and working-tree encodings are inert in this binary. A

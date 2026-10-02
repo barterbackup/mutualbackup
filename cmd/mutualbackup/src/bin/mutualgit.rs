@@ -712,7 +712,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Pin { oid } | Command::Unpin { oid } => {
-            let (_, repository_id) = discover_repository(&working_directory)?;
+            let repository_id = discover_shared_repository(&working_directory)?;
             let oid: [u8; 20] = git2::Oid::from_str(&oid)?.as_bytes().try_into()?;
             let pinned = pin_action;
             let request = if pinned {
@@ -739,7 +739,7 @@ async fn main() -> Result<()> {
             );
         }
         Command::Pins => {
-            let (_, repository_id) = discover_repository(&working_directory)?;
+            let repository_id = discover_shared_repository(&working_directory)?;
             let LocalResponse::GitCommitPins {
                 repository_id: listed_repository,
                 oids,
@@ -755,7 +755,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Prune => {
-            let (_, repository_id) = discover_repository(&working_directory)?;
+            let repository_id = discover_shared_repository(&working_directory)?;
             let LocalResponse::GitPruned(report) =
                 local_control_call(&socket, &LocalRequest::GitPrune { repository_id }).await?
             else {
@@ -861,7 +861,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Fetch { source } => {
-            let (_, repository_id) = discover_repository(&working_directory)?;
+            let repository_id = discover_shared_repository(&working_directory)?;
             let source = working_directory.join(source);
             let LocalResponse::GitFetched {
                 repository_id: returned_id,
@@ -1118,6 +1118,10 @@ fn discover_repository(start: &Path) -> Result<(PathBuf, Uuid)> {
     Ok((root, repository_id))
 }
 
+fn discover_shared_repository(start: &Path) -> Result<Uuid> {
+    Ok(discover_location(start)?.1)
+}
+
 fn discover_location(start: &Path) -> Result<(PathBuf, Uuid, Option<Uuid>)> {
     for directory in start.ancestors() {
         if let Some(scope) = linked_worktree_marker(directory)? {
@@ -1343,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn linked_marker_discovers_status_scope_without_routing_other_commands_to_primary() {
+    fn linked_marker_discovers_shared_repository_without_routing_primary_only_commands() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
@@ -1364,6 +1368,7 @@ mod tests {
             discover_location(&nested).unwrap(),
             (root, repository_id, Some(worktree_id))
         );
+        assert_eq!(discover_shared_repository(&nested).unwrap(), repository_id);
         assert!(discover_repository(&nested).is_err());
     }
 }
