@@ -19,6 +19,11 @@ use walkdir::WalkDir;
 mod guarded_file;
 #[cfg(target_os = "linux")]
 pub use guarded_file::GuardedFileCapturePlan;
+#[cfg(target_os = "linux")]
+#[path = "guarded_root.rs"]
+mod guarded_root;
+#[cfg(target_os = "linux")]
+pub use guarded_root::GuardedRootCapturePlan;
 
 #[cfg(target_os = "linux")]
 use crate::link_freeze::{
@@ -85,6 +90,8 @@ pub enum AnchorError {
     Symlink(PathBuf),
     #[error("unsupported filesystem object in protected tree: {0}")]
     UnsupportedObject(PathBuf),
+    #[error("guarded capture cannot freeze a file with hard-link aliases: {0}")]
+    UnsafeHardLink(PathBuf),
     #[error("unsafe relative path")]
     UnsafePath,
     #[error("unsupported Git worktree file mode")]
