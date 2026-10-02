@@ -2,6 +2,19 @@
 
 ## Milestone 6 active implementation gates
 
+- [ ] **M6 prune duplicate native anchors by physical reachability.** Git
+  prune currently treats a live blob OID as pinning every mapped anchor for
+  that OID (`crates/mb-git/src/prune.rs`). Repeated staging of identical file
+  bytes creates distinct reflink anchors; after those index entries are
+  replaced, the duplicate mappings remain indefinitely as long as one commit
+  names the blob. Collect surplus anchors individually, while retaining exact
+  anchors used by any staged index, unfinished operation, or live local-sector
+  recipe and at least one verified same-filesystem source needed for checkout
+  and export. Extend the prune roots passed from the node with the physical
+  anchor pins derived from retained revisions; an OID-only root cannot prove
+  that a recipe's chosen anchor may be removed. Add a provisioned Btrfs case
+  that stages identical bytes repeatedly, advances the index, prunes, then
+  verifies both backup sector serving and byte-exact checkout after reopen.
 - [ ] **M6 restore/reset recovery acceptance.** Checkout intent formats 9/10
   now carry BLAKE3 roots and lengths for previously unanchored working files;
   linked worktrees use wrapper version 2. Replay verifies those bytes in the

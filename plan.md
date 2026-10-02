@@ -3134,7 +3134,12 @@ backend gates. A command being present does not by itself close its slice.
   it must release unreachable native anchors, retire their backed-up sectors
   through the existing remote cleanup path, and make the removed history
   unavailable to normal recovery. It must never collect an object still needed
-  for a retained revision or live worktree. Include
+  for a retained revision or live worktree. Reachability is physical as well
+  as logical: a live blob ID does not pin every duplicate native anchor.
+  Retain anchors named by staged entries and live sector recipes, plus a
+  verified source on each filesystem needed for reflink checkout or export;
+  reclaim surplus same-content anchors after those pins are accounted for.
+  Include
   `pin`, `unpin`, and pin listing in the local command set, and document that
   the current frontend has no implicit reflog retention. Report
   reclaimable logical bytes separately from physically freed shared extents.
