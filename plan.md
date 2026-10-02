@@ -894,9 +894,11 @@ subsequent validation locally; do not use a remote compilation server.
   command syntax but sends stateful operations through the same versioned local
   control boundary; `mutualbackupd` remains the sole live catalog writer.
   Keep command parsing, Git object semantics, durable source capture, and
-  asynchronous backup jobs distinct. Unsupported Git commands or byte-changing
-  attributes fail explicitly rather than delegating to a stock Git process
-  that would create an untracked second object store.
+  asynchronous backup jobs distinct. Unsupported Git commands and options that
+  request content conversion fail explicitly. Existing byte-changing attributes
+  and configuration remain inert for payload bytes, so raw-byte commands still
+  work; never delegate them to a stock Git process that would create an
+  untracked second object store or transform file content.
 - Keep one resolved daemon-options model for human TOML and command-line flags;
   the config file is optional, flags override it, and neither form contains
   generated identity state. Paths written in TOML are relative to that file;
