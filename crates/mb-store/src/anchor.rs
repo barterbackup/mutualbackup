@@ -2511,6 +2511,7 @@ pub fn probe_guarded_link_freeze(root: impl AsRef<Path>) -> Result<(), AnchorErr
         if copy.logical_len != LENGTH || copy.data_extents != source_extents {
             return Err(io::Error::other("private anchor changed sparse layout").into());
         }
+        seal_anchor_file_handle(&private)?;
         fs::rename(&staging_path, &anchor_path)?;
         File::open(&probe_dir)?.sync_all()?;
         if !guard.is_held()? {

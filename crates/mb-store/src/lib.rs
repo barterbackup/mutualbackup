@@ -28,8 +28,8 @@ pub use database::{
 };
 #[cfg(target_os = "linux")]
 pub use link_freeze::{
-    AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion, IndependentSparseCopy,
-    LinkFreezeEditIntent, LinkFreezeEditPhase,
+    AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion, FrozenAnchorProof,
+    IndependentSparseCopy, LinkFreezeEditIntent, LinkFreezeEditPhase,
 };
 pub use source::{
     SourceBackendBinding, SourceBackendKind, SourceBlobImportPlan, SourceCapturePlan,
