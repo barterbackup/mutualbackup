@@ -193,29 +193,73 @@ impl LinkFreezeCaptureIntent {
     }
 
     /// Start editing only from the exact committed frozen capture record.
-    /// Replay that record first so a missing, changed, or already detached
-    /// anchor cannot supply an edit proof.
+    /// Verify its pinned anchor before using the durable proof for the edit.
     pub fn begin_edit(
         self,
         control: &ControlStore,
         source_parent: &PinnedDirectory,
         anchor_parent: &PinnedDirectory,
     ) -> anyhow::Result<LinkFreezeEditIntent> {
-        anyhow::ensure!(self.phase == LinkFreezeCapturePhase::Frozen);
-        anyhow::ensure!(LinkFreezeEditIntent::load(control, self.anchor_id)?.is_none());
-        let frozen = self
-            .resume(control, source_parent, anchor_parent)?
-            .ok_or_else(|| anyhow::anyhow!("frozen capture disappeared before edit"))?;
-        anyhow::ensure!(frozen.phase == LinkFreezeCapturePhase::Frozen);
+        let source_name = self.source_name.clone();
+        self.begin_edit_at(control, source_parent, source_name, anchor_parent)
+    }
+
+    /// A frozen source may have been renamed before its first edit. Bind the
+    /// edit replay to its current pinned name before recording the edit intent.
+    /// The anchor's inode and bytes, rather than the old pathname, supply the
+    /// immutable capture proof.
+    pub fn begin_edit_at(
+        self,
+        control: &ControlStore,
+        source_parent: &PinnedDirectory,
+        source_name: impl AsRef<Path>,
+        anchor_parent: &PinnedDirectory,
+    ) -> anyhow::Result<LinkFreezeEditIntent> {
+        let source_name = source_name.as_ref();
+        let rebound =
+            self.rebind_frozen_source(control, source_parent, source_name, anchor_parent)?;
         LinkFreezeEditIntent::begin(
             control,
-            frozen.anchor_id,
+            rebound.anchor_id,
             source_parent,
-            &frozen.source_name,
+            source_name,
             anchor_parent,
-            &frozen.anchor_name,
-            frozen.proof,
+            &rebound.anchor_name,
+            rebound.proof,
         )
+    }
+
+    /// Move the journal's source-name hint after a verified rename. The old
+    /// pathname may now be absent or hold an unrelated replacement; the
+    /// current pinned name must still be the sole link besides the anchor.
+    pub fn rebind_frozen_source(
+        mut self,
+        control: &ControlStore,
+        source_parent: &PinnedDirectory,
+        source_name: impl AsRef<Path>,
+        anchor_parent: &PinnedDirectory,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(self.phase == LinkFreezeCapturePhase::Frozen);
+        anyhow::ensure!(LinkFreezeEditIntent::load(control, self.anchor_id)?.is_none());
+        let source_name = source_name.as_ref();
+        anyhow::ensure!(
+            source_parent.entry_identity(source_name, false)? == Some(self.source_id),
+            "current source name does not match the frozen capture"
+        );
+        self.verify_frozen_anchor(control, anchor_parent, Some((source_parent, source_name)))?;
+        let source_parent_id = source_parent.identity()?;
+        if self.source_parent_id != source_parent_id || self.source_name != source_name {
+            let before = mb_core::canonical_bytes(&self)?;
+            self.source_parent_id = source_parent_id;
+            self.source_name = source_name.to_path_buf();
+            control.replace_record_if_value(
+                CAPTURE_INTENT_KIND,
+                self.anchor_id.as_bytes(),
+                &before,
+                &mb_core::canonical_bytes(&self)?,
+            )?;
+        }
+        Ok(self)
     }
 
     /// Reconcile a prepared freeze or verify a completed one. Changed source
@@ -247,6 +291,17 @@ impl LinkFreezeCaptureIntent {
             if edit.phase() == LinkFreezeEditPhase::Editable {
                 return self.finish_detached_edit(control, anchor_parent).map(Some);
             }
+        }
+        if self.phase == LinkFreezeCapturePhase::Frozen && edit.is_none() {
+            let original_link = if source_parent.identity()? == self.source_parent_id
+                && source_parent.entry_identity(&self.source_name, false)? == Some(self.source_id)
+            {
+                Some((source_parent, self.source_name.as_path()))
+            } else {
+                None
+            };
+            self.verify_frozen_anchor(control, anchor_parent, original_link)?;
+            return Ok(Some(self));
         }
         anyhow::ensure!(
             source_parent.identity()? == self.source_parent_id
@@ -285,17 +340,6 @@ impl LinkFreezeCaptureIntent {
             && hash_exact(&guard.file, source_metadata.len())? == self.proof.content.content_hash
             && file_data_extents(&guard.file, source_metadata.len())?
                 == self.proof.content.data_extents;
-        if self.phase == LinkFreezeCapturePhase::Frozen {
-            anyhow::ensure!(
-                anchor_entry == Some(self.source_id)
-                    && content_matches
-                    && FileAccessSnapshot::capture(&guard.file)?.mode & 0o222 == 0
-                    && guard.is_held()?,
-                "committed frozen anchor no longer matches its durable proof"
-            );
-            guard.release()?;
-            return Ok(Some(self));
-        }
         if !content_matches {
             if anchor_entry == Some(self.source_id) {
                 anchor_parent.remove_child_file_if_identity(&self.anchor_name, self.source_id)?;
@@ -354,6 +398,47 @@ impl LinkFreezeCaptureIntent {
         )?;
         guard.release()?;
         Ok(Some(self))
+    }
+
+    fn verify_frozen_anchor(
+        &self,
+        control: &ControlStore,
+        anchor_parent: &PinnedDirectory,
+        known_source_link: Option<(&PinnedDirectory, &Path)>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.phase == LinkFreezeCapturePhase::Frozen);
+        anyhow::ensure!(
+            control.get_record(CAPTURE_INTENT_KIND, self.anchor_id.as_bytes())?
+                == Some(mb_core::canonical_bytes(self)?)
+                && anchor_parent.identity()? == self.anchor_parent_id,
+            "frozen capture record or anchor directory changed"
+        );
+        anyhow::ensure!(
+            anchor_parent.entry_identity(&self.anchor_name, false)? == Some(self.source_id),
+            "frozen anchor inode changed"
+        );
+        let anchor = anchor_parent
+            .open_child_file(&self.anchor_name)?
+            .ok_or_else(|| anyhow::anyhow!("frozen anchor name disappeared"))?;
+        let guard = FileWriteExclusion::acquire(anchor)?;
+        let metadata = guard.file.metadata()?;
+        let source_link_matches = match known_source_link {
+            Some((parent, name)) => parent.entry_identity(name, false)? == Some(self.source_id),
+            None => true,
+        };
+        anyhow::ensure!(
+            metadata.is_file()
+                && metadata.ino() == self.source_id.inode
+                && metadata.nlink() == if known_source_link.is_some() { 2 } else { 1 }
+                && source_link_matches
+                && FileAccessSnapshot::capture(&guard.file)?.mode & 0o222 == 0
+                && self.content_matches(&guard.file)?
+                && guard.is_held()?
+                && anchor_parent.entry_identity(&self.anchor_name, false)? == Some(self.source_id),
+            "committed frozen anchor no longer matches its durable proof"
+        );
+        guard.release()?;
+        Ok(())
     }
 
     /// Finish an edit that reached durable `Editable` even if the former
@@ -809,6 +894,116 @@ mod tests {
             }
             detached.verify_detached_anchor(&store, &parent).unwrap();
         }
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN for fanotify permission events"]
+    fn frozen_capture_survives_source_rename_replacement_and_unlink() {
+        let root = test_directory();
+        let original = root.path().join("source");
+        let moved_dir = root.path().join("moved");
+        let moved = moved_dir.join("renamed");
+        fs::create_dir(&moved_dir).unwrap();
+        fs::write(&original, b"immutable original").unwrap();
+        let parent = PinnedDirectory::open(root.path()).unwrap();
+        let moved_parent = PinnedDirectory::open(&moved_dir).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([95; 32]));
+        let database_path = root.path().join("control.db");
+        let store = crate::database::ControlStore::open(&database_path, &keys).unwrap();
+        let anchor_id = uuid::Uuid::new_v4();
+        let frozen =
+            LinkFreezeCaptureIntent::begin(&store, anchor_id, &parent, "source", &parent, "anchor")
+                .unwrap()
+                .resume(&store, &parent, &parent)
+                .unwrap()
+                .unwrap();
+        let unknown = root.path().join("unknown-alias");
+        fs::hard_link(&original, &unknown).unwrap();
+        assert!(frozen.clone().resume(&store, &parent, &parent).is_err());
+        fs::remove_file(&unknown).unwrap();
+        fs::rename(&original, &moved).unwrap();
+        fs::write(&original, b"replacement").unwrap();
+        drop(store);
+
+        let store = crate::database::ControlStore::open(&database_path, &keys).unwrap();
+        let recovered = LinkFreezeCaptureIntent::load(&store, anchor_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered, frozen);
+        // A second, unaccounted link must not be accepted as a rename merely
+        // because the old pathname disappeared. The new pinned name supplies
+        // the missing link-group evidence before edit replay is rebound.
+        assert!(recovered.clone().resume(&store, &parent, &parent).is_err());
+        assert_eq!(
+            fs::read(root.path().join("anchor")).unwrap(),
+            b"immutable original"
+        );
+        assert!(
+            recovered
+                .clone()
+                .begin_edit(&store, &parent, &parent)
+                .is_err()
+        );
+        let rebound = recovered
+            .rebind_frozen_source(&store, &moved_parent, "renamed", &parent)
+            .unwrap();
+        assert_eq!(
+            rebound
+                .clone()
+                .resume(&store, &moved_parent, &parent)
+                .unwrap(),
+            Some(rebound.clone())
+        );
+        let _edit = rebound
+            .begin_edit_at(&store, &moved_parent, "renamed", &parent)
+            .unwrap();
+        drop(store);
+
+        let store = crate::database::ControlStore::open(&database_path, &keys).unwrap();
+        let rebound = LinkFreezeCaptureIntent::load(&store, anchor_id)
+            .unwrap()
+            .unwrap();
+        let detached = rebound
+            .resume(&store, &moved_parent, &parent)
+            .unwrap()
+            .unwrap();
+        assert_eq!(detached.phase(), LinkFreezeCapturePhase::Detached);
+        fs::write(&moved, b"changed later").unwrap();
+        assert_eq!(
+            fs::read(root.path().join("anchor")).unwrap(),
+            b"immutable original"
+        );
+        assert_eq!(fs::read(&original).unwrap(), b"replacement");
+        fs::remove_file(&moved).unwrap();
+        detached.verify_detached_anchor(&store, &parent).unwrap();
+
+        let second_id = uuid::Uuid::new_v4();
+        fs::write(&original, b"another original").unwrap();
+        let second = LinkFreezeCaptureIntent::begin(
+            &store,
+            second_id,
+            &parent,
+            "source",
+            &parent,
+            "second-anchor",
+        )
+        .unwrap()
+        .resume(&store, &parent, &parent)
+        .unwrap()
+        .unwrap();
+        fs::remove_file(&original).unwrap();
+        assert_eq!(
+            second
+                .resume(&store, &parent, &parent)
+                .unwrap()
+                .unwrap()
+                .phase(),
+            LinkFreezeCapturePhase::Frozen
+        );
+        assert_eq!(
+            fs::read(root.path().join("second-anchor")).unwrap(),
+            b"another original"
+        );
     }
 
     fn test_directory() -> tempfile::TempDir {
