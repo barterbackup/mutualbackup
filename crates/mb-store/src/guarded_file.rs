@@ -24,6 +24,10 @@ const RETIRE_KIND: &str = "guarded-file-retire-v1";
 const MARKER_PREFIX: &str = ".mutualbackup-guarded-file-v1-";
 const PAYLOAD_NAME: &str = "blob";
 
+pub(super) fn guarded_file_marker_name(anchor_id: Uuid) -> String {
+    format!("{MARKER_PREFIX}{anchor_id}")
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct DirectoryClaim {
     format_version: u16,
@@ -271,7 +275,7 @@ impl GuardedFileCapturePlan {
     }
 
     fn marker_name(&self) -> String {
-        format!("{MARKER_PREFIX}{}", self.anchor_id)
+        guarded_file_marker_name(self.anchor_id)
     }
 
     fn marker_bytes(&self, plan_hash: [u8; 32]) -> Vec<u8> {

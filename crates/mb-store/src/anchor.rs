@@ -3540,6 +3540,24 @@ fn remove_directory_at_expected(
     if relative.components().count() != 1 {
         return Err(AnchorError::UnsafePath);
     }
+    // Guarded captures retain hard links to a user's inode. Their own
+    // retirement journals must remove those links and restore source access;
+    // no generic anchor cleanup may recursively unlink a claimed directory.
+    if let Some(name) = relative.to_str()
+        && let Ok(anchor_id) = Uuid::parse_str(name)
+        && anchor_id.to_string() == name
+    {
+        for marker in [
+            guarded_root::guarded_root_marker_name(anchor_id),
+            guarded_file::guarded_file_marker_name(anchor_id),
+        ] {
+            match open_path_no_xdev_beneath(parent, Path::new(&marker)) {
+                Ok(_) => return Err(AnchorError::UnsafeOwnedDirectory(display.to_path_buf())),
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(_) => return Err(AnchorError::UnsafeOwnedDirectory(display.to_path_buf())),
+            }
+        }
+    }
     let handle = match open_path_no_xdev_beneath(parent, relative) {
         Ok(handle) => handle,
         Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
@@ -4641,6 +4659,63 @@ mod tests {
         );
         let opened = open_stable_anchor_area(&area.path_hint, &area).unwrap();
         assert!(opened.metadata().unwrap().is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn generic_anchor_removal_preserves_claimed_guarded_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("protected");
+        fs::create_dir(&root).unwrap();
+        let area = StableAnchorAreaLocator::prepare_for_root(&root).unwrap();
+        let pinned = PinnedDirectory::open(&area.path_hint).unwrap();
+        let marker_names: [fn(Uuid) -> String; 2] = [
+            guarded_file::guarded_file_marker_name,
+            guarded_root::guarded_root_marker_name,
+        ];
+        for marker_name in marker_names {
+            let anchor_id = Uuid::new_v4();
+            let name = anchor_id.to_string();
+            let directory = pinned.create_child_directory(&name).unwrap();
+            directory
+                .publish_sealed_bytes_child("blob", b"retained")
+                .unwrap();
+            let marker = marker_name(anchor_id);
+            let marker_id = pinned
+                .publish_sealed_bytes_child(&marker, b"owned")
+                .unwrap();
+            let manifest = FileAnchorManifest {
+                format_version: 1,
+                anchor_id,
+                area: area.clone(),
+                source_root_hint: root.clone(),
+                source_relative_path: PathBuf::from("source"),
+                logical_len: 8,
+                content_hash: [0; 32],
+                source_version: CaptureVersion {
+                    filesystem_id: area.filesystem_id,
+                    inode: 1,
+                    logical_len: 8,
+                    modified_secs: 0,
+                    modified_nanos: 0,
+                    changed_secs: 0,
+                    changed_nanos: 0,
+                },
+            };
+            assert!(matches!(
+                manifest.remove(),
+                Err(AnchorError::UnsafeOwnedDirectory(_))
+            ));
+            assert_eq!(
+                fs::read(area.path_hint.join(&name).join("blob")).unwrap(),
+                b"retained"
+            );
+            pinned
+                .remove_child_file_if_identity(&marker, marker_id)
+                .unwrap();
+            manifest.remove().unwrap();
+            assert!(!area.path_hint.join(&name).exists());
+        }
     }
 
     #[cfg(target_os = "linux")]
