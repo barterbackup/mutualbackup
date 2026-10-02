@@ -46,6 +46,9 @@ them as ADRs and test vectors before promising wire compatibility.
   hashes the immutable captured bytes as a raw Git blob, so its object ID must
   match `git hash-object --no-filters` on those bytes. Checkout writes the
   stored blob bytes unchanged; no clean/smudge step is part of either operation.
+  This is an intentional compatibility limit: a stock Git peer may present a
+  converted worktree, but our repository stores and checks out the exchanged
+  Git blob bytes unchanged. Document that difference in the Git-facing CLI.
 - Use a pinned SQLCipher/SQLite build as the common local storage engine, with
   per-page HMAC enabled. Keep control state separate from parity storage. The
   prototype instantiates one parity database; later, one database per configured
@@ -3118,6 +3121,8 @@ backend gates. A command being present does not by itself close its slice.
   behavior visible in help and status when such rules exist. Never run a
   configured filter command. Define safe support for Git file
   modes, symlinks, and path names rather than silently dropping them.
+  Treat raw-byte behavior as a gate for each supported command, including
+  interoperation commands, rather than deferring it to final milestone testing.
 - Protect the whole reachable Git commit graph and refs as owner-owned backed-up
   content, not just the currently checked-out tree. A signed MutualBackup
   revision/checkpoint is the protection boundary; seed-only recovery must
