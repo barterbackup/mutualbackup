@@ -1161,6 +1161,13 @@ impl ImportedBlobCapturePlan {
         self.root.source_root()
     }
 
+    pub fn source_root_identity(&self) -> NativeFileId {
+        NativeFileId {
+            filesystem_id: self.root.root_version.filesystem_id,
+            inode: self.root.root_version.inode,
+        }
+    }
+
     pub fn logical_len(&self) -> u64 {
         self.logical_len
     }

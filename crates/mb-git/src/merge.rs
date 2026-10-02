@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use git2::{IndexEntry, IndexTime, ObjectType, Oid, Repository};
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
-use mb_store::{AnchorError, ControlStore, DatabaseError, SourceBlobImportPlan};
+use mb_store::{AnchorError, ControlStore, DatabaseError, NativeFileId, SourceBlobImportPlan};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -560,12 +560,14 @@ mod scoped_blob_tests {
         if legacy {
             move_linked_blob_intent_to_legacy_primary(&control, scope).unwrap();
             assert_eq!(
-                primary_merge_blob_source_root(&control, repository_id).unwrap(),
+                primary_merge_blob_source(&control, repository_id)
+                    .unwrap()
+                    .map(|(path, _)| path),
                 Some(linked_root.clone())
             );
         } else {
             assert!(
-                primary_merge_blob_source_root(&control, repository_id)
+                primary_merge_blob_source(&control, repository_id)
                     .unwrap()
                     .is_none()
             );
@@ -611,6 +613,77 @@ mod scoped_blob_tests {
     fn legacy_linked_generated_blob_replays_from_its_recorded_root() {
         replay_after_capture(true);
     }
+
+    #[test]
+    fn pending_blob_discard_requires_exact_worktree_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("linked");
+        fs::create_dir(&root).unwrap();
+        let control =
+            ControlStore::open_with_key(temp.path().join("catalog.db"), &[88; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        for scope in [
+            GitWorktreeScope::primary(repository_id),
+            GitWorktreeScope::linked(repository_id, Uuid::new_v4()).unwrap(),
+        ] {
+            let plan = SourceBlobImportPlan::plan_direct(&root, 4).unwrap();
+            let root_id = plan.source_root_identity();
+            let anchor = plan.capture(b"data".as_slice()).unwrap();
+            let intent = MergeBlobIntent {
+                format_version: 1,
+                repository_id,
+                path: b"tracked".to_vec(),
+                inputs: MergeFileInputs {
+                    base: MergeFileInput {
+                        oid: [1; 20],
+                        mode: 0o100644,
+                    },
+                    ours: MergeFileInput {
+                        oid: [2; 20],
+                        mode: 0o100644,
+                    },
+                    theirs: MergeFileInput {
+                        oid: [3; 20],
+                        mode: 0o100644,
+                    },
+                },
+                result_oid: Oid::hash_object(ObjectType::Blob, b"data")
+                    .unwrap()
+                    .as_bytes()
+                    .try_into()
+                    .unwrap(),
+                result_mode: 0o100644,
+                plan,
+            };
+            control
+                .put_record(
+                    &intent_kind_for_scope(scope),
+                    ACTIVE,
+                    &encode_blob_intent_for_scope(scope, &intent).unwrap(),
+                )
+                .unwrap();
+            assert!(matches!(
+                discard_pending_merge_blob_for_scope(
+                    &control,
+                    scope,
+                    &root,
+                    NativeFileId {
+                        inode: root_id.inode + 1,
+                        ..root_id
+                    },
+                ),
+                Err(MergeBlobError::IncompatibleRecord)
+            ));
+            assert!(anchor.open_verified().is_ok());
+            let deletion = discard_pending_merge_blob_for_scope(&control, scope, &root, root_id)
+                .unwrap()
+                .unwrap();
+            assert!(anchor.open_verified().is_err());
+            assert!(has_pending_merge_blob_for_scope(&control, scope).unwrap());
+            control.put_records_and_delete(&[], &[deletion]).unwrap();
+            assert!(!has_pending_merge_blob_for_scope(&control, scope).unwrap());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -632,6 +705,47 @@ pub(crate) fn move_linked_blob_intent_to_legacy_primary(
         &[(kind, ACTIVE.to_vec())],
     )?;
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn seed_legacy_blob_intent_for_test(
+    control: &ControlStore,
+    repository_id: Uuid,
+    source_root: &Path,
+) -> Result<mb_store::FileAnchorManifest, MergeBlobError> {
+    let plan = SourceBlobImportPlan::plan_direct(source_root, 4)?;
+    let anchor = plan.capture(b"data".as_slice())?;
+    let intent = MergeBlobIntent {
+        format_version: 1,
+        repository_id,
+        path: b"tracked".to_vec(),
+        inputs: MergeFileInputs {
+            base: MergeFileInput {
+                oid: [1; 20],
+                mode: 0o100644,
+            },
+            ours: MergeFileInput {
+                oid: [2; 20],
+                mode: 0o100644,
+            },
+            theirs: MergeFileInput {
+                oid: [3; 20],
+                mode: 0o100644,
+            },
+        },
+        result_oid: Oid::hash_object(ObjectType::Blob, b"data")?
+            .as_bytes()
+            .try_into()
+            .expect("SHA-1 OID"),
+        result_mode: 0o100644,
+        plan,
+    };
+    control.put_record(
+        &intent_kind(repository_id),
+        ACTIVE,
+        &canonical_bytes(&intent)?,
+    )?;
+    Ok(anchor)
 }
 
 fn index_entry(path: &[u8], input: MergeFileInput) -> Result<IndexEntry, MergeBlobError> {
@@ -801,10 +915,10 @@ pub(crate) fn has_pending_merge_blob_for_scope(
 /// A format-1 blob intent predates linked-worktree namespacing. Its capture
 /// plan still binds the source root and native identity; callers can locate
 /// the exact registered worktree before replaying it.
-pub(crate) fn primary_merge_blob_source_root(
+pub(crate) fn primary_merge_blob_source(
     control: &ControlStore,
     repository_id: Uuid,
-) -> Result<Option<PathBuf>, MergeBlobError> {
+) -> Result<Option<(PathBuf, NativeFileId)>, MergeBlobError> {
     let Some(encoded) = control.get_record(&intent_kind(repository_id), ACTIVE)? else {
         return Ok(None);
     };
@@ -812,7 +926,10 @@ pub(crate) fn primary_merge_blob_source_root(
     if intent.format_version != 1 || intent.repository_id != repository_id {
         return Err(MergeBlobError::IncompatibleRecord);
     }
-    Ok(Some(intent.plan.source_root().to_path_buf()))
+    Ok(Some((
+        intent.plan.source_root().to_path_buf(),
+        intent.plan.source_root_identity(),
+    )))
 }
 
 pub(crate) fn resume_pending_merge_blob(
@@ -886,26 +1003,31 @@ pub(crate) fn resume_pending_merge_blob_for_scope(
     Ok(())
 }
 
-/// Force-pruning a missing linked worktree explicitly abandons its unfinished
-/// generated blob. The intent still owns the private native anchor until its
-/// plan is discarded; a repeated prune can finish after a crash.
-pub(crate) fn abandon_pending_merge_blob_for_scope(
+/// Prepare force-pruning a missing linked worktree. The private anchor is
+/// discarded first; the caller then retires this intent with the worktree
+/// registration in one catalog transaction. Repeating this step is safe.
+pub(crate) fn discard_pending_merge_blob_for_scope(
     control: &ControlStore,
     scope: GitWorktreeScope,
     root_path: &Path,
-) -> Result<(), MergeBlobError> {
+    root_id: NativeFileId,
+) -> Result<Option<(String, Vec<u8>)>, MergeBlobError> {
     let kind = intent_kind_for_scope(scope);
     let Some(encoded) = control.get_record(&kind, ACTIVE)? else {
-        return Ok(());
+        return Ok(None);
     };
     let intent = decode_blob_intent_for_scope(scope, &encoded)?;
+    let relative = PathBuf::from(OsString::from_vec(intent.path.clone()));
     if intent.format_version != 1
         || intent.repository_id != scope.repository_id()
         || intent.plan.source_root() != root_path
+        || intent.plan.source_root_identity() != root_id
+        || stage_path_key(&relative)? != intent.path
+        || intent.plan.logical_len() > MAX_AUTOMERGE_FILE_BYTES
+        || !matches!(intent.result_mode, 0o100644 | 0o100755)
     {
         return Err(MergeBlobError::IncompatibleRecord);
     }
     intent.plan.discard()?;
-    control.delete_record_if_value(&kind, ACTIVE, &encoded)?;
-    Ok(())
+    Ok(Some((kind, ACTIVE.to_vec())))
 }

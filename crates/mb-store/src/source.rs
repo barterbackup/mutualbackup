@@ -13,8 +13,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    AnchorError, ControlStore, FileAnchorManifest, ImportedBlobCapturePlan, PinnedDirectory,
-    ReflinkAnchor, ReflinkCapturePlan, ReflinkFileCapturePlan, StableAnchorManifest, probe_reflink,
+    AnchorError, ControlStore, FileAnchorManifest, ImportedBlobCapturePlan, NativeFileId,
+    PinnedDirectory, ReflinkAnchor, ReflinkCapturePlan, ReflinkFileCapturePlan,
+    StableAnchorManifest, probe_reflink,
 };
 #[cfg(target_os = "linux")]
 use crate::{GuardedFileCapturePlan, GuardedRootCapturePlan, probe_guarded_link_freeze};
@@ -394,6 +395,12 @@ impl SourceBlobImportPlan {
     pub fn source_root(&self) -> &Path {
         match self {
             Self::DirectV1(plan) => plan.source_root(),
+        }
+    }
+
+    pub fn source_root_identity(&self) -> NativeFileId {
+        match self {
+            Self::DirectV1(plan) => plan.source_root_identity(),
         }
     }
 

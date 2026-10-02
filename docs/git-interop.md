@@ -62,6 +62,9 @@ unresolved merge session after
 removing the directory. `--force` can also discard an
 interrupted initial checkout and its private staging directory after that
 worktree directory is gone; later checkouts still block it.
+The same force-prune path handles an unfinished merge blob recorded by an older
+version under the shared repository key when its exact registered worktree is
+missing; other operations remain blocked until that cleanup completes.
 An interrupted registration that has not started checkout can be pruned without
 `--force` after its directory is removed.
 All `mutualgit worktree` subcommands can be invoked from a linked worktree;

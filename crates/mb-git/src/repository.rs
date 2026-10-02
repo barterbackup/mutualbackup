@@ -41,7 +41,7 @@ use crate::interop::{
 use crate::merge::{
     MergeBlobError, has_merge_session, has_merge_session_for_scope,
     has_merge_session_outside_scope, load_merge_session, load_merge_session_for_scope,
-    mark_merge_resolved, mark_merge_resolved_for_scope, primary_merge_blob_source_root,
+    mark_merge_resolved, mark_merge_resolved_for_scope, primary_merge_blob_source,
     resume_pending_merge_blob, resume_pending_merge_blob_for_scope, session_key, session_kind,
     session_kind_for_scope,
 };
@@ -221,6 +221,41 @@ impl GitRepository {
         catalog_key: &[u8; 32],
         source_backend: SourceBackendKind,
     ) -> Result<Self, RepositoryError> {
+        Self::open_with_backend_policy(
+            source_root,
+            repository_id,
+            catalog_key,
+            source_backend,
+            None,
+        )
+    }
+
+    /// Only a force-prune request may open past a historical linked merge-blob
+    /// intent whose exact registered worktree directory is already missing.
+    pub fn open_with_backend_for_missing_worktree_prune(
+        source_root: impl AsRef<Path>,
+        repository_id: Uuid,
+        catalog_key: &[u8; 32],
+        source_backend: SourceBackendKind,
+        worktree_id: Uuid,
+        force: bool,
+    ) -> Result<Self, RepositoryError> {
+        Self::open_with_backend_policy(
+            source_root,
+            repository_id,
+            catalog_key,
+            source_backend,
+            Some((worktree_id, force)),
+        )
+    }
+
+    fn open_with_backend_policy(
+        source_root: impl AsRef<Path>,
+        repository_id: Uuid,
+        catalog_key: &[u8; 32],
+        source_backend: SourceBackendKind,
+        prune_missing: Option<(Uuid, bool)>,
+    ) -> Result<Self, RepositoryError> {
         if repository_id.is_nil() {
             return Err(RepositoryError::Conflict);
         }
@@ -229,7 +264,14 @@ impl GitRepository {
         let directory = root_dir
             .open_child_directory(GIT_CATALOG_DIRECTORY)?
             .ok_or(RepositoryError::NotInitialized)?;
-        Self::open_from_pinned(root, repository_id, directory, catalog_key, source_backend)
+        Self::open_from_pinned_with_policy(
+            root,
+            repository_id,
+            directory,
+            catalog_key,
+            source_backend,
+            prune_missing,
+        )
     }
 
     fn open_from_pinned(
@@ -238,6 +280,24 @@ impl GitRepository {
         directory: PinnedDirectory,
         catalog_key: &[u8; 32],
         source_backend: SourceBackendKind,
+    ) -> Result<Self, RepositoryError> {
+        Self::open_from_pinned_with_policy(
+            root,
+            repository_id,
+            directory,
+            catalog_key,
+            source_backend,
+            None,
+        )
+    }
+
+    fn open_from_pinned_with_policy(
+        root: PathBuf,
+        repository_id: Uuid,
+        directory: PinnedDirectory,
+        catalog_key: &[u8; 32],
+        source_backend: SourceBackendKind,
+        prune_missing: Option<(Uuid, bool)>,
     ) -> Result<Self, RepositoryError> {
         require_private_catalog(&directory)?;
         let ready = read_marker(&directory, GIT_CATALOG_MARKER_FILE)?
@@ -254,7 +314,13 @@ impl GitRepository {
             repository_id,
             source_backend,
         };
-        repository.resume_checkout()?;
+        if let Some((worktree_id, true)) = prune_missing
+            && repository.missing_legacy_blob_matches_worktree(worktree_id)?
+        {
+            repository.resume_primary_worktree()?;
+        } else {
+            repository.resume_checkout()?;
+        }
         resume_pending_prune(&repository.catalog, repository.repository_id)?;
         Ok(repository)
     }
@@ -308,7 +374,11 @@ impl GitRepository {
         worktree_id: Uuid,
         force: bool,
     ) -> Result<GitWorktreeInfo, RepositoryError> {
-        self.resume_checkout()?;
+        if force && self.missing_legacy_blob_matches_worktree(worktree_id)? {
+            self.resume_primary_worktree()?;
+        } else {
+            self.resume_checkout()?;
+        }
         let scope = crate::GitWorktreeScope::linked(self.repository_id, worktree_id)
             .ok_or(GitWorktreeError::Conflict)?;
         if !force || has_merge_session_outside_scope(&self.catalog, scope)? {
@@ -1058,13 +1128,17 @@ impl GitRepository {
     }
 
     fn resume_checkout(&self) -> Result<(), RepositoryError> {
-        let blob_root = primary_merge_blob_source_root(&self.catalog, self.repository_id)?;
-        if let Some(blob_root) = blob_root.as_deref()
-            && blob_root != self.root
+        let blob_source = primary_merge_blob_source(&self.catalog, self.repository_id)?;
+        if let Some((blob_root, root_id)) = blob_source.as_ref()
+            && blob_root != &self.root
         {
             let linked = list_worktrees(&self.catalog, self.repository_id)?
                 .into_iter()
-                .find(|info| info.path == blob_root && info.state == GitWorktreeState::Ready)
+                .find(|info| {
+                    info.path == *blob_root
+                        && info.root_id == *root_id
+                        && info.state == GitWorktreeState::Ready
+                })
                 .ok_or(MergeBlobError::IncompatibleRecord)?;
             resume_worktree(
                 &self.catalog,
@@ -1078,6 +1152,10 @@ impl GitRepository {
         } else {
             resume_pending_merge_blob(&self.catalog, self.repository_id, &self.root)?;
         }
+        self.resume_primary_worktree()
+    }
+
+    fn resume_primary_worktree(&self) -> Result<(), RepositoryError> {
         resume_pending_checkout(
             &self.catalog,
             self.repository_id,
@@ -1091,6 +1169,28 @@ impl GitRepository {
             &self.root,
         )?;
         Ok(())
+    }
+
+    fn missing_legacy_blob_matches_worktree(
+        &self,
+        worktree_id: Uuid,
+    ) -> Result<bool, RepositoryError> {
+        let Some((path, root_id)) = primary_merge_blob_source(&self.catalog, self.repository_id)?
+        else {
+            return Ok(false);
+        };
+        if path == self.root {
+            return Ok(false);
+        }
+        let info = get_worktree(&self.catalog, self.repository_id, worktree_id)?;
+        if info.state != GitWorktreeState::Ready || info.path != path || info.root_id != root_id {
+            return Ok(false);
+        }
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Ok(_) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn ensure_no_merge_session(&self) -> Result<(), RepositoryError> {
@@ -1559,6 +1659,88 @@ mod tests {
     }
 
     #[test]
+    fn missing_legacy_merge_blob_force_prune_reopens_without_reflink_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_root = temp.path().join("primary");
+        let linked_root = temp.path().join("linked");
+        fs::create_dir(&primary_root).unwrap();
+        fs::create_dir(&linked_root).unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [105_u8; 32];
+        let local = GitRepository::init(&primary_root, repository_id, &key).unwrap();
+        let worktree_id = Uuid::new_v4();
+        let info = GitWorktreeInfo {
+            format_version: 1,
+            repository_id,
+            worktree_id,
+            path: linked_root.clone(),
+            root_id: PinnedDirectory::open(&linked_root)
+                .unwrap()
+                .identity()
+                .unwrap(),
+            target_branch: "main".to_owned(),
+            state: GitWorktreeState::Ready,
+        };
+        local
+            .catalog
+            .put_record(
+                &crate::worktree::record_kind(repository_id),
+                worktree_id.as_bytes(),
+                &mb_core::canonical_bytes(&info).unwrap(),
+            )
+            .unwrap();
+        crate::head::store_selected_branch_for_scope(&local.catalog, info.scope().unwrap(), "main")
+            .unwrap();
+        let private_anchor = crate::merge::seed_legacy_blob_intent_for_test(
+            &local.catalog,
+            repository_id,
+            &linked_root,
+        )
+        .unwrap();
+        drop(local);
+        fs::remove_dir_all(&linked_root).unwrap();
+        assert!(GitRepository::open(&primary_root, repository_id, &key).is_err());
+        assert!(
+            GitRepository::open_with_backend_for_missing_worktree_prune(
+                &primary_root,
+                repository_id,
+                &key,
+                SourceBackendKind::ReflinkV1,
+                Uuid::new_v4(),
+                true,
+            )
+            .is_err()
+        );
+        assert!(private_anchor.open_verified().is_ok());
+        let local = GitRepository::open_with_backend_for_missing_worktree_prune(
+            &primary_root,
+            repository_id,
+            &key,
+            SourceBackendKind::ReflinkV1,
+            worktree_id,
+            true,
+        )
+        .unwrap();
+        assert!(
+            local
+                .prune_missing_linked_worktree(worktree_id, false)
+                .is_err()
+        );
+        assert!(private_anchor.open_verified().is_ok());
+        assert_eq!(
+            local
+                .prune_missing_linked_worktree(worktree_id, true)
+                .unwrap(),
+            info
+        );
+        assert!(private_anchor.open_verified().is_err());
+        drop(local);
+        let reopened = GitRepository::open(&primary_root, repository_id, &key).unwrap();
+        assert!(reopened.linked_worktrees().unwrap().is_empty());
+        assert!(!crate::merge::has_pending_merge_blob(&reopened.catalog, repository_id).unwrap());
+    }
+
+    #[test]
     fn interrupted_initialization_resumes_only_its_owned_intent() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
@@ -1777,16 +1959,22 @@ mod tests {
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn linked_content_merge_replays_its_own_generated_blob_after_reopen() {
-        linked_content_merge_replay(false);
+        linked_content_merge_replay(false, false);
     }
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn legacy_linked_content_merge_intent_replays_after_upgrade() {
-        linked_content_merge_replay(true);
+        linked_content_merge_replay(true, false);
     }
 
-    fn linked_content_merge_replay(legacy_intent: bool) {
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn missing_legacy_linked_content_merge_intent_force_prunes_safely() {
+        linked_content_merge_replay(true, true);
+    }
+
+    fn linked_content_merge_replay(legacy_intent: bool, remove_linked: bool) {
         let test_root = PathBuf::from(
             std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
                 .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
@@ -1836,6 +2024,39 @@ mod tests {
         }
         assert_eq!(fs::read(linked_root.join("tracked")).unwrap(), ours);
         drop(local);
+
+        if remove_linked {
+            fs::remove_dir_all(&linked_root).unwrap();
+            assert!(GitRepository::open(&primary_root, repository_id, &key).is_err());
+            let local = GitRepository::open_with_backend_for_missing_worktree_prune(
+                &primary_root,
+                repository_id,
+                &key,
+                SourceBackendKind::ReflinkV1,
+                linked.worktree_id,
+                true,
+            )
+            .unwrap();
+            assert!(
+                local
+                    .prune_missing_linked_worktree(linked.worktree_id, false)
+                    .is_err()
+            );
+            local
+                .prune_missing_linked_worktree(linked.worktree_id, true)
+                .unwrap();
+            assert!(!crate::merge::has_pending_merge_blob(&local.catalog, repository_id).unwrap());
+            assert!(local.linked_worktrees().unwrap().is_empty());
+            assert_eq!(fs::read(primary_root.join("tracked")).unwrap(), theirs);
+            let graph = local.export_graph_source().unwrap();
+            drop(local);
+            GitRepository::open(&primary_root, repository_id, &key).unwrap();
+            for blob in graph.blobs {
+                blob.anchor.remove().unwrap();
+            }
+            fs::remove_dir_all(run_root).unwrap();
+            return;
+        }
 
         let local = GitRepository::open(&primary_root, repository_id, &key).unwrap();
         assert_eq!(

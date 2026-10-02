@@ -32,8 +32,8 @@ use crate::head::{
 };
 use crate::history::{HistoryError, list_branches_for_scope};
 use crate::merge::{
-    MergeBlobError, abandon_pending_merge_blob_for_scope, has_pending_merge_blob_for_scope,
-    load_merge_session_for_scope, session_key, session_kind_for_scope,
+    MergeBlobError, discard_pending_merge_blob_for_scope, has_pending_merge_blob_for_scope,
+    load_merge_session_for_scope, primary_merge_blob_source, session_key, session_kind_for_scope,
 };
 use crate::rm::{GitRmError, abandon_missing_linked_rm};
 use crate::stage::{
@@ -680,7 +680,16 @@ pub(crate) fn prune_missing_worktree(
     let pending_stages = has_pending_stages_for_scope(control, scope)?;
     let pending_checkout = has_pending_checkout_for_scope(control, scope)?;
     let pending_merge_blob = has_pending_merge_blob_for_scope(control, scope)?;
-    if pending_merge_blob && !force {
+    let legacy_blob = match primary_merge_blob_source(control, repository_id)? {
+        Some((path, root_id)) if path == info.path => {
+            if root_id != info.root_id {
+                return Err(GitWorktreeError::Conflict);
+            }
+            true
+        }
+        _ => false,
+    };
+    if (pending_merge_blob || legacy_blob) && !force {
         return Err(GitWorktreeError::PendingOperation);
     }
     let merge_session =
@@ -761,7 +770,21 @@ pub(crate) fn prune_missing_worktree(
         )?;
     }
     if pending_merge_blob {
-        abandon_pending_merge_blob_for_scope(control, scope, &info.path)?;
+        deletions.push(
+            discard_pending_merge_blob_for_scope(control, scope, &info.path, info.root_id)?
+                .ok_or(GitWorktreeError::Conflict)?,
+        );
+    }
+    if legacy_blob {
+        deletions.push(
+            discard_pending_merge_blob_for_scope(
+                control,
+                GitWorktreeScope::primary(repository_id),
+                &info.path,
+                info.root_id,
+            )?
+            .ok_or(GitWorktreeError::Conflict)?,
+        );
     }
     control.put_records_and_retire_and_delete_if_value(
         &[],

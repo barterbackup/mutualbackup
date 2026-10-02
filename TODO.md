@@ -11,9 +11,10 @@
   merge, abort, resolution, continue, and interruption/reopen after generated
   blob capture, staged conflict resolution, and checkout publication without
   changing the primary worktree. Historical primary-keyed linked blob intents
-  now replay when their registered worktree still exists. A missing historical
-  worktree still needs an explicit, safe force-prune recovery path. Run the
-  provisioned Git gate before closing this item.
+  replay when their registered worktree still exists; a missing historical
+  worktree now has a force-prune path that discards its private generated blob
+  and retires the intent with its registration. Run the provisioned Git gate
+  before closing this item.
 - [ ] **M6 combined Git restore is one recoverable operation.**
   `mutualgit restore --staged --worktree PATH` now sends one daemon request for
   primary or linked worktrees. Version 11 checkout intents bind the selected

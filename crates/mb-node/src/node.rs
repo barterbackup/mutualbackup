@@ -1407,6 +1407,14 @@ impl Node {
     }
 
     fn open_git_repository(&self, repository_id: Uuid) -> Result<GitRepository> {
+        self.open_git_repository_with_policy(repository_id, None)
+    }
+
+    fn open_git_repository_with_policy(
+        &self,
+        repository_id: Uuid,
+        prune_missing: Option<(Uuid, bool)>,
+    ) -> Result<GitRepository> {
         let encoded = self
             .control
             .get_record("git-repository", repository_id.as_bytes())?
@@ -1434,8 +1442,18 @@ impl Node {
         }
         let backend = self.source_backend_for_root(&root, filesystem)?;
         let key = self.git_catalog_key(repository_id);
-        let repository =
-            GitRepository::open_with_backend(&root.path, repository_id, &key, backend.backend)?;
+        let repository = if let Some((worktree_id, force)) = prune_missing {
+            GitRepository::open_with_backend_for_missing_worktree_prune(
+                &root.path,
+                repository_id,
+                &key,
+                backend.backend,
+                worktree_id,
+                force,
+            )?
+        } else {
+            GitRepository::open_with_backend(&root.path, repository_id, &key, backend.backend)?
+        };
         Ok(repository)
     }
 
@@ -1472,7 +1490,7 @@ impl Node {
         worktree_id: Uuid,
         force: bool,
     ) -> Result<GitWorktreeInfo> {
-        self.open_git_repository(repository_id)?
+        self.open_git_repository_with_policy(repository_id, Some((worktree_id, force)))?
             .prune_missing_linked_worktree(worktree_id, force)
             .map_err(Into::into)
     }
