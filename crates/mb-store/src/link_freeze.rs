@@ -324,7 +324,7 @@ impl LinkFreezeEditIntent {
     /// Persist the intent before creating a private staging copy. The caller
     /// must have a separately durable capture record for this frozen anchor,
     /// and must identify both paths by pinned directories on recovery.
-    pub fn begin(
+    pub(crate) fn begin(
         control: &ControlStore,
         anchor_id: Uuid,
         source_parent: &PinnedDirectory,
@@ -549,7 +549,7 @@ impl LinkFreezeEditIntent {
         self.replace_phase(control, LinkFreezeEditPhase::Editable, None, None)
     }
 
-    pub fn retire(self, control: &ControlStore) -> anyhow::Result<()> {
+    pub(crate) fn retire(self, control: &ControlStore) -> anyhow::Result<()> {
         anyhow::ensure!(self.phase == LinkFreezeEditPhase::Editable);
         control.delete_record_if_value(
             EDIT_INTENT_KIND,
@@ -571,7 +571,7 @@ impl LinkFreezeEditIntent {
         source_name: impl AsRef<Path>,
         anchor_parent: &PinnedDirectory,
         anchor_name: impl AsRef<Path>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Self> {
         let source_name = source_name.as_ref();
         let anchor_name = anchor_name.as_ref();
         anyhow::ensure!(
@@ -734,7 +734,7 @@ impl LinkFreezeEditIntent {
                         &anchor,
                         self.copy.as_ref().unwrap(),
                     )?);
-                    return self.retire(control);
+                    return Ok(self);
                 }
             };
         }
@@ -1836,7 +1836,10 @@ mod tests {
                 );
                 continue;
             }
-            resumed.unwrap_or_else(|error| panic!("interruption {interruption}: {error:#}"));
+            resumed
+                .unwrap_or_else(|error| panic!("interruption {interruption}: {error:#}"))
+                .retire(&store)
+                .unwrap();
             assert!(
                 LinkFreezeEditIntent::load(&store, anchor_id)
                     .unwrap()

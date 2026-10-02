@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use super::{
     FileAccessSnapshot, FileWriteExclusion, FrozenAnchorProof, IndependentSparseCopy,
-    file_data_extents, hash_exact,
+    LinkFreezeEditIntent, LinkFreezeEditPhase, file_data_extents, hash_exact,
 };
 use crate::anchor::{NativeFileId, PinnedDirectory};
 use crate::database::ControlStore;
@@ -21,10 +21,25 @@ const CAPTURE_INTENT_KIND: &str = "link-freeze-capture-v1";
 pub enum LinkFreezeCapturePhase {
     Prepared,
     Frozen,
+    Detached,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LinkFreezeCaptureIntent {
+    format_version: u16,
+    anchor_id: Uuid,
+    source_parent_id: NativeFileId,
+    anchor_parent_id: NativeFileId,
+    source_id: NativeFileId,
+    source_name: PathBuf,
+    anchor_name: PathBuf,
+    proof: FrozenAnchorProof,
+    phase: LinkFreezeCapturePhase,
+    private_inode: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct LegacyCaptureIntentV1 {
     format_version: u16,
     anchor_id: Uuid,
     source_parent_id: NativeFileId,
@@ -91,7 +106,7 @@ impl LinkFreezeCaptureIntent {
             "source changed during guarded capture planning"
         );
         let intent = Self {
-            format_version: 1,
+            format_version: 2,
             anchor_id,
             source_parent_id,
             anchor_parent_id,
@@ -103,6 +118,7 @@ impl LinkFreezeCaptureIntent {
                 content: proof,
             },
             phase: LinkFreezeCapturePhase::Prepared,
+            private_inode: None,
         };
         anyhow::ensure!(
             control.put_record_if_absent(
@@ -120,14 +136,49 @@ impl LinkFreezeCaptureIntent {
         let Some(bytes) = control.get_record(CAPTURE_INTENT_KIND, anchor_id.as_bytes())? else {
             return Ok(None);
         };
-        let intent: Self = mb_core::decode_canonical(&bytes)?;
+        let intent: Self = match mb_core::decode_canonical::<Self>(&bytes) {
+            Ok(intent) if intent.format_version == 2 => intent,
+            _ => {
+                let legacy: LegacyCaptureIntentV1 = mb_core::decode_canonical(&bytes)?;
+                anyhow::ensure!(
+                    legacy.format_version == 1
+                        && legacy.anchor_id == anchor_id
+                        && legacy.phase != LinkFreezeCapturePhase::Detached,
+                    "unknown frozen capture intent format"
+                );
+                let migrated = Self {
+                    format_version: 2,
+                    anchor_id: legacy.anchor_id,
+                    source_parent_id: legacy.source_parent_id,
+                    anchor_parent_id: legacy.anchor_parent_id,
+                    source_id: legacy.source_id,
+                    source_name: legacy.source_name,
+                    anchor_name: legacy.anchor_name,
+                    proof: legacy.proof,
+                    phase: legacy.phase,
+                    private_inode: None,
+                };
+                control.replace_record_if_value(
+                    CAPTURE_INTENT_KIND,
+                    anchor_id.as_bytes(),
+                    &bytes,
+                    &mb_core::canonical_bytes(&migrated)?,
+                )?;
+                migrated
+            }
+        };
         anyhow::ensure!(
-            intent.format_version == 1
+            intent.format_version == 2
                 && intent.anchor_id == anchor_id
                 && intent.source_id.filesystem_id == intent.source_parent_id.filesystem_id
                 && intent.source_id.filesystem_id == intent.anchor_parent_id.filesystem_id
                 && intent.proof.original_access.format_version == 1
-                && intent.proof.content.data_extents.len() <= 65_536,
+                && intent.proof.content.data_extents.len() <= 65_536
+                && match intent.phase {
+                    LinkFreezeCapturePhase::Prepared | LinkFreezeCapturePhase::Frozen =>
+                        intent.private_inode.is_none(),
+                    LinkFreezeCapturePhase::Detached => intent.private_inode.is_some(),
+                },
             "invalid frozen capture intent"
         );
         Ok(Some(intent))
@@ -141,6 +192,32 @@ impl LinkFreezeCaptureIntent {
         (self.phase == LinkFreezeCapturePhase::Frozen).then_some(&self.proof)
     }
 
+    /// Start editing only from the exact committed frozen capture record.
+    /// Replay that record first so a missing, changed, or already detached
+    /// anchor cannot supply an edit proof.
+    pub fn begin_edit(
+        self,
+        control: &ControlStore,
+        source_parent: &PinnedDirectory,
+        anchor_parent: &PinnedDirectory,
+    ) -> anyhow::Result<LinkFreezeEditIntent> {
+        anyhow::ensure!(self.phase == LinkFreezeCapturePhase::Frozen);
+        anyhow::ensure!(LinkFreezeEditIntent::load(control, self.anchor_id)?.is_none());
+        let frozen = self
+            .resume(control, source_parent, anchor_parent)?
+            .ok_or_else(|| anyhow::anyhow!("frozen capture disappeared before edit"))?;
+        anyhow::ensure!(frozen.phase == LinkFreezeCapturePhase::Frozen);
+        LinkFreezeEditIntent::begin(
+            control,
+            frozen.anchor_id,
+            source_parent,
+            &frozen.source_name,
+            anchor_parent,
+            &frozen.anchor_name,
+            frozen.proof,
+        )
+    }
+
     /// Reconcile a prepared freeze or verify a completed one. Changed source
     /// bytes abandon an uncommitted attempt after removing only its known link
     /// and restoring access metadata on the now-unshared source. A collision
@@ -152,15 +229,42 @@ impl LinkFreezeCaptureIntent {
         anchor_parent: &PinnedDirectory,
     ) -> anyhow::Result<Option<Self>> {
         anyhow::ensure!(
-            source_parent.identity()? == self.source_parent_id
-                && anchor_parent.identity()? == self.anchor_parent_id,
-            "frozen capture directory identity changed"
-        );
-        anyhow::ensure!(
             control.get_record(CAPTURE_INTENT_KIND, self.anchor_id.as_bytes())?
                 == Some(mb_core::canonical_bytes(&self)?),
             "frozen capture intent changed before replay"
         );
+        if self.phase == LinkFreezeCapturePhase::Detached {
+            return self
+                .verify_detached_anchor(control, anchor_parent)
+                .map(Some);
+        }
+        let edit = LinkFreezeEditIntent::load(control, self.anchor_id)?;
+        if let Some(ref edit) = edit {
+            anyhow::ensure!(
+                self.phase == LinkFreezeCapturePhase::Frozen && self.matches_edit(edit),
+                "edit intent does not belong to the frozen capture"
+            );
+            if edit.phase() == LinkFreezeEditPhase::Editable {
+                return self.finish_detached_edit(control, anchor_parent).map(Some);
+            }
+        }
+        anyhow::ensure!(
+            source_parent.identity()? == self.source_parent_id
+                && anchor_parent.identity()? == self.anchor_parent_id,
+            "frozen capture directory identity changed"
+        );
+        if let Some(edit) = edit {
+            let editable = edit.resume(
+                control,
+                source_parent,
+                &self.source_name,
+                anchor_parent,
+                &self.anchor_name,
+            )?;
+            self = self.mark_detached(control, anchor_parent, &editable)?;
+            editable.retire(control)?;
+            return Ok(Some(self));
+        }
         let source = source_parent
             .open_child_file(&self.source_name)?
             .ok_or_else(|| anyhow::anyhow!("frozen source name disappeared"))?;
@@ -252,6 +356,124 @@ impl LinkFreezeCaptureIntent {
         Ok(Some(self))
     }
 
+    /// Finish an edit that reached durable `Editable` even if the former
+    /// working file was removed before the capture record advanced.
+    pub fn finish_detached_edit(
+        self,
+        control: &ControlStore,
+        anchor_parent: &PinnedDirectory,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(self.phase == LinkFreezeCapturePhase::Frozen);
+        anyhow::ensure!(
+            control.get_record(CAPTURE_INTENT_KIND, self.anchor_id.as_bytes())?
+                == Some(mb_core::canonical_bytes(&self)?),
+            "frozen capture record changed before edit completion"
+        );
+        let edit = LinkFreezeEditIntent::load(control, self.anchor_id)?
+            .ok_or_else(|| anyhow::anyhow!("editable journal disappeared"))?;
+        anyhow::ensure!(
+            self.matches_edit(&edit) && edit.phase() == LinkFreezeEditPhase::Editable,
+            "edit journal is not ready to detach its capture"
+        );
+        let detached = self.mark_detached(control, anchor_parent, &edit)?;
+        edit.retire(control)?;
+        Ok(detached)
+    }
+
+    /// A detached anchor remains verifiable even if its former working tree
+    /// was edited or removed. A crash after the capture phase advanced but
+    /// before the edit intent retired is also resolved here.
+    pub fn verify_detached_anchor(
+        self,
+        control: &ControlStore,
+        anchor_parent: &PinnedDirectory,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(self.phase == LinkFreezeCapturePhase::Detached);
+        anyhow::ensure!(
+            control.get_record(CAPTURE_INTENT_KIND, self.anchor_id.as_bytes())?
+                == Some(mb_core::canonical_bytes(&self)?)
+                && anchor_parent.identity()? == self.anchor_parent_id,
+            "detached capture record or anchor directory changed"
+        );
+        self.check_private_anchor(anchor_parent, self.private_inode.unwrap())?;
+        if let Some(edit) = LinkFreezeEditIntent::load(control, self.anchor_id)? {
+            anyhow::ensure!(
+                self.matches_edit(&edit)
+                    && edit.phase() == LinkFreezeEditPhase::Editable
+                    && edit.private_inode() == self.private_inode,
+                "pending edit disagrees with the detached capture"
+            );
+            edit.retire(control)?;
+        }
+        Ok(self)
+    }
+
+    fn mark_detached(
+        mut self,
+        control: &ControlStore,
+        anchor_parent: &PinnedDirectory,
+        edit: &LinkFreezeEditIntent,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.phase == LinkFreezeCapturePhase::Frozen
+                && edit.phase() == LinkFreezeEditPhase::Editable
+                && self.matches_edit(edit)
+        );
+        let private_inode = edit
+            .private_inode()
+            .ok_or_else(|| anyhow::anyhow!("editable anchor has no private inode"))?;
+        self.check_private_anchor(anchor_parent, private_inode)?;
+        let before = mb_core::canonical_bytes(&self)?;
+        self.phase = LinkFreezeCapturePhase::Detached;
+        self.private_inode = Some(private_inode);
+        control.replace_record_if_value(
+            CAPTURE_INTENT_KIND,
+            self.anchor_id.as_bytes(),
+            &before,
+            &mb_core::canonical_bytes(&self)?,
+        )?;
+        Ok(self)
+    }
+
+    fn check_private_anchor(
+        &self,
+        anchor_parent: &PinnedDirectory,
+        private_inode: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(anchor_parent.identity()? == self.anchor_parent_id);
+        let anchor_id = anchor_parent
+            .entry_identity(&self.anchor_name, false)?
+            .ok_or_else(|| anyhow::anyhow!("detached anchor name disappeared"))?;
+        anyhow::ensure!(
+            anchor_id.filesystem_id == self.source_id.filesystem_id
+                && anchor_id.inode == private_inode
+                && anchor_id.inode != self.source_id.inode,
+            "detached anchor inode changed"
+        );
+        let anchor = anchor_parent
+            .open_child_file(&self.anchor_name)?
+            .ok_or_else(|| anyhow::anyhow!("detached anchor name disappeared"))?;
+        let metadata = anchor.metadata()?;
+        anyhow::ensure!(
+            metadata.is_file()
+                && metadata.ino() == private_inode
+                && metadata.nlink() == 1
+                && metadata.len() == self.proof.content.logical_len
+                && FileAccessSnapshot::capture(&anchor)?.mode & 0o222 == 0
+                && hash_exact(&anchor, metadata.len())? == self.proof.content.content_hash
+                && file_data_extents(&anchor, metadata.len())? == self.proof.content.data_extents,
+            "detached anchor no longer matches its capture proof"
+        );
+        Ok(())
+    }
+
+    fn matches_edit(&self, edit: &LinkFreezeEditIntent) -> bool {
+        edit.anchor_id == self.anchor_id
+            && edit.source_id == self.source_id
+            && edit.original_access == self.proof.original_access
+            && edit.frozen_content == self.proof.content
+    }
+
     fn content_matches(&self, source: &File) -> anyhow::Result<bool> {
         let metadata = source.metadata()?;
         Ok(metadata.len() == self.proof.content.logical_len
@@ -302,9 +524,70 @@ mod tests {
 
     use mb_core::{KeyMaterial, Seed};
 
-    use super::{LinkFreezeCaptureIntent, LinkFreezeCapturePhase};
-    use crate::anchor::PinnedDirectory;
-    use crate::link_freeze::{FileAccessSnapshot, FileWriteExclusion, install_probe_acl};
+    use super::{
+        CAPTURE_INTENT_KIND, LegacyCaptureIntentV1, LinkFreezeCaptureIntent, LinkFreezeCapturePhase,
+    };
+    use crate::anchor::{NativeFileId, PinnedDirectory};
+    use crate::link_freeze::{
+        AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion, FrozenAnchorProof,
+        IndependentSparseCopy, install_probe_acl,
+    };
+
+    #[test]
+    fn version_one_frozen_capture_intent_migrates_before_replay() {
+        let root = test_directory();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([95; 32]));
+        let store =
+            crate::database::ControlStore::open(root.path().join("control.db"), &keys).unwrap();
+        let anchor_id = uuid::Uuid::new_v4();
+        let legacy = LegacyCaptureIntentV1 {
+            format_version: 1,
+            anchor_id,
+            source_parent_id: NativeFileId {
+                filesystem_id: 7,
+                inode: 11,
+            },
+            anchor_parent_id: NativeFileId {
+                filesystem_id: 7,
+                inode: 12,
+            },
+            source_id: NativeFileId {
+                filesystem_id: 7,
+                inode: 13,
+            },
+            source_name: "source".into(),
+            anchor_name: "anchor".into(),
+            proof: FrozenAnchorProof {
+                original_access: FileAccessSnapshot {
+                    format_version: 1,
+                    mode: 0o644,
+                    access_acl: AccessAclSnapshot::Absent,
+                },
+                content: IndependentSparseCopy {
+                    logical_len: 0,
+                    content_hash: [0; 32],
+                    data_extents: Vec::new(),
+                },
+            },
+            phase: LinkFreezeCapturePhase::Frozen,
+        };
+        let old = mb_core::canonical_bytes(&legacy).unwrap();
+        store
+            .put_record(CAPTURE_INTENT_KIND, anchor_id.as_bytes(), &old)
+            .unwrap();
+        let migrated = LinkFreezeCaptureIntent::load(&store, anchor_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.format_version, 2);
+        assert_eq!(migrated.phase(), LinkFreezeCapturePhase::Frozen);
+        assert_eq!(migrated.private_inode, None);
+        assert_eq!(
+            store
+                .get_record(CAPTURE_INTENT_KIND, anchor_id.as_bytes())
+                .unwrap(),
+            Some(mb_core::canonical_bytes(&migrated).unwrap())
+        );
+    }
 
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN for fanotify permission events"]
@@ -443,6 +726,88 @@ mod tests {
                         .is_err()
                 );
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN for fanotify permission events"]
+    fn capture_edit_handoff_survives_each_journal_boundary() {
+        for interruption in 0..=3 {
+            let root = test_directory();
+            let source_path = root.path().join("source");
+            let anchor_path = root.path().join("anchor");
+            let source = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&source_path)
+                .unwrap();
+            source.set_len(1024 * 1024).unwrap();
+            source.write_at(b"anchored", 4096).unwrap();
+            source.sync_all().unwrap();
+            drop(source);
+            let original_inode = fs::metadata(&source_path).unwrap().ino();
+            let parent = PinnedDirectory::open(root.path()).unwrap();
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([94; 32]));
+            let database_path = root.path().join("control.db");
+            let store = crate::database::ControlStore::open(&database_path, &keys).unwrap();
+            let anchor_id = uuid::Uuid::new_v4();
+            let frozen = LinkFreezeCaptureIntent::begin(
+                &store, anchor_id, &parent, "source", &parent, "anchor",
+            )
+            .unwrap()
+            .resume(&store, &parent, &parent)
+            .unwrap()
+            .unwrap();
+            let mut edit = frozen.clone().begin_edit(&store, &parent, &parent).unwrap();
+            if interruption >= 1 {
+                edit = edit
+                    .resume(&store, &parent, "source", &parent, "anchor")
+                    .unwrap();
+                assert_eq!(
+                    edit.phase(),
+                    crate::link_freeze::LinkFreezeEditPhase::Editable
+                );
+            }
+            if interruption == 2 {
+                let detached = frozen.mark_detached(&store, &parent, &edit).unwrap();
+                assert_eq!(detached.phase(), LinkFreezeCapturePhase::Detached);
+            }
+            drop(store);
+            let store = crate::database::ControlStore::open(&database_path, &keys).unwrap();
+            let capture = LinkFreezeCaptureIntent::load(&store, anchor_id)
+                .unwrap()
+                .unwrap();
+            if interruption >= 2 {
+                fs::remove_file(&source_path).unwrap();
+            }
+            let detached = if interruption == 2 {
+                capture.verify_detached_anchor(&store, &parent).unwrap()
+            } else if interruption == 3 {
+                capture.finish_detached_edit(&store, &parent).unwrap()
+            } else {
+                capture.resume(&store, &parent, &parent).unwrap().unwrap()
+            };
+            assert_eq!(detached.phase(), LinkFreezeCapturePhase::Detached);
+            assert!(
+                crate::link_freeze::LinkFreezeEditIntent::load(&store, anchor_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_ne!(fs::metadata(&anchor_path).unwrap().ino(), original_inode);
+            assert_eq!(fs::metadata(&anchor_path).unwrap().nlink(), 1);
+            assert_eq!(
+                fs::read(&anchor_path).unwrap()[4096..4112],
+                *b"anchored\0\0\0\0\0\0\0\0"
+            );
+            if interruption < 2 {
+                fs::write(&source_path, b"edited").unwrap();
+                assert_eq!(
+                    fs::read(&anchor_path).unwrap()[4096..4112],
+                    *b"anchored\0\0\0\0\0\0\0\0"
+                );
+            }
+            detached.verify_detached_anchor(&store, &parent).unwrap();
         }
     }
 
