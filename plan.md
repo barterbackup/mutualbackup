@@ -746,6 +746,21 @@ Proactive background repair comes later.
   write/append/truncate permission. A hard link alone is not a snapshot. The
   protection is user-reversible and defends against ordinary accidental
   modification, not a malicious process with the user's authority.
+- On Linux, make the long-lived edit guard a versioned FUSE worktree view over
+  an inaccessible private source directory on the same filesystem. The
+  short-lived lease/fanotify freeze remains the enrollment barrier; the FUSE
+  view is the path ordinary applications use afterward. Read-only opens may
+  use kernel FUSE passthrough to the frozen source inode. Before returning a
+  writable handle, accepting a shared writable mapping, or applying a
+  pathname truncate, allocation, or owner `chmod`, the view must run and
+  durably finish the existing sparse-detach journal, then pass through only
+  the independent editable inode. Rename and unlink preserve the immutable
+  anchor without detaching. A mount/daemon failure must make the view fail
+  closed, never expose the private source path or silently resume through it.
+  Probe the mount, passthrough capability, and inaccessible lower path locally
+  before guarded enrollment; lack of any required capability is an explicit
+  unsupported-backend result. See the [kernel FUSE passthrough design](https://docs.kernel.org/filesystems/fuse/fuse-passthrough.html)
+  and [FUSE I/O modes](https://docs.kernel.org/filesystems/fuse/fuse-io.html).
 - Before enabling that backend, extend the root probe through hard-link →
   guard/freeze → reject in-place mutation → allow rename/unlink/atomic
   replacement while the anchor survives → sparse detach → exact permission
@@ -763,8 +778,9 @@ Proactive background repair comes later.
   permissions. Failure or `ENOSPC` leaves the working inode frozen.
 - Evaluate persistent NTFS VSS only after testing service authorization,
   batching, diff-area headroom and eviction, and missing-snapshot reconciliation.
-  Native macOS support, portable ACL/xattr handling, independently chunked local
-  packing, and optional userspace-COW/FUSE are also post-prototype work.
+  Native macOS support, portable ACL/xattr handling, and independently chunked
+  local packing are also post-prototype work. The Linux FUSE guard above is a
+  Milestone 6 requirement for guarded link-freeze enrollment.
 
 ### Prototype databases
 
@@ -3180,8 +3196,11 @@ backend gates. A command being present does not by itself close its slice.
 - Then implement the already planned guarded link-freeze backend, including its
   atomic sparse private-copy transition when the user needs to edit the
   original inode. Preserve file IDs, paths, and metadata without freezing
-  directory names or removal. Never expose a raw hard link between an editable
-  worktree and an immutable anchor.
+  directory names or removal. Implement the long-lived Linux FUSE view above
+  before selecting this backend for any root; include read-only passthrough,
+  writable-open and shared-mapping detach, `chmod` and pathname truncate,
+  rename/unlink, and remount recovery. Never expose a raw hard link between an
+  editable worktree and an immutable anchor.
 - Then validate the already planned native Windows NTFS capture, including VSS
   where appropriate, macOS cloning, platform watchers, portable metadata/ACL
   policy, and explicit application-consistent capture hooks. Each enrolled root

@@ -78,8 +78,13 @@
   until detach is durable, even after owner `chmod`, pathname truncate,
   pre-opened handles, rename, and restart. `FAN_PRE_ACCESS` covers both reads
   and writes and reports a range rather than an edit intent, so it cannot be
-  used alone as a write detector. Keep guarded enrollment and Git staging and
-  checkout gated until the complete privileged probe passes. See
+  used alone as a write detector. Use the versioned FUSE worktree view specified
+  in the plan: pass through reads of frozen inodes, complete durable detach
+  before writable opens, shared mappings, truncate, allocation, or `chmod`,
+  and fail closed on mount/daemon loss. The existing 10 link-freeze and 2 guarded-root
+  privileged tests pass locally on Linux 7.2.5; they cover short-lived freeze
+  and replay, not this long-lived view. Keep guarded enrollment and Git staging
+  and checkout gated until the complete privileged probe passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
   and [fanotify(7)](https://man7.org/linux/man-pages/man7/fanotify.7.html).
 
