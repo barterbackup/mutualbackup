@@ -3353,6 +3353,7 @@ mod tests {
                 .map(|object| object.oid)
                 .collect(),
             blob_oids: pinned_graph.blobs.iter().map(|blob| blob.oid).collect(),
+            anchor_ids: Default::default(),
         };
         let signed_prune = local.prune_unreachable(&protected).unwrap();
         assert_eq!(signed_prune.metadata_objects_removed, 0);
@@ -4515,6 +4516,70 @@ mod tests {
         backup.remove().unwrap();
         drop(repo);
         anchors[0].remove().unwrap();
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn prune_reclaims_duplicate_live_blob_anchors_but_keeps_physical_pins() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-prune-duplicates-{}", Uuid::new_v4()));
+        let source_root = run_root.join("work");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(source_root.join("tracked"), b"exact\r\nbytes\0").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [25_u8; 32];
+        let repo = GitRepository::init(&source_root, repository_id, &key).unwrap();
+        let first = repo.stage_file("tracked").unwrap();
+        repo.commit("Author", "a@example.test", "first").unwrap();
+        let second = repo.stage_file("tracked").unwrap();
+        let third = repo.stage_file("tracked").unwrap();
+        assert_eq!(first.oid, second.oid);
+        assert_eq!(first.oid, third.oid);
+        assert_ne!(first.anchor_id, second.anchor_id);
+        assert_ne!(second.anchor_id, third.anchor_id);
+        let oid = Oid::from_bytes(&first.oid).unwrap();
+        assert_eq!(repo.anchors_for_oid(oid).unwrap().len(), 3);
+
+        let roots = crate::GitPruneRoots {
+            anchor_ids: std::iter::once(first.anchor_id).collect(),
+            ..Default::default()
+        };
+        let report = repo.prune_unreachable(&roots).unwrap();
+        assert_eq!(report.native_anchors_removed, 1);
+        let remaining = repo.anchors_for_oid(oid).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(
+            remaining
+                .iter()
+                .any(|anchor| anchor.anchor_id == first.anchor_id)
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|anchor| anchor.anchor_id == third.anchor_id)
+        );
+
+        let report = repo
+            .prune_unreachable(&crate::GitPruneRoots::default())
+            .unwrap();
+        assert_eq!(report.native_anchors_removed, 1);
+        let remaining = repo.anchors_for_oid(oid).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].anchor_id, third.anchor_id);
+        assert_eq!(repo.status().unwrap().changes.len(), 0);
+        assert_eq!(
+            fs::read(source_root.join("tracked")).unwrap(),
+            b"exact\r\nbytes\0"
+        );
+        drop(repo);
+        let reopened = GitRepository::open(&source_root, repository_id, &key).unwrap();
+        assert_eq!(reopened.anchors_for_oid(oid).unwrap().len(), 1);
+        drop(reopened);
+        remaining[0].remove().unwrap();
         fs::remove_dir_all(run_root).unwrap();
     }
 

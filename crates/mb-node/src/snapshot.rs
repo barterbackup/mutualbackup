@@ -517,6 +517,23 @@ pub(crate) fn git_prune_capture_pending(
     Ok(false)
 }
 
+/// Local sector recipes can keep an exact Git anchor serving encrypted backup
+/// data after its branch or index entry has gone away. Prune must preserve that
+/// physical source until the recipe itself is retired by guild GC.
+pub(crate) fn git_prune_recipe_anchor_ids(control: &ControlStore) -> Result<BTreeSet<Uuid>> {
+    let mut anchors = BTreeSet::new();
+    for (record_id, encoded) in control.records("local-sector")? {
+        let recipe: LocalSectorRecipe = decode_canonical(&encoded)?;
+        if record_id != recipe.reference.id {
+            bail!("local sector recipe key does not match its reference");
+        }
+        if let LocalPlaintextSource::StableAnchorFile { locator, .. } = recipe.source {
+            anchors.insert(locator.anchor_id);
+        }
+    }
+    Ok(anchors)
+}
+
 fn decode_recovery_anchor_intent(bytes: &[u8]) -> Result<(RecoveryAnchorIntent, bool)> {
     if let Ok(intent) = decode_canonical::<RecoveryAnchorIntent>(bytes)
         && intent.format_version == 2
@@ -3394,6 +3411,59 @@ fn hex_id(id: &[u8; 32]) -> String {
 #[cfg(test)]
 mod metadata_compatibility_tests {
     use super::*;
+
+    #[test]
+    fn git_prune_pins_exact_anchor_used_by_a_local_sector_recipe() {
+        let temporary = tempfile::tempdir().unwrap();
+        let control =
+            ControlStore::open_with_key(temporary.path().join("control.db"), &[42; 32]).unwrap();
+        let anchor_id = Uuid::new_v4();
+        let reference = SectorRef {
+            id: [43; 32],
+            root: [44; 32],
+            logical_len: 1,
+        };
+        let recipe = LocalSectorRecipe {
+            guild_id: [45; 32],
+            reference: reference.clone(),
+            source: LocalPlaintextSource::StableAnchorFile {
+                locator: StableAnchorFileLocator {
+                    area: mb_store::StableAnchorAreaLocator {
+                        area_id: Uuid::new_v4(),
+                        path_hint: temporary.path().to_path_buf(),
+                        filesystem_id: 1,
+                        volume_root_hint: temporary.path().to_path_buf(),
+                    },
+                    anchor_id,
+                    relative_path: "payload".to_owned(),
+                },
+                offset: 0,
+            },
+        };
+        control
+            .put_record(
+                "local-sector",
+                &reference.id,
+                &canonical_bytes(&recipe).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            git_prune_recipe_anchor_ids(&control).unwrap(),
+            BTreeSet::from([anchor_id])
+        );
+        control
+            .delete_record("local-sector", &reference.id)
+            .unwrap();
+        assert!(git_prune_recipe_anchor_ids(&control).unwrap().is_empty());
+        control
+            .put_record(
+                "local-sector",
+                &[46; 32],
+                &canonical_bytes(&recipe).unwrap(),
+            )
+            .unwrap();
+        assert!(git_prune_recipe_anchor_ids(&control).is_err());
+    }
 
     #[test]
     fn historical_git_graph_intent_migrates_with_main_head() {

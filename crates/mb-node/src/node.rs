@@ -42,11 +42,12 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::control::{GitRepositoryInfo, GitStagedFile, NodeStatus, ProtectedRoot};
 use crate::snapshot::{
     WriterCredentials, abandon_recovered_anchor_capture, build_revision_restore,
-    git_prune_capture_pending, install_inline_recipe, install_recovered_sector_recipe,
-    make_restore_root_private_at, prepare_revision, publish_owned_restore,
-    reanchor_recovered_revision, reconcile_pending_captures, recovered_recipe_is_stable,
-    render_sector, restore_revision_from_source, restore_signed_root_metadata_at,
-    resume_restore_publication, retire_revision_anchor, revision_git_backup, revision_head_id,
+    git_prune_capture_pending, git_prune_recipe_anchor_ids, install_inline_recipe,
+    install_recovered_sector_recipe, make_restore_root_private_at, prepare_revision,
+    publish_owned_restore, reanchor_recovered_revision, reconcile_pending_captures,
+    recovered_recipe_is_stable, render_sector, restore_revision_from_source,
+    restore_signed_root_metadata_at, resume_restore_publication, retire_revision_anchor,
+    revision_git_backup, revision_head_id,
 };
 use crate::volume::{StorageScrubReport, StorageVolumes, VolumeReaderConfig, open_control_store};
 
@@ -1968,6 +1969,9 @@ impl Node {
                 include_revision(revision)?;
             }
         }
+        protected
+            .anchor_ids
+            .extend(git_prune_recipe_anchor_ids(&self.control)?);
         self.open_git_repository(repository_id)?
             .prune_unreachable(&protected)
             .map_err(Into::into)

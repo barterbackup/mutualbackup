@@ -60,6 +60,9 @@ pub enum GitPruneError {
 pub struct GitPruneRoots {
     pub metadata_oids: HashSet<[u8; 20]>,
     pub blob_oids: HashSet<[u8; 20]>,
+    /// Exact native sources still needed by local sector recipes. These may
+    /// outlive the Git ref that originally named their blob.
+    pub anchor_ids: HashSet<Uuid>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -108,6 +111,31 @@ fn run_after_catalog_delete_hook() {
             hook();
         }
     });
+}
+
+fn retained_physical_ids(
+    live_blobs: &HashSet<[u8; 20]>,
+    pinned: &HashSet<Uuid>,
+    mapped: impl Iterator<Item = ([u8; 20], u64, Uuid)>,
+) -> HashSet<Uuid> {
+    let mut retained = pinned.clone();
+    let mut by_filesystem = HashMap::<([u8; 20], u64), (Uuid, bool)>::new();
+    for (oid, filesystem_id, anchor_id) in mapped {
+        if !live_blobs.contains(&oid) {
+            continue;
+        }
+        let entry = by_filesystem
+            .entry((oid, filesystem_id))
+            .or_insert((anchor_id, false));
+        entry.0 = entry.0.min(anchor_id);
+        entry.1 |= pinned.contains(&anchor_id);
+    }
+    for (fallback, has_pin) in by_filesystem.into_values() {
+        if !has_pin {
+            retained.insert(fallback);
+        }
+    }
+    retained
 }
 
 /// Finish physical deletion after an atomic catalog retirement. Anchor removal
@@ -187,6 +215,8 @@ pub(crate) fn prune_unreachable(
             indexed_anchors.insert((entry.oid, entry.anchor_id));
         }
     }
+    let mut pinned_anchors = protected.anchor_ids.clone();
+    pinned_anchors.extend(indexed_anchors.iter().map(|(_, anchor_id)| *anchor_id));
 
     let all_metadata = verified_metadata_ids(control, repository_id)?;
     if live_metadata
@@ -210,6 +240,8 @@ pub(crate) fn prune_unreachable(
     let prefix = object_kind_prefix(repository_id);
     let mut mapped_anchors = HashMap::new();
     let mut mapped_blobs = HashSet::new();
+    let mut native_by_oid = HashMap::new();
+    let mut mapped = Vec::new();
     for (kind, key, encoded) in control.records_with_kind_prefix(&prefix)? {
         let suffix = kind
             .strip_prefix(&prefix)
@@ -227,18 +259,38 @@ pub(crate) fn prune_unreachable(
             return Err(GitPruneError::IncompatibleRecord);
         }
         let oid_bytes: [u8; 20] = oid.as_bytes().try_into().expect("SHA-1 OID");
+        if native_by_oid
+            .insert(oid_bytes, (anchor.content_hash, anchor.logical_len))
+            .is_some_and(|previous| previous != (anchor.content_hash, anchor.logical_len))
+        {
+            return Err(GitPruneError::IncompatibleRecord);
+        }
         mapped_blobs.insert(oid_bytes);
         indexed_anchors.remove(&(oid_bytes, anchor.anchor_id));
-        if !live_blobs.contains(&oid_bytes) {
+        mapped.push((oid_bytes, kind, key, anchor));
+    }
+    if !indexed_anchors.is_empty() || !live_blobs.is_subset(&mapped_blobs) {
+        return Err(GitPruneError::MissingProtectedObject);
+    }
+
+    // An OID can have many independently captured reflinks. Keep exact index
+    // and recipe sources, then one source per filesystem for each live blob.
+    // This keeps checkout possible without retaining every redundant capture.
+    let retained_anchors = retained_physical_ids(
+        &live_blobs,
+        &pinned_anchors,
+        mapped
+            .iter()
+            .map(|(oid, _, _, anchor)| (*oid, anchor.area.filesystem_id, anchor.anchor_id)),
+    );
+    for (_, kind, key, anchor) in mapped {
+        if !retained_anchors.contains(&anchor.anchor_id) {
             candidates.push(Candidate {
                 kind,
                 key,
                 anchor: Some(anchor),
             });
         }
-    }
-    if !indexed_anchors.is_empty() || !live_blobs.is_subset(&mapped_blobs) {
-        return Err(GitPruneError::MissingProtectedObject);
     }
     if candidates.len() > crate::history::MAX_GRAPH_OBJECTS * 2 {
         return Err(GitPruneError::TooManyObjects);
@@ -283,4 +335,39 @@ pub(crate) fn prune_unreachable(
         resume_pending_prune(control, repository_id)?;
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn physical_prune_pins_recipes_and_index_and_keeps_one_source_per_filesystem() {
+        let live = [1; 20];
+        let dead = [2; 20];
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let c = Uuid::from_u128(3);
+        let d = Uuid::from_u128(4);
+        let e = Uuid::from_u128(5);
+        let retained = retained_physical_ids(
+            &HashSet::from([live]),
+            &HashSet::from([b, d]),
+            [
+                (live, 1, a),
+                (live, 1, b),
+                (live, 2, c),
+                (dead, 1, d),
+                (dead, 1, e),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(retained, HashSet::from([b, c, d]));
+        let without_pins = retained_physical_ids(
+            &HashSet::from([live]),
+            &HashSet::new(),
+            [(live, 1, b), (live, 1, a), (live, 2, c), (dead, 1, d)].into_iter(),
+        );
+        assert_eq!(without_pins, HashSet::from([a, c]));
+    }
 }
