@@ -63,6 +63,10 @@ An interrupted registration that has not started checkout can be pruned without
 It only forgets that worktree's local metadata; its branch and shared commits
 remain available. Run the separate history `prune` (or `gc`) command to reclaim
 anchors that no remaining ref or index needs.
+History prune reports removed logical anchor bytes and leaves physical bytes
+unknown when shared extents prevent an exact live accounting. The provisioned
+Linux Git gate measures Btrfs shared extents through stage and checkout and
+measures unique extents removed after pruning an unreferenced branch.
 `mutualgit restore PATH` restores working files from the staged index without
 moving HEAD or changing that index; `mutualgit restore --staged PATH` resets
 the selected index paths from HEAD without changing working files. Use both
