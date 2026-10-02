@@ -26,7 +26,10 @@ them as ADRs and test vectors before promising wire compatibility.
   SHA-1 or Git serialization from scratch. Git commits, branches, and worktrees
   are owner-local history represented in ordinary protected user data and
   metadata. Guild protocol authority remains the signed MutualBackup revision
-  and checkpoint, and peers need no Git awareness.
+  and checkpoint, and peers need no Git awareness. Present the supported basic
+  commands through a Git-style local CLI; its native repository is
+  `.mutualbackup`, while ordinary Git communicates through object/pack exchange
+  rather than opening that directory as `.git`.
 - The Git-compatible frontend preserves tracked file bytes exactly. No command
   automatically fixes line endings or applies another content conversion, even
   when the host's Git configuration enables one. Git clean filters can run
@@ -701,7 +704,10 @@ Proactive background repair comes later.
   whose bytes disagree.
 - For checkout or a second worktree, restore verified anchor bytes by reflink
   on a capable same-filesystem destination, preserving the exact blob bytes.
-  Never hard-link an editable worktree file directly to an immutable anchor.
+  Never hard-link an editable worktree file directly to an immutable anchor:
+  writing through that link would mutate the committed blob. A backend may use
+  hard links only if its guard first makes the shared inode safely immutable
+  and editing detaches it without changing the anchor.
   Make any unavoidable cross-filesystem copy explicit and bounded, and do not
   confuse checkout copy policy with the no-silent-copy capture rule. Protect
   dirty or untracked worktree files from destructive checkout. Keep per-worktree
@@ -3075,10 +3081,12 @@ backend gates. A command being present does not by itself close its slice.
 - Add the separate Git-compatible local binary for `init`, `add`, `status`,
   `commit`, `log`, `diff`, `branch`, `tag`, `switch`/`checkout`, `restore`/`reset`,
   `merge`, multiple worktrees, `fetch`/`pull`/`push`, explicit `pin`/`unpin`,
-  and history `prune`/`gc`. Document the supported syntax and fail clearly for
-  unsupported Git commands instead of passing them to stock Git. Implement the
-  supported Git index, commit DAG, refs, and safe
-  worktree operations over the daemon's single-writer catalog. Stage exact file
+  and history `prune`/`gc`. Make the supported subset invocable as `git` through
+  an explicit install name or PATH choice. Match basic command and option
+  behavior where safe; fail clearly for unsupported Git commands or options
+  instead of passing them to stock Git. Implement the supported Git index,
+  commit DAG, refs, and safe worktree operations over the daemon's single-writer
+  catalog. Stage exact file
   bytes in durable reflink anchors and reflink checkouts on capable same-
   filesystem destinations; use guarded link-freeze only after its own gate.
   A requested merge may create new content; capture its exact resulting bytes
@@ -3089,13 +3097,13 @@ backend gates. A command being present does not by itself close its slice.
   regardless of inherited Git config or attributes. Force Git-library calls
   that touch blob or working-tree bytes onto raw-byte paths; never let a Git
   library's default checkout/filter behavior re-enable conversion, including
-  during merge (including `merge.renormalize`), reset/restore, pull, and
+  during merge with `merge.renormalize`, reset/restore, pull, and
   worktree creation. Reject any command option that requests renormalization
   or a content filter. Import Git blob bytes as raw file bytes and export the
   same bytes. Treat incoming blob bytes as authoritative; do not try to reverse
   conversions already performed by another client's worktree. Report explicit
-  repository transforming rules
-  before changing the index, refs, anchors, or worktree.
+  repository transforming rules before changing the index, refs, anchors, or
+  worktree.
   Never run a configured filter command. Define safe support for Git file
   modes, symlinks, and path names rather than silently dropping them.
 - Protect the whole reachable Git commit graph and refs as owner-owned backed-up
@@ -3113,8 +3121,11 @@ backend gates. A command being present does not by itself close its slice.
   or config may transform its external working tree outside our control.
 - Define Git-facing history expiry and prune/GC over refs, index, worktrees,
   retained signed revisions, explicit protection pins, and in-flight work.
-  Deletion must release unreachable native anchors and trigger existing remote
-  cleanup; it must never collect an object still needed for recovery. Include
+  Prune is a real data-deletion operation: once no such protection remains,
+  it must release unreachable native anchors, retire their backed-up sectors
+  through the existing remote cleanup path, and make the removed history
+  unavailable to normal recovery. It must never collect an object still needed
+  for a retained revision or live worktree. Include
   `pin`, `unpin`, and pin listing in the local command set, and document that
   the current frontend has no implicit reflog retention. Report
   reclaimable logical bytes separately from physically freed shared extents.
@@ -3131,7 +3142,8 @@ backend gates. A command being present does not by itself close its slice.
 - Close the Git phase with a local gate for exact-byte add/edit/commit/checkout
   and multi-worktree cases, asserting captured source = staged blob = committed
   blob = restored file when no edit intervenes, and asserting imported/exported
-  blob bytes and IDs remain identical; mixed LF/CRLF, binary NUL, non-UTF-8
+  blob bytes and IDs remain identical even when a stock Git peer has different
+  line-ending or filter settings; mixed LF/CRLF, binary NUL, non-UTF-8
   payloads, and conversion-inducing system/global/repository `core.autocrlf`,
   `core.eol`, and `merge.renormalize` settings and `.gitattributes` rules for `text=auto`,
   `eol`, `filter`, `ident`, and `working-tree-encoding` across add, merge,
