@@ -2851,7 +2851,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
-    fn attributes_reject_conversion_before_stage_and_preserve_raw_checkout_bytes() {
+    fn transforming_attributes_are_inert_for_stage_commit_and_checkout() {
         let test_root = PathBuf::from(
             std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
                 .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
@@ -2864,19 +2864,13 @@ mod tests {
         let repository_id = Uuid::new_v4();
         let key = [97_u8; 32];
         let local = GitRepository::init(&source_root, repository_id, &key).unwrap();
-        assert!(matches!(
-            local.stage_file("payload.txt"),
-            Err(RepositoryError::Stage(StageError::Attributes(
-                crate::GitAttributesError::ContentConversion
-            )))
-        ));
-        assert!(local.staged_entry("payload.txt").unwrap().is_none());
-        assert!(local.status().unwrap().pending_adds.is_empty());
-        assert!(local.export_graph_source().unwrap().blobs.is_empty());
-
-        fs::write(source_root.join(".gitattributes"), b"*.txt -text\n").unwrap();
         local.stage_file(".gitattributes").unwrap();
         local.stage_file("payload.txt").unwrap();
+        let expected = git2::Oid::hash_object(git2::ObjectType::Blob, b"base\r\nbytes\0").unwrap();
+        assert_eq!(
+            local.staged_entry("payload.txt").unwrap().unwrap().oid,
+            expected.as_bytes()
+        );
         local.commit("Author", "a@example.test", "base").unwrap();
         local.create_branch("topic").unwrap();
         local.switch_branch("topic").unwrap();
@@ -2894,19 +2888,27 @@ mod tests {
             b"*.txt filter=convert\n",
         )
         .unwrap();
-        assert!(matches!(
-            local.stage_file(".gitattributes"),
-            Err(RepositoryError::Stage(StageError::Attributes(
-                crate::GitAttributesError::ContentConversion
-            )))
-        ));
-        assert!(matches!(
-            local.stage_file("payload.txt"),
-            Err(RepositoryError::Stage(StageError::Attributes(
-                crate::GitAttributesError::ContentConversion
-            )))
-        ));
+        local.stage_file(".gitattributes").unwrap();
+        local.stage_file("payload.txt").unwrap();
+        assert_eq!(
+            local.staged_entry("payload.txt").unwrap().unwrap().oid,
+            expected.as_bytes()
+        );
         assert!(local.status().unwrap().pending_adds.is_empty());
+        local
+            .commit("Author", "a@example.test", "filter rule")
+            .unwrap();
+        local
+            .merge_branch("topic", "Author", "a@example.test")
+            .unwrap();
+        assert_eq!(
+            fs::read(source_root.join("payload.txt")).unwrap(),
+            b"topic\nraw\r\n"
+        );
+        assert_eq!(
+            fs::read(source_root.join(".gitattributes")).unwrap(),
+            b"*.txt filter=convert\n"
+        );
         let graph = local.export_graph_source().unwrap();
         drop(local);
         for blob in graph.blobs {
@@ -2917,7 +2919,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
-    fn bare_fetch_rejects_transforming_attributes_before_import() {
+    fn bare_fetch_imports_transforming_attributes_as_raw_bytes() {
         let test_root = PathBuf::from(
             std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
                 .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
@@ -2961,16 +2963,23 @@ mod tests {
         let repository_id = Uuid::new_v4();
         let key = [98_u8; 32];
         let local = GitRepository::init(&source_root, repository_id, &key).unwrap();
-        assert!(matches!(
-            local.fetch_bare(&bare_root),
-            Err(RepositoryError::Fetch(crate::FetchError::Attributes(
-                crate::GitAttributesError::ContentConversion
-            )))
-        ));
-        assert!(local.remote_branches().unwrap().is_empty());
-        assert!(local.export_graph_source().unwrap().blobs.is_empty());
+        assert_eq!(local.fetch_bare(&bare_root).unwrap(), 1);
+        assert_eq!(local.remote_branches().unwrap().len(), 1);
+        local.pull_bare(&bare_root, "", "").unwrap();
+        assert_eq!(
+            fs::read(source_root.join(".gitattributes")).unwrap(),
+            b"*.txt filter=convert\n"
+        );
+        assert_eq!(
+            fs::read(source_root.join("payload.txt")).unwrap(),
+            b"raw\r\nbytes\0"
+        );
         assert!(!filter_marker.exists());
+        let graph = local.export_graph_source().unwrap();
         drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
         fs::remove_dir_all(run_root).unwrap();
     }
 

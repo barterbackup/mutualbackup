@@ -92,9 +92,12 @@ refspec is given; explicit branch and tag refspecs use the shared history.
 existing local tag may be fetched again at the same object ID, but a remote
 rewrite or tag namespace conflict rejects the entire fetch without moving any
 refs.
-`mutualgit --help` gives the current command forms. Staging and checkout do
-not apply Git line-ending rules or content filters. A transforming
-`.gitattributes` rule is rejected before publishing staged bytes.
+`mutualgit --help` gives the current command forms. Staging, checkout, merge,
+and import keep raw file bytes; Git line-ending rules, content filters,
+`ident`, and working-tree encodings are inert in this binary. A
+`.gitattributes` file remains ordinary tracked data, including when it asks
+stock Git to transform files. `mutualgit status` reports the raw-byte policy.
+Stock Git may still convert its own working-tree files after exchanging blobs.
 
 Install `git-remote-mutualbackup` on `PATH` to fetch from or push to this history
 with stock Git. The URL after `mutualbackup::` is the absolute path to the

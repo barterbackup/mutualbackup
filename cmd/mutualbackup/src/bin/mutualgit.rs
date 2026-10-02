@@ -152,7 +152,7 @@ enum Command {
         #[arg(long, alias = "staged")]
         cached: bool,
     },
-    /// Show staged, working-tree, and backup-protection state.
+    /// Show staged, working-tree, backup-protection, and raw-byte policy state.
     Status,
 }
 
@@ -1035,6 +1035,7 @@ async fn main() -> Result<()> {
                 bail!("daemon returned status for another repository");
             }
             println!("On branch {}", status.branch);
+            println!("Content conversion: disabled (raw file bytes)");
             if status.head_oid.is_some() {
                 if status.history_backed_up {
                     println!("Local history is protected by a signed backup");

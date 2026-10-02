@@ -21,7 +21,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::attributes::{is_attributes_path, validate_anchor};
 use crate::head::{
     HeadError, branch_selected_elsewhere, selected_branch, selected_branch_for_scope,
     selected_branch_record_for_scope, selected_ref, selected_ref_for_scope,
@@ -150,8 +149,6 @@ pub enum CheckoutError {
     GitAnchor(#[from] GitAnchorError),
     #[error("Git merge state error: {0}")]
     MergeState(#[from] MergeBlobError),
-    #[error("Git attributes policy error: {0}")]
-    Attributes(#[from] crate::GitAttributesError),
     #[error("Git object error: {0}")]
     Git(#[from] git2::Error),
     #[error("working-tree I/O error: {0}")]
@@ -1546,15 +1543,6 @@ fn begin_checkout_to_for_scope(
     }
     let old_tree = files_for_commit(control, repository_id, target.old_oid)?;
     let new_tree = files_for_commit(control, repository_id, Some(target.new_oid))?;
-    for (path, (oid, mode)) in &new_tree {
-        if is_attributes_path(path) && matches!(mode, 0o100644 | 0o100755) {
-            let anchor = anchors_for_oid(control, repository_id, Oid::from_bytes(oid)?)?
-                .into_iter()
-                .next()
-                .ok_or(CheckoutError::MissingAnchor)?;
-            validate_anchor(&anchor)?;
-        }
-    }
     let staged = staged_entries_for_scope(control, scope)?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
@@ -1928,20 +1916,6 @@ fn begin_index_or_head_restore(
         if let Some((oid, mode)) = target {
             entry_kind(mode)?;
             target_tree.insert(path.clone(), (oid, mode));
-            if is_attributes_path(path) && matches!(mode, 0o100644 | 0o100755) {
-                let anchors = anchors_for_oid(control, repository_id, Oid::from_bytes(&oid)?)?;
-                let anchor = if hard_reset {
-                    anchors.first()
-                } else {
-                    anchors.iter().find(|anchor| {
-                        staged
-                            .get(path)
-                            .is_some_and(|index| index.anchor_id == anchor.anchor_id)
-                    })
-                }
-                .ok_or(CheckoutError::MissingAnchor)?;
-                validate_anchor(anchor)?;
-            }
         }
     }
     let old_directories = parent_directory_paths(&old_tree)?;

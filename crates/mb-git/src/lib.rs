@@ -13,7 +13,6 @@ use mb_store::SourceBackendKind;
 use mb_store::{AnchorError, FileAnchorManifest};
 use thiserror::Error;
 
-mod attributes;
 #[cfg(target_os = "linux")]
 mod backup;
 #[cfg(target_os = "linux")]
@@ -43,7 +42,6 @@ mod status;
 #[cfg(target_os = "linux")]
 mod worktree;
 mod worktree_scope;
-pub use attributes::GitAttributesError;
 #[cfg(target_os = "linux")]
 pub use backup::{GitBackupBlob, GitBackupDescriptor, GitBackupError, GitDataExtent};
 #[cfg(target_os = "linux")]
