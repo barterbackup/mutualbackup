@@ -65,7 +65,7 @@ impl GitBackupDescriptor {
 
     /// Validate the descriptor and identify blobs that must be usable as
     /// symlink targets when native anchors are imported on recovery.
-    pub(crate) fn symlink_blob_oids(&self) -> Result<HashSet<Oid>, GitBackupError> {
+    pub fn symlink_blob_oids(&self) -> Result<HashSet<Oid>, GitBackupError> {
         if !matches!(self.format_version, 1..=4)
             || self.repository_id.is_nil()
             || self.refs.len() > MAX_OBJECTS

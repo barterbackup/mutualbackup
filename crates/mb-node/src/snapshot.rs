@@ -1163,8 +1163,15 @@ fn prepare_git_backup_descriptor(
     let GitGraphIntent {
         graph, head_branch, ..
     } = source;
-    let mut blobs = Vec::with_capacity(graph.blobs.len());
-    for blob in graph.blobs {
+    let GitGraphSource {
+        format_version,
+        repository_id,
+        refs,
+        objects,
+        blobs: source_blobs,
+    } = graph;
+    let mut blobs = Vec::with_capacity(source_blobs.len());
+    for blob in &source_blobs {
         if mb_git::blob_oid_from_anchor(&blob.anchor)?.as_bytes() != blob.oid {
             bail!("Git backup blob ID does not match its immutable source anchor");
         }
@@ -1220,26 +1227,37 @@ fn prepare_git_backup_descriptor(
         });
     }
     let selected_ref = format!("refs/heads/{head_branch}");
-    let selected_is_present = graph
-        .refs
+    let selected_is_present = refs
         .iter()
         .any(|reference| reference.name == selected_ref.as_bytes());
-    let descriptor_version = if !graph.refs.is_empty() && !selected_is_present {
+    let descriptor_version = if !refs.is_empty() && !selected_is_present {
         4
-    } else if graph.format_version == 2 {
+    } else if format_version == 2 {
         3
     } else {
         2
     };
     let descriptor = GitBackupDescriptor {
         format_version: descriptor_version,
-        repository_id: graph.repository_id,
-        refs: graph.refs,
-        objects: graph.objects,
+        repository_id,
+        refs,
+        objects,
         blobs,
         head_branch,
     };
-    descriptor.validate()?;
+    let symlink_blobs = descriptor.symlink_blob_oids()?;
+    for blob in &source_blobs {
+        if symlink_blobs.contains(&git2::Oid::from_bytes(&blob.oid)?) {
+            let mut target = Vec::with_capacity(blob.anchor.logical_len as usize);
+            blob.anchor
+                .open_verified()?
+                .take(4096)
+                .read_to_end(&mut target)?;
+            if target.len() as u64 != blob.anchor.logical_len || target.contains(&0) {
+                bail!("Git backup symlink target cannot be recreated exactly");
+            }
+        }
+    }
     Ok(descriptor)
 }
 
@@ -3584,6 +3602,70 @@ mod metadata_compatibility_tests {
         assert_eq!(descriptor.blobs[0].oid, blob_oid.as_bytes());
         assert_eq!(recipes.len(), 1);
         assert_eq!(data_references.len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_backup_rejects_nul_symlink_with_matching_blob_id() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let anchor = mb_store::SourceBlobImportPlan::plan_direct(&source, 1)
+            .unwrap()
+            .capture(std::io::Cursor::new([0]))
+            .unwrap();
+        let repository = git2::Repository::init_bare(temporary.path().join("git")).unwrap();
+        let blob_oid = repository.blob(&[0]).unwrap();
+        let mut builder = repository.treebuilder(None).unwrap();
+        builder.insert("link", blob_oid, 0o120000).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = repository.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Author", "a@example.test").unwrap();
+        let commit_oid = repository
+            .commit(None, &signature, &signature, "link", &tree, &[])
+            .unwrap();
+        let odb = repository.odb().unwrap();
+        let object = |kind, oid: git2::Oid| GitGraphObject {
+            kind,
+            oid: oid.as_bytes().try_into().unwrap(),
+            bytes: odb.read(oid).unwrap().data().to_vec(),
+        };
+        let repository_id = Uuid::new_v4();
+        let graph = GitGraphSource {
+            format_version: 1,
+            repository_id,
+            refs: vec![GitGraphRef {
+                name: b"refs/heads/main".to_vec(),
+                oid: commit_oid.as_bytes().try_into().unwrap(),
+            }],
+            objects: vec![object(1, commit_oid), object(2, tree_oid)],
+            blobs: vec![mb_git::GitGraphBlobSource {
+                oid: blob_oid.as_bytes().try_into().unwrap(),
+                anchor,
+            }],
+        };
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([214; 32]));
+        assert!(
+            prepare_git_backup_descriptor(
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &keys,
+                [31; 32],
+                repository_id,
+                &[33; 32],
+                &mut 0,
+                &mut BTreeMap::new(),
+                GitGraphIntent {
+                    format_version: 2,
+                    guild_id: [31; 32],
+                    revision_id: Uuid::new_v4(),
+                    protected_root_id: repository_id,
+                    graph,
+                    head_branch: "main".to_owned(),
+                },
+            )
+            .is_err()
+        );
     }
 
     fn restore_fixture(
