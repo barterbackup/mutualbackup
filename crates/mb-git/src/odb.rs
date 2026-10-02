@@ -276,13 +276,52 @@ extern "C" fn free_backend(base: *mut raw::git_odb_backend) {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::fs;
-    use std::io::Read;
+    use std::io::{Cursor, Read};
     use std::path::PathBuf;
 
-    use mb_store::SourceFileCapturePlan;
+    use mb_store::{SourceBlobImportPlan, SourceFileCapturePlan};
     use uuid::Uuid;
 
     use super::NativeOdb;
+
+    #[test]
+    fn native_odb_reads_raw_imports_without_a_reflink_filesystem() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("protected");
+        fs::create_dir(&root).unwrap();
+        let small_bytes = b"raw\r\nbytes\0";
+        let large_bytes = vec![0x5a; 2 * 1024 * 1024];
+        let small_plan =
+            SourceBlobImportPlan::plan_direct(&root, small_bytes.len() as u64).unwrap();
+        let large_plan =
+            SourceBlobImportPlan::plan_direct(&root, large_bytes.len() as u64).unwrap();
+        let small = small_plan.capture(Cursor::new(small_bytes)).unwrap();
+        let large = large_plan.capture(Cursor::new(&large_bytes)).unwrap();
+        let small_oid = crate::blob_oid_from_anchor(&small).unwrap();
+        let large_oid = crate::blob_oid_from_anchor(&large).unwrap();
+        assert_eq!(
+            small_oid,
+            git2::Oid::hash_object(git2::ObjectType::Blob, small_bytes).unwrap()
+        );
+        let odb = NativeOdb::from_anchors([small, large]).unwrap();
+        assert!(odb.odb().exists(small_oid));
+        assert_eq!(odb.odb().read(small_oid).unwrap().data(), small_bytes);
+        assert_eq!(
+            odb.odb().read_header(large_oid).unwrap().0,
+            large_bytes.len()
+        );
+        assert!(odb.odb().read(large_oid).is_err());
+        let (mut stream, length, kind) = odb.odb().reader(large_oid).unwrap();
+        assert_eq!(length, large_bytes.len());
+        assert_eq!(kind, git2::ObjectType::Blob);
+        let mut actual = Vec::new();
+        stream.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, large_bytes);
+        drop(stream);
+        drop(odb);
+        small_plan.discard().unwrap();
+        large_plan.discard().unwrap();
+    }
 
     #[test]
     #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
