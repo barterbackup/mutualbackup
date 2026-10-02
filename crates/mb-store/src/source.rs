@@ -21,10 +21,11 @@ use crate::{GuardedFileCapturePlan, GuardedRootCapturePlan, probe_guarded_link_f
 
 /// Local source capabilities never enter a signed peer record. ReflinkV1
 /// provides byte-exact sparse reflink capture, raw imports, and reflink
-/// checkout. GuardedLinkFreezeV1 currently provides replayable whole-root
-/// capture and retirement. Node enrollment must not select it until a live
-/// edit guard protects retained hard links; new Git stage/checkout operations
-/// remain unavailable until their separate source-safety gate is implemented.
+/// checkout. GuardedLinkFreezeV1 provides replayable whole-root capture and
+/// retirement plus an explicit per-file edit detach. Node enrollment must not
+/// select it until a live edit guard invokes that detach for every retained
+/// hard link; new Git stage/checkout operations remain unavailable until their
+/// separate source-safety gate is implemented.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SourceBackendKind {
     ReflinkV1,
@@ -248,6 +249,20 @@ impl SourceFileCapturePlan {
             Self::ReflinkV1(plan) => Ok(ReflinkAnchor::capture_file_plan(plan)?),
             #[cfg(target_os = "linux")]
             Self::GuardedLinkFreezeV1(plan) => Ok(plan.capture(control)?),
+        }
+    }
+
+    /// Ensure a retained source file can be edited without changing its
+    /// immutable anchor. Reflink captures already have independent inodes;
+    /// guarded captures must complete their durable sparse detach first.
+    pub fn prepare_edit_with_control(
+        &self,
+        control: &ControlStore,
+    ) -> Result<(), SourceFileCaptureError> {
+        match self {
+            Self::ReflinkV1(_) => Ok(()),
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(plan) => Ok(plan.prepare_edit(control)?),
         }
     }
 

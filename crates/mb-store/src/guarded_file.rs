@@ -364,6 +364,53 @@ impl GuardedFileCapturePlan {
         Ok(manifest)
     }
 
+    /// Detach the original source inode before allowing an edit to a captured
+    /// file. Replaying `capture` first completes an interrupted detach; the
+    /// frozen case then records its edit intent before the sparse private copy
+    /// and permission restoration. A caller may retry this after a crash.
+    pub fn prepare_edit(&self, control: &ControlStore) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            control
+                .get_record(MANIFEST_CLAIM_KIND, self.anchor_id.as_bytes())?
+                .is_some(),
+            "guarded file has no published capture to detach"
+        );
+        self.capture(control)?;
+        let intent = LinkFreezeCaptureIntent::load(control, self.anchor_id)?
+            .ok_or_else(|| anyhow::anyhow!("guarded file capture journal disappeared"))?;
+        if intent.phase() == LinkFreezeCapturePhase::Detached {
+            return Ok(());
+        }
+        let source_parent = self.open_source_parent()?;
+        let area_path = resolve_anchor_area(&self.area)?;
+        let area_file = open_stable_anchor_area(&area_path, &self.area)?;
+        let area = PinnedDirectory {
+            file: area_file,
+            filesystem_id: self.area.filesystem_id,
+        };
+        let anchor_parent = area
+            .open_child_directory(self.anchor_id.to_string())?
+            .ok_or_else(|| anyhow::anyhow!("guarded file anchor directory disappeared"))?;
+        let expected_source = NativeFileId {
+            filesystem_id: self.source_version.filesystem_id,
+            inode: self.source_version.inode,
+        };
+        anyhow::ensure!(intent.matches_file_plan(
+            self.anchor_id,
+            expected_source,
+            &anchor_parent,
+            Path::new(PAYLOAD_NAME),
+        )?);
+        intent.begin_edit(control, &source_parent, &anchor_parent)?;
+        let detached = LinkFreezeCaptureIntent::load(control, self.anchor_id)?
+            .ok_or_else(|| anyhow::anyhow!("guarded file capture journal disappeared"))?
+            .resume(control, &source_parent, &anchor_parent)?
+            .ok_or_else(|| anyhow::anyhow!("guarded file capture changed during edit"))?;
+        anyhow::ensure!(detached.phase() == LinkFreezeCapturePhase::Detached);
+        self.capture(control)?;
+        Ok(())
+    }
+
     fn marker_name(&self) -> String {
         guarded_file_marker_name(self.anchor_id)
     }
@@ -868,6 +915,15 @@ mod tests {
             replayed.capture(),
             Err(AnchorError::UnsupportedSourceOperation(_))
         ));
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([73; 32]));
+        let control = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        assert!(replayed.prepare_edit_with_control(&control).is_err());
+        assert!(
+            control
+                .get_record(PLAN_KIND, guarded.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1215,20 +1271,14 @@ mod tests {
 
         let store = ControlStore::open(&database_path, &keys).unwrap();
         assert_eq!(plan.capture(&store).unwrap(), manifest);
-        let source_parent = PinnedDirectory::open(&source_root).unwrap();
-        let anchor_parent =
-            PinnedDirectory::open(plan.area.path_hint.join(plan.anchor_id.to_string())).unwrap();
         let frozen = LinkFreezeCaptureIntent::load(&store, plan.anchor_id)
             .unwrap()
             .unwrap();
         assert_eq!(frozen.phase(), LinkFreezeCapturePhase::Frozen);
-        frozen
-            .begin_edit(&store, &source_parent, &anchor_parent)
-            .unwrap();
+        let source_plan = SourceFileCapturePlan::GuardedLinkFreezeV1(plan.clone());
+        source_plan.prepare_edit_with_control(&store).unwrap();
+        source_plan.prepare_edit_with_control(&store).unwrap();
         let detached = LinkFreezeCaptureIntent::load(&store, plan.anchor_id)
-            .unwrap()
-            .unwrap()
-            .resume(&store, &source_parent, &anchor_parent)
             .unwrap()
             .unwrap();
         assert_eq!(detached.phase(), LinkFreezeCapturePhase::Detached);
@@ -1285,6 +1335,45 @@ mod tests {
                 .join(frozen_plan.anchor_id.to_string())
                 .exists()
         );
+
+        let pending_path = source_root.join("pending");
+        fs::write(&pending_path, b"pending edit bytes").unwrap();
+        let pending_plan = GuardedFileCapturePlan::plan(&source_root, "pending").unwrap();
+        let pending_manifest = pending_plan.capture(&store).unwrap();
+        let source_parent = PinnedDirectory::open(&source_root).unwrap();
+        let anchor_parent = PinnedDirectory::open(
+            pending_plan
+                .area
+                .path_hint
+                .join(pending_plan.anchor_id.to_string()),
+        )
+        .unwrap();
+        LinkFreezeCaptureIntent::load(&store, pending_plan.anchor_id)
+            .unwrap()
+            .unwrap()
+            .begin_edit(&store, &source_parent, &anchor_parent)
+            .unwrap();
+        drop(store);
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        SourceFileCapturePlan::GuardedLinkFreezeV1(pending_plan.clone())
+            .prepare_edit_with_control(&store)
+            .unwrap();
+        assert_eq!(
+            LinkFreezeCaptureIntent::load(&store, pending_plan.anchor_id)
+                .unwrap()
+                .unwrap()
+                .phase(),
+            LinkFreezeCapturePhase::Detached
+        );
+        fs::write(&pending_path, b"editable").unwrap();
+        let mut retained = Vec::new();
+        pending_manifest
+            .open_verified()
+            .unwrap()
+            .read_to_end(&mut retained)
+            .unwrap();
+        assert_eq!(retained, b"pending edit bytes");
+        pending_plan.discard_unreferenced(&store).unwrap();
 
         fs::write(source_root.join("changed"), b"first").unwrap();
         let stale = GuardedFileCapturePlan::plan(&source_root, "changed").unwrap();
