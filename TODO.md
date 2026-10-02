@@ -16,9 +16,11 @@
   `202aa44` promotes per-signer failures to warning logs. Two subsequent
   isolated smoke runs and the complete Git acceptance script passed on
   `31018a0` with stricter diagnostic backup timeouts (900/600 seconds), but
-  did not reproduce the failure; `31018a0` also preserves relevant signer
-  warnings in future timeout output. Keep this reliability issue open until
-  the missing-signer path is explained and corrected.
+  did not reproduce the failure. The complete provisioned reflink script also
+  passed on `6caeb11` with the 600-second diagnostic timeout. `31018a0`
+  preserves relevant signer warnings in future timeout output. Keep this
+  reliability issue open until the missing-signer path is explained and
+  corrected.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a
@@ -32,15 +34,15 @@
   worktree now has a force-prune path that discards its private generated blob
   and retires the intent with its registration. The complete provisioned Git
   gate passed on `31018a0`, including the linked pull/merge Btrfs regression.
-- [ ] **M6 combined Git restore is one recoverable operation.**
+- [x] **M6 combined Git restore is one recoverable operation.**
   `mutualgit restore --staged --worktree PATH` now sends one daemon request for
   primary or linked worktrees. Version 11 checkout intents bind the selected
   HEAD paths, old worktree content roots, old index digest, and full target
   index; replay publishes selected worktree bytes before the index transition.
   Local intent, schema, CLI, and non-Btrfs Git tests pass. The ignored primary
   and linked Btrfs regressions cover dirty directory preflight, staged additions,
-  unrelated staged bytes, and interruption/reopen before and after index publication;
-  run the provisioned reflink acceptance gate before closing this item.
+  unrelated staged bytes, and interruption/reopen before and after index publication.
+  The complete provisioned reflink acceptance script passed on `6caeb11`.
 - [x] **M6 prune duplicate native anchors by physical reachability.** Git
   prune now distinguishes exact index and local-sector recipe pins from blob
   IDs and retains one verified source per filesystem for each live blob. It
