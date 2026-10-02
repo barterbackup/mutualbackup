@@ -6,6 +6,8 @@
 
 mod anchor;
 mod database;
+#[cfg(target_os = "linux")]
+mod link_freeze;
 mod source;
 
 pub use anchor::{
@@ -22,6 +24,8 @@ pub use database::{
     ObjectAttemptState, ParityObject, ParityScrubReport, ParityStore, ProtocolRecordRow,
     VariableParityObject,
 };
+#[cfg(target_os = "linux")]
+pub use link_freeze::FileWriteExclusion;
 pub use source::{
     SourceBackendBinding, SourceBackendKind, SourceBlobImportPlan, SourceCapturePlan,
     SourceFileCapturePlan,
