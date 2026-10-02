@@ -60,6 +60,12 @@ impl GitBackupDescriptor {
     /// Validate the full Git DAG and each blob's sector geometry before this
     /// descriptor can be placed in a signed revision or accepted on recovery.
     pub fn validate(&self) -> Result<(), GitBackupError> {
+        self.symlink_blob_oids().map(|_| ())
+    }
+
+    /// Validate the descriptor and identify blobs that must be usable as
+    /// symlink targets when native anchors are imported on recovery.
+    pub(crate) fn symlink_blob_oids(&self) -> Result<HashSet<Oid>, GitBackupError> {
         if !matches!(self.format_version, 1..=4)
             || self.repository_id.is_nil()
             || self.refs.len() > MAX_OBJECTS
@@ -198,6 +204,7 @@ impl GitBackupDescriptor {
         let mut pending_trees = Vec::new();
         let mut seen_trees = HashSet::new();
         let mut seen_blobs = HashSet::new();
+        let mut symlink_blobs = HashSet::new();
         while let Some(oid) = pending_commits.pop() {
             if !seen_commits.insert(oid) {
                 continue;
@@ -246,6 +253,9 @@ impl GitBackupDescriptor {
                         {
                             return Err(GitBackupError::InvalidGraph);
                         }
+                        if entry.filemode() == 0o120000 {
+                            symlink_blobs.insert(entry.id());
+                        }
                         seen_blobs.insert(entry.id());
                     }
                     _ => return Err(GitBackupError::InvalidGraph),
@@ -257,7 +267,7 @@ impl GitBackupDescriptor {
         {
             return Err(GitBackupError::InvalidGraph);
         }
-        Ok(())
+        Ok(symlink_blobs)
     }
 }
 

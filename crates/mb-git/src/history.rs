@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
+use std::io::Read;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
@@ -1672,7 +1673,7 @@ pub fn import_graph_backup(
     if descriptor.repository_id != repository_id {
         return Err(HistoryError::IncompatibleRecord);
     }
-    descriptor.validate()?;
+    let symlink_blobs = descriptor.symlink_blob_oids()?;
     for kind in [
         metadata_kind(repository_id),
         ref_kind(repository_id),
@@ -1699,6 +1700,19 @@ pub fn import_graph_backup(
         let anchor = by_oid.get(&oid).ok_or(HistoryError::IncompatibleRecord)?;
         if anchor.logical_len != blob.logical_len {
             return Err(HistoryError::IncompatibleRecord);
+        }
+        if symlink_blobs.contains(&oid) {
+            // A signed Git blob can still contain bytes that the filesystem
+            // cannot publish as a symlink. Reject it before catalog writes.
+            let mut target = Vec::with_capacity(anchor.logical_len as usize);
+            anchor
+                .open_verified()
+                .map_err(GitAnchorError::from)?
+                .take(4096)
+                .read_to_end(&mut target)?;
+            if target.len() as u64 != anchor.logical_len || target.contains(&0) {
+                return Err(HistoryError::IncompatibleRecord);
+            }
         }
         records.push((
             object_kind(repository_id, oid),
@@ -1782,4 +1796,75 @@ pub fn import_graph_backup(
     }
     control.put_records_and_delete(&records, &[])?;
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::io::Cursor;
+
+    use mb_store::SourceBlobImportPlan;
+
+    use super::*;
+    use crate::{GitBackupBlob, GitGraphObject, GitGraphRef};
+
+    #[test]
+    fn backup_import_rejects_nul_symlink_before_publishing_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let control =
+            ControlStore::open_with_key(directory.path().join("control.db"), &[7; 32]).unwrap();
+        let anchor = SourceBlobImportPlan::plan_direct(&source, 1)
+            .unwrap()
+            .capture(Cursor::new([0]))
+            .unwrap();
+        let git = Repository::init_bare(directory.path().join("git")).unwrap();
+        let blob_oid = git.blob(&[0]).unwrap();
+        let mut builder = git.treebuilder(None).unwrap();
+        builder.insert("link", blob_oid, 0o120000).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = git.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("Author", "a@example.test").unwrap();
+        let commit_oid = git
+            .commit(None, &signature, &signature, "link", &tree, &[])
+            .unwrap();
+        let odb = git.odb().unwrap();
+        let object = |kind, oid: Oid| GitGraphObject {
+            kind,
+            oid: oid.as_bytes().try_into().unwrap(),
+            bytes: odb.read(oid).unwrap().data().to_vec(),
+        };
+        let repository_id = Uuid::new_v4();
+        let descriptor = GitBackupDescriptor {
+            format_version: 4,
+            repository_id,
+            refs: vec![GitGraphRef {
+                name: b"refs/heads/main".to_vec(),
+                oid: commit_oid.as_bytes().try_into().unwrap(),
+            }],
+            objects: vec![object(1, commit_oid), object(2, tree_oid)],
+            blobs: vec![GitBackupBlob {
+                oid: blob_oid.as_bytes().try_into().unwrap(),
+                logical_len: 1,
+                data_extents: Vec::new(),
+            }],
+            head_branch: "main".to_owned(),
+        };
+        assert!(matches!(
+            import_graph_backup(&control, repository_id, &descriptor, &[anchor]),
+            Err(HistoryError::IncompatibleRecord)
+        ));
+        assert!(
+            control
+                .records(&metadata_kind(repository_id))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            control
+                .records(&ref_kind(repository_id))
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
