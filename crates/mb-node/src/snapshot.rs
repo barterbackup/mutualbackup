@@ -1165,6 +1165,9 @@ fn prepare_git_backup_descriptor(
     } = source;
     let mut blobs = Vec::with_capacity(graph.blobs.len());
     for blob in graph.blobs {
+        if mb_git::blob_oid_from_anchor(&blob.anchor)?.as_bytes() != blob.oid {
+            bail!("Git backup blob ID does not match its immutable source anchor");
+        }
         let mut file = blob.anchor.open_verified()?;
         let locator = blob.anchor.file_locator();
         let mut sectors = Vec::new();
@@ -3485,6 +3488,102 @@ mod metadata_compatibility_tests {
         .unwrap();
         let (_, recovered) = decode_private_metadata_with_git(&encoded).unwrap();
         assert_eq!(recovered, Some(descriptor));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_backup_rejects_blob_id_that_disagrees_with_replayed_anchor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let anchor = mb_store::SourceBlobImportPlan::plan_direct(&source, 5)
+            .unwrap()
+            .capture(std::io::Cursor::new(b"other"))
+            .unwrap();
+        let repository = git2::Repository::init_bare(temporary.path().join("git")).unwrap();
+        let blob_oid = repository.blob(b"hello").unwrap();
+        let mut builder = repository.treebuilder(None).unwrap();
+        builder.insert("file", blob_oid, 0o100644).unwrap();
+        let tree_oid = builder.write().unwrap();
+        let tree = repository.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Author", "a@example.test").unwrap();
+        let commit_oid = repository
+            .commit(None, &signature, &signature, "file", &tree, &[])
+            .unwrap();
+        let odb = repository.odb().unwrap();
+        let object = |kind, oid: git2::Oid| GitGraphObject {
+            kind,
+            oid: oid.as_bytes().try_into().unwrap(),
+            bytes: odb.read(oid).unwrap().data().to_vec(),
+        };
+        let repository_id = Uuid::new_v4();
+        let graph = GitGraphSource {
+            format_version: 1,
+            repository_id,
+            refs: vec![GitGraphRef {
+                name: b"refs/heads/main".to_vec(),
+                oid: commit_oid.as_bytes().try_into().unwrap(),
+            }],
+            objects: vec![object(1, commit_oid), object(2, tree_oid)],
+            blobs: vec![mb_git::GitGraphBlobSource {
+                oid: blob_oid.as_bytes().try_into().unwrap(),
+                anchor,
+            }],
+        };
+        let mut recipes = Vec::new();
+        let mut data_references = Vec::new();
+        let keys = KeyMaterial::from_seed(&mb_core::Seed::from_bytes([213; 32]));
+        let mut matching_graph = graph.clone();
+        assert!(
+            prepare_git_backup_descriptor(
+                &mut recipes,
+                &mut data_references,
+                &keys,
+                [31; 32],
+                repository_id,
+                &[33; 32],
+                &mut 0,
+                &mut BTreeMap::new(),
+                GitGraphIntent {
+                    format_version: 2,
+                    guild_id: [31; 32],
+                    revision_id: Uuid::new_v4(),
+                    protected_root_id: repository_id,
+                    graph,
+                    head_branch: "main".to_owned(),
+                },
+            )
+            .is_err()
+        );
+        assert!(recipes.is_empty());
+        assert!(data_references.is_empty());
+
+        matching_graph.blobs[0].anchor = mb_store::SourceBlobImportPlan::plan_direct(&source, 5)
+            .unwrap()
+            .capture(std::io::Cursor::new(b"hello"))
+            .unwrap();
+        let descriptor = prepare_git_backup_descriptor(
+            &mut recipes,
+            &mut data_references,
+            &keys,
+            [31; 32],
+            repository_id,
+            &[33; 32],
+            &mut 0,
+            &mut BTreeMap::new(),
+            GitGraphIntent {
+                format_version: 2,
+                guild_id: [31; 32],
+                revision_id: Uuid::new_v4(),
+                protected_root_id: repository_id,
+                graph: matching_graph,
+                head_branch: "main".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(descriptor.blobs[0].oid, blob_oid.as_bytes());
+        assert_eq!(recipes.len(), 1);
+        assert_eq!(data_references.len(), 1);
     }
 
     fn restore_fixture(
