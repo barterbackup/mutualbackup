@@ -23,6 +23,10 @@ use uuid::Uuid;
 use crate::anchor::{AnchorError, FileExtent, NativeFileId, PinnedDirectory, file_data_extents};
 use crate::database::ControlStore;
 
+#[path = "link_freeze_capture.rs"]
+mod capture;
+pub use capture::{LinkFreezeCaptureIntent, LinkFreezeCapturePhase};
+
 // Linux UAPI asm-generic/fcntl.h. The libc crate does not expose F_SETSIG.
 const F_SETSIG_LINUX: libc::c_int = 10;
 // Linux UAPI linux/fanotify.h. Permission events require CAP_SYS_ADMIN.
@@ -174,16 +178,6 @@ impl FileAccessSnapshot {
         copy: &IndependentSparseCopy,
         require_unchanged_source: bool,
     ) -> Result<(), AnchorError> {
-        use std::os::unix::fs::PermissionsExt;
-
-        if self.format_version != 1
-            || self.mode & !0o7777 != 0
-            || matches!(&self.access_acl, AccessAclSnapshot::Present(value) if value.is_empty() || value.len() > MAX_ACCESS_ACL_BYTES)
-        {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidInput, "invalid access snapshot").into(),
-            );
-        }
         verify_independent_anchor(source, anchor, copy)?;
         let source_metadata = source.metadata()?;
         if require_unchanged_source
@@ -193,9 +187,37 @@ impl FileAccessSnapshot {
             return Err(io::Error::other("private anchor is not independent and verified").into());
         }
         anchor.sync_all()?;
+        self.restore_access_metadata(source)
+    }
+
+    /// Undo an incomplete freeze only after the owned anchor link is gone and
+    /// the source inode has no other aliases. The capture intent must still
+    /// identify this pinned source inode before calling this method.
+    fn restore_unshared_after_abandon(&self, source: &File) -> Result<(), AnchorError> {
+        let metadata = source.metadata()?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(io::Error::other("cannot unfreeze a still-shared inode").into());
+        }
+        self.restore_access_metadata(source)
+    }
+
+    fn restore_access_metadata(&self, source: &File) -> Result<(), AnchorError> {
+        if self.format_version != 1
+            || self.mode & !0o7777 != 0
+            || matches!(&self.access_acl, AccessAclSnapshot::Present(value) if value.is_empty() || value.len() > MAX_ACCESS_ACL_BYTES)
+        {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid access snapshot").into(),
+            );
+        }
+        if self.matches(source)? {
+            return Ok(());
+        }
+        let source_metadata = source.metadata()?;
         // The lease must already be gone. Add owner write temporarily so the
         // pinned inode can be reopened for fsetxattr; fsetxattr on O_RDONLY
-        // descriptors fails even for the file owner. The anchor is separate.
+        // descriptors fails even for the file owner. A detached anchor or an
+        // abandoned capture means no immutable object shares this inode.
         source.set_permissions(std::fs::Permissions::from_mode(self.mode | 0o200))?;
         let pinned_path = format!("/proc/self/fd/{}", source.as_raw_fd());
         let writable = OpenOptions::new().write(true).open(pinned_path)?;
