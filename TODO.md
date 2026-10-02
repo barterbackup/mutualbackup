@@ -62,9 +62,11 @@
   conflicting content, staged-file replay, and primary/linked encoding. The
   linked Btrfs regression now also interrupts hard reset before file publication
   and after index publication, then reselects the linked worktree on reopen;
-  its targeted local run passes. Complete the provisioned interruption/reopen
-  gate, including same-Git-ID/different-native-root fixtures and safe handling
-  of historical pending intents, before closing this item.
+  its targeted local run passes. A provisioned Btrfs replay fixture now rejects
+  a wrong native anchor behind the expected Git ID and an unverifiable legacy
+  restore intent; its targeted run passes. The reflink acceptance script now
+  includes these checks alongside primary and linked restore and hard reset.
+  Rerun that complete script on exact committed source before closing this item.
 - [ ] **M6 guarded edit guard.** The store now has replayable per-file and
   whole-root sparse detaches, but node enrollment still selects only the
   reflink backend. Implement and locally probe a long-lived access decision

@@ -3467,13 +3467,17 @@ mod tests {
     #[test]
     fn unanchored_restore_replay_rejects_conflicting_bytes_and_legacy_unknown_root() {
         let temporary = tempfile::tempdir().unwrap();
-        let worktree_path = temporary.path().join("worktree");
-        let staging_path = temporary.path().join("staging");
+        assert_unanchored_restore_replay_rejects_conflicts(temporary.path());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_unanchored_restore_replay_rejects_conflicts(temporary: &Path) {
+        let worktree_path = temporary.join("worktree");
+        let staging_path = temporary.join("staging");
         std::fs::create_dir_all(&worktree_path).unwrap();
         std::fs::create_dir_all(&staging_path).unwrap();
         std::fs::write(worktree_path.join("tracked"), b"bravo").unwrap();
-        let control =
-            ControlStore::open_with_key(temporary.path().join("catalog.db"), &[66; 32]).unwrap();
+        let control = ControlStore::open_with_key(temporary.join("catalog.db"), &[66; 32]).unwrap();
         let repository_id = Uuid::new_v4();
         let worktree = PinnedDirectory::open(&worktree_path).unwrap();
         let staging = PinnedDirectory::open(&staging_path).unwrap();
@@ -3799,15 +3803,19 @@ mod tests {
     #[test]
     fn checkout_replay_keeps_worktree_bytes_on_native_root_conflict() {
         let temporary = tempfile::tempdir().unwrap();
-        let worktree_path = temporary.path().join("worktree");
-        let staging_path = temporary.path().join("staging");
+        assert_checkout_replay_keeps_worktree_bytes_on_native_root_conflict(temporary.path());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_checkout_replay_keeps_worktree_bytes_on_native_root_conflict(temporary: &Path) {
+        let worktree_path = temporary.join("worktree");
+        let staging_path = temporary.join("staging");
         std::fs::create_dir_all(&worktree_path).unwrap();
         std::fs::create_dir_all(&staging_path).unwrap();
         std::fs::write(worktree_path.join("tracked"), b"bravo").unwrap();
-        let control =
-            ControlStore::open_with_key(temporary.path().join("control.db"), &[64; 32]).unwrap();
+        let control = ControlStore::open_with_key(temporary.join("control.db"), &[64; 32]).unwrap();
         let repository_id = Uuid::new_v4();
-        let anchor = mb_store::SourceBlobImportPlan::plan_direct(temporary.path(), 5)
+        let anchor = mb_store::SourceBlobImportPlan::plan_direct(temporary, 5)
             .unwrap()
             .capture(std::io::Cursor::new(b"alpha"))
             .unwrap();
@@ -3847,6 +3855,26 @@ mod tests {
             b"bravo"
         );
         assert!(std::fs::read_dir(staging_path).unwrap().next().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn btrfs_replay_rejects_wrong_native_anchor_and_unverifiable_legacy_restore() {
+        let test_root = std::path::PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let temporary = tempfile::Builder::new()
+            .prefix("git-replay-conflict-")
+            .tempdir_in(test_root)
+            .unwrap();
+        let wrong_anchor = temporary.path().join("wrong-anchor");
+        let legacy = temporary.path().join("legacy");
+        std::fs::create_dir_all(&wrong_anchor).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        assert_checkout_replay_keeps_worktree_bytes_on_native_root_conflict(&wrong_anchor);
+        assert_unanchored_restore_replay_rejects_conflicts(&legacy);
     }
 
     #[test]
