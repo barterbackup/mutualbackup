@@ -3,7 +3,7 @@
 //! not eligible for enrollment until capture, replay, and retirement consume
 //! this inventory through the versioned source-backend boundary.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
@@ -26,6 +26,7 @@ use crate::{ControlStore, LinkFreezeCaptureIntent};
 
 const PLAN_KIND: &str = "guarded-root-plan-v1";
 const ROOT_CLAIM_KIND: &str = "guarded-root-claim-v1";
+const DIRECTORY_CLAIM_PREFIX: &str = "guarded-root-directory-v1/";
 const RETIRE_KIND: &str = "guarded-root-retire-v1";
 const MARKER_PREFIX: &str = ".mutualbackup-guarded-root-v1-";
 
@@ -34,6 +35,16 @@ struct RootClaim {
     format_version: u16,
     anchor_id: Uuid,
     root_id: NativeFileId,
+    plan_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct DirectoryClaim {
+    format_version: u16,
+    anchor_id: Uuid,
+    path: String,
+    parent_id: NativeFileId,
+    directory_id: NativeFileId,
     plan_hash: [u8; 32],
 }
 
@@ -339,6 +350,88 @@ impl GuardedRootCapturePlan {
         Ok(root_id)
     }
 
+    /// Materialize only the planned directory shape. A directory's parent is
+    /// synced and its inode claim recorded before any descendant can be used
+    /// by a file freeze. Replays verify each claimed inode and may replace an
+    /// empty directory left by a crash before its claim was recorded.
+    pub fn prepare_anchor_directories(&self, control: &ControlStore) -> anyhow::Result<()> {
+        let root_id = self.prepare_anchor_root(control)?;
+        let plan_hash = *blake3::hash(&mb_core::canonical_bytes(self)?).as_bytes();
+        let area_path = resolve_anchor_area(&self.area)?;
+        let area_file = open_stable_anchor_area(&area_path, &self.area)?;
+        let area = PinnedDirectory {
+            file: area_file,
+            filesystem_id: self.area.filesystem_id,
+        };
+        let root = area
+            .open_child_directory(self.anchor_id.to_string())?
+            .ok_or_else(|| anyhow::anyhow!("claimed guarded root disappeared"))?;
+        anyhow::ensure!(root.identity()? == root_id);
+        let mut opened = BTreeMap::from([(String::new(), root)]);
+        let claim_kind = self.directory_claim_kind();
+        for entry in &self.entries {
+            let GuardedRootEntry::Directory { path, .. } = entry else {
+                continue;
+            };
+            let relative = Path::new(path);
+            let name = relative
+                .file_name()
+                .ok_or(AnchorError::InvalidGuardedPlan)?;
+            let parent_path = relative
+                .parent()
+                .and_then(|parent| parent.to_str())
+                .ok_or(AnchorError::InvalidGuardedPlan)?;
+            let parent = opened
+                .get(parent_path)
+                .ok_or(AnchorError::InvalidGuardedPlan)?;
+            let parent_id = parent.identity()?;
+            let claimed = control.get_record(&claim_kind, path.as_bytes())?;
+            let directory = if let Some(bytes) = claimed {
+                let claim: DirectoryClaim = mb_core::decode_canonical(&bytes)?;
+                let directory = parent
+                    .open_child_directory(Path::new(name))?
+                    .ok_or_else(|| anyhow::anyhow!("claimed guarded directory disappeared"))?;
+                anyhow::ensure!(
+                    claim.format_version == 1
+                        && claim.anchor_id == self.anchor_id
+                        && claim.path == path.as_str()
+                        && claim.parent_id == parent_id
+                        && claim.directory_id == directory.identity()?
+                        && claim.plan_hash == plan_hash
+                        && unix_mode(&directory.as_file().metadata()?) & 0o777 == 0o700,
+                    "guarded directory differs from its durable claim"
+                );
+                directory
+            } else {
+                if let Some(unclaimed) = parent.open_child_directory(Path::new(name))? {
+                    anyhow::ensure!(
+                        parent
+                            .remove_empty_child_directory(Path::new(name), unclaimed.identity()?)?,
+                        "unclaimed guarded directory contains unknown entries"
+                    );
+                }
+                let directory = parent.create_child_directory(Path::new(name))?;
+                parent.sync_all()?;
+                let claim = DirectoryClaim {
+                    format_version: 1,
+                    anchor_id: self.anchor_id,
+                    path: path.clone(),
+                    parent_id,
+                    directory_id: directory.identity()?,
+                    plan_hash,
+                };
+                anyhow::ensure!(control.put_record_if_absent(
+                    &claim_kind,
+                    path.as_bytes(),
+                    &mb_core::canonical_bytes(&claim)?,
+                )?);
+                directory
+            };
+            opened.insert(path.clone(), directory);
+        }
+        Ok(())
+    }
+
     /// Abandon only a prepared, empty root namespace. A file freeze requires
     /// the later journal-aware retirement path; this method refuses any file
     /// capture intent or child entry rather than unlinking a frozen source.
@@ -417,12 +510,22 @@ impl GuardedRootCapturePlan {
             present_root.is_some() || claim_bytes.is_none() || existing_retirement.is_some(),
             "claimed guarded root disappeared before retirement began"
         );
+        if existing_retirement.is_none() {
+            self.verify_directory_claims_before_retirement(control, &area, plan_hash)?;
+        }
         if !control.put_record_if_absent(RETIRE_KIND, self.anchor_id.as_bytes(), &retire_bytes)? {
             anyhow::ensure!(
                 control.get_record(RETIRE_KIND, self.anchor_id.as_bytes())? == Some(retire_bytes),
                 "guarded root retirement belongs to another plan"
             );
         }
+        self.remove_empty_directories(
+            control,
+            &area,
+            claim.as_ref().map(|claim| claim.root_id),
+            plan_hash,
+            existing_retirement.is_some(),
+        )?;
         if let Some(present) = present_root {
             anyhow::ensure!(
                 area.remove_empty_child_directory(&directory_name, present)?,
@@ -442,8 +545,174 @@ impl GuardedRootCapturePlan {
         Ok(())
     }
 
+    fn verify_directory_claims_before_retirement(
+        &self,
+        control: &ControlStore,
+        area: &PinnedDirectory,
+        plan_hash: [u8; 32],
+    ) -> anyhow::Result<()> {
+        let claim_kind = self.directory_claim_kind();
+        let planned = self
+            .entries
+            .iter()
+            .filter(|entry| entry.is_directory())
+            .map(GuardedRootEntry::path)
+            .collect::<BTreeSet<_>>();
+        for (id, _) in control.records(&claim_kind)? {
+            anyhow::ensure!(
+                std::str::from_utf8(&id).is_ok_and(|path| planned.contains(path)),
+                "guarded root has an unplanned directory claim"
+            );
+        }
+        let Some(root) = area.open_child_directory(self.anchor_id.to_string())? else {
+            anyhow::ensure!(
+                control.records(&claim_kind)?.is_empty(),
+                "missing guarded root retains directory claims"
+            );
+            return Ok(());
+        };
+        for entry in &self.entries {
+            let GuardedRootEntry::Directory { path, .. } = entry else {
+                continue;
+            };
+            let Some(bytes) = control.get_record(&claim_kind, path.as_bytes())? else {
+                continue;
+            };
+            let claim: DirectoryClaim = mb_core::decode_canonical(&bytes)?;
+            let relative = Path::new(path);
+            let parent_path = relative
+                .parent()
+                .and_then(|parent| parent.to_str())
+                .ok_or(AnchorError::InvalidGuardedPlan)?;
+            let parent = if parent_path.is_empty() {
+                root.try_clone()?
+            } else {
+                root.open_descendant_directory(parent_path)?
+            };
+            anyhow::ensure!(
+                claim.format_version == 1
+                    && claim.anchor_id == self.anchor_id
+                    && claim.path == path.as_str()
+                    && claim.parent_id == parent.identity()?
+                    && claim.plan_hash == plan_hash
+                    && root.entry_identity(relative, true)? == Some(claim.directory_id),
+                "claimed guarded directory changed before retirement"
+            );
+        }
+        Ok(())
+    }
+
+    fn remove_empty_directories(
+        &self,
+        control: &ControlStore,
+        area: &PinnedDirectory,
+        claimed_root: Option<NativeFileId>,
+        plan_hash: [u8; 32],
+        retirement_replay: bool,
+    ) -> anyhow::Result<()> {
+        let claim_kind = self.directory_claim_kind();
+        let planned = self
+            .entries
+            .iter()
+            .filter(|entry| entry.is_directory())
+            .map(GuardedRootEntry::path)
+            .collect::<BTreeSet<_>>();
+        for (id, _) in control.records(&claim_kind)? {
+            anyhow::ensure!(
+                std::str::from_utf8(&id).is_ok_and(|path| planned.contains(path)),
+                "guarded root has an unplanned directory claim"
+            );
+        }
+        let Some(root) = area.open_child_directory(self.anchor_id.to_string())? else {
+            anyhow::ensure!(
+                control.records(&claim_kind)?.is_empty(),
+                "missing guarded root retains directory claims"
+            );
+            return Ok(());
+        };
+        if let Some(expected) = claimed_root {
+            anyhow::ensure!(root.identity()? == expected);
+        }
+        for entry in self.entries.iter().rev() {
+            let GuardedRootEntry::Directory { path, .. } = entry else {
+                continue;
+            };
+            let relative = Path::new(path);
+            let name = relative
+                .file_name()
+                .ok_or(AnchorError::InvalidGuardedPlan)?;
+            let parent_path = relative
+                .parent()
+                .and_then(|parent| parent.to_str())
+                .ok_or(AnchorError::InvalidGuardedPlan)?;
+            let recorded = control.get_record(&claim_kind, path.as_bytes())?;
+            let parent = if parent_path.is_empty() {
+                Some(root.try_clone()?)
+            } else if root.entry_identity(parent_path, true)?.is_some() {
+                Some(root.open_descendant_directory(parent_path)?)
+            } else {
+                None
+            };
+            let Some(parent) = parent else {
+                anyhow::ensure!(recorded.is_none(), "claimed parent directory disappeared");
+                continue;
+            };
+            let expected_parent = if parent_path.is_empty() {
+                claimed_root
+            } else {
+                control
+                    .get_record(&claim_kind, parent_path.as_bytes())?
+                    .map(|bytes| mb_core::decode_canonical::<DirectoryClaim>(&bytes))
+                    .transpose()?
+                    .map(|claim| claim.directory_id)
+            };
+            let present = parent.entry_identity(Path::new(name), true)?;
+            if recorded.is_some() || present.is_some() {
+                anyhow::ensure!(
+                    expected_parent == Some(parent.identity()?),
+                    "guarded directory parent lost its durable claim"
+                );
+            }
+            if let Some(bytes) = recorded.as_ref() {
+                let claim: DirectoryClaim = mb_core::decode_canonical(bytes)?;
+                anyhow::ensure!(
+                    claim.format_version == 1
+                        && claim.anchor_id == self.anchor_id
+                        && claim.path == path.as_str()
+                        && claim.plan_hash == plan_hash
+                        && claim.parent_id == parent.identity()?
+                        && claim.directory_id.filesystem_id == self.area.filesystem_id
+                        && present.is_none_or(|id| id == claim.directory_id),
+                    "guarded directory claim changed before retirement"
+                );
+                anyhow::ensure!(
+                    present.is_some() || retirement_replay,
+                    "claimed guarded directory disappeared before retirement"
+                );
+            }
+            if let Some(present) = present {
+                anyhow::ensure!(
+                    parent.remove_empty_child_directory(Path::new(name), present)?,
+                    "guarded directory is nonempty"
+                );
+            }
+            if let Some(bytes) = recorded {
+                control.delete_record_if_value(&claim_kind, path.as_bytes(), &bytes)?;
+            }
+        }
+        anyhow::ensure!(
+            control.records(&claim_kind)?.is_empty(),
+            "guarded directory claims remain after empty retirement"
+        );
+        Ok(())
+    }
+
     fn marker_name(&self) -> String {
         format!("{MARKER_PREFIX}{}", self.anchor_id)
+    }
+
+    fn directory_claim_kind(&self) -> String {
+        format!("{DIRECTORY_CLAIM_PREFIX}{}", self.anchor_id)
     }
 
     fn marker_bytes(&self, plan_hash: [u8; 32]) -> Vec<u8> {
@@ -847,6 +1116,117 @@ mod tests {
         fs::create_dir(&anchor).unwrap();
         assert!(plan.prepare_anchor_root(&store).is_err());
         assert!(anchor.is_dir());
+    }
+
+    #[test]
+    fn claimed_directories_reopen_and_retire_from_leaves_upward() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("parent/child")).unwrap();
+        fs::write(root.join("parent/child/file"), b"source bytes").unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([69; 32]));
+        let database_path = temp.path().join("control.db");
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        plan.prepare_anchor_directories(&store).unwrap();
+        let anchor = plan.area.path_hint.join(plan.anchor_id.to_string());
+        assert!(anchor.join("parent/child").is_dir());
+        assert!(!anchor.join("parent/child/file").exists());
+        drop(store);
+
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        plan.prepare_anchor_directories(&store).unwrap();
+        plan.discard_empty_anchor_root(&store).unwrap();
+        assert!(!anchor.exists());
+        assert!(
+            store
+                .records(&plan.directory_claim_kind())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read(root.join("parent/child/file")).unwrap(),
+            b"source bytes"
+        );
+    }
+
+    #[test]
+    fn unclaimed_nested_directory_must_be_empty_to_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("parent/child")).unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([70; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        plan.prepare_anchor_directories(&store).unwrap();
+        let anchor = plan.area.path_hint.join(plan.anchor_id.to_string());
+        let claim_kind = plan.directory_claim_kind();
+        store.delete_record(&claim_kind, b"parent/child").unwrap();
+        fs::write(anchor.join("parent/child/foreign"), b"keep").unwrap();
+
+        assert!(plan.prepare_anchor_directories(&store).is_err());
+        assert_eq!(
+            fs::read(anchor.join("parent/child/foreign")).unwrap(),
+            b"keep"
+        );
+        fs::remove_file(anchor.join("parent/child/foreign")).unwrap();
+        plan.prepare_anchor_directories(&store).unwrap();
+        plan.discard_empty_anchor_root(&store).unwrap();
+    }
+
+    #[test]
+    fn claimed_directory_replacement_is_never_adopted() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("child")).unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([71; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        plan.prepare_anchor_directories(&store).unwrap();
+        let anchor = plan.area.path_hint.join(plan.anchor_id.to_string());
+        fs::rename(anchor.join("child"), anchor.join("old-child")).unwrap();
+        fs::create_dir(anchor.join("child")).unwrap();
+
+        assert!(plan.prepare_anchor_directories(&store).is_err());
+        assert!(plan.discard_empty_anchor_root(&store).is_err());
+        assert!(anchor.join("child").is_dir());
+        assert!(anchor.join("old-child").is_dir());
+    }
+
+    #[test]
+    fn nested_retirement_replays_after_a_claimed_directory_was_unlinked() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("parent/child")).unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([72; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        plan.prepare_anchor_directories(&store).unwrap();
+        let anchor = plan.area.path_hint.join(plan.anchor_id.to_string());
+        fs::remove_dir(anchor.join("parent/child")).unwrap();
+        assert!(plan.discard_empty_anchor_root(&store).is_err());
+        assert!(
+            store
+                .get_record(RETIRE_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+
+        let retirement = RootRetirement {
+            format_version: 1,
+            anchor_id: plan.anchor_id,
+            plan_hash: *blake3::hash(&mb_core::canonical_bytes(&plan).unwrap()).as_bytes(),
+        };
+        store
+            .put_record(
+                RETIRE_KIND,
+                plan.anchor_id.as_bytes(),
+                &mb_core::canonical_bytes(&retirement).unwrap(),
+            )
+            .unwrap();
+        plan.discard_empty_anchor_root(&store).unwrap();
+        assert!(!anchor.exists());
     }
 
     #[test]
