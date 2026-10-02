@@ -2,6 +2,19 @@
 
 ## Milestone 6 active implementation gates
 
+- [ ] **M6 provisioned topology backup stalls after relay-only storage recovery.**
+  A fresh local Btrfs Git acceptance run on `3155689` passed its Git tests,
+  extent checks, node Git/recovery tests, and stock-Git bridge, then timed out
+  after 5,400 seconds in the five-daemon topology `backup --wait`. All members
+  remained at guild event sequence 36; the coordinator reported one coding Add
+  with only four of five signatures. The recovered storage peer exchanged relay
+  traffic while other nodes repeatedly dialed its obsolete loopback endpoint. A
+  separate direct smoke run passed. The failed run cleaned its temporary Btrfs
+  image, daemons, namespaces, and firewall rules. Identify the missing signer
+  and whether it is a transport failure or a conflicting signature lock,
+  correct the cause, and rerun the full gate on exact committed source.
+  `202aa44` promotes per-signer failures to warning logs for the next diagnostic
+  run.
 - [ ] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a

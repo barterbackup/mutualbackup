@@ -1119,6 +1119,10 @@ through the Git command slices while keeping the original backend deliverables
 in scope: a command is complete only when its raw-byte, crash/reopen, and
 native-anchor storage checks pass; the milestone still requires protected graph
 recovery, physical prune, guarded link-freeze, and platform backends.
+The provisioned Git acceptance run on `3155689` passed its Git-specific slices
+but failed the five-daemon topology backup after the 5,400-second timeout
+following relay-only storage recovery. The missing coding-group signer is under
+investigation; the provisioned gate is not yet passing on the current tree.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
