@@ -696,7 +696,9 @@ Proactive background repair comes later.
   retry rather than recording mixed bytes. An unavailable reflink fails this
   capture path explicitly; the later guarded link-freeze backend must meet its
   own safety probe before offering a hard-link alternative. Preserve sparse
-  extents and file identity where the backend supports them.
+  extents and file identity where the backend supports them. The index records
+  the raw captured blob ID: Git configuration and attributes cannot normalize
+  line endings or run a clean filter between capture and staging.
 - Capture Git symlinks without following them: their blob bytes are the exact
   link-target bytes, and checkout recreates the link under the path-safety
   policy. Never treat a symlink as a regular-file reflink; explicitly reject
@@ -713,6 +715,8 @@ Proactive background repair comes later.
   whose bytes disagree.
 - For checkout or a second worktree, restore verified anchor bytes by reflink
   on a capable same-filesystem destination, preserving the exact blob bytes.
+  Do not run a smudge filter, line-ending conversion, or encoding conversion
+  while publishing a worktree file, including after a merge, reset, or pull.
   Never hard-link an editable worktree file directly to an immutable anchor:
   writing through that link would mutate the committed blob. A backend may use
   hard links only if its guard first makes the shared inode safely immutable
@@ -1110,7 +1114,11 @@ gate passed on exact committed source `53ec2ec`; its earlier review and gate
 records below are historical. Milestone 6 is underway: the Git-compatible
 local-history and interoperability slices are being built ahead of the already
 planned source-backend and platform work. The byte-exact Git policy above and
-the complete Milestone 6 gates below remain requirements for closure.
+the complete Milestone 6 gates below remain requirements for closure. Iterate
+through the Git command slices while keeping the original backend deliverables
+in scope: a command is complete only when its raw-byte, crash/reopen, and
+native-anchor storage checks pass; the milestone still requires protected graph
+recovery, physical prune, guarded link-freeze, and platform backends.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
