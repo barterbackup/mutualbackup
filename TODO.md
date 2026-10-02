@@ -59,10 +59,12 @@
   linked worktrees use wrapper version 2. Replay verifies those bytes in the
   worktree and private staging, and old pending intents without a provable
   original root fail closed. Local unit tests cover regular files, symlinks,
-  conflicting content, staged-file replay, and primary/linked encoding. Run the
-  full provisioned Btrfs interruption/reopen gate for restore and hard reset,
-  including linked worktrees, same-Git-ID/different-native-root fixtures, and
-  safe handling of historical pending intents before closing this item.
+  conflicting content, staged-file replay, and primary/linked encoding. The
+  linked Btrfs regression now also interrupts hard reset before file publication
+  and after index publication, then reselects the linked worktree on reopen;
+  its targeted local run passes. Complete the provisioned interruption/reopen
+  gate, including same-Git-ID/different-native-root fixtures and safe handling
+  of historical pending intents, before closing this item.
 - [ ] **M6 guarded edit guard.** The store now has replayable per-file and
   whole-root sparse detaches, but node enrollment still selects only the
   reflink backend. Implement and locally probe a long-lived access decision

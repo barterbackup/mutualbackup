@@ -6030,8 +6030,79 @@ mod tests {
             fs::read(primary_root.join("tracked")).unwrap(),
             b"primary\r\n\0"
         );
+        fs::write(linked_root.join("tracked"), b"reset staged bytes").unwrap();
+        let reset_staged = repo
+            .linked_add_path(linked.worktree_id, "tracked")
+            .unwrap()
+            .unwrap();
+        fs::write(linked_root.join("tracked"), b"reset dirty bytes").unwrap();
+        crate::checkout::set_after_checkout_file_hook(Box::new(|| {
+            panic!("linked hard reset file crash")
+        }));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repo.linked_hard_reset(linked.worktree_id).unwrap();
+        }));
+        assert!(interrupted.is_err());
+        assert_eq!(
+            crate::stage::staged_entries_for_scope(&repo.catalog, linked.scope().unwrap()).unwrap()
+                [0]
+            .1
+            .oid,
+            reset_staged.oid
+        );
+        drop(repo);
+        let repo = GitRepository::open(&primary_root, repository_id, &key).unwrap();
+        assert_eq!(repo.linked_hard_reset(linked.worktree_id).unwrap(), 0);
+        assert_eq!(
+            fs::read(linked_root.join("tracked")).unwrap(),
+            b"primary\r\n\0"
+        );
+        assert_eq!(
+            crate::stage::staged_entries_for_scope(&repo.catalog, linked.scope().unwrap()).unwrap()
+                [0]
+            .1
+            .oid,
+            first.oid
+        );
+        fs::write(linked_root.join("tracked"), b"reset after index bytes").unwrap();
+        let committed_reset_staged = repo
+            .linked_add_path(linked.worktree_id, "tracked")
+            .unwrap()
+            .unwrap();
+        fs::write(linked_root.join("tracked"), b"another dirty edit").unwrap();
+        crate::checkout::set_after_checkout_commit_hook(Box::new(|| {
+            panic!("linked hard reset index crash")
+        }));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repo.linked_hard_reset(linked.worktree_id).unwrap();
+        }));
+        assert!(interrupted.is_err());
+        drop(repo);
+        let repo = GitRepository::open(&primary_root, repository_id, &key).unwrap();
+        assert_eq!(repo.linked_hard_reset(linked.worktree_id).unwrap(), 0);
+        assert_eq!(
+            fs::read(linked_root.join("tracked")).unwrap(),
+            b"primary\r\n\0"
+        );
+        assert_eq!(
+            fs::read(primary_root.join("tracked")).unwrap(),
+            b"primary\r\n\0"
+        );
+        assert_eq!(
+            crate::stage::staged_entries_for_scope(&repo.catalog, linked.scope().unwrap()).unwrap()
+                [0]
+            .1
+            .oid,
+            first.oid
+        );
         let mut anchors = std::collections::BTreeMap::new();
-        for oid in [first.oid, staged.oid, combined_staged.oid] {
+        for oid in [
+            first.oid,
+            staged.oid,
+            combined_staged.oid,
+            reset_staged.oid,
+            committed_reset_staged.oid,
+        ] {
             for anchor in repo
                 .anchors_for_oid(Oid::from_bytes(&oid).unwrap())
                 .unwrap()
