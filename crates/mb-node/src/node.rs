@@ -16383,7 +16383,8 @@ pub(crate) mod tests {
         fs::create_dir_all(&source_root).unwrap();
         fs::write(source_root.join("tracked"), b"base\r\n").unwrap();
         let data = tempfile::tempdir().unwrap();
-        let mut node = Node::open(data.path(), Seed::from_bytes([83; 32])).unwrap();
+        let seed = Seed::from_bytes([83; 32]);
+        let mut node = Node::open(data.path(), seed.clone()).unwrap();
         let info = node.git_init(&source_root).unwrap();
         node.git_add(info.repository_id, Path::new("tracked"))
             .unwrap();
@@ -16396,6 +16397,12 @@ pub(crate) mod tests {
             .unwrap();
         let topic = node
             .git_commit(info.repository_id, "Author", "a@example.test", "topic")
+            .unwrap();
+        // The index is replaced twice with identical bytes. Only the anchor
+        // selected by the backup recipe must survive after this branch dies.
+        node.git_add(info.repository_id, Path::new("tracked"))
+            .unwrap();
+        node.git_add(info.repository_id, Path::new("tracked"))
             .unwrap();
         node.git_switch_branch(info.repository_id, "main").unwrap();
         let before = node
@@ -16420,10 +16427,22 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
+        let protected_sectors = revision
+            .value
+            .data_sectors
+            .iter()
+            .map(|reference| {
+                (
+                    reference.id,
+                    node.sector_for_guild(&guild_id, &reference.id).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!protected_sectors.is_empty());
         node.git_delete_branch(info.repository_id, "topic", true)
             .unwrap();
         let retained = node.git_prune(info.repository_id).unwrap();
-        assert_eq!(retained.native_anchors_removed, 0);
+        assert_eq!(retained.native_anchors_removed, 2);
         assert_eq!(retained.metadata_objects_removed, 0);
         assert!(before.objects.iter().any(|object| object.oid == topic.oid));
         let current = node
@@ -16439,13 +16458,58 @@ pub(crate) mod tests {
             .anchor
             .clone();
         assert!(orphan.open_verified().is_ok());
+        assert!(
+            git_prune_recipe_anchor_ids(&node.control)
+                .unwrap()
+                .contains(&orphan.anchor_id)
+        );
+        for (sector_id, expected) in &protected_sectors {
+            assert_eq!(
+                node.sector_for_guild(&guild_id, sector_id).unwrap(),
+                *expected
+            );
+        }
+
+        drop(node);
+        let mut node = Node::open(data.path(), seed).unwrap();
+        for (sector_id, expected) in &protected_sectors {
+            assert_eq!(
+                node.sector_for_guild(&guild_id, sector_id).unwrap(),
+                *expected
+            );
+        }
+        fs::write(source_root.join("tracked"), b"changed outside Git").unwrap();
+        node.git_restore_worktree(info.repository_id, &[PathBuf::from("tracked")])
+            .unwrap();
+        assert_eq!(fs::read(source_root.join("tracked")).unwrap(), b"base\r\n");
 
         node.control
             .delete_record("user-revision", revision.value.revision_id.as_bytes())
             .unwrap();
+        let still_serving = node.git_prune(info.repository_id).unwrap();
+        assert_eq!(still_serving.native_anchors_removed, 0);
+        assert!(still_serving.metadata_objects_removed > 0);
+        assert!(orphan.open_verified().is_ok());
+        for (sector_id, expected) in &protected_sectors {
+            assert_eq!(
+                node.sector_for_guild(&guild_id, sector_id).unwrap(),
+                *expected
+            );
+        }
+        for reference in revision
+            .value
+            .metadata_sectors
+            .iter()
+            .chain(&revision.value.data_sectors)
+        {
+            node.control
+                .delete_record("local-sector", &reference.id)
+                .unwrap();
+        }
+        retire_revision_anchor(&mut node.control, revision.value.revision_id).unwrap();
         let removed = node.git_prune(info.repository_id).unwrap();
         assert!(removed.native_anchors_removed > 0);
-        assert!(removed.metadata_objects_removed > 0);
+        assert_eq!(removed.metadata_objects_removed, 0);
         assert!(orphan.open_verified().is_err());
         assert_eq!(
             node.open_git_repository(info.repository_id)

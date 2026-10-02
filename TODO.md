@@ -8,10 +8,11 @@
   removes surplus mappings with the existing crash-replayable deletion intent.
   Local decision and recipe-key tests pass. The new ignored Btrfs regression
   stages identical bytes repeatedly, prunes with and without an exact pin,
-  and checks the remaining catalog after reopen. Run the provisioned Git gate
-  and extend its node-level case to serve a signed backup sector from the
-  retained recipe anchor and check byte-exact checkout after reopening before
-  closing this item.
+  and checks the remaining catalog after reopen. The node-level Btrfs case now
+  also serves signed backup sectors across a reopen, restores exact worktree
+  bytes, and proves a recipe pin survives revision-record removal until the
+  sector recipe itself retires. Run the provisioned Git gate before closing
+  this item.
 - [ ] **M6 restore/reset recovery acceptance.** Checkout intent formats 9/10
   now carry BLAKE3 roots and lengths for previously unanchored working files;
   linked worktrees use wrapper version 2. Replay verifies those bytes in the
