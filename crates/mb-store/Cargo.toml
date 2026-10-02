@@ -17,3 +17,6 @@ tempfile.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser.workspace = true
