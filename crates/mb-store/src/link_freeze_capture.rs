@@ -536,6 +536,38 @@ impl LinkFreezeCaptureIntent {
         )
     }
 
+    /// Finish a frozen file's edit transition at its current pinned name.
+    /// The source may have moved before the edit or between journal phases;
+    /// each rebind proves the original inode and the current anchor layout.
+    pub fn detach_for_edit_at(
+        self,
+        control: &ControlStore,
+        source_parent: &PinnedDirectory,
+        source_name: impl AsRef<Path>,
+        anchor_parent: &PinnedDirectory,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(self.phase == LinkFreezeCapturePhase::Frozen);
+        let source_name = source_name.as_ref();
+        let anchor_id = self.anchor_id;
+        match LinkFreezeEditIntent::load(control, anchor_id)? {
+            Some(edit) if edit.phase() == LinkFreezeEditPhase::Editable => {
+                return self.finish_detached_edit(control, anchor_parent);
+            }
+            Some(_) => {
+                self.rebind_pending_edit(control, source_parent, source_name, anchor_parent)?;
+            }
+            None => {
+                self.begin_edit_at(control, source_parent, source_name, anchor_parent)?;
+            }
+        }
+        let detached = Self::load(control, anchor_id)?
+            .ok_or_else(|| anyhow::anyhow!("frozen capture journal disappeared during edit"))?
+            .resume(control, source_parent, anchor_parent)?
+            .ok_or_else(|| anyhow::anyhow!("frozen capture changed during edit"))?;
+        anyhow::ensure!(detached.phase == LinkFreezeCapturePhase::Detached);
+        Ok(detached)
+    }
+
     /// Move the journal's source-name hint after a verified rename. The old
     /// pathname may now be absent or hold an unrelated replacement; the
     /// current pinned name must still be the sole link besides the anchor.

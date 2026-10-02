@@ -23,7 +23,10 @@ use super::{
     open_source_root, open_stable_anchor_area, probe_guarded_link_freeze, reopen_pinned_file,
     resolve_anchor_area, unix_mode, validate_relative,
 };
-use crate::{ControlStore, LinkFreezeCaptureIntent, LinkFreezeCapturePhase};
+use crate::{
+    ControlStore, LinkFreezeCaptureIntent, LinkFreezeCapturePhase, LinkFreezeEditIntent,
+    LinkFreezeEditPhase,
+};
 
 const PLAN_KIND: &str = "guarded-root-plan-v1";
 const ROOT_CLAIM_KIND: &str = "guarded-root-claim-v1";
@@ -635,13 +638,25 @@ impl GuardedRootCapturePlan {
                             )?
                         }
                     };
-                    anyhow::ensure!(intent.matches_root_file_plan(
-                        *capture_id,
-                        expected_parent,
-                        expected_source,
-                        &anchor_parent,
-                        name,
-                    )?);
+                    // A detached file may have been renamed before its edit;
+                    // the immutable anchor still belongs to the planned inode.
+                    let matches_plan = if intent.phase() == LinkFreezeCapturePhase::Detached {
+                        intent.matches_file_plan(
+                            *capture_id,
+                            expected_source,
+                            &anchor_parent,
+                            name,
+                        )?
+                    } else {
+                        intent.matches_root_file_plan(
+                            *capture_id,
+                            expected_parent,
+                            expected_source,
+                            &anchor_parent,
+                            name,
+                        )?
+                    };
+                    anyhow::ensure!(matches_plan);
                     let verified = intent
                         .resume(control, &source_parent, &anchor_parent)?
                         .ok_or_else(|| anyhow::anyhow!("planned guarded source changed: {path}"))?;
@@ -756,6 +771,174 @@ impl GuardedRootCapturePlan {
             )?);
         }
         Ok(manifest)
+    }
+
+    /// Make one file from a published root capture editable while retaining
+    /// its exact immutable anchor. The current path may differ from its
+    /// capture-time path; a pinned inode check binds the edit to the right
+    /// file, and the per-file journal resumes an interrupted sparse detach.
+    pub fn prepare_file_edit_at(
+        &self,
+        control: &ControlStore,
+        captured_relative_path: impl AsRef<Path>,
+        current_relative_path: impl AsRef<Path>,
+    ) -> anyhow::Result<()> {
+        self.validate()?;
+        let captured_relative_path = captured_relative_path.as_ref();
+        let current_relative_path = current_relative_path.as_ref();
+        validate_relative(captured_relative_path)?;
+        validate_relative(current_relative_path)?;
+        let captured_path = captured_relative_path
+            .to_str()
+            .ok_or(AnchorError::NonUtf8Path)?;
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.path() == captured_path)
+            .ok_or_else(|| anyhow::anyhow!("file is not in the guarded root capture"))?;
+        let GuardedRootEntry::File {
+            capture_id,
+            version,
+            ..
+        } = entry
+        else {
+            anyhow::bail!("guarded root entry is not a file");
+        };
+        let plan_bytes = mb_core::canonical_bytes(self)?;
+        let plan_hash = *blake3::hash(&plan_bytes).as_bytes();
+        anyhow::ensure!(
+            control.get_record(PLAN_KIND, self.anchor_id.as_bytes())? == Some(plan_bytes)
+                && control
+                    .get_record(RETIRE_KIND, self.anchor_id.as_bytes())?
+                    .is_none()
+                && !LinkFreezeCaptureIntent::retirement_pending(control, *capture_id)?,
+            "guarded root file is not published or is being retired"
+        );
+        let area_path = resolve_anchor_area(&self.area)?;
+        let area_file = open_stable_anchor_area(&area_path, &self.area)?;
+        let area = PinnedDirectory {
+            file: area_file,
+            filesystem_id: self.area.filesystem_id,
+        };
+        anyhow::ensure!(
+            self.verified_marker(&area, plan_hash)?.is_some(),
+            "guarded root ownership marker disappeared"
+        );
+        let root_claim: RootClaim = mb_core::decode_canonical(
+            &control
+                .get_record(ROOT_CLAIM_KIND, self.anchor_id.as_bytes())?
+                .ok_or_else(|| anyhow::anyhow!("guarded root claim disappeared"))?,
+        )?;
+        let anchor_root = area
+            .open_child_directory(self.anchor_id.to_string())?
+            .ok_or_else(|| anyhow::anyhow!("guarded root anchor directory disappeared"))?;
+        anyhow::ensure!(
+            root_claim.format_version == 1
+                && root_claim.anchor_id == self.anchor_id
+                && root_claim.plan_hash == plan_hash
+                && root_claim.root_id == anchor_root.identity()?
+                && unix_mode(&anchor_root.as_file().metadata()?) & 0o777 == 0o700,
+            "guarded root anchor differs from its claim"
+        );
+        anyhow::ensure!(
+            self.verify_manifest_for_retirement(control, &anchor_root, plan_hash, false)?
+                .is_some_and(|(_, present)| present.is_some()),
+            "guarded root has no published manifest"
+        );
+        self.verify_directory_claims_before_retirement(control, &area, plan_hash)?;
+        let anchor_parent =
+            self.claimed_file_parent(control, &anchor_root, plan_hash, captured_relative_path)?;
+        let anchor_name = captured_relative_path
+            .file_name()
+            .ok_or(AnchorError::InvalidGuardedPlan)?;
+        let intent = LinkFreezeCaptureIntent::load(control, *capture_id)?
+            .ok_or_else(|| anyhow::anyhow!("guarded root file capture journal disappeared"))?;
+        anyhow::ensure!(intent.matches_file_plan(
+            *capture_id,
+            NativeFileId {
+                filesystem_id: version.filesystem_id,
+                inode: version.inode,
+            },
+            &anchor_parent,
+            Path::new(anchor_name),
+        )?);
+        if intent.phase() == LinkFreezeCapturePhase::Detached {
+            intent.verify_detached_anchor(control, &anchor_parent)?;
+            return Ok(());
+        }
+        anyhow::ensure!(intent.phase() == LinkFreezeCapturePhase::Frozen);
+        if LinkFreezeEditIntent::load(control, *capture_id)?
+            .as_ref()
+            .is_some_and(|edit| edit.phase() == LinkFreezeEditPhase::Editable)
+        {
+            intent.finish_detached_edit(control, &anchor_parent)?;
+            return Ok(());
+        }
+        let source_root = PinnedDirectory::open(&self.source_root)?;
+        anyhow::ensure!(
+            source_root.identity()?
+                == (NativeFileId {
+                    filesystem_id: self.root_version.filesystem_id,
+                    inode: self.root_version.inode,
+                }),
+            "guarded source root changed before edit"
+        );
+        let current_parent = current_relative_path
+            .parent()
+            .ok_or(AnchorError::UnsafePath)?;
+        let source_parent = if current_parent.as_os_str().is_empty() {
+            source_root
+        } else {
+            source_root.open_descendant_directory(current_parent)?
+        };
+        let source_name = current_relative_path
+            .file_name()
+            .ok_or(AnchorError::UnsafePath)?;
+        intent.detach_for_edit_at(control, &source_parent, source_name, &anchor_parent)?;
+        Ok(())
+    }
+
+    fn claimed_file_parent(
+        &self,
+        control: &ControlStore,
+        anchor_root: &PinnedDirectory,
+        plan_hash: [u8; 32],
+        captured_relative_path: &Path,
+    ) -> anyhow::Result<PinnedDirectory> {
+        let mut parent = anchor_root.try_clone()?;
+        let mut path = PathBuf::new();
+        let claim_kind = self.directory_claim_kind();
+        for component in captured_relative_path
+            .parent()
+            .ok_or(AnchorError::InvalidGuardedPlan)?
+            .components()
+        {
+            let std::path::Component::Normal(name) = component else {
+                anyhow::bail!("invalid guarded root file parent");
+            };
+            path.push(name);
+            let path_name = path.to_str().ok_or(AnchorError::InvalidGuardedPlan)?;
+            let claim: DirectoryClaim = mb_core::decode_canonical(
+                &control
+                    .get_record(&claim_kind, path_name.as_bytes())?
+                    .ok_or_else(|| anyhow::anyhow!("guarded root file parent claim disappeared"))?,
+            )?;
+            let child = parent
+                .open_child_directory(Path::new(name))?
+                .ok_or_else(|| anyhow::anyhow!("guarded root file parent disappeared"))?;
+            anyhow::ensure!(
+                claim.format_version == 1
+                    && claim.anchor_id == self.anchor_id
+                    && claim.path == path_name
+                    && claim.parent_id == parent.identity()?
+                    && claim.directory_id == child.identity()?
+                    && claim.plan_hash == plan_hash
+                    && unix_mode(&child.as_file().metadata()?) & 0o777 == 0o700,
+                "guarded root file parent differs from its claim"
+            );
+            parent = child;
+        }
+        Ok(parent)
     }
 
     fn verify_anchor_names(
@@ -952,16 +1135,24 @@ impl GuardedRootCapturePlan {
             let expected_parent = *source_directories
                 .get(parent_path)
                 .ok_or(AnchorError::InvalidGuardedPlan)?;
-            anyhow::ensure!(capture.matches_root_file_plan(
-                *capture_id,
-                expected_parent,
-                NativeFileId {
-                    filesystem_id: version.filesystem_id,
-                    inode: version.inode,
-                },
-                &anchor_parent,
-                name,
-            )?);
+            let expected_source = NativeFileId {
+                filesystem_id: version.filesystem_id,
+                inode: version.inode,
+            };
+            // Retirement no longer needs the old source pathname after the
+            // anchor became a verified private inode.
+            let matches_plan = if capture.phase() == LinkFreezeCapturePhase::Detached {
+                capture.matches_file_plan(*capture_id, expected_source, &anchor_parent, name)?
+            } else {
+                capture.matches_root_file_plan(
+                    *capture_id,
+                    expected_parent,
+                    expected_source,
+                    &anchor_parent,
+                    name,
+                )?
+            };
+            anyhow::ensure!(matches_plan);
             let source_parent =
                 match self.open_source_parent_for_retirement(parent_path, expected_parent) {
                     Ok(parent) => parent,
@@ -2042,6 +2233,29 @@ mod tests {
     }
 
     #[test]
+    fn root_edit_requires_a_published_file_capture() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("file"), b"source bytes").unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let capture_id = match &plan.entries[0] {
+            GuardedRootEntry::File { capture_id, .. } => *capture_id,
+            _ => panic!("expected file entry"),
+        };
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([84; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let source = crate::SourceCapturePlan::GuardedLinkFreezeV1(plan);
+        assert!(source.prepare_file_edit_at(&store, "file", "file").is_err());
+        assert!(
+            LinkFreezeCaptureIntent::load(&store, capture_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(root.join("file")).unwrap(), b"source bytes");
+    }
+
+    #[test]
     fn root_retirement_preserves_an_unknown_child_until_replay() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
@@ -2125,9 +2339,22 @@ mod tests {
         drop(store);
 
         let store = ControlStore::open(&database_path, &keys).unwrap();
+        crate::SourceCapturePlan::GuardedLinkFreezeV1(plan.clone())
+            .prepare_file_edit_at(&store, "nested/file", "nested/file")
+            .unwrap();
+        fs::write(&source, b"later edit").unwrap();
+        let mut retained = Vec::new();
+        manifest
+            .file_locator("nested/file".to_owned())
+            .unwrap()
+            .open()
+            .unwrap()
+            .read_to_end(&mut retained)
+            .unwrap();
+        assert_eq!(retained, b"raw\r\nbytes\0");
         plan.discard_unreferenced(&store).unwrap();
         plan.discard_unreferenced(&store).unwrap();
-        assert_eq!(fs::read(&source).unwrap(), b"raw\r\nbytes\0");
+        assert_eq!(fs::read(&source).unwrap(), b"later edit");
         assert_ne!(
             fs::metadata(&source).unwrap().permissions().mode() & 0o200,
             0
@@ -2139,6 +2366,69 @@ mod tests {
                 .join(plan.anchor_id.to_string())
                 .exists()
         );
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN for fanotify permission events"]
+    fn root_edit_replays_after_source_rename_without_changing_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        let original = root.join("nested/file");
+        fs::write(&original, b"original\r\nbytes\0").unwrap();
+        let plan = GuardedRootCapturePlan::plan(&root).unwrap();
+        let capture_id = plan
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                GuardedRootEntry::File {
+                    path, capture_id, ..
+                } if path == "nested/file" => Some(*capture_id),
+                _ => None,
+            })
+            .unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([85; 32]));
+        let database_path = temp.path().join("control.db");
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        let manifest = plan.capture(&store).unwrap();
+        let source_parent = PinnedDirectory::open(root.join("nested")).unwrap();
+        let anchor_parent = PinnedDirectory::open(
+            plan.area
+                .path_hint
+                .join(plan.anchor_id.to_string())
+                .join("nested"),
+        )
+        .unwrap();
+        LinkFreezeCaptureIntent::load(&store, capture_id)
+            .unwrap()
+            .unwrap()
+            .begin_edit(&store, &source_parent, &anchor_parent)
+            .unwrap();
+        fs::create_dir(root.join("moved")).unwrap();
+        let renamed = root.join("moved/renamed");
+        fs::rename(&original, &renamed).unwrap();
+        fs::write(&original, b"unrelated replacement").unwrap();
+        drop(store);
+
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        crate::SourceCapturePlan::GuardedLinkFreezeV1(plan.clone())
+            .prepare_file_edit_at(&store, "nested/file", "moved/renamed")
+            .unwrap();
+        fs::write(&renamed, b"new user bytes").unwrap();
+        assert_eq!(fs::read(&original).unwrap(), b"unrelated replacement");
+        assert_eq!(plan.capture(&store).unwrap(), manifest);
+        let mut retained = Vec::new();
+        manifest
+            .file_locator("nested/file".to_owned())
+            .unwrap()
+            .open()
+            .unwrap()
+            .read_to_end(&mut retained)
+            .unwrap();
+        assert_eq!(retained, b"original\r\nbytes\0");
+        plan.discard_unreferenced(&store).unwrap();
+        assert_eq!(fs::read(&renamed).unwrap(), b"new user bytes");
+        assert_eq!(fs::read(&original).unwrap(), b"unrelated replacement");
     }
 
     #[test]

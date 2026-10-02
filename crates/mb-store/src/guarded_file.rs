@@ -398,16 +398,7 @@ impl GuardedFileCapturePlan {
         let source_name = current_relative_path
             .file_name()
             .ok_or(AnchorError::UnsafePath)?;
-        if edit.is_some() {
-            intent.rebind_pending_edit(control, &source_parent, source_name, &anchor_parent)?;
-        } else {
-            intent.begin_edit_at(control, &source_parent, source_name, &anchor_parent)?;
-        }
-        let detached = LinkFreezeCaptureIntent::load(control, self.anchor_id)?
-            .ok_or_else(|| anyhow::anyhow!("guarded file capture journal disappeared"))?
-            .resume(control, &source_parent, &anchor_parent)?
-            .ok_or_else(|| anyhow::anyhow!("guarded file capture changed during edit"))?;
-        anyhow::ensure!(detached.phase() == LinkFreezeCapturePhase::Detached);
+        intent.detach_for_edit_at(control, &source_parent, source_name, &anchor_parent)?;
         manifest.open_verified()?;
         Ok(())
     }
