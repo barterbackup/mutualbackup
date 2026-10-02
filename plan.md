@@ -43,8 +43,9 @@ them as ADRs and test vectors before promising wire compatibility.
   Git-compatible object IDs describe the bytes actually retained in native
   anchors. Treat Git's automatic conversion settings as disabled in our binary,
   including when opening an existing repository or importing a commit. `add`
-  hashes the immutable captured bytes, and checkout writes the stored blob
-  bytes unchanged; no clean/smudge step is part of either operation.
+  hashes the immutable captured bytes as a raw Git blob, so its object ID must
+  match `git hash-object --no-filters` on those bytes. Checkout writes the
+  stored blob bytes unchanged; no clean/smudge step is part of either operation.
 - Use a pinned SQLCipher/SQLite build as the common local storage engine, with
   per-page HMAC enabled. Keep control state separate from parity storage. The
   prototype instantiates one parity database; later, one database per configured
@@ -3149,9 +3150,10 @@ backend gates. A command being present does not by itself close its slice.
   to an eager full copy.
 - Close the Git phase with a local gate for exact-byte add/edit/commit/checkout
   and multi-worktree cases, asserting captured source = staged blob = committed
-  blob = restored file when no edit intervenes, and asserting imported/exported
-  blob bytes and IDs remain identical even when a stock Git peer has different
-  line-ending or filter settings; mixed LF/CRLF, binary NUL, non-UTF-8
+  blob = restored file when no edit intervenes, comparing the blob ID with
+  `git hash-object --no-filters` on the original bytes, and asserting imported
+  and exported blob bytes and IDs remain identical even when a stock Git peer
+  has different line-ending or filter settings; mixed LF/CRLF, binary NUL, non-UTF-8
   payloads, and conversion-inducing system/global/repository/environment
   `core.autocrlf`, `core.eol`, and `merge.renormalize` settings and rules from
   `.gitattributes`, `core.attributesFile`, and `.git/info/attributes` for
