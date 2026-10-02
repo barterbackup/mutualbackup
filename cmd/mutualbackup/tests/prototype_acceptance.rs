@@ -1684,10 +1684,14 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         &final_owner_two,
     )
     .unwrap();
-    let topology_backup = cli(
+    let topology_backup = topology_backup_cli(
         &sockets[2],
-        ["backup", "--wait"],
         process_topology_backup_timeout(),
+        &[
+            &daemons[0].log,
+            &daemons[2].log,
+            &storage_recovered_daemon.log,
+        ],
     );
     assert!(topology_backup.contains("state:      Committed"));
     wait_for_peer_transfer(
@@ -1803,10 +1807,14 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         deterministic_bytes(512_047, 89),
     )
     .unwrap();
-    let relay_backup = cli(
+    let relay_backup = topology_backup_cli(
         &sockets[2],
-        ["backup", "--wait"],
         process_topology_backup_timeout(),
+        &[
+            &daemons[0].log,
+            &daemons[2].log,
+            &storage_recovered_daemon.log,
+        ],
     );
     assert!(relay_backup.contains("state:      Committed"));
     wait_for_peer_transfer(
@@ -2747,6 +2755,44 @@ fn cli<const N: usize>(socket: &Path, args: [&str; N], timeout: Duration) -> Str
     let mut owned = vec![os("--socket"), socket.as_os_str().to_owned()];
     owned.extend(args.into_iter().map(os));
     run_cli(&owned, timeout).unwrap()
+}
+
+fn topology_backup_cli(socket: &Path, timeout: Duration, logs: &[&Path]) -> String {
+    let args = vec![
+        os("--socket"),
+        socket.as_os_str().to_owned(),
+        os("backup"),
+        os("--wait"),
+    ];
+    run_cli(&args, timeout).unwrap_or_else(|error| {
+        let diagnostics = logs
+            .iter()
+            .map(|path| match fs::read_to_string(path) {
+                Ok(log) => {
+                    let relevant = log
+                        .lines()
+                        .rev()
+                        .filter(|line| {
+                            line.contains("guild member did not sign")
+                                || line.contains("coding activation deferred")
+                                || line.contains("coordinator backup attempt deferred")
+                        })
+                        .take(20)
+                        .collect::<Vec<_>>();
+                    let tail = log.lines().rev().take(12).collect::<Vec<_>>();
+                    format!(
+                        "{}:\nrelevant warnings:\n{}\nrecent log:\n{}",
+                        path.display(),
+                        relevant.into_iter().rev().collect::<Vec<_>>().join("\n"),
+                        tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+                    )
+                }
+                Err(read_error) => format!("{}: {read_error}", path.display()),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!("topology backup failed: {error}\n{diagnostics}");
+    })
 }
 
 fn git_cli<const N: usize>(socket: &Path, directory: &Path, args: [&str; N]) -> String {
