@@ -553,6 +553,21 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitWorktreeRestoreBoth {
+            repository_id,
+            worktree_id,
+            paths,
+        } => {
+            blocking_node(node, move |node| {
+                let changed_paths =
+                    node.git_worktree_restore_both(repository_id, worktree_id, &paths)?;
+                Ok(LocalResponse::GitBothRestored {
+                    repository_id,
+                    changed_paths,
+                })
+            })
+            .await
+        }
         LocalRequest::GitWorktreeHardReset {
             repository_id,
             worktree_id,
@@ -822,6 +837,19 @@ async fn handle_request(
             blocking_node(node, move |node| {
                 let changed_paths = node.git_restore_worktree(repository_id, &paths)?;
                 Ok(LocalResponse::GitWorktreeRestored {
+                    repository_id,
+                    changed_paths,
+                })
+            })
+            .await
+        }
+        LocalRequest::GitRestoreBoth {
+            repository_id,
+            paths,
+        } => {
+            blocking_node(node, move |node| {
+                let changed_paths = node.git_restore_both(repository_id, &paths)?;
+                Ok(LocalResponse::GitBothRestored {
                     repository_id,
                     changed_paths,
                 })

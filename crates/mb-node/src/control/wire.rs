@@ -379,6 +379,15 @@ pub enum LocalRequest {
         worktree_id: Uuid,
         path: PathBuf,
     },
+    GitRestoreBoth {
+        repository_id: Uuid,
+        paths: Vec<PathBuf>,
+    },
+    GitWorktreeRestoreBoth {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        paths: Vec<PathBuf>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -498,6 +507,10 @@ pub enum LocalResponse {
     SnapshotRestored(SnapshotInfo),
     GitWorktreePruned(GitWorktreeInfo),
     GitWorktreeRemoved(GitWorktreeInfo),
+    GitBothRestored {
+        repository_id: Uuid,
+        changed_paths: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -720,6 +733,11 @@ mod tests {
                 worktree_id: Uuid::from_bytes([5; 16]),
                 paths: vec![PathBuf::from("tracked")],
             },
+            LocalRequest::GitWorktreeRestoreBoth {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                paths: vec![PathBuf::from("tracked")],
+            },
             LocalRequest::GitWorktreeHardReset {
                 repository_id,
                 worktree_id: Uuid::from_bytes([5; 16]),
@@ -892,6 +910,10 @@ mod tests {
                 paths: Vec::new(),
             },
             LocalRequest::GitRestoreWorktree {
+                repository_id,
+                paths: vec![PathBuf::from("tracked")],
+            },
+            LocalRequest::GitRestoreBoth {
                 repository_id,
                 paths: vec![PathBuf::from("tracked")],
             },
@@ -1069,6 +1091,10 @@ mod tests {
                 changed_paths: 2,
             },
             LocalResponse::GitWorktreeRestored {
+                repository_id,
+                changed_paths: 1,
+            },
+            LocalResponse::GitBothRestored {
                 repository_id,
                 changed_paths: 1,
             },

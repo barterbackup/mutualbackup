@@ -3,15 +3,14 @@
 ## Milestone 6 active implementation gates
 
 - [ ] **M6 combined Git restore is one recoverable operation.**
-  `mutualgit restore --staged --worktree PATH` currently sends an index reset
-  and then a worktree restore as separate daemon requests. If the latter fails
-  preflight or the daemon stops between calls, the command reports failure
-  after already discarding the selected staged bytes. Add one daemon request
-  and a versioned checkout intent that binds the selected HEAD paths, old
-  worktree content roots, and target index; publish the selected worktree
-  bytes before the index transition. Cover primary and linked worktrees,
-  dirty-file conflicts, directory topology, and interruption/reopen at both
-  publication boundaries.
+  `mutualgit restore --staged --worktree PATH` now sends one daemon request for
+  primary or linked worktrees. Version 11 checkout intents bind the selected
+  HEAD paths, old worktree content roots, old index digest, and full target
+  index; replay publishes selected worktree bytes before the index transition.
+  Local intent, schema, CLI, and non-Btrfs Git tests pass. The ignored primary
+  and linked Btrfs regressions cover dirty directory preflight, staged additions,
+  unrelated staged bytes, and interruption/reopen before and after index publication;
+  run the provisioned reflink acceptance gate before closing this item.
 - [ ] **M6 prune duplicate native anchors by physical reachability.** Git
   prune now distinguishes exact index and local-sector recipe pins from blob
   IDs and retains one verified source per filesystem for each live blob. It

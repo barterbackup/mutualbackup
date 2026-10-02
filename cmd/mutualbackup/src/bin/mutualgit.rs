@@ -428,10 +428,11 @@ async fn main() -> Result<()> {
             worktree,
             paths,
         } => {
-            if staged {
+            if staged && worktree {
+                restore_both(&socket, &working_directory, paths).await?;
+            } else if staged {
                 reset_index(&socket, &working_directory, paths.clone()).await?;
-            }
-            if worktree || !staged {
+            } else {
                 restore_worktree(&socket, &working_directory, paths).await?;
             }
         }
@@ -1202,6 +1203,37 @@ async fn restore_worktree(
         bail!("daemon restored another repository's worktree");
     }
     println!("Restored {changed_paths} working path(s) from the index");
+    Ok(())
+}
+
+async fn restore_both(socket: &Path, working_directory: &Path, paths: Vec<PathBuf>) -> Result<()> {
+    let (root, repository_id, worktree_id) = discover_location(working_directory)?;
+    let paths = paths
+        .iter()
+        .map(|path| relative_for_add(&root, working_directory, path))
+        .collect::<Result<Vec<_>>>()?;
+    let request = match worktree_id {
+        Some(worktree_id) => LocalRequest::GitWorktreeRestoreBoth {
+            repository_id,
+            worktree_id,
+            paths,
+        },
+        None => LocalRequest::GitRestoreBoth {
+            repository_id,
+            paths,
+        },
+    };
+    let LocalResponse::GitBothRestored {
+        repository_id: returned_id,
+        changed_paths,
+    } = local_control_call(socket, &request).await?
+    else {
+        bail!("daemon returned the wrong response to combined Git restore");
+    };
+    if returned_id != repository_id {
+        bail!("daemon restored another repository's paths");
+    }
+    println!("Restored {changed_paths} path(s) in index and worktree from HEAD");
     Ok(())
 }
 
