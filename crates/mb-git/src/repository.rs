@@ -41,8 +41,9 @@ use crate::interop::{
 use crate::merge::{
     MergeBlobError, has_merge_session, has_merge_session_for_scope,
     has_merge_session_outside_scope, load_merge_session, load_merge_session_for_scope,
-    mark_merge_resolved, mark_merge_resolved_for_scope, resume_pending_merge_blob, session_key,
-    session_kind, session_kind_for_scope,
+    mark_merge_resolved, mark_merge_resolved_for_scope, primary_merge_blob_source_root,
+    resume_pending_merge_blob, resume_pending_merge_blob_for_scope, session_key, session_kind,
+    session_kind_for_scope,
 };
 use crate::prune::{
     GitPruneError, GitPruneReport, GitPruneRoots, prune_unreachable, resume_pending_prune,
@@ -57,8 +58,8 @@ use crate::stage::{
 };
 use crate::status::{GitStatus, StatusError, repository_status, repository_status_for_scope};
 use crate::worktree::{
-    GitWorktreeError, GitWorktreeInfo, add_worktree, get_worktree, list_worktrees,
-    prune_missing_worktree, remove_worktree, resume_worktree,
+    GitWorktreeError, GitWorktreeInfo, GitWorktreeState, add_worktree, get_worktree,
+    list_worktrees, prune_missing_worktree, remove_worktree, resume_worktree,
 };
 
 const INITIALIZATION_INTENT: &str = "repository-intent";
@@ -347,6 +348,11 @@ impl GitRepository {
             &self.root,
             &self.directory,
             self.source_backend,
+        )?;
+        resume_pending_merge_blob_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+            &info.path,
         )?;
         resume_pending_checkout_for_scope(
             &self.catalog,
@@ -1052,7 +1058,26 @@ impl GitRepository {
     }
 
     fn resume_checkout(&self) -> Result<(), RepositoryError> {
-        resume_pending_merge_blob(&self.catalog, self.repository_id, &self.root)?;
+        let blob_root = primary_merge_blob_source_root(&self.catalog, self.repository_id)?;
+        if let Some(blob_root) = blob_root.as_deref()
+            && blob_root != self.root
+        {
+            let linked = list_worktrees(&self.catalog, self.repository_id)?
+                .into_iter()
+                .find(|info| info.path == blob_root && info.state == GitWorktreeState::Ready)
+                .ok_or(MergeBlobError::IncompatibleRecord)?;
+            resume_worktree(
+                &self.catalog,
+                self.repository_id,
+                linked.worktree_id,
+                &self.root,
+                &self.directory,
+                self.source_backend,
+            )?;
+            resume_pending_merge_blob(&self.catalog, self.repository_id, blob_root)?;
+        } else {
+            resume_pending_merge_blob(&self.catalog, self.repository_id, &self.root)?;
+        }
         resume_pending_checkout(
             &self.catalog,
             self.repository_id,
@@ -1743,6 +1768,97 @@ mod tests {
         drop(local);
         drop(remote_commit);
         drop(remote);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn linked_content_merge_replays_its_own_generated_blob_after_reopen() {
+        linked_content_merge_replay(false);
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn legacy_linked_content_merge_intent_replays_after_upgrade() {
+        linked_content_merge_replay(true);
+    }
+
+    fn linked_content_merge_replay(legacy_intent: bool) {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-linked-content-merge-{}", Uuid::new_v4()));
+        let primary_root = run_root.join("primary");
+        let linked_root = run_root.join("linked");
+        fs::create_dir_all(&primary_root).unwrap();
+        fs::create_dir_all(&linked_root).unwrap();
+        let base = b"first\r\nsecond\nthird\r\nfourth\nfifth\r\n";
+        let ours = b"our first\r\nsecond\nthird\r\nfourth\nfifth\r\n";
+        let theirs = b"first\r\nsecond\nthird\r\nfourth\ntheir fifth\r\n";
+        let merged = b"our first\r\nsecond\nthird\r\nfourth\ntheir fifth\r\n";
+        fs::write(primary_root.join("tracked"), base).unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [104_u8; 32];
+        let local = GitRepository::init(&primary_root, repository_id, &key).unwrap();
+        local.stage_file("tracked").unwrap();
+        local.commit("Author", "a@example.test", "base").unwrap();
+        local.create_branch("topic").unwrap();
+        let linked = local.add_linked_worktree(&linked_root, "topic").unwrap();
+        fs::write(primary_root.join("tracked"), theirs).unwrap();
+        local.stage_file("tracked").unwrap();
+        let main = local.commit("Author", "a@example.test", "main").unwrap();
+        fs::write(linked_root.join("tracked"), ours).unwrap();
+        local
+            .linked_add_path(linked.worktree_id, "tracked")
+            .unwrap();
+        let topic = local
+            .linked_commit(linked.worktree_id, "Author", "a@example.test", "topic")
+            .unwrap();
+
+        crate::merge::set_after_merge_blob_capture_hook(Box::new(|| panic!("linked blob crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local
+                .linked_merge_branch(linked.worktree_id, "main", "Author", "a@example.test")
+                .unwrap();
+        }));
+        assert!(interrupted.is_err());
+        let scope = linked.scope().unwrap();
+        assert!(crate::merge::has_pending_merge_blob_for_scope(&local.catalog, scope).unwrap());
+        if legacy_intent {
+            crate::merge::move_linked_blob_intent_to_legacy_primary(&local.catalog, scope).unwrap();
+            assert!(
+                !crate::merge::has_pending_merge_blob_for_scope(&local.catalog, scope).unwrap()
+            );
+        }
+        assert_eq!(fs::read(linked_root.join("tracked")).unwrap(), ours);
+        drop(local);
+
+        let local = GitRepository::open(&primary_root, repository_id, &key).unwrap();
+        assert_eq!(
+            crate::merge::has_pending_merge_blob_for_scope(&local.catalog, scope).unwrap(),
+            !legacy_intent
+        );
+        local.resume_linked_worktree(linked.worktree_id).unwrap();
+        assert!(!crate::merge::has_pending_merge_blob_for_scope(&local.catalog, scope).unwrap());
+        assert!(!crate::merge::has_pending_merge_blob(&local.catalog, repository_id).unwrap());
+        let merged_oid = Oid::hash_object(git2::ObjectType::Blob, merged).unwrap();
+        assert_eq!(local.anchors_for_oid(merged_oid).unwrap().len(), 1);
+        local
+            .linked_merge_branch(linked.worktree_id, "main", "Author", "a@example.test")
+            .unwrap();
+        assert_eq!(fs::read(linked_root.join("tracked")).unwrap(), merged);
+        assert_eq!(fs::read(primary_root.join("tracked")).unwrap(), theirs);
+        assert_eq!(local.status().unwrap().head_oid, Some(main.oid));
+        assert_eq!(
+            local.linked_log(linked.worktree_id, 1).unwrap()[0].parent_oids,
+            vec![topic.oid, main.oid]
+        );
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
         for blob in graph.blobs {
             blob.anchor.remove().unwrap();
         }

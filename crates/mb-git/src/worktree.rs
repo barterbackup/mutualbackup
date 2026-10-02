@@ -31,7 +31,10 @@ use crate::head::{
     store_selected_branch_for_scope,
 };
 use crate::history::{HistoryError, list_branches_for_scope};
-use crate::merge::{load_merge_session_for_scope, session_key, session_kind_for_scope};
+use crate::merge::{
+    MergeBlobError, abandon_pending_merge_blob_for_scope, has_pending_merge_blob_for_scope,
+    load_merge_session_for_scope, session_key, session_kind_for_scope,
+};
 use crate::rm::{GitRmError, abandon_missing_linked_rm};
 use crate::stage::{
     StageError, abandon_missing_linked_worktree_stages, has_pending_stages_for_scope,
@@ -170,6 +173,8 @@ pub enum GitWorktreeError {
     Status(#[from] StatusError),
     #[error("Git worktree index failed: {0}")]
     Stage(#[from] StageError),
+    #[error("Git merge blob recovery failed: {0}")]
+    Merge(#[from] MergeBlobError),
     #[error("tracked removal recovery failed: {0}")]
     Rm(#[from] GitRmError),
     #[error("the linked worktree path, identity, or marker conflicts with its registration")]
@@ -674,6 +679,10 @@ pub(crate) fn prune_missing_worktree(
     let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
     let pending_stages = has_pending_stages_for_scope(control, scope)?;
     let pending_checkout = has_pending_checkout_for_scope(control, scope)?;
+    let pending_merge_blob = has_pending_merge_blob_for_scope(control, scope)?;
+    if pending_merge_blob && !force {
+        return Err(GitWorktreeError::PendingOperation);
+    }
     let merge_session =
         load_merge_session_for_scope(control, scope).map_err(|_| GitWorktreeError::Conflict)?;
     if merge_session.is_some() && !force {
@@ -750,6 +759,9 @@ pub(crate) fn prune_missing_worktree(
             &info.target_branch,
             catalog,
         )?;
+    }
+    if pending_merge_blob {
+        abandon_pending_merge_blob_for_scope(control, scope, &info.path)?;
     }
     control.put_records_and_retire_and_delete_if_value(
         &[],

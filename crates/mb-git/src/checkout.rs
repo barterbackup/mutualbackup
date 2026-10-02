@@ -1788,7 +1788,7 @@ fn begin_divergent_merge(
     }
     let merged = match create_pathwise_merge_commit(
         control,
-        repository_id,
+        scope,
         source,
         merge.old,
         merge.target,
@@ -1901,7 +1901,7 @@ pub(crate) fn continue_merge_for_scope(
     }
     let merged = create_pathwise_merge_commit(
         control,
-        repository_id,
+        scope,
         source,
         ours,
         theirs,

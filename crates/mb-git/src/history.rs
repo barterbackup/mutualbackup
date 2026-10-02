@@ -1228,13 +1228,14 @@ pub(crate) struct MergeIdentity<'a> {
 /// publishes the selected ref.
 pub(crate) fn create_pathwise_merge_commit(
     control: &ControlStore,
-    repository_id: Uuid,
+    scope: GitWorktreeScope,
     source: NativeSource<'_>,
     ours: Oid,
     theirs: Oid,
     identity: MergeIdentity<'_>,
     resolutions: Option<&BTreeMap<Vec<u8>, Option<GitIndexEntry>>>,
 ) -> Result<Oid, HistoryError> {
+    let repository_id = scope.repository_id();
     let temporary = tempfile::tempdir()?;
     let repository = Repository::init_bare(temporary.path())?;
     let metadata_odb = git2::Odb::new()?;
@@ -1335,7 +1336,7 @@ pub(crate) fn create_pathwise_merge_commit(
         }
     }
     for (path, inputs, blob) in &generated {
-        capture_generated_blob(control, repository_id, source, path, *inputs, blob)?;
+        capture_generated_blob(control, scope, source, path, *inputs, blob)?;
     }
 
     let mut anchors = Vec::new();

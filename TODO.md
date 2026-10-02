@@ -8,9 +8,12 @@
   linked namespace while the commit graph and refs stay shared. Local session,
   schema, CLI, and non-Btrfs Git checks pass. The new ignored Btrfs regression
   covers fast-forward and divergent clean pull, dirty-file refusal, conflicted
-  merge, abort, resolution, continue, and interruption/reopen after staged
-  conflict resolution and checkout publication without changing the primary
-  worktree. Run the provisioned Git gate before closing this item.
+  merge, abort, resolution, continue, and interruption/reopen after generated
+  blob capture, staged conflict resolution, and checkout publication without
+  changing the primary worktree. Historical primary-keyed linked blob intents
+  now replay when their registered worktree still exists. A missing historical
+  worktree still needs an explicit, safe force-prune recovery path. Run the
+  provisioned Git gate before closing this item.
 - [ ] **M6 combined Git restore is one recoverable operation.**
   `mutualgit restore --staged --worktree PATH` now sends one daemon request for
   primary or linked worktrees. Version 11 checkout intents bind the selected
