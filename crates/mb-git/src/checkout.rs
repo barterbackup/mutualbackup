@@ -161,6 +161,8 @@ pub enum CheckoutError {
     UnsupportedTopology,
     #[error("the checkout intent or its staged files changed unexpectedly")]
     IncompatibleIntent,
+    #[error("an older pending restore lacks the original file's native content root")]
+    UnverifiableLegacyIntent,
     #[error("no same-filesystem verified anchor is available for a target Git blob")]
     MissingAnchor,
     #[error("the checkout contains too many changed files")]
@@ -189,6 +191,22 @@ struct CheckoutFile {
     oid: [u8; 20],
     mode: u32,
     anchor_id: Uuid,
+    // Versions 1-8 did not record this. New restore/reset intents serialize
+    // these roots separately so their original positional encoding stays valid.
+    #[serde(skip)]
+    native_root: Option<NativeContentRoot>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct NativeContentRoot {
+    logical_len: u64,
+    content_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct NativeRootRecord {
+    path: Vec<u8>,
+    root: NativeContentRoot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -238,6 +256,35 @@ struct LinkedCheckoutIntent {
     worktree_id: Uuid,
     root_id: NativeFileId,
     checkout: CheckoutIntent,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LinkedCheckoutIntentV2 {
+    format_version: u16,
+    worktree_id: Uuid,
+    root_id: NativeFileId,
+    checkout: CheckoutIntentV9,
+}
+
+/// Versions 9 and 10 add strong roots for old working files that have no
+/// anchor. Version 9 restores selected paths; version 10 also resets the index.
+#[derive(Serialize, Deserialize)]
+struct CheckoutIntentV9 {
+    format_version: u16,
+    advance_ref: bool,
+    target_ref: Option<Vec<u8>>,
+    repository_id: Uuid,
+    old_branch: String,
+    old_oid: [u8; 20],
+    new_branch: String,
+    new_oid: [u8; 20],
+    staging_name: String,
+    staging_id: Option<NativeFileId>,
+    phase: Phase,
+    entries: Vec<CheckoutEntry>,
+    directories: Vec<CheckoutDirectory>,
+    removed_directories: Vec<CheckoutRemovedDirectory>,
+    native_roots: Vec<NativeRootRecord>,
 }
 
 struct CheckoutTarget<'a> {
@@ -372,6 +419,84 @@ impl From<LegacyCheckoutIntentV3> for CheckoutIntent {
             directories: legacy.directories,
             removed_directories: legacy.removed_directories,
         }
+    }
+}
+
+impl CheckoutIntentV9 {
+    fn from_intent(intent: &CheckoutIntent) -> Self {
+        let native_roots = intent
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                entry.old.as_ref().and_then(|old| {
+                    old.native_root.map(|root| NativeRootRecord {
+                        path: entry.path.clone(),
+                        root,
+                    })
+                })
+            })
+            .collect();
+        Self {
+            format_version: intent.format_version,
+            advance_ref: intent.advance_ref,
+            target_ref: intent.target_ref.clone(),
+            repository_id: intent.repository_id,
+            old_branch: intent.old_branch.clone(),
+            old_oid: intent.old_oid,
+            new_branch: intent.new_branch.clone(),
+            new_oid: intent.new_oid,
+            staging_name: intent.staging_name.clone(),
+            staging_id: intent.staging_id,
+            phase: intent.phase,
+            entries: intent.entries.clone(),
+            directories: intent.directories.clone(),
+            removed_directories: intent.removed_directories.clone(),
+            native_roots,
+        }
+    }
+
+    fn into_intent(self) -> Result<CheckoutIntent, CheckoutError> {
+        if !matches!(self.format_version, 9 | 10) || self.native_roots.len() > MAX_CHECKOUT_FILES {
+            return Err(CheckoutError::IncompatibleIntent);
+        }
+        let mut roots = BTreeMap::new();
+        for record in self.native_roots {
+            relative_path(&record.path)?;
+            if roots.insert(record.path, record.root).is_some() {
+                return Err(CheckoutError::IncompatibleIntent);
+            }
+        }
+        let mut entries = self.entries;
+        for entry in &mut entries {
+            if let Some(old) = entry.old.as_mut()
+                && old.anchor_id.is_nil()
+            {
+                old.native_root = Some(
+                    roots
+                        .remove(&entry.path)
+                        .ok_or(CheckoutError::IncompatibleIntent)?,
+                );
+            }
+        }
+        if !roots.is_empty() {
+            return Err(CheckoutError::IncompatibleIntent);
+        }
+        Ok(CheckoutIntent {
+            format_version: self.format_version,
+            advance_ref: self.advance_ref,
+            target_ref: self.target_ref,
+            repository_id: self.repository_id,
+            old_branch: self.old_branch,
+            old_oid: self.old_oid,
+            new_branch: self.new_branch,
+            new_oid: self.new_oid,
+            staging_name: self.staging_name,
+            staging_id: self.staging_id,
+            phase: self.phase,
+            entries,
+            directories: self.directories,
+            removed_directories: self.removed_directories,
+        })
     }
 }
 
@@ -681,12 +806,59 @@ fn verify_file_for_intent(
     expected: &CheckoutFile,
 ) -> Result<(), CheckoutError> {
     if expected.anchor_id.is_nil() {
-        // Restore/reset can capture an existing working file that has no
-        // native anchor. A future intent version must record its BLAKE3 root.
-        verify_file(parent, name, identity, expected)
+        let root = expected
+            .native_root
+            .ok_or(CheckoutError::UnverifiableLegacyIntent)?;
+        verify_file(parent, name, identity, expected)?;
+        verify_native_content_root(parent, name, identity, expected.mode, root)
     } else {
         verify_file_with_anchor(control, repository_id, parent, name, identity, expected)
     }
+}
+
+fn verify_native_content_root(
+    parent: &PinnedDirectory,
+    name: &OsStr,
+    identity: NativeFileId,
+    mode: u32,
+    root: NativeContentRoot,
+) -> Result<(), CheckoutError> {
+    if mode == 0o120000 {
+        let (target, observed) = parent
+            .read_child_symlink(name)?
+            .ok_or(CheckoutError::DirtyWorktree)?;
+        if observed != identity
+            || target.len() as u64 != root.logical_len
+            || blake3::hash(&target).as_bytes() != &root.content_hash
+            || entry_identity_for(parent, name, mode)? != Some(identity)
+        {
+            return Err(CheckoutError::DirtyWorktree);
+        }
+        return Ok(());
+    }
+    let mut file = parent
+        .open_child_file(name)?
+        .ok_or(CheckoutError::DirtyWorktree)?;
+    let before = file.metadata()?;
+    if before.len() != root.logical_len {
+        return Err(CheckoutError::DirtyWorktree);
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    if hasher.finalize().as_bytes() != &root.content_hash
+        || file_fingerprint(&before) != file_fingerprint(&file.metadata()?)
+        || entry_identity_for(parent, name, mode)? != Some(identity)
+    {
+        return Err(CheckoutError::DirtyWorktree);
+    }
+    Ok(())
 }
 
 pub(crate) fn verify_tracked_file_for_removal(
@@ -705,44 +877,19 @@ pub(crate) fn verify_tracked_file_for_removal(
             oid,
             mode,
             anchor_id: Uuid::nil(),
+            native_root: None,
         },
     )?;
-    if mode == 0o120000 {
-        let (target, observed) = parent
-            .read_child_symlink(name)?
-            .ok_or(CheckoutError::DirtyWorktree)?;
-        if observed != identity
-            || target.len() as u64 != anchor.logical_len
-            || blake3::hash(&target).as_bytes() != &anchor.content_hash
-            || entry_identity_for(parent, name, mode)? != Some(identity)
-        {
-            return Err(CheckoutError::DirtyWorktree);
-        }
-        return Ok(());
-    }
-    let mut file = parent
-        .open_child_file(name)?
-        .ok_or(CheckoutError::DirtyWorktree)?;
-    let before = file.metadata()?;
-    if before.len() != anchor.logical_len {
-        return Err(CheckoutError::DirtyWorktree);
-    }
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    if hasher.finalize().as_bytes() != &anchor.content_hash
-        || file_fingerprint(&before) != file_fingerprint(&file.metadata()?)
-        || entry_identity_for(parent, name, mode)? != Some(identity)
-    {
-        return Err(CheckoutError::DirtyWorktree);
-    }
-    Ok(())
+    verify_native_content_root(
+        parent,
+        name,
+        identity,
+        mode,
+        NativeContentRoot {
+            logical_len: anchor.logical_len,
+            content_hash: anchor.content_hash,
+        },
+    )
 }
 
 fn verify_staged_directory(
@@ -843,12 +990,12 @@ fn published_target_file(
 }
 
 fn validate_intent(intent: &CheckoutIntent, repository_id: Uuid) -> Result<(), CheckoutError> {
-    if !matches!(intent.format_version, 1..=8)
+    if !matches!(intent.format_version, 1..=10)
         || matches!(intent.format_version, 3 | 4 | 6) != intent.advance_ref
         || matches!(intent.format_version, 4 | 6) != intent.target_ref.is_some()
         || intent.format_version == 5
             && (intent.old_oid != [0; 20] || intent.old_branch == intent.new_branch)
-        || matches!(intent.format_version, 7 | 8)
+        || matches!(intent.format_version, 7..=10)
             && (intent.advance_ref
                 || intent.target_ref.is_some()
                 || intent.old_branch != intent.new_branch
@@ -891,6 +1038,20 @@ fn validate_intent(intent: &CheckoutIntent, repository_id: Uuid) -> Result<(), C
             || entry.old.is_none() && entry.new.is_none()
             || entry.old.is_some() != entry.old_id.is_some()
             || entry.phase_invalid(intent.phase)
+            || entry
+                .new
+                .as_ref()
+                .is_some_and(|new| new.native_root.is_some())
+            || matches!(intent.format_version, 9 | 10)
+                && entry
+                    .old
+                    .as_ref()
+                    .is_some_and(|old| old.anchor_id.is_nil() != old.native_root.is_some())
+            || !matches!(intent.format_version, 9 | 10)
+                && entry
+                    .old
+                    .as_ref()
+                    .is_some_and(|old| old.native_root.is_some())
         {
             return Err(CheckoutError::IncompatibleIntent);
         }
@@ -971,6 +1132,7 @@ fn encode_intent(intent: &CheckoutIntent) -> Result<Vec<u8>, CheckoutError> {
         })
         .map_err(Into::into),
         4..=8 => canonical_bytes(intent).map_err(Into::into),
+        9 | 10 => canonical_bytes(&CheckoutIntentV9::from_intent(intent)).map_err(Into::into),
         _ => Err(CheckoutError::IncompatibleIntent),
     }
 }
@@ -986,6 +1148,13 @@ fn encode_intent_for_scope(
     let encoded = encode_intent(intent)?;
     if scope.worktree_id() == scope.repository_id() {
         Ok(encoded)
+    } else if matches!(intent.format_version, 9 | 10) {
+        Ok(canonical_bytes(&LinkedCheckoutIntentV2 {
+            format_version: 2,
+            worktree_id: scope.worktree_id(),
+            root_id,
+            checkout: CheckoutIntentV9::from_intent(intent),
+        })?)
     } else {
         Ok(canonical_bytes(&LinkedCheckoutIntent {
             format_version: 1,
@@ -1018,15 +1187,31 @@ fn load_intent(
     if scope.worktree_id() == scope.repository_id() {
         return Ok(Some(decode_intent(&bytes, scope.repository_id())?));
     }
-    let linked: LinkedCheckoutIntent = decode_canonical(&bytes)?;
-    if linked.format_version != 1
-        || linked.worktree_id != scope.worktree_id()
-        || linked.root_id != root_id
-    {
-        return Err(CheckoutError::IncompatibleIntent);
-    }
-    validate_intent(&linked.checkout, scope.repository_id())?;
-    Ok(Some(linked.checkout))
+    let intent = match bytes.first().copied() {
+        Some(1) => {
+            let linked: LinkedCheckoutIntent = decode_canonical(&bytes)?;
+            if linked.format_version != 1
+                || linked.worktree_id != scope.worktree_id()
+                || linked.root_id != root_id
+            {
+                return Err(CheckoutError::IncompatibleIntent);
+            }
+            linked.checkout
+        }
+        Some(2) => {
+            let linked: LinkedCheckoutIntentV2 = decode_canonical(&bytes)?;
+            if linked.format_version != 2
+                || linked.worktree_id != scope.worktree_id()
+                || linked.root_id != root_id
+            {
+                return Err(CheckoutError::IncompatibleIntent);
+            }
+            linked.checkout.into_intent()?
+        }
+        _ => return Err(CheckoutError::IncompatibleIntent),
+    };
+    validate_intent(&intent, scope.repository_id())?;
+    Ok(Some(intent))
 }
 
 fn decode_intent(bytes: &[u8], repository_id: Uuid) -> Result<CheckoutIntent, CheckoutError> {
@@ -1038,6 +1223,7 @@ fn decode_intent(bytes: &[u8], repository_id: Uuid) -> Result<CheckoutIntent, Ch
         Some(2) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntentV2>(bytes)?),
         Some(3) => CheckoutIntent::from(decode_canonical::<LegacyCheckoutIntentV3>(bytes)?),
         Some(4..=8) => decode_canonical::<CheckoutIntent>(bytes)?,
+        Some(9 | 10) => decode_canonical::<CheckoutIntentV9>(bytes)?.into_intent()?,
         _ => return Err(CheckoutError::IncompatibleIntent),
     };
     validate_intent(&intent, repository_id)?;
@@ -1049,7 +1235,7 @@ fn target_branch_is_current(
     scope: GitWorktreeScope,
     intent: &CheckoutIntent,
 ) -> Result<bool, CheckoutError> {
-    if matches!(intent.format_version, 7 | 8) {
+    if matches!(intent.format_version, 7..=10) {
         let selected = selected_branch_for_scope(control, scope)?;
         let current = ref_oid(
             control,
@@ -1687,6 +1873,7 @@ fn begin_checkout_to_for_scope(
                 oid,
                 mode,
                 anchor_id: staged[path].anchor_id,
+                native_root: None,
             },
         )?;
     }
@@ -1713,6 +1900,7 @@ fn begin_checkout_to_for_scope(
                     oid: *oid,
                     mode: *mode,
                     anchor_id: staged[path].anchor_id,
+                    native_root: None,
                 },
             )?;
         }
@@ -1776,6 +1964,7 @@ fn begin_checkout_to_for_scope(
             oid: *oid,
             mode: *mode,
             anchor_id: staged[&path].anchor_id,
+            native_root: None,
         });
         let new_file = new
             .map(|(oid, mode)| {
@@ -1789,6 +1978,7 @@ fn begin_checkout_to_for_scope(
                         *oid,
                         root.identity()?.filesystem_id,
                     )?,
+                    native_root: None,
                 })
             })
             .transpose()?;
@@ -1872,7 +2062,7 @@ fn captured_worktree_file(
         return Ok(None);
     };
     if let Some(identity) = entry_identity_for(&parent, &leaf, 0o100644)? {
-        let file = parent
+        let mut file = parent
             .open_child_file(&leaf)?
             .ok_or(CheckoutError::DirtyWorktree)?;
         let before = file.metadata()?;
@@ -1885,15 +2075,30 @@ fn captured_worktree_file(
             ObjectType::Blob,
             PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
         )?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
         if file_fingerprint(&before) != file_fingerprint(&file.metadata()?) {
             return Err(CheckoutError::DirtyWorktree);
         }
+        let native_root = NativeContentRoot {
+            logical_len: before.len(),
+            content_hash: *hasher.finalize().as_bytes(),
+        };
         let captured = CheckoutFile {
             oid: oid.as_bytes().try_into().expect("SHA-1 OID"),
             mode,
             anchor_id: Uuid::nil(),
+            native_root: Some(native_root),
         };
         verify_file(&parent, &leaf, identity, &captured)?;
+        verify_native_content_root(&parent, &leaf, identity, mode, native_root)?;
         return Ok(Some((captured, identity)));
     }
     let symlink = match parent.read_child_symlink(&leaf) {
@@ -1909,8 +2114,21 @@ fn captured_worktree_file(
                 .expect("SHA-1 OID"),
             mode: 0o120000,
             anchor_id: Uuid::nil(),
+            native_root: Some(NativeContentRoot {
+                logical_len: target.len() as u64,
+                content_hash: *blake3::hash(&target).as_bytes(),
+            }),
         };
         verify_file(&parent, &leaf, identity, &captured)?;
+        verify_native_content_root(
+            &parent,
+            &leaf,
+            identity,
+            captured.mode,
+            captured
+                .native_root
+                .expect("captured symlink has native root"),
+        )?;
         return Ok(Some((captured, identity)));
     }
     Ok(None)
@@ -2051,10 +2269,32 @@ fn begin_index_or_head_restore(
     for path in selected {
         let old = old_files.get(&path);
         let new = target_tree.get(&path);
-        if old.is_some_and(|(file, _)| {
-            new.is_some_and(|(oid, mode)| *oid == file.oid && *mode == file.mode)
-        }) || old.is_none() && new.is_none()
-        {
+        let unchanged = if let (Some((file, _)), Some((oid, mode))) = (old, new) {
+            if *oid == file.oid && *mode == file.mode {
+                let anchor_id =
+                    choose_anchor(control, repository_id, *oid, root.identity()?.filesystem_id)?;
+                let anchor = indexed_anchor_manifest(
+                    control,
+                    repository_id,
+                    &GitIndexEntry {
+                        format_version: 1,
+                        oid: *oid,
+                        mode: *mode,
+                        anchor_id,
+                    },
+                )?;
+                file.native_root
+                    == Some(NativeContentRoot {
+                        logical_len: anchor.logical_len,
+                        content_hash: anchor.content_hash,
+                    })
+            } else {
+                false
+            }
+        } else {
+            old.is_none() && new.is_none()
+        };
+        if unchanged {
             continue;
         }
         let relative = relative_path(&path)?;
@@ -2082,6 +2322,7 @@ fn begin_index_or_head_restore(
                         *oid,
                         root.identity()?.filesystem_id,
                     )?,
+                    native_root: None,
                 })
             })
             .transpose()?;
@@ -2121,7 +2362,7 @@ fn begin_index_or_head_restore(
         .map(|oid| oid.as_bytes().try_into().expect("SHA-1 OID"))
         .unwrap_or([0; 20]);
     let mut intent = CheckoutIntent {
-        format_version: if hard_reset { 8 } else { 7 },
+        format_version: if hard_reset { 10 } else { 9 },
         advance_ref: false,
         target_ref: None,
         repository_id,
@@ -2340,7 +2581,7 @@ fn apply_intent(
             return Err(CheckoutError::BranchCheckedOutElsewhere);
         }
         let branches = list_branches_for_scope(control, scope)?;
-        let (old_current, target_available) = if matches!(intent.format_version, 7 | 8) {
+        let (old_current, target_available) = if matches!(intent.format_version, 7..=10) {
             let current = target_branch_is_current(control, scope, intent)?;
             (current, current)
         } else if intent.advance_ref {
@@ -2398,7 +2639,7 @@ fn apply_intent(
         if !old_current || !target_available {
             return Err(CheckoutError::IncompatibleIntent);
         }
-        let target_files = if intent.format_version == 7 {
+        let target_files = if matches!(intent.format_version, 7 | 9) {
             let staged = staged_entries_for_scope(control, scope)?
                 .into_iter()
                 .collect::<BTreeMap<_, _>>();
@@ -2415,7 +2656,7 @@ fn apply_intent(
                 }
             }
             files
-        } else if intent.format_version == 8 {
+        } else if matches!(intent.format_version, 8 | 10) {
             files_for_commit(
                 control,
                 intent.repository_id,
@@ -2591,10 +2832,11 @@ fn apply_intent(
                     oid: *oid,
                     mode: *mode,
                     anchor_id: choose_anchor(control, intent.repository_id, *oid, filesystem_id)?,
+                    native_root: None,
                 },
             )?;
         }
-        if intent.format_version == 7 {
+        if matches!(intent.format_version, 7 | 9) {
             intent.phase = Phase::Cleanup;
             save_intent(control, scope, root.identity()?, intent)?;
         } else {
@@ -2612,7 +2854,7 @@ fn apply_intent(
                             .ok_or(CheckoutError::IncompatibleIntent)?
                             .anchor_id
                     }
-                    None if intent.format_version == 8 => {
+                    None if matches!(intent.format_version, 8 | 10) => {
                         let anchor =
                             anchors_for_oid(control, intent.repository_id, Oid::from_bytes(oid)?)?
                                 .into_iter()
@@ -2649,7 +2891,7 @@ fn apply_intent(
                     deletions.push((index_kind_for_scope(scope), path.clone()));
                 }
             }
-            if intent.format_version != 8 {
+            if !matches!(intent.format_version, 8 | 10) {
                 records.push(selected_branch_record_for_scope(scope, &intent.new_branch)?);
             }
             if intent.advance_ref {
@@ -2762,6 +3004,265 @@ fn apply_intent(
 mod tests {
     use super::*;
 
+    fn unanchored_restore_intent(
+        repository_id: Uuid,
+        oid: [u8; 20],
+        mode: u32,
+        identity: NativeFileId,
+        root: NativeContentRoot,
+    ) -> CheckoutIntent {
+        CheckoutIntent {
+            format_version: 9,
+            advance_ref: false,
+            target_ref: None,
+            repository_id,
+            old_branch: "main".to_owned(),
+            old_oid: [0; 20],
+            new_branch: "main".to_owned(),
+            new_oid: [0; 20],
+            staging_name: format!("checkout-{}", Uuid::new_v4()),
+            staging_id: None,
+            phase: Phase::Preparing,
+            entries: vec![CheckoutEntry {
+                path: b"tracked".to_vec(),
+                old: Some(CheckoutFile {
+                    oid,
+                    mode,
+                    anchor_id: Uuid::nil(),
+                    native_root: Some(root),
+                }),
+                old_id: Some(identity),
+                new: None,
+                new_id: None,
+            }],
+            directories: Vec::new(),
+            removed_directories: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn versioned_unanchored_restore_roots_round_trip_for_primary_and_linked_worktrees() {
+        let database = tempfile::tempdir().unwrap();
+        let control =
+            ControlStore::open_with_key(database.path().join("catalog.db"), &[65; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        let root_id = NativeFileId {
+            filesystem_id: 4,
+            inode: 9,
+        };
+        let native_root = NativeContentRoot {
+            logical_len: 5,
+            content_hash: *blake3::hash(b"alpha").as_bytes(),
+        };
+        let intent =
+            unanchored_restore_intent(repository_id, [7; 20], 0o100644, root_id, native_root);
+        for version in [9, 10] {
+            let mut intent = intent.clone();
+            intent.format_version = version;
+            let encoded = encode_intent(&intent).unwrap();
+            assert_eq!(decode_intent(&encoded, repository_id).unwrap(), intent);
+            let linked = GitWorktreeScope::linked(repository_id, Uuid::new_v4()).unwrap();
+            let linked_bytes = encode_intent_for_scope(linked, root_id, &intent).unwrap();
+            assert_eq!(linked_bytes[0], 2);
+            control
+                .put_record(&intent_kind_for_scope(linked), INTENT_KEY, &linked_bytes)
+                .unwrap();
+            assert_eq!(
+                load_intent(&control, linked, root_id).unwrap(),
+                Some(intent)
+            );
+            control
+                .delete_record(&intent_kind_for_scope(linked), INTENT_KEY)
+                .unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unanchored_restore_replay_rejects_conflicting_bytes_and_legacy_unknown_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let worktree_path = temporary.path().join("worktree");
+        let staging_path = temporary.path().join("staging");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        std::fs::create_dir_all(&staging_path).unwrap();
+        std::fs::write(worktree_path.join("tracked"), b"bravo").unwrap();
+        let control =
+            ControlStore::open_with_key(temporary.path().join("catalog.db"), &[66; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        let worktree = PinnedDirectory::open(&worktree_path).unwrap();
+        let staging = PinnedDirectory::open(&staging_path).unwrap();
+        let identity = entry_identity_for(&worktree, OsStr::new("tracked"), 0o100644)
+            .unwrap()
+            .unwrap();
+        let oid = Oid::hash_object(ObjectType::Blob, b"bravo")
+            .unwrap()
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        let intent = unanchored_restore_intent(
+            repository_id,
+            oid,
+            0o100644,
+            identity,
+            NativeContentRoot {
+                logical_len: 5,
+                content_hash: *blake3::hash(b"alpha").as_bytes(),
+            },
+        );
+        let replayed = decode_intent(&encode_intent(&intent).unwrap(), repository_id).unwrap();
+        assert!(matches!(
+            apply_old_deletion(
+                &control,
+                repository_id,
+                &worktree,
+                &staging,
+                0,
+                &replayed.entries[0],
+            ),
+            Err(CheckoutError::DirtyWorktree)
+        ));
+        let mut legacy = intent;
+        legacy.format_version = 8;
+        legacy.entries[0].old.as_mut().unwrap().native_root = None;
+        let replayed = decode_intent(&encode_intent(&legacy).unwrap(), repository_id).unwrap();
+        assert!(matches!(
+            apply_old_deletion(
+                &control,
+                repository_id,
+                &worktree,
+                &staging,
+                0,
+                &replayed.entries[0],
+            ),
+            Err(CheckoutError::UnverifiableLegacyIntent)
+        ));
+        assert_eq!(
+            std::fs::read(worktree_path.join("tracked")).unwrap(),
+            b"bravo"
+        );
+        assert!(std::fs::read_dir(staging_path).unwrap().next().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unanchored_symlink_restore_replay_checks_target_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let worktree_path = temporary.path().join("worktree");
+        let staging_path = temporary.path().join("staging");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        std::fs::create_dir_all(&staging_path).unwrap();
+        std::os::unix::fs::symlink("bravo", worktree_path.join("tracked")).unwrap();
+        let control =
+            ControlStore::open_with_key(temporary.path().join("catalog.db"), &[67; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        let worktree = PinnedDirectory::open(&worktree_path).unwrap();
+        let staging = PinnedDirectory::open(&staging_path).unwrap();
+        let identity = entry_identity_for(&worktree, OsStr::new("tracked"), 0o120000)
+            .unwrap()
+            .unwrap();
+        let oid = Oid::hash_object(ObjectType::Blob, b"bravo")
+            .unwrap()
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        let intent = unanchored_restore_intent(
+            repository_id,
+            oid,
+            0o120000,
+            identity,
+            NativeContentRoot {
+                logical_len: 5,
+                content_hash: *blake3::hash(b"alpha").as_bytes(),
+            },
+        );
+        let replayed = decode_intent(&encode_intent(&intent).unwrap(), repository_id).unwrap();
+        assert!(matches!(
+            apply_old_deletion(
+                &control,
+                repository_id,
+                &worktree,
+                &staging,
+                0,
+                &replayed.entries[0],
+            ),
+            Err(CheckoutError::DirtyWorktree)
+        ));
+        assert_eq!(
+            std::fs::read_link(worktree_path.join("tracked")).unwrap(),
+            Path::new("bravo")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unanchored_restore_replay_verifies_private_staging_after_move() {
+        let temporary = tempfile::tempdir().unwrap();
+        let worktree_path = temporary.path().join("worktree");
+        let staging_path = temporary.path().join("staging");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        std::fs::create_dir_all(&staging_path).unwrap();
+        std::fs::write(worktree_path.join("tracked"), b"alpha").unwrap();
+        let control =
+            ControlStore::open_with_key(temporary.path().join("catalog.db"), &[68; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        let worktree = PinnedDirectory::open(&worktree_path).unwrap();
+        let staging = PinnedDirectory::open(&staging_path).unwrap();
+        let identity = entry_identity_for(&worktree, OsStr::new("tracked"), 0o100644)
+            .unwrap()
+            .unwrap();
+        let oid = Oid::hash_object(ObjectType::Blob, b"alpha")
+            .unwrap()
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        let intent = unanchored_restore_intent(
+            repository_id,
+            oid,
+            0o100644,
+            identity,
+            NativeContentRoot {
+                logical_len: 5,
+                content_hash: *blake3::hash(b"alpha").as_bytes(),
+            },
+        );
+        let replayed = decode_intent(&encode_intent(&intent).unwrap(), repository_id).unwrap();
+        apply_old_deletion(
+            &control,
+            repository_id,
+            &worktree,
+            &staging,
+            0,
+            &replayed.entries[0],
+        )
+        .unwrap();
+        assert!(!worktree_path.join("tracked").exists());
+        assert_eq!(
+            std::fs::read(staging_path.join("file-00000000")).unwrap(),
+            b"alpha"
+        );
+        apply_old_deletion(
+            &control,
+            repository_id,
+            &worktree,
+            &staging,
+            0,
+            &replayed.entries[0],
+        )
+        .unwrap();
+        std::fs::write(staging_path.join("file-00000000"), b"bravo").unwrap();
+        assert!(matches!(
+            apply_old_deletion(
+                &control,
+                repository_id,
+                &worktree,
+                &staging,
+                0,
+                &replayed.entries[0],
+            ),
+            Err(CheckoutError::DirtyWorktree)
+        ));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn tracked_removal_rechecks_native_bytes_after_matching_git_id() {
@@ -2854,6 +3355,7 @@ mod tests {
                 oid: oid.as_bytes().try_into().unwrap(),
                 mode: 0o100644,
                 anchor_id: anchor.anchor_id,
+                native_root: None,
             }),
             old_id: Some(identity),
             new: None,
@@ -2901,6 +3403,7 @@ mod tests {
                     oid: [2; 20],
                     mode: 0o100644,
                     anchor_id: Uuid::new_v4(),
+                    native_root: None,
                 }),
                 new_id: None,
             }],
@@ -3038,5 +3541,75 @@ mod tests {
         assert!(replayed.target_ref.is_none());
         assert_eq!(replayed.directories.len(), 1);
         assert_eq!(encode_intent(&replayed).unwrap(), original);
+    }
+
+    #[test]
+    fn version_eight_restore_intent_still_decodes_without_a_native_root() {
+        #[derive(Serialize)]
+        struct HistoricalFile {
+            oid: [u8; 20],
+            mode: u32,
+            anchor_id: Uuid,
+        }
+        #[derive(Serialize)]
+        struct HistoricalEntry {
+            path: Vec<u8>,
+            old: Option<HistoricalFile>,
+            old_id: Option<NativeFileId>,
+            new: Option<HistoricalFile>,
+            new_id: Option<NativeFileId>,
+        }
+        #[derive(Serialize)]
+        struct HistoricalIntent {
+            format_version: u16,
+            advance_ref: bool,
+            target_ref: Option<Vec<u8>>,
+            repository_id: Uuid,
+            old_branch: String,
+            old_oid: [u8; 20],
+            new_branch: String,
+            new_oid: [u8; 20],
+            staging_name: String,
+            staging_id: Option<NativeFileId>,
+            phase: Phase,
+            entries: Vec<HistoricalEntry>,
+            directories: Vec<CheckoutDirectory>,
+            removed_directories: Vec<CheckoutRemovedDirectory>,
+        }
+        let repository_id = Uuid::new_v4();
+        let old_id = NativeFileId {
+            filesystem_id: 4,
+            inode: 9,
+        };
+        let original = canonical_bytes(&HistoricalIntent {
+            format_version: 8,
+            advance_ref: false,
+            target_ref: None,
+            repository_id,
+            old_branch: "main".to_owned(),
+            old_oid: [1; 20],
+            new_branch: "main".to_owned(),
+            new_oid: [1; 20],
+            staging_name: format!("checkout-{}", Uuid::new_v4()),
+            staging_id: None,
+            phase: Phase::Preparing,
+            entries: vec![HistoricalEntry {
+                path: b"tracked".to_vec(),
+                old: Some(HistoricalFile {
+                    oid: [2; 20],
+                    mode: 0o100644,
+                    anchor_id: Uuid::nil(),
+                }),
+                old_id: Some(old_id),
+                new: None,
+                new_id: None,
+            }],
+            directories: Vec::new(),
+            removed_directories: Vec::new(),
+        })
+        .unwrap();
+        let decoded = decode_intent(&original, repository_id).unwrap();
+        assert_eq!(decoded.entries[0].old.as_ref().unwrap().native_root, None);
+        assert_eq!(encode_intent(&decoded).unwrap(), original);
     }
 }

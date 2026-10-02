@@ -2,16 +2,15 @@
 
 ## Milestone 6 active implementation gates
 
-- [ ] **M6 unanchored restore/reset dirty-file verification.** Anchor-backed
-  checkout, switch, merge, and replay now resolve the catalog's BLAKE3 root
-  before replacing or deleting tracked bytes. Restore/reset can instead record
-  a previously untracked or modified working file with a nil anchor ID;
-  `captured_worktree_file` and `verify_file_for_intent` still compare that file
-  using Git SHA-1 alone. Introduce a versioned checkout intent carrying the
-  captured native content root and length for those old files, verify both the
-  worktree and private staging on every replay phase, and fail closed for older
-  pending intents whose exact old bytes cannot be established. Cover regular
-  files, symlinks, interruption, and linked worktrees.
+- [ ] **M6 restore/reset recovery acceptance.** Checkout intent formats 9/10
+  now carry BLAKE3 roots and lengths for previously unanchored working files;
+  linked worktrees use wrapper version 2. Replay verifies those bytes in the
+  worktree and private staging, and old pending intents without a provable
+  original root fail closed. Local unit tests cover regular files, symlinks,
+  conflicting content, staged-file replay, and primary/linked encoding. Run the
+  full provisioned Btrfs interruption/reopen gate for restore and hard reset,
+  including linked worktrees, same-Git-ID/different-native-root fixtures, and
+  safe handling of historical pending intents before closing this item.
 - [ ] **M6 guarded edit guard.** The store now has replayable per-file and
   whole-root sparse detaches, but node enrollment still selects only the
   reflink backend. Implement and locally probe a long-lived access decision

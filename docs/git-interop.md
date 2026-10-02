@@ -76,6 +76,10 @@ moving HEAD or changing that index; `mutualgit restore --staged PATH` resets
 the selected index paths from HEAD without changing working files. Use both
 flags to reset the index first and then restore those working paths. Restore
 replays an interrupted file replacement when the daemon reopens the repository.
+Its durable intent records the old working file's native content root and
+length. A pending restore written by an older version without that root
+stops before further deletion or replacement and needs operator-assisted
+resolution.
 `mutualgit reset --hard` restores all tracked working paths and publishes the
 matching HEAD index in one replayable transition. It leaves HEAD and untracked
 paths alone, and refuses to replace a directory containing untracked files.
