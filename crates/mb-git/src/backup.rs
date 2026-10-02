@@ -96,10 +96,10 @@ impl GitBackupDescriptor {
                 return Err(GitBackupError::InvalidGraph);
             }
         }
-        let mut blob_ids = HashSet::new();
+        let mut blob_lengths = HashMap::new();
         for blob in &self.blobs {
             let oid = Oid::from_bytes(&blob.oid)?;
-            if !blob_ids.insert(oid) {
+            if blob_lengths.insert(oid, blob.logical_len).is_some() {
                 return Err(GitBackupError::InvalidGraph);
             }
             let mut previous_end = 0_u64;
@@ -235,8 +235,14 @@ impl GitBackupDescriptor {
                         pending_trees.push((path, entry.id()));
                     }
                     Some(ObjectType::Blob) => {
+                        // Checkout stores symlinks as exact target bytes and
+                        // cannot publish an empty or oversized target.
                         if !matches!(entry.filemode(), 0o100644 | 0o100755 | 0o120000)
-                            || !blob_ids.contains(&entry.id())
+                            || !blob_lengths.contains_key(&entry.id())
+                            || entry.filemode() == 0o120000
+                                && !blob_lengths
+                                    .get(&entry.id())
+                                    .is_some_and(|length| (1..=4095).contains(length))
                         {
                             return Err(GitBackupError::InvalidGraph);
                         }
@@ -247,7 +253,7 @@ impl GitBackupDescriptor {
             }
         }
         if seen_commits.len() + seen_trees.len() + seen_tags.len() != kinds.len()
-            || seen_blobs != blob_ids
+            || seen_blobs != blob_lengths.into_keys().collect()
         {
             return Err(GitBackupError::InvalidGraph);
         }
@@ -381,5 +387,47 @@ mod tests {
             descriptor.validate(),
             Err(GitBackupError::InvalidGraph)
         ));
+    }
+
+    #[test]
+    fn backup_rejects_symlinks_that_checkout_cannot_recreate() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::init_bare(directory.path()).unwrap();
+        let signature = git2::Signature::now("Author", "a@example.test").unwrap();
+        for payload in [Vec::new(), vec![b'a'; 4096]] {
+            let blob_oid = repository.blob(&payload).unwrap();
+            let mut builder = repository.treebuilder(None).unwrap();
+            builder.insert("link", blob_oid, 0o120000).unwrap();
+            let tree_oid = builder.write().unwrap();
+            let tree = repository.find_tree(tree_oid).unwrap();
+            let commit_oid = repository
+                .commit(None, &signature, &signature, "symlink", &tree, &[])
+                .unwrap();
+            let odb = repository.odb().unwrap();
+            let object = |kind, oid: Oid| GitGraphObject {
+                kind,
+                oid: oid.as_bytes().try_into().unwrap(),
+                bytes: odb.read(oid).unwrap().data().to_vec(),
+            };
+            let descriptor = GitBackupDescriptor {
+                format_version: 4,
+                repository_id: Uuid::new_v4(),
+                refs: vec![GitGraphRef {
+                    name: b"refs/heads/main".to_vec(),
+                    oid: commit_oid.as_bytes().try_into().unwrap(),
+                }],
+                objects: vec![object(1, commit_oid), object(2, tree_oid)],
+                blobs: vec![GitBackupBlob {
+                    oid: blob_oid.as_bytes().try_into().unwrap(),
+                    logical_len: payload.len() as u64,
+                    data_extents: Vec::new(),
+                }],
+                head_branch: "main".to_owned(),
+            };
+            assert!(matches!(
+                descriptor.validate(),
+                Err(GitBackupError::InvalidGraph)
+            ));
+        }
     }
 }
