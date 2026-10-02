@@ -233,7 +233,7 @@ impl LinkFreezeCaptureIntent {
     /// pathname may now be absent or hold an unrelated replacement; the
     /// current pinned name must still be the sole link besides the anchor.
     pub fn rebind_frozen_source(
-        mut self,
+        self,
         control: &ControlStore,
         source_parent: &PinnedDirectory,
         source_name: impl AsRef<Path>,
@@ -247,6 +247,124 @@ impl LinkFreezeCaptureIntent {
             "current source name does not match the frozen capture"
         );
         self.verify_frozen_anchor(control, anchor_parent, Some((source_parent, source_name)))?;
+        self.replace_source_name(control, source_parent, source_name)
+    }
+
+    /// An edit can be interrupted after the source moves. Rebind only when
+    /// the proposed name still owns the original inode and the anchor/staging
+    /// layout matches the edit's durable phase. No access is restored here.
+    pub fn rebind_pending_edit(
+        self,
+        control: &ControlStore,
+        source_parent: &PinnedDirectory,
+        source_name: impl AsRef<Path>,
+        anchor_parent: &PinnedDirectory,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(self.phase == LinkFreezeCapturePhase::Frozen);
+        anyhow::ensure!(
+            control.get_record(CAPTURE_INTENT_KIND, self.anchor_id.as_bytes())?
+                == Some(mb_core::canonical_bytes(&self)?),
+            "frozen capture changed before edit source rebinding"
+        );
+        let edit = LinkFreezeEditIntent::load(control, self.anchor_id)?
+            .ok_or_else(|| anyhow::anyhow!("frozen capture has no pending edit"))?;
+        anyhow::ensure!(
+            self.matches_edit(&edit) && edit.phase() != LinkFreezeEditPhase::Editable,
+            "pending edit does not match the frozen capture"
+        );
+        let source_name = source_name.as_ref();
+        anyhow::ensure!(
+            source_parent.entry_identity(source_name, false)? == Some(self.source_id)
+                && anchor_parent.identity()? == self.anchor_parent_id,
+            "current edit source or anchor directory changed"
+        );
+        let source = source_parent
+            .open_child_file(source_name)?
+            .ok_or_else(|| anyhow::anyhow!("current edit source disappeared"))?;
+        let anchor_entry = anchor_parent.entry_identity(&self.anchor_name, false)?;
+        match edit.phase() {
+            LinkFreezeEditPhase::SharedFrozen | LinkFreezeEditPhase::CopyStaging => {
+                self.verify_frozen_anchor(
+                    control,
+                    anchor_parent,
+                    Some((source_parent, source_name)),
+                )?;
+            }
+            LinkFreezeEditPhase::PrivateCopyReady => {
+                anyhow::ensure!(edit.copy.as_ref() == Some(&self.proof.content));
+                let private_inode = edit.private_inode.unwrap();
+                if anchor_entry == Some(self.source_id) {
+                    self.verify_frozen_anchor(
+                        control,
+                        anchor_parent,
+                        Some((source_parent, source_name)),
+                    )?;
+                    let staged_id = anchor_parent
+                        .entry_identity(&edit.staging_name, false)?
+                        .ok_or_else(|| anyhow::anyhow!("private staging name disappeared"))?;
+                    let staged = anchor_parent
+                        .open_child_file(&edit.staging_name)?
+                        .ok_or_else(|| anyhow::anyhow!("private staging name disappeared"))?;
+                    let metadata = staged.metadata()?;
+                    anyhow::ensure!(
+                        staged_id.filesystem_id == self.source_id.filesystem_id
+                            && staged_id.inode == private_inode
+                            && metadata.is_file()
+                            && metadata.ino() == private_inode
+                            && metadata.nlink() == 1
+                            && metadata.len() == self.proof.content.logical_len
+                            && FileAccessSnapshot::capture(&staged)?.mode & 0o222 == 0
+                            && self.content_matches(&staged)?,
+                        "private staging copy changed before source rebinding"
+                    );
+                } else {
+                    self.check_private_anchor(anchor_parent, private_inode)?;
+                    let staged_id = anchor_parent.entry_identity(&edit.staging_name, false)?;
+                    anyhow::ensure!(
+                        staged_id.is_none() || staged_id == Some(self.source_id),
+                        "unexpected staging alias blocks source rebinding"
+                    );
+                    let guard = FileWriteExclusion::acquire(source)?;
+                    anyhow::ensure!(
+                        guard.file.metadata()?.nlink() == if staged_id.is_some() { 2 } else { 1 }
+                            && FileAccessSnapshot::capture(&guard.file)?.mode & 0o222 == 0
+                            && self.content_matches(&guard.file)?
+                            && guard.is_held()?
+                            && source_parent.entry_identity(source_name, false)?
+                                == Some(self.source_id),
+                        "frozen source changed after anchor detachment"
+                    );
+                    guard.release()?;
+                }
+            }
+            LinkFreezeEditPhase::UnlockPending => {
+                anyhow::ensure!(edit.copy.as_ref() == Some(&self.proof.content));
+                self.check_private_anchor(anchor_parent, edit.private_inode.unwrap())?;
+                anyhow::ensure!(
+                    anchor_parent
+                        .entry_identity(&edit.staging_name, false)?
+                        .is_none()
+                        && source.metadata()?.nlink() == 1
+                        && source_parent.entry_identity(source_name, false)?
+                            == Some(self.source_id),
+                    "detached source has an unexpected hard-link alias"
+                );
+            }
+            LinkFreezeEditPhase::Editable => unreachable!(),
+        }
+        anyhow::ensure!(
+            LinkFreezeEditIntent::load(control, self.anchor_id)? == Some(edit),
+            "pending edit changed during source rebinding"
+        );
+        self.replace_source_name(control, source_parent, source_name)
+    }
+
+    fn replace_source_name(
+        mut self,
+        control: &ControlStore,
+        source_parent: &PinnedDirectory,
+        source_name: &Path,
+    ) -> anyhow::Result<Self> {
         let source_parent_id = source_parent.identity()?;
         if self.source_parent_id != source_parent_id || self.source_name != source_name {
             let before = mb_core::canonical_bytes(&self)?;
@@ -1004,6 +1122,133 @@ mod tests {
             fs::read(root.path().join("second-anchor")).unwrap(),
             b"another original"
         );
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN for fanotify permission events"]
+    fn pending_edit_rebinds_after_rename_at_each_detach_phase() {
+        for interruption in 0..=5 {
+            let root = test_directory();
+            let source_path = root.path().join("source");
+            let moved_dir = root.path().join("moved");
+            let moved_path = moved_dir.join("renamed");
+            fs::create_dir(&moved_dir).unwrap();
+            let source = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&source_path)
+                .unwrap();
+            source.set_len(1024 * 1024).unwrap();
+            source.write_at(b"original", 4096).unwrap();
+            source.sync_all().unwrap();
+            drop(source);
+            let parent = PinnedDirectory::open(root.path()).unwrap();
+            let moved_parent = PinnedDirectory::open(&moved_dir).unwrap();
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([96; 32]));
+            let database_path = root.path().join("control.db");
+            let store = crate::database::ControlStore::open(&database_path, &keys).unwrap();
+            let anchor_id = uuid::Uuid::new_v4();
+            let capture = LinkFreezeCaptureIntent::begin(
+                &store, anchor_id, &parent, "source", &parent, "anchor",
+            )
+            .unwrap()
+            .resume(&store, &parent, &parent)
+            .unwrap()
+            .unwrap();
+            let mut edit = capture
+                .clone()
+                .begin_edit(&store, &parent, &parent)
+                .unwrap();
+            if interruption >= 1 {
+                edit = edit.mark_copy_staging(&store).unwrap();
+            }
+            if interruption >= 2 {
+                let guard = FileWriteExclusion::acquire(File::open(&source_path).unwrap()).unwrap();
+                let private = parent.create_child_file(edit.staging_name()).unwrap();
+                let copy = guard.copy_sparse_independent(&private).unwrap();
+                edit = edit
+                    .mark_private_copy_ready(&store, &guard, &parent, private, copy)
+                    .unwrap();
+                guard.release().unwrap();
+            }
+            if interruption >= 3 {
+                let private_id = NativeFileId {
+                    filesystem_id: capture.source_id.filesystem_id,
+                    inode: edit.private_inode().unwrap(),
+                };
+                parent
+                    .exchange_child_files(
+                        "anchor",
+                        capture.source_id,
+                        &parent,
+                        edit.staging_name(),
+                        private_id,
+                    )
+                    .unwrap();
+            }
+            if interruption >= 4 {
+                parent
+                    .remove_child_file_if_identity(edit.staging_name(), capture.source_id)
+                    .unwrap();
+            }
+            if interruption >= 5 {
+                edit = edit
+                    .mark_unlock_pending(
+                        &store,
+                        &File::open(&source_path).unwrap(),
+                        &parent,
+                        "source",
+                        &parent,
+                        "anchor",
+                    )
+                    .unwrap();
+            }
+            fs::rename(&source_path, &moved_path).unwrap();
+            fs::write(&source_path, b"replacement").unwrap();
+            drop(store);
+
+            let store = crate::database::ControlStore::open(&database_path, &keys).unwrap();
+            let capture = LinkFreezeCaptureIntent::load(&store, anchor_id)
+                .unwrap()
+                .unwrap();
+            assert!(capture.clone().resume(&store, &parent, &parent).is_err());
+            assert!(
+                capture
+                    .clone()
+                    .rebind_pending_edit(&store, &parent, "source", &parent)
+                    .is_err()
+            );
+            let unknown = root.path().join("unknown-alias");
+            fs::hard_link(&moved_path, &unknown).unwrap();
+            assert!(
+                capture
+                    .clone()
+                    .rebind_pending_edit(&store, &moved_parent, "renamed", &parent)
+                    .is_err(),
+                "case {interruption} accepted an unknown alias"
+            );
+            fs::remove_file(&unknown).unwrap();
+            let rebound = capture
+                .rebind_pending_edit(&store, &moved_parent, "renamed", &parent)
+                .unwrap();
+            let detached = rebound
+                .resume(&store, &moved_parent, &parent)
+                .unwrap()
+                .unwrap();
+            assert_eq!(detached.phase(), LinkFreezeCapturePhase::Detached);
+            assert!(
+                crate::link_freeze::LinkFreezeEditIntent::load(&store, anchor_id)
+                    .unwrap()
+                    .is_none()
+            );
+            fs::write(&moved_path, b"changed later").unwrap();
+            assert_eq!(
+                fs::read(root.path().join("anchor")).unwrap()[4096..4104],
+                *b"original"
+            );
+            assert_eq!(fs::read(&source_path).unwrap(), b"replacement");
+        }
     }
 
     fn test_directory() -> tempfile::TempDir {
