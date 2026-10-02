@@ -534,6 +534,9 @@ fn finish_symlink_stage(
     let manifest = plan.capture_with_control(control)?;
     let oid = blob_oid_from_anchor(&manifest)?;
     plan.reconcile_with_control(control)?;
+    for existing in anchors_for_oid(control, scope.repository_id(), oid)? {
+        require_same_blob_bytes(&existing, &manifest)?;
+    }
     if let Some(observed) = verify_temporary_symlink_bytes(&catalog, &intent)? {
         if Some(observed) != intent.temp_id {
             return Err(StageError::IncompatibleRecord);
@@ -611,6 +614,9 @@ fn finish_stage_for_scope(
     let manifest = intent.plan.capture_with_control(control)?;
     let oid = blob_oid_from_anchor(&manifest)?;
     intent.plan.reconcile_with_control(control)?;
+    for existing in anchors_for_oid(control, scope.repository_id(), oid)? {
+        require_same_blob_bytes(&existing, &manifest)?;
+    }
     let entry = GitIndexEntry {
         format_version: 1,
         oid: oid.as_bytes().try_into().expect("SHA-1 OID has 20 bytes"),
@@ -1029,9 +1035,22 @@ pub(crate) fn pending_stage_paths_for_scope(
     Ok(paths)
 }
 
+fn require_same_blob_bytes(
+    existing: &FileAnchorManifest,
+    candidate: &FileAnchorManifest,
+) -> Result<(), StageError> {
+    if existing.content_hash != candidate.content_hash
+        || existing.logical_len != candidate.logical_len
+    {
+        return Err(GitAnchorError::OidCollision.into());
+    }
+    Ok(())
+}
+
 /// Resolve usable physical anchors for a Git blob ID, verifying both the
 /// native content root and Git object ID. A damaged payload remains mapped for
-/// repair/retention, but cannot prevent use of another verified copy.
+/// repair/retention, but cannot prevent use of another verified copy. Distinct
+/// native content under one Git ID is an ambiguous alias and fails closed.
 pub fn anchors_for_oid(
     control: &ControlStore,
     repository_id: Uuid,
@@ -1044,7 +1063,12 @@ pub fn anchors_for_oid(
             return Err(StageError::IncompatibleRecord);
         }
         match blob_oid_from_anchor(&manifest) {
-            Ok(actual) if actual == oid => anchors.push(manifest),
+            Ok(actual) if actual == oid => {
+                if let Some(existing) = anchors.first() {
+                    require_same_blob_bytes(existing, &manifest)?;
+                }
+                anchors.push(manifest);
+            }
             Ok(_) => return Err(StageError::IncompatibleRecord),
             Err(GitAnchorError::Anchor(_)) => {}
             Err(error) => return Err(error.into()),
@@ -1187,6 +1211,26 @@ mod tests {
         assert!(matches!(
             anchors_for_oid(&control, repository_id, other_oid),
             Err(StageError::IncompatibleRecord)
+        ));
+    }
+
+    #[test]
+    fn same_git_id_requires_identical_native_content_roots() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let capture = |bytes: &'static [u8]| {
+            mb_store::SourceBlobImportPlan::plan_direct(root, bytes.len() as u64)
+                .unwrap()
+                .capture(std::io::Cursor::new(bytes))
+                .unwrap()
+        };
+        let first = capture(b"alpha");
+        let duplicate = capture(b"alpha");
+        let alias = capture(b"bravo");
+        super::require_same_blob_bytes(&first, &duplicate).unwrap();
+        assert!(matches!(
+            super::require_same_blob_bytes(&first, &alias),
+            Err(StageError::Git(crate::GitAnchorError::OidCollision))
         ));
     }
 
