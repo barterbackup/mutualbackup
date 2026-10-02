@@ -148,20 +148,46 @@ impl PrototypeGuild {
     }
 
     pub fn commit_source(&mut self, owner_index: usize, source: &Path) -> Result<QuorumCheckpoint> {
+        let root_id = self
+            .live_node(owner_index)?
+            .lock()
+            .map_err(lock_error)?
+            .add_protected_root(source)?
+            .root_id;
+        self.commit_source_for_root(owner_index, root_id, source)
+    }
+
+    pub fn commit_source_for_root(
+        &mut self,
+        owner_index: usize,
+        root_id: uuid::Uuid,
+        source: &Path,
+    ) -> Result<QuorumCheckpoint> {
         let role_indices = role_indices(owner_index, self.nodes.len())?;
         let owner = self.live_node(role_indices[0])?;
         let revision = owner.lock().map_err(lock_error)?.prepare_revision(
             self.guild_id,
-            uuid::Uuid::from_bytes([1; 16]),
+            root_id,
             source,
             1,
             None,
         )?;
-        let mut target_sectors = revision.value.metadata_sectors.clone();
-        target_sectors.extend(revision.value.data_sectors.clone());
+        let mut target_sectors = BTreeMap::new();
+        for reference in revision
+            .value
+            .metadata_sectors
+            .iter()
+            .chain(&revision.value.data_sectors)
+        {
+            if let Some(previous) = target_sectors.insert(reference.id, reference.clone())
+                && previous != *reference
+            {
+                bail!("the same content sector ID has conflicting references");
+            }
+        }
         let mut groups = Vec::with_capacity(target_sectors.len());
 
-        for (ordinal, target_reference) in target_sectors.iter().enumerate() {
+        for (ordinal, target_reference) in target_sectors.values().enumerate() {
             let owner_bytes = owner
                 .lock()
                 .map_err(lock_error)?
@@ -529,6 +555,95 @@ fn lock_error<T>(_: std::sync::PoisonError<T>) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn seed_only_recovery_rebuilds_git_branches_and_exact_blobs() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let root = test_root.join(format!("git-seed-recovery-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let main_bytes = b"main\r\n\0bytes";
+        let topic_bytes = b"topic\n\xffbytes\r\n";
+        fs::write(source.join("tracked"), main_bytes).unwrap();
+        let seeds = (0_u8..5)
+            .map(|value| Seed::from_bytes([value + 140; 32]))
+            .collect::<Vec<_>>();
+        let owner_seed = seeds[0].clone();
+        let owner_keys = KeyMaterial::from_seed(&owner_seed);
+        let mut guild = PrototypeGuild::create(&root.join("nodes"), seeds).unwrap();
+        let owner = guild.live_node(0).unwrap();
+        let (repository_id, main_oid, topic_oid) = {
+            let mut node = owner.lock().unwrap();
+            let repository_id = node.git_init(&source).unwrap().repository_id;
+            node.git_add(repository_id, Path::new("tracked")).unwrap();
+            let main = node
+                .git_commit(repository_id, "Author", "a@example.test", "main")
+                .unwrap();
+            node.git_create_branch(repository_id, "topic").unwrap();
+            node.git_switch_branch(repository_id, "topic").unwrap();
+            fs::write(source.join("tracked"), topic_bytes).unwrap();
+            node.git_add(repository_id, Path::new("tracked")).unwrap();
+            let topic = node
+                .git_commit(repository_id, "Author", "a@example.test", "topic")
+                .unwrap();
+            node.git_switch_branch(repository_id, "main").unwrap();
+            (repository_id, main.oid, topic.oid)
+        };
+        assert_eq!(fs::read(source.join("tracked")).unwrap(), main_bytes);
+        let repository = mb_git::GitRepository::open(
+            &source,
+            repository_id,
+            &mb_git::catalog_key(&owner_keys, repository_id),
+        )
+        .unwrap();
+        let graph = repository.export_graph_source().unwrap();
+        drop(repository);
+        assert!(graph.refs.iter().any(|reference| {
+            reference.name == b"refs/heads/topic" && reference.oid == topic_oid
+        }));
+
+        let checkpoint = guild
+            .commit_source_for_root(0, repository_id, &source)
+            .unwrap();
+        assert_eq!(checkpoint.checkpoint.revisions.len(), 1);
+        drop(owner);
+        for blob in &graph.blobs {
+            blob.anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(&source).unwrap();
+        let lost_data_dir = guild.lose_node(0).unwrap();
+        fs::remove_dir_all(lost_data_dir).unwrap();
+        let restored = root.join("restored");
+        let recovered = guild
+            .recover(owner_seed, &root.join("recovered-owner"), &restored)
+            .unwrap();
+        let node = recovered.lock().unwrap();
+        let status = node.git_status(repository_id).unwrap();
+        assert_eq!(status.branch, "main");
+        assert_eq!(status.head_oid, Some(main_oid));
+        // This lab fixture uses a format-3 checkpoint, which can restore the
+        // graph but lacks the format-7 packing catalog needed to attest it.
+        assert!(!status.history_backed_up);
+        assert_eq!(fs::read(restored.join("tracked")).unwrap(), main_bytes);
+        let branches = node.git_branches(repository_id).unwrap();
+        assert!(
+            branches
+                .iter()
+                .any(|branch| branch.name == "topic" && branch.oid == topic_oid)
+        );
+        node.git_switch_branch(repository_id, "topic").unwrap();
+        assert_eq!(fs::read(restored.join("tracked")).unwrap(), topic_bytes);
+        assert_eq!(node.git_log(repository_id, 2).unwrap()[0].oid, topic_oid);
+        drop(node);
+        drop(recovered);
+        drop(guild);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     /// Run with MUTUALBACKUP_REFLINK_TEST_ROOT pointing at a disposable Btrfs
     /// or XFS directory. The GCP runner supplies that directory explicitly.

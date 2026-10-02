@@ -2204,9 +2204,11 @@ mod tests {
             .catalog
             .put_record(&pending_kind, b"pending", b"test-only-pending")
             .unwrap();
-        assert!(local
-            .prune_missing_linked_worktree(linked.worktree_id, true)
-            .is_err());
+        assert!(
+            local
+                .prune_missing_linked_worktree(linked.worktree_id, true)
+                .is_err()
+        );
         assert_eq!(local.linked_worktrees().unwrap(), vec![linked.clone()]);
         assert!(staged_anchor.open_verified().is_ok());
         local

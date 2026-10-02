@@ -1200,7 +1200,53 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         deterministic_bytes(190_000, 29),
     )
     .unwrap();
-    cli_path(&sockets[1], ["root", "add"], &owner_one_source);
+    let owner_one_initial = deterministic_bytes(180_000, 17);
+    let topic_bytes = b"topic\r\n\0\xffbyte-exact\n";
+    git_cli(&sockets[1], &owner_one_source, ["init"]);
+    git_cli(
+        &sockets[1],
+        &owner_one_source,
+        ["add", "documents/data.bin"],
+    );
+    git_cli(
+        &sockets[1],
+        &owner_one_source,
+        [
+            "commit",
+            "--author-name",
+            "Owner",
+            "--author-email",
+            "owner@example.test",
+            "-m",
+            "main",
+        ],
+    );
+    git_cli(&sockets[1], &owner_one_source, ["branch", "topic"]);
+    git_cli(&sockets[1], &owner_one_source, ["switch", "topic"]);
+    fs::write(owner_one_source.join("documents/data.bin"), topic_bytes).unwrap();
+    git_cli(
+        &sockets[1],
+        &owner_one_source,
+        ["add", "documents/data.bin"],
+    );
+    git_cli(
+        &sockets[1],
+        &owner_one_source,
+        [
+            "commit",
+            "--author-name",
+            "Owner",
+            "--author-email",
+            "owner@example.test",
+            "-m",
+            "topic",
+        ],
+    );
+    git_cli(&sockets[1], &owner_one_source, ["switch", "main"]);
+    assert_eq!(
+        fs::read(owner_one_source.join("documents/data.bin")).unwrap(),
+        owner_one_initial
+    );
     cli_path(&sockets[2], ["root", "add"], &owner_two_source);
 
     let first = cli(
@@ -1209,6 +1255,10 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         PROCESS_SMALL_BACKUP_TIMEOUT,
     );
     assert!(first.contains("state:      Committed"));
+    assert!(
+        git_cli(&sockets[1], &owner_one_source, ["status"])
+            .contains("Local history is protected by a signed backup")
+    );
     let second = cli(
         &sockets[2],
         ["backup", "--wait"],
@@ -1389,6 +1439,21 @@ fn five_daemons_recover_latest_snapshot_from_seed_and_dht() {
         &recovered_socket,
         &mut recovered_daemon,
         Duration::from_secs(90),
+    );
+    assert!(
+        git_cli(&recovered_socket, &restored, ["status"])
+            .contains("Local history is protected by a signed backup")
+    );
+    assert!(git_cli(&recovered_socket, &restored, ["branch"]).contains("topic"));
+    git_cli(
+        &recovered_socket,
+        &restored,
+        ["restore", "documents/data.bin"],
+    );
+    git_cli(&recovered_socket, &restored, ["switch", "topic"]);
+    assert_eq!(
+        fs::read(restored.join("documents/data.bin")).unwrap(),
+        topic_bytes
     );
 
     let storage_recovered_dir = run_root.join("storage-recovered");
@@ -2668,6 +2733,31 @@ fn cli<const N: usize>(socket: &Path, args: [&str; N], timeout: Duration) -> Str
     let mut owned = vec![os("--socket"), socket.as_os_str().to_owned()];
     owned.extend(args.into_iter().map(os));
     run_cli(&owned, timeout).unwrap()
+}
+
+fn git_cli<const N: usize>(socket: &Path, directory: &Path, args: [&str; N]) -> String {
+    let mut owned = vec![
+        os("--socket"),
+        socket.as_os_str().to_owned(),
+        os("-C"),
+        directory.as_os_str().to_owned(),
+    ];
+    owned.extend(args.into_iter().map(os));
+    let output = run_output(
+        env!("CARGO_BIN_EXE_mutualgit"),
+        &owned,
+        PROCESS_SMALL_BACKUP_TIMEOUT,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "mutualgit {:?} failed with {}\nstdout:\n{}\nstderr:\n{}",
+        owned,
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
 }
 
 fn cli_path<const N: usize>(socket: &Path, args: [&str; N], path: &Path) -> String {
