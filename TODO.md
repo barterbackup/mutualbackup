@@ -92,9 +92,14 @@
   lower source on both filesystems. `e4f4147` connects a single captured file
   to its durable detach journal before FUSE `O_WRONLY` and `O_RDWR` passthrough;
   ordinary-user writes retain the original source inode and leave a distinct,
-  byte-exact anchor on ext4 and fresh Btrfs. Extend this to the whole versioned
-  worktree namespace, metadata and truncate operations, rename/unlink,
-  concurrent handles, and mount/restart failure before enrollment. Keep Git
+  byte-exact anchor on ext4 and fresh Btrfs. `2cf0cb3` extends that single-file
+  probe to owner `chmod`, pathname truncate, and `O_TRUNC` open: each completes
+  detach before changing the source inode, retains the exact anchor bytes, and
+  passes as an ordinary user on ext4 and fresh local Btrfs. The five privileged
+  FUSE probes, normal store library tests, formatting, and strict locked
+  workspace Clippy pass. Extend this to the whole versioned worktree namespace,
+  remaining metadata/allocation operations, rename/unlink, concurrent handles,
+  and mount/restart failure before enrollment. Keep Git
   staging and checkout gated until the complete privileged probe passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
   and [fanotify(7)](https://man7.org/linux/man-pages/man7/fanotify.7.html).

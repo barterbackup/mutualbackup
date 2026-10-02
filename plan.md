@@ -1158,8 +1158,11 @@ the FUSE view while the private lower source remains inaccessible on both
 filesystems. `e4f4147` passed a single-file FUSE write-detach probe on ext4
 and fresh Btrfs: ordinary-user `O_WRONLY` and `O_RDWR` writes receive the
 original source inode only after durable sparse detach, while the independent
-anchor keeps exact captured bytes. Whole-worktree dispatch, metadata and
-truncate edits, rename/unlink, mount supervision/recovery, and guarded
+anchor keeps exact captured bytes. `2cf0cb3` extends that probe to ordinary-user
+owner `chmod`, pathname truncate, and `O_TRUNC` open; all five privileged FUSE
+tests pass on ext4 and a fresh local Btrfs image, and the stored anchor remains
+byte-exact. Whole-worktree dispatch, remaining metadata/allocation operations,
+rename/unlink, concurrent handles, mount supervision/recovery, and guarded
 enrollment remain unimplemented.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
