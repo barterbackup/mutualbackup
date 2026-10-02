@@ -17,8 +17,10 @@
   isolated smoke runs and the complete Git acceptance script passed on
   `31018a0` with stricter diagnostic backup timeouts (900/600 seconds), but
   did not reproduce the failure. The complete provisioned reflink script also
-  passed on `6caeb11` with the 600-second diagnostic timeout. `31018a0`
-  preserves relevant signer warnings in future timeout output. Keep this
+  passed on `6caeb11` with the 600-second diagnostic timeout. The expanded
+  reflink script passed again on `d53b4be` with that timeout; one transient
+  coding-activation request failure recovered before the topology completed.
+  `31018a0` preserves relevant signer warnings in future timeout output. Keep this
   reliability issue open until the missing-signer path is explained and
   corrected.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
@@ -54,7 +56,7 @@
   bytes, and proves a recipe pin survives revision-record removal until the
   sector recipe itself retires. The complete provisioned Git gate passed on
   `31018a0`, including the Btrfs and signed-revision prune regressions.
-- [ ] **M6 restore/reset recovery acceptance.** Checkout intent formats 9/10
+- [x] **M6 restore/reset recovery acceptance.** Checkout intent formats 9/10
   now carry BLAKE3 roots and lengths for previously unanchored working files;
   linked worktrees use wrapper version 2. Replay verifies those bytes in the
   worktree and private staging, and old pending intents without a provable
@@ -66,7 +68,9 @@
   a wrong native anchor behind the expected Git ID and an unverifiable legacy
   restore intent; its targeted run passes. The reflink acceptance script now
   includes these checks alongside primary and linked restore and hard reset.
-  Rerun that complete script on exact committed source before closing this item.
+  The complete provisioned reflink acceptance script passed on exact committed
+  source `d53b4be`, including all new replay cases and the five-daemon smoke.
+  Its disposable Btrfs image, namespaces, and firewall rules were cleaned up.
 - [ ] **M6 guarded edit guard.** The store now has replayable per-file and
   whole-root sparse detaches, but node enrollment still selects only the
   reflink backend. Implement and locally probe a long-lived access decision
