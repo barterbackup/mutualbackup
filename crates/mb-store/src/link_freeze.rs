@@ -340,6 +340,10 @@ impl LinkFreezeEditIntent {
         );
         let source_name = source_name.as_ref();
         let anchor_name = anchor_name.as_ref();
+        anyhow::ensure!(
+            source_parent.identity()? != anchor_parent.identity()? || source_name != anchor_name,
+            "the editable source cannot be its own anchor"
+        );
         let source = source_parent
             .open_child_file(source_name)?
             .ok_or_else(|| anyhow::anyhow!("frozen source name disappeared"))?;
@@ -1301,6 +1305,41 @@ mod tests {
         FrozenAnchorProof, IndependentSparseCopy, LinkFreezeEditIntent, LinkFreezeEditPhase,
         copy_sparse_independent, file_data_extents, hash_exact, install_probe_acl,
     };
+
+    #[test]
+    fn edit_intent_rejects_using_the_anchor_name_as_its_source() {
+        let root = test_directory();
+        fs::write(root.path().join("source"), b"immutable bytes").unwrap();
+        fs::hard_link(root.path().join("source"), root.path().join("anchor")).unwrap();
+        let parent = PinnedDirectory::open(root.path()).unwrap();
+        let file = File::open(root.path().join("anchor")).unwrap();
+        let proof = FrozenAnchorProof {
+            original_access: FileAccessSnapshot::capture(&file).unwrap(),
+            content: IndependentSparseCopy {
+                logical_len: file.metadata().unwrap().len(),
+                content_hash: hash_exact(&file, file.metadata().unwrap().len()).unwrap(),
+                data_extents: file_data_extents(&file, file.metadata().unwrap().len()).unwrap(),
+            },
+        };
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([74; 32]));
+        let store = ControlStore::open(root.path().join("control.db"), &keys).unwrap();
+        let anchor_id = Uuid::new_v4();
+        assert!(
+            LinkFreezeEditIntent::begin(
+                &store, anchor_id, &parent, "anchor", &parent, "anchor", proof,
+            )
+            .is_err()
+        );
+        assert!(
+            LinkFreezeEditIntent::load(&store, anchor_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fs::read(root.path().join("anchor")).unwrap(),
+            b"immutable bytes"
+        );
+    }
 
     #[test]
     fn access_snapshot_records_the_acl_mask_changed_by_chmod() {

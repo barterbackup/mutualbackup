@@ -259,10 +259,23 @@ impl SourceFileCapturePlan {
         &self,
         control: &ControlStore,
     ) -> Result<(), SourceFileCaptureError> {
+        self.prepare_edit_at_with_control(control, self.relative_path())
+    }
+
+    /// A guarded source may have moved since capture. The caller supplies its
+    /// current path so the backend can prove that inode before replaying the
+    /// edit journal; a reflink capture needs no detach at either path.
+    pub fn prepare_edit_at_with_control(
+        &self,
+        control: &ControlStore,
+        current_relative_path: impl AsRef<Path>,
+    ) -> Result<(), SourceFileCaptureError> {
         match self {
             Self::ReflinkV1(_) => Ok(()),
             #[cfg(target_os = "linux")]
-            Self::GuardedLinkFreezeV1(plan) => Ok(plan.prepare_edit(control)?),
+            Self::GuardedLinkFreezeV1(plan) => {
+                Ok(plan.prepare_edit_at(control, current_relative_path)?)
+            }
         }
     }
 

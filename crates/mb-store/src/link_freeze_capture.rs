@@ -550,6 +550,11 @@ impl LinkFreezeCaptureIntent {
         anyhow::ensure!(LinkFreezeEditIntent::load(control, self.anchor_id)?.is_none());
         let source_name = source_name.as_ref();
         anyhow::ensure!(
+            source_parent.identity()? != anchor_parent.identity()?
+                || source_name != self.anchor_name,
+            "the editable source cannot be its own anchor"
+        );
+        anyhow::ensure!(
             source_parent.entry_identity(source_name, false)? == Some(self.source_id),
             "current source name does not match the frozen capture"
         );
@@ -580,6 +585,11 @@ impl LinkFreezeCaptureIntent {
             "pending edit does not match the frozen capture"
         );
         let source_name = source_name.as_ref();
+        anyhow::ensure!(
+            source_parent.identity()? != anchor_parent.identity()?
+                || source_name != self.anchor_name,
+            "the editable source cannot be its own anchor"
+        );
         anyhow::ensure!(
             source_parent.entry_identity(source_name, false)? == Some(self.source_id)
                 && anchor_parent.identity()? == self.anchor_parent_id,
@@ -1049,7 +1059,7 @@ mod tests {
     use crate::anchor::{NativeFileId, PinnedDirectory};
     use crate::link_freeze::{
         AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion, FrozenAnchorProof,
-        IndependentSparseCopy, install_probe_acl,
+        IndependentSparseCopy, LinkFreezeEditIntent, install_probe_acl,
     };
 
     #[test]
@@ -1373,6 +1383,17 @@ mod tests {
                 .resume(&store, &parent, &parent)
                 .unwrap()
                 .unwrap();
+        assert!(
+            frozen
+                .clone()
+                .begin_edit_at(&store, &parent, "anchor", &parent)
+                .is_err()
+        );
+        assert!(
+            LinkFreezeEditIntent::load(&store, anchor_id)
+                .unwrap()
+                .is_none()
+        );
         let unknown = root.path().join("unknown-alias");
         fs::hard_link(&original, &unknown).unwrap();
         assert!(frozen.clone().resume(&store, &parent, &parent).is_err());

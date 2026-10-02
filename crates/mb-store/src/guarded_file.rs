@@ -15,7 +15,10 @@ use super::{
     open_source_beneath, open_source_root, open_stable_anchor_area, probe_guarded_link_freeze,
     resolve_anchor_area, unix_mode, validate_relative,
 };
-use crate::{ControlStore, LinkFreezeCaptureIntent, LinkFreezeCapturePhase};
+use crate::{
+    ControlStore, LinkFreezeCaptureIntent, LinkFreezeCapturePhase, LinkFreezeEditIntent,
+    LinkFreezeEditPhase,
+};
 
 const PLAN_KIND: &str = "guarded-file-plan-v1";
 const DIRECTORY_CLAIM_KIND: &str = "guarded-file-directory-v1";
@@ -297,17 +300,7 @@ impl GuardedFileCapturePlan {
             verified.phase(),
             LinkFreezeCapturePhase::Frozen | LinkFreezeCapturePhase::Detached
         ));
-        let content = verified.content_proof();
-        let manifest = FileAnchorManifest {
-            format_version: 1,
-            anchor_id: self.anchor_id,
-            area: self.area.clone(),
-            source_root_hint: self.source_root.clone(),
-            source_relative_path: self.relative_path.clone(),
-            logical_len: content.logical_len,
-            content_hash: content.content_hash,
-            source_version: self.source_version.clone(),
-        };
+        let manifest = self.manifest_for_intent(&verified);
         let manifest_name = capture_manifest_name(self.anchor_id);
         let manifest_bytes = mb_core::canonical_bytes(&manifest)?;
         let claim = ManifestClaim {
@@ -365,32 +358,119 @@ impl GuardedFileCapturePlan {
     }
 
     /// Detach the original source inode before allowing an edit to a captured
-    /// file. Replaying `capture` first completes an interrupted detach; the
-    /// frozen case then records its edit intent before the sparse private copy
-    /// and permission restoration. A caller may retry this after a crash.
+    /// file. A caller may retry this after a crash, including after the source
+    /// was renamed before or during the detach.
     pub fn prepare_edit(&self, control: &ControlStore) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            control
-                .get_record(MANIFEST_CLAIM_KIND, self.anchor_id.as_bytes())?
-                .is_some(),
-            "guarded file has no published capture to detach"
-        );
-        self.capture(control)?;
+        self.prepare_edit_at(control, &self.relative_path)
+    }
+
+    /// Bind an edit to the current path of the original frozen inode. The
+    /// protected manifest keeps its capture-time path; only the edit journal's
+    /// source locator changes after the pinned inode has been verified.
+    pub fn prepare_edit_at(
+        &self,
+        control: &ControlStore,
+        current_relative_path: impl AsRef<Path>,
+    ) -> anyhow::Result<()> {
+        let current_relative_path = current_relative_path.as_ref();
+        validate_relative(current_relative_path)?;
         let intent = LinkFreezeCaptureIntent::load(control, self.anchor_id)?
             .ok_or_else(|| anyhow::anyhow!("guarded file capture journal disappeared"))?;
+        anyhow::ensure!(matches!(
+            intent.phase(),
+            LinkFreezeCapturePhase::Frozen | LinkFreezeCapturePhase::Detached
+        ));
+        let (anchor_parent, manifest) = self.verified_published_edit_anchor(control, &intent)?;
         if intent.phase() == LinkFreezeCapturePhase::Detached {
+            intent.verify_detached_anchor(control, &anchor_parent)?;
             return Ok(());
         }
-        let source_parent = self.open_source_parent()?;
+        let edit = LinkFreezeEditIntent::load(control, self.anchor_id)?;
+        if edit
+            .as_ref()
+            .is_some_and(|edit| edit.phase() == LinkFreezeEditPhase::Editable)
+        {
+            intent.finish_detached_edit(control, &anchor_parent)?;
+            manifest.open_verified()?;
+            return Ok(());
+        }
+        let source_parent = self.open_source_parent_at(current_relative_path)?;
+        let source_name = current_relative_path
+            .file_name()
+            .ok_or(AnchorError::UnsafePath)?;
+        if edit.is_some() {
+            intent.rebind_pending_edit(control, &source_parent, source_name, &anchor_parent)?;
+        } else {
+            intent.begin_edit_at(control, &source_parent, source_name, &anchor_parent)?;
+        }
+        let detached = LinkFreezeCaptureIntent::load(control, self.anchor_id)?
+            .ok_or_else(|| anyhow::anyhow!("guarded file capture journal disappeared"))?
+            .resume(control, &source_parent, &anchor_parent)?
+            .ok_or_else(|| anyhow::anyhow!("guarded file capture changed during edit"))?;
+        anyhow::ensure!(detached.phase() == LinkFreezeCapturePhase::Detached);
+        manifest.open_verified()?;
+        Ok(())
+    }
+
+    fn verified_published_edit_anchor(
+        &self,
+        control: &ControlStore,
+        intent: &LinkFreezeCaptureIntent,
+    ) -> anyhow::Result<(PinnedDirectory, FileAnchorManifest)> {
+        anyhow::ensure!(
+            control
+                .get_record(RETIRE_KIND, self.anchor_id.as_bytes())?
+                .is_none()
+                && !LinkFreezeCaptureIntent::retirement_pending(control, self.anchor_id)?,
+            "guarded file anchor is being retired"
+        );
+        let manifest = self.manifest_for_intent(intent);
+        anyhow::ensure!(
+            Self::load_for_manifest(control, &manifest)?.as_ref() == Some(self),
+            "guarded file has no matching published capture"
+        );
+        let plan_hash = *blake3::hash(&mb_core::canonical_bytes(self)?).as_bytes();
         let area_path = resolve_anchor_area(&self.area)?;
         let area_file = open_stable_anchor_area(&area_path, &self.area)?;
         let area = PinnedDirectory {
             file: area_file,
             filesystem_id: self.area.filesystem_id,
         };
+        anyhow::ensure!(
+            self.verified_marker(&area, plan_hash)?.is_some(),
+            "guarded file ownership marker disappeared"
+        );
+        let directory_claim: DirectoryClaim = mb_core::decode_canonical(
+            &control
+                .get_record(DIRECTORY_CLAIM_KIND, self.anchor_id.as_bytes())?
+                .ok_or_else(|| anyhow::anyhow!("guarded file directory claim disappeared"))?,
+        )?;
         let anchor_parent = area
             .open_child_directory(self.anchor_id.to_string())?
             .ok_or_else(|| anyhow::anyhow!("guarded file anchor directory disappeared"))?;
+        anyhow::ensure!(
+            directory_claim.format_version == 1
+                && directory_claim.anchor_id == self.anchor_id
+                && directory_claim.plan_hash == plan_hash
+                && directory_claim.directory_id == anchor_parent.identity()?
+                && unix_mode(&anchor_parent.as_file().metadata()?) & 0o777 == 0o700,
+            "guarded file directory differs from its claim"
+        );
+        let manifest_claim: ManifestClaim = mb_core::decode_canonical(
+            &control
+                .get_record(MANIFEST_CLAIM_KIND, self.anchor_id.as_bytes())?
+                .ok_or_else(|| anyhow::anyhow!("guarded file has no published manifest"))?,
+        )?;
+        anyhow::ensure!(
+            manifest_claim.format_version == 1
+                && manifest_claim.anchor_id == self.anchor_id
+                && manifest_claim.directory_id == directory_claim.directory_id
+                && manifest_claim.plan_hash == plan_hash
+                && manifest_claim.manifest_hash
+                    == *blake3::hash(&mb_core::canonical_bytes(&manifest)?).as_bytes(),
+            "guarded file manifest differs from its claim"
+        );
+        self.verified_manifest_for_retirement(Some(&anchor_parent), Some(&manifest_claim), false)?;
         let expected_source = NativeFileId {
             filesystem_id: self.source_version.filesystem_id,
             inode: self.source_version.inode,
@@ -401,14 +481,22 @@ impl GuardedFileCapturePlan {
             &anchor_parent,
             Path::new(PAYLOAD_NAME),
         )?);
-        intent.begin_edit(control, &source_parent, &anchor_parent)?;
-        let detached = LinkFreezeCaptureIntent::load(control, self.anchor_id)?
-            .ok_or_else(|| anyhow::anyhow!("guarded file capture journal disappeared"))?
-            .resume(control, &source_parent, &anchor_parent)?
-            .ok_or_else(|| anyhow::anyhow!("guarded file capture changed during edit"))?;
-        anyhow::ensure!(detached.phase() == LinkFreezeCapturePhase::Detached);
-        self.capture(control)?;
-        Ok(())
+        manifest.open_verified()?;
+        Ok((anchor_parent, manifest))
+    }
+
+    fn manifest_for_intent(&self, intent: &LinkFreezeCaptureIntent) -> FileAnchorManifest {
+        let content = intent.content_proof();
+        FileAnchorManifest {
+            format_version: 1,
+            anchor_id: self.anchor_id,
+            area: self.area.clone(),
+            source_root_hint: self.source_root.clone(),
+            source_relative_path: self.relative_path.clone(),
+            logical_len: content.logical_len,
+            content_hash: content.content_hash,
+            source_version: self.source_version.clone(),
+        }
     }
 
     fn marker_name(&self) -> String {
@@ -779,13 +867,17 @@ impl GuardedFileCapturePlan {
     }
 
     fn open_source_parent(&self) -> Result<PinnedDirectory, AnchorError> {
+        self.open_source_parent_at(&self.relative_path)
+    }
+
+    fn open_source_parent_at(&self, relative_path: &Path) -> Result<PinnedDirectory, AnchorError> {
+        validate_relative(relative_path)?;
         let root = PinnedDirectory::open(&self.source_root)?;
         if root.identity()? != self.source_root_id {
             return Err(AnchorError::SourceChanged(PathBuf::new()));
         }
         let mut parent = root;
-        for component in self
-            .relative_path
+        for component in relative_path
             .parent()
             .ok_or(AnchorError::UnsafePath)?
             .components()
@@ -795,7 +887,7 @@ impl GuardedFileCapturePlan {
             };
             parent = parent
                 .open_child_directory(Path::new(name))?
-                .ok_or_else(|| AnchorError::SourceChanged(self.relative_path.clone()))?;
+                .ok_or_else(|| AnchorError::SourceChanged(relative_path.to_path_buf()))?;
         }
         Ok(parent)
     }
@@ -1353,10 +1445,15 @@ mod tests {
             .unwrap()
             .begin_edit(&store, &source_parent, &anchor_parent)
             .unwrap();
+        let moved_dir = source_root.join("moved");
+        fs::create_dir(&moved_dir).unwrap();
+        let moved_pending = moved_dir.join("pending-renamed");
+        fs::rename(&pending_path, &moved_pending).unwrap();
+        fs::write(&pending_path, b"unrelated replacement").unwrap();
         drop(store);
         let store = ControlStore::open(&database_path, &keys).unwrap();
         SourceFileCapturePlan::GuardedLinkFreezeV1(pending_plan.clone())
-            .prepare_edit_with_control(&store)
+            .prepare_edit_at_with_control(&store, "moved/pending-renamed")
             .unwrap();
         assert_eq!(
             LinkFreezeCaptureIntent::load(&store, pending_plan.anchor_id)
@@ -1365,7 +1462,8 @@ mod tests {
                 .phase(),
             LinkFreezeCapturePhase::Detached
         );
-        fs::write(&pending_path, b"editable").unwrap();
+        fs::write(&moved_pending, b"editable").unwrap();
+        assert_eq!(fs::read(&pending_path).unwrap(), b"unrelated replacement");
         let mut retained = Vec::new();
         pending_manifest
             .open_verified()
@@ -1374,6 +1472,27 @@ mod tests {
             .unwrap();
         assert_eq!(retained, b"pending edit bytes");
         pending_plan.discard_unreferenced(&store).unwrap();
+
+        let fresh_path = source_root.join("fresh");
+        fs::write(&fresh_path, b"fresh frozen bytes").unwrap();
+        let fresh_plan = GuardedFileCapturePlan::plan(&source_root, "fresh").unwrap();
+        let fresh_manifest = fresh_plan.capture(&store).unwrap();
+        let moved_fresh = moved_dir.join("fresh-renamed");
+        fs::rename(&fresh_path, &moved_fresh).unwrap();
+        fs::write(&fresh_path, b"another replacement").unwrap();
+        fresh_plan
+            .prepare_edit_at(&store, "moved/fresh-renamed")
+            .unwrap();
+        fs::write(&moved_fresh, b"later edit").unwrap();
+        let mut fresh_retained = Vec::new();
+        fresh_manifest
+            .open_verified()
+            .unwrap()
+            .read_to_end(&mut fresh_retained)
+            .unwrap();
+        assert_eq!(fresh_retained, b"fresh frozen bytes");
+        assert_eq!(fs::read(&fresh_path).unwrap(), b"another replacement");
+        fresh_plan.discard_unreferenced(&store).unwrap();
 
         fs::write(source_root.join("changed"), b"first").unwrap();
         let stale = GuardedFileCapturePlan::plan(&source_root, "changed").unwrap();
