@@ -14,6 +14,11 @@ use thiserror::Error;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+#[cfg(target_os = "linux")]
+use crate::link_freeze::{
+    AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion, install_probe_acl,
+};
+
 const AREA_PREFIX: &str = ".mutualbackup-anchors";
 const AREA_MARKER: &str = ".mutualbackup-anchor-area-v1";
 const AREA_MAGIC: &str = "mutualbackup-anchor-area-v1";
@@ -2369,6 +2374,166 @@ pub fn probe_reflink(root: impl AsRef<Path>) -> Result<(), AnchorError> {
         }
         validate_sparse_probe_extents(&file_data_extents(&source, PROBE_LENGTH)?, PROBE_LENGTH)?;
         validate_sparse_probe_extents(&file_data_extents(&cloned, PROBE_LENGTH)?, PROBE_LENGTH)?;
+        if filesystem_identity(root)? != root_identity
+            || filesystem_identity(&probe_dir)? != root_identity
+        {
+            return Err(AnchorError::FilesystemChanged);
+        }
+        Ok(())
+    })();
+    let cleanup = remove_owned_directory(parent, &probe_name);
+    cleanup?;
+    sync_directory(parent)?;
+    result
+}
+
+/// Exercise the full disposable guarded hard-link lifecycle on this root's
+/// filesystem. Passing this probe does not enroll the backend: its durable
+/// capture, detach journal, and recovery path must be present before use.
+#[cfg(target_os = "linux")]
+pub fn probe_guarded_link_freeze(root: impl AsRef<Path>) -> Result<(), AnchorError> {
+    use std::io;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+
+    let root = root.as_ref();
+    if !root.is_dir() {
+        return Err(AnchorError::InvalidRoot);
+    }
+    let root_identity = filesystem_identity(root)?;
+    let parent = root.parent().ok_or(AnchorError::NoExternalAnchorLocation)?;
+    if filesystem_identity(parent)? != root_identity {
+        return Err(AnchorError::NoExternalAnchorLocation);
+    }
+    reject_nested_filesystems(root, root_identity)?;
+    let probe_name = format!(".mutualbackup-link-probe-{}", Uuid::new_v4());
+    let probe_dir = parent.join(&probe_name);
+    create_private_dir_new(&probe_dir)?;
+    let source_path = probe_dir.join("source");
+    let moved_path = probe_dir.join("source-moved");
+    let anchor_path = probe_dir.join("anchor");
+    let staging_path = probe_dir.join("private-staging");
+    let result = (|| {
+        const LENGTH: u64 = 4 * 1024 * 1024;
+        const DATA_OFFSET: u64 = 1024 * 1024;
+        let source = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&source_path)?;
+        source.set_len(LENGTH)?;
+        source.write_at(b"source-before-freeze", DATA_OFFSET)?;
+        source.write_at(b"tail", 3 * 1024 * 1024)?;
+        source.sync_all()?;
+        let acl_supported = install_probe_acl(&source)?;
+        let source_extents = file_data_extents(&source, LENGTH)?;
+        validate_sparse_probe_extents(&source_extents, LENGTH)?;
+        if source.metadata()?.nlink() != 1 {
+            return Err(io::Error::other("probe source has an unexpected hard-link alias").into());
+        }
+        let writer_rejected = FileWriteExclusion::acquire(File::open(&source_path)?)
+            .err()
+            .and_then(|error| error.raw_os_error())
+            == Some(libc::EAGAIN);
+        if !writer_rejected {
+            return Err(io::Error::other("pre-opened writer did not block freeze").into());
+        }
+        // A writable shared mapping must remain a lease conflict even after
+        // its creating descriptor closes. Do not touch the sparse hole.
+        // SAFETY: source is a regular file longer than the requested mapping.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                source.as_raw_fd(),
+                0,
+            )
+        };
+        if mapping == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error().into());
+        }
+        drop(source);
+        let mapping_rejected = FileWriteExclusion::acquire(File::open(&source_path)?)
+            .err()
+            .and_then(|error| error.raw_os_error())
+            == Some(libc::EAGAIN);
+        // SAFETY: mapping is the exact 4096-byte region returned above.
+        if unsafe { libc::munmap(mapping, 4096) } < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        if !mapping_rejected {
+            return Err(
+                io::Error::other("pre-opened writable mapping did not block freeze").into(),
+            );
+        }
+
+        let source_read = File::open(&source_path)?;
+        let guard = FileWriteExclusion::acquire(source_read.try_clone()?)?;
+        let access = FileAccessSnapshot::capture(&source_read)?;
+        if acl_supported != matches!(&access.access_acl, AccessAclSnapshot::Present(_)) {
+            return Err(io::Error::other("probe ACL support changed").into());
+        }
+        fs::hard_link(&source_path, &anchor_path)?;
+        fs::set_permissions(
+            &source_path,
+            fs::Permissions::from_mode(access.mode & !0o222),
+        )?;
+        source_read.sync_all()?;
+        File::open(&probe_dir)?.sync_all()?;
+        if !guard.is_held()? || FileAccessSnapshot::capture(&source_read)?.mode & 0o222 != 0 {
+            return Err(io::Error::other("link freeze failed to remove write access").into());
+        }
+        let alias = CString::new(anchor_path.as_os_str().as_bytes())
+            .map_err(|_| AnchorError::UnsafePath)?;
+        // SAFETY: the pathname is NUL-terminated and points to the probe alias.
+        if unsafe { libc::truncate(alias.as_ptr(), 0) } != -1
+            || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+        {
+            return Err(io::Error::other("frozen hard-link alias accepted truncate").into());
+        }
+        fs::rename(&source_path, &moved_path)?;
+        fs::write(&source_path, b"replacement")?;
+        fs::remove_file(&source_path)?;
+        fs::rename(&moved_path, &source_path)?;
+        if !guard.is_held()? {
+            return Err(io::Error::other("write exclusion did not follow moved inode").into());
+        }
+
+        let private = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&staging_path)?;
+        let copy = guard.copy_sparse_independent(&private)?;
+        if copy.logical_len != LENGTH || copy.data_extents != source_extents {
+            return Err(io::Error::other("private anchor changed sparse layout").into());
+        }
+        fs::rename(&staging_path, &anchor_path)?;
+        File::open(&probe_dir)?.sync_all()?;
+        if !guard.is_held()? {
+            return Err(io::Error::other("write exclusion failed before anchor detach").into());
+        }
+        guard.release()?;
+
+        let anchor_read = File::open(&anchor_path)?;
+        access.restore_after_detach(&source_read, &anchor_read, &copy)?;
+        let editable = OpenOptions::new().write(true).open(&source_path)?;
+        editable.write_at(b"source-after-freeze!", DATA_OFFSET)?;
+        editable.sync_all()?;
+        let mut unchanged = [0_u8; 20];
+        let read = anchor_read.read_at(&mut unchanged, DATA_OFFSET)?;
+        if read != unchanged.len()
+            || &unchanged != b"source-before-freeze"
+            || source_read.metadata()?.ino() == anchor_read.metadata()?.ino()
+            || !access.matches(&source_read)?
+        {
+            return Err(
+                io::Error::other("private anchor or original access metadata changed").into(),
+            );
+        }
         if filesystem_identity(root)? != root_identity
             || filesystem_identity(&probe_dir)? != root_identity
         {

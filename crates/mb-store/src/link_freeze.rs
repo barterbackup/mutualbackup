@@ -7,7 +7,7 @@
 //! This guard is not the durable backend: the caller still has to record and
 //! recover the permission and anchor transition.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -122,6 +122,90 @@ impl FileAccessSnapshot {
         }
         Ok(*self == Self::capture(file)?)
     }
+
+    /// Restore exact access metadata only after a verified private anchor has
+    /// replaced the last shared link. A durable `UNLOCK_PENDING` intent must
+    /// already exist so a crash during this multi-step restore can be retried.
+    pub fn restore_after_detach(
+        &self,
+        source: &File,
+        anchor: &File,
+        copy: &IndependentSparseCopy,
+    ) -> Result<(), AnchorError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if self.format_version != 1
+            || self.mode & !0o7777 != 0
+            || matches!(&self.access_acl, AccessAclSnapshot::Present(value) if value.is_empty() || value.len() > MAX_ACCESS_ACL_BYTES)
+        {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid access snapshot").into(),
+            );
+        }
+        let source_metadata = source.metadata()?;
+        let anchor_metadata = anchor.metadata()?;
+        if !source_metadata.is_file()
+            || !anchor_metadata.is_file()
+            || source_metadata.dev() != anchor_metadata.dev()
+            || source_metadata.ino() == anchor_metadata.ino()
+            || source_metadata.nlink() != 1
+            || anchor_metadata.nlink() != 1
+            || source_metadata.len() != copy.logical_len
+            || anchor_metadata.len() != copy.logical_len
+            || hash_exact(source, copy.logical_len)? != copy.content_hash
+            || hash_exact(anchor, copy.logical_len)? != copy.content_hash
+            || file_data_extents(anchor, copy.logical_len)? != copy.data_extents
+        {
+            return Err(io::Error::other("private anchor is not independent and verified").into());
+        }
+        anchor.sync_all()?;
+        // The lease must already be gone. Add owner write temporarily so the
+        // pinned inode can be reopened for fsetxattr; fsetxattr on O_RDONLY
+        // descriptors fails even for the file owner. The anchor is separate.
+        source.set_permissions(std::fs::Permissions::from_mode(self.mode | 0o200))?;
+        let pinned_path = format!("/proc/self/fd/{}", source.as_raw_fd());
+        let writable = OpenOptions::new().write(true).open(pinned_path)?;
+        let reopened = writable.metadata()?;
+        if reopened.dev() != source_metadata.dev() || reopened.ino() != source_metadata.ino() {
+            return Err(io::Error::other("source inode changed during access restore").into());
+        }
+        match &self.access_acl {
+            AccessAclSnapshot::Unsupported => {}
+            AccessAclSnapshot::Absent => {
+                // SAFETY: the pinned writable descriptor and constant xattr
+                // name are valid; ENODATA means the desired state is present.
+                if unsafe { libc::fremovexattr(writable.as_raw_fd(), ACCESS_ACL_NAME.as_ptr()) } < 0
+                {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ENODATA) {
+                        return Err(error.into());
+                    }
+                }
+            }
+            AccessAclSnapshot::Present(value) => {
+                // SAFETY: value remains allocated for the call and the kernel
+                // validates the POSIX ACL encoding before installing it.
+                if unsafe {
+                    libc::fsetxattr(
+                        writable.as_raw_fd(),
+                        ACCESS_ACL_NAME.as_ptr(),
+                        value.as_ptr().cast(),
+                        value.len(),
+                        0,
+                    )
+                } < 0
+                {
+                    return Err(io::Error::last_os_error().into());
+                }
+            }
+        }
+        source.set_permissions(std::fs::Permissions::from_mode(self.mode))?;
+        source.sync_all()?;
+        if !self.matches(source)? {
+            return Err(io::Error::other("original mode or ACL was not restored exactly").into());
+        }
+        Ok(())
+    }
 }
 
 fn read_access_acl(file: &File) -> io::Result<AccessAclSnapshot> {
@@ -164,6 +248,50 @@ fn read_access_acl(file: &File) -> io::Result<AccessAclSnapshot> {
         ));
     }
     Ok(AccessAclSnapshot::Present(value))
+}
+
+/// Install a named-user ACL on a disposable probe file when supported, so the
+/// freeze/restore lifecycle exercises the ACL mask rather than mode bits only.
+pub(crate) fn install_probe_acl(file: &File) -> io::Result<bool> {
+    // Linux POSIX ACL xattr: version 2 and owner, named user, group, mask,
+    // other entries. The named user grants write only through the mask.
+    let mut acl = 2_u32.to_le_bytes().to_vec();
+    // SAFETY: geteuid has no pointers and returns this process's effective UID.
+    let named_user = if unsafe { libc::geteuid() } == 2000 {
+        2001
+    } else {
+        2000
+    };
+    for (tag, permission, id) in [
+        (1_u16, 6_u16, u32::MAX),
+        (2, 6, named_user),
+        (4, 6, u32::MAX),
+        (16, 6, u32::MAX),
+        (32, 0, u32::MAX),
+    ] {
+        acl.extend_from_slice(&tag.to_le_bytes());
+        acl.extend_from_slice(&permission.to_le_bytes());
+        acl.extend_from_slice(&id.to_le_bytes());
+    }
+    // SAFETY: the descriptor, constant name, and allocated ACL buffer remain
+    // valid through the call; the kernel validates the encoding.
+    if unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            ACCESS_ACL_NAME.as_ptr(),
+            acl.as_ptr().cast(),
+            acl.len(),
+            0,
+        )
+    } < 0
+    {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    Ok(true)
 }
 
 #[repr(C)]
@@ -547,9 +675,11 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 
+    use crate::anchor::probe_guarded_link_freeze;
+
     use super::{
-        ACCESS_ACL_NAME, AFTER_SPARSE_COPY_START, AccessAclSnapshot, FileAccessSnapshot,
-        FileWriteExclusion, file_data_extents,
+        AFTER_SPARSE_COPY_START, AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion,
+        copy_sparse_independent, file_data_extents, install_probe_acl,
     };
 
     #[test]
@@ -562,37 +692,12 @@ mod tests {
             .create_new(true)
             .open(&path)
             .unwrap();
+        file.write_at(b"acl-content", 0).unwrap();
         file.set_permissions(fs::Permissions::from_mode(0o660))
             .unwrap();
-        // Linux POSIX ACL xattr: version 2 and owner, named user, group,
-        // mask, and other entries. The named user grants write through mask.
-        let mut acl = 2_u32.to_le_bytes().to_vec();
-        for (tag, permission, id) in [
-            (1_u16, 6_u16, u32::MAX),
-            (2, 6, 2000),
-            (4, 6, u32::MAX),
-            (16, 6, u32::MAX),
-            (32, 0, u32::MAX),
-        ] {
-            acl.extend_from_slice(&tag.to_le_bytes());
-            acl.extend_from_slice(&permission.to_le_bytes());
-            acl.extend_from_slice(&id.to_le_bytes());
-        }
-        // SAFETY: the descriptor and xattr name are valid and acl owns its
-        // full buffer for the duration of this call.
-        let set = unsafe {
-            libc::fsetxattr(
-                file.as_raw_fd(),
-                ACCESS_ACL_NAME.as_ptr(),
-                acl.as_ptr().cast(),
-                acl.len(),
-                0,
-            )
-        };
-        if set < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EOPNOTSUPP) {
+        if !install_probe_acl(&file).unwrap() {
             return;
         }
-        assert_eq!(set, 0);
         let snapshot = FileAccessSnapshot::capture(&File::open(&path).unwrap()).unwrap();
         assert_eq!(snapshot.mode, 0o660);
         assert!(matches!(
@@ -603,24 +708,19 @@ mod tests {
         let decoded: FileAccessSnapshot = mb_core::decode_canonical(&encoded).unwrap();
         assert_eq!(decoded, snapshot);
 
+        let anchor = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(root.path().join("private-anchor"))
+            .unwrap();
+        let copy = copy_sparse_independent(&file, &anchor).unwrap();
+
         file.set_permissions(fs::Permissions::from_mode(0o440))
             .unwrap();
         assert!(!snapshot.matches(&file).unwrap());
-        // SAFETY: the same valid descriptor, name, and original ACL buffer
-        // are used to model exact restoration after an anchor is detached.
-        assert_eq!(
-            unsafe {
-                libc::fsetxattr(
-                    file.as_raw_fd(),
-                    ACCESS_ACL_NAME.as_ptr(),
-                    acl.as_ptr().cast(),
-                    acl.len(),
-                    0,
-                )
-            },
-            0
-        );
-        file.set_permissions(fs::Permissions::from_mode(snapshot.mode))
+        snapshot
+            .restore_after_detach(&file, &anchor, &copy)
             .unwrap();
         assert!(snapshot.matches(&file).unwrap());
     }
@@ -779,6 +879,11 @@ mod tests {
         assert_eq!(copied.logical_len, logical_len);
         assert_eq!(copied.data_extents, original_extents);
         assert!(guard.is_held().unwrap());
+        assert!(
+            access
+                .restore_after_detach(&guard.file, &shared, &copied)
+                .is_err()
+        );
         guard.release().unwrap();
 
         fs::rename(&staging_path, &anchor_path).unwrap();
@@ -786,7 +891,11 @@ mod tests {
             fs::metadata(&source_path).unwrap().ino(),
             fs::metadata(&anchor_path).unwrap().ino()
         );
-        fs::set_permissions(&source_path, fs::Permissions::from_mode(access.mode)).unwrap();
+        let source_read = File::open(&source_path).unwrap();
+        let anchor_read = File::open(&anchor_path).unwrap();
+        access
+            .restore_after_detach(&source_read, &anchor_read, &copied)
+            .unwrap();
         fs::write(&source_path, b"edited").unwrap();
         assert_eq!(fs::metadata(&anchor_path).unwrap().len(), logical_len);
         assert_eq!(fs::read(&anchor_path).unwrap()[..4], *b"head");
@@ -797,6 +906,20 @@ mod tests {
         assert_eq!(
             file_data_extents(&File::open(&anchor_path).unwrap(), logical_len).unwrap(),
             original_extents
+        );
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN for fanotify permission events"]
+    fn guarded_root_probe_cleans_up_after_complete_sparse_acl_lifecycle() {
+        let parent = test_directory();
+        let root = parent.path().join("work");
+        fs::create_dir(&root).unwrap();
+        probe_guarded_link_freeze(&root).unwrap();
+        let children = fs::read_dir(parent.path()).unwrap().count();
+        assert_eq!(
+            children, 1,
+            "the disposable probe directory must be removed"
         );
     }
 
