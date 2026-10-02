@@ -21,6 +21,7 @@ const INTENT_PREFIX: &str = "git-merge-blob-intent-v1/";
 const SESSION_PREFIX: &str = "git-merge-session-v1/";
 const LINKED_SESSION_PREFIX: &str = "git-worktree-merge-session-v1/";
 const ACTIVE: &[u8] = b"active";
+pub(crate) type SessionRecord = (String, Vec<u8>, Vec<u8>);
 pub(crate) const MAX_AUTOMERGE_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -202,7 +203,10 @@ mod scoped_session_tests {
                 .unresolved_paths,
             vec![b"tracked".to_vec()]
         );
-        unmark_merge_resolved_for_scope(&control, linked, b"tracked").unwrap();
+        let (kind, key, bytes) = resolution_record_for_scope(&control, linked, b"tracked", false)
+            .unwrap()
+            .unwrap();
+        control.put_record(&kind, &key, &bytes).unwrap();
         assert_eq!(
             merge_state_for_scope(&control, linked)
                 .unwrap()
@@ -313,6 +317,44 @@ pub(crate) fn store_merge_session_for_scope(
     Ok(())
 }
 
+/// Return the merge-session write to publish in the same catalog transaction
+/// as an index change. A staged conflict must never outlive an unresolved
+/// session flag (or leave a resolved flag after `rm --cached`).
+pub(crate) fn resolution_record_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    path: &[u8],
+    resolved: bool,
+) -> Result<Option<SessionRecord>, MergeBlobError> {
+    let Some((mut session, _)) = load_merge_session_for_scope(control, scope)? else {
+        return Ok(None);
+    };
+    if session
+        .conflicts
+        .binary_search_by(|candidate| candidate.as_slice().cmp(path))
+        .is_err()
+    {
+        return Ok(None);
+    }
+    match (
+        resolved,
+        session
+            .resolved
+            .binary_search_by(|candidate| candidate.as_slice().cmp(path)),
+    ) {
+        (true, Err(position)) => session.resolved.insert(position, path.to_vec()),
+        (false, Ok(position)) => {
+            session.resolved.remove(position);
+        }
+        _ => return Ok(None),
+    }
+    Ok(Some((
+        session_kind_for_scope(scope),
+        ACTIVE.to_vec(),
+        encode_session_for_scope(scope, &session)?,
+    )))
+}
+
 pub(crate) fn mark_merge_resolved(
     control: &ControlStore,
     repository_id: Uuid,
@@ -341,37 +383,6 @@ pub(crate) fn mark_merge_resolved_for_scope(
         .binary_search_by(|candidate| candidate.as_slice().cmp(path))
     {
         session.resolved.insert(position, path.to_vec());
-        control.replace_record_if_value(
-            &session_kind_for_scope(scope),
-            ACTIVE,
-            &before,
-            &encode_session_for_scope(scope, &session)?,
-        )?;
-    }
-    Ok(())
-}
-
-pub(crate) fn unmark_merge_resolved(
-    control: &ControlStore,
-    repository_id: Uuid,
-    path: &[u8],
-) -> Result<(), MergeBlobError> {
-    unmark_merge_resolved_for_scope(control, GitWorktreeScope::primary(repository_id), path)
-}
-
-pub(crate) fn unmark_merge_resolved_for_scope(
-    control: &ControlStore,
-    scope: GitWorktreeScope,
-    path: &[u8],
-) -> Result<(), MergeBlobError> {
-    let Some((mut session, before)) = load_merge_session_for_scope(control, scope)? else {
-        return Ok(());
-    };
-    if let Ok(position) = session
-        .resolved
-        .binary_search_by(|candidate| candidate.as_slice().cmp(path))
-    {
-        session.resolved.remove(position);
         control.replace_record_if_value(
             &session_kind_for_scope(scope),
             ACTIVE,

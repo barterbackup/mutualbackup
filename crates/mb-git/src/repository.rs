@@ -42,7 +42,7 @@ use crate::merge::{
     MergeBlobError, has_merge_session, has_merge_session_for_scope,
     has_merge_session_outside_scope, load_merge_session, load_merge_session_for_scope,
     mark_merge_resolved, mark_merge_resolved_for_scope, resume_pending_merge_blob, session_key,
-    session_kind, session_kind_for_scope, unmark_merge_resolved, unmark_merge_resolved_for_scope,
+    session_kind, session_kind_for_scope,
 };
 use crate::prune::{
     GitPruneError, GitPruneReport, GitPruneRoots, prune_unreachable, resume_pending_prune,
@@ -50,8 +50,8 @@ use crate::prune::{
 use crate::rm::{GitRmError, remove_tracked_for_scope, resume_pending_rm_for_scope};
 use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, abandon_pending_stage_for_scope,
-    anchors_for_oid, pending_stage_paths, pending_stage_paths_for_scope, remove_cached,
-    remove_cached_for_scope, resume_pending_stages_for_scope_with_backend,
+    anchors_for_oid, remove_cached, remove_cached_for_scope,
+    remove_cached_for_scope_with_resolution, resume_pending_stages_for_scope_with_backend,
     stage_file_for_scope_with_backend, stage_path_key, stage_symlink_for_scope_with_backend,
     staged_entry,
 };
@@ -380,11 +380,7 @@ impl GitRepository {
     ) -> Result<Option<GitIndexEntry>, RepositoryError> {
         let info = self.resume_linked_worktree(worktree_id)?;
         let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
-        let pending_paths = pending_stage_paths_for_scope(&self.catalog, scope)?;
         resume_pending_stages_for_scope_with_backend(&self.catalog, scope, self.source_backend)?;
-        for path in pending_paths {
-            mark_merge_resolved_for_scope(&self.catalog, scope, &path)?;
-        }
         let relative = relative_path.as_ref();
         stage_path_key(relative)?;
         let mut parent = PinnedDirectory::open(&info.path)?;
@@ -417,7 +413,6 @@ impl GitRepository {
                 relative,
                 self.source_backend,
             )?;
-            mark_merge_resolved_for_scope(&self.catalog, scope, &stage_path_key(relative)?)?;
             return Ok(Some(entry));
         }
         if parent.open_child_file(name)?.is_some() {
@@ -428,7 +423,6 @@ impl GitRepository {
                 relative,
                 self.source_backend,
             )?;
-            mark_merge_resolved_for_scope(&self.catalog, scope, &stage_path_key(relative)?)?;
             Ok(Some(entry))
         } else {
             self.linked_missing_path(scope, relative)
@@ -441,13 +435,14 @@ impl GitRepository {
         relative: &Path,
     ) -> Result<Option<GitIndexEntry>, RepositoryError> {
         let path = stage_path_key(relative)?;
-        let removed = remove_cached_for_scope(&self.catalog, scope, relative)?;
+        let removed =
+            remove_cached_for_scope_with_resolution(&self.catalog, scope, relative, true)?;
         let conflict = load_merge_session_for_scope(&self.catalog, scope)?
             .is_some_and(|(session, _)| session.conflicts.binary_search(&path).is_ok());
         if !removed && !conflict {
             return Err(StageError::MissingUntrackedPath.into());
         }
-        if conflict {
+        if conflict && !removed {
             mark_merge_resolved_for_scope(&self.catalog, scope, &path)?;
         }
         Ok(None)
@@ -460,12 +455,11 @@ impl GitRepository {
     ) -> Result<bool, RepositoryError> {
         let info = self.resume_linked_worktree(worktree_id)?;
         let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
-        let relative = relative_path.as_ref();
-        let removed = remove_cached_for_scope(&self.catalog, scope, relative)?;
-        if removed {
-            unmark_merge_resolved_for_scope(&self.catalog, scope, &stage_path_key(relative)?)?;
-        }
-        Ok(removed)
+        Ok(remove_cached_for_scope(
+            &self.catalog,
+            scope,
+            relative_path.as_ref(),
+        )?)
     }
 
     pub fn linked_remove_tracked(
@@ -724,19 +718,13 @@ impl GitRepository {
     ) -> Result<GitIndexEntry, RepositoryError> {
         self.resume_checkout()?;
         let relative = relative_path.as_ref();
-        let entry = stage_file_for_scope_with_backend(
+        Ok(stage_file_for_scope_with_backend(
             &self.catalog,
             crate::GitWorktreeScope::primary(self.repository_id),
             &self.root,
             relative,
             self.source_backend,
-        )?;
-        mark_merge_resolved(
-            &self.catalog,
-            self.repository_id,
-            &stage_path_key(relative)?,
-        )?;
-        Ok(entry)
+        )?)
     }
 
     /// Like `git add <path>`, capture a present file or symlink, or stage the
@@ -778,11 +766,6 @@ impl GitRepository {
                 relative,
                 self.source_backend,
             )?;
-            mark_merge_resolved(
-                &self.catalog,
-                self.repository_id,
-                &stage_path_key(relative)?,
-            )?;
             return Ok(Some(entry));
         }
         if parent.open_child_file(name)?.is_some() {
@@ -797,13 +780,18 @@ impl GitRepository {
         relative: &Path,
     ) -> Result<Option<GitIndexEntry>, RepositoryError> {
         let path = stage_path_key(relative)?;
-        let removed = self.remove_cached(relative)?;
+        let removed = remove_cached_for_scope_with_resolution(
+            &self.catalog,
+            crate::GitWorktreeScope::primary(self.repository_id),
+            relative,
+            true,
+        )?;
         let conflict = load_merge_session(&self.catalog, self.repository_id)?
             .is_some_and(|(session, _)| session.conflicts.binary_search(&path).is_ok());
         if !removed && !conflict {
             return Err(StageError::MissingUntrackedPath.into());
         }
-        if conflict {
+        if conflict && !removed {
             mark_merge_resolved(&self.catalog, self.repository_id, &path)?;
         }
         Ok(None)
@@ -811,16 +799,11 @@ impl GitRepository {
 
     pub fn remove_cached(&self, relative_path: impl AsRef<Path>) -> Result<bool, RepositoryError> {
         self.resume_checkout()?;
-        let relative = relative_path.as_ref();
-        let removed = remove_cached(&self.catalog, self.repository_id, relative)?;
-        if removed {
-            unmark_merge_resolved(
-                &self.catalog,
-                self.repository_id,
-                &stage_path_key(relative)?,
-            )?;
-        }
-        Ok(removed)
+        Ok(remove_cached(
+            &self.catalog,
+            self.repository_id,
+            relative_path.as_ref(),
+        )?)
     }
 
     pub fn remove_tracked(&self, relative_path: impl AsRef<Path>) -> Result<bool, RepositoryError> {
@@ -836,16 +819,11 @@ impl GitRepository {
 
     pub fn resume_pending_stages(&self) -> Result<Vec<GitIndexEntry>, RepositoryError> {
         self.resume_checkout()?;
-        let paths = pending_stage_paths(&self.catalog, self.repository_id)?;
-        let entries = resume_pending_stages_for_scope_with_backend(
+        Ok(resume_pending_stages_for_scope_with_backend(
             &self.catalog,
             crate::GitWorktreeScope::primary(self.repository_id),
             self.source_backend,
-        )?;
-        for path in paths {
-            mark_merge_resolved(&self.catalog, self.repository_id, &path)?;
-        }
-        Ok(entries)
+        )?)
     }
 
     pub fn abandon_pending_stage(
@@ -5854,9 +5832,15 @@ mod tests {
             ))
         ));
         fs::write(linked_root.join("tracked"), b"resolved\r\n\0").unwrap();
-        local
-            .linked_add_path(linked.worktree_id, "tracked")
-            .unwrap();
+        crate::stage::set_after_stage_publication_hook(Box::new(|| panic!("linked stage crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local
+                .linked_add_path(linked.worktree_id, "tracked")
+                .unwrap();
+        }));
+        assert!(interrupted.is_err());
+        drop(local);
+        let local = GitRepository::open(&primary_root, repository_id, &key).unwrap();
         assert!(
             local
                 .linked_status(linked.worktree_id)

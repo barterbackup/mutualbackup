@@ -23,7 +23,21 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::merge::{MergeBlobError, SessionRecord, resolution_record_for_scope};
 use crate::{GitAnchorError, GitWorktreeScope, blob_oid_from_anchor};
+
+fn resolution_record_for_stage(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    path: &[u8],
+    resolved: bool,
+) -> Result<Option<SessionRecord>, StageError> {
+    resolution_record_for_scope(control, scope, path, resolved).map_err(|error| match error {
+        MergeBlobError::Database(error) => StageError::Database(error),
+        MergeBlobError::Model(error) => StageError::Model(error),
+        _ => StageError::IncompatibleRecord,
+    })
+}
 
 const MAX_STAGE_PATH_BYTES: usize = 4096;
 const INTENT_PREFIX: &str = "git-stage-intent-v1/";
@@ -38,11 +52,27 @@ const OBJECT_PREFIX: &str = "git-object-anchor-v1/";
 thread_local! {
     static AFTER_MISSING_STAGE_DISCARD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static AFTER_STAGE_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
 pub(crate) fn set_after_missing_stage_discard_hook(hook: Box<dyn FnOnce()>) {
     AFTER_MISSING_STAGE_DISCARD.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_stage_publication_hook(hook: Box<dyn FnOnce()>) {
+    AFTER_STAGE_PUBLICATION.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+fn run_after_stage_publication_hook() {
+    #[cfg(test)]
+    AFTER_STAGE_PUBLICATION.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
 }
 
 fn run_after_missing_stage_discard_hook() {
@@ -549,23 +579,23 @@ fn finish_symlink_stage(
         mode: 0o120000,
         anchor_id: manifest.anchor_id,
     };
-    control.put_records_and_retire_if_value(
-        &[
-            (
-                object_kind(scope.repository_id(), oid),
-                manifest.anchor_id.as_bytes().to_vec(),
-                canonical_bytes(&manifest)?,
-            ),
-            (
-                index_kind_for_scope(scope),
-                key.to_vec(),
-                canonical_bytes(&entry)?,
-            ),
-        ],
-        &kind,
-        key,
-        &canonical_bytes(&intent)?,
-    )?;
+    let mut records = vec![
+        (
+            object_kind(scope.repository_id(), oid),
+            manifest.anchor_id.as_bytes().to_vec(),
+            canonical_bytes(&manifest)?,
+        ),
+        (
+            index_kind_for_scope(scope),
+            key.to_vec(),
+            canonical_bytes(&entry)?,
+        ),
+    ];
+    if let Some(resolution) = resolution_record_for_stage(control, scope, key, true)? {
+        records.push(resolution);
+    }
+    control.put_records_and_retire_if_value(&records, &kind, key, &canonical_bytes(&intent)?)?;
+    run_after_stage_publication_hook();
     Ok(entry)
 }
 
@@ -623,23 +653,23 @@ fn finish_stage_for_scope(
         mode: intent.git_mode,
         anchor_id: manifest.anchor_id,
     };
-    control.put_records_and_retire_if_value(
-        &[
-            (
-                object_kind(scope.repository_id(), oid),
-                manifest.anchor_id.as_bytes().to_vec(),
-                canonical_bytes(&manifest)?,
-            ),
-            (
-                index_kind_for_scope(scope),
-                path_key.to_vec(),
-                canonical_bytes(&entry)?,
-            ),
-        ],
-        &kind,
-        path_key,
-        &expected,
-    )?;
+    let mut records = vec![
+        (
+            object_kind(scope.repository_id(), oid),
+            manifest.anchor_id.as_bytes().to_vec(),
+            canonical_bytes(&manifest)?,
+        ),
+        (
+            index_kind_for_scope(scope),
+            path_key.to_vec(),
+            canonical_bytes(&entry)?,
+        ),
+    ];
+    if let Some(resolution) = resolution_record_for_stage(control, scope, path_key, true)? {
+        records.push(resolution);
+    }
+    control.put_records_and_retire_if_value(&records, &kind, path_key, &expected)?;
+    run_after_stage_publication_hook();
     Ok(entry)
 }
 
@@ -713,6 +743,15 @@ pub(crate) fn remove_cached_for_scope(
     scope: GitWorktreeScope,
     relative_path: impl AsRef<Path>,
 ) -> Result<bool, StageError> {
+    remove_cached_for_scope_with_resolution(control, scope, relative_path, false)
+}
+
+pub(crate) fn remove_cached_for_scope_with_resolution(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    relative_path: impl AsRef<Path>,
+    resolved: bool,
+) -> Result<bool, StageError> {
     let key = stage_path_key(relative_path.as_ref())?;
     if control
         .get_record(&intent_kind_for_scope(scope), &key)?
@@ -731,7 +770,10 @@ pub(crate) fn remove_cached_for_scope(
     if entry.format_version != 1 || !matches!(entry.mode, 0o100644 | 0o100755 | 0o120000) {
         return Err(StageError::IncompatibleRecord);
     }
-    control.delete_record_if_value(&kind, &key, &encoded)?;
+    let records = resolution_record_for_stage(control, scope, &key, resolved)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    control.put_records_and_retire_if_value(&records, &kind, &key, &encoded)?;
     Ok(true)
 }
 
@@ -1106,6 +1148,7 @@ mod tests {
     };
 
     use git2::Oid;
+    use mb_core::canonical_bytes;
     use mb_store::{
         AnchorError, ControlStore, GIT_CATALOG_DIRECTORY, PinnedDirectory, SourceBackendKind,
         SourceFileCapturePlan, StableAnchorAreaLocator,
@@ -1121,6 +1164,76 @@ mod tests {
         staged_entry, staged_entry_for_scope,
     };
     use crate::GitWorktreeScope;
+    use crate::merge::{MergeSession, merge_state_for_scope, store_merge_session_for_scope};
+
+    #[test]
+    fn index_removal_and_conflict_resolution_share_one_catalog_transition() {
+        let database = tempfile::tempdir().unwrap();
+        let control =
+            ControlStore::open_with_key(database.path().join("catalog.db"), &[73; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        for scope in [
+            GitWorktreeScope::primary(repository_id),
+            GitWorktreeScope::linked(repository_id, Uuid::new_v4()).unwrap(),
+        ] {
+            store_merge_session_for_scope(
+                &control,
+                scope,
+                &MergeSession {
+                    format_version: 1,
+                    repository_id,
+                    branch: "topic".to_owned(),
+                    ours: [1; 20],
+                    theirs: [2; 20],
+                    source_ref: b"refs/heads/source".to_vec(),
+                    author_name: "Author".to_owned(),
+                    author_email: "a@example.test".to_owned(),
+                    message: "merge".to_owned(),
+                    conflicts: vec![b"tracked".to_vec()],
+                    resolved: Vec::new(),
+                },
+            )
+            .unwrap();
+            let index_kind = super::index_kind_for_scope(scope);
+            let entry = super::GitIndexEntry {
+                format_version: 1,
+                oid: [3; 20],
+                mode: 0o100644,
+                anchor_id: Uuid::new_v4(),
+            };
+            control
+                .put_record(&index_kind, b"tracked", &canonical_bytes(&entry).unwrap())
+                .unwrap();
+            assert!(
+                super::remove_cached_for_scope_with_resolution(&control, scope, "tracked", true)
+                    .unwrap()
+            );
+            assert!(
+                control
+                    .get_record(&index_kind, b"tracked")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                merge_state_for_scope(&control, scope)
+                    .unwrap()
+                    .unwrap()
+                    .unresolved_paths
+                    .is_empty()
+            );
+            control
+                .put_record(&index_kind, b"tracked", &canonical_bytes(&entry).unwrap())
+                .unwrap();
+            assert!(super::remove_cached_for_scope(&control, scope, "tracked").unwrap());
+            assert_eq!(
+                merge_state_for_scope(&control, scope)
+                    .unwrap()
+                    .unwrap()
+                    .unresolved_paths,
+                vec![b"tracked".to_vec()]
+            );
+        }
+    }
 
     #[derive(Serialize)]
     struct TestCaptureVersion {
