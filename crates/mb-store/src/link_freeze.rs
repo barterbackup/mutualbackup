@@ -11,14 +11,17 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileExt, MetadataExt};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-use crate::anchor::{AnchorError, FileExtent, file_data_extents};
+use crate::anchor::{AnchorError, FileExtent, NativeFileId, PinnedDirectory, file_data_extents};
+use crate::database::ControlStore;
 
 // Linux UAPI asm-generic/fcntl.h. The libc crate does not expose F_SETSIG.
 const F_SETSIG_LINUX: libc::c_int = 10;
@@ -34,6 +37,7 @@ const FAN_DENY: u32 = 0x0000_0002;
 const FANOTIFY_METADATA_VERSION: u8 = 3;
 const MAX_ACCESS_ACL_BYTES: usize = 64 * 1024;
 const ACCESS_ACL_NAME: &std::ffi::CStr = c"system.posix_acl_access";
+const EDIT_INTENT_KIND: &str = "link-freeze-edit-v1";
 
 #[cfg(test)]
 thread_local! {
@@ -69,7 +73,7 @@ pub enum AccessAclSnapshot {
 
 /// Verified private inode produced from a frozen hard-link source. Publication
 /// and recovery of the copy remain the owning backend's responsibility.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IndependentSparseCopy {
     pub logical_len: u64,
     pub content_hash: [u8; 32],
@@ -123,6 +127,22 @@ impl FileAccessSnapshot {
         Ok(*self == Self::capture(file)?)
     }
 
+    /// Recovery can retire an `UNLOCK_PENDING` intent if the detached anchor
+    /// still matches its durable copy proof and the working inode already has
+    /// its original access metadata. The caller must separately match both
+    /// inodes to the identities stored in that intent. The source may already
+    /// have been edited, so its current bytes must not be compared to the
+    /// immutable anchor here.
+    pub fn is_restored_after_detach(
+        &self,
+        source: &File,
+        anchor: &File,
+        copy: &IndependentSparseCopy,
+    ) -> Result<bool, AnchorError> {
+        verify_independent_anchor(source, anchor, copy)?;
+        Ok(self.matches(source)?)
+    }
+
     /// Restore exact access metadata only after a verified private anchor has
     /// replaced the last shared link. A durable `UNLOCK_PENDING` intent must
     /// already exist so a crash during this multi-step restore can be retried.
@@ -142,19 +162,10 @@ impl FileAccessSnapshot {
                 io::Error::new(io::ErrorKind::InvalidInput, "invalid access snapshot").into(),
             );
         }
+        verify_independent_anchor(source, anchor, copy)?;
         let source_metadata = source.metadata()?;
-        let anchor_metadata = anchor.metadata()?;
-        if !source_metadata.is_file()
-            || !anchor_metadata.is_file()
-            || source_metadata.dev() != anchor_metadata.dev()
-            || source_metadata.ino() == anchor_metadata.ino()
-            || source_metadata.nlink() != 1
-            || anchor_metadata.nlink() != 1
-            || source_metadata.len() != copy.logical_len
-            || anchor_metadata.len() != copy.logical_len
+        if source_metadata.len() != copy.logical_len
             || hash_exact(source, copy.logical_len)? != copy.content_hash
-            || hash_exact(anchor, copy.logical_len)? != copy.content_hash
-            || file_data_extents(anchor, copy.logical_len)? != copy.data_extents
         {
             return Err(io::Error::other("private anchor is not independent and verified").into());
         }
@@ -205,6 +216,319 @@ impl FileAccessSnapshot {
             return Err(io::Error::other("original mode or ACL was not restored exactly").into());
         }
         Ok(())
+    }
+}
+
+fn verify_independent_anchor(
+    source: &File,
+    anchor: &File,
+    copy: &IndependentSparseCopy,
+) -> Result<(), AnchorError> {
+    let source_metadata = source.metadata()?;
+    let anchor_metadata = anchor.metadata()?;
+    if !source_metadata.is_file()
+        || !anchor_metadata.is_file()
+        || source_metadata.dev() != anchor_metadata.dev()
+        || source_metadata.ino() == anchor_metadata.ino()
+        || source_metadata.nlink() != 1
+        || anchor_metadata.nlink() != 1
+        || anchor_metadata.len() != copy.logical_len
+        || hash_exact(anchor, copy.logical_len)? != copy.content_hash
+        || file_data_extents(anchor, copy.logical_len)? != copy.data_extents
+    {
+        return Err(io::Error::other("private anchor is not independent and verified").into());
+    }
+    Ok(())
+}
+
+/// The durable ordering for detaching a frozen shared anchor before an edit.
+/// A capture journal must already own the `SharedFrozen` state; this edit
+/// journal never makes an unrecorded writable inode immutable by itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum LinkFreezeEditPhase {
+    SharedFrozen,
+    CopyStaging,
+    PrivateCopyReady,
+    UnlockPending,
+    Editable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LinkFreezeEditIntent {
+    format_version: u16,
+    anchor_id: Uuid,
+    source_id: NativeFileId,
+    staging_name: String,
+    original_access: FileAccessSnapshot,
+    phase: LinkFreezeEditPhase,
+    copy: Option<IndependentSparseCopy>,
+    private_inode: Option<u64>,
+}
+
+impl LinkFreezeEditIntent {
+    /// Persist the intent before creating a private staging copy. The caller
+    /// must have a separately durable capture record for this frozen anchor,
+    /// and must identify both paths by pinned directories on recovery.
+    pub fn begin(
+        control: &ControlStore,
+        anchor_id: Uuid,
+        source_parent: &PinnedDirectory,
+        source_name: impl AsRef<Path>,
+        anchor_parent: &PinnedDirectory,
+        anchor_name: impl AsRef<Path>,
+        original_access: FileAccessSnapshot,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(!anchor_id.is_nil(), "nil frozen anchor ID");
+        anyhow::ensure!(
+            original_access.format_version == 1,
+            "unknown access snapshot"
+        );
+        let source_name = source_name.as_ref();
+        let anchor_name = anchor_name.as_ref();
+        let source = source_parent
+            .open_child_file(source_name)?
+            .ok_or_else(|| anyhow::anyhow!("frozen source name disappeared"))?;
+        let shared_anchor = anchor_parent
+            .open_child_file(anchor_name)?
+            .ok_or_else(|| anyhow::anyhow!("shared anchor name disappeared"))?;
+        let source_id = source_parent
+            .entry_identity(source_name, false)?
+            .ok_or_else(|| anyhow::anyhow!("frozen source name disappeared"))?;
+        let anchor_entry = anchor_parent
+            .entry_identity(anchor_name, false)?
+            .ok_or_else(|| anyhow::anyhow!("shared anchor name disappeared"))?;
+        let staging_name = format!(".link-edit-{anchor_id}");
+        anyhow::ensure!(
+            anchor_parent
+                .entry_identity(&staging_name, false)?
+                .is_none(),
+            "an old private staging name already exists"
+        );
+        let source_meta = source.metadata()?;
+        let anchor_meta = shared_anchor.metadata()?;
+        anyhow::ensure!(
+            source_meta.is_file()
+                && anchor_meta.is_file()
+                && source_id == anchor_entry
+                && source_id.inode == source_meta.ino()
+                && source_meta.dev() == anchor_meta.dev()
+                && source_meta.ino() == anchor_meta.ino()
+                && source_meta.nlink() == 2
+                && FileAccessSnapshot::capture(&source)?.mode & 0o222 == 0,
+            "edit intent needs one exactly shared frozen source and anchor"
+        );
+        let intent = Self {
+            format_version: 1,
+            anchor_id,
+            source_id,
+            staging_name,
+            original_access,
+            phase: LinkFreezeEditPhase::SharedFrozen,
+            copy: None,
+            private_inode: None,
+        };
+        anyhow::ensure!(
+            control.put_record_if_absent(
+                EDIT_INTENT_KIND,
+                anchor_id.as_bytes(),
+                &mb_core::canonical_bytes(&intent)?,
+            )?,
+            "a different edit intent already owns this anchor"
+        );
+        Ok(intent)
+    }
+
+    pub fn load(control: &ControlStore, anchor_id: Uuid) -> anyhow::Result<Option<Self>> {
+        let Some(bytes) = control.get_record(EDIT_INTENT_KIND, anchor_id.as_bytes())? else {
+            return Ok(None);
+        };
+        let intent: Self = mb_core::decode_canonical(&bytes)?;
+        anyhow::ensure!(intent.format_version == 1 && intent.anchor_id == anchor_id);
+        anyhow::ensure!(intent.staging_name == format!(".link-edit-{anchor_id}"));
+        anyhow::ensure!(matches!(
+            (
+                intent.phase,
+                intent.copy.is_some(),
+                intent.private_inode.is_some()
+            ),
+            (
+                LinkFreezeEditPhase::SharedFrozen | LinkFreezeEditPhase::CopyStaging,
+                false,
+                false
+            ) | (
+                LinkFreezeEditPhase::PrivateCopyReady
+                    | LinkFreezeEditPhase::UnlockPending
+                    | LinkFreezeEditPhase::Editable,
+                true,
+                true
+            )
+        ));
+        Ok(Some(intent))
+    }
+
+    pub fn phase(&self) -> LinkFreezeEditPhase {
+        self.phase
+    }
+
+    pub fn copy(&self) -> Option<&IndependentSparseCopy> {
+        self.copy.as_ref()
+    }
+
+    pub fn private_inode(&self) -> Option<u64> {
+        self.private_inode
+    }
+
+    pub fn staging_name(&self) -> &str {
+        &self.staging_name
+    }
+
+    pub fn mark_copy_staging(mut self, control: &ControlStore) -> anyhow::Result<Self> {
+        anyhow::ensure!(self.phase == LinkFreezeEditPhase::SharedFrozen);
+        self.replace_phase(control, LinkFreezeEditPhase::CopyStaging, None, None)
+    }
+
+    /// The copy must have been created through this held guard and synced by
+    /// `copy_sparse_independent`. Persist its proof and inode before changing
+    /// either anchor name. A failed CAS leaves the source frozen.
+    pub fn mark_private_copy_ready(
+        mut self,
+        control: &ControlStore,
+        guard: &FileWriteExclusion,
+        staging_parent: &PinnedDirectory,
+        private: &File,
+        copy: IndependentSparseCopy,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(self.phase == LinkFreezeEditPhase::CopyStaging);
+        anyhow::ensure!(guard.is_held()?);
+        let source_meta = guard.file.metadata()?;
+        let private_meta = private.metadata()?;
+        let staged_id = staging_parent.entry_identity(&self.staging_name, false)?;
+        anyhow::ensure!(
+            source_meta.is_file()
+                && source_meta.ino() == self.source_id.inode
+                && source_meta.nlink() == 2
+                && private_meta.is_file()
+                && private_meta.dev() == source_meta.dev()
+                && private_meta.ino() != source_meta.ino()
+                && private_meta.nlink() == 1
+                && staged_id.map(|id| id.filesystem_id) == Some(self.source_id.filesystem_id)
+                && staged_id.map(|id| id.inode) == Some(private_meta.ino())
+                && source_meta.len() == copy.logical_len
+                && private_meta.len() == copy.logical_len
+                && hash_exact(&guard.file, copy.logical_len)? == copy.content_hash
+                && hash_exact(private, copy.logical_len)? == copy.content_hash
+                && file_data_extents(private, copy.logical_len)? == copy.data_extents,
+            "private staging copy no longer matches the frozen source"
+        );
+        private.sync_all()?;
+        self.replace_phase(
+            control,
+            LinkFreezeEditPhase::PrivateCopyReady,
+            Some(copy),
+            Some(private_meta.ino()),
+        )
+    }
+
+    /// Call after the private inode owns the anchor name and the old shared
+    /// staging alias is gone. This syncs the pinned parent before the CAS and
+    /// also handles replay after a rename completed before the CAS.
+    pub fn mark_unlock_pending(
+        mut self,
+        control: &ControlStore,
+        source: &File,
+        source_parent: &PinnedDirectory,
+        source_name: impl AsRef<Path>,
+        anchor_parent: &PinnedDirectory,
+        anchor_name: impl AsRef<Path>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(self.phase == LinkFreezeEditPhase::PrivateCopyReady);
+        self.check_source(source, source_parent, source_name)?;
+        let private_anchor = anchor_parent
+            .open_child_file(anchor_name)?
+            .ok_or_else(|| anyhow::anyhow!("private anchor name disappeared"))?;
+        anyhow::ensure!(
+            private_anchor.metadata()?.ino() == self.private_inode.unwrap(),
+            "the expected private inode does not own the anchor name"
+        );
+        verify_independent_anchor(source, &private_anchor, self.copy.as_ref().unwrap())?;
+        private_anchor.sync_all()?;
+        anchor_parent.sync_all()?;
+        self.replace_phase(control, LinkFreezeEditPhase::UnlockPending, None, None)
+    }
+
+    /// A replay may reach this step after permissions were restored and the
+    /// user edited the source. Only the private anchor proof remains immutable.
+    pub fn mark_editable(
+        mut self,
+        control: &ControlStore,
+        source: &File,
+        source_parent: &PinnedDirectory,
+        source_name: impl AsRef<Path>,
+        anchor_parent: &PinnedDirectory,
+        anchor_name: impl AsRef<Path>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(self.phase == LinkFreezeEditPhase::UnlockPending);
+        self.check_source(source, source_parent, source_name)?;
+        let private_anchor = anchor_parent
+            .open_child_file(anchor_name)?
+            .ok_or_else(|| anyhow::anyhow!("private anchor name disappeared"))?;
+        anyhow::ensure!(private_anchor.metadata()?.ino() == self.private_inode.unwrap());
+        anyhow::ensure!(self.original_access.is_restored_after_detach(
+            source,
+            &private_anchor,
+            self.copy.as_ref().unwrap(),
+        )?);
+        self.replace_phase(control, LinkFreezeEditPhase::Editable, None, None)
+    }
+
+    pub fn retire(self, control: &ControlStore) -> anyhow::Result<()> {
+        anyhow::ensure!(self.phase == LinkFreezeEditPhase::Editable);
+        control.delete_record_if_value(
+            EDIT_INTENT_KIND,
+            self.anchor_id.as_bytes(),
+            &mb_core::canonical_bytes(&self)?,
+        )?;
+        Ok(())
+    }
+
+    fn check_source(
+        &self,
+        source: &File,
+        parent: &PinnedDirectory,
+        name: impl AsRef<Path>,
+    ) -> anyhow::Result<()> {
+        let metadata = source.metadata()?;
+        anyhow::ensure!(
+            metadata.is_file()
+                && metadata.ino() == self.source_id.inode
+                && parent.entry_identity(name, false)? == Some(self.source_id),
+            "edit intent source identity changed"
+        );
+        Ok(())
+    }
+
+    fn replace_phase(
+        &mut self,
+        control: &ControlStore,
+        phase: LinkFreezeEditPhase,
+        copy: Option<IndependentSparseCopy>,
+        private_inode: Option<u64>,
+    ) -> anyhow::Result<Self> {
+        let before = mb_core::canonical_bytes(self)?;
+        self.phase = phase;
+        if let Some(copy) = copy {
+            self.copy = Some(copy);
+        }
+        if let Some(private_inode) = private_inode {
+            self.private_inode = Some(private_inode);
+        }
+        control.replace_record_if_value(
+            EDIT_INTENT_KIND,
+            self.anchor_id.as_bytes(),
+            &before,
+            &mb_core::canonical_bytes(self)?,
+        )?;
+        Ok(self.clone())
     }
 }
 
@@ -675,11 +999,16 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 
-    use crate::anchor::probe_guarded_link_freeze;
+    use mb_core::{KeyMaterial, Seed};
+    use uuid::Uuid;
+
+    use crate::anchor::{PinnedDirectory, probe_guarded_link_freeze};
+    use crate::database::ControlStore;
 
     use super::{
         AFTER_SPARSE_COPY_START, AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion,
-        copy_sparse_independent, file_data_extents, install_probe_acl,
+        LinkFreezeEditIntent, LinkFreezeEditPhase, copy_sparse_independent, file_data_extents,
+        install_probe_acl,
     };
 
     #[test]
@@ -715,14 +1044,40 @@ mod tests {
             .open(root.path().join("private-anchor"))
             .unwrap();
         let copy = copy_sparse_independent(&file, &anchor).unwrap();
+        let encoded_copy = mb_core::canonical_bytes(&copy).unwrap();
+        let recovered_copy: super::IndependentSparseCopy =
+            mb_core::decode_canonical(&encoded_copy).unwrap();
+        assert_eq!(recovered_copy, copy);
 
         file.set_permissions(fs::Permissions::from_mode(0o440))
             .unwrap();
         assert!(!snapshot.matches(&file).unwrap());
+        assert!(
+            !snapshot
+                .is_restored_after_detach(&file, &anchor, &recovered_copy)
+                .unwrap()
+        );
         snapshot
             .restore_after_detach(&file, &anchor, &copy)
             .unwrap();
         assert!(snapshot.matches(&file).unwrap());
+        file.write_at(b"edited", 0).unwrap();
+        assert!(
+            snapshot
+                .is_restored_after_detach(&file, &anchor, &recovered_copy)
+                .unwrap()
+        );
+        assert!(
+            snapshot
+                .restore_after_detach(&file, &anchor, &recovered_copy)
+                .is_err()
+        );
+        anchor.write_at(b"damage", 0).unwrap();
+        assert!(
+            snapshot
+                .is_restored_after_detach(&file, &anchor, &recovered_copy)
+                .is_err()
+        );
     }
 
     #[test]
@@ -907,6 +1262,110 @@ mod tests {
             file_data_extents(&File::open(&anchor_path).unwrap(), logical_len).unwrap(),
             original_extents
         );
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN for fanotify permission events"]
+    fn edit_journal_replays_private_copy_and_retirement_after_source_edit() {
+        let root = test_directory();
+        let source_path = root.path().join("source");
+        let anchor_path = root.path().join("anchor");
+        let source = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&source_path)
+            .unwrap();
+        source.set_len(1024 * 1024).unwrap();
+        source.write_at(b"before-edit", 4096).unwrap();
+        source.sync_all().unwrap();
+        drop(source);
+        fs::hard_link(&source_path, &anchor_path).unwrap();
+        let source = File::open(&source_path).unwrap();
+        let shared_anchor = File::open(&anchor_path).unwrap();
+        assert_eq!(
+            source.metadata().unwrap().ino(),
+            shared_anchor.metadata().unwrap().ino()
+        );
+        let guard = FileWriteExclusion::acquire(source.try_clone().unwrap()).unwrap();
+        let access = FileAccessSnapshot::capture(&source).unwrap();
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o444)).unwrap();
+        source.sync_all().unwrap();
+        File::open(root.path()).unwrap().sync_all().unwrap();
+        guard.release().unwrap();
+
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([91; 32]));
+        let database_path = root.path().join("control.db");
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        let anchor_id = Uuid::new_v4();
+        let parent = PinnedDirectory::open(root.path()).unwrap();
+        let frozen = LinkFreezeEditIntent::begin(
+            &store,
+            anchor_id,
+            &parent,
+            "source",
+            &parent,
+            "anchor",
+            access.clone(),
+        )
+        .unwrap();
+        assert!(
+            LinkFreezeEditIntent::begin(
+                &store,
+                anchor_id,
+                &parent,
+                "source",
+                &parent,
+                "anchor",
+                access.clone(),
+            )
+            .is_err()
+        );
+        let copying = frozen.clone().mark_copy_staging(&store).unwrap();
+        assert!(frozen.mark_copy_staging(&store).is_err());
+        let guard = FileWriteExclusion::acquire(source.try_clone().unwrap()).unwrap();
+        let staging_path = root.path().join(copying.staging_name());
+        let private = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&staging_path)
+            .unwrap();
+        let copy = guard.copy_sparse_independent(&private).unwrap();
+        let ready = copying
+            .mark_private_copy_ready(&store, &guard, &parent, &private, copy.clone())
+            .unwrap();
+        assert_eq!(ready.phase(), LinkFreezeEditPhase::PrivateCopyReady);
+        drop(store);
+
+        // Simulate a restart between the synced copy and anchor publication.
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        let ready = LinkFreezeEditIntent::load(&store, anchor_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.copy(), Some(&copy));
+        fs::rename(&staging_path, &anchor_path).unwrap();
+        let private_anchor = File::open(&anchor_path).unwrap();
+        let pending = ready
+            .mark_unlock_pending(&store, &source, &parent, "source", &parent, "anchor")
+            .unwrap();
+        guard.release().unwrap();
+        access
+            .restore_after_detach(&source, &private_anchor, &copy)
+            .unwrap();
+        fs::write(&source_path, b"after-edit").unwrap();
+        let editable = pending
+            .mark_editable(&store, &source, &parent, "source", &parent, "anchor")
+            .unwrap();
+        assert_eq!(editable.phase(), LinkFreezeEditPhase::Editable);
+        editable.retire(&store).unwrap();
+        assert!(
+            LinkFreezeEditIntent::load(&store, anchor_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(private_anchor.read_at(&mut [0_u8; 11], 4096).unwrap(), 11);
+        assert_eq!(fs::read(&anchor_path).unwrap()[4096..4107], *b"before-edit");
     }
 
     #[test]
