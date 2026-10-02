@@ -87,11 +87,15 @@
   disposable FUSE passthrough probe, passing locally on ext4 and a fresh Btrfs
   loop image: it reads exact bytes through a shared read-only mapping, rejects
   a writable open in the FUSE handler, and keeps the lower inode unchanged
-  after read-only `O_TRUNC` and owner `chmod` attempts. It does not yet detach
-  on writes, supervise the mount, or recover after restart. `eac567e` also
+  after read-only `O_TRUNC` and owner `chmod` attempts. `eac567e` also
   proves an ordinary user can read the view but cannot access the private
-  lower source on both filesystems. Keep guarded enrollment, Git staging, and
-  checkout gated until the complete privileged probe passes. See
+  lower source on both filesystems. `e4f4147` connects a single captured file
+  to its durable detach journal before FUSE `O_WRONLY` and `O_RDWR` passthrough;
+  ordinary-user writes retain the original source inode and leave a distinct,
+  byte-exact anchor on ext4 and fresh Btrfs. Extend this to the whole versioned
+  worktree namespace, metadata and truncate operations, rename/unlink,
+  concurrent handles, and mount/restart failure before enrollment. Keep Git
+  staging and checkout gated until the complete privileged probe passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
   and [fanotify(7)](https://man7.org/linux/man-pages/man7/fanotify.7.html).
 

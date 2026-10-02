@@ -1155,7 +1155,11 @@ mapping, writable-open refusal, and lower-inode safety under read-only
 `O_TRUNC` and `chmod` attempts. This establishes a host capability for the
 planned guarded view. `eac567e` also proves ordinary-user read access through
 the FUSE view while the private lower source remains inaccessible on both
-filesystems. Durable write-detach, mount supervision/recovery, and guarded
+filesystems. `e4f4147` passed a single-file FUSE write-detach probe on ext4
+and fresh Btrfs: ordinary-user `O_WRONLY` and `O_RDWR` writes receive the
+original source inode only after durable sparse detach, while the independent
+anchor keeps exact captured bytes. Whole-worktree dispatch, metadata and
+truncate edits, rename/unlink, mount supervision/recovery, and guarded
 enrollment remain unimplemented.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
