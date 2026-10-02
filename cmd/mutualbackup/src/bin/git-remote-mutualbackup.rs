@@ -303,11 +303,16 @@ async fn main() -> Result<()> {
                     .as_ref()
                     .context("Git requested objects before listing remote refs")?;
                 validate_fetch(value, branches, tags)?;
+                let mut command_count = 1_usize;
                 loop {
                     let next = read_line(&mut input)?
                         .context("Git closed an unfinished remote-helper fetch batch")?;
                     if next.is_empty() {
                         break;
+                    }
+                    command_count += 1;
+                    if command_count > MAX_ADVERTISED_REFS {
+                        bail!("Git remote-helper fetch batch exceeds the local bound");
                     }
                     validate_fetch(&next, branches, tags)?;
                 }
@@ -347,6 +352,9 @@ async fn main() -> Result<()> {
                     }
                     if !next.starts_with("push ") {
                         bail!("unsupported Git remote-helper push batch command");
+                    }
+                    if commands.len() >= MAX_ADVERTISED_REFS {
+                        bail!("Git remote-helper push batch exceeds the local bound");
                     }
                     commands.push(next);
                 }
