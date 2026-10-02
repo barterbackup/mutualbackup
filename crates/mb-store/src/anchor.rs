@@ -1150,7 +1150,9 @@ impl ImportedBlobCapturePlan {
     pub fn plan(source_root: impl AsRef<Path>, logical_len: u64) -> Result<Self, AnchorError> {
         Ok(Self {
             format_version: 1,
-            root: ReflinkAnchor::plan(source_root)?,
+            // Git supplies these bytes as a stream. Publication creates an
+            // independent inode and never clones a working-tree file.
+            root: plan_anchor_root(source_root, false)?,
             logical_len,
         })
     }
@@ -1645,6 +1647,41 @@ pub fn remove_owned_directory_tree(
     )))
 }
 
+fn plan_anchor_root(
+    source_root: impl AsRef<Path>,
+    reflink_required: bool,
+) -> Result<ReflinkCapturePlan, AnchorError> {
+    let source_root = source_root
+        .as_ref()
+        .canonicalize()
+        .map_err(|_| AnchorError::InvalidRoot)?;
+    let root_file = open_source_root(&source_root)?;
+    let root_metadata = root_file.metadata()?;
+    if !root_metadata.is_dir() {
+        return Err(AnchorError::InvalidRoot);
+    }
+    if reflink_required {
+        probe_reflink(&source_root)?;
+    }
+
+    let area = prepare_stable_anchor_area(&source_root, &root_metadata)?;
+    #[cfg(target_os = "linux")]
+    let filesystem = filesystem_identity_for_file(&root_file)?;
+    #[cfg(not(target_os = "linux"))]
+    let filesystem = filesystem_identity(&source_root)?;
+    let (root_modified_secs, root_modified_nanos) = modified_parts(&root_metadata);
+    Ok(ReflinkCapturePlan {
+        format_version: 1,
+        anchor_id: Uuid::new_v4(),
+        source_root,
+        area,
+        root_version: capture_version(filesystem.stable_id, &root_metadata),
+        root_mode: unix_mode(&root_metadata),
+        root_modified_secs,
+        root_modified_nanos,
+    })
+}
+
 impl ReflinkAnchor {
     pub fn capture(source_root: impl AsRef<Path>) -> Result<StableAnchorManifest, AnchorError> {
         let plan = Self::plan(source_root)?;
@@ -1652,33 +1689,7 @@ impl ReflinkAnchor {
     }
 
     pub fn plan(source_root: impl AsRef<Path>) -> Result<ReflinkCapturePlan, AnchorError> {
-        let source_root = source_root
-            .as_ref()
-            .canonicalize()
-            .map_err(|_| AnchorError::InvalidRoot)?;
-        let root_file = open_source_root(&source_root)?;
-        let root_metadata = root_file.metadata()?;
-        if !root_metadata.is_dir() {
-            return Err(AnchorError::InvalidRoot);
-        }
-        probe_reflink(&source_root)?;
-
-        let area = prepare_stable_anchor_area(&source_root, &root_metadata)?;
-        #[cfg(target_os = "linux")]
-        let filesystem = filesystem_identity_for_file(&root_file)?;
-        #[cfg(not(target_os = "linux"))]
-        let filesystem = filesystem_identity(&source_root)?;
-        let (root_modified_secs, root_modified_nanos) = modified_parts(&root_metadata);
-        Ok(ReflinkCapturePlan {
-            format_version: 1,
-            anchor_id: Uuid::new_v4(),
-            source_root,
-            area,
-            root_version: capture_version(filesystem.stable_id, &root_metadata),
-            root_mode: unix_mode(&root_metadata),
-            root_modified_secs,
-            root_modified_nanos,
-        })
+        plan_anchor_root(source_root, true)
     }
 
     pub fn capture_plan(plan: &ReflinkCapturePlan) -> Result<StableAnchorManifest, AnchorError> {
@@ -4864,18 +4875,15 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
     fn direct_blob_import_is_exact_and_replays_without_its_input_stream() {
-        let test_root = PathBuf::from(
-            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
-                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
-        );
-        let run_root = test_root.join(format!("import-blob-{}", Uuid::new_v4()));
+        let temp = tempfile::tempdir().unwrap();
+        let run_root = temp.path().join("import-blob");
         let source_root = run_root.join("work");
         fs::create_dir_all(&source_root).unwrap();
         let bytes = [b"Git\r\nbytes\0".as_slice(), &vec![0x5a; 2 * 1024 * 1024]].concat();
-        let plan =
-            crate::SourceBlobImportPlan::plan_direct(&source_root, bytes.len() as u64).unwrap();
+        let plan = crate::SourceBackendKind::GuardedLinkFreezeV1
+            .plan_blob_import(&source_root, bytes.len() as u64)
+            .unwrap();
         let plan: crate::SourceBlobImportPlan =
             decode_canonical(&canonical_bytes(&plan).unwrap()).unwrap();
         assert!(matches!(
