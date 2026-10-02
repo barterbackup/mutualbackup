@@ -120,6 +120,92 @@ impl GuardedFileCapturePlan {
         self.source_mode
     }
 
+    /// Identify a guarded Git blob anchor from its durable local plan. Prune
+    /// must route it through this backend's journal rather than generic file
+    /// removal. A missing manifest claim is valid only during retirement.
+    pub fn load_for_manifest(
+        control: &ControlStore,
+        manifest: &FileAnchorManifest,
+    ) -> anyhow::Result<Option<Self>> {
+        let Some(bytes) = control.get_record(PLAN_KIND, manifest.anchor_id.as_bytes())? else {
+            return Ok(None);
+        };
+        let plan: Self = mb_core::decode_canonical(&bytes)?;
+        anyhow::ensure!(
+            mb_core::canonical_bytes(&plan)? == bytes
+                && plan.format_version == 1
+                && !plan.anchor_id.is_nil()
+                && plan.anchor_id == manifest.anchor_id
+                && plan.area == manifest.area
+                && !plan.area.area_id.is_nil()
+                && plan.source_root.is_absolute()
+                && plan.area.path_hint.is_absolute()
+                && plan.area.volume_root_hint.is_absolute()
+                && plan.source_root_id.filesystem_id == plan.area.filesystem_id
+                && plan.source_root_id.inode != 0
+                && plan.source_version.filesystem_id == plan.area.filesystem_id
+                && plan.source_version.inode != 0
+                && plan.source_mode & libc::S_IFMT == libc::S_IFREG
+                && validate_relative(&plan.relative_path).is_ok()
+                && manifest.format_version == 1
+                && manifest.source_root_hint == plan.source_root
+                && manifest.source_relative_path == plan.relative_path
+                && manifest.source_version == plan.source_version
+                && manifest.logical_len == plan.source_version.logical_len,
+            "Git blob manifest differs from its guarded source plan"
+        );
+        let plan_hash = *blake3::hash(&bytes).as_bytes();
+        let retirement = control.get_record(RETIRE_KIND, plan.anchor_id.as_bytes())?;
+        if let Some(bytes) = retirement.as_ref() {
+            anyhow::ensure!(
+                mb_core::decode_canonical::<FileRetirement>(bytes)?
+                    == (FileRetirement {
+                        format_version: 1,
+                        anchor_id: plan.anchor_id,
+                        plan_hash,
+                    }),
+                "guarded file retirement belongs to another plan"
+            );
+        }
+        let directory_claim =
+            control.get_record(DIRECTORY_CLAIM_KIND, plan.anchor_id.as_bytes())?;
+        let directory_claim = directory_claim
+            .as_deref()
+            .map(mb_core::decode_canonical::<DirectoryClaim>)
+            .transpose()?;
+        if let Some(claim) = directory_claim.as_ref() {
+            anyhow::ensure!(
+                claim.format_version == 1
+                    && claim.anchor_id == plan.anchor_id
+                    && claim.plan_hash == plan_hash
+                    && claim.directory_id.filesystem_id == plan.area.filesystem_id,
+                "guarded file directory claim differs from its source plan"
+            );
+        }
+        if let Some(claim_bytes) =
+            control.get_record(MANIFEST_CLAIM_KIND, plan.anchor_id.as_bytes())?
+        {
+            let claim: ManifestClaim = mb_core::decode_canonical(&claim_bytes)?;
+            anyhow::ensure!(
+                claim.format_version == 1
+                    && claim.anchor_id == plan.anchor_id
+                    && claim.plan_hash == plan_hash
+                    && directory_claim
+                        .as_ref()
+                        .is_some_and(|directory| directory.directory_id == claim.directory_id)
+                    && claim.manifest_hash
+                        == *blake3::hash(&mb_core::canonical_bytes(manifest)?).as_bytes(),
+                "Git blob manifest differs from its guarded claim"
+            );
+        } else {
+            anyhow::ensure!(
+                retirement.is_some(),
+                "guarded Git blob has no durable claim"
+            );
+        }
+        Ok(Some(plan))
+    }
+
     /// Persist plan ownership before creating an anchor directory, then use
     /// the per-file freeze journal to make its payload durable. The manifest
     /// appears only after journal replay proves the anchor's exact bytes.
@@ -739,6 +825,61 @@ mod tests {
             content_hash: [42; 32],
             source_version: plan.source_version.clone(),
         }
+    }
+
+    #[test]
+    fn guarded_file_plan_lookup_requires_exact_manifest_claim_or_retirement() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("protected");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("source"), b"raw bytes").unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([123; 32]));
+        let control = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let (_, plan_hash, directory_id) = claimed_test_directory(&plan, &control);
+        let manifest = mock_manifest(&plan);
+        assert!(GuardedFileCapturePlan::load_for_manifest(&control, &manifest).is_err());
+        let claim = ManifestClaim {
+            format_version: 1,
+            anchor_id: plan.anchor_id,
+            directory_id,
+            plan_hash,
+            manifest_hash: *blake3::hash(&mb_core::canonical_bytes(&manifest).unwrap()).as_bytes(),
+        };
+        control
+            .put_record(
+                MANIFEST_CLAIM_KIND,
+                plan.anchor_id.as_bytes(),
+                &mb_core::canonical_bytes(&claim).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            GuardedFileCapturePlan::load_for_manifest(&control, &manifest).unwrap(),
+            Some(plan.clone())
+        );
+        let mut changed = manifest.clone();
+        changed.content_hash[0] ^= 1;
+        assert!(GuardedFileCapturePlan::load_for_manifest(&control, &changed).is_err());
+        control
+            .delete_record(MANIFEST_CLAIM_KIND, plan.anchor_id.as_bytes())
+            .unwrap();
+        assert!(GuardedFileCapturePlan::load_for_manifest(&control, &manifest).is_err());
+        let retirement = FileRetirement {
+            format_version: 1,
+            anchor_id: plan.anchor_id,
+            plan_hash,
+        };
+        control
+            .put_record(
+                RETIRE_KIND,
+                plan.anchor_id.as_bytes(),
+                &mb_core::canonical_bytes(&retirement).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            GuardedFileCapturePlan::load_for_manifest(&control, &manifest).unwrap(),
+            Some(plan)
+        );
     }
 
     #[test]

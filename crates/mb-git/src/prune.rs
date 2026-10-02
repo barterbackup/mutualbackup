@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet};
 
 use git2::Oid;
 use mb_core::{ModelError, canonical_bytes, decode_canonical};
-use mb_store::{AnchorError, ControlStore, DatabaseError, FileAnchorManifest};
+use mb_store::{
+    AnchorError, ControlStore, DatabaseError, FileAnchorManifest, GuardedFileCapturePlan,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -40,6 +42,8 @@ pub enum GitPruneError {
     Model(#[from] ModelError),
     #[error("native anchor deletion failed: {0}")]
     Anchor(#[from] AnchorError),
+    #[error("guarded native anchor retirement failed: {0}")]
+    GuardedAnchor(#[from] anyhow::Error),
     #[error("Git object ID is invalid: {0}")]
     Git(#[from] git2::Error),
     #[error("a stage or fetch is in progress; finish it before pruning")]
@@ -128,7 +132,11 @@ pub(crate) fn resume_pending_prune(
         if anchor.format_version != 1 || !seen.insert(anchor.anchor_id) {
             return Err(GitPruneError::IncompatibleRecord);
         }
-        anchor.remove()?;
+        if let Some(plan) = GuardedFileCapturePlan::load_for_manifest(control, anchor)? {
+            plan.discard_unreferenced(control)?;
+        } else {
+            anchor.remove()?;
+        }
     }
     control.delete_record_if_value(&kind, ACTIVE, &encoded)?;
     Ok(())
