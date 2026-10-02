@@ -14,7 +14,8 @@ use uuid::Uuid;
 #[command(
     name = "mutualgit",
     version,
-    about = "Git-compatible MutualBackup history"
+    about = "Git-compatible MutualBackup history",
+    long_about = "Git-compatible MutualBackup history over native anchors. File bytes are preserved exactly: automatic line-ending conversion, clean/smudge filters, ident expansion, and working-tree encoding conversion are disabled, regardless of Git config or attributes."
 )]
 struct Cli {
     /// Run as if started in this directory.

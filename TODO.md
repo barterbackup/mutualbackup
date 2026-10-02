@@ -1,5 +1,19 @@
 # Product TODO
 
+## Milestone 6 active implementation gates
+
+- [ ] **M6 guarded edit guard.** The store now has replayable per-file and
+  whole-root sparse detaches, but node enrollment still selects only the
+  reflink backend. Implement and locally probe a long-lived access decision
+  that permits normal reads without detaching every anchor and prevents writes
+  until detach is durable, even after owner `chmod`, pathname truncate,
+  pre-opened handles, rename, and restart. `FAN_PRE_ACCESS` covers both reads
+  and writes and reports a range rather than an edit intent, so it cannot be
+  used alone as a write detector. Keep guarded enrollment and Git staging and
+  checkout gated until the complete privileged probe passes. See
+  [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
+  and [fanotify(7)](https://man7.org/linux/man-pages/man7/fanotify.7.html).
+
 ## Milestone 4 follow-up source review — closed 2026-09-15
 
 Source review of `197c6b0..1b9f99e` found one remaining completion blocker

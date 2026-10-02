@@ -3164,7 +3164,13 @@ backend gates. A command being present does not by itself close its slice.
   trips without a persistent payload mirror.
 - Close guarded link-freeze separately with its full atomic edit/failure and
   anchor-recovery probe, including `ENOSPC`, unknown hard-link aliases, and
-  restart at each permission and sparse-detach transition.
+  restart at each permission and sparse-detach transition. Before enabling a
+  long-lived edit guard, prove that ordinary reads do not trigger eager detach
+  while every write path remains blocked until a private anchor is durable,
+  including after owner `chmod`, pathname truncate, and a daemon restart.
+  Linux `FAN_PRE_ACCESS` reports both read and write access with a byte range;
+  that event alone does not identify an edit. Keep enrollment gated until the
+  full access decision and failure behavior pass a privileged local probe.
 - Close each listed platform backend only after its own capture/edit/restore,
   metadata fidelity, application-consistency, and source-loss recovery gate.
   Milestone 6 closes only after the Git, guarded-link-freeze, and listed
