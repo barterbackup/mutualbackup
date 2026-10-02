@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn access_snapshot_records_the_acl_mask_changed_by_chmod() {
-        let root = tempfile::tempdir().unwrap();
+        let root = test_directory();
         let path = root.path().join("access");
         let file = OpenOptions::new()
             .read(true)
@@ -469,7 +469,7 @@ mod tests {
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN for fanotify permission events"]
     fn lease_rejects_open_writers_and_writable_mappings() {
-        let root = tempfile::tempdir().unwrap();
+        let root = test_directory();
         let path = root.path().join("source");
         fs::write(&path, vec![7_u8; 4096]).unwrap();
 
@@ -504,6 +504,8 @@ mod tests {
 
         let guard = FileWriteExclusion::acquire(File::open(&path).unwrap()).unwrap();
         assert!(guard.is_held().unwrap());
+        let access = FileAccessSnapshot::capture(&guard.file).unwrap();
+        assert!(access.matches(&guard.file).unwrap());
         let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
         // SAFETY: the NUL-terminated path and integer flags are valid.
         let competing = unsafe {
@@ -546,5 +548,15 @@ mod tests {
             assert!(OpenOptions::new().write(true).open(&anchor).is_err());
         }
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    fn test_directory() -> tempfile::TempDir {
+        match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-link-freeze-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        }
     }
 }
