@@ -3,10 +3,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use git2::{ObjectType, Oid, Repository};
@@ -192,48 +192,55 @@ pub(crate) fn committed_files_for_scope(
 }
 
 fn worktree_change(
-    root: &Path,
+    root: &PinnedDirectory,
     path: &[u8],
     staged: &GitIndexEntry,
 ) -> Result<Option<GitChange>, StatusError> {
-    let full = root.join(OsString::from_vec(path.to_vec()));
-    let metadata = match fs::symlink_metadata(&full) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Some(GitChange::Deleted));
+    let relative = PathBuf::from(OsString::from_vec(path.to_vec()));
+    let parent_path = relative.parent().ok_or(StatusError::IncompatibleRecord)?;
+    let parent = if parent_path.as_os_str().is_empty() {
+        None
+    } else {
+        match root.open_descendant_directory(parent_path) {
+            Ok(parent) => Some(parent),
+            Err(AnchorError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => {
+                return Ok(Some(GitChange::Deleted));
+            }
+            Err(AnchorError::Io(error)) if error.raw_os_error() == Some(libc::ENOTDIR) => {
+                return Ok(Some(GitChange::TypeChanged));
+            }
+            Err(AnchorError::Io(error)) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return Ok(Some(GitChange::TypeChanged));
+            }
+            Err(AnchorError::UnsupportedObject(_)) => {
+                return Ok(Some(GitChange::TypeChanged));
+            }
+            Err(error) => return Err(error.into()),
         }
-        Err(error) => return Err(error.into()),
     };
+    let parent = parent.as_ref().unwrap_or(root);
+    let name = relative
+        .file_name()
+        .ok_or(StatusError::IncompatibleRecord)?;
     if staged.mode == 0o120000 {
-        if !metadata.file_type().is_symlink() {
-            return Ok(Some(GitChange::TypeChanged));
-        }
-        let relative = PathBuf::from(OsString::from_vec(path.to_vec()));
-        let root = PinnedDirectory::open(root)?;
-        let parent = relative.parent().ok_or(StatusError::IncompatibleRecord)?;
-        let directory = if parent.as_os_str().is_empty() {
-            root
-        } else {
-            root.open_descendant_directory(parent)?
+        let target = match parent.read_child_symlink(name) {
+            Ok(Some(target)) => target,
+            Ok(None) => return Ok(Some(GitChange::Deleted)),
+            Err(AnchorError::UnsupportedObject(_)) => return Ok(Some(GitChange::TypeChanged)),
+            Err(error) => return Err(error.into()),
         };
-        let target = directory
-            .read_child_symlink(
-                relative
-                    .file_name()
-                    .ok_or(StatusError::IncompatibleRecord)?,
-            )?
-            .ok_or(StatusError::IncompatibleRecord)?;
         let oid = Oid::hash_object(ObjectType::Blob, &target.0)?;
         return Ok((oid.as_bytes() != staged.oid).then_some(GitChange::Modified));
     }
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Ok(Some(GitChange::TypeChanged));
-    }
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let file = options.open(&full)?;
+    let file = match parent.open_child_file(name) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Ok(Some(GitChange::Deleted)),
+        Err(AnchorError::UnsupportedObject(_)) => return Ok(Some(GitChange::TypeChanged)),
+        Err(AnchorError::Io(error)) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Ok(Some(GitChange::TypeChanged));
+        }
+        Err(error) => return Err(error.into()),
+    };
     let opened_metadata = file.metadata()?;
     if !opened_metadata.is_file() {
         return Ok(Some(GitChange::TypeChanged));
@@ -252,12 +259,15 @@ fn worktree_change(
     }
 }
 
-fn walk_untracked(root: &Path, tracked: &BTreeSet<Vec<u8>>) -> Result<Vec<Vec<u8>>, StatusError> {
-    let mut pending = vec![(root.to_path_buf(), Vec::<u8>::new())];
+fn walk_untracked(
+    root: &PinnedDirectory,
+    tracked: &BTreeSet<Vec<u8>>,
+) -> Result<Vec<Vec<u8>>, StatusError> {
+    let mut pending = vec![(root.try_clone()?, Vec::<u8>::new())];
     let mut untracked = Vec::new();
     let mut visited = 0;
     while let Some((directory, prefix)) = pending.pop() {
-        for item in fs::read_dir(directory)? {
+        for item in fs::read_dir(directory.descriptor_path())? {
             let item = item?;
             let name = item.file_name();
             let name_bytes = name.as_bytes();
@@ -273,7 +283,10 @@ fn walk_untracked(root: &Path, tracked: &BTreeSet<Vec<u8>>) -> Result<Vec<Vec<u8
             let kind = item.file_type()?;
             if kind.is_dir() {
                 path.push(b'/');
-                pending.push((item.path(), path));
+                let child = directory
+                    .open_child_directory(&name)?
+                    .ok_or(AnchorError::PinnedFileChanged)?;
+                pending.push((child, path));
             } else if !tracked.contains(&path) {
                 untracked.push(path);
             }
@@ -307,6 +320,7 @@ pub(crate) fn repository_status_for_scope(
     }
     let mut all_paths = staged.keys().cloned().collect::<BTreeSet<_>>();
     all_paths.extend(committed.keys().cloned());
+    let root = PinnedDirectory::open(root)?;
     let mut changes = Vec::new();
     for path in all_paths {
         let staged_entry = staged.get(&path);
@@ -320,7 +334,7 @@ pub(crate) fn repository_status_for_scope(
             _ => None,
         };
         let worktree = match staged_entry {
-            Some(index) => worktree_change(root, &path, index)?,
+            Some(index) => worktree_change(&root, &path, index)?,
             None => None,
         };
         if index_change.is_some() || worktree.is_some() {
@@ -332,7 +346,7 @@ pub(crate) fn repository_status_for_scope(
         }
     }
     let tracked = staged.keys().cloned().collect();
-    let untracked = walk_untracked(root, &tracked)?;
+    let untracked = walk_untracked(&root, &tracked)?;
     Ok(GitStatus {
         format_version: 1,
         repository_id,
@@ -348,4 +362,77 @@ pub(crate) fn repository_status_for_scope(
             None
         },
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    #[test]
+    fn tracked_status_does_not_follow_a_replaced_parent_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("file"), b"same bytes").unwrap();
+        symlink(outside.path(), root.path().join("dir")).unwrap();
+        let pinned = PinnedDirectory::open(root.path()).unwrap();
+        let staged = GitIndexEntry {
+            format_version: 1,
+            oid: Oid::hash_object(ObjectType::Blob, b"same bytes")
+                .unwrap()
+                .as_bytes()
+                .try_into()
+                .unwrap(),
+            mode: 0o100644,
+            anchor_id: Uuid::new_v4(),
+        };
+        assert_eq!(
+            worktree_change(&pinned, b"dir/file", &staged).unwrap(),
+            Some(GitChange::TypeChanged)
+        );
+        assert_eq!(
+            walk_untracked(&pinned, &BTreeSet::new()).unwrap(),
+            vec![b"dir".to_vec()]
+        );
+    }
+
+    #[test]
+    fn tracked_status_reports_a_missing_parent_as_deleted() {
+        let root = tempfile::tempdir().unwrap();
+        let pinned = PinnedDirectory::open(root.path()).unwrap();
+        let staged = GitIndexEntry {
+            format_version: 1,
+            oid: [1; 20],
+            mode: 0o100644,
+            anchor_id: Uuid::new_v4(),
+        };
+        assert_eq!(
+            worktree_change(&pinned, b"dir/file", &staged).unwrap(),
+            Some(GitChange::Deleted)
+        );
+    }
+
+    #[test]
+    fn tracked_status_reports_a_replaced_file_symlink_as_type_change() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("file"), b"same bytes").unwrap();
+        symlink(outside.path().join("file"), root.path().join("file")).unwrap();
+        let pinned = PinnedDirectory::open(root.path()).unwrap();
+        let staged = GitIndexEntry {
+            format_version: 1,
+            oid: Oid::hash_object(ObjectType::Blob, b"same bytes")
+                .unwrap()
+                .as_bytes()
+                .try_into()
+                .unwrap(),
+            mode: 0o100644,
+            anchor_id: Uuid::new_v4(),
+        };
+        assert_eq!(
+            worktree_change(&pinned, b"file", &staged).unwrap(),
+            Some(GitChange::TypeChanged)
+        );
+    }
 }
