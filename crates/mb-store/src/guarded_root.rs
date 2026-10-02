@@ -738,6 +738,355 @@ impl GuardedRootCapturePlan {
         Ok(())
     }
 
+    /// The caller must prove that no signed revision, Git object, or pending
+    /// operation still references this root. The root marker fences new
+    /// freezes, and each file's own retirement journal restores source access
+    /// before its anchor directory is removed. Repeating this call resumes an
+    /// interrupted retirement.
+    pub fn discard_unreferenced(&self, control: &ControlStore) -> anyhow::Result<()> {
+        self.validate()?;
+        let plan_bytes = mb_core::canonical_bytes(self)?;
+        let plan_hash = *blake3::hash(&plan_bytes).as_bytes();
+        let recorded_plan = control.get_record(PLAN_KIND, self.anchor_id.as_bytes())?;
+        anyhow::ensure!(
+            recorded_plan
+                .as_ref()
+                .is_none_or(|bytes| bytes == &plan_bytes),
+            "guarded root plan changed before retirement"
+        );
+        let retirement = RootRetirement {
+            format_version: 1,
+            anchor_id: self.anchor_id,
+            plan_hash,
+        };
+        let retirement_bytes = mb_core::canonical_bytes(&retirement)?;
+        let existing_retirement = control.get_record(RETIRE_KIND, self.anchor_id.as_bytes())?;
+        anyhow::ensure!(
+            existing_retirement
+                .as_ref()
+                .is_none_or(|bytes| bytes == &retirement_bytes),
+            "guarded root retirement belongs to another plan"
+        );
+        let area_path = resolve_anchor_area(&self.area)?;
+        let area_file = open_stable_anchor_area(&area_path, &self.area)?;
+        let area = PinnedDirectory {
+            file: area_file,
+            filesystem_id: self.area.filesystem_id,
+        };
+        let root_claim_bytes = control.get_record(ROOT_CLAIM_KIND, self.anchor_id.as_bytes())?;
+        let root_claim = root_claim_bytes
+            .as_deref()
+            .map(mb_core::decode_canonical::<RootClaim>)
+            .transpose()?;
+        let anchor_root = area.open_child_directory(self.anchor_id.to_string())?;
+        if recorded_plan.is_none() || anchor_root.is_none() {
+            anyhow::ensure!(
+                existing_retirement.is_some() || recorded_plan.is_none(),
+                "guarded root disappeared before retirement began"
+            );
+            anyhow::ensure!(
+                control
+                    .get_record(MANIFEST_CLAIM_KIND, self.anchor_id.as_bytes())?
+                    .is_none(),
+                "missing guarded root retains a manifest claim"
+            );
+            for entry in &self.entries {
+                if let GuardedRootEntry::File { capture_id, .. } = entry {
+                    anyhow::ensure!(
+                        LinkFreezeCaptureIntent::load(control, *capture_id)?.is_none(),
+                        "missing guarded root retains a file capture"
+                    );
+                }
+            }
+            self.discard_empty_anchor_root(control)?;
+            self.finish_file_retirement_records(control)?;
+            return Ok(());
+        }
+        let anchor_root = anchor_root.unwrap();
+        let root_claim =
+            root_claim.ok_or_else(|| anyhow::anyhow!("guarded root lacks its claim"))?;
+        anyhow::ensure!(
+            root_claim.format_version == 1
+                && root_claim.anchor_id == self.anchor_id
+                && root_claim.plan_hash == plan_hash
+                && root_claim.root_id == anchor_root.identity()?
+                && self.verified_marker(&area, plan_hash)?.is_some(),
+            "guarded root ownership changed before retirement"
+        );
+        if existing_retirement.is_none() {
+            self.verify_directory_claims_before_retirement(control, &area, plan_hash)?;
+        }
+        self.verify_manifest_for_retirement(
+            control,
+            &anchor_root,
+            plan_hash,
+            existing_retirement.is_some(),
+        )?;
+        if existing_retirement.is_none() {
+            anyhow::ensure!(control.put_record_if_absent(
+                RETIRE_KIND,
+                self.anchor_id.as_bytes(),
+                &retirement_bytes,
+            )?);
+        }
+        let mut source_directories = BTreeMap::from([(
+            String::new(),
+            NativeFileId {
+                filesystem_id: self.root_version.filesystem_id,
+                inode: self.root_version.inode,
+            },
+        )]);
+        for entry in &self.entries {
+            if let GuardedRootEntry::Directory { path, version, .. } = entry {
+                source_directories.insert(
+                    path.clone(),
+                    NativeFileId {
+                        filesystem_id: version.filesystem_id,
+                        inode: version.inode,
+                    },
+                );
+            }
+        }
+        for entry in &self.entries {
+            let GuardedRootEntry::File {
+                path,
+                capture_id,
+                version,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            let relative = Path::new(path);
+            let name = relative
+                .file_name()
+                .ok_or(AnchorError::InvalidGuardedPlan)?;
+            let name = Path::new(name);
+            let parent_path = relative
+                .parent()
+                .and_then(|parent| parent.to_str())
+                .ok_or(AnchorError::InvalidGuardedPlan)?;
+            let anchor_parent = if parent_path.is_empty() {
+                anchor_root.try_clone()?
+            } else {
+                anchor_root.open_descendant_directory(parent_path)?
+            };
+            let Some(capture) = LinkFreezeCaptureIntent::load(control, *capture_id)? else {
+                anyhow::ensure!(
+                    anchor_parent.entry_identity(name, false)?.is_none(),
+                    "guarded root has an unjournaled file anchor: {path}"
+                );
+                LinkFreezeCaptureIntent::finish_completed_retirement(control, *capture_id)?;
+                continue;
+            };
+            let expected_parent = *source_directories
+                .get(parent_path)
+                .ok_or(AnchorError::InvalidGuardedPlan)?;
+            anyhow::ensure!(capture.matches_root_file_plan(
+                *capture_id,
+                expected_parent,
+                NativeFileId {
+                    filesystem_id: version.filesystem_id,
+                    inode: version.inode,
+                },
+                &anchor_parent,
+                name,
+            )?);
+            let source_parent =
+                match self.open_source_parent_for_retirement(parent_path, expected_parent) {
+                    Ok(parent) => parent,
+                    Err(_) => anchor_parent.try_clone()?,
+                };
+            let capture = if capture.phase() == LinkFreezeCapturePhase::Prepared {
+                capture.resume(control, &source_parent, &anchor_parent)?
+            } else {
+                Some(capture)
+            };
+            if let Some(capture) = capture {
+                capture.retire_unreferenced(control, &source_parent, &anchor_parent)?;
+            }
+            LinkFreezeCaptureIntent::finish_completed_retirement(control, *capture_id)?;
+        }
+        self.remove_claimed_manifest(control, &anchor_root, plan_hash)?;
+        self.discard_empty_anchor_root(control)?;
+        self.finish_file_retirement_records(control)?;
+        Ok(())
+    }
+
+    fn open_source_parent_for_retirement(
+        &self,
+        parent_path: &str,
+        expected: NativeFileId,
+    ) -> Result<PinnedDirectory, AnchorError> {
+        let root = PinnedDirectory::open(&self.source_root)?;
+        if root.identity()?
+            != (NativeFileId {
+                filesystem_id: self.root_version.filesystem_id,
+                inode: self.root_version.inode,
+            })
+        {
+            return Err(AnchorError::SourceChanged(PathBuf::new()));
+        }
+        let parent = if parent_path.is_empty() {
+            root
+        } else {
+            root.open_descendant_directory(parent_path)?
+        };
+        if parent.identity()? != expected {
+            return Err(AnchorError::SourceChanged(PathBuf::from(parent_path)));
+        }
+        Ok(parent)
+    }
+
+    fn finish_file_retirement_records(&self, control: &ControlStore) -> anyhow::Result<()> {
+        for entry in &self.entries {
+            if let GuardedRootEntry::File { capture_id, .. } = entry {
+                LinkFreezeCaptureIntent::finish_completed_retirement(control, *capture_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_manifest_for_retirement(
+        &self,
+        control: &ControlStore,
+        anchor_root: &PinnedDirectory,
+        plan_hash: [u8; 32],
+        allow_missing: bool,
+    ) -> anyhow::Result<Option<(Vec<u8>, Option<NativeFileId>)>> {
+        let name = capture_manifest_name(self.anchor_id);
+        let recorded = control.get_record(MANIFEST_CLAIM_KIND, self.anchor_id.as_bytes())?;
+        let present = anchor_root.entry_identity(&name, false)?;
+        let Some(bytes) = recorded else {
+            anyhow::ensure!(
+                present.is_none(),
+                "unguarded root manifest blocks retirement"
+            );
+            return Ok(None);
+        };
+        let claim: RootManifestClaim = mb_core::decode_canonical(&bytes)?;
+        anyhow::ensure!(
+            claim.format_version == 1
+                && claim.anchor_id == self.anchor_id
+                && claim.root_id == anchor_root.identity()?
+                && claim.plan_hash == plan_hash,
+            "guarded root manifest claim changed before retirement"
+        );
+        if present.is_some() {
+            let mut file = anchor_root
+                .open_child_file(&name)?
+                .ok_or_else(|| anyhow::anyhow!("guarded root manifest disappeared"))?;
+            let metadata = file.metadata()?;
+            anyhow::ensure!(
+                metadata.len() <= V1_MAX_CATALOG_BYTES as u64
+                    && metadata.nlink() == 1
+                    && unix_mode(&metadata) & 0o222 == 0,
+                "guarded root manifest metadata changed"
+            );
+            let mut encoded = Vec::new();
+            file.read_to_end(&mut encoded)?;
+            anyhow::ensure!(
+                *blake3::hash(&encoded).as_bytes() == claim.manifest_hash,
+                "guarded root manifest bytes changed"
+            );
+            let manifest: StableAnchorManifest = mb_core::decode_canonical(&encoded)?;
+            anyhow::ensure!(
+                manifest.format_version == 2
+                    && manifest.anchor_id == self.anchor_id
+                    && manifest.area == self.area
+                    && manifest.source_root_hint == self.source_root
+                    && manifest.root_mode == self.root_mode
+                    && manifest.root_modified_secs == self.root_modified_secs
+                    && manifest.root_modified_nanos == self.root_modified_nanos
+                    && manifest.entries.len() == self.entries.len(),
+                "guarded root manifest differs from its source plan"
+            );
+            for (planned, captured) in self.entries.iter().zip(&manifest.entries) {
+                let matches = match (planned, captured) {
+                    (
+                        GuardedRootEntry::Directory {
+                            path,
+                            mode,
+                            modified_secs,
+                            modified_nanos,
+                            ..
+                        },
+                        CapturedEntry::Directory {
+                            path: actual_path,
+                            mode: actual_mode,
+                            modified_secs: actual_secs,
+                            modified_nanos: actual_nanos,
+                        },
+                    ) => {
+                        path == actual_path
+                            && mode == actual_mode
+                            && modified_secs == actual_secs
+                            && modified_nanos == actual_nanos
+                    }
+                    (
+                        GuardedRootEntry::File {
+                            path,
+                            version,
+                            mode,
+                            modified_secs,
+                            modified_nanos,
+                            ..
+                        },
+                        CapturedEntry::FileV2 {
+                            path: actual_path,
+                            mode: actual_mode,
+                            logical_len,
+                            modified_secs: actual_secs,
+                            modified_nanos: actual_nanos,
+                            native_id,
+                            ..
+                        },
+                    ) => {
+                        path == actual_path
+                            && mode == actual_mode
+                            && *logical_len == version.logical_len
+                            && modified_secs == actual_secs
+                            && modified_nanos == actual_nanos
+                            && *native_id
+                                == (NativeFileId {
+                                    filesystem_id: version.filesystem_id,
+                                    inode: version.inode,
+                                })
+                    }
+                    _ => false,
+                };
+                anyhow::ensure!(matches, "guarded root manifest entry changed");
+            }
+        } else {
+            anyhow::ensure!(allow_missing, "claimed guarded root manifest disappeared");
+        }
+        Ok(Some((bytes, present)))
+    }
+
+    fn remove_claimed_manifest(
+        &self,
+        control: &ControlStore,
+        anchor_root: &PinnedDirectory,
+        plan_hash: [u8; 32],
+    ) -> anyhow::Result<()> {
+        if let Some((claim_bytes, present)) =
+            self.verify_manifest_for_retirement(control, anchor_root, plan_hash, true)?
+        {
+            if let Some(identity) = present {
+                anchor_root.remove_child_file_if_identity(
+                    capture_manifest_name(self.anchor_id),
+                    identity,
+                )?;
+            }
+            control.delete_record_if_value(
+                MANIFEST_CLAIM_KIND,
+                self.anchor_id.as_bytes(),
+                &claim_bytes,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Abandon only a prepared, empty root namespace. A file freeze requires
     /// the later journal-aware retirement path; this method refuses any file
     /// capture intent or child entry rather than unlinking a frozen source.
@@ -1197,6 +1546,7 @@ fn scan_directory(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Read;
     use std::path::Path;
 
     use mb_core::{KeyMaterial, Seed};
@@ -1512,6 +1862,182 @@ mod tests {
 
         let store = ControlStore::open(&database_path, &keys).unwrap();
         assert_eq!(plan.capture(&store).unwrap(), manifest);
+        plan.discard_unreferenced(&store).unwrap();
+        plan.discard_unreferenced(&store).unwrap();
+        assert!(
+            !plan
+                .area
+                .path_hint
+                .join(plan.anchor_id.to_string())
+                .exists()
+        );
+        assert!(
+            store
+                .get_record(MANIFEST_CLAIM_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(root.join("parent/child").is_dir());
+    }
+
+    #[test]
+    fn root_retirement_with_an_unstarted_file_preserves_source_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("parent")).unwrap();
+        fs::write(root.join("parent/file"), b"raw\r\nbytes\0").unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([78; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        plan.prepare_anchor_directories(&store).unwrap();
+        plan.discard_unreferenced(&store).unwrap();
+        assert_eq!(
+            fs::read(root.join("parent/file")).unwrap(),
+            b"raw\r\nbytes\0"
+        );
+        assert!(plan.prepare_anchor_root(&store).is_err());
+    }
+
+    #[test]
+    fn published_root_retirement_replays_after_manifest_unlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([81; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        plan.capture(&store).unwrap();
+        let retirement = RootRetirement {
+            format_version: 1,
+            anchor_id: plan.anchor_id,
+            plan_hash: *blake3::hash(&mb_core::canonical_bytes(&plan).unwrap()).as_bytes(),
+        };
+        store
+            .put_record(
+                RETIRE_KIND,
+                plan.anchor_id.as_bytes(),
+                &mb_core::canonical_bytes(&retirement).unwrap(),
+            )
+            .unwrap();
+        let anchor =
+            PinnedDirectory::open(plan.area.path_hint.join(plan.anchor_id.to_string())).unwrap();
+        anchor
+            .remove_child_file(capture_manifest_name(plan.anchor_id))
+            .unwrap();
+        plan.discard_unreferenced(&store).unwrap();
+        assert!(
+            store
+                .get_record(MANIFEST_CLAIM_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !plan
+                .area
+                .path_hint
+                .join(plan.anchor_id.to_string())
+                .exists()
+        );
+    }
+
+    #[test]
+    fn root_retirement_preserves_an_unknown_child_until_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("child")).unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([82; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        plan.capture(&store).unwrap();
+        let anchor = plan.area.path_hint.join(plan.anchor_id.to_string());
+        fs::write(anchor.join("child/foreign"), b"keep").unwrap();
+        assert!(plan.discard_unreferenced(&store).is_err());
+        assert_eq!(fs::read(anchor.join("child/foreign")).unwrap(), b"keep");
+        assert!(plan.capture(&store).is_err());
+        fs::remove_file(anchor.join("child/foreign")).unwrap();
+        plan.discard_unreferenced(&store).unwrap();
+        assert!(!anchor.exists());
+    }
+
+    #[test]
+    fn root_retirement_refuses_a_changed_claimed_manifest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([79; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        plan.capture(&store).unwrap();
+        let manifest_path = plan
+            .area
+            .path_hint
+            .join(plan.anchor_id.to_string())
+            .join(capture_manifest_name(plan.anchor_id));
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&manifest_path, b"changed").unwrap();
+        assert!(plan.discard_unreferenced(&store).is_err());
+        assert!(
+            store
+                .get_record(RETIRE_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN for fanotify permission events"]
+    fn complete_root_capture_replays_and_restores_access_on_retirement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-root-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        let source = root.join("nested/file");
+        fs::write(&source, b"raw\r\nbytes\0").unwrap();
+        let plan = GuardedRootCapturePlan::plan(&root).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([80; 32]));
+        let database_path = temp.path().join("control.db");
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        let manifest = plan.capture(&store).unwrap();
+        let mut anchored = Vec::new();
+        manifest
+            .file_locator("nested/file".to_owned())
+            .unwrap()
+            .open()
+            .unwrap()
+            .read_to_end(&mut anchored)
+            .unwrap();
+        assert_eq!(anchored, b"raw\r\nbytes\0");
+        assert_eq!(plan.capture(&store).unwrap(), manifest);
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o222,
+            0
+        );
+        drop(store);
+
+        let store = ControlStore::open(&database_path, &keys).unwrap();
+        plan.discard_unreferenced(&store).unwrap();
+        plan.discard_unreferenced(&store).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"raw\r\nbytes\0");
+        assert_ne!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o200,
+            0
+        );
+        assert!(
+            !plan
+                .area
+                .path_hint
+                .join(plan.anchor_id.to_string())
+                .exists()
+        );
     }
 
     #[test]
