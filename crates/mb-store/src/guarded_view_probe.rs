@@ -1,8 +1,9 @@
 //! Disposable Linux FUSE passthrough probe for the future guarded worktree.
 //!
-//! This proves only that this host can mount a view and pass read-only file
-//! access to a lower inode. It does not provide the long-lived edit guard and
-//! must not be used as an enrollment decision by itself.
+//! This proves that this host can mount a view, pass read-only file access to
+//! a lower inode, and finish one captured file's durable detach before a
+//! writable open. It is not a complete long-lived edit guard and must not be
+//! used as an enrollment decision by itself.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -27,16 +28,20 @@ use fuser::{
 const FILE_INODE: INodeNo = INodeNo(2);
 const ENTRY_TTL: Duration = Duration::ZERO;
 const PROBE_BYTES: &[u8] = b"mutualbackup-guarded-view-probe";
+// The kernel supplies O_LARGEFILE in FUSE_OPEN even when libc defines it as
+// zero for the native 64-bit ABI.
+const KERNEL_O_LARGEFILE: i32 = 0o100000;
 
-struct ReadOnlyProbeView {
+struct SingleFileProbeView {
     source: File,
     source_attr: FileAttr,
     next_handle: AtomicU64,
     denied_writable: Arc<AtomicU64>,
     backing: Mutex<HashMap<u64, BackingId>>,
+    open_for_write: Option<Arc<dyn Fn(OpenAccMode) -> io::Result<File> + Send + Sync>>,
 }
 
-impl ReadOnlyProbeView {
+impl SingleFileProbeView {
     fn root_attr(&self) -> FileAttr {
         FileAttr {
             ino: INodeNo::ROOT,
@@ -58,7 +63,28 @@ impl ReadOnlyProbeView {
     }
 }
 
-impl Filesystem for ReadOnlyProbeView {
+fn probe_file_attr(source: &File, advertised_mode: u16) -> io::Result<FileAttr> {
+    let metadata = source.metadata()?;
+    Ok(FileAttr {
+        ino: FILE_INODE,
+        size: metadata.len(),
+        blocks: metadata.blocks(),
+        atime: UNIX_EPOCH,
+        mtime: UNIX_EPOCH,
+        ctime: UNIX_EPOCH,
+        crtime: UNIX_EPOCH,
+        kind: FileType::RegularFile,
+        perm: advertised_mode,
+        nlink: 1,
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        rdev: 0,
+        flags: 0,
+        blksize: metadata.blksize() as u32,
+    })
+}
+
+impl Filesystem for SingleFileProbeView {
     fn init(&mut self, _request: &Request, config: &mut KernelConfig) -> io::Result<()> {
         config
             .add_capabilities(InitFlags::FUSE_PASSTHROUGH)
@@ -98,12 +124,36 @@ impl Filesystem for ReadOnlyProbeView {
             reply.error(Errno::ENOENT);
             return;
         }
-        if flags.acc_mode() != OpenAccMode::O_RDONLY {
-            self.denied_writable.fetch_add(1, Ordering::Relaxed);
+        if flags.0 & !(libc::O_ACCMODE | KERNEL_O_LARGEFILE) != 0 {
             reply.error(Errno::EACCES);
             return;
         }
-        let backing = match reply.open_backing(&self.source) {
+        let writable;
+        let source = if flags.acc_mode() == OpenAccMode::O_RDONLY {
+            &self.source
+        } else if matches!(
+            flags.acc_mode(),
+            OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR
+        ) {
+            let Some(open_for_write) = &self.open_for_write else {
+                self.denied_writable.fetch_add(1, Ordering::Relaxed);
+                reply.error(Errno::EACCES);
+                return;
+            };
+            writable = match open_for_write(flags.acc_mode()) {
+                Ok(file) => file,
+                Err(_) => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
+            &writable
+        } else {
+            self.denied_writable.fetch_add(1, Ordering::Relaxed);
+            reply.error(Errno::EACCES);
+            return;
+        };
+        let backing = match reply.open_backing(source) {
             Ok(backing) => backing,
             Err(_) => {
                 reply.error(Errno::EIO);
@@ -166,32 +216,16 @@ pub fn probe_guarded_view_passthrough(source_root: impl AsRef<Path>) -> anyhow::
     drop(writable);
     fs::set_permissions(&lower_path, fs::Permissions::from_mode(0o444))?;
     let source = File::open(&lower_path)?;
-    let metadata = source.metadata()?;
     let denied_writable = Arc::new(AtomicU64::new(0));
-    let view = ReadOnlyProbeView {
+    let view = SingleFileProbeView {
+        // Advertise the original editable mode. The lower inode is frozen;
+        // the view must still reject writes until detach.
+        source_attr: probe_file_attr(&source, 0o666)?,
         source,
-        source_attr: FileAttr {
-            ino: FILE_INODE,
-            size: metadata.len(),
-            blocks: metadata.blocks(),
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
-            kind: FileType::RegularFile,
-            // Advertise the original editable mode. The lower inode is
-            // frozen; the view must still reject writes until detach.
-            perm: 0o666,
-            nlink: 1,
-            uid: metadata.uid(),
-            gid: metadata.gid(),
-            rdev: 0,
-            flags: 0,
-            blksize: metadata.blksize() as u32,
-        },
         next_handle: AtomicU64::new(1),
         denied_writable: Arc::clone(&denied_writable),
         backing: Mutex::new(HashMap::new()),
+        open_for_write: None,
     };
     let mut config = Config::default();
     config.acl = SessionACL::All;
@@ -298,6 +332,23 @@ pub fn probe_guarded_view_passthrough(source_root: impl AsRef<Path>) -> anyhow::
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{self, Read};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex};
+
+    use fuser::{Config, OpenAccMode, SessionACL};
+    use mb_core::{KeyMaterial, Seed};
+
+    use crate::{
+        ControlStore, GuardedFileCapturePlan, LinkFreezeCaptureIntent, LinkFreezeCapturePhase,
+    };
+
+    use super::{SingleFileProbeView, probe_file_attr};
+
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN and FUSE passthrough"]
     fn read_only_passthrough_mount_preserves_bytes_and_denies_writable_open() {
@@ -306,5 +357,136 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| disposable.path().to_path_buf());
         super::probe_guarded_view_passthrough(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn writable_open_finishes_durable_detach_before_passthrough() {
+        let area = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-view-edit-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        fs::set_permissions(area.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let lower = area.path().join("lower");
+        let mountpoint = area.path().join("view");
+        let control_dir = area.path().join("control");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(&mountpoint).unwrap();
+        fs::create_dir(&control_dir).unwrap();
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+        let lower_path = lower.join("sample");
+        let original = b"raw\r\nbytes\0guarded";
+        fs::write(&lower_path, original).unwrap();
+        fs::set_permissions(&lower_path, fs::Permissions::from_mode(0o666)).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([73; 32]));
+        let control = ControlStore::open(control_dir.join("control.db"), &keys).unwrap();
+        let plan = GuardedFileCapturePlan::plan(&lower, "sample").unwrap();
+        let manifest = plan.capture(&control).unwrap();
+        let source = File::open(&lower_path).unwrap();
+        let original_inode = source.metadata().unwrap().ino();
+        let control = Arc::new(Mutex::new(control));
+        let control_for_open = Arc::clone(&control);
+        let plan_for_open = plan.clone();
+        let path_for_open = lower_path.clone();
+        let open_for_write = Arc::new(move |mode: OpenAccMode| -> io::Result<File> {
+            let control = control_for_open
+                .lock()
+                .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+            plan_for_open
+                .prepare_edit(&control)
+                .map_err(io::Error::other)?;
+            OpenOptions::new()
+                .read(mode == OpenAccMode::O_RDWR)
+                .write(true)
+                .open(&path_for_open)
+        });
+        let view = SingleFileProbeView {
+            source_attr: probe_file_attr(&source, 0o666).unwrap(),
+            source,
+            next_handle: AtomicU64::new(1),
+            denied_writable: Arc::new(AtomicU64::new(0)),
+            backing: Mutex::default(),
+            open_for_write: Some(open_for_write),
+        };
+        let mut config = Config::default();
+        config.acl = SessionACL::All;
+        let session = fuser::spawn_mount(view, &mountpoint, &config).unwrap();
+        let result = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(fs::read(mountpoint.join("sample"))? == original);
+            let _ = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_TRUNC)
+                .open(mountpoint.join("sample"));
+            let _ =
+                fs::set_permissions(mountpoint.join("sample"), fs::Permissions::from_mode(0o666));
+            anyhow::ensure!(fs::read(&lower_path)? == original);
+            anyhow::ensure!(fs::metadata(&lower_path)?.permissions().mode() & 0o222 == 0);
+            let guest_read = Command::new("cat")
+                .uid(65534)
+                .gid(65534)
+                .arg(mountpoint.join("sample"))
+                .output()?;
+            anyhow::ensure!(
+                guest_read.status.success(),
+                "ordinary-user read failed: {}",
+                String::from_utf8_lossy(&guest_read.stderr)
+            );
+            anyhow::ensure!(guest_read.stdout == original);
+            anyhow::ensure!(
+                fs::metadata(mountpoint.join("sample"))?
+                    .permissions()
+                    .mode()
+                    & 0o222
+                    != 0
+            );
+            let output = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.write(fd,b'EDIT'); os.fsync(fd); os.close(fd)")
+                .arg(mountpoint.join("sample"))
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "ordinary-user write failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            anyhow::ensure!(fs::read(&lower_path)?.starts_with(b"EDIT"));
+            anyhow::ensure!(fs::read(mountpoint.join("sample"))?.starts_with(b"EDIT"));
+            let second_open = Command::new("python3")
+                .uid(65534)
+                .gid(65534)
+                .arg("-c")
+                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_RDWR); os.lseek(fd,5,os.SEEK_SET); os.write(fd,b'NEXT'); os.fsync(fd); os.close(fd)")
+                .arg(mountpoint.join("sample"))
+                .output()?;
+            anyhow::ensure!(
+                second_open.status.success(),
+                "ordinary-user read/write open failed: {}",
+                String::from_utf8_lossy(&second_open.stderr)
+            );
+            anyhow::ensure!(fs::read(&lower_path)?.starts_with(b"EDIT\nNEXT"));
+            let source_metadata = fs::metadata(&lower_path)?;
+            anyhow::ensure!(
+                source_metadata.ino() == original_inode && source_metadata.nlink() == 1
+            );
+            anyhow::ensure!(source_metadata.permissions().mode() & 0o222 != 0);
+            let mut anchored = Vec::new();
+            let mut anchor = manifest.open_verified()?;
+            anyhow::ensure!(anchor.metadata()?.ino() != original_inode);
+            anchor.read_to_end(&mut anchored)?;
+            anyhow::ensure!(anchored == original);
+            anyhow::ensure!(
+                LinkFreezeCaptureIntent::load(&control.lock().unwrap(), plan.anchor_id())?
+                    .is_some_and(|intent| intent.phase() == LinkFreezeCapturePhase::Detached)
+            );
+            Ok(())
+        })();
+        let unmounted = session.umount_and_join();
+        result.unwrap();
+        unmounted.unwrap();
     }
 }
