@@ -93,6 +93,10 @@ impl GuardedFileCapturePlan {
     /// appears only after journal replay proves the anchor's exact bytes.
     pub fn capture(&self, control: &ControlStore) -> anyhow::Result<FileAnchorManifest> {
         anyhow::ensure!(self.format_version == 1 && !self.anchor_id.is_nil());
+        anyhow::ensure!(
+            !LinkFreezeCaptureIntent::retirement_pending(control, self.anchor_id)?,
+            "guarded file anchor is being retired"
+        );
         validate_relative(&self.relative_path)?;
         let encoded_plan = mb_core::canonical_bytes(self)?;
         let new_plan =
@@ -213,6 +217,90 @@ impl GuardedFileCapturePlan {
         Ok(manifest)
     }
 
+    /// The owner must prove this anchor is unreferenced before calling this
+    /// method. Keep the plan record until source access and namespace cleanup
+    /// both finish, so a crash can replay the same retirement.
+    pub fn discard_unreferenced(&self, control: &ControlStore) -> anyhow::Result<()> {
+        anyhow::ensure!(self.format_version == 1 && !self.anchor_id.is_nil());
+        let plan_bytes = mb_core::canonical_bytes(self)?;
+        let recorded_plan = control.get_record(PLAN_KIND, self.anchor_id.as_bytes())?;
+        let area_path = resolve_anchor_area(&self.area)?;
+        let area_file = open_stable_anchor_area(&area_path, &self.area)?;
+        let area = PinnedDirectory {
+            file: area_file,
+            filesystem_id: self.area.filesystem_id,
+        };
+        let directory_name = self.anchor_id.to_string();
+        if recorded_plan.is_none() {
+            anyhow::ensure!(
+                area.open_child_directory(&directory_name)?.is_none()
+                    && LinkFreezeCaptureIntent::load(control, self.anchor_id)?.is_none(),
+                "unowned guarded anchor directory or capture remains after retirement"
+            );
+            LinkFreezeCaptureIntent::finish_completed_retirement(control, self.anchor_id)?;
+            return Ok(());
+        }
+        anyhow::ensure!(recorded_plan.as_ref() == Some(&plan_bytes));
+        let anchor_parent = area.open_child_directory(&directory_name)?;
+        if let Some(anchor_parent) = anchor_parent.as_ref() {
+            let source_parent = self
+                .open_source_parent()
+                .unwrap_or(anchor_parent.try_clone()?);
+            if let Some(capture) = LinkFreezeCaptureIntent::load(control, self.anchor_id)? {
+                let capture = if capture.phase() == LinkFreezeCapturePhase::Prepared {
+                    capture.resume(control, &source_parent, anchor_parent)?
+                } else {
+                    Some(capture)
+                };
+                if let Some(capture) = capture {
+                    capture.retire_unreferenced(control, &source_parent, anchor_parent)?;
+                }
+            }
+            anyhow::ensure!(
+                LinkFreezeCaptureIntent::retirement_ready_for_cleanup(control, self.anchor_id)?
+                    && LinkFreezeCaptureIntent::load(control, self.anchor_id)?.is_none()
+                    && anchor_parent.entry_identity(PAYLOAD_NAME, false)?.is_none(),
+                "guarded anchor still has a live capture or payload"
+            );
+            let manifest_name = capture_manifest_name(self.anchor_id);
+            if let Some(manifest_id) = anchor_parent.entry_identity(&manifest_name, false)? {
+                let mut file = anchor_parent
+                    .open_child_file(&manifest_name)?
+                    .ok_or_else(|| anyhow::anyhow!("guarded manifest disappeared"))?;
+                anyhow::ensure!(file.metadata()?.len() <= 64 * 1024);
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                let manifest: FileAnchorManifest = mb_core::decode_canonical(&bytes)?;
+                anyhow::ensure!(
+                    manifest.format_version == 1
+                        && manifest.anchor_id == self.anchor_id
+                        && manifest.area == self.area
+                        && manifest.source_root_hint == self.source_root
+                        && manifest.source_relative_path == self.relative_path
+                        && manifest.source_version == self.source_version,
+                    "guarded manifest does not belong to this source plan"
+                );
+                anchor_parent.remove_child_file_if_identity(&manifest_name, manifest_id)?;
+            }
+            anyhow::ensure!(
+                area.remove_empty_child_directory(&directory_name, anchor_parent.identity()?)?,
+                "guarded anchor directory has unknown remaining entries"
+            );
+        } else {
+            anyhow::ensure!(
+                LinkFreezeCaptureIntent::load(control, self.anchor_id)?.is_none(),
+                "missing guarded anchor directory has a live capture"
+            );
+            anyhow::ensure!(
+                LinkFreezeCaptureIntent::retirement_ready_for_cleanup(control, self.anchor_id)?,
+                "guarded retirement has not restored source access"
+            );
+        }
+        control.delete_record_if_value(PLAN_KIND, self.anchor_id.as_bytes(), &plan_bytes)?;
+        LinkFreezeCaptureIntent::finish_completed_retirement(control, self.anchor_id)?;
+        Ok(())
+    }
+
     fn open_source_parent(&self) -> Result<PinnedDirectory, AnchorError> {
         let root = PinnedDirectory::open(&self.source_root)?;
         if root.identity()? != self.source_root_id {
@@ -240,6 +328,7 @@ impl GuardedFileCapturePlan {
 mod tests {
     use std::fs;
     use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
 
     use mb_core::{KeyMaterial, Seed};
 
@@ -305,6 +394,42 @@ mod tests {
             .read_to_end(&mut retained)
             .unwrap();
         assert_eq!(retained, b"raw\r\nbytes\0");
+        plan.discard_unreferenced(&store).unwrap();
+        assert!(manifest.open_verified().is_err());
+        assert!(
+            LinkFreezeCaptureIntent::load(&store, plan.anchor_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !plan
+                .area
+                .path_hint
+                .join(plan.anchor_id.to_string())
+                .exists()
+        );
+
+        let frozen_path = source_root.join("frozen");
+        fs::write(&frozen_path, b"keep source bytes").unwrap();
+        let frozen_plan = GuardedFileCapturePlan::plan(&source_root, "frozen").unwrap();
+        frozen_plan.capture(&store).unwrap();
+        assert_eq!(
+            fs::metadata(&frozen_path).unwrap().permissions().mode() & 0o222,
+            0
+        );
+        frozen_plan.discard_unreferenced(&store).unwrap();
+        assert_eq!(fs::read(&frozen_path).unwrap(), b"keep source bytes");
+        assert_ne!(
+            fs::metadata(&frozen_path).unwrap().permissions().mode() & 0o200,
+            0
+        );
+        assert!(
+            !frozen_plan
+                .area
+                .path_hint
+                .join(frozen_plan.anchor_id.to_string())
+                .exists()
+        );
 
         fs::write(source_root.join("changed"), b"first").unwrap();
         let stale = GuardedFileCapturePlan::plan(&source_root, "changed").unwrap();
@@ -314,6 +439,14 @@ mod tests {
             LinkFreezeCaptureIntent::load(&store, stale.anchor_id)
                 .unwrap()
                 .is_none()
+        );
+        stale.discard_unreferenced(&store).unwrap();
+        assert!(
+            !stale
+                .area
+                .path_hint
+                .join(stale.anchor_id.to_string())
+                .exists()
         );
     }
 }

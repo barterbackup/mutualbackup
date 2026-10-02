@@ -16,6 +16,7 @@ use crate::anchor::{CaptureVersion, NativeFileId, PinnedDirectory, capture_versi
 use crate::database::ControlStore;
 
 const CAPTURE_INTENT_KIND: &str = "link-freeze-capture-v1";
+const RETIRE_INTENT_KIND: &str = "link-freeze-retire-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LinkFreezeCapturePhase {
@@ -49,6 +50,47 @@ struct LegacyCaptureIntentV1 {
     anchor_name: PathBuf,
     proof: FrozenAnchorProof,
     phase: LinkFreezeCapturePhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum RetirePhase {
+    Planned,
+    NoSource,
+    AnchorRemoved,
+    AccessRestored,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct RetireIntent {
+    format_version: u16,
+    capture: LinkFreezeCaptureIntent,
+    phase: RetirePhase,
+}
+
+impl RetireIntent {
+    fn load(control: &ControlStore, anchor_id: Uuid) -> anyhow::Result<Option<Self>> {
+        let Some(bytes) = control.get_record(RETIRE_INTENT_KIND, anchor_id.as_bytes())? else {
+            return Ok(None);
+        };
+        let intent: Self = mb_core::decode_canonical(&bytes)?;
+        anyhow::ensure!(
+            intent.format_version == 1 && intent.capture.anchor_id == anchor_id,
+            "invalid frozen-anchor retirement"
+        );
+        Ok(Some(intent))
+    }
+
+    fn advance(&mut self, control: &ControlStore, phase: RetirePhase) -> anyhow::Result<()> {
+        let before = mb_core::canonical_bytes(&self)?;
+        self.phase = phase;
+        control.replace_record_if_value(
+            RETIRE_INTENT_KIND,
+            self.capture.anchor_id.as_bytes(),
+            &before,
+            &mb_core::canonical_bytes(&self)?,
+        )?;
+        Ok(())
+    }
 }
 
 impl LinkFreezeCaptureIntent {
@@ -231,6 +273,196 @@ impl LinkFreezeCaptureIntent {
 
     pub fn phase(&self) -> LinkFreezeCapturePhase {
         self.phase
+    }
+
+    pub(crate) fn retirement_pending(
+        control: &ControlStore,
+        anchor_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        Ok(RetireIntent::load(control, anchor_id)?.is_some())
+    }
+
+    pub(crate) fn retirement_ready_for_cleanup(
+        control: &ControlStore,
+        anchor_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        Ok(RetireIntent::load(control, anchor_id)?
+            .is_none_or(|intent| intent.phase == RetirePhase::AccessRestored))
+    }
+
+    pub(crate) fn finish_completed_retirement(
+        control: &ControlStore,
+        anchor_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        let Some(intent) = RetireIntent::load(control, anchor_id)? else {
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            intent.phase == RetirePhase::AccessRestored
+                && control
+                    .get_record(CAPTURE_INTENT_KIND, anchor_id.as_bytes())?
+                    .is_none(),
+            "frozen-anchor retirement still needs source or anchor recovery"
+        );
+        control.delete_record_if_value(
+            RETIRE_INTENT_KIND,
+            anchor_id.as_bytes(),
+            &mb_core::canonical_bytes(&intent)?,
+        )?;
+        Ok(true)
+    }
+
+    /// Retire an unreferenced capture without leaving a shared source inode
+    /// frozen. The caller must first prove that no protected graph or pending
+    /// capture still pins this anchor. A separate durable marker covers the
+    /// unlink/access-restore gap across crashes.
+    pub(crate) fn retire_unreferenced(
+        self,
+        control: &ControlStore,
+        source_parent: &PinnedDirectory,
+        anchor_parent: &PinnedDirectory,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(
+                self.phase,
+                LinkFreezeCapturePhase::Frozen | LinkFreezeCapturePhase::Detached
+            ) && LinkFreezeEditIntent::load(control, self.anchor_id)?.is_none()
+                && anchor_parent.identity()? == self.anchor_parent_id,
+            "capture cannot retire during a pending freeze or edit"
+        );
+        anyhow::ensure!(
+            control.get_record(CAPTURE_INTENT_KIND, self.anchor_id.as_bytes())?
+                == Some(mb_core::canonical_bytes(&self)?),
+            "capture changed before retirement"
+        );
+        let mut retire = match RetireIntent::load(control, self.anchor_id)? {
+            Some(existing) => {
+                anyhow::ensure!(existing.capture == self, "retirement changed capture proof");
+                existing
+            }
+            None => {
+                let intent = RetireIntent {
+                    format_version: 1,
+                    capture: self.clone(),
+                    phase: RetirePhase::Planned,
+                };
+                anyhow::ensure!(control.put_record_if_absent(
+                    RETIRE_INTENT_KIND,
+                    self.anchor_id.as_bytes(),
+                    &mb_core::canonical_bytes(&intent)?,
+                )?);
+                intent
+            }
+        };
+        if retire.phase == RetirePhase::Planned {
+            if self.phase == LinkFreezeCapturePhase::Detached {
+                if let Some(private_id) = anchor_parent.entry_identity(&self.anchor_name, false)? {
+                    self.check_private_anchor(anchor_parent, self.private_inode.unwrap())?;
+                    anchor_parent.remove_child_file_if_identity(&self.anchor_name, private_id)?;
+                }
+                retire.advance(control, RetirePhase::AccessRestored)?;
+            } else {
+                let source_entry = if source_parent.identity()? == self.source_parent_id {
+                    source_parent.entry_identity(&self.source_name, false)?
+                } else {
+                    None
+                };
+                let anchor_entry = anchor_parent.entry_identity(&self.anchor_name, false)?;
+                match (source_entry, anchor_entry) {
+                    (Some(source_id), Some(anchor_id))
+                        if source_id == self.source_id && anchor_id == self.source_id =>
+                    {
+                        let source = source_parent
+                            .open_child_file(&self.source_name)?
+                            .ok_or_else(|| anyhow::anyhow!("frozen source disappeared"))?;
+                        let guard = FileWriteExclusion::acquire(source)?;
+                        anyhow::ensure!(
+                            guard.file.metadata()?.nlink() == 2
+                                && FileAccessSnapshot::capture(&guard.file)?.mode & 0o222 == 0
+                                && self.content_matches(&guard.file)?
+                                && guard.is_held()?,
+                            "shared anchor changed before retirement"
+                        );
+                        anchor_parent
+                            .remove_child_file_if_identity(&self.anchor_name, self.source_id)?;
+                        anyhow::ensure!(guard.file.metadata()?.nlink() == 1 && guard.is_held()?);
+                        retire.advance(control, RetirePhase::AnchorRemoved)?;
+                        guard.release()?;
+                    }
+                    (Some(source_id), None) if source_id == self.source_id => {
+                        anyhow::ensure!(
+                            source_parent
+                                .open_child_file(&self.source_name)?
+                                .ok_or_else(|| anyhow::anyhow!("retiring source disappeared"))?
+                                .metadata()?
+                                .nlink()
+                                == 1,
+                            "retiring source kept another hard-link alias"
+                        );
+                        retire.advance(control, RetirePhase::AnchorRemoved)?;
+                    }
+                    (None, Some(anchor_id)) if anchor_id == self.source_id => {
+                        let anchor = anchor_parent
+                            .open_child_file(&self.anchor_name)?
+                            .ok_or_else(|| anyhow::anyhow!("frozen anchor disappeared"))?;
+                        let guard = FileWriteExclusion::acquire(anchor)?;
+                        anyhow::ensure!(
+                            guard.file.metadata()?.nlink() == 1
+                                && FileAccessSnapshot::capture(&guard.file)?.mode & 0o222 == 0
+                                && self.content_matches(&guard.file)?
+                                && guard.is_held()?,
+                            "unlinked source left an unverified anchor"
+                        );
+                        retire.advance(control, RetirePhase::NoSource)?;
+                        guard.release()?;
+                    }
+                    _ => anyhow::bail!("retiring anchor has an unknown source or alias"),
+                }
+            }
+        }
+        if retire.phase == RetirePhase::NoSource {
+            if let Some(anchor_id) = anchor_parent.entry_identity(&self.anchor_name, false)? {
+                anyhow::ensure!(anchor_id == self.source_id);
+                let anchor = anchor_parent
+                    .open_child_file(&self.anchor_name)?
+                    .ok_or_else(|| anyhow::anyhow!("retiring anchor disappeared"))?;
+                let guard = FileWriteExclusion::acquire(anchor)?;
+                anyhow::ensure!(
+                    guard.file.metadata()?.nlink() == 1
+                        && self.content_matches(&guard.file)?
+                        && guard.is_held()?,
+                    "unlinked retiring anchor changed"
+                );
+                anchor_parent.remove_child_file_if_identity(&self.anchor_name, self.source_id)?;
+                guard.release()?;
+            }
+            retire.advance(control, RetirePhase::AccessRestored)?;
+        }
+        if retire.phase == RetirePhase::AnchorRemoved {
+            anyhow::ensure!(
+                source_parent.identity()? == self.source_parent_id
+                    && source_parent.entry_identity(&self.source_name, false)?
+                        == Some(self.source_id)
+                    && anchor_parent
+                        .entry_identity(&self.anchor_name, false)?
+                        .is_none(),
+                "retiring source moved before access restoration"
+            );
+            let source = source_parent
+                .open_child_file(&self.source_name)?
+                .ok_or_else(|| anyhow::anyhow!("retiring source disappeared"))?;
+            self.proof
+                .original_access
+                .restore_unshared_after_abandon(&source)?;
+            retire.advance(control, RetirePhase::AccessRestored)?;
+        }
+        anyhow::ensure!(retire.phase == RetirePhase::AccessRestored);
+        control.delete_record_if_value(
+            CAPTURE_INTENT_KIND,
+            self.anchor_id.as_bytes(),
+            &mb_core::canonical_bytes(&self)?,
+        )?;
+        Ok(())
     }
 
     pub(crate) fn matches_file_plan(
@@ -453,6 +685,10 @@ impl LinkFreezeCaptureIntent {
         anchor_parent: &PinnedDirectory,
     ) -> anyhow::Result<Option<Self>> {
         anyhow::ensure!(
+            !Self::retirement_pending(control, self.anchor_id)?,
+            "frozen anchor is being retired"
+        );
+        anyhow::ensure!(
             control.get_record(CAPTURE_INTENT_KIND, self.anchor_id.as_bytes())?
                 == Some(mb_core::canonical_bytes(&self)?),
             "frozen capture intent changed before replay"
@@ -586,6 +822,10 @@ impl LinkFreezeCaptureIntent {
         anchor_parent: &PinnedDirectory,
         known_source_link: Option<(&PinnedDirectory, &Path)>,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !Self::retirement_pending(control, self.anchor_id)?,
+            "frozen anchor is being retired"
+        );
         anyhow::ensure!(self.phase == LinkFreezeCapturePhase::Frozen);
         anyhow::ensure!(
             control.get_record(CAPTURE_INTENT_KIND, self.anchor_id.as_bytes())?
@@ -790,7 +1030,8 @@ mod tests {
     use mb_core::{KeyMaterial, Seed};
 
     use super::{
-        CAPTURE_INTENT_KIND, LegacyCaptureIntentV1, LinkFreezeCaptureIntent, LinkFreezeCapturePhase,
+        CAPTURE_INTENT_KIND, LegacyCaptureIntentV1, LinkFreezeCaptureIntent,
+        LinkFreezeCapturePhase, RETIRE_INTENT_KIND, RetireIntent, RetirePhase,
     };
     use crate::anchor::{NativeFileId, PinnedDirectory};
     use crate::link_freeze::{
@@ -852,6 +1093,28 @@ mod tests {
                 .unwrap(),
             Some(mb_core::canonical_bytes(&migrated).unwrap())
         );
+        let retired = RetireIntent {
+            format_version: 1,
+            capture: migrated.clone(),
+            phase: RetirePhase::AccessRestored,
+        };
+        store
+            .put_record_if_absent(
+                RETIRE_INTENT_KIND,
+                anchor_id.as_bytes(),
+                &mb_core::canonical_bytes(&retired).unwrap(),
+            )
+            .unwrap();
+        assert!(LinkFreezeCaptureIntent::finish_completed_retirement(&store, anchor_id).is_err());
+        store
+            .delete_record_if_value(
+                CAPTURE_INTENT_KIND,
+                anchor_id.as_bytes(),
+                &mb_core::canonical_bytes(&migrated).unwrap(),
+            )
+            .unwrap();
+        assert!(LinkFreezeCaptureIntent::finish_completed_retirement(&store, anchor_id).unwrap());
+        assert!(!LinkFreezeCaptureIntent::retirement_pending(&store, anchor_id).unwrap());
     }
 
     #[test]
@@ -1311,6 +1574,72 @@ mod tests {
             );
             assert_eq!(fs::read(&source_path).unwrap(), b"replacement");
         }
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN for fanotify permission events"]
+    fn retirement_recovers_after_anchor_unlink_before_access_restore() {
+        let root = test_directory();
+        let source_path = root.path().join("source");
+        let anchor_path = root.path().join("anchor");
+        fs::write(&source_path, b"keep working bytes").unwrap();
+        let original_mode = fs::metadata(&source_path).unwrap().permissions().mode() & 0o7777;
+        let parent = PinnedDirectory::open(root.path()).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([98; 32]));
+        let database_path = root.path().join("control.db");
+        let store = crate::database::ControlStore::open(&database_path, &keys).unwrap();
+        let anchor_id = uuid::Uuid::new_v4();
+        let frozen =
+            LinkFreezeCaptureIntent::begin(&store, anchor_id, &parent, "source", &parent, "anchor")
+                .unwrap()
+                .resume(&store, &parent, &parent)
+                .unwrap()
+                .unwrap();
+        let planned = RetireIntent {
+            format_version: 1,
+            capture: frozen.clone(),
+            phase: RetirePhase::Planned,
+        };
+        store
+            .put_record_if_absent(
+                RETIRE_INTENT_KIND,
+                anchor_id.as_bytes(),
+                &mb_core::canonical_bytes(&planned).unwrap(),
+            )
+            .unwrap();
+        let guard = FileWriteExclusion::acquire(File::open(&source_path).unwrap()).unwrap();
+        parent
+            .remove_child_file_if_identity("anchor", frozen.source_id)
+            .unwrap();
+        guard.release().unwrap();
+        assert!(!anchor_path.exists());
+        assert_eq!(
+            fs::metadata(&source_path).unwrap().permissions().mode() & 0o222,
+            0
+        );
+        drop(store);
+
+        let store = crate::database::ControlStore::open(&database_path, &keys).unwrap();
+        let frozen = LinkFreezeCaptureIntent::load(&store, anchor_id)
+            .unwrap()
+            .unwrap();
+        assert!(frozen.clone().resume(&store, &parent, &parent).is_err());
+        frozen
+            .retire_unreferenced(&store, &parent, &parent)
+            .unwrap();
+        assert_eq!(fs::read(&source_path).unwrap(), b"keep working bytes");
+        assert_eq!(
+            fs::metadata(&source_path).unwrap().permissions().mode() & 0o7777,
+            original_mode
+        );
+        assert!(
+            LinkFreezeCaptureIntent::load(&store, anchor_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(LinkFreezeCaptureIntent::retirement_pending(&store, anchor_id).unwrap());
+        assert!(LinkFreezeCaptureIntent::finish_completed_retirement(&store, anchor_id).unwrap());
+        assert!(!LinkFreezeCaptureIntent::retirement_pending(&store, anchor_id).unwrap());
     }
 
     fn test_directory() -> tempfile::TempDir {
