@@ -16,13 +16,13 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, ensure};
 use fuser::{
-    BackingId, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, InitFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags, ReplyAttr, ReplyEmpty,
-    ReplyEntry, ReplyOpen, Request, SessionACL,
+    BackingId, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, InitFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags, ReplyAttr,
+    ReplyEmpty, ReplyEntry, ReplyOpen, Request, SessionACL, TimeOrNow,
 };
 
 const FILE_INODE: INodeNo = INodeNo(2);
@@ -34,15 +34,21 @@ const KERNEL_O_LARGEFILE: i32 = 0o100000;
 
 struct SingleFileProbeView {
     source: File,
-    source_attr: FileAttr,
+    source_attr: Mutex<FileAttr>,
     next_handle: AtomicU64,
     denied_writable: Arc<AtomicU64>,
-    backing: Mutex<HashMap<u64, BackingId>>,
+    backing: Mutex<HashMap<u64, ActiveBacking>>,
     open_for_write: Option<Arc<dyn Fn(OpenAccMode) -> io::Result<File> + Send + Sync>>,
+}
+
+struct ActiveBacking {
+    id: BackingId,
+    mode: OpenAccMode,
 }
 
 impl SingleFileProbeView {
     fn root_attr(&self) -> FileAttr {
+        let source_attr = self.source_attr.lock().unwrap();
         FileAttr {
             ino: INodeNo::ROOT,
             size: 0,
@@ -54,12 +60,20 @@ impl SingleFileProbeView {
             kind: FileType::Directory,
             perm: 0o755,
             nlink: 2,
-            uid: self.source_attr.uid,
-            gid: self.source_attr.gid,
+            uid: source_attr.uid,
+            gid: source_attr.gid,
             rdev: 0,
             flags: 0,
             blksize: 4096,
         }
+    }
+
+    fn current_file_attr(&self) -> io::Result<FileAttr> {
+        let metadata = self.source.metadata()?;
+        let mut attr = self.source_attr.lock().unwrap();
+        attr.size = metadata.len();
+        attr.blocks = metadata.blocks();
+        Ok(*attr)
     }
 }
 
@@ -99,7 +113,10 @@ impl Filesystem for SingleFileProbeView {
 
     fn lookup(&self, _request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         if parent == INodeNo::ROOT && name == OsStr::new("sample") {
-            reply.entry(&ENTRY_TTL, &self.source_attr, Generation(0));
+            match self.current_file_attr() {
+                Ok(attr) => reply.entry(&ENTRY_TTL, &attr, Generation(0)),
+                Err(_) => reply.error(Errno::EIO),
+            }
         } else {
             reply.error(Errno::ENOENT);
         }
@@ -114,8 +131,84 @@ impl Filesystem for SingleFileProbeView {
     ) {
         match inode {
             INodeNo::ROOT => reply.attr(&ENTRY_TTL, &self.root_attr()),
-            FILE_INODE => reply.attr(&ENTRY_TTL, &self.source_attr),
+            FILE_INODE => match self.current_file_attr() {
+                Ok(attr) => reply.attr(&ENTRY_TTL, &attr),
+                Err(_) => reply.error(Errno::EIO),
+            },
             _ => reply.error(Errno::ENOENT),
+        }
+    }
+
+    fn setattr(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        ctime: Option<SystemTime>,
+        handle: Option<FileHandle>,
+        crtime: Option<SystemTime>,
+        chgtime: Option<SystemTime>,
+        bkuptime: Option<SystemTime>,
+        flags: Option<BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        if inode != FILE_INODE {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        if (mode.is_none() && size.is_none())
+            || uid.is_some()
+            || gid.is_some()
+            || atime.is_some()
+            || mtime.is_some()
+            || ctime.is_some()
+            || crtime.is_some()
+            || chgtime.is_some()
+            || bkuptime.is_some()
+            || flags.is_some()
+        {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        if let Some(handle) = handle {
+            let held = self.backing.lock().unwrap();
+            let Some(backing) = held.get(&handle.0) else {
+                reply.error(Errno::EIO);
+                return;
+            };
+            if size.is_some() && backing.mode == OpenAccMode::O_RDONLY {
+                reply.error(Errno::EACCES);
+                return;
+            }
+        }
+        let Some(open_for_write) = &self.open_for_write else {
+            reply.error(Errno::EACCES);
+            return;
+        };
+        let result = (|| -> io::Result<FileAttr> {
+            // The callback completes the durable sparse detach before this
+            // operation can change the inode shared with an anchor.
+            let source = open_for_write(OpenAccMode::O_RDWR)?;
+            if let Some(size) = size {
+                source.set_len(size)?;
+            }
+            if let Some(mode) = mode {
+                source.set_permissions(fs::Permissions::from_mode(mode & 0o7777))?;
+            }
+            source.sync_all()?;
+            if let Some(mode) = mode {
+                self.source_attr.lock().unwrap().perm = (mode & 0o7777) as u16;
+            }
+            self.current_file_attr()
+        })();
+        match result {
+            Ok(attr) => reply.attr(&ENTRY_TTL, &attr),
+            Err(_) => reply.error(Errno::EIO),
         }
     }
 
@@ -162,8 +255,14 @@ impl Filesystem for SingleFileProbeView {
         };
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let mut held = self.backing.lock().unwrap();
-        held.insert(handle, backing);
-        reply.opened_passthrough(FileHandle(handle), FopenFlags::empty(), &held[&handle]);
+        held.insert(
+            handle,
+            ActiveBacking {
+                id: backing,
+                mode: flags.acc_mode(),
+            },
+        );
+        reply.opened_passthrough(FileHandle(handle), FopenFlags::empty(), &held[&handle].id);
     }
 
     fn release(
@@ -220,7 +319,7 @@ pub fn probe_guarded_view_passthrough(source_root: impl AsRef<Path>) -> anyhow::
     let view = SingleFileProbeView {
         // Advertise the original editable mode. The lower inode is frozen;
         // the view must still reject writes until detach.
-        source_attr: probe_file_attr(&source, 0o666)?,
+        source_attr: Mutex::new(probe_file_attr(&source, 0o666)?),
         source,
         next_handle: AtomicU64::new(1),
         denied_writable: Arc::clone(&denied_writable),
@@ -334,7 +433,7 @@ pub fn probe_guarded_view_passthrough(source_root: impl AsRef<Path>) -> anyhow::
 mod tests {
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, Read};
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
     use std::process::Command;
     use std::sync::atomic::AtomicU64;
@@ -359,9 +458,15 @@ mod tests {
         super::probe_guarded_view_passthrough(root).unwrap();
     }
 
-    #[test]
-    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
-    fn writable_open_finishes_durable_detach_before_passthrough() {
+    #[derive(Clone, Copy)]
+    enum FirstMutation {
+        WritableOpen,
+        OwnerChmod,
+        PathTruncate,
+        OpenTruncate,
+    }
+
+    fn guarded_view_mutation_case(first: FirstMutation) {
         let area = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
             Some(root) => tempfile::Builder::new()
                 .prefix("mb-guarded-view-edit-")
@@ -403,8 +508,10 @@ mod tests {
                 .write(true)
                 .open(&path_for_open)
         });
+        let mut advertised = probe_file_attr(&source, 0o666).unwrap();
+        advertised.uid = 65534;
         let view = SingleFileProbeView {
-            source_attr: probe_file_attr(&source, 0o666).unwrap(),
+            source_attr: Mutex::new(advertised),
             source,
             next_handle: AtomicU64::new(1),
             denied_writable: Arc::new(AtomicU64::new(0)),
@@ -416,12 +523,6 @@ mod tests {
         let session = fuser::spawn_mount(view, &mountpoint, &config).unwrap();
         let result = (|| -> anyhow::Result<()> {
             anyhow::ensure!(fs::read(mountpoint.join("sample"))? == original);
-            let _ = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_TRUNC)
-                .open(mountpoint.join("sample"));
-            let _ =
-                fs::set_permissions(mountpoint.join("sample"), fs::Permissions::from_mode(0o666));
             anyhow::ensure!(fs::read(&lower_path)? == original);
             anyhow::ensure!(fs::metadata(&lower_path)?.permissions().mode() & 0o222 == 0);
             let guest_read = Command::new("cat")
@@ -442,33 +543,68 @@ mod tests {
                     & 0o222
                     != 0
             );
+            let script = match first {
+                FirstMutation::WritableOpen => {
+                    "import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.write(fd,b'EDIT'); os.fsync(fd); os.close(fd)"
+                }
+                FirstMutation::OwnerChmod => "import os,sys; os.chmod(sys.argv[1],0o600)",
+                FirstMutation::PathTruncate => "import os,sys; os.truncate(sys.argv[1],3)",
+                FirstMutation::OpenTruncate => {
+                    "import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY|os.O_TRUNC); os.write(fd,b'REPLACED'); os.fsync(fd); os.close(fd)"
+                }
+            };
             let output = Command::new("python3")
                 .uid(65534)
                 .gid(65534)
                 .arg("-c")
-                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.write(fd,b'EDIT'); os.fsync(fd); os.close(fd)")
+                .arg(script)
                 .arg(mountpoint.join("sample"))
                 .output()?;
             anyhow::ensure!(
                 output.status.success(),
-                "ordinary-user write failed: {}",
+                "ordinary-user guarded mutation failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            anyhow::ensure!(fs::read(&lower_path)?.starts_with(b"EDIT"));
-            anyhow::ensure!(fs::read(mountpoint.join("sample"))?.starts_with(b"EDIT"));
-            let second_open = Command::new("python3")
-                .uid(65534)
-                .gid(65534)
-                .arg("-c")
-                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_RDWR); os.lseek(fd,5,os.SEEK_SET); os.write(fd,b'NEXT'); os.fsync(fd); os.close(fd)")
-                .arg(mountpoint.join("sample"))
-                .output()?;
-            anyhow::ensure!(
-                second_open.status.success(),
-                "ordinary-user read/write open failed: {}",
-                String::from_utf8_lossy(&second_open.stderr)
-            );
-            anyhow::ensure!(fs::read(&lower_path)?.starts_with(b"EDIT\nNEXT"));
+            match first {
+                FirstMutation::WritableOpen => {
+                    anyhow::ensure!(fs::read(&lower_path)?.starts_with(b"EDIT"));
+                    anyhow::ensure!(fs::read(mountpoint.join("sample"))?.starts_with(b"EDIT"));
+                    let second_open = Command::new("python3")
+                        .uid(65534)
+                        .gid(65534)
+                        .arg("-c")
+                        .arg("import os,sys; fd=os.open(sys.argv[1],os.O_RDWR); os.lseek(fd,5,os.SEEK_SET); os.write(fd,b'NEXT'); os.fsync(fd); os.close(fd)")
+                        .arg(mountpoint.join("sample"))
+                        .output()?;
+                    anyhow::ensure!(
+                        second_open.status.success(),
+                        "ordinary-user read/write open failed: {}",
+                        String::from_utf8_lossy(&second_open.stderr)
+                    );
+                    anyhow::ensure!(fs::read(&lower_path)?.starts_with(b"EDIT\nNEXT"));
+                }
+                FirstMutation::OwnerChmod => {
+                    anyhow::ensure!(fs::read(&lower_path)? == original);
+                    anyhow::ensure!(
+                        fs::metadata(&lower_path)?.permissions().mode() & 0o777 == 0o600
+                    );
+                    anyhow::ensure!(
+                        fs::metadata(mountpoint.join("sample"))?
+                            .permissions()
+                            .mode()
+                            & 0o777
+                            == 0o600
+                    );
+                }
+                FirstMutation::PathTruncate => {
+                    anyhow::ensure!(fs::read(&lower_path)? == original[..3]);
+                    anyhow::ensure!(fs::read(mountpoint.join("sample"))? == original[..3]);
+                }
+                FirstMutation::OpenTruncate => {
+                    anyhow::ensure!(fs::read(&lower_path)? == b"REPLACED");
+                    anyhow::ensure!(fs::read(mountpoint.join("sample"))? == b"REPLACED");
+                }
+            }
             let source_metadata = fs::metadata(&lower_path)?;
             anyhow::ensure!(
                 source_metadata.ino() == original_inode && source_metadata.nlink() == 1
@@ -488,5 +624,29 @@ mod tests {
         let unmounted = session.umount_and_join();
         result.unwrap();
         unmounted.unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn writable_open_finishes_durable_detach_before_passthrough() {
+        guarded_view_mutation_case(FirstMutation::WritableOpen);
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn owner_chmod_detaches_before_changing_source_mode() {
+        guarded_view_mutation_case(FirstMutation::OwnerChmod);
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn pathname_truncate_detaches_before_changing_source_bytes() {
+        guarded_view_mutation_case(FirstMutation::PathTruncate);
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn truncating_open_detaches_before_changing_source_bytes() {
+        guarded_view_mutation_case(FirstMutation::OpenTruncate);
     }
 }
