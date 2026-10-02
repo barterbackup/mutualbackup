@@ -1039,9 +1039,9 @@ async fn main() -> Result<()> {
             println!("Content conversion: disabled (raw file bytes)");
             if status.head_oid.is_some() {
                 if status.history_backed_up {
-                    println!("Local history is protected by a signed backup");
+                    println!("Commit graph and refs are protected by a signed backup");
                 } else {
-                    println!("Local commits are awaiting a signed backup");
+                    println!("Commit graph or refs are awaiting a signed backup");
                 }
             }
             if let Some(merge) = &status.merge {

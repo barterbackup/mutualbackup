@@ -1488,9 +1488,10 @@ impl Node {
     }
 
     pub fn git_worktree_status(&self, repository_id: Uuid, worktree_id: Uuid) -> Result<GitStatus> {
-        self.open_git_repository(repository_id)?
-            .linked_status(worktree_id)
-            .map_err(Into::into)
+        let repository = self.open_git_repository(repository_id)?;
+        let mut status = repository.linked_status(worktree_id)?;
+        status.history_backed_up = self.git_history_backed_up(repository_id, &repository)?;
+        Ok(status)
     }
 
     pub fn git_worktree_add_path(
@@ -2125,12 +2126,21 @@ impl Node {
     pub fn git_status(&self, repository_id: Uuid) -> Result<GitStatus> {
         let repository = self.open_git_repository(repository_id)?;
         let mut status = repository.status()?;
+        status.history_backed_up = self.git_history_backed_up(repository_id, &repository)?;
+        Ok(status)
+    }
+
+    fn git_history_backed_up(
+        &self,
+        repository_id: Uuid,
+        repository: &GitRepository,
+    ) -> Result<bool> {
         let Some(installed) = self.installed_guild()? else {
-            return Ok(status);
+            return Ok(false);
         };
         let guild_id = installed.certificate.genesis.guild_id;
         let Some(checkpoint) = self.current_checkpoint(guild_id)? else {
-            return Ok(status);
+            return Ok(false);
         };
         checkpoint.verify()?;
         if checkpoint.checkpoint.guild_id != guild_id
@@ -2141,7 +2151,7 @@ impl Node {
         if checkpoint.checkpoint.format_version != 7 {
             // Older checkpoints may certify a revision without a complete
             // root-bound packing catalog for every Git history sector.
-            return Ok(status);
+            return Ok(false);
         }
         let Some(revision) = checkpoint
             .checkpoint
@@ -2153,18 +2163,17 @@ impl Node {
             })
             .max_by_key(|revision| revision.value.sequence)
         else {
-            return Ok(status);
+            return Ok(false);
         };
         if revision.value.metadata_sectors.is_empty() {
-            return Ok(status);
+            return Ok(false);
         }
         let Some(backup) = revision_git_backup(&self.control, &self.keys, guild_id, revision)?
         else {
-            return Ok(status);
+            return Ok(false);
         };
         let graph = repository.export_graph_source()?;
-        status.history_backed_up = backup.repository_id == repository_id
-            && backup.head_branch == status.branch
+        Ok(backup.repository_id == repository_id
             && backup.refs == graph.refs
             && backup.objects == graph.objects
             && backup.blobs.len() == graph.blobs.len()
@@ -2174,8 +2183,7 @@ impl Node {
                 .zip(graph.blobs.iter())
                 .all(|(backed_up, local)| {
                     backed_up.oid == local.oid && backed_up.logical_len == local.anchor.logical_len
-                });
-        Ok(status)
+                }))
     }
 
     fn register_protected_root(

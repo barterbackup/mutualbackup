@@ -76,8 +76,8 @@ pub struct GitStatus {
     pub repository_id: Uuid,
     pub branch: String,
     pub head_oid: Option<[u8; 20]>,
-    /// The daemon sets this only when a certified checkpoint covers the same
-    /// reachable graph and refs currently present in the local catalog.
+    /// A certified checkpoint covers the local reachable graph and refs.
+    /// This does not attest uncommitted index entries or worktree selection.
     pub history_backed_up: bool,
     pub changes: Vec<GitStatusChange>,
     pub untracked: Vec<Vec<u8>>,

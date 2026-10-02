@@ -3099,6 +3099,9 @@ backend gates. A command being present does not by itself close its slice.
   filesystem destinations; use guarded link-freeze only after its own gate.
   A requested merge may create new content; capture its exact resulting bytes
   as new blobs, and make conflicts/abort recoverable without normalization.
+  `restore --staged --worktree` must use one replayable daemon operation for
+  the selected paths, so a failed worktree preflight cannot first discard
+  their staged bytes.
   Never create a persistent second Git blob or pack copy of native payloads.
 - Disable all automatic content conversion in this binary, including CRLF/text
   handling, clean/smudge/process filters, `ident`, and working-tree encodings,
