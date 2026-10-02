@@ -478,6 +478,19 @@ impl LinkFreezeCaptureIntent {
             && self.anchor_name == anchor_name)
     }
 
+    pub(crate) fn matches_root_file_plan(
+        &self,
+        anchor_id: Uuid,
+        source_parent_id: NativeFileId,
+        source_id: NativeFileId,
+        anchor_parent: &PinnedDirectory,
+        anchor_name: &Path,
+    ) -> anyhow::Result<bool> {
+        Ok(self.source_parent_id == source_parent_id
+            && self.source_name == anchor_name
+            && self.matches_file_plan(anchor_id, source_id, anchor_parent, anchor_name)?)
+    }
+
     pub(crate) fn content_proof(&self) -> &IndependentSparseCopy {
         &self.proof.content
     }

@@ -15,14 +15,15 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    AnchorError, CaptureVersion, DirectoryStream, FilesystemIdentity, GIT_CATALOG_DIRECTORY,
-    MAX_CAPTURE_DEPTH, MAX_CAPTURE_ENTRIES, MAX_RELATIVE_PATH_BYTES, NativeFileId, PinnedDirectory,
-    StableAnchorAreaLocator, capture_version, filesystem_identity_for_file,
-    git_catalog_marker_from_root, modified_parts, open_path_no_xdev_beneath, open_source_beneath,
-    open_source_root, open_stable_anchor_area, probe_guarded_link_freeze, reopen_pinned_file,
-    resolve_anchor_area, unix_mode, validate_relative,
+    AnchorError, CaptureVersion, CapturedEntry, DirectoryStream, FilesystemIdentity,
+    GIT_CATALOG_DIRECTORY, MAX_CAPTURE_DEPTH, MAX_CAPTURE_ENTRIES, MAX_CAPTURE_EXTENTS,
+    MAX_RELATIVE_PATH_BYTES, NativeFileId, PinnedDirectory, StableAnchorAreaLocator,
+    capture_version, filesystem_identity_for_file, git_catalog_marker_from_root, modified_parts,
+    open_path_no_xdev_beneath, open_source_beneath, open_source_root, open_stable_anchor_area,
+    probe_guarded_link_freeze, reopen_pinned_file, resolve_anchor_area, unix_mode,
+    validate_relative,
 };
-use crate::{ControlStore, LinkFreezeCaptureIntent};
+use crate::{ControlStore, LinkFreezeCaptureIntent, LinkFreezeCapturePhase};
 
 const PLAN_KIND: &str = "guarded-root-plan-v1";
 const ROOT_CLAIM_KIND: &str = "guarded-root-claim-v1";
@@ -430,6 +431,162 @@ impl GuardedRootCapturePlan {
             opened.insert(path.clone(), directory);
         }
         Ok(())
+    }
+
+    /// Freeze every inventoried file into its corresponding claimed anchor
+    /// directory. Each file uses its own durable journal, so a retry continues
+    /// completed freezes and refuses a changed, not-yet-frozen source. The
+    /// returned entries are only a candidate whole-root catalog; callers must
+    /// still publish and protect a complete manifest before enrollment.
+    pub fn freeze_planned_files(
+        &self,
+        control: &ControlStore,
+    ) -> anyhow::Result<Vec<CapturedEntry>> {
+        self.prepare_anchor_directories(control)?;
+        let area_path = resolve_anchor_area(&self.area)?;
+        let area_file = open_stable_anchor_area(&area_path, &self.area)?;
+        let area = PinnedDirectory {
+            file: area_file,
+            filesystem_id: self.area.filesystem_id,
+        };
+        let anchor_root = area
+            .open_child_directory(self.anchor_id.to_string())?
+            .ok_or_else(|| anyhow::anyhow!("claimed guarded root disappeared"))?;
+        let root_parent_id = NativeFileId {
+            filesystem_id: self.root_version.filesystem_id,
+            inode: self.root_version.inode,
+        };
+        let mut source_directories = BTreeMap::from([(String::new(), root_parent_id)]);
+        let mut captured = Vec::with_capacity(self.entries.len());
+        let mut extent_count = 0usize;
+        for entry in &self.entries {
+            match entry {
+                GuardedRootEntry::Directory {
+                    path,
+                    version,
+                    mode,
+                    modified_secs,
+                    modified_nanos,
+                } => {
+                    source_directories.insert(
+                        path.clone(),
+                        NativeFileId {
+                            filesystem_id: version.filesystem_id,
+                            inode: version.inode,
+                        },
+                    );
+                    captured.push(CapturedEntry::Directory {
+                        path: path.clone(),
+                        mode: *mode,
+                        modified_secs: *modified_secs,
+                        modified_nanos: *modified_nanos,
+                    });
+                }
+                GuardedRootEntry::File {
+                    path,
+                    capture_id,
+                    version,
+                    mode,
+                    modified_secs,
+                    modified_nanos,
+                } => {
+                    let relative = Path::new(path);
+                    let name = relative
+                        .file_name()
+                        .ok_or(AnchorError::InvalidGuardedPlan)?;
+                    let name = Path::new(name);
+                    let parent_path = relative
+                        .parent()
+                        .and_then(|parent| parent.to_str())
+                        .ok_or(AnchorError::InvalidGuardedPlan)?;
+                    let expected_parent = *source_directories
+                        .get(parent_path)
+                        .ok_or(AnchorError::InvalidGuardedPlan)?;
+                    let anchor_parent = if parent_path.is_empty() {
+                        anchor_root.try_clone()?
+                    } else {
+                        anchor_root.open_descendant_directory(parent_path)?
+                    };
+                    let recorded = LinkFreezeCaptureIntent::load(control, *capture_id)?;
+                    let source_parent = PinnedDirectory::open(&self.source_root).and_then(|root| {
+                        if root.identity()? != root_parent_id {
+                            return Err(AnchorError::SourceChanged(PathBuf::new()));
+                        }
+                        if parent_path.is_empty() {
+                            Ok(root)
+                        } else {
+                            root.open_descendant_directory(parent_path)
+                        }
+                    });
+                    let source_parent = match source_parent {
+                        Ok(parent) if parent.identity()? == expected_parent => parent,
+                        _ if recorded.as_ref().is_some_and(|intent| {
+                            intent.phase() != LinkFreezeCapturePhase::Prepared
+                        }) =>
+                        {
+                            anchor_parent.try_clone()?
+                        }
+                        _ => anyhow::bail!("planned guarded source parent changed: {path}"),
+                    };
+                    let expected_source = NativeFileId {
+                        filesystem_id: version.filesystem_id,
+                        inode: version.inode,
+                    };
+                    let intent = match recorded {
+                        Some(intent) => intent,
+                        None => {
+                            anyhow::ensure!(
+                                anchor_parent.entry_identity(name, false)?.is_none(),
+                                "unowned guarded file anchor blocks first freeze: {path}"
+                            );
+                            LinkFreezeCaptureIntent::begin_checked(
+                                control,
+                                *capture_id,
+                                &source_parent,
+                                name,
+                                &anchor_parent,
+                                name,
+                                version,
+                            )?
+                        }
+                    };
+                    anyhow::ensure!(intent.matches_root_file_plan(
+                        *capture_id,
+                        expected_parent,
+                        expected_source,
+                        &anchor_parent,
+                        name,
+                    )?);
+                    let verified = intent
+                        .resume(control, &source_parent, &anchor_parent)?
+                        .ok_or_else(|| anyhow::anyhow!("planned guarded source changed: {path}"))?;
+                    anyhow::ensure!(matches!(
+                        verified.phase(),
+                        LinkFreezeCapturePhase::Frozen | LinkFreezeCapturePhase::Detached
+                    ));
+                    let proof = verified.content_proof();
+                    anyhow::ensure!(
+                        proof.logical_len == version.logical_len,
+                        "guarded file proof differs from planned length: {path}"
+                    );
+                    extent_count = extent_count
+                        .checked_add(proof.data_extents.len())
+                        .ok_or(AnchorError::CatalogTooLarge)?;
+                    anyhow::ensure!(extent_count <= MAX_CAPTURE_EXTENTS);
+                    captured.push(CapturedEntry::FileV2 {
+                        path: path.clone(),
+                        mode: *mode,
+                        logical_len: proof.logical_len,
+                        modified_secs: *modified_secs,
+                        modified_nanos: *modified_nanos,
+                        native_id: expected_source,
+                        data_extents: proof.data_extents.clone(),
+                    });
+                }
+            }
+        }
+        anchor_root.sync_all()?;
+        Ok(captured)
     }
 
     /// Abandon only a prepared, empty root namespace. A file freeze requires
@@ -1148,6 +1305,51 @@ mod tests {
             fs::read(root.join("parent/child/file")).unwrap(),
             b"source bytes"
         );
+    }
+
+    #[test]
+    fn freeze_planned_files_returns_only_a_candidate_catalog_for_empty_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("parent/child")).unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([73; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let entries = plan.freeze_planned_files(&store).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            &entries[0],
+            CapturedEntry::Directory { path, .. } if path == "parent"
+        ));
+        assert!(matches!(
+            &entries[1],
+            CapturedEntry::Directory { path, .. } if path == "parent/child"
+        ));
+        plan.discard_empty_anchor_root(&store).unwrap();
+    }
+
+    #[test]
+    fn changed_file_does_not_acquire_a_guarded_freeze_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("file"), b"original").unwrap();
+        let plan = planned_without_privileged_probe(&root);
+        let capture_id = match &plan.entries[0] {
+            GuardedRootEntry::File { capture_id, .. } => *capture_id,
+            _ => panic!("expected file"),
+        };
+        fs::write(root.join("file"), b"changed bytes").unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([74; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        assert!(plan.freeze_planned_files(&store).is_err());
+        assert!(
+            LinkFreezeCaptureIntent::load(&store, capture_id)
+                .unwrap()
+                .is_none()
+        );
+        plan.discard_empty_anchor_root(&store).unwrap();
+        assert_eq!(fs::read(root.join("file")).unwrap(), b"changed bytes");
     }
 
     #[test]
