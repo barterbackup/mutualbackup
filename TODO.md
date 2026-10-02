@@ -12,10 +12,14 @@
   separate direct smoke run passed. The failed run cleaned its temporary Btrfs
   image, daemons, namespaces, and firewall rules. Identify the missing signer
   and whether it is a transport failure or a conflicting signature lock,
-  correct the cause, and rerun the full gate on exact committed source.
-  `202aa44` promotes per-signer failures to warning logs for the next diagnostic
-  run.
-- [ ] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
+  correct the cause, and repeat the full gate on exact committed source.
+  `202aa44` promotes per-signer failures to warning logs. Two subsequent
+  isolated smoke runs and the complete Git acceptance script passed on
+  `31018a0` with stricter diagnostic backup timeouts (900/600 seconds), but
+  did not reproduce the failure; `31018a0` also preserves relevant signer
+  warnings in future timeout output. Keep this reliability issue open until
+  the missing-signer path is explained and corrected.
+- [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a
   linked namespace while the commit graph and refs stay shared. Local session,
@@ -26,8 +30,8 @@
   changing the primary worktree. Historical primary-keyed linked blob intents
   replay when their registered worktree still exists; a missing historical
   worktree now has a force-prune path that discards its private generated blob
-  and retires the intent with its registration. Run the provisioned Git gate
-  before closing this item.
+  and retires the intent with its registration. The complete provisioned Git
+  gate passed on `31018a0`, including the linked pull/merge Btrfs regression.
 - [ ] **M6 combined Git restore is one recoverable operation.**
   `mutualgit restore --staged --worktree PATH` now sends one daemon request for
   primary or linked worktrees. Version 11 checkout intents bind the selected
@@ -37,7 +41,7 @@
   and linked Btrfs regressions cover dirty directory preflight, staged additions,
   unrelated staged bytes, and interruption/reopen before and after index publication;
   run the provisioned reflink acceptance gate before closing this item.
-- [ ] **M6 prune duplicate native anchors by physical reachability.** Git
+- [x] **M6 prune duplicate native anchors by physical reachability.** Git
   prune now distinguishes exact index and local-sector recipe pins from blob
   IDs and retains one verified source per filesystem for each live blob. It
   removes surplus mappings with the existing crash-replayable deletion intent.
@@ -46,8 +50,8 @@
   and checks the remaining catalog after reopen. The node-level Btrfs case now
   also serves signed backup sectors across a reopen, restores exact worktree
   bytes, and proves a recipe pin survives revision-record removal until the
-  sector recipe itself retires. Run the provisioned Git gate before closing
-  this item.
+  sector recipe itself retires. The complete provisioned Git gate passed on
+  `31018a0`, including the Btrfs and signed-revision prune regressions.
 - [ ] **M6 restore/reset recovery acceptance.** Checkout intent formats 9/10
   now carry BLAKE3 roots and lengths for previously unanchored working files;
   linked worktrees use wrapper version 2. Replay verifies those bytes in the

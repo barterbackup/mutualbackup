@@ -1121,8 +1121,13 @@ native-anchor storage checks pass; the milestone still requires protected graph
 recovery, physical prune, guarded link-freeze, and platform backends.
 The provisioned Git acceptance run on `3155689` passed its Git-specific slices
 but failed the five-daemon topology backup after the 5,400-second timeout
-following relay-only storage recovery. The missing coding-group signer is under
-investigation; the provisioned gate is not yet passing on the current tree.
+following relay-only storage recovery. Two later isolated smoke runs and the
+complete provisioned Git script passed on `31018a0` with stricter 900/600-second
+diagnostic backup timeouts; the latter passed all Git, node, stock-Git bridge,
+and five-daemon checks. The original intermittent missing-signer failure is
+still unexplained and tracked in TODO.md. Linked pull/merge and physical-prune
+slice gates are closed; combined restore and the broader backend/platform gates
+remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
