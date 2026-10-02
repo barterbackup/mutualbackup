@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 // Linux UAPI asm-generic/fcntl.h. The libc crate does not expose F_SETSIG.
 const F_SETSIG_LINUX: libc::c_int = 10;
 // Linux UAPI linux/fanotify.h. Permission events require CAP_SYS_ADMIN.
@@ -27,6 +29,115 @@ const FAN_PRE_ACCESS: u64 = 0x0010_0000;
 const FAN_Q_OVERFLOW: u64 = 0x0000_4000;
 const FAN_DENY: u32 = 0x0000_0002;
 const FANOTIFY_METADATA_VERSION: u8 = 3;
+const MAX_ACCESS_ACL_BYTES: usize = 64 * 1024;
+const ACCESS_ACL_NAME: &std::ffi::CStr = c"system.posix_acl_access";
+
+/// Exact original access metadata to persist before freezing a shared inode.
+/// An unsupported ACL facility is distinct from a supported filesystem with
+/// no access ACL, so a later backend does not silently invent ACL semantics.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileAccessSnapshot {
+    pub format_version: u16,
+    pub mode: u32,
+    pub access_acl: AccessAclSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AccessAclSnapshot {
+    Unsupported,
+    Absent,
+    Present(Vec<u8>),
+}
+
+impl FileAccessSnapshot {
+    /// Capture the mode and raw POSIX access ACL through a pinned descriptor.
+    /// The caller must durably record this value before changing permissions.
+    pub fn capture(file: &File) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let before = file.metadata()?;
+        if !before.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "access snapshot requires a regular file",
+            ));
+        }
+        let access_acl = read_access_acl(file)?;
+        let after = file.metadata()?;
+        if (
+            before.dev(),
+            before.ino(),
+            before.mode(),
+            before.ctime(),
+            before.ctime_nsec(),
+        ) != (
+            after.dev(),
+            after.ino(),
+            after.mode(),
+            after.ctime(),
+            after.ctime_nsec(),
+        ) {
+            return Err(io::Error::other(
+                "file metadata changed during access snapshot",
+            ));
+        }
+        Ok(Self {
+            format_version: 1,
+            mode: before.mode() & 0o7777,
+            access_acl,
+        })
+    }
+
+    /// Check both mode and ACL after recovery without changing the file.
+    pub fn matches(&self, file: &File) -> io::Result<bool> {
+        if self.format_version != 1 {
+            return Ok(false);
+        }
+        Ok(*self == Self::capture(file)?)
+    }
+}
+
+fn read_access_acl(file: &File) -> io::Result<AccessAclSnapshot> {
+    let fd = file.as_raw_fd();
+    // SAFETY: the pinned descriptor and NUL-terminated xattr name are valid.
+    let length = unsafe { libc::fgetxattr(fd, ACCESS_ACL_NAME.as_ptr(), std::ptr::null_mut(), 0) };
+    if length < 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENODATA) => Ok(AccessAclSnapshot::Absent),
+            Some(libc::EOPNOTSUPP) => Ok(AccessAclSnapshot::Unsupported),
+            _ => Err(error),
+        };
+    }
+    let length = length as usize;
+    if length == 0 || length > MAX_ACCESS_ACL_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "POSIX access ACL exceeds its supported bound or is empty",
+        ));
+    }
+    let mut value = vec![0_u8; length];
+    // SAFETY: the allocated vector has length bytes and the kernel writes at
+    // most that many bytes; a changed ACL returns ERANGE or a different size.
+    let read = unsafe {
+        libc::fgetxattr(
+            fd,
+            ACCESS_ACL_NAME.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if read < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if read as usize != length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "POSIX access ACL changed during capture",
+        ));
+    }
+    Ok(AccessAclSnapshot::Present(value))
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -280,7 +391,80 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
-    use super::FileWriteExclusion;
+    use super::{ACCESS_ACL_NAME, AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion};
+
+    #[test]
+    fn access_snapshot_records_the_acl_mask_changed_by_chmod() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("access");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.set_permissions(fs::Permissions::from_mode(0o660))
+            .unwrap();
+        // Linux POSIX ACL xattr: version 2 and owner, named user, group,
+        // mask, and other entries. The named user grants write through mask.
+        let mut acl = 2_u32.to_le_bytes().to_vec();
+        for (tag, permission, id) in [
+            (1_u16, 6_u16, u32::MAX),
+            (2, 6, 2000),
+            (4, 6, u32::MAX),
+            (16, 6, u32::MAX),
+            (32, 0, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&permission.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        // SAFETY: the descriptor and xattr name are valid and acl owns its
+        // full buffer for the duration of this call.
+        let set = unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                ACCESS_ACL_NAME.as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        };
+        if set < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EOPNOTSUPP) {
+            return;
+        }
+        assert_eq!(set, 0);
+        let snapshot = FileAccessSnapshot::capture(&File::open(&path).unwrap()).unwrap();
+        assert_eq!(snapshot.mode, 0o660);
+        assert!(matches!(
+            &snapshot.access_acl,
+            AccessAclSnapshot::Present(_)
+        ));
+        let encoded = mb_core::canonical_bytes(&snapshot).unwrap();
+        let decoded: FileAccessSnapshot = mb_core::decode_canonical(&encoded).unwrap();
+        assert_eq!(decoded, snapshot);
+
+        file.set_permissions(fs::Permissions::from_mode(0o440))
+            .unwrap();
+        assert!(!snapshot.matches(&file).unwrap());
+        // SAFETY: the same valid descriptor, name, and original ACL buffer
+        // are used to model exact restoration after an anchor is detached.
+        assert_eq!(
+            unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    ACCESS_ACL_NAME.as_ptr(),
+                    acl.as_ptr().cast(),
+                    acl.len(),
+                    0,
+                )
+            },
+            0
+        );
+        file.set_permissions(fs::Permissions::from_mode(snapshot.mode))
+            .unwrap();
+        assert!(snapshot.matches(&file).unwrap());
+    }
 
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN for fanotify permission events"]
