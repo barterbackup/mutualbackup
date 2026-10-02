@@ -10,7 +10,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
@@ -19,7 +21,7 @@ use anyhow::{Context, ensure};
 use fuser::{
     BackingId, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
     INodeNo, InitFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags, ReplyAttr, ReplyEmpty,
-    ReplyEntry, ReplyOpen, Request,
+    ReplyEntry, ReplyOpen, Request, SessionACL,
 };
 
 const FILE_INODE: INodeNo = INodeNo(2);
@@ -148,6 +150,7 @@ pub fn probe_guarded_view_passthrough(source_root: impl AsRef<Path>) -> anyhow::
         .prefix(".mutualbackup-fuse-probe-")
         .tempdir_in(parent)
         .context("create disposable FUSE probe directory")?;
+    fs::set_permissions(area.path(), fs::Permissions::from_mode(0o755))?;
     let lower = area.path().join("lower");
     let mountpoint = area.path().join("view");
     fs::create_dir(&lower)?;
@@ -190,12 +193,34 @@ pub fn probe_guarded_view_passthrough(source_root: impl AsRef<Path>) -> anyhow::
         denied_writable: Arc::clone(&denied_writable),
         backing: Mutex::new(HashMap::new()),
     };
-    let session = fuser::spawn_mount(view, &mountpoint, &Config::default())
+    let mut config = Config::default();
+    config.acl = SessionACL::All;
+    let session = fuser::spawn_mount(view, &mountpoint, &config)
         .context("mount disposable FUSE passthrough view")?;
     let result = (|| -> anyhow::Result<()> {
         ensure!(
             fs::read(mountpoint.join("sample"))? == PROBE_BYTES,
             "FUSE passthrough changed bytes"
+        );
+        let ordinary_read = Command::new("cat")
+            .uid(65534)
+            .gid(65534)
+            .arg(mountpoint.join("sample"))
+            .output()
+            .context("read guarded view as an ordinary user")?;
+        ensure!(
+            ordinary_read.status.success() && ordinary_read.stdout == PROBE_BYTES,
+            "ordinary user could not read exact bytes through FUSE view"
+        );
+        let private_read = Command::new("cat")
+            .uid(65534)
+            .gid(65534)
+            .arg(&lower_path)
+            .output()
+            .context("check private lower source access")?;
+        ensure!(
+            !private_read.status.success(),
+            "ordinary user can bypass the guarded view through the lower path"
         );
         let visible = File::open(mountpoint.join("sample"))?;
         // SAFETY: the mapping is read-only, shared, and bounded by this
