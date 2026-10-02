@@ -74,6 +74,10 @@ pub enum StageError {
     UnsafePath,
     #[error("the stage intent or index record is incompatible or corrupt")]
     IncompatibleRecord,
+    #[error(
+        "pending add belongs to another source backend; restore that backend or abandon the add"
+    )]
+    BackendMismatch,
     #[error("Git stage catalog paths currently require Linux byte paths")]
     UnsupportedPlatform,
     #[error("staged symlink temporary file I/O failed: {0}")]
@@ -483,6 +487,16 @@ fn finish_symlink_stage(
     if control.get_record(&kind, key)?.as_deref() != Some(canonical_bytes(&intent)?.as_slice()) {
         return Err(StageError::IncompatibleRecord);
     }
+    if let Some(plan) = intent.plan.as_ref() {
+        if plan.backend_kind() != source_backend {
+            return Err(StageError::BackendMismatch);
+        }
+    } else if !source_backend.supports_git_file_staging() {
+        return Err(AnchorError::UnsupportedSourceOperation(
+            "Git file staging with guarded link-freeze",
+        )
+        .into());
+    }
     let catalog = symlink_catalog(&intent)?;
     let observed_temp = verify_temporary_symlink_bytes(&catalog, &intent)?;
     if let (Some(expected), Some(observed)) = (intent.temp_id, observed_temp)
@@ -562,6 +576,12 @@ pub(crate) fn stage_symlink_for_scope_with_backend(
     relative_path: &Path,
     source_backend: SourceBackendKind,
 ) -> Result<GitIndexEntry, StageError> {
+    if !source_backend.supports_git_file_staging() {
+        return Err(AnchorError::UnsupportedSourceOperation(
+            "Git file staging with guarded link-freeze",
+        )
+        .into());
+    }
     let (key, intent) = begin_symlink_stage_for_scope(
         control,
         scope,
@@ -578,11 +598,15 @@ fn finish_stage_for_scope(
     scope: GitWorktreeScope,
     path_key: &[u8],
     intent: &StageIntent,
+    source_backend: SourceBackendKind,
 ) -> Result<GitIndexEntry, StageError> {
     let kind = intent_kind_for_scope(scope);
     let expected = canonical_bytes(intent)?;
     if control.get_record(&kind, path_key)?.as_deref() != Some(expected.as_slice()) {
         return Err(StageError::IncompatibleRecord);
+    }
+    if intent.plan.backend_kind() != source_backend {
+        return Err(StageError::BackendMismatch);
     }
     let manifest = intent.plan.capture_with_control(control)?;
     let oid = blob_oid_from_anchor(&manifest)?;
@@ -660,7 +684,7 @@ pub(crate) fn stage_file_for_scope_with_backend(
         relative_path.as_ref(),
         source_backend,
     )?;
-    finish_stage_for_scope(control, scope, &key, &intent)
+    finish_stage_for_scope(control, scope, &key, &intent, source_backend)
 }
 
 /// Remove a path from the staged index while leaving its working file alone,
@@ -729,7 +753,13 @@ pub(crate) fn resume_pending_stages_for_scope_with_backend(
     let mut resumed = Vec::new();
     for (key, encoded) in control.records(&intent_kind_for_scope(scope))? {
         let intent = decode_intent(&encoded, scope.repository_id(), &key)?;
-        resumed.push(finish_stage_for_scope(control, scope, &key, &intent)?);
+        resumed.push(finish_stage_for_scope(
+            control,
+            scope,
+            &key,
+            &intent,
+            source_backend,
+        )?);
     }
     for (key, encoded) in control.records(&symlink_intent_kind_for_scope(scope))? {
         let intent = decode_symlink_intent(&encoded, scope.repository_id(), &key)?;
@@ -1070,6 +1100,74 @@ mod tests {
         assert_eq!(decoded.format_version, 1);
         assert!(decoded.catalog_root.is_none());
         assert_eq!(mb_core::canonical_bytes(&decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn guarded_backend_rejects_symlink_stage_before_creating_temporary_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("work");
+        let catalog_path = root.join(GIT_CATALOG_DIRECTORY);
+        fs::create_dir_all(&catalog_path).unwrap();
+        symlink("target", root.join("linked")).unwrap();
+        let catalog = PinnedDirectory::open(&catalog_path).unwrap();
+        let control =
+            ControlStore::open_with_key(catalog_path.join("catalog.db"), &[37; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        let scope = GitWorktreeScope::primary(repository_id);
+
+        assert!(matches!(
+            super::stage_symlink_for_scope_with_backend(
+                &control,
+                scope,
+                &root,
+                &root,
+                &catalog,
+                Path::new("linked"),
+                SourceBackendKind::GuardedLinkFreezeV1,
+            ),
+            Err(StageError::Anchor(AnchorError::UnsupportedSourceOperation(
+                _
+            )))
+        ));
+        assert!(
+            control
+                .get_record(&super::symlink_intent_kind_for_scope(scope), b"linked")
+                .unwrap()
+                .is_none()
+        );
+
+        let (key, intent) = begin_symlink_stage(
+            &control,
+            repository_id,
+            &root,
+            &catalog,
+            Path::new("linked"),
+        )
+        .unwrap();
+        assert!(matches!(
+            super::finish_symlink_stage(
+                &control,
+                scope,
+                &key,
+                intent.clone(),
+                SourceBackendKind::GuardedLinkFreezeV1,
+            ),
+            Err(StageError::Anchor(AnchorError::UnsupportedSourceOperation(
+                _
+            )))
+        ));
+        assert!(
+            catalog
+                .entry_identity(&intent.temp_name, false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            control
+                .get_record(&super::symlink_intent_kind_for_scope(scope), &key)
+                .unwrap(),
+            Some(mb_core::canonical_bytes(&intent).unwrap())
+        );
     }
 
     #[test]

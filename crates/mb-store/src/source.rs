@@ -70,6 +70,12 @@ impl SourceBackendBinding {
 }
 
 impl SourceBackendKind {
+    /// The guarded backend cannot retain Git file anchors until its live
+    /// edit-detach guard is available to every enrolled worktree.
+    pub fn supports_git_file_staging(self) -> bool {
+        matches!(self, Self::ReflinkV1)
+    }
+
     pub fn probe(self, source_root: impl AsRef<Path>) -> Result<(), AnchorError> {
         match self {
             Self::ReflinkV1 => probe_reflink(source_root),
@@ -200,6 +206,14 @@ pub enum SourceFileCaptureError {
 }
 
 impl SourceFileCapturePlan {
+    pub fn backend_kind(&self) -> SourceBackendKind {
+        match self {
+            Self::ReflinkV1(_) => SourceBackendKind::ReflinkV1,
+            #[cfg(target_os = "linux")]
+            Self::GuardedLinkFreezeV1(_) => SourceBackendKind::GuardedLinkFreezeV1,
+        }
+    }
+
     pub fn plan_reflink(
         source_root: impl AsRef<Path>,
         relative_path: impl AsRef<Path>,

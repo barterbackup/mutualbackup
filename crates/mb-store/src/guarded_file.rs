@@ -852,6 +852,12 @@ mod tests {
         );
         assert_eq!(replayed.relative_path(), guarded.relative_path());
         assert_eq!(replayed.source_mode().unwrap(), guarded.source_mode());
+        assert_eq!(
+            replayed.backend_kind(),
+            SourceBackendKind::GuardedLinkFreezeV1
+        );
+        assert!(!SourceBackendKind::GuardedLinkFreezeV1.supports_git_file_staging());
+        assert!(SourceBackendKind::ReflinkV1.supports_git_file_staging());
         assert!(matches!(
             SourceBackendKind::GuardedLinkFreezeV1.plan_file(&root, "source"),
             Err(AnchorError::UnsupportedSourceOperation(_))
