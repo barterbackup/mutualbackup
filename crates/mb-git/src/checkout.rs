@@ -35,7 +35,7 @@ use crate::merge::{
 };
 use crate::stage::{
     GitIndexEntry, StageError, anchors_for_oid, has_pending_stages_for_scope, index_kind_for_scope,
-    stage_path_key, staged_entries, staged_entries_for_scope,
+    indexed_anchor_manifest, stage_path_key, staged_entries, staged_entries_for_scope,
 };
 use crate::status::{StatusError, TreeFiles, files_for_commit, repository_status};
 use crate::{GitAnchorError, GitWorktreeScope, NativeSource, blob_oid_from_anchor};
@@ -651,6 +651,44 @@ fn verify_file(
     Ok(())
 }
 
+fn verify_file_with_anchor(
+    control: &ControlStore,
+    repository_id: Uuid,
+    parent: &PinnedDirectory,
+    name: &OsStr,
+    identity: NativeFileId,
+    expected: &CheckoutFile,
+) -> Result<(), CheckoutError> {
+    if expected.anchor_id.is_nil() {
+        return Err(CheckoutError::IncompatibleIntent);
+    }
+    let entry = GitIndexEntry {
+        format_version: 1,
+        oid: expected.oid,
+        mode: expected.mode,
+        anchor_id: expected.anchor_id,
+    };
+    let anchor = indexed_anchor_manifest(control, repository_id, &entry)?;
+    verify_tracked_file_for_removal(parent, name, identity, expected.oid, expected.mode, &anchor)
+}
+
+fn verify_file_for_intent(
+    control: &ControlStore,
+    repository_id: Uuid,
+    parent: &PinnedDirectory,
+    name: &OsStr,
+    identity: NativeFileId,
+    expected: &CheckoutFile,
+) -> Result<(), CheckoutError> {
+    if expected.anchor_id.is_nil() {
+        // Restore/reset can capture an existing working file that has no
+        // native anchor. A future intent version must record its BLAKE3 root.
+        verify_file(parent, name, identity, expected)
+    } else {
+        verify_file_with_anchor(control, repository_id, parent, name, identity, expected)
+    }
+}
+
 pub(crate) fn verify_tracked_file_for_removal(
     parent: &PinnedDirectory,
     name: &OsStr,
@@ -723,6 +761,8 @@ fn verify_staged_directory(
 }
 
 fn apply_old_deletion(
+    control: &ControlStore,
+    repository_id: Uuid,
     root: &PinnedDirectory,
     staging: &PinnedDirectory,
     index: usize,
@@ -736,7 +776,14 @@ fn apply_old_deletion(
     let staged = stage_name(index);
     match entry_identity_for(staging, OsStr::new(&staged), old.mode)? {
         Some(identity) if identity == old_id => {
-            verify_file(staging, OsStr::new(&staged), old_id, old)?;
+            verify_file_for_intent(
+                control,
+                repository_id,
+                staging,
+                OsStr::new(&staged),
+                old_id,
+                old,
+            )?;
             return Ok(());
         }
         Some(_) => return Err(CheckoutError::IncompatibleIntent),
@@ -746,7 +793,7 @@ fn apply_old_deletion(
     if entry_identity_for(&parent, &leaf, old.mode)? != Some(old_id) {
         return Err(CheckoutError::DirtyWorktree);
     }
-    verify_file(&parent, &leaf, old_id, old)?;
+    verify_file_for_intent(control, repository_id, &parent, &leaf, old_id, old)?;
     move_entry(
         &parent,
         &leaf,
@@ -755,7 +802,14 @@ fn apply_old_deletion(
         OsStr::new(&staged),
         old.mode,
     )?;
-    verify_file(staging, OsStr::new(&staged), old_id, old)?;
+    verify_file_for_intent(
+        control,
+        repository_id,
+        staging,
+        OsStr::new(&staged),
+        old_id,
+        old,
+    )?;
     Ok(())
 }
 
@@ -767,6 +821,8 @@ fn path_at_or_below(path: &[u8], ancestor: &[u8]) -> bool {
 }
 
 fn published_target_file(
+    control: &ControlStore,
+    repository_id: Uuid,
     root: &PinnedDirectory,
     entry: &CheckoutEntry,
 ) -> Result<bool, CheckoutError> {
@@ -778,7 +834,7 @@ fn published_target_file(
     let (parent, leaf) = parent_and_name(root, &entry.path)?;
     match entry_identity_for(&parent, &leaf, target.mode)? {
         Some(identity) if identity == new_id => {
-            verify_file(&parent, &leaf, new_id, target)?;
+            verify_file_with_anchor(control, repository_id, &parent, &leaf, new_id, target)?;
             Ok(true)
         }
         None => Ok(false),
@@ -1621,7 +1677,9 @@ fn begin_checkout_to_for_scope(
         let (parent, leaf) = parent_and_name(&root, path)?;
         let identity =
             entry_identity_for(&parent, &leaf, mode)?.ok_or(CheckoutError::DirtyWorktree)?;
-        verify_file(
+        verify_file_with_anchor(
+            control,
+            repository_id,
             &parent,
             &leaf,
             identity,
@@ -1645,7 +1703,9 @@ fn begin_checkout_to_for_scope(
             let (parent, leaf) = parent_and_name(&root, path)?;
             let identity =
                 entry_identity_for(&parent, &leaf, *mode)?.ok_or(CheckoutError::DirtyWorktree)?;
-            verify_file(
+            verify_file_with_anchor(
+                control,
+                repository_id,
                 &parent,
                 &leaf,
                 identity,
@@ -2199,7 +2259,14 @@ fn apply_intent(
             };
             let name = stage_name(index);
             if let Some(identity) = entry_identity_for(&staging, OsStr::new(&name), target.mode)? {
-                verify_file(&staging, OsStr::new(&name), identity, target)?;
+                verify_file_with_anchor(
+                    control,
+                    intent.repository_id,
+                    &staging,
+                    OsStr::new(&name),
+                    identity,
+                    target,
+                )?;
                 if entry.new_id.is_some_and(|recorded| recorded != identity) {
                     return Err(CheckoutError::IncompatibleIntent);
                 }
@@ -2222,7 +2289,14 @@ fn apply_intent(
                 )?;
                 let identity = entry_identity_for(&staging, OsStr::new(&name), target.mode)?
                     .ok_or(CheckoutError::IncompatibleIntent)?;
-                verify_file(&staging, OsStr::new(&name), identity, target)?;
+                verify_file_with_anchor(
+                    control,
+                    intent.repository_id,
+                    &staging,
+                    OsStr::new(&name),
+                    identity,
+                    target,
+                )?;
                 entry.new_id = Some(identity);
             }
             save_intent(control, scope, root.identity()?, intent)?;
@@ -2358,7 +2432,7 @@ fn apply_intent(
         };
         for (index, entry) in intent.entries.iter().enumerate() {
             if entry.new.is_none() {
-                apply_old_deletion(root, &staging, index, entry)?;
+                apply_old_deletion(control, intent.repository_id, root, &staging, index, entry)?;
                 run_after_checkout_file_hook();
             }
         }
@@ -2373,7 +2447,7 @@ fn apply_intent(
                 .iter()
                 .find(|entry| entry.path == *path)
                 .ok_or(CheckoutError::IncompatibleIntent)?;
-            if published_target_file(root, entry)? {
+            if published_target_file(control, intent.repository_id, root, entry)? {
                 continue;
             }
             for directory in intent
@@ -2421,8 +2495,22 @@ fn apply_intent(
                     let staged_old = entry_identity_for(&staging, OsStr::new(&staged), old.mode)?;
                     let staged_new = entry_identity_for(&staging, OsStr::new(&staged), new.mode)?;
                     if work_old == Some(old_id) && staged_new == Some(new_id) {
-                        verify_file(&parent, &leaf, old_id, old)?;
-                        verify_file(&staging, OsStr::new(&staged), new_id, new)?;
+                        verify_file_for_intent(
+                            control,
+                            intent.repository_id,
+                            &parent,
+                            &leaf,
+                            old_id,
+                            old,
+                        )?;
+                        verify_file_with_anchor(
+                            control,
+                            intent.repository_id,
+                            &staging,
+                            OsStr::new(&staged),
+                            new_id,
+                            new,
+                        )?;
                         parent.exchange_child_entries(
                             &leaf,
                             (old_id, entry_kind(old.mode)?),
@@ -2433,14 +2521,35 @@ fn apply_intent(
                     } else if work_new != Some(new_id) || staged_old != Some(old_id) {
                         return Err(CheckoutError::DirtyWorktree);
                     }
-                    verify_file(&parent, &leaf, new_id, new)?;
-                    verify_file(&staging, OsStr::new(&staged), old_id, old)?;
+                    verify_file_with_anchor(
+                        control,
+                        intent.repository_id,
+                        &parent,
+                        &leaf,
+                        new_id,
+                        new,
+                    )?;
+                    verify_file_for_intent(
+                        control,
+                        intent.repository_id,
+                        &staging,
+                        OsStr::new(&staged),
+                        old_id,
+                        old,
+                    )?;
                 }
                 (None, None, Some(new), Some(new_id)) => {
                     let work_id = entry_identity_for(&parent, &leaf, new.mode)?;
                     let staged_id = entry_identity_for(&staging, OsStr::new(&staged), new.mode)?;
                     if !entry_exists(&parent, &leaf)? && staged_id == Some(new_id) {
-                        verify_file(&staging, OsStr::new(&staged), new_id, new)?;
+                        verify_file_with_anchor(
+                            control,
+                            intent.repository_id,
+                            &staging,
+                            OsStr::new(&staged),
+                            new_id,
+                            new,
+                        )?;
                         move_entry(
                             &staging,
                             OsStr::new(&staged),
@@ -2452,7 +2561,14 @@ fn apply_intent(
                     } else if work_id != Some(new_id) || staged_id.is_some() {
                         return Err(CheckoutError::DirtyWorktree);
                     }
-                    verify_file(&parent, &leaf, new_id, new)?;
+                    verify_file_with_anchor(
+                        control,
+                        intent.repository_id,
+                        &parent,
+                        &leaf,
+                        new_id,
+                        new,
+                    )?;
                 }
                 _ => return Err(CheckoutError::IncompatibleIntent),
             }
@@ -2460,18 +2576,21 @@ fn apply_intent(
         }
         // The target refs remain immutable while the daemon owns this intent.
         // Verify every target path once more before changing the visible HEAD.
+        let filesystem_id = root.identity()?.filesystem_id;
         for (path, (oid, mode)) in &target_files {
             let (parent, leaf) = parent_and_name(root, path)?;
             let identity =
                 entry_identity_for(&parent, &leaf, *mode)?.ok_or(CheckoutError::DirtyWorktree)?;
-            verify_file(
+            verify_file_with_anchor(
+                control,
+                intent.repository_id,
                 &parent,
                 &leaf,
                 identity,
                 &CheckoutFile {
                     oid: *oid,
                     mode: *mode,
-                    anchor_id: Uuid::nil(),
+                    anchor_id: choose_anchor(control, intent.repository_id, *oid, filesystem_id)?,
                 },
             )?;
         }
@@ -2613,7 +2732,14 @@ fn apply_intent(
                 if Some(identity) != entry.old_id {
                     return Err(CheckoutError::IncompatibleIntent);
                 }
-                verify_file(&staging, OsStr::new(&staged), identity, old)?;
+                verify_file_for_intent(
+                    control,
+                    intent.repository_id,
+                    &staging,
+                    OsStr::new(&staged),
+                    identity,
+                    old,
+                )?;
                 remove_staged_entry(&staging, OsStr::new(&staged), identity, old.mode)?;
             } else if entry_exists(&staging, OsStr::new(&staged))? {
                 return Err(CheckoutError::IncompatibleIntent);
@@ -2689,6 +2815,59 @@ mod tests {
             verify_tracked_file_for_removal(&root, name, identity, oid, 0o120000, &anchor),
             Err(CheckoutError::DirtyWorktree)
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn checkout_replay_keeps_worktree_bytes_on_native_root_conflict() {
+        let temporary = tempfile::tempdir().unwrap();
+        let worktree_path = temporary.path().join("worktree");
+        let staging_path = temporary.path().join("staging");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        std::fs::create_dir_all(&staging_path).unwrap();
+        std::fs::write(worktree_path.join("tracked"), b"bravo").unwrap();
+        let control =
+            ControlStore::open_with_key(temporary.path().join("control.db"), &[64; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        let anchor = mb_store::SourceBlobImportPlan::plan_direct(temporary.path(), 5)
+            .unwrap()
+            .capture(std::io::Cursor::new(b"alpha"))
+            .unwrap();
+        // Model a same-SHA-1/different-native-root conflict without needing
+        // to manufacture a cryptographic collision for this replay test.
+        let oid = Oid::hash_object(ObjectType::Blob, b"bravo").unwrap();
+        control
+            .put_record(
+                &crate::stage::object_kind(repository_id, oid),
+                anchor.anchor_id.as_bytes(),
+                &canonical_bytes(&anchor).unwrap(),
+            )
+            .unwrap();
+        let worktree = PinnedDirectory::open(&worktree_path).unwrap();
+        let staging = PinnedDirectory::open(&staging_path).unwrap();
+        let identity = entry_identity_for(&worktree, OsStr::new("tracked"), 0o100644)
+            .unwrap()
+            .unwrap();
+        let entry = CheckoutEntry {
+            path: b"tracked".to_vec(),
+            old: Some(CheckoutFile {
+                oid: oid.as_bytes().try_into().unwrap(),
+                mode: 0o100644,
+                anchor_id: anchor.anchor_id,
+            }),
+            old_id: Some(identity),
+            new: None,
+            new_id: None,
+        };
+        assert!(matches!(
+            apply_old_deletion(&control, repository_id, &worktree, &staging, 0, &entry),
+            Err(CheckoutError::DirtyWorktree)
+        ));
+        assert_eq!(
+            std::fs::read(worktree_path.join("tracked")).unwrap(),
+            b"bravo"
+        );
+        assert!(std::fs::read_dir(staging_path).unwrap().next().is_none());
     }
 
     #[test]
