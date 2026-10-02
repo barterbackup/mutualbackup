@@ -892,7 +892,7 @@ async fn main() -> Result<()> {
             author_name,
             author_email,
         } => {
-            let (_, repository_id) = discover_repository(&working_directory)?;
+            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
             let source = working_directory.join(source);
             let author_name = match author_name {
                 Some(value) => value,
@@ -904,19 +904,25 @@ async fn main() -> Result<()> {
                     optional_author_field("GIT_AUTHOR_EMAIL", "user.email")?.unwrap_or_default()
                 }
             };
-            let LocalResponse::GitPulled {
-                repository_id: returned_id,
-                oid,
-            } = local_control_call(
-                &socket,
-                &LocalRequest::GitPullBare {
+            let request = match worktree_id {
+                Some(worktree_id) => LocalRequest::GitWorktreePullBare {
+                    repository_id,
+                    worktree_id,
+                    path: source.clone(),
+                    author_name,
+                    author_email,
+                },
+                None => LocalRequest::GitPullBare {
                     repository_id,
                     path: source.clone(),
                     author_name,
                     author_email,
                 },
-            )
-            .await?
+            };
+            let LocalResponse::GitPulled {
+                repository_id: returned_id,
+                oid,
+            } = local_control_call(&socket, &request).await?
             else {
                 bail!("daemon returned the wrong response to Git pull");
             };
@@ -936,12 +942,18 @@ async fn main() -> Result<()> {
             author_name,
             author_email,
         } => {
-            let (_, repository_id) = discover_repository(&working_directory)?;
+            let (_, repository_id, worktree_id) = discover_location(&working_directory)?;
             if abort {
+                let request = match worktree_id {
+                    Some(worktree_id) => LocalRequest::GitWorktreeMergeAbort {
+                        repository_id,
+                        worktree_id,
+                    },
+                    None => LocalRequest::GitMergeAbort { repository_id },
+                };
                 let LocalResponse::GitMergeAborted {
                     repository_id: returned_id,
-                } = local_control_call(&socket, &LocalRequest::GitMergeAbort { repository_id })
-                    .await?
+                } = local_control_call(&socket, &request).await?
                 else {
                     bail!("daemon returned the wrong response to Git merge --abort");
                 };
@@ -952,11 +964,17 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             if continue_merge {
+                let request = match worktree_id {
+                    Some(worktree_id) => LocalRequest::GitWorktreeMergeContinue {
+                        repository_id,
+                        worktree_id,
+                    },
+                    None => LocalRequest::GitMergeContinue { repository_id },
+                };
                 let LocalResponse::GitMerged {
                     repository_id: returned_id,
                     oid,
-                } = local_control_call(&socket, &LocalRequest::GitMergeContinue { repository_id })
-                    .await?
+                } = local_control_call(&socket, &request).await?
                 else {
                     bail!("daemon returned the wrong response to Git merge --continue");
                 };
@@ -978,19 +996,25 @@ async fn main() -> Result<()> {
                     optional_author_field("GIT_AUTHOR_EMAIL", "user.email")?.unwrap_or_default()
                 }
             };
-            let LocalResponse::GitMerged {
-                repository_id: returned_id,
-                oid,
-            } = local_control_call(
-                &socket,
-                &LocalRequest::GitMergeBranch {
+            let request = match worktree_id {
+                Some(worktree_id) => LocalRequest::GitWorktreeMergeBranch {
+                    repository_id,
+                    worktree_id,
+                    branch: branch.clone(),
+                    author_name,
+                    author_email,
+                },
+                None => LocalRequest::GitMergeBranch {
                     repository_id,
                     branch: branch.clone(),
                     author_name,
                     author_email,
                 },
-            )
-            .await?
+            };
+            let LocalResponse::GitMerged {
+                repository_id: returned_id,
+                oid,
+            } = local_control_call(&socket, &request).await?
             else {
                 bail!("daemon returned the wrong response to Git merge");
             };
@@ -1110,14 +1134,6 @@ fn optional_author_field(environment: &str, config_key: &str) -> Result<Option<S
         Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
-}
-
-fn discover_repository(start: &Path) -> Result<(PathBuf, Uuid)> {
-    let (root, repository_id, worktree_id) = discover_location(start)?;
-    if worktree_id.is_some() {
-        bail!("this command is not yet supported in a linked worktree");
-    }
-    Ok((root, repository_id))
 }
 
 fn discover_shared_repository(start: &Path) -> Result<Uuid> {
@@ -1380,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn linked_marker_discovers_shared_repository_without_routing_primary_only_commands() {
+    fn linked_marker_discovers_shared_repository_and_worktree_scope() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
@@ -1402,6 +1418,5 @@ mod tests {
             (root, repository_id, Some(worktree_id))
         );
         assert_eq!(discover_shared_repository(&nested).unwrap(), repository_id);
-        assert!(discover_repository(&nested).is_err());
     }
 }

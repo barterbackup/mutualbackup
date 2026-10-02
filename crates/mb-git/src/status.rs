@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::GitWorktreeScope;
 use crate::head::{HeadError, selected_branch_for_scope, selected_ref_for_scope};
-use crate::merge::{GitMergeState, MergeBlobError, merge_state};
+use crate::merge::{GitMergeState, MergeBlobError, merge_state_for_scope};
 use crate::stage::{
     GitIndexEntry, StageError, indexed_anchor_manifest, pending_stage_paths_for_scope,
     staged_entries_for_scope,
@@ -388,11 +388,7 @@ pub(crate) fn repository_status_for_scope(
         changes,
         untracked,
         pending_adds: pending_stage_paths_for_scope(control, scope)?,
-        merge: if scope.worktree_id() == repository_id {
-            merge_state(control, repository_id)?
-        } else {
-            None
-        },
+        merge: merge_state_for_scope(control, scope)?,
     })
 }
 

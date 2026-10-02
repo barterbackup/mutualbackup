@@ -65,13 +65,6 @@ pub(crate) fn selected_branch_for_scope(
     Ok(record.branch)
 }
 
-pub(crate) fn selected_ref(
-    control: &ControlStore,
-    repository_id: Uuid,
-) -> Result<Vec<u8>, HeadError> {
-    selected_ref_for_scope(control, GitWorktreeScope::primary(repository_id))
-}
-
 pub(crate) fn selected_ref_for_scope(
     control: &ControlStore,
     scope: GitWorktreeScope,

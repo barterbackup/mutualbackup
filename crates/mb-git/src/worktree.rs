@@ -31,6 +31,7 @@ use crate::head::{
     store_selected_branch_for_scope,
 };
 use crate::history::{HistoryError, list_branches_for_scope};
+use crate::merge::{load_merge_session_for_scope, session_key, session_kind_for_scope};
 use crate::rm::{GitRmError, abandon_missing_linked_rm};
 use crate::stage::{
     StageError, abandon_missing_linked_worktree_stages, has_pending_stages_for_scope,
@@ -673,6 +674,11 @@ pub(crate) fn prune_missing_worktree(
     let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
     let pending_stages = has_pending_stages_for_scope(control, scope)?;
     let pending_checkout = has_pending_checkout_for_scope(control, scope)?;
+    let merge_session =
+        load_merge_session_for_scope(control, scope).map_err(|_| GitWorktreeError::Conflict)?;
+    if merge_session.is_some() && !force {
+        return Err(GitWorktreeError::PendingOperation);
+    }
     if (pending_stages && (!force || pending_checkout))
         || (pending_checkout && (!force || info.state != GitWorktreeState::Preparing))
     {
@@ -717,6 +723,9 @@ pub(crate) fn prune_missing_worktree(
         .into_iter()
         .map(|(key, _)| (index_kind.clone(), key))
         .collect::<Vec<_>>();
+    if merge_session.is_some() {
+        deletions.push((session_kind_for_scope(scope), session_key().to_vec()));
+    }
     if !head_rows.is_empty() {
         deletions.push((head_kind, b"branch".to_vec()));
     }

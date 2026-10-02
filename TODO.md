@@ -3,13 +3,13 @@
 ## Milestone 6 active implementation gates
 
 - [ ] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
-  and `mutualgit merge` still call the primary-only repository discovery path;
-  their checkout and merge-session code also assumes the primary index and
-  worktree. Scope fetch/merge, conflict resolution, and replay to the selected
-  linked worktree while retaining the shared commit graph and single-writer
-  daemon. Cover fast-forward, divergent clean and conflicted merges, abort and
-  continue, dirty-file refusal, and interruption/reopen without altering the
-  primary worktree or another linked index.
+  and `mutualgit merge` now route through the selected linked worktree. Their
+  conflict sessions, staged resolutions, status, and checkout replay use a
+  linked namespace while the commit graph and refs stay shared. Local session,
+  schema, CLI, and non-Btrfs Git checks pass. The new ignored Btrfs regression
+  covers fast-forward and divergent clean pull, dirty-file refusal, conflicted
+  merge, abort, resolution, continue, and interruption/reopen without changing
+  the primary worktree. Run the provisioned Git gate before closing this item.
 - [ ] **M6 combined Git restore is one recoverable operation.**
   `mutualgit restore --staged --worktree PATH` now sends one daemon request for
   primary or linked worktrees. Version 11 checkout intents bind the selected

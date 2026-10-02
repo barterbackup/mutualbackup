@@ -388,6 +388,32 @@ pub enum LocalRequest {
         worktree_id: Uuid,
         paths: Vec<PathBuf>,
     },
+    GitWorktreePullBare {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        path: PathBuf,
+        #[serde(default)]
+        author_name: String,
+        #[serde(default)]
+        author_email: String,
+    },
+    GitWorktreeMergeBranch {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        branch: String,
+        #[serde(default)]
+        author_name: String,
+        #[serde(default)]
+        author_email: String,
+    },
+    GitWorktreeMergeContinue {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+    },
+    GitWorktreeMergeAbort {
+        repository_id: Uuid,
+        worktree_id: Uuid,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -966,14 +992,36 @@ mod tests {
                 author_name: "Author".to_owned(),
                 author_email: "a@example.test".to_owned(),
             },
+            LocalRequest::GitWorktreePullBare {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                path: PathBuf::from("/home/user/remote.git"),
+                author_name: "Author".to_owned(),
+                author_email: "a@example.test".to_owned(),
+            },
             LocalRequest::GitMergeBranch {
                 repository_id,
                 branch: "older".to_owned(),
                 author_name: "Author".to_owned(),
                 author_email: "a@example.test".to_owned(),
             },
+            LocalRequest::GitWorktreeMergeBranch {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+                branch: "older".to_owned(),
+                author_name: "Author".to_owned(),
+                author_email: "a@example.test".to_owned(),
+            },
             LocalRequest::GitMergeContinue { repository_id },
+            LocalRequest::GitWorktreeMergeContinue {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+            },
             LocalRequest::GitMergeAbort { repository_id },
+            LocalRequest::GitWorktreeMergeAbort {
+                repository_id,
+                worktree_id: Uuid::from_bytes([5; 16]),
+            },
             LocalRequest::GitDiff {
                 repository_id,
                 cached: true,

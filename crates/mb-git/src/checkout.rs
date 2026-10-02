@@ -23,22 +23,22 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::head::{
-    HeadError, branch_selected_elsewhere, selected_branch, selected_branch_for_scope,
-    selected_branch_record_for_scope, selected_ref, selected_ref_for_scope,
+    HeadError, branch_selected_elsewhere, selected_branch_for_scope,
+    selected_branch_record_for_scope, selected_ref_for_scope,
 };
 use crate::history::{
     GitBranchInfo, HistoryError, MergeIdentity, commit_descends_from, create_pathwise_merge_commit,
     fetched_ref_record, list_branches_for_scope, merge_commit_parents, ref_kind, ref_oid,
 };
 use crate::merge::{
-    MergeBlobError, MergeSession, load_merge_session, session_key, session_kind,
-    store_merge_session,
+    MergeBlobError, MergeSession, load_merge_session_for_scope, session_key,
+    session_kind_for_scope, store_merge_session_for_scope,
 };
 use crate::stage::{
     GitIndexEntry, StageError, anchors_for_oid, has_pending_stages_for_scope, index_kind_for_scope,
-    indexed_anchor_manifest, stage_path_key, staged_entries, staged_entries_for_scope,
+    indexed_anchor_manifest, stage_path_key, staged_entries_for_scope,
 };
-use crate::status::{StatusError, TreeFiles, files_for_commit, repository_status};
+use crate::status::{StatusError, TreeFiles, files_for_commit, repository_status_for_scope};
 use crate::{GitAnchorError, GitWorktreeScope, NativeSource, blob_oid_from_anchor};
 
 const INTENT_PREFIX: &str = "git-checkout-intent-v1/";
@@ -1608,19 +1608,32 @@ pub(crate) fn begin_pull(
     author_name: &str,
     author_email: &str,
 ) -> Result<Oid, CheckoutError> {
-    let root_path = source.root;
-    resume_pending_checkout(
+    begin_pull_for_scope(
         control,
-        repository_id,
-        root_path,
+        GitWorktreeScope::primary(repository_id),
+        source,
         catalog_dir,
-        source.backend,
-    )?;
-    let branch = selected_branch(control, repository_id)?;
+        author_name,
+        author_email,
+    )
+}
+
+pub(crate) fn begin_pull_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    source: NativeSource<'_>,
+    catalog_dir: &PinnedDirectory,
+    author_name: &str,
+    author_email: &str,
+) -> Result<Oid, CheckoutError> {
+    let repository_id = scope.repository_id();
+    let root_path = source.root;
+    resume_pending_checkout_for_scope(control, scope, root_path, catalog_dir, source.backend)?;
+    let branch = selected_branch_for_scope(control, scope)?;
     let remote_ref = format!("refs/remotes/origin/{branch}");
     let target = ref_oid(control, repository_id, remote_ref.as_bytes())?
         .ok_or(CheckoutError::MissingRemoteBranch)?;
-    let local_ref = selected_ref(control, repository_id)?;
+    let local_ref = selected_ref_for_scope(control, scope)?;
     let old = ref_oid(control, repository_id, &local_ref)?;
     if let Some(old) = old {
         if old == target {
@@ -1633,7 +1646,7 @@ pub(crate) fn begin_pull(
             let message = format!("Merge remote-tracking branch 'origin/{branch}'");
             return begin_divergent_merge(
                 control,
-                repository_id,
+                scope,
                 source,
                 catalog_dir,
                 DivergentMerge {
@@ -1648,9 +1661,9 @@ pub(crate) fn begin_pull(
             );
         }
     }
-    begin_checkout_to(
+    begin_checkout_to_for_scope(
         control,
-        repository_id,
+        scope,
         root_path,
         catalog_dir,
         CheckoutTarget {
@@ -1679,19 +1692,34 @@ pub(crate) fn begin_merge_branch(
     author_name: &str,
     author_email: &str,
 ) -> Result<Oid, CheckoutError> {
-    let root_path = source.root;
-    resume_pending_checkout(
+    begin_merge_branch_for_scope(
         control,
-        repository_id,
-        root_path,
+        GitWorktreeScope::primary(repository_id),
+        source,
         catalog_dir,
-        source.backend,
-    )?;
+        branch,
+        author_name,
+        author_email,
+    )
+}
+
+pub(crate) fn begin_merge_branch_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    source: NativeSource<'_>,
+    catalog_dir: &PinnedDirectory,
+    branch: &str,
+    author_name: &str,
+    author_email: &str,
+) -> Result<Oid, CheckoutError> {
+    let repository_id = scope.repository_id();
+    let root_path = source.root;
+    resume_pending_checkout_for_scope(control, scope, root_path, catalog_dir, source.backend)?;
     if branch.len() > 1024 || !Branch::name_is_valid(branch)? {
         return Err(HistoryError::InvalidBranch.into());
     }
-    let selected = selected_branch(control, repository_id)?;
-    let local_ref = selected_ref(control, repository_id)?;
+    let selected = selected_branch_for_scope(control, scope)?;
+    let local_ref = selected_ref_for_scope(control, scope)?;
     let source_ref = format!("refs/heads/{branch}");
     let target = ref_oid(control, repository_id, source_ref.as_bytes())?
         .ok_or(CheckoutError::MissingMergeBranch)?;
@@ -1707,7 +1735,7 @@ pub(crate) fn begin_merge_branch(
             let message = format!("Merge branch '{branch}'");
             return begin_divergent_merge(
                 control,
-                repository_id,
+                scope,
                 source,
                 catalog_dir,
                 DivergentMerge {
@@ -1722,9 +1750,9 @@ pub(crate) fn begin_merge_branch(
             );
         }
     }
-    begin_checkout_to(
+    begin_checkout_to_for_scope(
         control,
-        repository_id,
+        scope,
         root_path,
         catalog_dir,
         CheckoutTarget {
@@ -1744,16 +1772,17 @@ pub(crate) fn begin_merge_branch(
 
 fn begin_divergent_merge(
     control: &ControlStore,
-    repository_id: Uuid,
+    scope: GitWorktreeScope,
     source: NativeSource<'_>,
     catalog_dir: &PinnedDirectory,
     merge: DivergentMerge<'_>,
 ) -> Result<Oid, CheckoutError> {
+    let repository_id = scope.repository_id();
     let root_path = source.root;
     if merge.author_name.is_empty() || merge.author_email.is_empty() {
         return Err(CheckoutError::MissingMergeIdentity);
     }
-    let status = repository_status(control, repository_id, root_path)?;
+    let status = repository_status_for_scope(control, scope, root_path)?;
     if !status.changes.is_empty() || !status.pending_adds.is_empty() {
         return Err(CheckoutError::DirtyWorktree);
     }
@@ -1772,8 +1801,9 @@ fn begin_divergent_merge(
     ) {
         Ok(merged) => merged,
         Err(HistoryError::MergeConflicts(paths)) => {
-            store_merge_session(
+            store_merge_session_for_scope(
                 control,
+                scope,
                 &MergeSession {
                     format_version: 1,
                     repository_id,
@@ -1792,9 +1822,9 @@ fn begin_divergent_merge(
         }
         Err(error) => return Err(error.into()),
     };
-    begin_checkout_to(
+    begin_checkout_to_for_scope(
         control,
-        repository_id,
+        scope,
         root_path,
         catalog_dir,
         CheckoutTarget {
@@ -1818,24 +1848,33 @@ pub(crate) fn continue_merge(
     source: NativeSource<'_>,
     catalog_dir: &PinnedDirectory,
 ) -> Result<Oid, CheckoutError> {
-    let root_path = source.root;
-    resume_pending_checkout(
+    continue_merge_for_scope(
         control,
-        repository_id,
-        root_path,
+        GitWorktreeScope::primary(repository_id),
+        source,
         catalog_dir,
-        source.backend,
-    )?;
+    )
+}
+
+pub(crate) fn continue_merge_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    source: NativeSource<'_>,
+    catalog_dir: &PinnedDirectory,
+) -> Result<Oid, CheckoutError> {
+    let repository_id = scope.repository_id();
+    let root_path = source.root;
+    resume_pending_checkout_for_scope(control, scope, root_path, catalog_dir, source.backend)?;
     let (session, _) =
-        load_merge_session(control, repository_id)?.ok_or(MergeBlobError::MissingSession)?;
-    let branch = selected_branch(control, repository_id)?;
+        load_merge_session_for_scope(control, scope)?.ok_or(MergeBlobError::MissingSession)?;
+    let branch = selected_branch_for_scope(control, scope)?;
     let ours = Oid::from_bytes(&session.ours)?;
     let theirs = Oid::from_bytes(&session.theirs)?;
     if branch != session.branch
         || ref_oid(
             control,
             repository_id,
-            &selected_ref(control, repository_id)?,
+            &selected_ref_for_scope(control, scope)?,
         )? != Some(ours)
         || ref_oid(control, repository_id, &session.source_ref)? != Some(theirs)
     {
@@ -1851,7 +1890,7 @@ pub(crate) fn continue_merge(
                 .collect(),
         ));
     }
-    let staged = staged_entries(control, repository_id)?
+    let staged = staged_entries_for_scope(control, scope)?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     let mut resolutions = BTreeMap::new();
@@ -1873,9 +1912,9 @@ pub(crate) fn continue_merge(
         },
         Some(&resolutions),
     )?;
-    begin_checkout_to(
+    begin_checkout_to_for_scope(
         control,
-        repository_id,
+        scope,
         root_path,
         catalog_dir,
         CheckoutTarget {
@@ -1891,24 +1930,6 @@ pub(crate) fn continue_merge(
         source.backend,
     )?;
     Ok(merged)
-}
-
-fn begin_checkout_to(
-    control: &ControlStore,
-    repository_id: Uuid,
-    root_path: &Path,
-    catalog_dir: &PinnedDirectory,
-    target: CheckoutTarget<'_>,
-    source_backend: SourceBackendKind,
-) -> Result<(), CheckoutError> {
-    begin_checkout_to_for_scope(
-        control,
-        GitWorktreeScope::primary(repository_id),
-        root_path,
-        catalog_dir,
-        target,
-        source_backend,
-    )
 }
 
 fn begin_checkout_to_for_scope(
@@ -3183,11 +3204,7 @@ fn apply_intent(
                 INTENT_KEY.to_vec(),
                 encode_intent_for_scope(scope, root.identity()?, intent)?,
             ));
-            let merge_session = if scope.worktree_id() == scope.repository_id() {
-                load_merge_session(control, intent.repository_id)?
-            } else {
-                None
-            };
+            let merge_session = load_merge_session_for_scope(control, scope)?;
             if let Some((session, encoded)) = merge_session {
                 let (first, second) = merge_commit_parents(
                     control,
@@ -3216,7 +3233,7 @@ fn apply_intent(
                 control.put_records_and_retire_and_delete_if_value(
                     &records,
                     &deletions,
-                    &session_kind(intent.repository_id),
+                    &session_kind_for_scope(scope),
                     session_key(),
                     &encoded,
                 )?;

@@ -1069,6 +1069,25 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitWorktreePullBare {
+            repository_id,
+            worktree_id,
+            path,
+            author_name,
+            author_email,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_pull_bare(
+                    repository_id,
+                    worktree_id,
+                    &path,
+                    &author_name,
+                    &author_email,
+                )
+                .map(|oid| LocalResponse::GitPulled { repository_id, oid })
+            })
+            .await
+        }
         LocalRequest::GitMergeBranch {
             repository_id,
             branch,
@@ -1081,6 +1100,25 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitWorktreeMergeBranch {
+            repository_id,
+            worktree_id,
+            branch,
+            author_name,
+            author_email,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_merge_branch(
+                    repository_id,
+                    worktree_id,
+                    &branch,
+                    &author_name,
+                    &author_email,
+                )
+                .map(|oid| LocalResponse::GitMerged { repository_id, oid })
+            })
+            .await
+        }
         LocalRequest::GitMergeContinue { repository_id } => {
             blocking_node(node, move |node| {
                 node.git_merge_continue(repository_id)
@@ -1088,9 +1126,29 @@ async fn handle_request(
             })
             .await
         }
+        LocalRequest::GitWorktreeMergeContinue {
+            repository_id,
+            worktree_id,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_merge_continue(repository_id, worktree_id)
+                    .map(|oid| LocalResponse::GitMerged { repository_id, oid })
+            })
+            .await
+        }
         LocalRequest::GitMergeAbort { repository_id } => {
             blocking_node(node, move |node| {
                 node.git_merge_abort(repository_id)
+                    .map(|()| LocalResponse::GitMergeAborted { repository_id })
+            })
+            .await
+        }
+        LocalRequest::GitWorktreeMergeAbort {
+            repository_id,
+            worktree_id,
+        } => {
+            blocking_node(node, move |node| {
+                node.git_worktree_merge_abort(repository_id, worktree_id)
                     .map(|()| LocalResponse::GitMergeAborted { repository_id })
             })
             .await

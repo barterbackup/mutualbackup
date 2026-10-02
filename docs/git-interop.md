@@ -57,7 +57,8 @@ After deliberately removing a linked worktree directory, run
 `mutualgit worktree prune WORKTREE_ID` from any remaining worktree to release
 its branch ownership and index pins. The command refuses an existing path,
 staged differences, or an unfinished add or checkout. Use `--force` to discard
-staged changes and pending adds after removing the directory. `--force` can also discard an
+staged changes, pending adds, and that worktree's unresolved merge session after
+removing the directory. `--force` can also discard an
 interrupted initial checkout and its private staging directory after that
 worktree directory is gone; later checkouts still block it.
 An interrupted registration that has not started checkout can be pruned without
@@ -102,8 +103,10 @@ refspec is given; explicit branch and tag refspecs use the shared history.
 existing local tag may be fetched again at the same object ID, but a remote
 rewrite or tag namespace conflict rejects the entire fetch without moving any
 refs.
-`mutualgit pull` and `mutualgit merge` currently require the primary worktree;
-linked-worktree merge sessions and replay are still an open milestone 6 gate.
+From a linked worktree, `pull` and `merge` use its selected branch, index, and
+working files. A conflict session stays with that worktree; resolve paths with
+`add`, then use `merge --continue` or `merge --abort` there. The provisioned
+linked merge and replay gate remains open in `TODO.md`.
 Repository-wide `fetch`, `pin`, `unpin`, `pins`, and history `prune`/`gc` also
 work when invoked from a linked worktree; they use the shared repository catalog.
 `mutualgit --help` gives the current command forms. Staging, checkout, merge,

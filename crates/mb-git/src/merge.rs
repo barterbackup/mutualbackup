@@ -15,10 +15,11 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::stage::{StageError, anchors_for_oid, object_kind, stage_path_key};
-use crate::{GitAnchorError, NativeOdb, NativeSource, blob_oid_from_anchor};
+use crate::{GitAnchorError, GitWorktreeScope, NativeOdb, NativeSource, blob_oid_from_anchor};
 
 const INTENT_PREFIX: &str = "git-merge-blob-intent-v1/";
 const SESSION_PREFIX: &str = "git-merge-session-v1/";
+const LINKED_SESSION_PREFIX: &str = "git-worktree-merge-session-v1/";
 const ACTIVE: &[u8] = b"active";
 pub(crate) const MAX_AUTOMERGE_FILE_BYTES: u64 = 1024 * 1024;
 
@@ -69,8 +70,34 @@ pub(crate) struct MergeSession {
     pub resolved: Vec<Vec<u8>>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct LinkedMergeSessionV1 {
+    format_version: u16,
+    worktree_id: Uuid,
+    session: MergeSession,
+}
+
 pub(crate) fn session_kind(repository_id: Uuid) -> String {
     format!("{SESSION_PREFIX}{repository_id}")
+}
+
+pub(crate) fn session_kind_for_scope(scope: GitWorktreeScope) -> String {
+    scope.local_kind(SESSION_PREFIX, LINKED_SESSION_PREFIX)
+}
+
+fn encode_session_for_scope(
+    scope: GitWorktreeScope,
+    session: &MergeSession,
+) -> Result<Vec<u8>, MergeBlobError> {
+    if scope.worktree_id() == scope.repository_id() {
+        Ok(canonical_bytes(session)?)
+    } else {
+        Ok(canonical_bytes(&LinkedMergeSessionV1 {
+            format_version: 1,
+            worktree_id: scope.worktree_id(),
+            session: session.clone(),
+        })?)
+    }
 }
 
 pub(crate) fn session_key() -> &'static [u8] {
@@ -114,6 +141,99 @@ fn validate_session(session: &MergeSession, repository_id: Uuid) -> Result<(), M
     Ok(())
 }
 
+#[cfg(test)]
+mod scoped_session_tests {
+    use super::*;
+
+    #[test]
+    fn linked_merge_sessions_bind_worktree_and_keep_primary_record_compatible() {
+        let database = tempfile::tempdir().unwrap();
+        let control =
+            ControlStore::open_with_key(database.path().join("catalog.db"), &[68; 32]).unwrap();
+        let repository_id = Uuid::new_v4();
+        let primary = GitWorktreeScope::primary(repository_id);
+        let linked = GitWorktreeScope::linked(repository_id, Uuid::new_v4()).unwrap();
+        let other = GitWorktreeScope::linked(repository_id, Uuid::new_v4()).unwrap();
+        let session = MergeSession {
+            format_version: 1,
+            repository_id,
+            branch: "topic".to_owned(),
+            ours: [1; 20],
+            theirs: [2; 20],
+            source_ref: b"refs/heads/source".to_vec(),
+            author_name: "Author".to_owned(),
+            author_email: "a@example.test".to_owned(),
+            message: "merge".to_owned(),
+            conflicts: vec![b"tracked".to_vec()],
+            resolved: Vec::new(),
+        };
+        store_merge_session_for_scope(&control, primary, &session).unwrap();
+        store_merge_session_for_scope(&control, linked, &session).unwrap();
+        assert_eq!(
+            control
+                .get_record(&session_kind(repository_id), ACTIVE)
+                .unwrap(),
+            Some(canonical_bytes(&session).unwrap())
+        );
+        assert_eq!(
+            load_merge_session_for_scope(&control, linked)
+                .unwrap()
+                .unwrap()
+                .0,
+            session
+        );
+        assert!(
+            load_merge_session_for_scope(&control, other)
+                .unwrap()
+                .is_none()
+        );
+        mark_merge_resolved_for_scope(&control, linked, b"tracked").unwrap();
+        assert!(
+            merge_state_for_scope(&control, linked)
+                .unwrap()
+                .unwrap()
+                .unresolved_paths
+                .is_empty()
+        );
+        assert_eq!(
+            merge_state_for_scope(&control, primary)
+                .unwrap()
+                .unwrap()
+                .unresolved_paths,
+            vec![b"tracked".to_vec()]
+        );
+        unmark_merge_resolved_for_scope(&control, linked, b"tracked").unwrap();
+        assert_eq!(
+            merge_state_for_scope(&control, linked)
+                .unwrap()
+                .unwrap()
+                .unresolved_paths,
+            vec![b"tracked".to_vec()]
+        );
+        assert!(has_merge_session_outside_scope(&control, linked).unwrap());
+        control
+            .delete_record(&session_kind(repository_id), ACTIVE)
+            .unwrap();
+        assert!(has_merge_session(&control, repository_id).unwrap());
+        assert!(!has_merge_session_outside_scope(&control, linked).unwrap());
+        store_merge_session_for_scope(&control, other, &session).unwrap();
+        assert!(has_merge_session_outside_scope(&control, linked).unwrap());
+        let wrong = canonical_bytes(&LinkedMergeSessionV1 {
+            format_version: 1,
+            worktree_id: other.worktree_id(),
+            session: session.clone(),
+        })
+        .unwrap();
+        control
+            .put_record(&session_kind_for_scope(linked), ACTIVE, &wrong)
+            .unwrap();
+        assert!(matches!(
+            load_merge_session_for_scope(&control, linked),
+            Err(MergeBlobError::IncompatibleRecord)
+        ));
+    }
+}
+
 pub(crate) fn load_merge_session(
     control: &ControlStore,
     repository_id: Uuid,
@@ -126,22 +246,67 @@ pub(crate) fn load_merge_session(
     Ok(Some((session, encoded)))
 }
 
+pub(crate) fn load_merge_session_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+) -> Result<Option<(MergeSession, Vec<u8>)>, MergeBlobError> {
+    if scope.worktree_id() == scope.repository_id() {
+        return load_merge_session(control, scope.repository_id());
+    }
+    let Some(encoded) = control.get_record(&session_kind_for_scope(scope), ACTIVE)? else {
+        return Ok(None);
+    };
+    let linked: LinkedMergeSessionV1 = decode_canonical(&encoded)?;
+    if linked.format_version != 1 || linked.worktree_id != scope.worktree_id() {
+        return Err(MergeBlobError::IncompatibleRecord);
+    }
+    validate_session(&linked.session, scope.repository_id())?;
+    Ok(Some((linked.session, encoded)))
+}
+
 pub(crate) fn has_merge_session(
     control: &ControlStore,
     repository_id: Uuid,
 ) -> Result<bool, MergeBlobError> {
-    Ok(load_merge_session(control, repository_id)?.is_some())
+    if load_merge_session(control, repository_id)?.is_some() {
+        return Ok(true);
+    }
+    let linked_prefix = format!("{LINKED_SESSION_PREFIX}{repository_id}/");
+    Ok(!control.records_with_kind_prefix(&linked_prefix)?.is_empty())
 }
 
-pub(crate) fn store_merge_session(
+pub(crate) fn has_merge_session_outside_scope(
     control: &ControlStore,
+    scope: GitWorktreeScope,
+) -> Result<bool, MergeBlobError> {
+    if load_merge_session(control, scope.repository_id())?.is_some() {
+        return Ok(true);
+    }
+    let linked_prefix = format!("{LINKED_SESSION_PREFIX}{}/", scope.repository_id());
+    let own_kind = session_kind_for_scope(scope);
+    Ok(control
+        .records_with_kind_prefix(&linked_prefix)?
+        .iter()
+        .any(|(kind, key, _)| kind != &own_kind || key.as_slice() != ACTIVE))
+}
+
+pub(crate) fn has_merge_session_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+) -> Result<bool, MergeBlobError> {
+    Ok(load_merge_session_for_scope(control, scope)?.is_some())
+}
+
+pub(crate) fn store_merge_session_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
     session: &MergeSession,
 ) -> Result<(), MergeBlobError> {
-    validate_session(session, session.repository_id)?;
+    validate_session(session, scope.repository_id())?;
     if !control.put_record_if_absent(
-        &session_kind(session.repository_id),
+        &session_kind_for_scope(scope),
         ACTIVE,
-        &canonical_bytes(session)?,
+        &encode_session_for_scope(scope, session)?,
     )? {
         return Err(MergeBlobError::PendingSession);
     }
@@ -153,7 +318,15 @@ pub(crate) fn mark_merge_resolved(
     repository_id: Uuid,
     path: &[u8],
 ) -> Result<(), MergeBlobError> {
-    let Some((mut session, before)) = load_merge_session(control, repository_id)? else {
+    mark_merge_resolved_for_scope(control, GitWorktreeScope::primary(repository_id), path)
+}
+
+pub(crate) fn mark_merge_resolved_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    path: &[u8],
+) -> Result<(), MergeBlobError> {
+    let Some((mut session, before)) = load_merge_session_for_scope(control, scope)? else {
         return Ok(());
     };
     if session
@@ -169,10 +342,10 @@ pub(crate) fn mark_merge_resolved(
     {
         session.resolved.insert(position, path.to_vec());
         control.replace_record_if_value(
-            &session_kind(repository_id),
+            &session_kind_for_scope(scope),
             ACTIVE,
             &before,
-            &canonical_bytes(&session)?,
+            &encode_session_for_scope(scope, &session)?,
         )?;
     }
     Ok(())
@@ -183,7 +356,15 @@ pub(crate) fn unmark_merge_resolved(
     repository_id: Uuid,
     path: &[u8],
 ) -> Result<(), MergeBlobError> {
-    let Some((mut session, before)) = load_merge_session(control, repository_id)? else {
+    unmark_merge_resolved_for_scope(control, GitWorktreeScope::primary(repository_id), path)
+}
+
+pub(crate) fn unmark_merge_resolved_for_scope(
+    control: &ControlStore,
+    scope: GitWorktreeScope,
+    path: &[u8],
+) -> Result<(), MergeBlobError> {
+    let Some((mut session, before)) = load_merge_session_for_scope(control, scope)? else {
         return Ok(());
     };
     if let Ok(position) = session
@@ -192,20 +373,20 @@ pub(crate) fn unmark_merge_resolved(
     {
         session.resolved.remove(position);
         control.replace_record_if_value(
-            &session_kind(repository_id),
+            &session_kind_for_scope(scope),
             ACTIVE,
             &before,
-            &canonical_bytes(&session)?,
+            &encode_session_for_scope(scope, &session)?,
         )?;
     }
     Ok(())
 }
 
-pub(crate) fn merge_state(
+pub(crate) fn merge_state_for_scope(
     control: &ControlStore,
-    repository_id: Uuid,
+    scope: GitWorktreeScope,
 ) -> Result<Option<GitMergeState>, MergeBlobError> {
-    let Some((session, _)) = load_merge_session(control, repository_id)? else {
+    let Some((session, _)) = load_merge_session_for_scope(control, scope)? else {
         return Ok(None);
     };
     Ok(Some(GitMergeState {

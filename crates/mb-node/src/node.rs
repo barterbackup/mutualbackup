@@ -2109,6 +2109,23 @@ impl Node {
         Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
     }
 
+    pub fn git_worktree_pull_bare(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        path: &Path,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<[u8; 20]> {
+        let oid = self.open_git_repository(repository_id)?.linked_pull_bare(
+            worktree_id,
+            path,
+            author_name,
+            author_email,
+        )?;
+        Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
+    }
+
     pub fn git_merge_branch(
         &self,
         repository_id: Uuid,
@@ -2124,13 +2141,44 @@ impl Node {
         Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
     }
 
+    pub fn git_worktree_merge_branch(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+        branch: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<[u8; 20]> {
+        let oid = self
+            .open_git_repository(repository_id)?
+            .linked_merge_branch(worktree_id, branch, author_name, author_email)?;
+        Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
+    }
+
     pub fn git_merge_continue(&self, repository_id: Uuid) -> Result<[u8; 20]> {
         let oid = self.open_git_repository(repository_id)?.merge_continue()?;
         Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
     }
 
+    pub fn git_worktree_merge_continue(
+        &self,
+        repository_id: Uuid,
+        worktree_id: Uuid,
+    ) -> Result<[u8; 20]> {
+        let oid = self
+            .open_git_repository(repository_id)?
+            .linked_merge_continue(worktree_id)?;
+        Ok(oid.as_bytes().try_into().expect("SHA-1 OID"))
+    }
+
     pub fn git_merge_abort(&self, repository_id: Uuid) -> Result<()> {
         self.open_git_repository(repository_id)?.merge_abort()?;
+        Ok(())
+    }
+
+    pub fn git_worktree_merge_abort(&self, repository_id: Uuid, worktree_id: Uuid) -> Result<()> {
+        self.open_git_repository(repository_id)?
+            .linked_merge_abort(worktree_id)?;
         Ok(())
     }
 

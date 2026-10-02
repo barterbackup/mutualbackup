@@ -82,9 +82,13 @@ local-request =
   / { "GitPushTagBare": { repository_id: uuid-text, path: tstr, name: tstr } }
   / { "GitFetchBare": { repository_id: uuid-text, path: tstr } }
   / { "GitPullBare": { repository_id: uuid-text, path: tstr, ? author_name: tstr, ? author_email: tstr } }
+  / { "GitWorktreePullBare": { repository_id: uuid-text, worktree_id: uuid-text, path: tstr, ? author_name: tstr, ? author_email: tstr } }
   / { "GitMergeBranch": { repository_id: uuid-text, branch: tstr, ? author_name: tstr, ? author_email: tstr } }
+  / { "GitWorktreeMergeBranch": { repository_id: uuid-text, worktree_id: uuid-text, branch: tstr, ? author_name: tstr, ? author_email: tstr } }
   / { "GitMergeContinue": { repository_id: uuid-text } }
+  / { "GitWorktreeMergeContinue": { repository_id: uuid-text, worktree_id: uuid-text } }
   / { "GitMergeAbort": { repository_id: uuid-text } }
+  / { "GitWorktreeMergeAbort": { repository_id: uuid-text, worktree_id: uuid-text } }
   / { "GitDiff": { repository_id: uuid-text, cached: bool } }
   / { "GitStatus": { repository_id: uuid-text } }
   / "GuildStatus"

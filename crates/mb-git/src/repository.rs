@@ -16,9 +16,10 @@ use uuid::Uuid;
 
 use crate::NativeSource;
 use crate::checkout::{
-    CheckoutError, begin_hard_reset_for_scope, begin_merge_branch, begin_pull,
-    begin_restore_both_for_scope, begin_restore_for_scope, begin_switch, begin_switch_for_scope,
-    continue_merge, resume_pending_checkout, resume_pending_checkout_for_scope,
+    CheckoutError, begin_hard_reset_for_scope, begin_merge_branch, begin_merge_branch_for_scope,
+    begin_pull, begin_pull_for_scope, begin_restore_both_for_scope, begin_restore_for_scope,
+    begin_switch, begin_switch_for_scope, continue_merge, continue_merge_for_scope,
+    resume_pending_checkout, resume_pending_checkout_for_scope,
 };
 use crate::diff::{DiffError, GitDiff, repository_diff, repository_diff_for_scope};
 use crate::fetch::{FetchError, fetch_bare, import_pushed_branch, import_pushed_tag};
@@ -38,8 +39,10 @@ use crate::interop::{
     push_current_branch_to_bare, push_tag_to_bare,
 };
 use crate::merge::{
-    MergeBlobError, has_merge_session, load_merge_session, mark_merge_resolved,
-    resume_pending_merge_blob, session_key, session_kind, unmark_merge_resolved,
+    MergeBlobError, has_merge_session, has_merge_session_for_scope,
+    has_merge_session_outside_scope, load_merge_session, load_merge_session_for_scope,
+    mark_merge_resolved, mark_merge_resolved_for_scope, resume_pending_merge_blob, session_key,
+    session_kind, session_kind_for_scope, unmark_merge_resolved, unmark_merge_resolved_for_scope,
 };
 use crate::prune::{
     GitPruneError, GitPruneReport, GitPruneRoots, prune_unreachable, resume_pending_prune,
@@ -47,9 +50,10 @@ use crate::prune::{
 use crate::rm::{GitRmError, remove_tracked_for_scope, resume_pending_rm_for_scope};
 use crate::stage::{
     GitIndexEntry, StageError, abandon_pending_stage, abandon_pending_stage_for_scope,
-    anchors_for_oid, pending_stage_paths, remove_cached, remove_cached_for_scope,
-    resume_pending_stages_for_scope_with_backend, stage_file_for_scope_with_backend,
-    stage_path_key, stage_symlink_for_scope_with_backend, staged_entry,
+    anchors_for_oid, pending_stage_paths, pending_stage_paths_for_scope, remove_cached,
+    remove_cached_for_scope, resume_pending_stages_for_scope_with_backend,
+    stage_file_for_scope_with_backend, stage_path_key, stage_symlink_for_scope_with_backend,
+    staged_entry,
 };
 use crate::status::{GitStatus, StatusError, repository_status, repository_status_for_scope};
 use crate::worktree::{
@@ -304,7 +308,11 @@ impl GitRepository {
         force: bool,
     ) -> Result<GitWorktreeInfo, RepositoryError> {
         self.resume_checkout()?;
-        self.ensure_no_merge_session()?;
+        let scope = crate::GitWorktreeScope::linked(self.repository_id, worktree_id)
+            .ok_or(GitWorktreeError::Conflict)?;
+        if !force || has_merge_session_outside_scope(&self.catalog, scope)? {
+            self.ensure_no_merge_session()?;
+        }
         Ok(prune_missing_worktree(
             &self.catalog,
             self.repository_id,
@@ -372,7 +380,11 @@ impl GitRepository {
     ) -> Result<Option<GitIndexEntry>, RepositoryError> {
         let info = self.resume_linked_worktree(worktree_id)?;
         let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
+        let pending_paths = pending_stage_paths_for_scope(&self.catalog, scope)?;
         resume_pending_stages_for_scope_with_backend(&self.catalog, scope, self.source_backend)?;
+        for path in pending_paths {
+            mark_merge_resolved_for_scope(&self.catalog, scope, &path)?;
+        }
         let relative = relative_path.as_ref();
         stage_path_key(relative)?;
         let mut parent = PinnedDirectory::open(&info.path)?;
@@ -396,7 +408,7 @@ impl GitRepository {
             Err(error) => return Err(error.into()),
         };
         if symlink {
-            return Ok(Some(stage_symlink_for_scope_with_backend(
+            let entry = stage_symlink_for_scope_with_backend(
                 &self.catalog,
                 scope,
                 &info.path,
@@ -404,16 +416,20 @@ impl GitRepository {
                 &self.directory,
                 relative,
                 self.source_backend,
-            )?));
+            )?;
+            mark_merge_resolved_for_scope(&self.catalog, scope, &stage_path_key(relative)?)?;
+            return Ok(Some(entry));
         }
         if parent.open_child_file(name)?.is_some() {
-            Ok(Some(stage_file_for_scope_with_backend(
+            let entry = stage_file_for_scope_with_backend(
                 &self.catalog,
                 scope,
                 &info.path,
                 relative,
                 self.source_backend,
-            )?))
+            )?;
+            mark_merge_resolved_for_scope(&self.catalog, scope, &stage_path_key(relative)?)?;
+            Ok(Some(entry))
         } else {
             self.linked_missing_path(scope, relative)
         }
@@ -424,8 +440,15 @@ impl GitRepository {
         scope: crate::GitWorktreeScope,
         relative: &Path,
     ) -> Result<Option<GitIndexEntry>, RepositoryError> {
-        if !remove_cached_for_scope(&self.catalog, scope, relative)? {
+        let path = stage_path_key(relative)?;
+        let removed = remove_cached_for_scope(&self.catalog, scope, relative)?;
+        let conflict = load_merge_session_for_scope(&self.catalog, scope)?
+            .is_some_and(|(session, _)| session.conflicts.binary_search(&path).is_ok());
+        if !removed && !conflict {
             return Err(StageError::MissingUntrackedPath.into());
+        }
+        if conflict {
+            mark_merge_resolved_for_scope(&self.catalog, scope, &path)?;
         }
         Ok(None)
     }
@@ -436,11 +459,13 @@ impl GitRepository {
         relative_path: impl AsRef<Path>,
     ) -> Result<bool, RepositoryError> {
         let info = self.resume_linked_worktree(worktree_id)?;
-        Ok(remove_cached_for_scope(
-            &self.catalog,
-            info.scope().ok_or(GitWorktreeError::Conflict)?,
-            relative_path,
-        )?)
+        let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
+        let relative = relative_path.as_ref();
+        let removed = remove_cached_for_scope(&self.catalog, scope, relative)?;
+        if removed {
+            unmark_merge_resolved_for_scope(&self.catalog, scope, &stage_path_key(relative)?)?;
+        }
+        Ok(removed)
     }
 
     pub fn linked_remove_tracked(
@@ -449,6 +474,7 @@ impl GitRepository {
         relative_path: impl AsRef<Path>,
     ) -> Result<bool, RepositoryError> {
         let info = self.resume_linked_worktree(worktree_id)?;
+        self.ensure_no_merge_session_for_scope(info.scope().ok_or(GitWorktreeError::Conflict)?)?;
         Ok(remove_tracked_for_scope(
             &self.catalog,
             info.scope().ok_or(GitWorktreeError::Conflict)?,
@@ -479,6 +505,7 @@ impl GitRepository {
     ) -> Result<GitCommitInfo, RepositoryError> {
         let info = self.resume_linked_worktree(worktree_id)?;
         let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
+        self.ensure_no_merge_session_for_scope(scope)?;
         resume_pending_stages_for_scope_with_backend(&self.catalog, scope, self.source_backend)?;
         Ok(commit_index_for_scope(
             &self.catalog,
@@ -673,6 +700,7 @@ impl GitRepository {
         name: &str,
     ) -> Result<GitBranchInfo, RepositoryError> {
         let info = self.resume_linked_worktree(worktree_id)?;
+        self.ensure_no_merge_session()?;
         let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
         match switch_same_tree_branch_for_scope(&self.catalog, scope, name) {
             Ok(branch) => Ok(branch),
@@ -1069,6 +1097,16 @@ impl GitRepository {
         Ok(())
     }
 
+    fn ensure_no_merge_session_for_scope(
+        &self,
+        scope: crate::GitWorktreeScope,
+    ) -> Result<(), RepositoryError> {
+        if has_merge_session_for_scope(&self.catalog, scope)? {
+            return Err(MergeBlobError::PendingSession.into());
+        }
+        Ok(())
+    }
+
     pub fn status(&self) -> Result<GitStatus, RepositoryError> {
         self.resume_checkout()?;
         Ok(repository_status(
@@ -1277,6 +1315,31 @@ impl GitRepository {
         )?)
     }
 
+    pub fn linked_pull_bare(
+        &self,
+        worktree_id: Uuid,
+        source: impl AsRef<Path>,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<Oid, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
+        self.ensure_no_merge_session()?;
+        self.ensure_no_merge_session_for_scope(scope)?;
+        self.fetch_bare(source)?;
+        Ok(begin_pull_for_scope(
+            &self.catalog,
+            scope,
+            NativeSource {
+                root: &info.path,
+                backend: self.source_backend,
+            },
+            &self.directory,
+            author_name,
+            author_email,
+        )?)
+    }
+
     /// Merge a local branch, publishing a two-parent commit for disjoint paths.
     pub fn merge_branch(
         &self,
@@ -1297,6 +1360,31 @@ impl GitRepository {
         )?)
     }
 
+    pub fn linked_merge_branch(
+        &self,
+        worktree_id: Uuid,
+        branch: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<Oid, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
+        self.ensure_no_merge_session()?;
+        self.ensure_no_merge_session_for_scope(scope)?;
+        Ok(begin_merge_branch_for_scope(
+            &self.catalog,
+            scope,
+            NativeSource {
+                root: &info.path,
+                backend: self.source_backend,
+            },
+            &self.directory,
+            branch,
+            author_name,
+            author_email,
+        )?)
+    }
+
     /// Finish a conflicted merge using explicitly staged resolution bytes.
     pub fn merge_continue(&self) -> Result<Oid, RepositoryError> {
         self.resume_checkout()?;
@@ -1304,6 +1392,19 @@ impl GitRepository {
             &self.catalog,
             self.repository_id,
             self.native_source(),
+            &self.directory,
+        )?)
+    }
+
+    pub fn linked_merge_continue(&self, worktree_id: Uuid) -> Result<Oid, RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        Ok(continue_merge_for_scope(
+            &self.catalog,
+            info.scope().ok_or(GitWorktreeError::Conflict)?,
+            NativeSource {
+                root: &info.path,
+                backend: self.source_backend,
+            },
             &self.directory,
         )?)
     }
@@ -1316,6 +1417,19 @@ impl GitRepository {
             .ok_or(MergeBlobError::MissingSession)?;
         self.catalog.delete_record_if_value(
             &session_kind(self.repository_id),
+            session_key(),
+            &encoded,
+        )?;
+        Ok(())
+    }
+
+    pub fn linked_merge_abort(&self, worktree_id: Uuid) -> Result<(), RepositoryError> {
+        let info = self.resume_linked_worktree(worktree_id)?;
+        let scope = info.scope().ok_or(GitWorktreeError::Conflict)?;
+        let (_, encoded) = load_merge_session_for_scope(&self.catalog, scope)?
+            .ok_or(MergeBlobError::MissingSession)?;
+        self.catalog.delete_record_if_value(
+            &session_kind_for_scope(scope),
             session_key(),
             &encoded,
         )?;
@@ -2228,6 +2342,30 @@ mod tests {
         ));
 
         let scope = linked.scope().unwrap();
+        crate::merge::store_merge_session_for_scope(
+            &local.catalog,
+            scope,
+            &crate::merge::MergeSession {
+                format_version: 1,
+                repository_id,
+                branch: "topic".to_owned(),
+                ours: [1; 20],
+                theirs: [2; 20],
+                source_ref: b"refs/heads/main".to_vec(),
+                author_name: "Author".to_owned(),
+                author_email: "a@example.test".to_owned(),
+                message: "merge".to_owned(),
+                conflicts: vec![b"tracked".to_vec()],
+                resolved: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            local.prune_missing_linked_worktree(linked.worktree_id, false),
+            Err(RepositoryError::MergeBlob(
+                crate::MergeBlobError::PendingSession
+            ))
+        ));
         let pending_kind =
             scope.local_kind("git-stage-intent-v1/", "git-worktree-stage-intent-v1/");
         local
@@ -2252,6 +2390,11 @@ mod tests {
             linked
         );
         assert!(local.linked_worktrees().unwrap().is_empty());
+        assert!(
+            crate::merge::load_merge_session_for_scope(&local.catalog, scope)
+                .unwrap()
+                .is_none()
+        );
         assert!(
             local
                 .catalog
@@ -5584,6 +5727,236 @@ mod tests {
         drop(repo);
         for anchor in anchors.into_values() {
             anchor.remove().unwrap();
+        }
+        fs::remove_dir_all(run_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned Btrfs test filesystem"]
+    fn linked_pull_and_conflicted_merge_replay_without_touching_primary_worktree() {
+        let test_root = PathBuf::from(
+            std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT")
+                .expect("the reflink acceptance harness must set MUTUALBACKUP_REFLINK_TEST_ROOT"),
+        );
+        let run_root = test_root.join(format!("git-linked-merge-{}", Uuid::new_v4()));
+        let primary_root = run_root.join("primary");
+        let linked_root = run_root.join("linked");
+        let observer_root = run_root.join("observer");
+        let bare_root = run_root.join("remote.git");
+        fs::create_dir_all(&primary_root).unwrap();
+        fs::create_dir_all(&linked_root).unwrap();
+        fs::create_dir_all(&observer_root).unwrap();
+        fs::write(primary_root.join("tracked"), b"base\r\n").unwrap();
+        let repository_id = Uuid::new_v4();
+        let key = [99_u8; 32];
+        let local = GitRepository::init(&primary_root, repository_id, &key).unwrap();
+        local.stage_file("tracked").unwrap();
+        let base = local.commit("Author", "a@example.test", "base").unwrap();
+        local.create_branch("topic").unwrap();
+        local.create_branch("source").unwrap();
+        local.create_branch("observer").unwrap();
+        let linked = local.add_linked_worktree(&linked_root, "topic").unwrap();
+        let observer = local
+            .add_linked_worktree(&observer_root, "observer")
+            .unwrap();
+        local.switch_branch("source").unwrap();
+        fs::write(primary_root.join("tracked"), b"source first\n").unwrap();
+        local.stage_file("tracked").unwrap();
+        let first_source = local
+            .commit("Author", "a@example.test", "source first")
+            .unwrap();
+        git2::Repository::init_bare(&bare_root).unwrap();
+        local
+            .push_branch_to_bare(&bare_root, "source", "topic")
+            .unwrap();
+
+        fs::write(linked_root.join("tracked"), b"dirty linked bytes").unwrap();
+        assert!(matches!(
+            local.linked_pull_bare(linked.worktree_id, &bare_root, "", ""),
+            Err(RepositoryError::Checkout(
+                crate::CheckoutError::DirtyWorktree
+            ))
+        ));
+        assert_eq!(
+            local.linked_status(linked.worktree_id).unwrap().head_oid,
+            Some(base.oid)
+        );
+        fs::write(linked_root.join("tracked"), b"base\r\n").unwrap();
+        assert_eq!(
+            local
+                .linked_pull_bare(linked.worktree_id, &bare_root, "", "")
+                .unwrap()
+                .as_bytes(),
+            first_source.oid
+        );
+        assert_eq!(
+            fs::read(linked_root.join("tracked")).unwrap(),
+            b"source first\n"
+        );
+
+        fs::write(primary_root.join("tracked"), b"source second\n").unwrap();
+        fs::write(primary_root.join("source-only"), b"source-only\r\n\0").unwrap();
+        local.stage_file("tracked").unwrap();
+        local.stage_file("source-only").unwrap();
+        let second_source = local
+            .commit("Author", "a@example.test", "source second")
+            .unwrap();
+        fs::write(linked_root.join("tracked"), b"dirty before merge").unwrap();
+        assert!(matches!(
+            local.linked_merge_branch(linked.worktree_id, "source", "Author", "a@example.test"),
+            Err(RepositoryError::Checkout(
+                crate::CheckoutError::DirtyWorktree
+            ))
+        ));
+        assert_eq!(
+            local.linked_status(linked.worktree_id).unwrap().head_oid,
+            Some(first_source.oid)
+        );
+        fs::write(linked_root.join("tracked"), b"topic second\n").unwrap();
+        local
+            .linked_add_path(linked.worktree_id, "tracked")
+            .unwrap();
+        let topic = local
+            .linked_commit(
+                linked.worktree_id,
+                "Author",
+                "a@example.test",
+                "topic second",
+            )
+            .unwrap();
+        assert!(matches!(
+            local.linked_merge_branch(linked.worktree_id, "source", "Author", "a@example.test"),
+            Err(RepositoryError::Checkout(crate::CheckoutError::MergeConflicts(paths)))
+                if paths == vec![b"tracked".to_vec()]
+        ));
+        assert!(local.status().unwrap().merge.is_none());
+        assert_eq!(
+            local
+                .linked_status(linked.worktree_id)
+                .unwrap()
+                .merge
+                .unwrap()
+                .unresolved_paths,
+            vec![b"tracked".to_vec()]
+        );
+        local.linked_merge_abort(linked.worktree_id).unwrap();
+        assert!(
+            local
+                .linked_status(linked.worktree_id)
+                .unwrap()
+                .merge
+                .is_none()
+        );
+        assert!(matches!(
+            local.linked_merge_branch(linked.worktree_id, "source", "Author", "a@example.test"),
+            Err(RepositoryError::Checkout(
+                crate::CheckoutError::MergeConflicts(_)
+            ))
+        ));
+        fs::write(linked_root.join("tracked"), b"resolved\r\n\0").unwrap();
+        local
+            .linked_add_path(linked.worktree_id, "tracked")
+            .unwrap();
+        assert!(
+            local
+                .linked_status(linked.worktree_id)
+                .unwrap()
+                .merge
+                .unwrap()
+                .unresolved_paths
+                .is_empty()
+        );
+        crate::checkout::set_after_checkout_file_hook(Box::new(|| panic!("linked merge crash")));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local.linked_merge_continue(linked.worktree_id).unwrap();
+        }));
+        assert!(interrupted.is_err());
+        assert_eq!(
+            crate::history::ref_oid(&local.catalog, repository_id, b"refs/heads/topic").unwrap(),
+            Some(Oid::from_bytes(&topic.oid).unwrap())
+        );
+        drop(local);
+
+        let local = GitRepository::open(&primary_root, repository_id, &key).unwrap();
+        local.resume_linked_worktree(linked.worktree_id).unwrap();
+        let linked_status = local.linked_status(linked.worktree_id).unwrap();
+        assert!(linked_status.merge.is_none());
+        assert!(linked_status.changes.is_empty());
+        assert_eq!(
+            fs::read(linked_root.join("tracked")).unwrap(),
+            b"resolved\r\n\0"
+        );
+        assert_eq!(
+            fs::read(linked_root.join("source-only")).unwrap(),
+            b"source-only\r\n\0"
+        );
+        assert_eq!(
+            fs::read(primary_root.join("tracked")).unwrap(),
+            b"source second\n"
+        );
+        assert_eq!(local.status().unwrap().head_oid, Some(second_source.oid));
+        assert!(local.status().unwrap().changes.is_empty());
+        assert_eq!(
+            local.linked_log(linked.worktree_id, 1).unwrap()[0].parent_oids,
+            vec![topic.oid, second_source.oid]
+        );
+        local
+            .create_branch_from("remote-followup", "topic")
+            .unwrap();
+        local.switch_branch("remote-followup").unwrap();
+        fs::write(primary_root.join("remote-only"), b"remote\n\0").unwrap();
+        local.stage_file("remote-only").unwrap();
+        let remote_followup = local
+            .commit("Author", "a@example.test", "remote followup")
+            .unwrap();
+        local
+            .push_branch_to_bare(&bare_root, "remote-followup", "topic")
+            .unwrap();
+        fs::write(linked_root.join("linked-only"), b"linked\r\n\0").unwrap();
+        local
+            .linked_add_path(linked.worktree_id, "linked-only")
+            .unwrap();
+        let linked_followup = local
+            .linked_commit(
+                linked.worktree_id,
+                "Author",
+                "a@example.test",
+                "linked followup",
+            )
+            .unwrap();
+        let pulled = local
+            .linked_pull_bare(linked.worktree_id, &bare_root, "Author", "a@example.test")
+            .unwrap();
+        assert_eq!(
+            local.linked_log(linked.worktree_id, 1).unwrap()[0].parent_oids,
+            vec![linked_followup.oid, remote_followup.oid]
+        );
+        assert_eq!(
+            local.linked_status(linked.worktree_id).unwrap().head_oid,
+            Some(pulled.as_bytes().try_into().unwrap())
+        );
+        assert_eq!(
+            fs::read(linked_root.join("remote-only")).unwrap(),
+            b"remote\n\0"
+        );
+        assert_eq!(
+            fs::read(linked_root.join("linked-only")).unwrap(),
+            b"linked\r\n\0"
+        );
+        assert_eq!(local.status().unwrap().head_oid, Some(remote_followup.oid));
+        assert!(local.status().unwrap().changes.is_empty());
+        assert_eq!(
+            fs::read(observer_root.join("tracked")).unwrap(),
+            b"base\r\n"
+        );
+        let observer_status = local.linked_status(observer.worktree_id).unwrap();
+        assert_eq!(observer_status.head_oid, Some(base.oid));
+        assert!(observer_status.changes.is_empty());
+        assert!(observer_status.merge.is_none());
+        let graph = local.export_graph_source().unwrap();
+        drop(local);
+        for blob in graph.blobs {
+            blob.anchor.remove().unwrap();
         }
         fs::remove_dir_all(run_root).unwrap();
     }
