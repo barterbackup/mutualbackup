@@ -756,8 +756,8 @@ impl GuardedRootCapturePlan {
     fn retirement_directory_paths(
         &self,
         control: &ControlStore,
-    ) -> anyhow::Result<BTreeMap<String, PathBuf>> {
-        let mut paths = BTreeMap::from([(String::new(), PathBuf::new())]);
+    ) -> anyhow::Result<BTreeMap<String, Option<PathBuf>>> {
+        let mut paths = BTreeMap::from([(String::new(), Some(PathBuf::new()))]);
         let mut occupied = std::collections::BTreeSet::from([PathBuf::new()]);
         for (index, entry) in self.entries.iter().enumerate() {
             let GuardedRootEntry::Directory { path, version, .. } = entry else {
@@ -775,7 +775,10 @@ impl GuardedRootCapturePlan {
                 expected,
             )?;
             anyhow::ensure!(
-                occupied.insert(current.clone()) && paths.insert(path.clone(), current).is_none(),
+                current
+                    .as_ref()
+                    .is_none_or(|current| occupied.insert(current.clone()))
+                    && paths.insert(path.clone(), current).is_none(),
                 "captured directories alias a retirement path"
             );
         }
@@ -1085,15 +1088,25 @@ impl GuardedRootCapturePlan {
         snapshot: &LowerOwnershipSnapshot,
         lower: &PinnedDirectory,
         isolation: Option<&DirectoryIsolation>,
-        paths: Option<&BTreeMap<String, PathBuf>>,
+        paths: Option<&BTreeMap<String, Option<PathBuf>>>,
     ) -> anyhow::Result<()> {
         for entry in self.lower_directory_entries(snapshot) {
             let current = match paths {
                 Some(paths) => paths
                     .get(&entry.path)
-                    .ok_or_else(|| anyhow::anyhow!("captured directory lost its retirement path"))?
-                    .as_path(),
-                None => Path::new(&entry.path),
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("captured directory lost its retirement record")
+                    })?
+                    .as_deref(),
+                None => Some(Path::new(&entry.path)),
+            };
+            let Some(current) = current else {
+                anyhow::ensure!(
+                    !lower.contains_descendant_id(entry.native_id)?,
+                    "removed captured directory still has a lower-tree name: {}",
+                    entry.path
+                );
+                continue;
             };
             let directory = Self::open_lower_directory_at_path(lower, entry, current)?;
             if isolation.is_some() {
@@ -1161,7 +1174,7 @@ impl GuardedRootCapturePlan {
         control: &ControlStore,
         snapshot: &LowerOwnershipSnapshot,
         isolation: Option<&DirectoryIsolation>,
-        directory_paths: &BTreeMap<String, PathBuf>,
+        directory_paths: &BTreeMap<String, Option<PathBuf>>,
     ) -> anyhow::Result<()> {
         let lower = PinnedDirectory::open(&self.source_root)?;
         self.verify_lower_directories_for_retirement(
@@ -1201,7 +1214,7 @@ impl GuardedRootCapturePlan {
         snapshot: &LowerOwnershipSnapshot,
         bytes: &[u8],
         isolation: Option<&DirectoryIsolation>,
-        directory_paths: &BTreeMap<String, PathBuf>,
+        directory_paths: &BTreeMap<String, Option<PathBuf>>,
     ) -> anyhow::Result<()> {
         let lower = PinnedDirectory::open(&self.source_root)?;
         self.verify_lower_directories_for_retirement(
@@ -1223,10 +1236,17 @@ impl GuardedRootCapturePlan {
         if let Some(record) = isolation {
             let mut entries = self.lower_directory_entries(snapshot);
             entries.sort_by_key(|entry| {
-                std::cmp::Reverse(directory_paths[&entry.path].components().count())
+                std::cmp::Reverse(
+                    directory_paths[&entry.path]
+                        .as_ref()
+                        .map(|path| path.components().count())
+                        .unwrap_or(usize::MAX),
+                )
             });
             for entry in entries {
-                let current = &directory_paths[&entry.path];
+                let Some(current) = directory_paths[&entry.path].as_deref() else {
+                    continue;
+                };
                 let directory = Self::open_lower_directory_at_path(&lower, entry, current)?;
                 Self::check_directory_isolation_metadata(directory.as_file())?;
                 let before = directory.as_file().metadata()?;

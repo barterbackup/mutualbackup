@@ -730,6 +730,69 @@ impl PinnedDirectory {
         )
     }
 
+    /// A removed guarded directory may release its owner-restoration record
+    /// only when its captured inode has no remaining name in the lower tree.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn contains_descendant_id(
+        &self,
+        expected: NativeFileId,
+    ) -> Result<bool, AnchorError> {
+        fn scan(
+            directory: &PinnedDirectory,
+            expected: NativeFileId,
+            depth: usize,
+            entries: &mut usize,
+            skip_catalog: bool,
+        ) -> Result<bool, AnchorError> {
+            if depth > MAX_CAPTURE_DEPTH {
+                return Err(AnchorError::CatalogTooLarge);
+            }
+            let mut stream = DirectoryStream::open(directory.as_file())?;
+            while let Some(name) = stream.next_name()? {
+                if skip_catalog && name.as_bytes() == GIT_CATALOG_DIRECTORY.as_bytes() {
+                    continue;
+                }
+                *entries += 1;
+                if *entries > MAX_CAPTURE_ENTRIES {
+                    return Err(AnchorError::CatalogTooLarge);
+                }
+                let component = Path::new(std::ffi::OsStr::from_bytes(name.as_bytes()));
+                let pinned = open_path_no_xdev_beneath(directory.as_file(), component)?;
+                let metadata = pinned.metadata()?;
+                if !metadata.is_dir() && !metadata.is_file() {
+                    return Err(AnchorError::UnsupportedObject(component.to_path_buf()));
+                }
+                let id = native_file_id(directory.filesystem_id, &metadata);
+                if id == expected {
+                    return Ok(true);
+                }
+                if metadata.is_dir() {
+                    let file = reopen_pinned_file(&pinned, true, component)?;
+                    let child = PinnedDirectory {
+                        file,
+                        filesystem_id: directory.filesystem_id,
+                    };
+                    if child.identity()? != id {
+                        return Err(AnchorError::SourceChanged(component.to_path_buf()));
+                    }
+                    if scan(&child, expected, depth + 1, entries, false)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+
+        let mut entries = 0;
+        scan(
+            self,
+            expected,
+            0,
+            &mut entries,
+            self.has_marked_git_catalog()?,
+        )
+    }
+
     pub fn open_descendant_directory(
         &self,
         relative: impl AsRef<Path>,
@@ -5145,6 +5208,30 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(root.entry_identity("source", true).unwrap(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descendant_identity_scan_follows_moves_and_proves_removed_directory_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("parent/captured")).unwrap();
+        let root = PinnedDirectory::open(temp.path()).unwrap();
+        let captured = root
+            .open_descendant_directory("parent/captured")
+            .unwrap()
+            .identity()
+            .unwrap();
+        assert!(root.contains_descendant_id(captured).unwrap());
+
+        fs::rename(
+            temp.path().join("parent/captured"),
+            temp.path().join("moved"),
+        )
+        .unwrap();
+        assert!(root.contains_descendant_id(captured).unwrap());
+
+        fs::remove_dir(temp.path().join("moved")).unwrap();
+        assert!(!root.contains_descendant_id(captured).unwrap());
     }
 
     #[cfg(target_os = "linux")]

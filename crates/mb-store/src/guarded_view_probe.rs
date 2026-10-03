@@ -118,31 +118,30 @@ pub(crate) fn captured_file_path_for_retirement(
         .transpose()
 }
 
-/// Resolve a captured directory after a completed FUSE move. A removed
-/// captured directory has no inode to restore and requires a separate
-/// retirement policy, so this path fails closed for now.
+/// Resolve a captured directory after a completed FUSE move or removal. The
+/// caller must prove that a removed inode has no remaining lower-tree name.
 pub(crate) fn captured_directory_path_for_retirement(
     control: &ControlStore,
     anchor_id: Uuid,
     view_inode: u64,
     captured_path: &str,
     expected: NativeFileId,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<Option<PathBuf>> {
     let mut id = anchor_id.as_bytes().to_vec();
     id.extend_from_slice(&view_inode.to_le_bytes());
     let Some(bytes) = control.get_record(DIRECTORY_KIND, &id)? else {
-        return Ok(PathBuf::from(captured_path));
+        return Ok(Some(PathBuf::from(captured_path)));
     };
     let record: DirectoryRecord = mb_core::decode_canonical(&bytes)?;
     ensure!(
         record.version == 1 && record.expected == expected,
         "captured directory has a mismatched namespace record"
     );
-    let current = record
+    record
         .current
         .as_deref()
-        .context("removed captured directory needs separate owner recovery")?;
-    checked_namespace_relative_path(current)
+        .map(checked_namespace_relative_path)
+        .transpose()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

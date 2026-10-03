@@ -697,10 +697,16 @@
   directory move with a nested frozen file survives remount and retirement on
   ext4 and fresh local Btrfs; malformed records, a replaced lower directory,
   and an interrupted owner-before-mode restoration fail or replay as expected.
-  Guarded enrollment still needs retirement after captured directory removals
-  and replacements, recovery of detached owner obligations for removed or
-  replaced names, protected mutable-view metadata, and the complete privileged
-  mount gate.
+  Retirement now also accepts a completed FUSE removal or replacement of an
+  empty captured directory. Before dropping its original-owner obligation, a
+  bounded descriptor walk proves that the removed inode has no remaining name
+  in the lower tree; a replacement source directory still restores its owner
+  and mode at the verified target path. An ordinary-user rmdir/replace,
+  remount, and final retirement pass on ext4 and fresh local Btrfs, alongside
+  118 normal store tests and strict workspace Clippy. Guarded enrollment still
+  needs recovery of detached owner obligations for removed or replaced file
+  names, protected mutable-view metadata, and the complete privileged mount
+  gate.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
