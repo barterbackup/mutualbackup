@@ -14,9 +14,10 @@
   no filter marker is created. The expanded local Btrfs regression also covers
   a system clean filter, a repository filter setting and `info/attributes` on
   the ordinary-Git side, native content merge, and linked-worktree checkout and
-  merge; its raw merged blob and restored bytes match. Complete the remaining
-  cross-command audit required by plan.md, especially reset/restore and import
-  paths under conflicting conversion settings and every supported CLI command.
+  merge, combined linked restore, and primary hard reset; its raw merged blob
+  and restored bytes match. Complete the remaining cross-command audit required
+  by plan.md, especially every supported CLI command and importing ordinary-Git
+  histories whose blobs have already been transformed by that Git client.
 - [ ] **M6 provisioned topology backup stalls after relay-only storage recovery.**
   A fresh local Btrfs Git acceptance run on `3155689` passed its Git tests,
   extent checks, node Git/recovery tests, and stock-Git bridge, then timed out

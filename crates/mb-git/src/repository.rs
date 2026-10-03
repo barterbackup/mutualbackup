@@ -3589,6 +3589,41 @@ mod tests {
                 fs::read(linked_root.join("tracked.txt")).unwrap(),
                 b"topic\nraw\r\n"
             );
+            fs::write(linked_root.join("merge.txt"), b"linked staged\n").unwrap();
+            let linked_stage = local
+                .linked_add_path(linked.worktree_id, "merge.txt")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                linked_stage.oid,
+                Oid::hash_object(git2::ObjectType::Blob, b"linked staged\n")
+                    .unwrap()
+                    .as_bytes()
+            );
+            fs::write(linked_root.join("merge.txt"), b"linked dirty\r\n").unwrap();
+            local
+                .linked_restore_both(linked.worktree_id, &[PathBuf::from("merge.txt")])
+                .unwrap();
+            assert_eq!(
+                fs::read(linked_root.join("merge.txt")).unwrap(),
+                merge_result
+            );
+            assert!(
+                local
+                    .linked_status(linked.worktree_id)
+                    .unwrap()
+                    .changes
+                    .is_empty()
+            );
+            fs::write(source_root.join("merge.txt"), b"primary staged\n").unwrap();
+            local.stage_file("merge.txt").unwrap();
+            fs::write(source_root.join("merge.txt"), b"primary dirty\r\n").unwrap();
+            local.hard_reset().unwrap();
+            assert_eq!(
+                fs::read(source_root.join("merge.txt")).unwrap(),
+                merge_result
+            );
+            assert!(local.status().unwrap().changes.is_empty());
             let bare_root = run_root.join("remote.git");
             let remote = git2::Repository::init_bare(&bare_root).unwrap();
             fs::write(

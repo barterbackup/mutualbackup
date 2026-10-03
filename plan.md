@@ -1162,7 +1162,8 @@ switch, fetch/pull/push under inherited global and environment conversion
 settings, an external attributes file, and configured filters without executing
 them. That regression now also exercises a system clean filter, repository
 filter settings and `info/attributes` on the ordinary-Git side, raw native
-content merge, and linked-worktree checkout and merge. The broader
+content merge, linked-worktree checkout and merge, combined linked restore,
+and primary hard reset. The broader
 cross-command audit remains open.
 The provisioned Git acceptance run on `3155689` passed its Git-specific slices
 but failed the five-daemon topology backup after the 5,400-second timeout
