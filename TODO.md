@@ -101,8 +101,17 @@
   the locked all-target workspace suite (313 passing `mb-node` tests), and
   strict workspace Clippy pass. Plain lifecycle signer failures now name
   the member and sequence at warning level. This addresses the observed
-  same-event partial-quorum loss; the full provisioned topology gate still
-  needs to pass on the final committed source before closing this blocker.
+  same-event partial-quorum loss. The complete provisioned Git gate passed on
+  exact source `9f3bee0`, including all 62 Btrfs Git cases and the five-daemon
+  test in 1,547.13 seconds; disposable Btrfs and network resources were
+  removed. During that run, one recovered signer temporarily exhausted its
+  transport tiers and then rejected event 27 while its guild state lagged;
+  another topology pass had two transport-exhausted signers at event 39. The
+  coordinator advanced through those partial quorums and the backup committed.
+  Keep this reliability item open until the historical 5,400-second stall is
+  excluded by stronger repeated topology evidence or its remaining response
+  path is corrected; this one passing gate does not prove that every missing
+  signer will eventually become reachable.
 - [x] **M6 pull and merge operate from linked worktrees.** `mutualgit pull`
   and `mutualgit merge` now route through the selected linked worktree. Their
   conflict sessions, staged resolutions, status, and checkout replay use a

@@ -1361,10 +1361,15 @@ only missing signers, then atomically remove partial signatures when the event
 installs; they do not require all unanimous responses in one pass. A focused
 reopen/invalid-signature regression, existing guild administration and coding
 lifecycle tests, core guild tests, the locked all-target workspace suite
-(313 passing `mb-node` tests), and strict workspace Clippy pass. The full
-provisioned topology gate remains required on the final committed source, and
-the remaining signer-response path is not yet classified as transport or
-application failure.
+(313 passing `mb-node` tests), and strict workspace Clippy pass. The complete
+provisioned Git gate passed on exact commit `9f3bee0`: all 62 Btrfs Git cases,
+stock-Git bridge, node recovery checks, and the five-daemon topology/recovery
+test in 1,547.13 seconds. A signer temporarily exhausted its transport tiers
+and then rejected event 27 while its guild state lagged; two signers exhausted
+transport tiers at event 39. The coordinator advanced and the backup committed.
+Disposable Btrfs and network resources were removed. Keep the intermittent
+5,400-second reliability case open pending stronger repeated topology evidence
+or a correction for any signer that remains unavailable indefinitely.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
