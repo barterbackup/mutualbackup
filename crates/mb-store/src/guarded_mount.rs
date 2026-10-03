@@ -472,13 +472,13 @@ fn decode_mountinfo_path(encoded: &str) -> anyhow::Result<PathBuf> {
 mod tests {
     use std::ffi::CString;
     use std::fs::{self, File, OpenOptions};
-    use std::io::{Read, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
-    use std::process::{Child, Command};
+    use std::process::{Child, Command, Stdio};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -563,6 +563,149 @@ mod tests {
             );
             plan.discard_unreferenced(&control.lock().unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn guarded_mount_isolates_a_preopened_read_only_lower_descriptor() {
+        let area = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-guarded-held-fd-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        fs::set_permissions(area.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let lower = area.path().join("lower");
+        let mountpoint = area.path().join("view");
+        let control_dir = area.path().join("control");
+        fs::create_dir(&lower).unwrap();
+        fs::create_dir(&mountpoint).unwrap();
+        fs::create_dir(&control_dir).unwrap();
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&mountpoint, fs::Permissions::from_mode(0o755)).unwrap();
+        let original = b"preopened\r\n\0source";
+        let source = lower.join("sample");
+        fs::write(&source, original).unwrap();
+        let source_path = CString::new(source.as_os_str().as_bytes()).unwrap();
+        // SAFETY: this test owns the NUL-free disposable source path.
+        assert_eq!(
+            unsafe { libc::chown(source_path.as_ptr(), 65534, 65534) },
+            0
+        );
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([113; 32]));
+        let control = Arc::new(Mutex::new(
+            ControlStore::open(control_dir.join("control.db"), &keys).unwrap(),
+        ));
+        let plan = GuardedRootCapturePlan::plan(&lower).unwrap();
+        assert_eq!(
+            fs::metadata(area.path()).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(&lower).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(fs::metadata(&source).unwrap().uid(), 65534);
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        let mut child = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-u")
+            .arg("-c")
+            .arg(
+                r#"import errno, os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+dirfd = os.open(os.path.dirname(sys.argv[1]), os.O_RDONLY | os.O_DIRECTORY)
+print('READY', flush=True)
+assert sys.stdin.readline() == 'continue\n'
+for operation in (
+    lambda: os.fchmod(fd, 0o600),
+    lambda: os.open('/proc/self/fd/%d' % fd, os.O_WRONLY),
+    lambda: os.open(sys.argv[1], os.O_RDONLY),
+    lambda: os.fchmod(dirfd, 0o777),
+    lambda: os.open('sample', os.O_RDONLY, dir_fd=dirfd),
+):
+    try:
+        operation()
+    except OSError as error:
+        assert error.errno in (errno.EACCES, errno.EPERM), error
+    else:
+        raise AssertionError('private lower inode remained accessible')
+view = os.open(sys.argv[2], os.O_RDWR)
+os.pwrite(view, b'EDIT', 0)
+os.fsync(view)
+os.close(view)
+os.close(fd)
+os.close(dirfd)
+print('DONE', flush=True)
+"#,
+            )
+            .arg(&source)
+            .arg(mountpoint.join("sample"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        if line != "READY\n" {
+            let child_output = child.wait_with_output().unwrap();
+            panic!(
+                "held-descriptor child did not open the lower file: {line:?}, {}",
+                String::from_utf8_lossy(&child_output.stderr)
+            );
+        }
+
+        let manifest = plan.capture(&control.lock().unwrap()).unwrap();
+        // This is the isolation state the enrollment transition must reach
+        // durably before exposing a view. The test holds an older descriptor
+        // across that transition; enrollment itself remains gated.
+        assert_eq!(unsafe { libc::chown(source_path.as_ptr(), 0, 0) }, 0);
+        fs::set_permissions(&lower, fs::Permissions::from_mode(0o700)).unwrap();
+        let mount =
+            GuardedViewMount::start(&manifest, Arc::clone(&control), &mountpoint, 65534, 65534)
+                .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"continue\n")
+            .unwrap();
+        line.clear();
+        output.read_line(&mut line).unwrap();
+        let status = child.wait().unwrap();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(status.success(), "held-descriptor child failed: {stderr}");
+        assert_eq!(line, "DONE\n");
+
+        let mut changed = original.to_vec();
+        changed[..4].copy_from_slice(b"EDIT");
+        assert_eq!(fs::read(&source).unwrap(), changed);
+        let mut anchor = manifest
+            .file_locator("sample".to_owned())
+            .unwrap()
+            .open()
+            .unwrap();
+        let mut frozen = Vec::new();
+        anchor.read_to_end(&mut frozen).unwrap();
+        assert_eq!(frozen, original);
+        mount.stop().unwrap();
+        GuardedViewMount::retire_claim(manifest.anchor_id, &control.lock().unwrap()).unwrap();
+        plan.discard_unreferenced(&control.lock().unwrap()).unwrap();
     }
 
     #[test]

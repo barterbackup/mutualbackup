@@ -517,6 +517,14 @@
   guarded-view probes, and the node mount-restart probe pass on ext4 and fresh
   local Btrfs; 115 normal store tests, formatting, and strict workspace Clippy
   pass.
+  A focused privileged probe now holds ordinary-user read-only file and
+  directory descriptors across capture, then manually isolates the lower
+  ownership and mode before mounting. It confirms `fchmod`, writable
+  `/proc/self/fd` reopen, and retained-directory lookup fail, while a FUSE edit
+  leaves the frozen anchor byte-exact. It passes on ext4 and fresh local Btrfs.
+  The manual ownership step is not a replayable enrollment transition and does
+  not protect mutable view metadata in signed recovery, so enrollment remains
+  gated.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
