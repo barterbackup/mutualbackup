@@ -2263,6 +2263,17 @@ impl GuardedProbeView {
     ) -> anyhow::Result<FileAnchorManifest> {
         self.verify_private_lower_ownership()?;
         self.verify_lower_namespace()?;
+        self.capture_stopped_file_after_full_check(source_root, relative_path)
+    }
+
+    /// A complete stopped-view metadata snapshot has already checked private
+    /// ownership and every lower name. Repeating those walks for each file
+    /// would make a whole-view recapture quadratic in directory I/O.
+    pub(crate) fn capture_stopped_file_after_full_check(
+        &self,
+        source_root: &Path,
+        relative_path: &Path,
+    ) -> anyhow::Result<FileAnchorManifest> {
         let namespace = self
             .namespace
             .as_ref()
@@ -2341,7 +2352,7 @@ impl GuardedProbeView {
                 return Ok(manifest);
             }
         }
-        let plan = GuardedFileCapturePlan::plan(source_root, relative_path)?;
+        let plan = GuardedFileCapturePlan::plan_in_claimed_view(source_root, relative_path)?;
         ensure!(
             plan.source_root_identity() == lower_root.identity()?
                 && plan.source_file_identity() == source_id,

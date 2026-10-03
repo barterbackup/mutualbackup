@@ -758,6 +758,17 @@
   privileged test covers active-anchor refusal, superseded-anchor cleanup,
   and final root cleanup on local ext4 and disposable Btrfs. Node-level
   reachability and signed-revision GC still need to drive this ordering.
+  A single stopped-view capture now returns versioned visible metadata plus
+  one immutable, byte-hashed, sparse-extent-checked locator per file. It reuses
+  an original root anchor only while that file's root journal says the working
+  inode is frozen; an edited inode may retain the same native ID, so identity
+  alone is insufficient. Edited and created files use durable secondary guards.
+  The aggregate verifies after canonical encoding and control-DB reopen, and
+  its focused nested-path regression passes on ext4 and disposable Btrfs.
+  This remains local capture input: the node still must persist the aggregate
+  as a replayable intent, bind its metadata and file bytes into a signed owner
+  revision, recover the mutable view from a seed, and drive reachability-based
+  cleanup before guarded enrollment.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

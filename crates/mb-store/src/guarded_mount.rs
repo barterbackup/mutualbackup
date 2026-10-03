@@ -2,10 +2,11 @@
 //! root has already been captured. Enrollment still owns the separate,
 //! replayable transition from a user's original directory to this layout.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io;
-use std::os::unix::ffi::OsStringExt;
+use std::io::{self, Read};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -15,10 +16,11 @@ use fuser::{BackgroundSession, Config, MountOption, SessionACL};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::guarded_view_probe::{GuardedProbeView, GuardedViewMetadataV1};
+use crate::guarded_view_probe::{GuardedProbeView, GuardedViewEntryKind, GuardedViewMetadataV1};
 use crate::{
-    ControlStore, FileAnchorManifest, GuardedRootCapturePlan, NativeFileId, PinnedDirectory,
-    StableAnchorManifest, filesystem_identity,
+    CapturedEntry, ControlStore, FileAnchorManifest, FileExtent, GuardedRootCapturePlan,
+    NativeFileId, PinnedDirectory, StableAnchorFileLocator, StableAnchorManifest,
+    filesystem_identity,
 };
 
 const MOUNT_CLAIM_KIND: &str = "guarded-view-mount-v1";
@@ -52,6 +54,104 @@ pub struct GuardedViewMount {
     session: Option<BackgroundSession>,
     mountpoint: PathBuf,
     source: String,
+}
+
+/// One quiescent view with an immutable anchor for every visible file. This
+/// local capture is input to a future signed owner revision, not a revision by
+/// itself. The revision owner must pin its file locators until retirement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GuardedStoppedCaptureV1 {
+    pub format_version: u16,
+    pub metadata: GuardedViewMetadataV1,
+    pub files: Vec<GuardedStoppedFileV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GuardedStoppedFileV1 {
+    pub path: Vec<u8>,
+    pub native_id: NativeFileId,
+    pub locator: StableAnchorFileLocator,
+    pub logical_len: u64,
+    pub content_hash: [u8; 32],
+    pub data_extents: Vec<FileExtent>,
+}
+
+impl GuardedStoppedCaptureV1 {
+    /// Recheck a persisted local capture before building signed sector data.
+    /// This proves each locator still supplies the exact captured bytes and
+    /// sparse layout, without depending on the mutable lower worktree.
+    pub fn verify(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.format_version == 1
+                && self.metadata.format_version == 1
+                && !self.metadata.anchor_id.is_nil()
+                && mb_core::canonical_bytes(self)?.len() <= mb_core::V1_MAX_CATALOG_BYTES,
+            "invalid guarded stopped-capture version or size"
+        );
+        let mut previous = None::<&[u8]>;
+        for entry in &self.metadata.entries {
+            let path = PathBuf::from(OsString::from_vec(entry.path.clone()));
+            let mut normalized = PathBuf::new();
+            for component in path.components() {
+                let Component::Normal(name) = component else {
+                    anyhow::bail!("guarded stopped capture has an unsafe path")
+                };
+                normalized.push(name);
+            }
+            ensure!(
+                !entry.path.is_empty()
+                    && !entry.path.contains(&0)
+                    && normalized.as_os_str().as_bytes() == entry.path
+                    && previous.is_none_or(|prior| prior < entry.path.as_slice()),
+                "guarded stopped capture has an unsafe or unordered path"
+            );
+            previous = Some(&entry.path);
+        }
+        let file_entries: Vec<_> = self
+            .metadata
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == GuardedViewEntryKind::File)
+            .collect();
+        ensure!(
+            file_entries.len() == self.files.len(),
+            "guarded stopped capture lacks a visible file anchor"
+        );
+        for (entry, captured) in file_entries.into_iter().zip(&self.files) {
+            ensure!(
+                captured.path == entry.path
+                    && captured.native_id == entry.native_id
+                    && captured.logical_len == entry.logical_len
+                    && captured.locator.area.filesystem_id
+                        == self.metadata.lower_root_id.filesystem_id,
+                "guarded stopped file differs from visible metadata"
+            );
+            let mut file = captured.locator.open()?;
+            ensure!(
+                file.metadata()?.len() == captured.logical_len,
+                "guarded stopped anchor has another length"
+            );
+            let mut hasher = blake3::Hasher::new();
+            let mut read_len = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                read_len += read as u64;
+            }
+            ensure!(
+                read_len == captured.logical_len
+                    && hasher.finalize().as_bytes() == &captured.content_hash
+                    && crate::anchor::file_data_extents(&file, captured.logical_len)?
+                        == captured.data_extents,
+                "guarded stopped anchor differs from its captured bytes or extents"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl GuardedViewMount {
@@ -390,7 +490,7 @@ impl GuardedViewMount {
         anchor_id: Uuid,
         control: Arc<Mutex<ControlStore>>,
     ) -> anyhow::Result<GuardedViewMetadataV1> {
-        Self::with_stopped_view(anchor_id, control, |view, _| {
+        Self::with_stopped_view(anchor_id, control, |view, _, _| {
             view.verified_metadata_snapshot(anchor_id)
         })
     }
@@ -405,15 +505,154 @@ impl GuardedViewMount {
         relative_path: impl AsRef<Path>,
     ) -> anyhow::Result<FileAnchorManifest> {
         let relative_path = relative_path.as_ref().to_path_buf();
-        Self::with_stopped_view(anchor_id, control, |view, claim| {
+        Self::with_stopped_view(anchor_id, control, |view, claim, _| {
             view.capture_stopped_file(&claim.lower_root, &relative_path)
+        })
+    }
+
+    /// Freeze every visible file under one stopped-mount fence. An unchanged
+    /// file may reuse its original root anchor; an edited or newly created
+    /// file gets a durable per-inode guard before this method returns.
+    pub fn capture_stopped_view(
+        anchor_id: Uuid,
+        control: Arc<Mutex<ControlStore>>,
+    ) -> anyhow::Result<GuardedStoppedCaptureV1> {
+        let control_for_capture = Arc::clone(&control);
+        Self::with_stopped_view(anchor_id, control, |view, claim, original| {
+            let before = view.verified_metadata_snapshot(anchor_id)?;
+            let root_plan = {
+                let store = control_for_capture
+                    .lock()
+                    .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+                GuardedRootCapturePlan::load_active_for_view(&store, original)?
+            };
+            let mut original_files = BTreeMap::new();
+            for entry in &original.entries {
+                if let CapturedEntry::FileV2 {
+                    path,
+                    logical_len,
+                    native_id,
+                    ..
+                } = entry
+                {
+                    ensure!(
+                        original_files
+                            .insert(*native_id, (path, *logical_len))
+                            .is_none(),
+                        "guarded root has duplicate captured file identity"
+                    );
+                }
+            }
+            let mut files = Vec::new();
+            for entry in before
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == GuardedViewEntryKind::File)
+            {
+                let path = PathBuf::from(OsString::from_vec(entry.path.clone()));
+                let reusable_original = if let Some((captured_path, captured_len)) =
+                    original_files.get(&entry.native_id)
+                {
+                    let proof = {
+                        let store = control_for_capture
+                            .lock()
+                            .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
+                        if root_plan.file_has_editable_inode(&store, captured_path)? {
+                            None
+                        } else {
+                            Some(root_plan.captured_file_content_proof(&store, captured_path)?)
+                        }
+                    };
+                    if let Some(proof) = proof {
+                        ensure!(
+                            *captured_len == entry.logical_len
+                                && proof.logical_len == entry.logical_len,
+                            "unchanged guarded file has another length"
+                        );
+                        Some((original.file_locator((*captured_path).clone())?, proof))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let (locator, expected_hash, expected_extents) =
+                    if let Some((locator, proof)) = reusable_original {
+                        (locator, proof.content_hash, Some(proof.data_extents))
+                    } else {
+                        let manifest =
+                            view.capture_stopped_file_after_full_check(&claim.lower_root, &path)?;
+                        ensure!(
+                            manifest.logical_len == entry.logical_len,
+                            "recaptured guarded file has another length"
+                        );
+                        (manifest.file_locator(), manifest.content_hash, None)
+                    };
+                let mut file = locator.open()?;
+                ensure!(
+                    file.metadata()?.len() == entry.logical_len,
+                    "guarded anchor length changed during stopped capture"
+                );
+                let mut hasher = blake3::Hasher::new();
+                let mut read_len = 0_u64;
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let read = file.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                    read_len += read as u64;
+                }
+                ensure!(
+                    read_len == entry.logical_len,
+                    "guarded anchor length changed while reading"
+                );
+                let content_hash = *hasher.finalize().as_bytes();
+                ensure!(
+                    expected_hash == content_hash,
+                    "guarded anchor bytes differ from their capture proof"
+                );
+                let data_extents = crate::anchor::file_data_extents(&file, entry.logical_len)?;
+                ensure!(
+                    expected_extents.is_none_or(|expected| expected == data_extents),
+                    "guarded anchor extents differ from their capture proof"
+                );
+                files.push(GuardedStoppedFileV1 {
+                    path: entry.path.clone(),
+                    native_id: entry.native_id,
+                    locator,
+                    logical_len: entry.logical_len,
+                    content_hash,
+                    data_extents,
+                });
+            }
+            let after = view.verified_metadata_snapshot(anchor_id)?;
+            ensure!(
+                after == before,
+                "guarded metadata changed while capturing its files"
+            );
+            let capture = GuardedStoppedCaptureV1 {
+                format_version: 1,
+                metadata: before,
+                files,
+            };
+            ensure!(
+                mb_core::canonical_bytes(&capture)?.len() <= mb_core::V1_MAX_CATALOG_BYTES,
+                "guarded stopped capture exceeds its catalog bound"
+            );
+            Ok(capture)
         })
     }
 
     fn with_stopped_view<T>(
         anchor_id: Uuid,
         control: Arc<Mutex<ControlStore>>,
-        operation: impl FnOnce(&GuardedProbeView, &MountClaim) -> anyhow::Result<T>,
+        operation: impl FnOnce(
+            &GuardedProbeView,
+            &MountClaim,
+            &StableAnchorManifest,
+        ) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
         let _lifecycle = MOUNT_LIFECYCLE
             .lock()
@@ -461,7 +700,7 @@ impl GuardedViewMount {
             claim.view_uid,
             claim.view_gid,
         )?;
-        let value = operation(&view, &claim)?;
+        let value = operation(&view, &claim, &manifest)?;
         let control = control
             .lock()
             .map_err(|_| io::Error::other("guarded control lock is poisoned"))?;
@@ -626,7 +865,10 @@ mod tests {
 
     use crate::{ControlStore, GuardedRootCapturePlan};
 
-    use super::{GuardedViewMount, MOUNT_CLAIM_KIND, MOUNT_RETIRE_KIND, decode_mountinfo_path};
+    use super::{
+        GuardedStoppedCaptureV1, GuardedViewMount, MOUNT_CLAIM_KIND, MOUNT_RETIRE_KIND,
+        decode_mountinfo_path,
+    };
 
     #[test]
     fn mountinfo_paths_decode_spaces_and_non_utf8_bytes() {
@@ -1646,6 +1888,22 @@ print('DONE', flush=True)
             unsafe { libc::chown(source_path.as_ptr(), 65534, 65534) },
             0
         );
+        let untouched_bytes = b"untouched\r\nsource";
+        fs::write(lower.join("untouched"), untouched_bytes).unwrap();
+        fs::set_permissions(lower.join("untouched"), fs::Permissions::from_mode(0o644)).unwrap();
+        let untouched_path = CString::new(lower.join("untouched").as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::chown(untouched_path.as_ptr(), 65534, 65534) },
+            0
+        );
+        fs::create_dir(lower.join("nested")).unwrap();
+        fs::set_permissions(lower.join("nested"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(lower.join("nested/kept"), b"nested unchanged").unwrap();
+        let nested_path = CString::new(lower.join("nested/kept").as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::chown(nested_path.as_ptr(), 65534, 65534) },
+            0
+        );
         let keys = KeyMaterial::from_seed(&Seed::from_bytes([113; 32]));
         let control = Arc::new(Mutex::new(
             ControlStore::open(control_dir.join("control.db"), &keys).unwrap(),
@@ -1681,6 +1939,53 @@ print('DONE', flush=True)
             file.read_to_end(&mut bytes).unwrap();
             bytes
         };
+        let captured_view =
+            GuardedViewMount::capture_stopped_view(original.anchor_id, Arc::clone(&control))
+                .unwrap();
+        assert_eq!(captured_view.format_version, 1);
+        assert_eq!(
+            mb_core::decode_canonical::<GuardedStoppedCaptureV1>(
+                &mb_core::canonical_bytes(&captured_view).unwrap()
+            )
+            .unwrap(),
+            captured_view
+        );
+        captured_view.verify().unwrap();
+        let mut wrong_bytes = captured_view.clone();
+        wrong_bytes.files[0].content_hash[0] ^= 1;
+        assert!(wrong_bytes.verify().is_err());
+        drop(control);
+        let control = Arc::new(Mutex::new(
+            ControlStore::open(control_dir.join("control.db"), &keys).unwrap(),
+        ));
+        assert_eq!(captured_view.files.len(), 3);
+        let sample = captured_view
+            .files
+            .iter()
+            .find(|file| file.path == b"sample")
+            .unwrap();
+        let untouched = captured_view
+            .files
+            .iter()
+            .find(|file| file.path == b"untouched")
+            .unwrap();
+        assert_ne!(sample.locator.anchor_id, original.anchor_id);
+        assert_eq!(sample.content_hash, *blake3::hash(&first_bytes).as_bytes());
+        assert_eq!(untouched.locator.anchor_id, original.anchor_id);
+        assert_eq!(
+            untouched.content_hash,
+            *blake3::hash(untouched_bytes).as_bytes()
+        );
+        let nested = captured_view
+            .files
+            .iter()
+            .find(|file| file.path == b"nested/kept")
+            .unwrap();
+        assert_eq!(nested.locator.anchor_id, original.anchor_id);
+        assert_eq!(
+            nested.content_hash,
+            *blake3::hash(b"nested unchanged").as_bytes()
+        );
 
         let first = GuardedViewMount::capture_stopped_file(
             original.anchor_id,
@@ -1688,6 +1993,12 @@ print('DONE', flush=True)
             "sample",
         )
         .unwrap();
+        assert_eq!(first.anchor_id, sample.locator.anchor_id);
+        assert_eq!(
+            GuardedViewMount::capture_stopped_view(original.anchor_id, Arc::clone(&control))
+                .unwrap(),
+            captured_view
+        );
         assert_eq!(anchor_bytes(&first), first_bytes);
         assert_eq!(
             GuardedViewMount::capture_stopped_file(
@@ -1743,6 +2054,7 @@ print('DONE', flush=True)
             .discard_unreferenced(&control.lock().unwrap())
             .unwrap();
         assert!(first.open_verified().is_err());
+        assert!(captured_view.verify().is_err());
         let remounted =
             GuardedViewMount::recover_claimed(original.anchor_id, Arc::clone(&control)).unwrap();
         edit(&mountpoint.join("moved"), "EDIT3");

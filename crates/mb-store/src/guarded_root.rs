@@ -26,8 +26,8 @@ use super::{
 };
 use crate::link_freeze::{AccessAclSnapshot, FileOwner, read_access_acl};
 use crate::{
-    ControlStore, LinkFreezeCaptureIntent, LinkFreezeCapturePhase, LinkFreezeEditIntent,
-    LinkFreezeEditPhase,
+    ControlStore, IndependentSparseCopy, LinkFreezeCaptureIntent, LinkFreezeCapturePhase,
+    LinkFreezeEditIntent, LinkFreezeEditPhase,
 };
 
 const PLAN_KIND: &str = "guarded-root-plan-v1";
@@ -1328,6 +1328,69 @@ impl GuardedRootCapturePlan {
         }
         Ok(LinkFreezeEditIntent::load(control, capture_id)?
             .is_some_and(|edit| edit.phase() == LinkFreezeEditPhase::Editable))
+    }
+
+    /// Bind an original root file's sealed manifest entry to its immutable
+    /// per-file journal. A later stopped-view revision may reuse the original
+    /// anchor only while that journal still reports a frozen working inode.
+    pub(crate) fn captured_file_content_proof(
+        &self,
+        control: &ControlStore,
+        captured_path: &str,
+    ) -> anyhow::Result<IndependentSparseCopy> {
+        let (capture_id, source_id) = match self
+            .entries
+            .iter()
+            .find(|entry| entry.path() == captured_path)
+        {
+            Some(GuardedRootEntry::File {
+                capture_id,
+                version,
+                ..
+            }) => (
+                *capture_id,
+                NativeFileId {
+                    filesystem_id: version.filesystem_id,
+                    inode: version.inode,
+                },
+            ),
+            _ => anyhow::bail!("guarded root has no captured file at {captured_path}"),
+        };
+        let relative = Path::new(captured_path);
+        validate_relative(relative)?;
+        let parent = relative.parent().ok_or(AnchorError::InvalidGuardedPlan)?;
+        let name = relative
+            .file_name()
+            .ok_or(AnchorError::InvalidGuardedPlan)?;
+        let area_path = resolve_anchor_area(&self.area)?;
+        let area_file = open_stable_anchor_area(&area_path, &self.area)?;
+        let area = PinnedDirectory {
+            file: area_file,
+            filesystem_id: self.area.filesystem_id,
+        };
+        let root = area
+            .open_child_directory(self.anchor_id.to_string())?
+            .ok_or_else(|| anyhow::anyhow!("guarded root anchor disappeared"))?;
+        let anchor_parent = if parent.as_os_str().is_empty() {
+            root
+        } else {
+            root.open_descendant_directory(parent)?
+        };
+        let intent = LinkFreezeCaptureIntent::load(control, capture_id)?
+            .ok_or_else(|| anyhow::anyhow!("guarded root file journal disappeared"))?;
+        anyhow::ensure!(
+            matches!(
+                intent.phase(),
+                LinkFreezeCapturePhase::Frozen | LinkFreezeCapturePhase::Detached
+            ) && intent.matches_file_plan(
+                capture_id,
+                source_id,
+                &anchor_parent,
+                Path::new(name)
+            )?,
+            "guarded root file journal differs from its anchor"
+        );
+        Ok(intent.content_proof().clone())
     }
 
     pub(crate) fn load_active_for_view(

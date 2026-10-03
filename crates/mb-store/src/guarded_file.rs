@@ -72,13 +72,32 @@ impl GuardedFileCapturePlan {
         source_root: impl AsRef<Path>,
         relative_path: impl AsRef<Path>,
     ) -> Result<Self, AnchorError> {
-        let relative_path = relative_path.as_ref();
+        Self::plan_internal(source_root.as_ref(), relative_path.as_ref(), true)
+    }
+
+    /// A claimed guarded view has already passed the full filesystem probe
+    /// and checks its complete lower namespace before each stopped capture.
+    /// Repeating that probe per file would reread the user's directories and
+    /// change their atime on some filesystems.
+    pub(crate) fn plan_in_claimed_view(
+        source_root: impl AsRef<Path>,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<Self, AnchorError> {
+        Self::plan_internal(source_root.as_ref(), relative_path.as_ref(), false)
+    }
+
+    fn plan_internal(
+        source_root: &Path,
+        relative_path: &Path,
+        probe_filesystem: bool,
+    ) -> Result<Self, AnchorError> {
         validate_relative(relative_path)?;
         let source_root = source_root
-            .as_ref()
             .canonicalize()
             .map_err(|_| AnchorError::InvalidRoot)?;
-        probe_guarded_link_freeze(&source_root)?;
+        if probe_filesystem {
+            probe_guarded_link_freeze(&source_root)?;
+        }
         let root = open_source_root(&source_root)?;
         let root_filesystem = filesystem_identity_for_file(&root)?;
         let root_metadata = root.metadata()?;

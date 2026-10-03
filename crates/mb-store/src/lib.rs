@@ -31,7 +31,7 @@ pub use database::{
     VariableParityObject,
 };
 #[cfg(target_os = "linux")]
-pub use guarded_mount::GuardedViewMount;
+pub use guarded_mount::{GuardedStoppedCaptureV1, GuardedStoppedFileV1, GuardedViewMount};
 #[cfg(target_os = "linux")]
 pub use guarded_view_probe::{
     GuardedViewEntryKind, GuardedViewMetadataEntry, GuardedViewMetadataV1,
