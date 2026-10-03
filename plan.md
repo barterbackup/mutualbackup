@@ -32,8 +32,11 @@ them as ADRs and test vectors before promising wire compatibility.
   rather than opening that directory as `.git`.
 - The Git-compatible frontend preserves tracked file bytes exactly. No command
   automatically fixes line endings or applies another content conversion, even
-  when the host's Git configuration enables one. Git clean filters can run
-  arbitrary transformations; disabling CRLF normalization alone is insufficient.
+  when the host's Git configuration enables one. Git's `text`/`eol` handling
+  can normalize line endings on its own; a configured `filter.<name>.clean`
+  command is a separate, arbitrary transformation. Disable both directions of
+  both mechanisms rather than assuming that disabling CRLF normalization also
+  disables custom filters.
   Do not offer a compatibility flag, `--renormalize` equivalent, or per-command
   override that enables such conversion in our binary. Existing Git attributes
   and configuration that request conversion are inert for file content in our
@@ -548,6 +551,10 @@ formats. A tracked regular file's Git blob is exactly the bytes captured at
 `add`: no CRLF or other end-of-line normalization, clean/smudge/process filter,
 `ident` expansion, or `working-tree-encoding` conversion on add, commit,
 checkout, restore/reset, switch, merge, worktree creation, import, or export.
+The immutable captured source is the source of truth for the blob, including
+mixed line endings and non-text bytes; no intermediate normalized Git-index
+payload may replace it. Git tree and commit objects still use canonical Git
+serialization, while file payloads remain raw.
 For a tracked file that the user has not edited, require byte identity across
 the captured source, staged blob, committed blob, and every restored worktree
 file. `status` and `diff` compare the working bytes with the raw staged and
@@ -3228,9 +3235,11 @@ backend gates. A command being present does not by itself close its slice.
 - Disable all automatic content conversion in this binary, including CRLF/text
   handling, clean/smudge/process filters, `ident`, and working-tree encodings,
   regardless of inherited Git config, environment overrides, or attribute
-  source. Force Git-library calls that touch blob or working-tree bytes onto
-  raw-byte paths; never let a Git
-  library's default checkout/filter behavior re-enable conversion, including
+  source. Enforce the policy at the source-backend and Git object-store boundary,
+  then audit every Git-library call that touches blob or working-tree bytes;
+  configuration defaults alone are not the guard. Force those calls onto
+  raw-byte paths; never let a Git library's default checkout/filter behavior
+  re-enable conversion, including
   during merge with `merge.renormalize`, reset/restore, pull, and
   worktree creation. Reject any command option that requests renormalization
   or a content filter. Import Git blob bytes as raw file bytes and export the
