@@ -2633,7 +2633,12 @@ impl Filesystem for GuardedProbeView {
             return;
         }
         if inode == INodeNo::ROOT || self.directory(inode.0).is_some() {
-            if mode.is_none() || size.is_some() || handle.is_some() {
+            if mode.is_none()
+                || size.is_some()
+                || atime.is_some()
+                || mtime.is_some()
+                || handle.is_some()
+            {
                 reply.error(Errno::EINVAL);
                 return;
             }
