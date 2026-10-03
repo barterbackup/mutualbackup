@@ -1161,9 +1161,12 @@ original source inode only after durable sparse detach, while the independent
 anchor keeps exact captured bytes. `2cf0cb3` extends that probe to ordinary-user
 owner `chmod`, pathname truncate, and `O_TRUNC` open; all five privileged FUSE
 tests pass on ext4 and a fresh local Btrfs image, and the stored anchor remains
-byte-exact. Whole-worktree dispatch, remaining metadata/allocation operations,
-rename/unlink, concurrent handles, mount supervision/recovery, and guarded
-enrollment remain unimplemented.
+byte-exact. `7f52416` adds a single-file FUSE rename/unlink probe: rename
+preserves the frozen anchor until a later write at the new name
+detaches it; unlink leaves the exact anchor available. All seven privileged
+FUSE probes pass on ext4 and fresh local Btrfs. Whole-worktree dispatch,
+remaining metadata/allocation operations, atomic replacement, concurrent
+handles, mount supervision/recovery, and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network

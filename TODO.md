@@ -97,9 +97,14 @@
   detach before changing the source inode, retains the exact anchor bytes, and
   passes as an ordinary user on ext4 and fresh local Btrfs. The five privileged
   FUSE probes, normal store library tests, formatting, and strict locked
-  workspace Clippy pass. Extend this to the whole versioned worktree namespace,
-  remaining metadata/allocation operations, rename/unlink, concurrent handles,
-  and mount/restart failure before enrollment. Keep Git
+  workspace Clippy pass. `7f52416` adds single-file view rename/unlink handling:
+  rename leaves the captured hard-link
+  anchor frozen until a later write at the new name detaches it, and unlink
+  removes the working name while the exact anchor remains. All seven privileged
+  FUSE probes pass on ext4 and fresh local Btrfs. Extend this to the whole
+  versioned worktree namespace, remaining metadata/allocation operations,
+  atomic replacement, concurrent handles, and mount/restart failure before
+  enrollment. Whole-worktree rename/unlink dispatch is still open. Keep Git
   staging and checkout gated until the complete privileged probe passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
   and [fanotify(7)](https://man7.org/linux/man-pages/man7/fanotify.7.html).
