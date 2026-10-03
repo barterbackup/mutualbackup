@@ -1618,6 +1618,7 @@ impl GuardedProbeFile {
         attr.nlink = metadata.nlink() as u32;
         attr.atime = metadata.accessed()?;
         attr.mtime = metadata.modified()?;
+        attr.ctime = unix_system_time(metadata.ctime(), metadata.ctime_nsec())?;
         Ok(*attr)
     }
 
@@ -2442,6 +2443,7 @@ impl GuardedProbeView {
             let metadata = lower_root.as_file().metadata()?;
             attr.atime = metadata.accessed()?;
             attr.mtime = metadata.modified()?;
+            attr.ctime = unix_system_time(metadata.ctime(), metadata.ctime_nsec())?;
         }
         Ok(attr)
     }
@@ -2460,6 +2462,7 @@ impl GuardedProbeView {
         let mut attr = directory.attr;
         attr.atime = metadata.accessed()?;
         attr.mtime = metadata.modified()?;
+        attr.ctime = unix_system_time(metadata.ctime(), metadata.ctime_nsec())?;
         attr.perm = (metadata.permissions().mode() & 0o7777) as u16;
         Ok(attr)
     }
@@ -2473,7 +2476,7 @@ fn probe_file_attr(source: &File, inode: INodeNo, advertised_mode: u16) -> io::R
         blocks: metadata.blocks(),
         atime: metadata.accessed()?,
         mtime: metadata.modified()?,
-        ctime: UNIX_EPOCH,
+        ctime: unix_system_time(metadata.ctime(), metadata.ctime_nsec())?,
         crtime: UNIX_EPOCH,
         kind: FileType::RegularFile,
         perm: advertised_mode,
@@ -2498,7 +2501,7 @@ fn probe_directory_attr(
         blocks: 0,
         atime: metadata.accessed()?,
         mtime: metadata.modified()?,
-        ctime: UNIX_EPOCH,
+        ctime: unix_system_time(metadata.ctime(), metadata.ctime_nsec())?,
         crtime: UNIX_EPOCH,
         kind: FileType::Directory,
         perm: advertised_mode,
@@ -2530,6 +2533,21 @@ fn requested_file_times(atime: Option<TimeOrNow>, mtime: Option<TimeOrNow>) -> O
         });
     }
     Some(times)
+}
+
+fn unix_system_time(seconds: i64, nanoseconds: i64) -> io::Result<SystemTime> {
+    let total = i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds);
+    let magnitude = total.unsigned_abs();
+    let seconds = u64::try_from(magnitude / 1_000_000_000)
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+    let nanos = (magnitude % 1_000_000_000) as u32;
+    let duration = Duration::new(seconds, nanos);
+    if total >= 0 {
+        UNIX_EPOCH.checked_add(duration)
+    } else {
+        UNIX_EPOCH.checked_sub(duration)
+    }
+    .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))
 }
 
 impl Filesystem for GuardedProbeView {
@@ -3759,8 +3777,20 @@ mod tests {
         DIRECTORY_RENAME_KIND, DIRECTORY_REPLACE_KIND, DirectoryCreateIntent, DirectoryRecord,
         DirectoryRemoveIntent, DirectoryRenameIntent, DirectoryReplaceIntent, FILE_INODE,
         GuardedNamespace, GuardedProbeFile, GuardedProbeView, NAMESPACE_KIND, NamespaceRecord,
-        ProbeLocation, REPLACE_KIND, probe_file_attr,
+        ProbeLocation, REPLACE_KIND, probe_file_attr, unix_system_time,
     };
+
+    #[test]
+    fn native_change_time_keeps_nanoseconds_on_both_sides_of_epoch() {
+        assert_eq!(
+            unix_system_time(1, 250_000_000).unwrap(),
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_250)
+        );
+        assert_eq!(
+            unix_system_time(-1, 500_000_000).unwrap(),
+            std::time::UNIX_EPOCH - std::time::Duration::from_millis(500)
+        );
+    }
 
     #[test]
     fn populated_directory_replacement_replays_each_boundary() {
@@ -5330,6 +5360,10 @@ mod tests {
                             == 1_600_000_001_987_654_321
                     );
                     anyhow::ensure!(visible.modified()? == lower.modified()?);
+                    anyhow::ensure!(
+                        visible.ctime() == lower.ctime()
+                            && visible.ctime_nsec() == lower.ctime_nsec()
+                    );
                     anyhow::ensure!(fs::read(&lower_path)? == original);
                 }
                 FirstMutation::PathTruncate => {
@@ -6210,12 +6244,21 @@ mod tests {
                 .unwrap();
         let session = fuser::spawn_mount(rebuilt, &mountpoint, &config).unwrap();
         let replayed = (|| -> anyhow::Result<()> {
-            for (path, expected) in [
-                (&mountpoint, 1_600_000_000_123_456_789_u128),
-                (&mountpoint.join("nested"), 1_600_000_000_123_456_790),
-                (&mountpoint.join("nested/newdir"), 1_600_000_000_123_456_791),
+            for (path, lower_path, expected) in [
+                (&mountpoint, &lower, 1_600_000_000_123_456_789_u128),
+                (
+                    &mountpoint.join("nested"),
+                    &nested,
+                    1_600_000_000_123_456_790,
+                ),
+                (
+                    &mountpoint.join("nested/newdir"),
+                    &nested.join("newdir"),
+                    1_600_000_000_123_456_791,
+                ),
             ] {
                 let metadata = fs::metadata(path)?;
+                let lower_metadata = fs::metadata(lower_path)?;
                 anyhow::ensure!(
                     metadata
                         .modified()?
@@ -6229,6 +6272,10 @@ mod tests {
                         .duration_since(std::time::UNIX_EPOCH)?
                         .as_nanos()
                         == expected
+                );
+                anyhow::ensure!(
+                    metadata.ctime() == lower_metadata.ctime()
+                        && metadata.ctime_nsec() == lower_metadata.ctime_nsec()
                 );
             }
             anyhow::ensure!(fs::metadata(&mountpoint)?.permissions().mode() & 0o7777 == 0o755);

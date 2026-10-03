@@ -217,9 +217,8 @@
   epoch placeholders. Owner `utime` detaches a frozen file before changing its
   nanosecond timestamps; its privileged probe passes on ext4 and fresh local
   Btrfs. The 112 normal store tests, all 13 privileged guarded probes on both
-  filesystems, formatting, and strict workspace Clippy pass. Change-time
-  fidelity, protected root-mode recovery, and mount supervision
-  remain open.
+  filesystems, formatting, and strict workspace Clippy pass. Protected
+  root-mode recovery and mount supervision remain open.
   The two-file guarded-root probe also sets nanosecond timestamps on a newly
   created file after atomic replacement, remounts the view, and verifies the
   rebuilt attributes on ext4 and fresh local Btrfs.
@@ -229,8 +228,15 @@
   lower root still `0700`. The ordinary-user nested probe checks nanosecond
   timestamps for all three directory kinds after FUSE remount on ext4 and fresh
   local Btrfs. The 112 normal store tests, all 13 privileged probes on both
-  filesystems, formatting, and strict workspace Clippy pass. Change-time
-  fidelity, protected root-mode recovery, and mount supervision remain open.
+  filesystems, formatting, and strict workspace Clippy pass. Protected
+  root-mode recovery and mount supervision remain open.
+  The view now reports native `ctime` with nanosecond precision for files,
+  root, captured directories, and dynamic directories. The conversion also
+  handles pre-epoch timestamps. Ordinary-user probes compare view and lower
+  `ctime` on ext4 and fresh local Btrfs, including after remount. The 113
+  normal store tests, all 13 privileged probes on both filesystems, formatting,
+  and strict workspace Clippy pass. Protected recovery of the full metadata
+  set and the remaining guarded enrollment gates are still open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

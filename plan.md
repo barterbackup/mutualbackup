@@ -1275,7 +1275,7 @@ The guarded view now reports real regular-file access/modified times and
 accepts owner `utime` only after durable detach. A first-mutation probe verifies
 nanosecond values and exact anchor bytes on ext4 and fresh local Btrfs; all 13
 privileged guarded probes, 112 normal store tests, formatting, and strict
-workspace Clippy pass. Change-time metadata remains to be done.
+workspace Clippy pass. Protected metadata recovery remains to be done.
 The two-file guarded-root probe additionally verifies that nanosecond access
 and modified times on a created, atomically moved file survive view remount on
 ext4 and fresh local Btrfs.
@@ -1285,7 +1285,12 @@ pinned directory. The nested ordinary-user probe checks nanosecond values
 across FUSE remount on ext4 and fresh local Btrfs; 112 normal store tests,
 all 13 privileged probes on both filesystems, formatting, and strict workspace
 Clippy pass. Root mode remains virtual; the private lower root stays `0700`.
-Change-time and protected root-mode recovery remain gated.
+Protected root-mode recovery remains gated. The view now derives file and
+directory `ctime` from native inode metadata at nanosecond precision, including
+negative Unix timestamps; ordinary-user probes compare it with the lower
+inodes on ext4 and fresh local Btrfs across remount. The 113 normal store tests,
+all 13 privileged probes, formatting, and strict workspace Clippy pass. This
+does not yet establish seed-only recovery of every mutable metadata field.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
