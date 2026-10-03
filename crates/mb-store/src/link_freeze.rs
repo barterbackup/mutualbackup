@@ -44,8 +44,13 @@ const ACCESS_ACL_NAME: &std::ffi::CStr = c"system.posix_acl_access";
 const EDIT_INTENT_KIND: &str = "link-freeze-edit-v1";
 
 #[cfg(test)]
+type SparseCopyWriteHook = Box<dyn FnOnce() -> io::Result<()>>;
+
+#[cfg(test)]
 thread_local! {
     static AFTER_SPARSE_COPY_START: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static AFTER_SPARSE_COPY_WRITE: std::cell::RefCell<Option<SparseCopyWriteHook>> =
         std::cell::RefCell::new(None);
 }
 
@@ -56,6 +61,14 @@ fn run_after_sparse_copy_start_hook() {
             hook();
         }
     });
+}
+
+#[cfg(test)]
+fn run_after_sparse_copy_write_hook() -> io::Result<()> {
+    AFTER_SPARSE_COPY_WRITE.with(|slot| match slot.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
 }
 
 /// Exact original access metadata to persist before freezing a shared inode.
@@ -1136,6 +1149,8 @@ fn copy_sparse_independent(
                     .into());
                 }
                 written += count;
+                #[cfg(test)]
+                run_after_sparse_copy_write_hook()?;
             }
             position += read as u64;
         }
@@ -1301,9 +1316,10 @@ mod tests {
     use crate::database::ControlStore;
 
     use super::{
-        AFTER_SPARSE_COPY_START, AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion,
-        FrozenAnchorProof, IndependentSparseCopy, LinkFreezeEditIntent, LinkFreezeEditPhase,
-        copy_sparse_independent, file_data_extents, hash_exact, install_probe_acl,
+        AFTER_SPARSE_COPY_START, AFTER_SPARSE_COPY_WRITE, AccessAclSnapshot, FileAccessSnapshot,
+        FileWriteExclusion, FrozenAnchorProof, IndependentSparseCopy, LinkFreezeEditIntent,
+        LinkFreezeEditPhase, copy_sparse_independent, file_data_extents, hash_exact,
+        install_probe_acl,
     };
 
     #[test]
@@ -1727,7 +1743,7 @@ mod tests {
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN for fanotify permission events"]
     fn edit_replay_recovers_each_detach_interruption() {
-        for interruption in 0..=8 {
+        for interruption in 0..=9 {
             let root = test_directory();
             let source_path = root.path().join("source");
             let anchor_path = root.path().join("anchor");
@@ -1784,7 +1800,7 @@ mod tests {
                 staging.sync_all().unwrap();
                 parent.sync_all().unwrap();
             }
-            if interruption >= 2 {
+            if (2..=8).contains(&interruption) {
                 let guard = FileWriteExclusion::acquire(source.try_clone().unwrap()).unwrap();
                 let staging = parent.create_child_file(&staging_name).unwrap();
                 let copy = guard.copy_sparse_independent(&staging).unwrap();
@@ -1837,7 +1853,7 @@ mod tests {
                 intent.phase(),
                 match interruption {
                     0 => LinkFreezeEditPhase::SharedFrozen,
-                    1 => LinkFreezeEditPhase::CopyStaging,
+                    1 | 9 => LinkFreezeEditPhase::CopyStaging,
                     2..=4 | 8 => LinkFreezeEditPhase::PrivateCopyReady,
                     5..=6 => LinkFreezeEditPhase::UnlockPending,
                     _ => LinkFreezeEditPhase::Editable,
@@ -1849,10 +1865,49 @@ mod tests {
 
             let store = ControlStore::open(&database_path, &keys).unwrap();
             let parent = PinnedDirectory::open(root.path()).unwrap();
-            let resumed = LinkFreezeEditIntent::load(&store, anchor_id)
+            if interruption == 9 {
+                AFTER_SPARSE_COPY_WRITE.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(|| {
+                        Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+                    }));
+                });
+            }
+            let mut resumed = LinkFreezeEditIntent::load(&store, anchor_id)
                 .unwrap()
                 .unwrap()
                 .resume(&store, &parent, "source", &parent, "anchor");
+            if interruption == 9 {
+                let error = resumed.expect_err("injected sparse-copy ENOSPC must stop detach");
+                assert!(error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(std::io::Error::raw_os_error)
+                        == Some(libc::ENOSPC)
+                }));
+                assert_eq!(
+                    LinkFreezeEditIntent::load(&store, anchor_id)
+                        .unwrap()
+                        .unwrap()
+                        .phase(),
+                    LinkFreezeEditPhase::CopyStaging
+                );
+                assert_eq!(
+                    fs::metadata(&source_path).unwrap().ino(),
+                    fs::metadata(&anchor_path).unwrap().ino()
+                );
+                assert_eq!(fs::read(&anchor_path).unwrap()[4096..4107], *b"before-edit");
+                assert_eq!(
+                    FileAccessSnapshot::capture(&File::open(&source_path).unwrap())
+                        .unwrap()
+                        .mode
+                        & 0o222,
+                    0
+                );
+                resumed = LinkFreezeEditIntent::load(&store, anchor_id)
+                    .unwrap()
+                    .unwrap()
+                    .resume(&store, &parent, "source", &parent, "anchor");
+            }
             if interruption == 8 {
                 assert!(resumed.is_err());
                 assert_eq!(

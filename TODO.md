@@ -444,6 +444,11 @@
   ext4 and fresh local Btrfs; 115 normal store tests, formatting, and strict
   workspace Clippy pass. This does not close protected mutable-view recovery,
   daemon supervision, or guarded enrollment.
+  The sparse-detach replay test now injects `ENOSPC` after a staging write.
+  On ext4 and fresh local Btrfs, the error leaves the edit journal in
+  `CopyStaging`, the shared source frozen, and the captured anchor exact;
+  retry removes the incomplete staging file and finishes the detach. A real
+  disk-full mount probe and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
