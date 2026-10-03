@@ -623,9 +623,10 @@
   Restart after one file retired and ordinary two-file retirement pass on ext4
   and fresh local Btrfs, alongside 115 normal store tests and strict workspace
   Clippy.
-  This path currently requires the recorded root and directories to remain
-  unchanged; directory isolation and user-visible metadata changes need their
-  own replayable restoration. Detached owner-isolated files remain fenced.
+  This earlier retirement path requires the recorded root and directories to
+  remain unchanged; the later directory-isolation journal below handles its
+  owner/mode changes. User-visible path and metadata changes still need
+  replayable restoration. Detached owner-isolated files remain fenced.
   An owner-first root capture path now records its private selection before
   the first file, rechecks each prepared file under a write guard, and records
   the original owner before freezing access and changing UID/GID. It creates
@@ -639,9 +640,20 @@
   refusal, 116 normal store tests, and strict Clippy pass; the privileged
   cases pass on ext4 and fresh local Btrfs. The older ordinary guarded-capture
   path remains available for non-enrollment use and must not be selected for
-  a private guarded mount. Guarded enrollment still needs directory isolation
-  and recovery, owner restoration after detach, signed mutable-view state,
-  and the complete privileged mount gate.
+  a private guarded mount. A separate directory-isolation record now binds the
+  original lower-ownership snapshot to the selected private UID/GID before any
+  directory mode or owner change. The root and every captured child directory
+  transition to private `0700` ownership, replaying original, mode-restricted,
+  and fully private intermediate states. Root retirement restores their
+  original owner and mode after all frozen file anchors retire, and replays an
+  interrupted restoration. Access/default ACLs and file capabilities on
+  directories fail closed before isolation. Three privileged probes cover
+  interrupted isolation/retirement, retained ordinary-user directory
+  descriptors, and default-ACL refusal on ext4 and fresh local Btrfs; 116
+  normal store tests and strict workspace Clippy pass. Guarded enrollment still
+  needs exact lower-namespace admission, restoration after FUSE path changes,
+  owner restoration after file detach, protected mutable-view metadata, and
+  the complete privileged mount gate.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

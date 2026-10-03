@@ -1568,8 +1568,8 @@ root-level retirement now preflights unchanged directory metadata and binds
 changed file owners to their isolation records, then clears the lower-owner
 snapshot after all file retirements. Restart after one file completed and a
 changed-directory refusal pass on ext4 and fresh local Btrfs. The held file
-guard also checks an unjournaled owner before unlink. This path does
-not yet cover private or user-modified directories; detached owner-isolated
+guard also checks an unjournaled owner before unlink. This earlier path did
+not cover private or user-modified directories; detached owner-isolated
 files remain fenced. A separately selected owner-first root capture now
 journals its private policy before the first file, revalidates each prepared
 source under a new held write guard, and changes its mode and owner before
@@ -1577,11 +1577,16 @@ creating a hard-link anchor. Thus the initial proof guard may end without
 leaving a user-owned immutable link; intermediate crashes replay or cancel
 from durable file journals. Privileged interruption, root replay/retirement,
 and ACL refusal pass on ext4 and fresh local Btrfs. The ordinary guarded
-capture path still must not be selected for enrollment. Directory isolation,
-detached-owner recovery, and signed mutable-view recovery remain open.
-Guarded enrollment therefore still needs durable private-inode ownership and
-mode isolation plus virtualized, protected metadata before ordinary user-owned
-source trees are admissible.
+capture path still must not be selected for enrollment.
+Directory isolation now journals its original ownership snapshot and private
+UID/GID before any chmod/chown, then replays partial lower-directory changes.
+Root retirement restores directory ownership and mode after frozen anchors
+retire. Ext4 and fresh local Btrfs probes cover interrupted transitions,
+retained ordinary-user directory descriptors, and default-ACL refusal; 116
+normal store tests and strict workspace Clippy pass. Exact lower-namespace
+admission, restoration after FUSE path changes, detached-file owner recovery,
+signed mutable-view recovery, and the complete privileged mount gate remain
+open before ordinary user-owned roots can be enrolled.
 Broader FUSE failure paths and guarded enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace

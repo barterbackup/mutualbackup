@@ -6,8 +6,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use mb_core::V1_MAX_CATALOG_BYTES;
@@ -36,10 +37,33 @@ const MANIFEST_CLAIM_KIND: &str = "guarded-root-manifest-v1";
 const RETIRE_KIND: &str = "guarded-root-retire-v1";
 const LOWER_OWNERSHIP_KIND: &str = "guarded-root-lower-ownership-v1";
 const PRIVATE_FILE_CAPTURE_KIND: &str = "guarded-root-private-file-capture-v1";
+const DIRECTORY_ISOLATION_KIND: &str = "guarded-root-directory-isolation-v1";
 const MARKER_PREFIX: &str = ".mutualbackup-guarded-root-v1-";
 
 pub(super) fn guarded_root_marker_name(anchor_id: Uuid) -> String {
     format!("{MARKER_PREFIX}{anchor_id}")
+}
+
+fn reject_directory_xattr(directory: &File, name: &std::ffi::CStr) -> std::io::Result<()> {
+    let length = unsafe {
+        libc::fgetxattr(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if length >= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded directory isolation cannot preserve this xattr",
+        ));
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENODATA | libc::EOPNOTSUPP) => Ok(()),
+        _ => Err(error),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -99,6 +123,17 @@ struct PrivateFileCapture {
     format_version: u16,
     anchor_id: Uuid,
     plan_hash: [u8; 32],
+    view_uid: u32,
+    private_uid: u32,
+    private_gid: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct DirectoryIsolation {
+    format_version: u16,
+    anchor_id: Uuid,
+    plan_hash: [u8; 32],
+    snapshot_hash: [u8; 32],
     view_uid: u32,
     private_uid: u32,
     private_gid: u32,
@@ -621,6 +656,177 @@ impl GuardedRootCapturePlan {
         Ok(manifest)
     }
 
+    fn directory_isolation(
+        &self,
+        control: &ControlStore,
+        snapshot_bytes: &[u8],
+    ) -> anyhow::Result<Option<DirectoryIsolation>> {
+        let Some(bytes) =
+            control.get_record(DIRECTORY_ISOLATION_KIND, self.anchor_id.as_bytes())?
+        else {
+            return Ok(None);
+        };
+        let record: DirectoryIsolation = mb_core::decode_canonical(&bytes)?;
+        let private = self
+            .private_file_capture(control)?
+            .ok_or_else(|| anyhow::anyhow!("directory isolation lost private capture policy"))?;
+        anyhow::ensure!(
+            record.format_version == 1
+                && record.anchor_id == self.anchor_id
+                && record.plan_hash == private.plan_hash
+                && record.snapshot_hash == *blake3::hash(snapshot_bytes).as_bytes()
+                && record.view_uid == private.view_uid
+                && record.private_uid == private.private_uid
+                && record.private_gid == private.private_gid,
+            "guarded directory isolation differs from its ownership snapshot"
+        );
+        Ok(Some(record))
+    }
+
+    fn lower_directory_entries<'a>(
+        &'a self,
+        snapshot: &'a LowerOwnershipSnapshot,
+    ) -> Vec<&'a LowerOwnershipEntry> {
+        let mut entries = Vec::with_capacity(self.entries.len() + 1);
+        entries.push(&snapshot.entries[0]);
+        for (planned, recorded) in self.entries.iter().zip(snapshot.entries.iter().skip(1)) {
+            if planned.is_directory() {
+                entries.push(recorded);
+            }
+        }
+        entries
+    }
+
+    fn open_lower_directory(
+        lower: &PinnedDirectory,
+        entry: &LowerOwnershipEntry,
+    ) -> anyhow::Result<PinnedDirectory> {
+        let directory = if entry.path.is_empty() {
+            lower.try_clone()?
+        } else {
+            lower.open_descendant_directory(&entry.path)?
+        };
+        anyhow::ensure!(
+            directory.identity()? == entry.native_id
+                && (entry.path.is_empty()
+                    || lower.entry_identity(&entry.path, true)? == Some(entry.native_id)),
+            "guarded lower directory identity changed: {}",
+            entry.path
+        );
+        Ok(directory)
+    }
+
+    fn check_directory_isolation_metadata(directory: &File) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(read_access_acl(directory)?, AccessAclSnapshot::Absent),
+            "guarded directory isolation cannot preserve an access ACL"
+        );
+        reject_directory_xattr(directory, c"system.posix_acl_default")?;
+        reject_directory_xattr(directory, c"security.capability")?;
+        Ok(())
+    }
+
+    /// Make every captured lower directory inaccessible to the view user.
+    /// The root snapshot and this bound record precede all chmod/chown calls;
+    /// replay accepts only original, mode-restricted, or fully private states.
+    pub fn isolate_lower_directories(
+        &self,
+        control: &ControlStore,
+        manifest: &StableAnchorManifest,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !crate::guarded_mount::mount_claim_exists(control, self.anchor_id)?,
+            "guarded view is already claimed"
+        );
+        anyhow::ensure!(
+            Self::load_active_for_view(control, manifest)? == *self
+                && self.capture(control)? == *manifest,
+            "guarded directory isolation needs its published private capture"
+        );
+        let private = self
+            .private_file_capture(control)?
+            .ok_or_else(|| anyhow::anyhow!("guarded private file capture is missing"))?;
+        let snapshot_bytes = control
+            .get_record(LOWER_OWNERSHIP_KIND, self.anchor_id.as_bytes())?
+            .ok_or_else(|| anyhow::anyhow!("guarded lower ownership snapshot is missing"))?;
+        self.reconcile(control)?;
+        let snapshot: LowerOwnershipSnapshot = mb_core::decode_canonical(&snapshot_bytes)?;
+        let lower = PinnedDirectory::open(&self.source_root)?;
+        let expected = DirectoryIsolation {
+            format_version: 1,
+            anchor_id: self.anchor_id,
+            plan_hash: private.plan_hash,
+            snapshot_hash: *blake3::hash(&snapshot_bytes).as_bytes(),
+            view_uid: private.view_uid,
+            private_uid: private.private_uid,
+            private_gid: private.private_gid,
+        };
+        let prior = self.directory_isolation(control, &snapshot_bytes)?;
+        anyhow::ensure!(
+            prior.as_ref().is_none_or(|record| record == &expected),
+            "guarded directory isolation parameters changed"
+        );
+        self.verify_lower_directories_for_retirement(&snapshot, &lower, prior.as_ref())?;
+        for entry in self.lower_directory_entries(&snapshot) {
+            let directory = Self::open_lower_directory(&lower, entry)?;
+            Self::check_directory_isolation_metadata(directory.as_file())?;
+        }
+        if prior.is_none() {
+            anyhow::ensure!(control.put_record_if_absent(
+                DIRECTORY_ISOLATION_KIND,
+                self.anchor_id.as_bytes(),
+                &mb_core::canonical_bytes(&expected)?,
+            )?);
+        }
+        for entry in self.lower_directory_entries(&snapshot).into_iter().rev() {
+            let directory = Self::open_lower_directory(&lower, entry)?;
+            let before = directory.as_file().metadata()?;
+            if unix_mode(&before) & 0o7777 != 0o700 {
+                directory
+                    .as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o700))?;
+                directory.sync_all()?;
+            }
+            let after_mode = directory.as_file().metadata()?;
+            anyhow::ensure!(
+                unix_mode(&after_mode) & 0o7777 == 0o700,
+                "guarded lower directory mode was not isolated: {}",
+                entry.path
+            );
+            if (after_mode.uid(), after_mode.gid()) != (private.private_uid, private.private_gid) {
+                let result = unsafe {
+                    libc::fchown(
+                        directory.as_file().as_raw_fd(),
+                        private.private_uid as libc::uid_t,
+                        private.private_gid as libc::gid_t,
+                    )
+                };
+                if result < 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                directory.sync_all()?;
+            }
+            let after = directory.as_file().metadata()?;
+            anyhow::ensure!(
+                (after.uid(), after.gid()) == (private.private_uid, private.private_gid)
+                    && unix_mode(&after) & 0o7777 == 0o700
+                    && Self::open_lower_directory(&lower, entry)?.identity()? == entry.native_id,
+                "guarded lower directory owner was not isolated: {}",
+                entry.path
+            );
+        }
+        self.verify_lower_directories_for_retirement(&snapshot, &lower, Some(&expected))?;
+        let root_metadata = lower.as_file().metadata()?;
+        anyhow::ensure!(
+            (root_metadata.uid(), root_metadata.gid())
+                == (private.private_uid, private.private_gid)
+                && unix_mode(&root_metadata) & 0o7777 == 0o700,
+            "guarded lower root was not privately isolated"
+        );
+        self.verify_initial_private_directories(&lower, private.view_uid)?;
+        Ok(())
+    }
+
     /// Isolate every frozen file owner using the durable root snapshot. Each
     /// file has its own write exclusion and owner journal; a failed pass can
     /// resume without changing the identity or bytes of an earlier anchor.
@@ -752,6 +958,12 @@ impl GuardedRootCapturePlan {
             self.private_file_capture(control)?.is_none(),
             "private file capture needs journal-aware root retirement"
         );
+        anyhow::ensure!(
+            control
+                .get_record(DIRECTORY_ISOLATION_KIND, self.anchor_id.as_bytes())?
+                .is_none(),
+            "isolated lower directories need journal-aware retirement"
+        );
         for entry in &self.entries {
             if let GuardedRootEntry::File { capture_id, .. } = entry {
                 anyhow::ensure!(
@@ -777,30 +989,35 @@ impl GuardedRootCapturePlan {
         &self,
         snapshot: &LowerOwnershipSnapshot,
         lower: &PinnedDirectory,
+        isolation: Option<&DirectoryIsolation>,
     ) -> anyhow::Result<()> {
-        let root_entry = snapshot
-            .entries
-            .first()
-            .ok_or(AnchorError::InvalidGuardedPlan)?;
-        let directories = std::iter::once(root_entry).chain(
-            self.entries
-                .iter()
-                .zip(snapshot.entries.iter().skip(1))
-                .filter_map(|(planned, recorded)| planned.is_directory().then_some(recorded)),
-        );
-        for entry in directories {
-            let directory = if entry.path.is_empty() {
-                lower.try_clone()?
-            } else {
-                lower.open_descendant_directory(&entry.path)?
-            };
+        for entry in self.lower_directory_entries(snapshot) {
+            let directory = Self::open_lower_directory(lower, entry)?;
+            if isolation.is_some() {
+                Self::check_directory_isolation_metadata(directory.as_file())?;
+            }
             let metadata = directory.as_file().metadata()?;
+            let mode = unix_mode(&metadata) & 0o7777;
+            let original =
+                (metadata.uid(), metadata.gid()) == (entry.uid, entry.gid) && mode == entry.mode;
+            let permitted = match isolation {
+                Some(record) => {
+                    let restricted_original =
+                        (metadata.uid(), metadata.gid()) == (entry.uid, entry.gid) && mode == 0o700;
+                    let private = (metadata.uid(), metadata.gid())
+                        == (record.private_uid, record.private_gid)
+                        && mode == 0o700;
+                    matches!(entry.access_acl, AccessAclSnapshot::Absent)
+                        && (original || restricted_original || private)
+                        && matches!(
+                            read_access_acl(directory.as_file())?,
+                            AccessAclSnapshot::Absent
+                        )
+                }
+                None => original && read_access_acl(directory.as_file())? == entry.access_acl,
+            };
             anyhow::ensure!(
-                directory.identity()? == entry.native_id
-                    && metadata.uid() == entry.uid
-                    && metadata.gid() == entry.gid
-                    && unix_mode(&metadata) & 0o7777 == entry.mode
-                    && read_access_acl(directory.as_file())? == entry.access_acl,
+                permitted,
                 "guarded lower directory changed during retirement: {}",
                 entry.path
             );
@@ -840,9 +1057,10 @@ impl GuardedRootCapturePlan {
         &self,
         control: &ControlStore,
         snapshot: &LowerOwnershipSnapshot,
+        isolation: Option<&DirectoryIsolation>,
     ) -> anyhow::Result<()> {
         let lower = PinnedDirectory::open(&self.source_root)?;
-        self.verify_lower_directories_for_retirement(snapshot, &lower)?;
+        self.verify_lower_directories_for_retirement(snapshot, &lower, isolation)?;
         for (planned, recorded) in self.entries.iter().zip(snapshot.entries.iter().skip(1)) {
             let GuardedRootEntry::File { capture_id, .. } = planned else {
                 continue;
@@ -873,9 +1091,10 @@ impl GuardedRootCapturePlan {
         control: &ControlStore,
         snapshot: &LowerOwnershipSnapshot,
         bytes: &[u8],
+        isolation: Option<&DirectoryIsolation>,
     ) -> anyhow::Result<()> {
         let lower = PinnedDirectory::open(&self.source_root)?;
-        self.verify_lower_directories_for_retirement(snapshot, &lower)?;
+        self.verify_lower_directories_for_retirement(snapshot, &lower, isolation)?;
         for planned in &self.entries {
             let GuardedRootEntry::File { capture_id, .. } = planned else {
                 continue;
@@ -885,6 +1104,48 @@ impl GuardedRootCapturePlan {
                     && !LinkFreezeCaptureIntent::owner_isolation_pending(control, *capture_id)?,
                 "guarded lower file still has an owner restoration obligation"
             );
+        }
+        if let Some(record) = isolation {
+            for entry in self.lower_directory_entries(snapshot).into_iter().rev() {
+                let directory = Self::open_lower_directory(&lower, entry)?;
+                Self::check_directory_isolation_metadata(directory.as_file())?;
+                let before = directory.as_file().metadata()?;
+                if (before.uid(), before.gid()) != (entry.uid, entry.gid) {
+                    let result = unsafe {
+                        libc::fchown(
+                            directory.as_file().as_raw_fd(),
+                            entry.uid as libc::uid_t,
+                            entry.gid as libc::gid_t,
+                        )
+                    };
+                    if result < 0 {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                    directory.sync_all()?;
+                }
+                if unix_mode(&directory.as_file().metadata()?) & 0o7777 != entry.mode {
+                    directory
+                        .as_file()
+                        .set_permissions(std::fs::Permissions::from_mode(entry.mode))?;
+                    directory.sync_all()?;
+                }
+                let after = directory.as_file().metadata()?;
+                anyhow::ensure!(
+                    (after.uid(), after.gid()) == (entry.uid, entry.gid)
+                        && unix_mode(&after) & 0o7777 == entry.mode
+                        && read_access_acl(directory.as_file())? == entry.access_acl
+                        && Self::open_lower_directory(&lower, entry)?.identity()?
+                            == entry.native_id,
+                    "guarded lower directory was not restored: {}",
+                    entry.path
+                );
+            }
+            self.verify_lower_directories_for_retirement(snapshot, &lower, None)?;
+            control.delete_record_if_value(
+                DIRECTORY_ISOLATION_KIND,
+                self.anchor_id.as_bytes(),
+                &mb_core::canonical_bytes(record)?,
+            )?;
         }
         control.delete_record_if_value(LOWER_OWNERSHIP_KIND, self.anchor_id.as_bytes(), bytes)?;
         Ok(())
@@ -994,6 +1255,18 @@ impl GuardedRootCapturePlan {
     pub fn reconcile(&self, control: &ControlStore) -> anyhow::Result<()> {
         self.validate()?;
         self.private_file_capture(control)?;
+        let directory_snapshot =
+            control.get_record(LOWER_OWNERSHIP_KIND, self.anchor_id.as_bytes())?;
+        if let Some(bytes) = &directory_snapshot {
+            self.directory_isolation(control, bytes)?;
+        } else {
+            anyhow::ensure!(
+                control
+                    .get_record(DIRECTORY_ISOLATION_KIND, self.anchor_id.as_bytes())?
+                    .is_none(),
+                "guarded directory isolation lost its ownership snapshot"
+            );
+        }
         if let Some(recorded) = control.get_record(PLAN_KIND, self.anchor_id.as_bytes())? {
             anyhow::ensure!(
                 recorded == mb_core::canonical_bytes(self)?,
@@ -1795,11 +2068,24 @@ impl GuardedRootCapturePlan {
                 Ok::<_, anyhow::Error>((bytes, snapshot))
             })
             .transpose()?;
+        let directory_isolation = match &lower_ownership {
+            Some((bytes, _)) => self.directory_isolation(control, bytes)?,
+            None => {
+                anyhow::ensure!(
+                    control
+                        .get_record(DIRECTORY_ISOLATION_KIND, self.anchor_id.as_bytes())?
+                        .is_none(),
+                    "guarded directory isolation lost its ownership snapshot"
+                );
+                None
+            }
+        };
         if recorded_plan.is_none()
             && let Some(private) = &private_capture
         {
             anyhow::ensure!(
                 lower_ownership.is_none()
+                    && directory_isolation.is_none()
                     && control
                         .get_record(ROOT_CLAIM_KIND, self.anchor_id.as_bytes())?
                         .is_none()
@@ -1833,7 +2119,11 @@ impl GuardedRootCapturePlan {
                 "guarded lower owner lost its root plan"
             );
             self.reconcile(control)?;
-            self.verify_lower_ownership_before_retirement(control, snapshot)?;
+            self.verify_lower_ownership_before_retirement(
+                control,
+                snapshot,
+                directory_isolation.as_ref(),
+            )?;
         }
         let retirement = RootRetirement {
             format_version: 1,
@@ -2032,7 +2322,12 @@ impl GuardedRootCapturePlan {
             LinkFreezeCaptureIntent::finish_completed_retirement(control, *capture_id)?;
         }
         if let Some((bytes, snapshot)) = &lower_ownership {
-            self.finish_lower_ownership_retirement(control, snapshot, bytes)?;
+            self.finish_lower_ownership_retirement(
+                control,
+                snapshot,
+                bytes,
+                directory_isolation.as_ref(),
+            )?;
         }
         if let Some(private) = &private_capture {
             control.delete_record_if_value(
@@ -2230,6 +2525,12 @@ impl GuardedRootCapturePlan {
         anyhow::ensure!(
             self.private_file_capture(control)?.is_none(),
             "private file capture needs journal-aware retirement"
+        );
+        anyhow::ensure!(
+            control
+                .get_record(DIRECTORY_ISOLATION_KIND, self.anchor_id.as_bytes())?
+                .is_none(),
+            "isolated lower directories need journal-aware retirement"
         );
         anyhow::ensure!(
             control
@@ -3907,6 +4208,293 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    #[ignore = "requires root and CAP_SYS_ADMIN for guarded directory isolation"]
+    fn private_directory_isolation_replays_and_restores_on_root_retirement() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // No interruption, after nested chmod, after nested chown/root chmod,
+        // and after the first retirement chown are distinct replay states.
+        for interruption in 0..4 {
+            let temp = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+                Some(root) => tempfile::Builder::new()
+                    .prefix("mb-private-directories-")
+                    .tempdir_in(root)
+                    .unwrap(),
+                None => tempfile::tempdir().unwrap(),
+            };
+            let root = temp.path().join("root");
+            let nested = root.join("nested");
+            fs::create_dir_all(&nested).unwrap();
+            let source = nested.join("file");
+            fs::write(&source, b"exact\r\n\0directory bytes").unwrap();
+            for path in [&root, &nested, &source] {
+                let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
+            }
+            let plan = GuardedRootCapturePlan::plan(&root).unwrap();
+            let keys = KeyMaterial::from_seed(&Seed::from_bytes([128; 32]));
+            let database_path = temp.path().join("control.db");
+            let store = ControlStore::open(&database_path, &keys).unwrap();
+            let manifest = plan
+                .capture_private_file_owners(&store, 65534, 0, 0)
+                .unwrap();
+            let snapshot_bytes = store
+                .get_record(LOWER_OWNERSHIP_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .unwrap();
+            if interruption == 1 || interruption == 2 {
+                let marker = plan.private_file_capture(&store).unwrap().unwrap();
+                let record = DirectoryIsolation {
+                    format_version: 1,
+                    anchor_id: plan.anchor_id,
+                    plan_hash: marker.plan_hash,
+                    snapshot_hash: *blake3::hash(&snapshot_bytes).as_bytes(),
+                    view_uid: marker.view_uid,
+                    private_uid: marker.private_uid,
+                    private_gid: marker.private_gid,
+                };
+                assert!(
+                    store
+                        .put_record_if_absent(
+                            DIRECTORY_ISOLATION_KIND,
+                            plan.anchor_id.as_bytes(),
+                            &mb_core::canonical_bytes(&record).unwrap(),
+                        )
+                        .unwrap()
+                );
+                fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+                if interruption == 2 {
+                    let encoded = std::ffi::CString::new(nested.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 0, 0) }, 0);
+                    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+                } else {
+                    assert_eq!(fs::metadata(&nested).unwrap().uid(), 65534);
+                }
+            }
+            drop(store);
+
+            let store = ControlStore::open(&database_path, &keys).unwrap();
+            plan.isolate_lower_directories(&store, &manifest).unwrap();
+            plan.isolate_lower_directories(&store, &manifest).unwrap();
+            for directory in [&root, &nested] {
+                let metadata = fs::metadata(directory).unwrap();
+                assert_eq!((metadata.uid(), metadata.gid()), (0, 0));
+                assert_eq!(metadata.permissions().mode() & 0o7777, 0o700);
+            }
+            assert!(
+                store
+                    .get_record(DIRECTORY_ISOLATION_KIND, plan.anchor_id.as_bytes())
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(fs::read(&source).unwrap(), b"exact\r\n\0directory bytes");
+            if interruption == 3 {
+                let encoded = std::ffi::CString::new(nested.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
+                assert_eq!(
+                    fs::metadata(&nested).unwrap().permissions().mode() & 0o7777,
+                    0o700
+                );
+            }
+            plan.discard_unreferenced(&store).unwrap();
+            for directory in [&root, &nested] {
+                let metadata = fs::metadata(directory).unwrap();
+                assert_eq!((metadata.uid(), metadata.gid()), (65534, 65534));
+                assert_eq!(metadata.permissions().mode() & 0o7777, 0o755);
+            }
+            assert_eq!(fs::metadata(&source).unwrap().uid(), 65534);
+            assert_eq!(fs::read(source).unwrap(), b"exact\r\n\0directory bytes");
+            assert!(
+                store
+                    .get_record(DIRECTORY_ISOLATION_KIND, plan.anchor_id.as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root and CAP_SYS_ADMIN for retained-directory descriptor probe"]
+    fn private_directory_isolation_blocks_retained_user_descriptors() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let temp = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-private-directory-fds-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let root = temp.path().join("root");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o755)).unwrap();
+        let source = nested.join("file");
+        fs::write(&source, b"held directory bytes").unwrap();
+        for path in [&root, &nested, &source] {
+            let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
+        }
+        let plan = GuardedRootCapturePlan::plan(&root).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([129; 32]));
+        let control_dir = tempfile::tempdir().unwrap();
+        let store = ControlStore::open(control_dir.path().join("control.db"), &keys).unwrap();
+        let manifest = plan
+            .capture_private_file_owners(&store, 65534, 0, 0)
+            .unwrap();
+        let mut child = Command::new("python3")
+            .uid(65534)
+            .gid(65534)
+            .arg("-u")
+            .arg("-c")
+            .arg(
+                r#"import errno, os, sys
+root = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+nested = os.open(sys.argv[2], os.O_RDONLY | os.O_DIRECTORY)
+print('READY', flush=True)
+assert sys.stdin.readline() == 'continue\n'
+for operation in (
+    lambda: os.fchmod(root, 0o777),
+    lambda: os.fchmod(nested, 0o777),
+    lambda: os.open('nested', os.O_RDONLY | os.O_DIRECTORY, dir_fd=root),
+    lambda: os.open('file', os.O_RDONLY, dir_fd=nested),
+):
+    try:
+        operation()
+    except OSError as error:
+        assert error.errno in (errno.EACCES, errno.EPERM), error
+    else:
+        raise AssertionError('retained directory descriptor bypassed private lower mode')
+os.close(nested)
+os.close(root)
+print('DONE', flush=True)
+"#,
+            )
+            .arg(&root)
+            .arg(&nested)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        if line != "READY\n" {
+            let status = child.wait().unwrap();
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!("retained-directory child did not start: {status}: {stderr}");
+        }
+        plan.isolate_lower_directories(&store, &manifest).unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"continue\n")
+            .unwrap();
+        line.clear();
+        output.read_line(&mut line).unwrap();
+        let status = child.wait().unwrap();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(
+            status.success(),
+            "retained-directory child failed: {stderr}"
+        );
+        assert_eq!(line, "DONE\n");
+        plan.discard_unreferenced(&store).unwrap();
+        assert_eq!(fs::read(source).unwrap(), b"held directory bytes");
+    }
+
+    #[test]
+    #[ignore = "requires root and CAP_SYS_ADMIN for guarded directory ACL probe"]
+    fn private_directory_isolation_refuses_default_acl_before_mutation() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = match std::env::var_os("MUTUALBACKUP_REFLINK_TEST_ROOT") {
+            Some(root) => tempfile::Builder::new()
+                .prefix("mb-private-directory-acl-")
+                .tempdir_in(root)
+                .unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let root = temp.path().join("root");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let source = nested.join("file");
+        fs::write(&source, b"directory ACL refusal").unwrap();
+        for path in [&root, &nested, &source] {
+            let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 65534, 65534) }, 0);
+        }
+        let plan = GuardedRootCapturePlan::plan(&root).unwrap();
+        let keys = KeyMaterial::from_seed(&Seed::from_bytes([130; 32]));
+        let store = ControlStore::open(temp.path().join("control.db"), &keys).unwrap();
+        let manifest = plan
+            .capture_private_file_owners(&store, 65534, 0, 0)
+            .unwrap();
+        let mut acl = 2_u32.to_le_bytes().to_vec();
+        for (tag, permission) in [(1_u16, 7_u16), (4, 5), (32, 5)] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&permission.to_le_bytes());
+            acl.extend_from_slice(&u32::MAX.to_le_bytes());
+        }
+        let encoded = std::ffi::CString::new(nested.as_os_str().as_bytes()).unwrap();
+        let result = unsafe {
+            libc::setxattr(
+                encoded.as_ptr(),
+                c"system.posix_acl_default".as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        };
+        if result < 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EOPNOTSUPP)
+            );
+            plan.discard_unreferenced(&store).unwrap();
+            return;
+        }
+        assert!(plan.isolate_lower_directories(&store, &manifest).is_err());
+        assert!(
+            store
+                .get_record(DIRECTORY_ISOLATION_KIND, plan.anchor_id.as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        for directory in [&root, &nested] {
+            let metadata = fs::metadata(directory).unwrap();
+            assert_eq!((metadata.uid(), metadata.gid()), (65534, 65534));
+            assert_eq!(metadata.permissions().mode() & 0o7777, 0o755);
+        }
+        assert_eq!(
+            unsafe { libc::removexattr(encoded.as_ptr(), c"system.posix_acl_default".as_ptr()) },
+            0
+        );
+        plan.isolate_lower_directories(&store, &manifest).unwrap();
+        plan.discard_unreferenced(&store).unwrap();
+        assert_eq!(fs::read(source).unwrap(), b"directory ACL refusal");
     }
 
     #[test]
