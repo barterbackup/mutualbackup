@@ -255,6 +255,10 @@
   replacement and unlink. Truncate through one and allocation through the
   other continue to affect only the displaced/unlinked inode, while the new
   name and captured anchors remain exact on ext4 and fresh local Btrfs.
+  Guarded passthrough open and create now accept `O_APPEND`. An ordinary-user
+  append probe seeks back to the start before writing and still appends after
+  durable detach; a newly created file also appends through its first handle.
+  All 17 privileged FUSE probes pass on ext4 and fresh local Btrfs.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)

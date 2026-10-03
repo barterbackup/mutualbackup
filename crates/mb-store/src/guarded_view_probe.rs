@@ -2863,7 +2863,7 @@ impl Filesystem for GuardedProbeView {
             reply.error(Errno::ENOENT);
             return;
         };
-        if flags.0 & !(libc::O_ACCMODE | KERNEL_O_LARGEFILE) != 0 {
+        if flags.0 & !(libc::O_ACCMODE | libc::O_APPEND | KERNEL_O_LARGEFILE) != 0 {
             reply.error(Errno::EACCES);
             return;
         }
@@ -3095,6 +3095,7 @@ impl Filesystem for GuardedProbeView {
             | libc::O_CREAT
             | libc::O_EXCL
             | libc::O_TRUNC
+            | libc::O_APPEND
             | libc::O_CLOEXEC
             | libc::O_NOCTTY
             | KERNEL_O_LARGEFILE;
@@ -5207,6 +5208,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum FirstMutation {
         WritableOpen,
+        Append,
         SharedMapping,
         ConcurrentOpens,
         MixedOpenModes,
@@ -5315,6 +5317,9 @@ mod tests {
                 FirstMutation::WritableOpen => {
                     "import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY); os.write(fd,b'EDIT'); os.fsync(fd); os.close(fd)"
                 }
+                FirstMutation::Append => {
+                    "import os,sys; fd=os.open(sys.argv[1],os.O_WRONLY|os.O_APPEND); os.lseek(fd,0,os.SEEK_SET); os.write(fd,b'APPEND'); os.fsync(fd); os.close(fd)"
+                }
                 FirstMutation::SharedMapping => {
                     "import mmap,os,sys; fd=os.open(sys.argv[1],os.O_RDWR); mapped=mmap.mmap(fd,0,flags=mmap.MAP_SHARED,prot=mmap.PROT_READ|mmap.PROT_WRITE); mapped[:4]=b'MMAP'; mapped.flush(); mapped.close(); os.fsync(fd); os.close(fd)"
                 }
@@ -5369,6 +5374,11 @@ mod tests {
                         String::from_utf8_lossy(&second_open.stderr)
                     );
                     anyhow::ensure!(fs::read(&lower_path)?.starts_with(b"EDIT\nNEXT"));
+                }
+                FirstMutation::Append => {
+                    let expected = [original.as_slice(), b"APPEND"].concat();
+                    anyhow::ensure!(fs::read(&lower_path)? == expected);
+                    anyhow::ensure!(fs::read(mountpoint.join("sample"))? == expected);
                 }
                 FirstMutation::SharedMapping => {
                     anyhow::ensure!(fs::read(&lower_path)?.starts_with(b"MMAP"));
@@ -5507,6 +5517,12 @@ mod tests {
 
     #[test]
     #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
+    fn append_open_detaches_before_writing_at_end() {
+        guarded_view_mutation_case(FirstMutation::Append);
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_ADMIN, FUSE passthrough, and fanotify permission events"]
     fn shared_writable_mapping_detaches_before_mapped_write() {
         guarded_view_mutation_case(FirstMutation::SharedMapping);
     }
@@ -5637,7 +5653,7 @@ mod tests {
                 .uid(65534)
                 .gid(65534)
                 .arg("-c")
-                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_RDWR,0o640); os.write(fd,b'gamma-bytes'); os.fsync(fd); os.close(fd); os.rename(sys.argv[1],sys.argv[2]); fd=os.open(sys.argv[2],os.O_WRONLY); os.write(fd,b'EDIT'); os.fsync(fd); os.close(fd)")
+                .arg("import os,sys; fd=os.open(sys.argv[1],os.O_CREAT|os.O_EXCL|os.O_RDWR|os.O_APPEND,0o640); os.write(fd,b'gamma-bytes'); os.lseek(fd,0,os.SEEK_SET); os.write(fd,b'-append'); assert os.pread(fd,18,0)==b'gamma-bytes-append'; os.fsync(fd); os.close(fd); os.rename(sys.argv[1],sys.argv[2]); fd=os.open(sys.argv[2],os.O_WRONLY); os.write(fd,b'EDIT'); os.fsync(fd); os.close(fd)")
                 .arg(mountpoint.join("gamma"))
                 .arg(mountpoint.join("delta"))
                 .output()?;
@@ -5646,7 +5662,7 @@ mod tests {
                 "guarded file creation failed: {}",
                 String::from_utf8_lossy(&create.stderr)
             );
-            anyhow::ensure!(fs::read(lower.join("delta"))?.starts_with(b"EDIT"));
+            anyhow::ensure!(fs::read(lower.join("delta"))? == b"EDITa-bytes-append");
             let beta_inode = fs::metadata(lower.join("beta"))?.ino();
             let edit = Command::new("python3")
                 .uid(65534)

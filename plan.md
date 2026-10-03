@@ -1309,6 +1309,9 @@ mount supervision, and guarded enrollment remain open.
 The two-file probe now holds two writable descriptors across atomic replacement
 and unlink; handle-based truncate and allocation remain bound to the old inode
 without changing the replacement or captured anchors on ext4 and Btrfs.
+Guarded passthrough open and create now allow `O_APPEND`. Ordinary-user probes
+verify that seeking to offset zero still appends after detach and on a newly
+created file; all 17 privileged FUSE probes pass on ext4 and fresh local Btrfs.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
