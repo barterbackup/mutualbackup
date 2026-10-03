@@ -608,10 +608,17 @@
   `/proc/self/fd` reopen fail; exact anchor bytes and replay pass on ext4 and
   fresh local Btrfs. Files with access ACLs or file capabilities are refused
   before the ownership change until those metadata rules are implemented.
-  Owner-isolated anchors cannot yet retire. Enrollment still needs the initial
-  freeze and owner change joined under one guard, directory isolation and
-  recovery, owner restoration after detach/retirement, and signed view state.
-  The 115 normal store tests and strict workspace Clippy pass.
+  A frozen, owner-isolated file can now retire after its anchor is unlinked:
+  the retirement journal restores its recorded UID/GID and original access,
+  then removes the owner record only after the capture is retired. Restart
+  probes cover interruption after unlink and after `fchown`; the held-descriptor
+  probe also verifies final restoration. These pass on ext4 and fresh local
+  Btrfs, alongside 115 normal store tests and strict workspace Clippy.
+  Root retirement still refuses the surviving lower-ownership snapshot, and
+  detached owner-isolated files remain fenced. Enrollment still needs the
+  initial freeze and owner change joined under one guard, directory isolation
+  and recovery, owner restoration after detach/root retirement, and signed
+  mutable-view state.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

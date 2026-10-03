@@ -1559,10 +1559,14 @@ Frozen-file owner isolation now has a separate durable record before `fchown`
 under the held write-exclusion guard. A root pass uses the original owner from
 the lower snapshot and replays a partially isolated file set. Privileged
 held-descriptor and partial-replay probes pass on ext4 and fresh local Btrfs;
-ACL and file-capability cases fail before mutation. Retirement stays fenced
-until owner restoration exists. The initial freeze and ownership change still
-have a guard-release gap, so this is not yet an enrollment-safe transition;
-directory isolation and signed mutable-view recovery also remain open.
+ACL and file-capability cases fail before mutation. Frozen-file retirement
+now replays UID/GID and access restoration after anchor unlink; interruption
+after unlink and after `fchown` passes on ext4 and fresh local Btrfs. The
+root-level lower-ownership snapshot still blocks root retirement, and
+detached owner-isolated files remain fenced. The initial freeze and ownership
+change still have a guard-release gap, so this is not yet an enrollment-safe
+transition; directory isolation and signed mutable-view recovery also remain
+open.
 Guarded enrollment therefore still needs durable private-inode ownership and
 mode isolation plus virtualized, protected metadata before ordinary user-owned
 source trees are admissible.
