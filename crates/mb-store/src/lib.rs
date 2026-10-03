@@ -33,7 +33,7 @@ pub use database::{
 #[cfg(target_os = "linux")]
 pub use guarded_mount::GuardedViewMount;
 #[cfg(target_os = "linux")]
-pub use guarded_view_probe::{GuardedProbeView, probe_guarded_view_passthrough};
+pub use guarded_view_probe::probe_guarded_view_passthrough;
 #[cfg(target_os = "linux")]
 pub use link_freeze::{
     AccessAclSnapshot, FileAccessSnapshot, FileWriteExclusion, FrozenAnchorProof,

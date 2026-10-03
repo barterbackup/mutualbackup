@@ -1358,6 +1358,12 @@ view; with permission checking, the unrelated read fails while the intended
 owner still edits through durable detach and the original anchor remains exact.
 The edit survives clean and killed-daemon remount on ext4 and fresh local Btrfs.
 Daemon ownership and guarded enrollment remain gated separately.
+The raw FUSE view is now crate-private, leaving the checked guarded mount
+wrapper as its public path. All 18 privileged view probes now use kernel
+permission checking and pass on ext4 and fresh local Btrfs; the claimed-mount
+recovery probe also passes there. Normal store tests, formatting, and strict
+workspace Clippy pass. Enrollment remains gated on daemon ownership and
+protected view-metadata recovery.
 `b69ce33` further makes signed endpoint sets authoritative over persistent
 bootstrap and attempt-scoped recovery hints, and prevents a pending dial to a
 withdrawn direct endpoint from holding transport selection on direct. The

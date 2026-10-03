@@ -1575,11 +1575,10 @@ struct GuardedProbeDirectory {
     native_id: NativeFileId,
 }
 
-/// Experimental FUSE view for a published guarded capture. Enrollment and
-/// mount supervision remain gated until directory mutation coverage and the
-/// remaining write paths are complete. The caller must keep the lower source
-/// directory inaccessible to ordinary users while this view is mounted.
-pub struct GuardedProbeView {
+/// FUSE view for a published guarded capture. Only the guarded mount wrapper
+/// may expose this to callers, so its permission and recovery checks cannot
+/// be omitted by accident.
+pub(crate) struct GuardedProbeView {
     files: HashMap<u64, Arc<GuardedProbeFile>>,
     dynamic_files: Mutex<HashMap<u64, Arc<GuardedProbeFile>>>,
     directories: HashMap<u64, GuardedProbeDirectory>,
@@ -3826,6 +3825,9 @@ pub fn probe_guarded_view_passthrough(source_root: impl AsRef<Path>) -> anyhow::
     let view = GuardedProbeView::new(vec![file], 0o755, Arc::clone(&denied_writable), None);
     let mut config = Config::default();
     config.acl = SessionACL::All;
+    config
+        .mount_options
+        .push(fuser::MountOption::DefaultPermissions);
     let session = fuser::spawn_mount(view, &mountpoint, &config)
         .context("mount disposable FUSE passthrough view")?;
     let result = (|| -> anyhow::Result<()> {
@@ -5377,6 +5379,9 @@ mod tests {
             );
             let mut config = Config::default();
             config.acl = SessionACL::All;
+            config
+                .mount_options
+                .push(fuser::MountOption::DefaultPermissions);
             let _session = fuser::spawn_mount(view, root.join("view"), &config).unwrap();
             assert_eq!(
                 fs::read(root.join("view/sample")).unwrap(),
@@ -5547,6 +5552,9 @@ mod tests {
         );
         let mut config = Config::default();
         config.acl = SessionACL::All;
+        config
+            .mount_options
+            .push(fuser::MountOption::DefaultPermissions);
         let session = fuser::spawn_mount(view, &mountpoint, &config).unwrap();
         let result = (|| -> anyhow::Result<()> {
             anyhow::ensure!(fs::read(mountpoint.join("sample"))? == original);
@@ -5873,6 +5881,9 @@ mod tests {
                 .unwrap();
         let mut config = Config::default();
         config.acl = SessionACL::All;
+        config
+            .mount_options
+            .push(fuser::MountOption::DefaultPermissions);
         let session = fuser::spawn_mount(view, &mountpoint, &config).unwrap();
         let result = (|| -> anyhow::Result<()> {
             let list = Command::new("python3")
@@ -6138,6 +6149,9 @@ mod tests {
                 .unwrap();
         let mut config = Config::default();
         config.acl = SessionACL::All;
+        config
+            .mount_options
+            .push(fuser::MountOption::DefaultPermissions);
         let session = fuser::spawn_mount(view, &mountpoint, &config).unwrap();
         let result = (|| -> anyhow::Result<()> {
             let replacement = Command::new("python3")
@@ -6216,6 +6230,9 @@ mod tests {
         let control = Arc::new(Mutex::new(control));
         let mut config = Config::default();
         config.acl = SessionACL::All;
+        config
+            .mount_options
+            .push(fuser::MountOption::DefaultPermissions);
         let view =
             GuardedProbeView::from_guarded_capture(&manifest, Arc::clone(&control), 65534, 65534)
                 .unwrap();
@@ -6365,6 +6382,9 @@ mod tests {
                 .unwrap();
         let mut config = Config::default();
         config.acl = SessionACL::All;
+        config
+            .mount_options
+            .push(fuser::MountOption::DefaultPermissions);
         let session = fuser::spawn_mount(view, &mountpoint, &config).unwrap();
         let result = (|| -> anyhow::Result<()> {
             anyhow::ensure!(

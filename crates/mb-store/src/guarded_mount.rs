@@ -15,9 +15,10 @@ use fuser::{BackgroundSession, Config, MountOption, SessionACL};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::guarded_view_probe::GuardedProbeView;
 use crate::{
-    ControlStore, GuardedProbeView, GuardedRootCapturePlan, NativeFileId, PinnedDirectory,
-    StableAnchorManifest, filesystem_identity,
+    ControlStore, GuardedRootCapturePlan, NativeFileId, PinnedDirectory, StableAnchorManifest,
+    filesystem_identity,
 };
 
 const MOUNT_CLAIM_KIND: &str = "guarded-view-mount-v1";

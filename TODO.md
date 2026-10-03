@@ -380,6 +380,11 @@
   the intended owner can still edit after durable detach without changing the
   frozen anchor. The edit survives clean and killed-daemon remount on ext4 and
   fresh local Btrfs. Daemon supervision and enrollment remain open.
+  The raw guarded FUSE filesystem type is now crate-private, so callers use
+  the mount wrapper that enforces permission and mount-identity checks. All
+  18 privileged view probes now mount with kernel default permission checking
+  and pass on ext4 and fresh local Btrfs, as does the claimed-mount recovery
+  test. Normal store tests, formatting, and strict workspace Clippy pass.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See
   [fanotify_mark(2)](https://man7.org/linux/man-pages/man2/fanotify_mark.2.html)
