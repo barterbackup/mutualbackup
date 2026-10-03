@@ -1180,9 +1180,14 @@ pinned source directories, updating the file's visible path before a later
 edit; tracked-name replacement fails without changing either source. An
 uncertain move failure poisons the view. The ten privileged probes pass on
 ext4 and fresh local Btrfs, with normal store tests and strict workspace
-Clippy passing. Directory mutations, create and atomic replacement, remaining
-metadata/allocation modes, concurrent handles, mount supervision/recovery,
-and guarded enrollment remain open.
+Clippy passing. `6147a32` builds the experimental view from a published
+guarded manifest and stored plan, checking pinned source identities and anchor
+availability. The two-file and nested probes pass on ext4 and fresh local
+Btrfs through that constructor. A rebuild after an unjournaled rename refuses
+to serve, making durable namespace replay the next restart requirement.
+Directory mutations, create and atomic replacement, remaining metadata and
+allocation modes, concurrent handles, mount supervision/recovery, and guarded
+enrollment remain open.
 M5-123 through M5-126 corrected live coding ownership and removed-holder
 discovery. M5-127 passed local formatting, strict locked all-target workspace
 Clippy and tests, Docker lab safety, all 23 fresh disposable Btrfs/network
