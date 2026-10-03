@@ -36,7 +36,9 @@ them as ADRs and test vectors before promising wire compatibility.
   can normalize line endings on its own; a configured `filter.<name>.clean`
   command is a separate, arbitrary transformation. Disable both directions of
   both mechanisms rather than assuming that disabling CRLF normalization also
-  disables custom filters.
+  disables custom filters. This includes Git LFS filters: an LFS pointer is
+  tracked and restored as its literal bytes, with no automatic LFS transfer or
+  pointer substitution by our binary.
   Do not offer a compatibility flag, `--renormalize` equivalent, or per-command
   override that enables such conversion in our binary. Existing Git attributes
   and configuration that request conversion are inert for file content in our
@@ -3569,6 +3571,8 @@ plan; passing a Git command gate does not close a source-backend or platform gat
   settings and all clean/smudge/process, encoding, and ident rules are inert:
   the captured file, staged blob, exported blob, and restored file have the
   same bytes unless the user or merge operation explicitly changes content.
+  Include repositories that configure Git LFS in this check: its pointer bytes
+  are ordinary tracked content here, and no filter or external transfer runs.
 - Make Git-facing prune release unreachable native anchors and backed-up
   sectors while respecting every live ref, index entry, worktree, protection
   pin, retained signed revision, and in-flight operation.
@@ -3698,7 +3702,8 @@ stored Git blob bytes exactly, without trying to reverse that conversion.
   options that enable renormalization or filters without changing index, refs,
   anchors, or worktree. Verify that transforming rules remain present but inert
   while raw-byte commands succeed, including after those rules change between
-  staging, commit, checkout, and an ordinary-Git exchange;
+  staging, commit, checkout, and an ordinary-Git exchange; include a Git LFS
+  filter rule and verify that its pointer stays byte-exact without invoking LFS;
   verify `status` and `diff` report a line-ending-only edit as dirty and
   destructive worktree operations protect that edit;
   sparse and large files; hard links, symlinks, modes, and unusual path names;
