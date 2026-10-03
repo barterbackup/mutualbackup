@@ -680,6 +680,8 @@ impl GuardedFileCapturePlan {
     /// both finish, so a crash can replay the same retirement.
     pub fn discard_unreferenced(&self, control: &ControlStore) -> anyhow::Result<()> {
         anyhow::ensure!(self.format_version == 1 && !self.anchor_id.is_nil());
+        let view_guard =
+            crate::guarded_view_probe::file_guard_record_for_retirement(control, self)?;
         let plan_bytes = mb_core::canonical_bytes(self)?;
         let plan_hash = *blake3::hash(&plan_bytes).as_bytes();
         let recorded_plan = control.get_record(PLAN_KIND, self.anchor_id.as_bytes())?;
@@ -723,6 +725,13 @@ impl GuardedFileCapturePlan {
                     RETIRE_KIND,
                     self.anchor_id.as_bytes(),
                     &retirement_bytes,
+                )?;
+            }
+            if let Some((id, bytes)) = view_guard {
+                control.delete_record_if_value(
+                    crate::guarded_view_probe::FILE_GUARD_KIND,
+                    &id,
+                    &bytes,
                 )?;
             }
             return Ok(());
@@ -878,6 +887,13 @@ impl GuardedFileCapturePlan {
             self.anchor_id.as_bytes(),
             &retirement_bytes,
         )?;
+        if let Some((id, bytes)) = view_guard {
+            control.delete_record_if_value(
+                crate::guarded_view_probe::FILE_GUARD_KIND,
+                &id,
+                &bytes,
+            )?;
+        }
         Ok(())
     }
 

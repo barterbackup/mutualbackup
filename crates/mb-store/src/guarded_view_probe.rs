@@ -51,7 +51,7 @@ const DIRECTORY_RENAME_KIND: &str = "guarded-view-directory-rename-v1";
 const DIRECTORY_REPLACE_KIND: &str = "guarded-view-directory-replace-v1";
 const ROOT_MODE_KIND: &str = "guarded-view-root-mode-v1";
 const DIRECTORY_MODE_KIND: &str = "guarded-view-directory-mode-v1";
-const FILE_GUARD_KIND: &str = "guarded-view-file-guard-v1";
+pub(crate) const FILE_GUARD_KIND: &str = "guarded-view-file-guard-v1";
 
 /// The mount must be retired before root cleanup. A pending FUSE namespace
 /// operation needs remount replay first; retiring anchors against either side
@@ -86,7 +86,46 @@ pub(crate) fn verify_retired_namespace_quiescent(
             );
         }
     }
+    ensure!(
+        !control
+            .records(FILE_GUARD_KIND)?
+            .iter()
+            .any(|(id, _)| id.starts_with(anchor_id.as_bytes())),
+        "guarded view retains a file-anchor retirement obligation"
+    );
     Ok(())
+}
+
+/// A stopped view keeps its latest file capture in a durable per-inode record.
+/// The anchor cannot be retired while that view may remount. Once the view's
+/// claim is retired, the record remains until the anchor's own retirement has
+/// completed, so a crash cannot lose the cleanup obligation.
+pub(crate) fn file_guard_record_for_retirement(
+    control: &ControlStore,
+    plan: &GuardedFileCapturePlan,
+) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let mut found = None;
+    for (id, bytes) in control.records(FILE_GUARD_KIND)? {
+        ensure!(id.len() == 24, "invalid guarded file guard record ID");
+        let record: FileGuardRecord = mb_core::decode_canonical(&bytes)?;
+        ensure!(
+            record.version == 1
+                && record.root_anchor_id.as_bytes() == &id[..16]
+                && record.view_inode.to_le_bytes() == id[16..]
+                && record.view_inode > INodeNo::ROOT.0,
+            "invalid guarded file guard record"
+        );
+        if record.plan.anchor_id() != plan.anchor_id() {
+            continue;
+        }
+        ensure!(
+            record.plan == *plan && found.is_none(),
+            "guarded file guard has a different or duplicate anchor plan"
+        );
+        crate::guarded_mount::require_mount_claim_retired(control, record.root_anchor_id)?;
+        found = Some((id, bytes));
+    }
+    Ok(found)
 }
 
 /// Resolve a captured file's final FUSE name without replaying or modifying

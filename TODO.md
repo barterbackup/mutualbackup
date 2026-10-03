@@ -752,6 +752,12 @@
   revisions, seed-only recovery of the mutable view, and coordinated
   retirement of the per-inode guard records and their anchors before guarded
   enrollment or Git stage/checkout may select this backend.
+  File-anchor retirement now rejects a guard still needed by a claimed view;
+  it removes the matching per-inode record only after physical anchor cleanup.
+  Root-anchor retirement waits for all such records to clear. The focused
+  privileged test covers active-anchor refusal, superseded-anchor cleanup,
+  and final root cleanup on local ext4 and disposable Btrfs. Node-level
+  reachability and signed-revision GC still need to drive this ordering.
   Broader FUSE failure paths and the full guarded-enrollment gate remain open.
   Keep Git staging and checkout gated until the complete privileged probe
   passes. See

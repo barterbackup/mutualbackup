@@ -1700,6 +1700,14 @@ print('DONE', flush=True)
         );
         let remounted =
             GuardedViewMount::recover_claimed(original.anchor_id, Arc::clone(&control)).unwrap();
+        let first_plan = {
+            let store = control.lock().unwrap();
+            let plan = crate::GuardedFileCapturePlan::load_for_manifest(&store, &first)
+                .unwrap()
+                .unwrap();
+            assert!(plan.discard_unreferenced(&store).is_err());
+            plan
+        };
         assert_eq!(
             fs::metadata(mountpoint.join("sample"))
                 .unwrap()
@@ -1731,6 +1739,10 @@ print('DONE', flush=True)
         .unwrap();
         assert_ne!(second.anchor_id, first.anchor_id);
         assert_eq!(anchor_bytes(&second), second_bytes);
+        first_plan
+            .discard_unreferenced(&control.lock().unwrap())
+            .unwrap();
+        assert!(first.open_verified().is_err());
         let remounted =
             GuardedViewMount::recover_claimed(original.anchor_id, Arc::clone(&control)).unwrap();
         edit(&mountpoint.join("moved"), "EDIT3");
@@ -1761,12 +1773,19 @@ print('DONE', flush=True)
 
         let store = control.lock().unwrap();
         GuardedViewMount::retire_claim(original.anchor_id, &store).unwrap();
-        for anchor in [&first, &second, &created] {
+        assert!(root_plan.discard_unreferenced(&store).is_err());
+        for anchor in [&second, &created] {
             let plan = crate::GuardedFileCapturePlan::load_for_manifest(&store, anchor)
                 .unwrap()
                 .unwrap();
             plan.discard_unreferenced(&store).unwrap();
         }
+        assert!(
+            store
+                .records(crate::guarded_view_probe::FILE_GUARD_KIND)
+                .unwrap()
+                .is_empty()
+        );
         root_plan.discard_unreferenced(&store).unwrap();
         assert!(fs::read(lower.join("moved")).unwrap().starts_with(b"EDIT3"));
     }
