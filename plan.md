@@ -36,7 +36,10 @@ them as ADRs and test vectors before promising wire compatibility.
   can normalize line endings on its own; a configured `filter.<name>.clean`
   command is a separate, arbitrary transformation. Disable both directions of
   both mechanisms rather than assuming that disabling CRLF normalization also
-  disables custom filters. This includes Git LFS filters: an LFS pointer is
+  disables custom filters. Do not invoke configured `textconv`/external diff or
+  merge drivers implicitly: display and merge must use the raw tracked bytes,
+  and only an explicit user edit or the built-in merge result may create new
+  file content. This includes Git LFS filters: an LFS pointer is
   tracked and restored as its literal bytes, with no automatic LFS transfer or
   pointer substitution by our binary.
   Do not offer a compatibility flag, `--renormalize` equivalent, or per-command
@@ -579,6 +582,11 @@ not grant permission to transform other files. Never invoke an external filter
 or write a converted temporary payload while checking such rules. Git object
 IDs use the selected repository's canonical object framing
 and hash algorithm, computed by the Git library from the immutable captured bytes.
+Consequently, adding a file through our binary may produce a different blob ID
+from stock Git's filtered `add` of the same worktree path. That difference is
+expected: compare against `git hash-object --no-filters` on the source bytes,
+and require ordinary-Git exchange to preserve object bytes and IDs rather than
+emulate the peer's worktree conversion.
 Retain MutualBackup's independent content roots and signed revision authority.
 
 - **Prototype sector object:** fixed 64 KiB RS-level bytes, logical tail length,
@@ -3692,8 +3700,9 @@ while the original source-backend and platform gates remain separate.
   conversions already performed by another client's worktree. Treat inherited
   and repository transforming rules as inert for payload bytes, and make this
   behavior visible in help and status when such rules exist. Never run a
-  configured filter command. Define safe support for Git file
-  modes, symlinks, and path names rather than silently dropping them.
+  configured filter, `textconv`/external diff, or merge-driver command while
+  reading, displaying, or combining tracked content. Define safe support for
+  Git file modes, symlinks, and path names rather than silently dropping them.
   Check `status`, `diff`, and dirty-worktree preflight against raw blob bytes,
   so a line-ending-only edit cannot disappear from the index or be silently
   overwritten by checkout, restore, switch, or pull.
@@ -3765,6 +3774,8 @@ while the original source-backend and platform gates remain separate.
   while raw-byte commands succeed, including after those rules change between
   staging, commit, checkout, and an ordinary-Git exchange; include a Git LFS
   filter rule and verify that its pointer stays byte-exact without invoking LFS;
+  configure external diff/`textconv` and merge drivers and verify raw diff and
+  built-in merge results without invoking those commands;
   verify `status` and `diff` report a line-ending-only edit as dirty and
   destructive worktree operations protect that edit;
   sparse and large files; hard links, symlinks, modes, and unusual path names;
